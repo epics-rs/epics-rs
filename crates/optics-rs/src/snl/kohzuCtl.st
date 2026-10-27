@@ -483,6 +483,9 @@ assign  yOffsetHi to "{P}Kohzu_yOffsetAO.DRVH";
 double  yOffsetLo;
 assign  yOffsetLo to "{P}Kohzu_yOffsetAO.DRVL";
 
+double  yOffsetInit;
+assign  yOffsetInit to "{P}Kohzu_yOffsetAO";
+
 %%#include <string.h>
 %%#include <math.h>
 
@@ -564,7 +567,11 @@ state initSequence {
 			yOffsetLo = 17.5 - .000001;
 			pvPut(yOffsetLo);
 			yOffset = 17.5;
-			pvPut(yOffset);
+			/* C defect: put yOffset itself, which is monitored: the
+			 * yOffsetLo put clamps VAL to 17.499999 and posts it, and that
+			 * event could land before the put, which then wrote 17.499999. */
+			yOffsetInit = 17.5;
+			pvPut(yOffsetInit);
 			yMotDesiredHi = 0.;
 			pvPut(yMotDesiredHi);
 			yMotDesiredLo = -35;

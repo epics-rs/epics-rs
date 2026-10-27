@@ -1,5 +1,5 @@
 //! kohzuCtl's boot ends where C's does. initSequence's two theta passes
-//! (`kohzuCtl.st:580`, `:594-602`) clamp against C's unset thetaHi/thetaLo
+//! (`kohzuCtl.st:587`, `:601-609`) clamp against C's unset thetaHi/thetaLo
 //! and are rolled back. The first waitForCmnd then takes the connect-time
 //! monitors its waitForCmndEnter leaves set, in its order: thetaLimits, the
 //! theta readback (thetaMotStopped `!causedMove`), then yOffset. A zero
@@ -28,7 +28,7 @@ use std::time::Duration;
 const KOHZU_DB: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/db/kohzuSeq.db");
 /// GEOM is left to the program's own `GEOM=1` (`kohzuCtl.st:1`).
 const SEQ_MACROS: &str = "P=K:,M_THETA=th,M_Y=y,M_Z=z";
-/// initSequence's radConv (`kohzuCtl.st:525`).
+/// initSequence's radConv (`kohzuCtl.st:528`).
 const RAD_CONV: f64 = 57.2958;
 const MOTORS: &str = r#"
 record(motor, "K:th") { field(HLM, "90") field(LLM, "-10") }
@@ -422,7 +422,7 @@ async fn use_set_and_motor_sets(ioc: &PvDatabase) -> [f64; 4] {
     ]
 }
 
-/// updateSet (kohzuCtl.st:1403-1446) runs on the connect-time monitors with UseSet first,
+/// updateSet (kohzuCtl.st:1410-1453) runs on the connect-time monitors with UseSet first,
 /// so UseSet's value wins: a preset motor .SET is put back (C kohzuIoc
 /// oracle: th.SET=Set before seq gives all Use).
 #[epics_base_rs::epics_test]
@@ -466,7 +466,7 @@ async fn a_motor_set_put_drives_use_set_and_the_other_motors() {
 }
 
 /// A tweak past its limit leaves the setpoint but still runs C's
-/// eChanged/lChanged/thChanged chain (kohzuCtl.st:748-809), so in auto
+/// eChanged/lChanged/thChanged chain (kohzuCtl.st:755-816), so in auto
 /// mode it moves Y back from where it was driven (C kohzuIoc oracle: y=5,
 /// E tweak 1000 → y.VAL -17.77; the same for lambda and theta). One case
 /// per test process: kohzuCtl is not reentrant, so a second instance would
@@ -569,7 +569,7 @@ async fn idle(db: &PvDatabase, ack: &str, msg1: &str) {
 }
 
 /// Run `posts` once the sequencer has passed waitForCmndEnter's efClears
-/// (kohzuCtl.st:606-651): `ack` sends it there, and the enter's `opAck = 0` follows them.
+/// (kohzuCtl.st:613-658): `ack` sends it there, and the enter's `opAck = 0` follows them.
 /// Its puts are queued, so no record lock can hold it inside the enter.
 async fn post_after_enter(db: &PvDatabase, ack: &str, posts: impl FnOnce(&PvDatabase)) {
     idle(db, ack, "K:KohzuSeqMsg1SI").await;
@@ -678,7 +678,7 @@ async fn a_setpoint_put_during_a_move_is_dropped() {
 
 /// Readbacks at the yOffset pass's own Y and Z for theta 10 leave every
 /// motor nothing to do, so thTime is 0: Move keeps each speed, where C put
-/// 0/0, a NaN, into Y's and Z's VELO (`kohzuCtl.st:1025-1035`). th.VELO
+/// 0/0, a NaN, into Y's and Z's VELO (`kohzuCtl.st:1032-1042`). th.VELO
 /// stays only if the pass took that thTime = 0 branch.
 #[epics_base_rs::epics_test]
 async fn a_move_with_nothing_to_do_keeps_the_motor_speeds() {
@@ -698,7 +698,7 @@ async fn a_move_with_nothing_to_do_keeps_the_motor_speeds() {
 }
 
 /// Theta at VELO 0, as speed control leaves it after a move without theta
-/// travel, takes zero time (`kohzuCtl.st:1001-1011`): Z is the slowest to
+/// travel, takes zero time (`kohzuCtl.st:1008-1018`): Z is the slowest to
 /// theta 20, so it keeps its speed and theta and Y get their travel over
 /// Z's time. C took an infinite thTime and put 0 into every VELO.
 #[epics_base_rs::epics_test]
@@ -756,16 +756,16 @@ fn trace_of(test: &str) -> Vec<String> {
 }
 
 /// With kohzuCtlDebug set at boot, the boot passes print C's lines; the
-/// rolled-back moveKohzu arm prints none (kohzuCtl.st:1060-1066).
+/// rolled-back moveKohzu arm prints none (kohzuCtl.st:1067-1073).
 #[epics_base_rs::epics_test]
 async fn debug_prints_c_lines() {
     if std::env::var_os(CHILD).is_none() {
         let trace = trace_of("debug_prints_c_lines");
         // C's Linux run races the monitor of waitForCmndEnter's own
-        // pvPut(kohzuMoving) (kohzuCtl.st:656) against waitForCmnd's whens.
+        // pvPut(kohzuMoving) (kohzuCtl.st:663) against waitForCmnd's whens.
         // This follows C's delivery on CAC-event above the state set
-        // (dbContext.cpp), RTEMS's outcome: it has landed, so kMbusy (:712)
-        // wins over the pending yOffset_mon (:724).
+        // (dbContext.cpp), RTEMS's outcome: it has landed, so kMbusy (:719)
+        // wins over the pending yOffset_mon (:731).
         assert_eq!(
             trace,
             [
@@ -817,7 +817,7 @@ async fn debug_prints_c_lines() {
 }
 
 /// initSequence's escaped block names each motor `{P}{M_x}`
-/// (`kohzuCtl.st:538-556`) and publishes the names.
+/// (`kohzuCtl.st:541-559`) and publishes the names.
 #[epics_base_rs::epics_test]
 async fn init_names_the_motors_from_p_and_their_macros() {
     let ioc = boot([10.0, -17.77, 100.78]).await;
@@ -837,7 +837,7 @@ async fn init_names_the_motors_from_p_and_their_macros() {
 
 /// Wait for the Y drive limits initSequence puts for the geometry `seq`
 /// was given in `macro_def`: 0/-35 for geom 1, 60/0 for geom 2
-/// (`kohzuCtl.st:557-577`).
+/// (`kohzuCtl.st:560-584`).
 async fn y_drive_limits(macro_def: &str, geom: i16, rbv: [f64; 3]) -> Kohzu {
     let ioc = boot_seq(rbv, &[], macro_def).await;
     let want = if geom == 2 { [60.0, 0.0] } else { [0.0, -35.0] };
@@ -877,7 +877,7 @@ async fn an_empty_geom_is_geometry_1() {
 
 /// Geometry 2 keeps the db's yOffset (`Kohzu_yOffsetAO` DOL 1) and puts
 /// Y = yOffset/(2 cos theta), Z = yOffset/(2 sin theta)
-/// (`kohzuCtl.st:956-957`; values from that formula, not a C IOC run).
+/// (`kohzuCtl.st:963-964`; values from that formula, not a C IOC run).
 #[epics_base_rs::epics_test]
 async fn geom_2_0_moves_y_and_z_by_geometry_2() {
     let theta = 10.0 / RAD_CONV;

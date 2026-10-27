@@ -155,6 +155,22 @@ pub async fn sleep(duration: Duration) {
 // Thread bootstrap
 // ──────────────────────────────────────────────────────────────────────────
 
+/// Drive `fut` on a current-thread runtime of its own: the body of every
+/// thread that loops on one for its life.
+pub(crate) fn block_on_for_thread<Fut: Future>(fut: Fut) -> Fut::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build thread runtime")
+        .block_on(async {
+            // The runtime's deferred-waker list grows on its first deferred
+            // yield; taken here, the yield the coop budget forces in a frame
+            // burst no longer allocates mid-frame.
+            tokio::task::yield_now().await;
+            fut.await
+        })
+}
+
 /// Spawn a dedicated OS thread that runs the given async closure inside an
 /// async runtime. Returns the OS-thread `JoinHandle`.
 pub fn run_thread<F, Fut>(make_fut: F) -> std::thread::JoinHandle<()>
@@ -162,13 +178,7 @@ where
     F: FnOnce() -> Fut + Send + 'static,
     Fut: Future<Output = ()> + 'static,
 {
-    std::thread::spawn(move || {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("failed to build driver runtime")
-            .block_on(make_fut());
-    })
+    std::thread::spawn(move || block_on_for_thread(make_fut()))
 }
 
 /// Same as [`run_thread`], but with a thread name (useful in `ps`, crash dumps).
@@ -179,12 +189,6 @@ where
 {
     std::thread::Builder::new()
         .name(name.to_string())
-        .spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("failed to build driver runtime")
-                .block_on(make_fut());
-        })
+        .spawn(move || block_on_for_thread(make_fut()))
         .expect("failed to spawn driver thread")
 }

@@ -1515,6 +1515,10 @@ impl PortActor {
         let lend = Arc::clone(&self.lend);
         let mut actor = Box::new(self);
         let mut actor = rt.block_on(async move {
+            // The runtime's deferred-waker list grows on its first deferred
+            // yield; taken here, the yield the coop budget forces in a
+            // request burst no longer allocates mid-request.
+            tokio::task::yield_now().await;
             // The registration connect armed in `new`, ahead of every request.
             actor.registration_pass();
             let mut stop = Stop::Listening(shutdown_rx);

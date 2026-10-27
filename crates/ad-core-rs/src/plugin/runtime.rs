@@ -4163,11 +4163,7 @@ fn plugin_data_loop<P: NDPluginProcess>(
     // NDPluginDriver.cpp:152-153 seeds it.
     let mut sources = vec![(String::new(), 0i32); processor.num_array_sources().max(1)];
     sources[0] = (initial_upstream.port, initial_upstream.addr);
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    rt.block_on(async {
+    crate::runtime::block_on_for_thread(async {
         // Sort flush timer — starts disabled (very long interval).
         // Re-created when sort_time changes.
         let mut sort_flush_interval = tokio::time::interval(std::time::Duration::from_secs(3600));

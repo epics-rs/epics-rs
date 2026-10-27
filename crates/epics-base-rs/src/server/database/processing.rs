@@ -4409,55 +4409,63 @@ impl PvDatabase {
     /// the single owner of [`ProcessAction::DelayedCallbackAfter`](crate::server::record::ProcessAction::DelayedCallbackAfter)
     /// and the port of `boRecord.c::myCallbackFunc` (:105-118).
     ///
-    /// The fire takes the record gate (C `dbScanLock`), runs
-    /// [`Record::delayed_callback_fire`](crate::server::record::Record::delayed_callback_fire)
-    /// and only then re-enters `process()`. The handler's mutation is therefore
-    /// reachable from the timer alone: no record flag survives the arm, so no
-    /// other process cycle can consume the one-shot. Re-arming mints a fresh
-    /// token, exactly as C's re-`callbackRequestDelayed` replaces the pending
-    /// delayed callback.
+    /// The fire runs [`Self::delayed_callback_in`] in one frame of the record
+    /// gate (C `dbScanLock`). The handler's mutation is therefore reachable
+    /// from the timer alone: no record flag survives the arm, so no other
+    /// process cycle can consume the one-shot. Re-arming mints a fresh token,
+    /// exactly as C's re-`callbackRequestDelayed` replaces the pending delayed
+    /// callback.
     fn schedule_delayed_callback(&self, name: &[u8], rec: InFrame<'_>, delay: std::time::Duration) {
-        let token = Self::mint_async_token_in(name, rec);
+        let mut token = Self::mint_async_token_in(name, rec);
         let prio = rec.read().common.callback_priority();
         let db = self.clone();
-        let name = RecordName::from(name);
         crate::runtime::task::spawn_background(prio, async move {
-            let mut token = token;
             let mut delay = delay;
             loop {
                 crate::runtime::task::sleep_background(delay).await;
                 // A newer arm (or a cancel) superseded this timer while it
                 // slept — the same `AsyncToken` gate `ReprocessAfter` uses.
-                if !token.is_current() {
+                if !token.is_current() || !db.accepts_reentry() {
                     return;
                 }
-                let outcome = {
-                    let records = db.inner.records.read();
-                    let Some(rec) = records.get(&*name) else {
-                        return;
-                    };
-                    let rec = rec.clone();
-                    drop(records);
-                    let mut instance = rec.write();
-                    let pact = instance.is_processing();
-                    instance.record.delayed_callback_fire(pact)
+                let Some(rec) = db.get_record_no_resolve(&token.name) else {
+                    return;
                 };
-                match outcome {
-                    crate::server::record::DelayedCallbackOutcome::Reprocess => {
-                        let _ = token.fire(&db).await;
-                        return;
-                    }
-                    crate::server::record::DelayedCallbackOutcome::Rearm(again) => {
-                        let Some(fresh) = db.mint_async_token(&name) else {
-                            return;
-                        };
-                        token = fresh;
-                        delay = again;
-                    }
-                    crate::server::record::DelayedCallbackOutcome::Drop => return,
-                }
+                let rearm = {
+                    let gate = FrameGate::Taken(db.lock_instance(&rec));
+                    db.delayed_callback_in(&token.name, gate.frame(&rec))
+                };
+                let Some((fresh, again)) = rearm else {
+                    return;
+                };
+                token = fresh;
+                delay = again;
             }
         });
+    }
+
+    /// C `myCallbackFunc` inside its one `dbScanLock` (`boRecord.c:107-119`,
+    /// `busyRecord.c:112-124`): the PACT test, the handler's VAL=0 and the
+    /// `dbProcess` that drives it out share the frame, so no put lands between
+    /// the zero and its pass. Answers the re-arm, minted under the same hold.
+    fn delayed_callback_in(
+        &self,
+        name: &[u8],
+        rec: InFrame<'_>,
+    ) -> Option<(AsyncToken, std::time::Duration)> {
+        let pact = rec.read().is_processing();
+        let outcome = rec.write().record.delayed_callback_fire(pact);
+        match outcome {
+            crate::server::record::DelayedCallbackOutcome::Reprocess => {
+                let target = ProcessTarget::Resolved(name, rec.unframed());
+                let _ = self.run_process_frame(target, &mut ProcStack::new(), false, true, false);
+                None
+            }
+            crate::server::record::DelayedCallbackOutcome::Rearm(again) => {
+                Some((Self::mint_async_token_in(name, rec), again))
+            }
+            crate::server::record::DelayedCallbackOutcome::Drop => None,
+        }
     }
 
     /// Schedule [`ProcessAction::ValuePutAfter`](crate::server::record::ProcessAction::ValuePutAfter):
@@ -4581,10 +4589,12 @@ impl PvDatabase {
                 if generation.load(std::sync::atomic::Ordering::Acquire) != epoch {
                     return;
                 }
-                let fields = {
-                    let mut instance = rec.write();
-                    instance.record.watchdog_fire()
-                };
+                // C `wdogCallback`'s one `dbScanLock` (`histogramRecord.c:
+                // 112-116`): the count reset, the stamp and the post share
+                // it, so no pass of the record lands between them.
+                let gate = FrameGate::of_held(rec.lock_record());
+                let frame = gate.frame(&rec);
+                let fields = frame.write().record.watchdog_fire();
                 if fields.is_empty() {
                     // C `wdogCallback`: `mcnt == 0` -> no stamp, no post; the
                     // timer still re-arms. C tests `prec->mcnt` before it even
@@ -4592,16 +4602,12 @@ impl PvDatabase {
                     // TSEL read happens on an empty tick either.
                     continue;
                 }
-                // Between the two guards, like every other stamp point: the
-                // TSEL read takes its own locks.
                 let tsel = match db.db() {
                     // A tick is a chain of its own, as C's `wdogCallback` is.
-                    Some(db) => {
-                        db.with_frame(&rec, |frame| db.read_tsel(frame, &mut ProcStack::new()))
-                    }
+                    Some(db) => db.read_tsel(frame, &mut ProcStack::new()),
                     None => super::TselStamp::None,
                 };
-                let mut instance = rec.write();
+                let mut instance = frame.write();
                 let inst = &mut *instance;
                 tsel.stamp(&inst.name, &mut inst.common, || false);
                 for field in fields {
@@ -10277,6 +10283,20 @@ impl PvDatabase {
         let record_gate = FrameGate::Taken(self.lock_instance(&rec));
         let mut visited = ProcStack::new();
         self.complete_async_record_inner(canonical, record_gate.frame(&rec), &mut visited)
+    }
+
+    /// [`Self::complete_async_record`] for a callback body that holds the
+    /// record's frame already — C's `prec->rset->process(prec)` under the
+    /// `dbScanLock` that body took (`seqRecord.c:206-209`).
+    pub(super) fn complete_async_in(
+        &self,
+        canonical: RecordName,
+        rec: InFrame<'_>,
+    ) -> CaResult<()> {
+        if !self.accepts_reentry() {
+            return Ok(());
+        }
+        self.complete_async_record_inner(canonical, rec, &mut ProcStack::new())
     }
 
     fn complete_async_record_inner(

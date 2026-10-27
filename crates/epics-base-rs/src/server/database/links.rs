@@ -5253,7 +5253,8 @@ impl PvDatabase {
                 //
                 // Ported one-for-one: PACT here, the group walk on a task that
                 // re-takes THIS record's L1 gate per group, and
-                // `complete_async_record` as `asyncFinish`. `spawn_background`
+                // `complete_async_in` as `asyncFinish` inside the last
+                // group's gate. `spawn_background`
                 // is the callback pool (`callbackRequest`) and
                 // `sleep_background` its delayed timer
                 // (`callbackRequestDelayed`), so the DLY test belongs inside
@@ -5264,7 +5265,7 @@ impl PvDatabase {
                 // `callbackSetPriority(prec->prio, &pcb->callback)` — so the
                 // band is taken here, under the same write lock that sets PACT.
                 if !active.is_empty() {
-                    let rec_name = name.to_owned();
+                    let rec_name = RecordName::from(name);
                     let prio = {
                         let instance = rec.write();
                         instance.enter_pact();
@@ -5273,7 +5274,8 @@ impl PvDatabase {
                     let db = self.clone();
                     let rec = Arc::clone(rec.unframed());
                     crate::runtime::task::spawn_background(prio, async move {
-                        for grp in &active {
+                        let last = active.len() - 1;
+                        for (index, grp) in active.iter().enumerate() {
                             let dly = grp.dly;
                             if dly > 0.0 {
                                 crate::runtime::task::sleep_background(
@@ -5281,22 +5283,22 @@ impl PvDatabase {
                                 )
                                 .await;
                             }
-                            {
-                                // C `processCallback`'s `dbScanLock` /
-                                // `dbScanUnlock` pair (`seqRecord.c:252`,
-                                // `:274`) — held for this group alone. The
-                                // seq is claimed as `processTarget`'s source.
-                                let mut visited = crate::server::database::ProcStack::new();
-                                visited.claim(&rec);
-                                db.with_frame(&rec, |frame| {
-                                    db.seq_group_step(frame, grp, &mut visited)
-                                });
-                            }
+                            // C `processCallback`'s `dbScanLock` /
+                            // `dbScanUnlock` pair (`seqRecord.c:252`, `:274`)
+                            // — held for this group, and after the last one
+                            // for `processNextLink`'s `pgrp == NULL` →
+                            // `prec->rset->process(prec)` (`:206-209`), which
+                            // takes the `pact` branch into `asyncFinish`. The
+                            // seq is claimed as `processTarget`'s source.
+                            let mut visited = crate::server::database::ProcStack::new();
+                            visited.claim(&rec);
+                            db.with_frame(&rec, |frame| {
+                                db.seq_group_step(frame, grp, &mut visited);
+                                if index == last {
+                                    let _ = db.complete_async_in(rec_name.clone(), frame);
+                                }
+                            });
                         }
-                        // `pgrp == NULL` → `prec->rset->process(prec)`
-                        // (`seqRecord.c:206-209`), which takes the `pact`
-                        // branch into `asyncFinish`.
-                        let _ = db.complete_async_record(&rec_name).await;
                     });
                     return MultiOutDispatch::went_async();
                 }

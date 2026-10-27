@@ -736,18 +736,22 @@ fn scan_int(
     }
     if *width != 0 && c == Some(b'0') {
         dec(width);
-        buf.push(b'0');
         c = r.inchar();
-        if *width != 0 && lower(c) == Some(b'x') {
+        // A `0x` is a prefix, not the number `0`: with no digit after it the
+        // item is a matching failure (C11 7.21.6.2p10). glibc before 2.42
+        // read it as 0 (BZ #12701), which is not copied.
+        if *width != 0 && lower(c) == Some(b'x') && (base == 0 || base == 16) {
+            base = 16;
+            dec(width);
+            if *width == 0 {
+                return Err(Stop::Conv);
+            }
+            c = r.inchar();
+        } else {
             if base == 0 {
-                base = 16;
+                base = 8;
             }
-            if base == 16 {
-                dec(width);
-                c = r.inchar();
-            }
-        } else if base == 0 {
-            base = 8;
+            buf.push(b'0');
         }
     }
     if base == 0 {
@@ -823,9 +827,7 @@ fn scan_float(r: &mut Input<'_>, width: &mut i64) -> Result<Vec<u8>, Stop> {
     if c.is_none() {
         return Err(Stop::Input);
     }
-    let mut got_sign = false;
     if let Some(sign @ (b'-' | b'+')) = c {
-        got_sign = true;
         buf.push(sign);
         if *width == 0 {
             return Err(Stop::Conv);
@@ -838,6 +840,27 @@ fn scan_float(r: &mut Input<'_>, width: &mut i64) -> Result<Vec<u8>, Stop> {
     }
     if lower(c) == Some(b'n') {
         spell(r, &mut c, &mut buf, width, b"an")?;
+        // glibc before 2.41 left a `(n-char-sequence)` unread (BZ #30647).
+        if *width != 0 {
+            c = r.inchar();
+            if c != Some(b'(') {
+                r.ungetc(c);
+                return Ok(buf);
+            }
+            while c != Some(b')') {
+                buf.push(c.unwrap());
+                dec(width);
+                if *width == 0 {
+                    return Err(Stop::Conv);
+                }
+                c = r.inchar();
+                if !c.is_some_and(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b')') {
+                    return Err(Stop::Conv);
+                }
+            }
+            buf.push(b')');
+            dec(width);
+        }
         return Ok(buf);
     }
     if lower(c) == Some(b'i') {
@@ -859,7 +882,10 @@ fn scan_float(r: &mut Input<'_>, width: &mut i64) -> Result<Vec<u8>, Stop> {
         buf.push(b'0');
         c = r.inchar();
         dec(width);
-        if *width != 0 && lower(c) == Some(b'x') {
+        if lower(c) == Some(b'x') {
+            if *width == 0 {
+                return Err(Stop::Conv);
+            }
             buf.push(c.unwrap());
             hex = true;
             exp_char = b'p';
@@ -880,6 +906,7 @@ fn scan_float(r: &mut Input<'_>, width: &mut i64) -> Result<Vec<u8>, Stop> {
                 buf.push(exp_char);
                 got_e = true;
                 got_dot = true;
+                got_digit = false;
             }
             Some(b'.') if !got_dot => {
                 buf.push(b'.');
@@ -899,7 +926,10 @@ fn scan_float(r: &mut Input<'_>, width: &mut i64) -> Result<Vec<u8>, Stop> {
         }
         dec(width);
     }
-    if buf.len() == usize::from(got_sign) || hex && buf.len() == 2 + usize::from(got_sign) {
+    // No digit in the significand or after the exponent character, or a bare
+    // `0x`: a matching failure. glibc before 2.42 handed `1e` or `0x.` to
+    // `strtod` and took what it read (BZ #12701), which is not copied.
+    if !got_digit {
         return Err(Stop::Conv);
     }
     Ok(buf)
@@ -1030,7 +1060,17 @@ fn scan(input: &[u8], fmt: &[u8], out: &[&dyn ScanTarget]) -> c_int {
                         break;
                     }
                 }
-                Ok(Some(Scanned::Chars(&input[start..r.at])))
+                let chars = Scanned::Chars(&input[start..r.at]);
+                if width > 0 {
+                    // Short of `width`: glibc has stored what it read, then
+                    // fails the input. glibc before 2.42 counted the
+                    // conversion (BZ #12701), which is not copied.
+                    if !suppress {
+                        targets.next().ok_or(Stop::Conv)?.store(chars);
+                    }
+                    return Err(Stop::Input);
+                }
+                Ok(Some(chars))
             }
             b's' if !wide => {
                 let start = r.at;
@@ -1128,6 +1168,13 @@ fn scan(input: &[u8], fmt: &[u8], out: &[&dyn ScanTarget]) -> c_int {
                     return Err(Stop::Conv);
                 }
                 Ok(Some(Scanned::Double(match length {
+                    // `strtof` puts a `nan(...)` payload below its own quiet
+                    // bit.
+                    Length::None if d.value.is_nan() => {
+                        let b = d.value.to_bits();
+                        let sign = (b >> 32) as u32 & 0x8000_0000;
+                        f32::from_bits(sign | 0x7fc0_0000 | b as u32 & 0x3f_ffff) as f64
+                    }
                     // `strtof` rounds the decimal once; a hex float rounds
                     // to a double first, the same below 54 significant bits.
                     Length::None => std::str::from_utf8(&buf[..d.len])
@@ -1590,13 +1637,11 @@ mod tests {
     }
 
     /// A destination of the comparison with glibc.
-    #[cfg(all(unix, target_env = "gnu"))]
     trait Checked {
         fn target(&self) -> &dyn ScanTarget;
         fn bytes(&self) -> Vec<u8>;
     }
 
-    #[cfg(all(unix, target_env = "gnu"))]
     impl<T: ScanStore + Copy> Checked for SeqVar<T> {
         fn target(&self) -> &dyn ScanTarget {
             self
@@ -1660,14 +1705,16 @@ mod tests {
             "99999999999",
             "1e5",
         ] {
-            same_as_glibc_scan!(input, "%i", i32);
-            same_as_glibc_scan!(input, "%x%n", u32, i32);
+            // Pinned in `sscanf_follows_c11_where_older_glibc_did_not`.
+            if !matches!(input, "0x" | "0xg") {
+                same_as_glibc_scan!(input, "%i", i32);
+                same_as_glibc_scan!(input, "%x%n", u32, i32);
+            }
             same_as_glibc_scan!(input, "%2d%n", i32, i32);
             same_as_glibc_scan!(input, "%o", u32);
         }
         same_as_glibc_scan!("12345", "%2d%3d", i32, i32);
         same_as_glibc_scan!("-5", "%1d%d", i32, i32);
-        same_as_glibc_scan!("0x1f", "%2x%n", u32, i32);
         same_as_glibc_scan!("0x1f", "%3x", u32);
         same_as_glibc_scan!("300 70000 -1", "%hhd %hd %hu", i8, i16, u16);
         same_as_glibc_scan!("-1 9223372036854775807", "%ld %lld", c_long, i64);
@@ -1686,9 +1733,6 @@ mod tests {
             "info",
             "nan",
             "nax",
-            "1e",
-            "1e+",
-            "1e+x",
             ".5",
             "-.",
             ".",
@@ -1705,7 +1749,10 @@ mod tests {
         ] {
             same_as_glibc_scan!(input, "%f%n", f32, i32);
             same_as_glibc_scan!(input, "%lf%n", f64, i32);
-            same_as_glibc_scan!(input, "%3le%n", f64, i32);
+            // Pinned in `sscanf_follows_c11_where_older_glibc_did_not`.
+            if !matches!(input, "-2e3" | "7e-46") {
+                same_as_glibc_scan!(input, "%3le%n", f64, i32);
+            }
         }
         same_as_glibc_scan!("1.5 2", "%a %lA", f32, f64);
         // Strings, characters and sets.
@@ -1730,6 +1777,127 @@ mod tests {
         same_as_glibc_scan!("5", "%d%", i32);
         same_as_glibc_scan!("5 6", "%*d %d %2$d", i32, i32);
         same_as_glibc_scan!("ab", "%b", S);
+    }
+
+    /// `scan` into zeroed destinations of the types given, against the
+    /// values given.
+    macro_rules! scans_as {
+        ($input:expr, $fmt:expr, $n:expr $(, $t:ty = $want:expr)* $(,)?) => {{
+            let (input, fmt): (&str, &str) = ($input, $fmt);
+            let vars: Vec<Box<dyn Checked>> = vec![$(Box::new(<SeqVar<$t>>::zeroed())),*];
+            let wants: Vec<Box<dyn Checked>> = vec![$(Box::new(<SeqVar<$t>>::new($want))),*];
+            let targets: Vec<&dyn ScanTarget> = vars.iter().map(|v| v.target()).collect();
+            let n = scan(input.as_bytes(), fmt.as_bytes(), &targets);
+            assert_eq!(n, $n, "{input:?} {fmt:?}");
+            for (i, (v, want)) in vars.iter().zip(&wants).enumerate() {
+                assert_eq!(v.bytes(), want.bytes(), "{input:?} {fmt:?} destination {i}");
+            }
+        }};
+    }
+
+    /// The C11 7.21.6.2p10 matching failures glibc 2.42 adopted (BZ #12701)
+    /// and the NaN `(n-char-sequence)` 2.41 reads (BZ #30647), as glibc 2.43
+    /// scans them; a host with an older glibc scans them otherwise, so
+    /// `sscanf_matches_glibc` leaves them out.
+    #[test]
+    fn sscanf_follows_c11_where_older_glibc_did_not() {
+        type S = [c_char; 16];
+        let s = |b: &[u8]| {
+            let mut a: S = [0; 16];
+            a.iter_mut().zip(b).for_each(|(a, &b)| *a = b as c_char);
+            a
+        };
+        // A `0x` with no digit after it.
+        for (input, fmt) in [
+            ("0x", "%i%n"),
+            ("0x", "%x%n"),
+            ("0X", "%X%n"),
+            ("-0x", "%i%n"),
+            ("+0x", "%x%n"),
+            ("0xg", "%i%n"),
+            ("0xg", "%x%n"),
+            ("0xg", "%p%n"),
+            ("0x", "%p%n"),
+            ("0x1f", "%2x%n"),
+            ("0x1f", "%2i%n"),
+            ("-0x1", "%3i%n"),
+        ] {
+            scans_as!(input, fmt, 0, u64 = 0, i32 = 0);
+        }
+        scans_as!("0x(nil)", "%p%n", 1, u64 = 0, i32 = 7);
+        // No digit in the significand or after the exponent character.
+        for input in ["1e", "1e+", "1e+x"] {
+            scans_as!(input, "%f%n", 0, f32 = 0.0, i32 = 0);
+            scans_as!(input, "%lf%n", 0, f64 = 0.0, i32 = 0);
+            scans_as!(input, "%3le%n", 0, f64 = 0.0, i32 = 0);
+        }
+        for (input, fmt) in [
+            ("-2e3", "%3le%n"),
+            ("7e-46", "%3le%n"),
+            ("0x5", "%2f%n"),
+            ("-0x5", "%3f%n"),
+            ("0x.", "%lf%n"),
+            ("0x.p1", "%lf%n"),
+            ("-0x.", "%lf%n"),
+            ("0x1p", "%lf%n"),
+            ("0x1p+", "%lf%n"),
+            ("0x1p-x", "%lf%n"),
+            ("1.e", "%lf%n"),
+            ("1e5", "%2lf%n"),
+            ("1e+5", "%3lf%n"),
+            ("0e", "%lf%n"),
+            ("0x0p", "%lf%n"),
+            ("1E", "%lf%n"),
+            ("1e-", "%f%n"),
+        ] {
+            scans_as!(input, fmt, 0, f64 = 0.0, i32 = 0);
+        }
+        // `nan(n-char-sequence)`, the sequence `strtod`'s payload.
+        for (input, fmt) in [
+            ("nan(", "%lf%n"),
+            ("nan(1-2)", "%lf%n"),
+            ("nan(12)", "%4lf%n"),
+            ("nan(12)", "%5lf%n"),
+            ("nan(12)", "%6lf%n"),
+        ] {
+            scans_as!(input, fmt, 0, f64 = 0.0, i32 = 0);
+        }
+        for (input, fmt, bits, end) in [
+            ("nan()", "%lf%n", 0x7ff8_0000_0000_0000, 5),
+            ("nan(12)", "%lf%n", 0x7ff8_0000_0000_000c, 7),
+            ("nan(a_B9)", "%lf%n", 0x7ff8_0000_0000_0000, 9),
+            ("nan(12)", "%7lf%n", 0x7ff8_0000_0000_000c, 7),
+            ("-nan(5)", "%lf%n", 0xfff8_0000_0000_0005, 7),
+            ("nan(0x7b)", "%lf%n", 0x7ff8_0000_0000_007b, 9),
+            (
+                "nan(99999999999999999999999)",
+                "%lf%n",
+                0x7fff_ffff_ffff_ffff,
+                28,
+            ),
+            ("nan(12)x", "%lf%n", 0x7ff8_0000_0000_000c, 7),
+        ] {
+            scans_as!(input, fmt, 1, f64 = f64::from_bits(bits), i32 = end);
+        }
+        scans_as!(
+            "NAN(7)",
+            "%f%n",
+            1,
+            f32 = f32::from_bits(0x7fc0_0007),
+            i32 = 6
+        );
+        // `%c` short of its width stores what it read and fails the input.
+        scans_as!("ab", "%3c%n", -1, S = s(b"ab"), i32 = 0);
+        scans_as!("ab", "%*3c%n", -1, i32 = 0);
+        scans_as!(
+            "x ab",
+            "%c %3c%n",
+            1,
+            c_char = b'x' as c_char,
+            S = s(b"ab"),
+            i32 = 0
+        );
+        scans_as!("a", "%2c%n", -1, S = s(b"a"), i32 = 0);
     }
 
     #[test]

@@ -5133,13 +5133,13 @@ mod json_link_tests {
     }
 
     /// `%i` is glibc's under EPICS's `_GNU_SOURCE`: the C23 `0b` prefix
-    /// counts, and a bare `0x`/`0b` is consumed with its `0` (measured on
-    /// glibc 2.39: `#C0xS2` scans C=0 S=2).
+    /// counts, and a bare `0x`/`0b` is a matching failure, so the `ret` is
+    /// odd (measured on glibc 2.43; 2.39 scanned `#C0xS2` as C=0 S=2).
     #[test]
     fn a_hw_number_is_glibc_scanf_i() {
         assert_eq!(hw("#C0b11 S2").render(), "#C3 S2 @");
-        assert_eq!(hw("#C0xS2").render(), "#C0 S2 @");
-        assert_eq!(hw("#C-0b S2").render(), "#C0 S2 @");
+        assert_eq!(parse_link_v2("#C0xS2"), ParsedLink::None);
+        assert_eq!(parse_link_v2("#C-0b S2"), ParsedLink::None);
         assert_eq!(parse_link_v2("#C\u{a0}1 S2"), ParsedLink::None);
     }
 

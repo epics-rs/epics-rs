@@ -225,7 +225,7 @@ macro_rules! seqg_escaped {
 
 epics_seq_rs::include_program!("kohzuCtl");
 
-/// `kohzuCtl_calc2dSpacing` (`kohzuCtl.st:1552-1576`), by the name the SNL
+/// `kohzuCtl_calc2dSpacing` (`kohzuCtl.st:1553-1577`), by the name the SNL
 /// code calls, on the `-r` block.
 #[allow(non_snake_case)]
 fn kohzuCtl_calc2dSpacing() -> f64 {

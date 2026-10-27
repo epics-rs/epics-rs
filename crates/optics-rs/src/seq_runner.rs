@@ -219,7 +219,7 @@ mod tests {
     /// initSequence puts the `Y_OFF` macro into the y offset
     /// (`ml_monoCtl.st:584-595`), and updatePsuedo puts the y motor readback,
     /// 0 here, once the readback's first monitor sets `yMotRdbk_mon`, as every
-    /// monitor sets its synced flag (`seq_ca.c:328-329`, `ml_monoCtl.st:1292-1295`).
+    /// monitor sets its synced flag (`seq_ca.c:328-329`, `ml_monoCtl.st:1293-1296`).
     /// The two state sets run on their own threads, so either put may be the
     /// last, but each puts its own value, where C could put one twice.
     #[epics_base_rs::epics_test]

@@ -629,9 +629,10 @@ state waitForCmndEnter {
 		efClear(K_mon);
 		efClear(L_mon);
 		efClear(A_mon);
-		efClear(E_mon);
-		efClear(lambda_mon);
-		efClear(theta_mon);
+		/* C's monitored E, lambda and theta kept a request dropped here. */
+		if (efTestAndClear(E_mon)) E = EReq;
+		if (efTestAndClear(lambda_mon)) lambda = lambdaReq;
+		if (efTestAndClear(theta_mon)) theta = thetaReq;
 
 		thetaMotRdbkEcho = thetaMotRdbk;
 		pvPut(thetaMotRdbkEcho);

@@ -281,13 +281,21 @@ const BSD_PCB_LOOKUP: bool = cfg!(all(unix, not(target_os = "linux")));
 impl HeldPort {
     /// A TCP number for a listener under test, which binds beside the hold:
     /// on unix both sides set `SO_REUSEADDR` and the hold is not listening;
-    /// on Windows a specific bind over an unoptioned wildcard succeeds.
+    /// on Windows a specific bind over an unoptioned wildcard succeeds. A
+    /// connect while no subject listens is refused, as on a free number:
+    /// Darwin and the BSDs would drop its SYN, so there the hold is
+    /// connected to a loopback peer it keeps (`BSD_PCB_LOOKUP`).
     pub fn tcp() -> Self {
         let hold = Socket::new(Domain::IPV4, Type::STREAM, None).expect("open a TCP hold");
         #[cfg(unix)]
         hold.set_reuse_address(true)
             .expect("SO_REUSEADDR on the hold");
-        Self::bind(hold)
+        let held = Self::bind(hold);
+        if BSD_PCB_LOOKUP {
+            held.connected()
+        } else {
+            held
+        }
     }
 
     /// A UDP number for a socket under test that sets the datagram fanout
@@ -541,6 +549,22 @@ mod tests {
     fn plain_bind(ty: Type, ip: [u8; 4], port: u16) -> std::io::Result<Socket> {
         let s = Socket::new(Domain::IPV4, ty, None).unwrap();
         s.bind(&SocketAddr::from((ip, port)).into()).map(|()| s)
+    }
+
+    /// A dialer is refused on the TCP hold as on a free number, before the
+    /// subject listens and after it is gone, and reaches the subject between.
+    #[test]
+    fn a_tcp_hold_refuses_a_connect_while_no_subject_listens() {
+        let held = HeldPort::tcp();
+        let at = SocketAddr::from(([127, 0, 0, 1], held.port));
+        // Bounded: a dropped SYN would leave the connect in progress.
+        let dial = || std::net::TcpStream::connect_timeout(&at, std::time::Duration::from_secs(10));
+        let refused = || dial().unwrap_err().kind();
+        assert_eq!(refused(), std::io::ErrorKind::ConnectionRefused);
+        let subject = TcpListener::bind(at).unwrap();
+        dial().unwrap();
+        drop(subject);
+        assert_eq!(refused(), std::io::ErrorKind::ConnectionRefused);
     }
 
     /// The hold keeps a plain bind off the number and lets the subject's on.

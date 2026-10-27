@@ -4,10 +4,11 @@
 
 use std::fs::File;
 use std::io::Write;
-use std::net::{Ipv4Addr, TcpListener};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::time::{Duration, Instant};
+
+use named_port::HeldPort;
 
 pub const CHILD: &str = "PVA_IOC_SHELL_CHILD_STCMD";
 
@@ -24,20 +25,14 @@ pub fn ioc_child() {
     .expect("the IOC runs");
 }
 
-pub fn free_port() -> u16 {
-    TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 /// An IOC child on `db` serving PVA on `port`, finding PVs at `servers`.
+/// The caller keeps `port` held as long as any IOC may dial it: a number
+/// probed and released is any socket's, under load a connect's source port.
 ///
 /// Its stdout and stderr go to `{name}.out` and `{name}.err` in `dir`: a
 /// pipe nobody reads blocks the shell once its prompts and report headers
 /// fill it, at 8 KiB when the user is past `fs.pipe-user-pages-soft`.
-pub fn spawn_ioc(dir: &Path, name: &str, db: &str, port: u16, servers: &str) -> Child {
+pub fn spawn_ioc(dir: &Path, name: &str, db: &str, port: &HeldPort, servers: &str) -> Child {
     let db_path = dir.join(format!("{name}.db"));
     std::fs::write(&db_path, db).unwrap();
     let stcmd = dir.join(format!("{name}.cmd"));
@@ -50,7 +45,7 @@ pub fn spawn_ioc(dir: &Path, name: &str, db: &str, port: u16, servers: &str) -> 
     Command::new(std::env::current_exe().unwrap())
         .args(["ioc_child", "--exact", "--nocapture"])
         .env(CHILD, &stcmd)
-        .env("EPICS_PVAS_SERVER_PORT", port.to_string())
+        .env("EPICS_PVAS_SERVER_PORT", port.port.to_string())
         .env("EPICS_PVAS_BROADCAST_PORT", "0")
         .env("EPICS_PVAS_INTF_ADDR_LIST", "127.0.0.1")
         .env("EPICS_PVAS_AUTO_BEACON_ADDR_LIST", "NO")

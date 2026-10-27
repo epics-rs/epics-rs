@@ -12,9 +12,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use common::{CHILD, Shell, free_port, signal, spawn_ioc};
+use common::{CHILD, Shell, signal, spawn_ioc};
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
 use epics_pva_rs::server_native::{PvaServer, SharedPV, SharedSource};
+use named_port::HeldPort;
 
 /// The child half; a no-op unless the parent set [`CHILD`].
 #[test]
@@ -65,14 +66,14 @@ fn a_refused_pva_link_put_prints_the_pvxs_line() {
     });
 
     let dir = tempfile::tempdir().unwrap();
-    let remote_port = free_port();
-    let mut remote = spawn_ioc(dir.path(), "remote", REMOTE, remote_port, "");
+    let (remote_port, local_port) = (HeldPort::tcp(), HeldPort::tcp());
+    let mut remote = spawn_ioc(dir.path(), "remote", REMOTE, &remote_port, "");
     let mut ioc = spawn_ioc(
         dir.path(),
         "local",
         DB,
-        free_port(),
-        &format!("{} 127.0.0.1:{remote_port}", server.tcp_addr()),
+        &local_port,
+        &format!("{} 127.0.0.1:{}", server.tcp_addr(), remote_port.port),
     );
     let stderr = dir.path().join("local.err");
     // The put lines among the whole lines written so far.

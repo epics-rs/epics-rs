@@ -54,13 +54,9 @@ record(ai, "LNK") { field(INP, {pva:"XA"}) field(SCAN, "1 second") }
     )
     .unwrap();
     // The link reaches the IOC's own server by name server, so its TCP port
-    // is fixed.
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-        .to_string();
+    // is fixed, and held until the IOC is gone.
+    let held = named_port::HeldPort::tcp();
+    let port = held.port.to_string();
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args(["ioc_child", "--exact", "--nocapture"])
         .env(CHILD, &stcmd)

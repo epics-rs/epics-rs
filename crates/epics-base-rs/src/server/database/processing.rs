@@ -4412,10 +4412,16 @@ impl PvDatabase {
     /// The fire runs [`Self::delayed_callback_in`] in one frame of the record
     /// gate (C `dbScanLock`). The handler's mutation is therefore reachable
     /// from the timer alone: no record flag survives the arm, so no other
-    /// process cycle can consume the one-shot. Re-arming mints a fresh token,
-    /// exactly as C's re-`callbackRequestDelayed` replaces the pending delayed
-    /// callback.
-    fn schedule_delayed_callback(&self, name: &[u8], rec: InFrame<'_>, delay: std::time::Duration) {
+    /// process cycle can consume the one-shot. Re-arming mints a fresh token
+    /// for the same `callback`, exactly as C's re-`callbackRequestDelayed`
+    /// replaces the pending delayed callback.
+    fn schedule_delayed_callback(
+        &self,
+        name: &[u8],
+        rec: InFrame<'_>,
+        delay: std::time::Duration,
+        callback: crate::server::record::DelayedCallback,
+    ) {
         let mut token = Self::mint_async_token_in(name, rec);
         let prio = rec.read().common.callback_priority();
         let db = self.clone();
@@ -4433,7 +4439,7 @@ impl PvDatabase {
                 };
                 let rearm = {
                     let gate = FrameGate::Taken(db.lock_instance(&rec));
-                    db.delayed_callback_in(&token.name, gate.frame(&rec))
+                    db.delayed_callback_in(&token.name, gate.frame(&rec), callback)
                 };
                 let Some((fresh, again)) = rearm else {
                     return;
@@ -4452,9 +4458,9 @@ impl PvDatabase {
         &self,
         name: &[u8],
         rec: InFrame<'_>,
+        callback: crate::server::record::DelayedCallback,
     ) -> Option<(AsyncToken, std::time::Duration)> {
-        let pact = rec.read().is_processing();
-        let outcome = rec.write().record.delayed_callback_fire(pact);
+        let outcome = rec.write().delayed_callback_fire_and_drain(callback);
         match outcome {
             crate::server::record::DelayedCallbackOutcome::Reprocess => {
                 // C's `dbProcess` with PACT clear: a fresh pass, not an async
@@ -4462,6 +4468,10 @@ impl PvDatabase {
                 // zero instead of taking its put as done.
                 let target = ProcessTarget::Resolved(name, rec.unframed());
                 let _ = self.run_process_frame(target, &mut ProcStack::new(), false, false, false);
+                None
+            }
+            crate::server::record::DelayedCallbackOutcome::ScanOnce => {
+                self.scan_once(name);
                 None
             }
             crate::server::record::DelayedCallbackOutcome::Rearm(again) => {
@@ -10092,12 +10102,12 @@ impl PvDatabase {
                         }
                     }
                 }
-                ProcessAction::DelayedCallbackAfter(delay) => {
-                    // C `callbackRequestDelayed` whose handler mutates the
-                    // record before `dbProcess` (bo/busy HIGH one-shot). The
-                    // mutation lives in `delayed_callback_fire`, not in
-                    // `process()`, so only this timer can perform it.
-                    self.schedule_delayed_callback(record_name, rec, delay);
+                ProcessAction::DelayedCallbackAfter(delay, callback) => {
+                    // C `callbackRequestDelayed` on one of the record's own
+                    // callbacks (bo/busy HIGH, scaler). The body lives in
+                    // `delayed_callback_fire`, not in `process()`, so only
+                    // this timer can perform it.
+                    self.schedule_delayed_callback(record_name, rec, delay, callback);
                 }
                 ProcessAction::ValuePutAfter(delay) => {
                     self.schedule_value_put(record_name, rec, delay);

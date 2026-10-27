@@ -3,7 +3,8 @@ use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
 use crate::error::{CaError, CaResult};
 use crate::server::record::{
-    DelayedCallbackOutcome, FieldMetadataOverride, MENU_SIMM, ProcessAction, ProcessOutcome, Record,
+    DelayedCallback, DelayedCallbackOutcome, FieldMetadataOverride, MENU_SIMM, ProcessAction,
+    ProcessOutcome, Record,
 };
 use crate::types::{EpicsValue, PvString};
 
@@ -424,6 +425,7 @@ impl Record for BoRecord {
         if self.val == 1 && self.high > 0.0 {
             actions.push(ProcessAction::DelayedCallbackAfter(
                 crate::runtime::time::duration_from_secs(self.high),
+                DelayedCallback::ONLY,
             ));
         }
         actions
@@ -437,7 +439,11 @@ impl Record for BoRecord {
     /// and the only writer of the one-shot's `prec->val = 0` (`rg 'prec->val =
     /// 0' boRecord.c` returns :116 here, :160 the RVAL convert and :364
     /// `put_enum_str`).
-    fn delayed_callback_fire(&mut self, pact: bool) -> DelayedCallbackOutcome {
+    fn delayed_callback_fire(
+        &mut self,
+        _callback: DelayedCallback,
+        pact: bool,
+    ) -> DelayedCallbackOutcome {
         if !pact {
             self.val = 0;
             return DelayedCallbackOutcome::Reprocess;

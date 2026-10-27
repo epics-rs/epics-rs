@@ -1304,7 +1304,7 @@ fn test_reqstart_no_reconciliation_when_driver_does_not_adjust() {
 /// BUG 3 regression — C scalerRecord.c:537-538 schedules the first periodic
 /// display update (`callbackRequestDelayed(pupdateCallback, 1.0/rat1)`) when
 /// autocount transitions to `ss = SCALER_STATE_COUNTING` and `rat1 > .1`.
-/// A freshly-started autocount must emit a `ReprocessAfter` so its displayed
+/// A freshly-started autocount must arm the update callback so its displayed
 /// counts refresh on the RAT1 cadence.
 #[test]
 fn test_autocount_start_schedules_periodic_update() {
@@ -1324,13 +1324,13 @@ fn test_autocount_start_schedules_periodic_update() {
         .actions
         .iter()
         .filter_map(|a| match a {
-            ProcessAction::ReprocessAfter(d) => Some(*d),
+            ProcessAction::DelayedCallbackAfter(d, _) => Some(*d),
             _ => None,
         })
         .collect();
     assert!(
         !reprocess.is_empty(),
-        "autocount start must schedule a periodic ReprocessAfter (C:537-538)"
+        "autocount start must schedule a periodic update (C:537-538)"
     );
     assert!(
         reprocess
@@ -1341,7 +1341,7 @@ fn test_autocount_start_schedules_periodic_update() {
 }
 
 /// BUG 3 regression — when `rat1 <= 0.1`, C schedules no periodic update;
-/// the autocount start must not emit a periodic `ReprocessAfter`.
+/// the autocount start must not arm the update callback.
 #[test]
 fn test_autocount_start_no_periodic_update_when_rat1_too_low() {
     use epics_base_rs::server::record::ProcessAction;
@@ -1359,7 +1359,7 @@ fn test_autocount_start_no_periodic_update_when_rat1_too_low() {
         !outcome
             .actions
             .iter()
-            .any(|a| matches!(a, ProcessAction::ReprocessAfter(_))),
+            .any(|a| matches!(a, ProcessAction::DelayedCallbackAfter(..))),
         "rat1 <= 0.1 must not schedule a periodic update"
     );
 }

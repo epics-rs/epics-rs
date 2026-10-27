@@ -16,7 +16,9 @@
 use std::time::Duration;
 
 use epics_base_rs::server::ioc_builder::IocBuilder;
-use epics_base_rs::server::record::{DelayedCallbackOutcome, ProcessAction, Record};
+use epics_base_rs::server::record::{
+    DelayedCallback, DelayedCallbackOutcome, ProcessAction, Record,
+};
 use epics_base_rs::server::records::bo::BoRecord;
 use epics_base_rs::server::records::busy::BusyRecord;
 use epics_base_rs::types::EpicsValue;
@@ -213,7 +215,7 @@ fn the_write_pass_arms_the_delayed_callback_and_leaves_val_alone() {
         assert!(
             rec.after_write_actions()
                 .iter()
-                .any(|a| matches!(a, ProcessAction::DelayedCallbackAfter(_))),
+                .any(|a| matches!(a, ProcessAction::DelayedCallbackAfter(..))),
             "{label}: VAL=1 with HIGH>0 must arm the delayed callback"
         );
         assert_eq!(
@@ -246,7 +248,7 @@ fn the_timer_body_matches_my_callback_func() {
 
         // PACT set, VAL=1, HIGH>0 -> C's `if (prec->pact)` branch: re-arm, no zero.
         assert_eq!(
-            rec.delayed_callback_fire(true),
+            rec.delayed_callback_fire(DelayedCallback::ONLY, true),
             DelayedCallbackOutcome::Rearm(Duration::from_secs_f64(5.0)),
             "{label}: a PACT-held fire re-arms"
         );
@@ -258,7 +260,7 @@ fn the_timer_body_matches_my_callback_func() {
 
         // PACT clear -> C's else branch: zero and reprocess.
         assert_eq!(
-            rec.delayed_callback_fire(false),
+            rec.delayed_callback_fire(DelayedCallback::ONLY, false),
             DelayedCallbackOutcome::Reprocess,
             "{label}: a PACT-clear fire reprocesses"
         );
@@ -270,7 +272,7 @@ fn the_timer_body_matches_my_callback_func() {
 
         // PACT set with nothing left to release -> neither.
         assert_eq!(
-            rec.delayed_callback_fire(true),
+            rec.delayed_callback_fire(DelayedCallback::ONLY, true),
             DelayedCallbackOutcome::Drop,
             "{label}: a PACT-held fire on VAL=0 does nothing at all"
         );
@@ -306,18 +308,18 @@ fn a_high_beyond_duration_rearms_at_the_unreachable_deadline() {
 
         // Representable: still re-arms.
         assert_eq!(
-            build(1e18).delayed_callback_fire(true),
+            build(1e18).delayed_callback_fire(DelayedCallback::ONLY, true),
             DelayedCallbackOutcome::Rearm(Duration::from_secs_f64(1e18)),
             "{label}: 1e18 s is inside Duration and must still re-arm"
         );
         // Past u64::MAX seconds: the deadline no comparison reaches.
         assert_eq!(
-            build(1e300).delayed_callback_fire(true),
+            build(1e300).delayed_callback_fire(DelayedCallback::ONLY, true),
             DelayedCallbackOutcome::Rearm(Duration::MAX),
             "{label}: HIGH=1e300 must re-arm at Duration::MAX, not panic"
         );
         assert_eq!(
-            build(f64::INFINITY).delayed_callback_fire(true),
+            build(f64::INFINITY).delayed_callback_fire(DelayedCallback::ONLY, true),
             DelayedCallbackOutcome::Rearm(Duration::MAX),
             "{label}: HIGH=inf must re-arm at Duration::MAX, not panic"
         );

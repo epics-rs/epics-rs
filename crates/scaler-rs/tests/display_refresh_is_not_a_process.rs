@@ -13,14 +13,13 @@
 //! }
 //! ```
 //!
-//! The port arms the refresh as a `ProcessAction::ReprocessAfter`, whose
-//! re-entry IS a process cycle — so a refresh armed while counting lands after
-//! the count has stopped and fires FLNK a second time.
+//! The refresh is a `ProcessAction::DelayedCallbackAfter`, whose hook runs in
+//! place of `process()`.
 //!
-//! Boundaries: refresh re-entry with `ss == IDLE` vs `ss != IDLE`, and a
-//! re-entry of the OTHER kind (the delayed start, `delayCallbackFunc`) landing
-//! with `ss == IDLE` — which must still start the count, so the gate cannot
-//! key on `ss` alone.
+//! Boundaries: refresh with `ss == IDLE` vs `ss != IDLE`, and the OTHER
+//! callback (the delayed start, `delayCallbackFunc`) landing with
+//! `ss == IDLE` — which must still start the count, so the gate cannot key on
+//! `ss` alone.
 
 #![cfg_attr(exec_backend, allow(unused_imports))]
 // This file's other cases are pure record-layer `#[test]`s; only the one
@@ -30,7 +29,9 @@
 // — does not have. Gated per item rather than per file so the
 // record-layer cases keep compiling in that configuration.
 
-use epics_base_rs::server::record::{ProcessAction, Record};
+use epics_base_rs::server::record::{
+    DelayedCallback, DelayedCallbackOutcome, ProcessAction, Record,
+};
 use epics_base_rs::types::EpicsValue;
 #[cfg(tokio_backend)]
 use epics_ca_rs::server::CaServerBuilder;
@@ -41,10 +42,12 @@ use std::time::Duration;
 const SCALER_STATE_IDLE: i16 = 0;
 const SCALER_STATE_COUNTING: i16 = 2;
 
-fn has_reprocess(actions: &[ProcessAction]) -> bool {
-    actions
-        .iter()
-        .any(|a| matches!(a, ProcessAction::ReprocessAfter(_)))
+/// The callback the actions armed, which the framework keeps with its timer.
+fn armed(actions: &[ProcessAction]) -> Option<DelayedCallback> {
+    actions.iter().find_map(|a| match a {
+        ProcessAction::DelayedCallbackAfter(_, callback) => Some(*callback),
+        _ => None,
+    })
 }
 
 /// One CA put to CNT: `special()` and the actions it queued, then the
@@ -57,17 +60,8 @@ fn put_cnt(rec: &mut ScalerRecord, cnt: i16) -> Vec<ProcessAction> {
     actions
 }
 
-/// The record's own scheduled re-entry, as the framework runs it.
-fn fire_timer(rec: &mut ScalerRecord) -> Vec<ProcessAction> {
-    rec.set_process_continuation(
-        true,
-        epics_base_rs::server::record::Pact::new(&std::sync::atomic::AtomicBool::new(false)),
-    );
-    rec.process().unwrap().actions
-}
-
 /// A user count in progress with the display refresh armed (RATE 10 Hz).
-fn counting() -> ScalerRecord {
+fn counting() -> (ScalerRecord, DelayedCallback) {
     let mut rec = ScalerRecord::default();
     rec.freq = 1e7;
     rec.tp = 100.0;
@@ -76,35 +70,24 @@ fn counting() -> ScalerRecord {
     rec.init_record(1).unwrap();
     let actions = put_cnt(&mut rec, 1);
     assert_eq!(rec.ss, SCALER_STATE_COUNTING, "the count must have started");
-    assert!(
-        has_reprocess(&actions),
-        "C :590-596 arms the periodic display update while ss == COUNTING"
-    );
-    rec
+    let refresh =
+        armed(&actions).expect("C :590-596 arms the periodic display update while ss == COUNTING");
+    (rec, refresh)
 }
 
 /// The refresh lands after the operator stopped the count. C returns at
 /// `:567` having done nothing.
 #[test]
 fn a_refresh_landing_after_the_count_stopped_does_nothing() {
-    let mut rec = counting();
+    let (mut rec, refresh) = counting();
 
     put_cnt(&mut rec, 0);
     assert_eq!(rec.ss, SCALER_STATE_IDLE);
-    assert!(
-        rec.should_fire_forward_link(),
-        "the stop's own process cycle fires FLNK once (C :476-481)"
-    );
 
-    let actions = fire_timer(&mut rec);
-    assert!(
-        !rec.should_fire_forward_link(),
-        "a display refresh cannot reach recGblFwdLink — C's updateCallbackFunc \
-         never calls process()"
-    );
-    assert!(
-        actions.is_empty(),
-        "C :567 returns before reading, posting or re-arming: {actions:?}"
+    assert_eq!(
+        rec.delayed_callback_fire(refresh, false),
+        DelayedCallbackOutcome::Drop,
+        "C :567 returns before reading, posting or re-arming"
     );
 }
 
@@ -112,18 +95,16 @@ fn a_refresh_landing_after_the_count_stopped_does_nothing() {
 /// still fires no forward link.
 #[test]
 fn a_refresh_landing_mid_count_refreshes_and_rearms() {
-    let mut rec = counting();
+    let (mut rec, refresh) = counting();
 
-    let actions = fire_timer(&mut rec);
-    assert_eq!(rec.ss, SCALER_STATE_COUNTING, "the count is untouched");
     assert!(
-        has_reprocess(&actions),
+        matches!(
+            rec.delayed_callback_fire(refresh, false),
+            DelayedCallbackOutcome::Rearm(_)
+        ),
         "ss == COUNTING still re-arms the next update (C :590-596)"
     );
-    assert!(
-        !rec.should_fire_forward_link(),
-        "no forward link while ss != IDLE (C :470)"
-    );
+    assert_eq!(rec.ss, SCALER_STATE_COUNTING, "the count is untouched");
 }
 
 /// The refresh lands with the done interrupt already raised: `updateCounts`
@@ -131,13 +112,17 @@ fn a_refresh_landing_mid_count_refreshes_and_rearms() {
 /// `deviceCallbackFunc` process that completes it (`:366`).
 #[test]
 fn a_refresh_landing_after_done_leaves_completion_to_the_interrupt() {
-    let mut rec = counting();
+    let (mut rec, refresh) = counting();
     rec.set_done();
 
-    let actions = fire_timer(&mut rec);
-    assert_eq!(rec.ss, SCALER_STATE_COUNTING, "a refresh completes nothing");
-    assert!(has_reprocess(&actions), "and re-arms the next update");
-    assert!(!rec.should_fire_forward_link());
+    assert!(
+        matches!(
+            rec.delayed_callback_fire(refresh, false),
+            DelayedCallbackOutcome::Rearm(_)
+        ),
+        "a refresh re-arms the next update"
+    );
+    assert_eq!(rec.ss, SCALER_STATE_COUNTING, "and completes nothing");
 
     rec.process().unwrap();
     assert_eq!(
@@ -148,30 +133,51 @@ fn a_refresh_landing_after_done_leaves_completion_to_the_interrupt() {
     assert!(rec.should_fire_forward_link());
 }
 
-/// The delayed start is the OTHER callback: it lands with `ss == IDLE` too and
-/// must still start the count.
-#[test]
-fn a_delayed_start_landing_with_ss_idle_still_starts_the_count() {
+/// A user count waiting out DLY, with the delayed start armed.
+fn waiting() -> (ScalerRecord, DelayedCallback) {
     let mut rec = ScalerRecord::default();
     rec.freq = 1e7;
     rec.tp = 100.0;
-    // Long enough that the put's own process lands inside it: a host that
-    // spends DLY between `special` and that process starts the count there,
-    // as C's `delayCallbackFunc` would have set REQSTART by then.
     rec.dly = 0.5;
     rec.nch = 4;
     rec.init_record(1).unwrap();
 
     let actions = put_cnt(&mut rec, 1);
-    assert!(has_reprocess(&actions), "DLY > 0 arms the delayed start");
+    let start = armed(&actions).expect("DLY > 0 arms the delayed start");
     assert_eq!(rec.ss, SCALER_STATE_IDLE, "nothing counts during the wait");
+    (rec, start)
+}
 
-    std::thread::sleep(Duration::from_millis(600));
-    fire_timer(&mut rec);
+/// The delayed start is the OTHER callback: it lands with `ss == IDLE` too and
+/// must still start the count, through the `scanOnce` pass it asks for.
+#[test]
+fn a_delayed_start_landing_with_ss_idle_still_starts_the_count() {
+    let (mut rec, start) = waiting();
+
+    assert_eq!(
+        rec.delayed_callback_fire(start, false),
+        DelayedCallbackOutcome::ScanOnce,
+        "delayCallbackFunc sets REQSTART and calls scanOnce (C :227-229)"
+    );
+    rec.process().unwrap();
     assert_eq!(
         rec.ss, SCALER_STATE_COUNTING,
-        "delayCallbackFunc's re-entry must start the count even though ss was IDLE"
+        "the scanOnce pass starts the count even though ss was IDLE"
     );
+}
+
+/// A delayed start racing the abort finds `us != WAITING` and does nothing,
+/// as C's guard at `:227`.
+#[test]
+fn a_delayed_start_after_an_abort_does_nothing() {
+    let (mut rec, start) = waiting();
+
+    put_cnt(&mut rec, 0);
+    assert_eq!(
+        rec.delayed_callback_fire(start, false),
+        DelayedCallbackOutcome::Drop
+    );
+    assert_eq!(rec.ss, SCALER_STATE_IDLE);
 }
 
 /// End to end, the finding's own trigger: RATE=10 arms a refresh at t=0, the

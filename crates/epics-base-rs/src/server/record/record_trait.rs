@@ -2453,23 +2453,30 @@ pub enum ProcessAction {
     /// has no runtime for. The current cycle's OUT/FLNK/notify proceed
     /// normally.
     ///
-    /// Equivalent to C EPICS `callbackRequestDelayed()` + `scanOnce()`
-    /// (`db/callback.c:410` (`callbackRequestDelayed`), `db/dbScan.c:660`
-    /// (`scanOnce`); epics-base R7.0.10).
+    /// C `callbackRequestProcessCallbackDelayed()` (`db/callback.c:430`), or
+    /// a delayed callback whose function calls `(*prset->process)(prec)`
+    /// under `dbScanLock` (`ProcessCallback`, `:379-387`): the record's own
+    /// `process()` resumed as its async continuation, past `dbProcess`'s PACT
+    /// and disable tests and its TPRO line. A C callback that calls
+    /// `scanOnce` or `dbProcess`, or never processes, is a
+    /// [`Self::DelayedCallbackAfter`].
     ReprocessAfter(std::time::Duration),
 
-    /// C `callbackRequestDelayed()` armed with a handler that mutates the
-    /// record BEFORE it calls `dbProcess` — `boRecord.c::myCallbackFunc`
-    /// (:105-118) and its `busyRecord.c:107-124` twin, the HIGH one-shot.
+    /// C `callbackRequestDelayed()` armed on one of the record's own
+    /// `CALLBACK`s, whose function is [`Record::delayed_callback_fire`]:
+    /// `boRecord.c::myCallbackFunc` (:105-118) and its `busyRecord.c:107-124`
+    /// twin, scaler's update, delay and autocount callbacks
+    /// (`scalerRecord.c:203-239`).
     ///
     /// Distinct from [`Self::ReprocessAfter`], whose timer re-enters
-    /// `process()` unchanged. Here the fire runs
-    /// [`Record::delayed_callback_fire`] under the record gate first, and that
-    /// hook — not `process()` — performs the timer's own mutation. The record
-    /// therefore keeps no "a timer is pending" flag for `process()` to consume,
-    /// so a foreign scan, a caput or a FLNK arriving inside the delay window
-    /// cannot take the one-shot the timer owns.
-    DelayedCallbackAfter(std::time::Duration),
+    /// `process()` unchanged. Here the fire runs the hook under the record
+    /// gate, and its [`DelayedCallbackOutcome`] decides whether a fresh pass
+    /// follows. The record therefore keeps no "a timer is pending" flag for
+    /// `process()` to consume, so a foreign scan, a caput or a FLNK arriving
+    /// inside the delay window cannot take what the timer owns. The
+    /// [`DelayedCallback`] travels with the timer, as C's function pointer
+    /// does with its `CALLBACK`.
+    DelayedCallbackAfter(std::time::Duration, DelayedCallback),
 
     /// C throttle's `callbackRequestDelayed(&delayFuncCb, ..)`
     /// (`throttleRecord.c:593`), whose handler runs `valuePut` under
@@ -3005,21 +3012,31 @@ impl<T> IntoIterator for CycleList<T> {
     }
 }
 
+/// Which of a record's `CALLBACK`s a [`ProcessAction::DelayedCallbackAfter`]
+/// timer was armed on, handed back to [`Record::delayed_callback_fire`]. A
+/// record with one callback (bo, busy) arms [`Self::ONLY`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DelayedCallback(pub u8);
+
+impl DelayedCallback {
+    pub const ONLY: Self = Self(0);
+}
+
 /// What the [`ProcessAction::DelayedCallbackAfter`] timer does once the
-/// record's [`Record::delayed_callback_fire`] handler has run — the three arms
-/// of C `boRecord.c::myCallbackFunc` (:105-118).
+/// record's [`Record::delayed_callback_fire`] handler has run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DelayedCallbackOutcome {
-    /// C's `else` branch (`boRecord.c:115-117`): the handler made its change,
-    /// so `dbProcess` the record now — a fresh pass, not the async
-    /// continuation [`ProcessAction::ReprocessAfter`] runs.
+    /// C's `dbProcess` from the callback (`boRecord.c:115-117`): a fresh pass
+    /// now, under the same hold, not the async continuation
+    /// [`ProcessAction::ReprocessAfter`] runs.
     Reprocess,
-    /// C's `if (prec->pact)` branch (`boRecord.c:107-114`): the record is
-    /// mid-async-cycle, so the handler changed nothing and the timer is re-armed
-    /// for this long instead.
+    /// C's `scanOnce` from the callback (`scalerRecord.c:229`, `:239`): a
+    /// fresh pass queued on the scan-once thread, whatever the record's SCAN.
+    ScanOnce,
+    /// The callback re-requests itself: arm the same [`DelayedCallback`] for
+    /// this long (`boRecord.c:107-114`, `scalerRecord.c:590-596`).
     Rearm(std::time::Duration),
-    /// C's `if (prec->pact)` branch with its inner test false: the timer expires
-    /// with nothing left to do, neither mutating nor processing.
+    /// The callback ends without processing the record.
     Drop,
 }
 
@@ -6275,13 +6292,19 @@ pub trait Record: RecordAny + Send + Sync + 'static {
     /// ```
     ///
     /// Run under the record gate (C `dbScanLock`) when the timer fires, and
-    /// before any `process()` re-entry. `pact` is the record's PACT at fire
-    /// time, which the record cannot read for itself.
+    /// before any `process()` re-entry. `callback` is the one the timer was
+    /// armed on; `pact` is the record's PACT at fire time, which the record
+    /// cannot read for itself. The [`Self::take_process_posted_fields`] marks
+    /// the hook leaves are posted when it returns.
     ///
     /// This hook is the ONLY place the one-shot's mutation may happen: keeping
     /// it out of `process()` is what stops an unrelated process cycle from
     /// consuming it. Default: change nothing and process the record again.
-    fn delayed_callback_fire(&mut self, _pact: bool) -> DelayedCallbackOutcome {
+    fn delayed_callback_fire(
+        &mut self,
+        _callback: DelayedCallback,
+        _pact: bool,
+    ) -> DelayedCallbackOutcome {
         DelayedCallbackOutcome::Reprocess
     }
 
@@ -7607,16 +7630,10 @@ pub trait Record: RecordAny + Send + Sync + 'static {
     /// [`ProcessAction::ReprocessAfter`] timer firing, or a put-notify
     /// completion — rather than a fresh put / scan / forward-link process.
     ///
-    /// C hands records this distinction for free: `callbackRequestDelayed`
-    /// dispatches to a callback function of the record's own, never to
-    /// `process()`. A port that models the timer with `ReprocessAfter` has
-    /// both events arriving at the same entry point, so a record whose C
-    /// original keeps the two paths separate — throttle's `delayFuncCallback`
-    /// -> `valuePut` versus `process()` -> `enterValue`
-    /// (`throttleRecord.c:518-613`) — cannot route the cycle without knowing
-    /// which one it is. The framework already knows; this hook is what it
-    /// tells the record, so the record never has to infer it from a clock
-    /// reading (which a mid-flight interval change silently falsifies).
+    /// A C callback with a body of its own never arrives here: it is a
+    /// [`ProcessAction::DelayedCallbackAfter`] or
+    /// [`ProcessAction::ValuePutAfter`], whose hook runs instead of
+    /// `process()`.
     ///
     /// `pact` is `prec->pact` at entry, which is what a record whose C
     /// `process()` branches on PACT (calcout's ODLY arm, `calcoutRecord.c:231`)

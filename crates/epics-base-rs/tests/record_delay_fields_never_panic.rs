@@ -67,7 +67,7 @@ fn a_high_the_network_can_set_never_unwinds_process() {
                 .after_write_actions()
                 .iter()
                 .find_map(|a| match a {
-                    ProcessAction::DelayedCallbackAfter(d) => Some(*d),
+                    ProcessAction::DelayedCallbackAfter(d, _) => Some(*d),
                     _ => None,
                 })
                 .unwrap_or_else(|| panic!("{kind} HIGH={high} must still arm the one-shot"));
@@ -91,7 +91,7 @@ fn a_high_the_network_can_set_never_unwinds_process() {
             assert!(
                 !rec.after_write_actions()
                     .iter()
-                    .any(|a| matches!(a, ProcessAction::DelayedCallbackAfter(_))),
+                    .any(|a| matches!(a, ProcessAction::DelayedCallbackAfter(..))),
                 "{kind} HIGH={high} fails C's `high > 0` test and arms nothing"
             );
         }

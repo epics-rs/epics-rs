@@ -1,8 +1,8 @@
 use crate::error::{CaError, CaResult};
 use crate::server::record::{CycleCell, CycleRead, CycleValue};
 use crate::server::record::{
-    DelayedCallbackOutcome, FieldMetadataOverride, MENU_YES_NO, ProcessAction, ProcessOutcome,
-    Record,
+    DelayedCallback, DelayedCallbackOutcome, FieldMetadataOverride, MENU_YES_NO, ProcessAction,
+    ProcessOutcome, Record,
 };
 use crate::types::{EpicsValue, PvString};
 
@@ -355,6 +355,7 @@ impl Record for BusyRecord {
         if self.val == 1 && self.high > 0.0 {
             actions.push(ProcessAction::DelayedCallbackAfter(
                 crate::runtime::time::duration_from_secs(self.high),
+                DelayedCallback::ONLY,
             ));
         }
         actions
@@ -367,7 +368,11 @@ impl Record for BusyRecord {
     /// C `busyRecord.c::myCallbackFunc` (:107-124), boRecord's verbatim — the
     /// HIGH timer's own body and the only writer of the one-shot's
     /// `prec->val = 0`.
-    fn delayed_callback_fire(&mut self, pact: bool) -> DelayedCallbackOutcome {
+    fn delayed_callback_fire(
+        &mut self,
+        _callback: DelayedCallback,
+        pact: bool,
+    ) -> DelayedCallbackOutcome {
         if !pact {
             self.val = 0;
             return DelayedCallbackOutcome::Reprocess;

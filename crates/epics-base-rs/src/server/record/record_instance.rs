@@ -7789,7 +7789,8 @@ impl RecordInstance {
 
     /// The drain of what a processing step posted: a type without
     /// `PROCESS_POSTED` pays this one bit test. Private: the callers are
-    /// [`Self::process_hooked`] and [`Self::apply_invalid_output_value_and_drain`].
+    /// [`Self::process_hooked`], [`Self::apply_invalid_output_value_and_drain`]
+    /// and [`Self::delayed_callback_fire_and_drain`].
     #[inline(always)]
     fn drain_process_posts(&mut self) {
         if self
@@ -7814,6 +7815,19 @@ impl RecordInstance {
         let applied = self.record.apply_invalid_output_value(ivov);
         self.drain_process_posts();
         applied
+    }
+
+    /// [`Record::delayed_callback_fire`] with this instance's PACT, and the
+    /// drain of what it posted: scaler's `updateCounts` posts the counts from
+    /// the callback itself (`scalerRecord.c:579-588`).
+    pub(crate) fn delayed_callback_fire_and_drain(
+        &mut self,
+        callback: crate::server::record::DelayedCallback,
+    ) -> crate::server::record::DelayedCallbackOutcome {
+        let pact = self.is_processing();
+        let outcome = self.record.delayed_callback_fire(callback, pact);
+        self.drain_process_posts();
+        outcome
     }
 
     /// The table names are upper-case, so the read skips `resolve_field`'s

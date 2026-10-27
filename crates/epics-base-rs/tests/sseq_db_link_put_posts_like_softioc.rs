@@ -23,7 +23,7 @@ use epics_base_rs::server::event_queue::EventReader;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::pv::MonitorEvent;
 use epics_base_rs::server::recgbl::EventMask;
-use epics_base_rs::server::record::RecordCell;
+use epics_base_rs::server::record::{ProcessCompletion, RecordCell};
 use epics_base_rs::server::records::sseq::SseqRecord;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
@@ -73,6 +73,16 @@ fn subscribe(db: &PvDatabase, field: &str, sid: u32, ftype: DbFieldType) -> Mon 
         rx,
         rec,
         field: field.to_string(),
+    }
+}
+
+/// Until the put's cycle completes: sseq runs its links from a callback
+/// (`sseqRecord.c:443-448`), after the put returns.
+async fn completed(put: ProcessCompletion) {
+    if let Some(rx) = put.into_handle() {
+        let _ = epics_base_rs::runtime::task::timeout(fact_budget::FACT_BUDGET, rx)
+            .await
+            .expect("the put's cycle never completed");
     }
 }
 
@@ -171,10 +181,12 @@ record(sseq, "SQ") { field(PREC, "2") field(DOL1, "SRC") field(DOL2, "7") }
         vec![(EpicsValue::Long(0), 0, 0)],
     ];
     for (pass, want) in [want_first, want_second].iter().enumerate() {
-        db.put_record_field_from_ca("SQ", "PROC", EpicsValue::Short(1))
-            .await
-            .unwrap();
-        epics_base_rs::runtime::task::sleep(Duration::from_millis(200)).await;
+        completed(
+            db.put_record_field_from_ca("SQ", "PROC", EpicsValue::Short(1))
+                .await
+                .unwrap(),
+        )
+        .await;
         for (i, (f, _)) in fields.iter().enumerate() {
             assert_eq!(drain(&mut rxs[i]), want[i], "pass {pass}: SQ.{f}");
         }
@@ -222,10 +234,12 @@ record(sseq, "SQ2") { field(PREC, "2") field(DOL1, "SRC") field(DOL2, "7") field
         field: "DO1".into(),
     };
     drain(&mut rx);
-    db.put_record_field_from_ca("SQ2", "PROC", EpicsValue::Short(1))
-        .await
-        .unwrap();
-    epics_base_rs::runtime::task::sleep(Duration::from_millis(300)).await;
+    completed(
+        db.put_record_field_from_ca("SQ2", "PROC", EpicsValue::Short(1))
+            .await
+            .unwrap(),
+    )
+    .await;
     assert_eq!(
         drain(&mut rx),
         [

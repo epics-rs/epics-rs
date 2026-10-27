@@ -20,10 +20,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::database::filters::{FilteredMonitorEvent, SubscriptionFilter};
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::recgbl::{EventMask, alarm_condition_string};
-use epics_base_rs::server::record::MENU_ALARM_SEVR;
+use epics_base_rs::server::record::{MENU_ALARM_SEVR, ProcessCompletion};
 use epics_base_rs::server::records::sseq::SseqRecord;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
@@ -176,10 +177,12 @@ async fn sseq_posts_its_link_reads_as_the_oracle_does() {
         }
     }
     for (record, field, value) in STEPS {
-        db.put_record_field_from_ca(record, field, EpicsValue::String(value.into()))
-            .await
-            .unwrap();
-        epics_base_rs::runtime::task::sleep(Duration::from_millis(100)).await;
+        completed(
+            db.put_record_field_from_ca(record, field, EpicsValue::String(value.into()))
+                .await
+                .unwrap(),
+        )
+        .await;
         // A step posts each string at most once, so the one read now is the
         // one its post carried.
         for (pv, field) in [("Q.STR1", "STR1"), ("Q.STR2", "STR2")] {
@@ -280,17 +283,22 @@ record(sseq, "Q") {
     }
     // Plain `caput`, C `dbPutField`: a put-notify would wait out the
     // sequence's PACT (`dbNotify.c` restart queue) and reach an idle record.
-    for (field, settle) in [
-        ("PROC", 200),
-        ("ABORT", 1000),
-        ("PROC", 1000),
-        ("ABORT", 200),
+    // The first ABORT lands 0.2 s into `DLY1`.
+    for (field, inside_dly1) in [
+        ("PROC", true),
+        ("ABORT", false),
+        ("PROC", false),
+        ("ABORT", false),
     ] {
         // The idle ABORT is refused, as C's `return(-1)` is.
         let _ = db
             .put_record_field_from_ca_no_notify("Q", field, EpicsValue::String("1".into()))
             .await;
-        epics_base_rs::runtime::task::sleep(Duration::from_millis(settle)).await;
+        if inside_dly1 {
+            epics_base_rs::runtime::task::sleep(Duration::from_millis(200)).await;
+        } else {
+            idle(&db, "Q").await;
+        }
     }
     let got: Vec<String> = streams.iter().map(|s| s.lock().unwrap().clone()).collect();
     for (got, want, class) in [
@@ -300,6 +308,28 @@ record(sseq, "Q") {
     ] {
         assert_eq!(by_pv(got), by_pv(want), "{class}");
     }
+}
+
+/// Until the put's cycle completes: sseq runs its links from a callback
+/// (`sseqRecord.c:443-448`), after the put returns.
+async fn completed(put: ProcessCompletion) {
+    if let Some(rx) = put.into_handle() {
+        let _ = epics_base_rs::runtime::task::timeout(fact_budget::FACT_BUDGET, rx)
+            .await
+            .expect("the put's cycle never completed");
+    }
+}
+
+/// Until `rec` leaves PACT.
+async fn idle(db: &PvDatabase, rec: &str) {
+    let cell = db.get_record(rec).unwrap();
+    epics_base_rs::runtime::task::timeout(fact_budget::FACT_BUDGET, async {
+        while cell.read().is_processing() {
+            epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{rec} never left PACT"));
 }
 
 /// Each PV's lines in the order it received them.

@@ -12280,9 +12280,19 @@ record(ai, "AR") { field(DTYP, "Async Soft Channel") field(INP, "S2") }"#,
         ctx.block_on(db.ioc_init());
         ctx.block_on(db.initialize_link_locality());
         let gf = |pv: &str| run_cmd(&ctx, "dbgf", &[pv]).trim_end().to_string();
-        let sleep = |ms| std::thread::sleep(std::time::Duration::from_millis(ms));
         const ONE: &str = "DBF_UCHAR:          1 = 0x1";
         const ZERO: &str = "DBF_UCHAR:          0 = 0x0";
+        // A notify completes from a callback, after the put returned.
+        let idle = |rec: &str| {
+            let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+            while gf(&format!("{rec}.PACT")) != ZERO {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{rec} never left PACT"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
 
         run_cmd(&ctx, "dbpf", &["AS.PROC", "1"]);
         assert_eq!(gf("AS.PACT"), ONE);
@@ -12290,9 +12300,8 @@ record(ai, "AR") { field(DTYP, "Async Soft Channel") field(INP, "S2") }"#,
         assert_eq!(gf("AS.VAL"), "DBF_DOUBLE:         0");
         run_cmd(&ctx, "dbpf", &["AS2.PROC", "1"]);
         run_cmd(&ctx, "dbpf", &["AT.PROC", "1"]);
-        sleep(300);
+        idle("AT");
         assert_eq!(gf("AT.VAL"), "DBF_DOUBLE:         5");
-        assert_eq!(gf("AT.PACT"), ZERO);
         assert_eq!(gf("AT.STAT"), r#"DBF_STRING:         "NO_ALARM""#);
 
         assert_eq!(
@@ -12301,14 +12310,15 @@ record(ai, "AR") { field(DTYP, "Async Soft Channel") field(INP, "S2") }"#,
         );
         assert_eq!(gf("AS.PACT"), ZERO);
         assert_eq!(gf("AS.VAL"), "DBF_DOUBLE:         0");
-        sleep(2500);
+        idle("SQ");
+        idle("AS2");
         assert_eq!(gf("X.VAL"), "DBF_DOUBLE:         3");
-        assert_eq!(gf("SQ.PACT"), ZERO);
+        assert_eq!(gf("AS2.VAL"), "DBF_DOUBLE:         7");
+        // Nothing orders after a cancelled notify: AS keeps a window.
+        std::thread::sleep(std::time::Duration::from_millis(500));
         assert_eq!(gf("AS.VAL"), "DBF_DOUBLE:         0");
         assert_eq!(gf("AS.PACT"), ZERO);
         assert_eq!(gf("AS.STAT"), r#"DBF_STRING:         "UDF""#);
-        assert_eq!(gf("AS2.VAL"), "DBF_DOUBLE:         7");
-        assert_eq!(gf("AS2.PACT"), ZERO);
 
         assert_eq!(
             run_cmd(&ctx, "dbpf", &["AR.INP", "NOPE"]).trim_end(),
@@ -12320,9 +12330,8 @@ record(ai, "AR") { field(DTYP, "Async Soft Channel") field(INP, "S2") }"#,
         assert_eq!(gf("AR.PACT"), ONE);
 
         run_cmd(&ctx, "dbpf", &["AS.PROC", "1"]);
-        sleep(300);
+        idle("AS");
         assert_eq!(gf("AS.VAL"), "DBF_DOUBLE:         5");
-        assert_eq!(gf("AS.PACT"), ZERO);
     }
 
     /// A PN_LINK keeps only its severity bits (`devAiSoftCallback.c:115`):
@@ -12351,7 +12360,15 @@ record(ai, "AC") { field(DTYP, "Async Soft Channel") field(INP, "CNT2 CA") }"#,
                 format!(r#"DBF_STRING:         "{target} NMS""#)
             );
             run_cmd(&ctx, "dbpf", &[&format!("{rec}.PROC"), "1"]);
-            std::thread::sleep(std::time::Duration::from_millis(300));
+            // The notify completes from a callback, after the put returned.
+            let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+            while gf(&format!("{rec}.PACT")) != "DBF_UCHAR:          0 = 0x0" {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{rec} never left PACT"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
             assert_eq!(gf(&format!("{rec}.VAL")), "DBF_DOUBLE:         1", "{rec}");
             assert_eq!(
                 gf(&format!("{target}.VAL")),

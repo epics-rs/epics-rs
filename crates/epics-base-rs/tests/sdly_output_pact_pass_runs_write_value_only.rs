@@ -29,8 +29,16 @@ fn double(db: &epics_base_rs::server::database::PvDatabase, pv: &str) -> f64 {
     db.get_pv(pv).unwrap().to_f64().unwrap()
 }
 
-async fn settle() {
-    epics_base_rs::runtime::task::sleep(Duration::from_millis(300)).await;
+/// Until `rec` leaves PACT: the SDLY expiry writes SIOL from a callback.
+async fn idle(db: &epics_base_rs::server::database::PvDatabase, rec: &str) {
+    let cell = db.get_record(rec).unwrap();
+    epics_base_rs::runtime::task::timeout(fact_budget::FACT_BUDGET, async {
+        while cell.read().is_processing() {
+            epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{rec} never left PACT"));
 }
 
 #[epics_macros_rs::epics_test]
@@ -50,9 +58,8 @@ async fn the_delayed_write_keeps_the_first_pass_value() {
     db.put_record_field_from_ca("SRC", "VAL", EpicsValue::Double(9.0))
         .await
         .unwrap();
-    settle().await;
+    idle(&db, "AO:DOL").await;
     let rec = db.get_record("AO:DOL").unwrap();
-    assert!(!rec.read().is_processing());
     assert_eq!((double(&db, "TGT"), double(&db, "AO:DOL")), (5.0, 5.0));
     let (stat, sevr) = {
         let i = rec.read();
@@ -67,12 +74,12 @@ async fn the_delayed_write_keeps_the_first_pass_value() {
     db.process_record_with_links("AO:OROC", &mut visited)
         .await
         .unwrap();
-    settle().await;
+    idle(&db, "AO:OROC").await;
     assert_eq!(double(&db, "TGT2"), 10.0);
     db.put_record_field_from_ca("AO:OROC", "VAL", EpicsValue::Double(20.0))
         .await
         .unwrap();
-    settle().await;
+    idle(&db, "AO:OROC").await;
     assert_eq!(
         (double(&db, "TGT2"), double(&db, "AO:OROC.OVAL")),
         (11.0, 11.0)

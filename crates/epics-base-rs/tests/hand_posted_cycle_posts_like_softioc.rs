@@ -97,6 +97,9 @@ struct Throttle {
     posts: u64,
     process_posts: u64,
     queued: Vec<ProcessAction>,
+    /// `delayFuncCallback` runs so far, read as `FIRES`: the tests' wait on
+    /// the cooldown, which has no PACT to clear.
+    fires: u32,
 }
 
 static FIELDS: &[FieldDesc] = &[
@@ -283,6 +286,7 @@ impl Record for Throttle {
     /// `delayFuncCallback` (`throttleRecord.c:530-538`).
     fn delayed_value_put(&mut self) -> ProcessActions {
         let mut actions = Vec::new();
+        self.fires += 1;
         self.forward = false;
         self.value_put(&mut actions);
         actions.into()
@@ -299,6 +303,7 @@ impl Record for Throttle {
             "DRVLL" => EpicsValue::Double(self.drvll),
             "OUTL" => EpicsValue::String(self.outl.clone().into()),
             "SINP" => EpicsValue::String(self.sinp.clone().into()),
+            "FIRES" => EpicsValue::Long(self.fires as i32),
             _ => return None,
         })
     }
@@ -382,6 +387,23 @@ async fn put(db: &PvDatabase, rec: &str, field: &str, v: f64) {
         .put_record_field_from_ca_no_notify(rec, field, EpicsValue::Double(v))
         .await;
     epics_base_rs::runtime::task::sleep(Duration::from_millis(100)).await;
+}
+
+/// Until `rec`'s cooldown has fired `n` times. Read under the record's lock,
+/// so that fire's whole `valuePut`, forward link included, has run.
+async fn fired(db: &PvDatabase, rec: &str, n: i32) {
+    let cell = db.get_record(rec).unwrap();
+    let fires = || match cell.read().record.get_field("FIRES") {
+        Some(EpicsValue::Long(n)) => n,
+        other => panic!("{rec}.FIRES = {other:?}"),
+    };
+    epics_base_rs::runtime::task::timeout(fact_budget::FACT_BUDGET, async {
+        while fires() < n {
+            epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{rec}'s cooldown never fired {n} times"));
 }
 
 const INVALID: u16 = 3;
@@ -561,7 +583,7 @@ async fn a_sync_after_the_write_posts_under_the_previous_stamp() {
         drain(rx);
     }
     let before = time_of(&db, "TS");
-    epics_base_rs::runtime::task::sleep(Duration::from_millis(1200)).await;
+    fired(&db, "TS", 1).await;
     let after = time_of(&db, "TS");
     assert!(after > before);
     assert_eq!(drain_stamps(&mut sent), [(2.0, before), (2.0, after)]);
@@ -591,11 +613,11 @@ async fn the_cooldown_timer_runs_no_closing_reset() {
     drain(&mut sent);
     drain(&mut val);
     let stat = || db.get_record("TC").unwrap().read().common.stat;
-    epics_base_rs::runtime::task::sleep(Duration::from_millis(1100)).await;
+    fired(&db, "TC", 1).await;
     assert_eq!(drain(&mut sent), [(2.0, LINK_ALARM, INVALID)]);
     assert_eq!(drain(&mut val), []);
     assert_eq!(stat(), LINK_ALARM);
-    epics_base_rs::runtime::task::sleep(Duration::from_millis(1000)).await;
+    fired(&db, "TC", 2).await;
     assert_eq!(drain(&mut sent), [(2.0, NO_ALARM, 0)]);
     assert_eq!(stat(), NO_ALARM);
 }
@@ -611,7 +633,7 @@ async fn a_queued_put_after_the_cooldown_commits_its_closing_reset() {
     put(&db, "TC", "VAL", 1.0).await;
     put(&db, "TC", "VAL", 2.0).await;
     put(&db, "TC", "SYNC", 1.0).await;
-    epics_base_rs::runtime::task::sleep(Duration::from_millis(1000)).await;
+    fired(&db, "TC", 1).await;
     let common = |db: &PvDatabase| {
         let c = db.get_record("TC").unwrap().read().common.clone();
         (c.stat, c.amsg.to_string())
@@ -633,7 +655,7 @@ async fn a_disabled_record_still_writes_its_queued_value_when_the_delay_ends() {
     put(&db, "TD", "VAL", 1.0).await;
     put(&db, "TD", "VAL", 2.0).await;
     put(&db, "TD", "DISA", 1.0).await;
-    epics_base_rs::runtime::task::sleep(Duration::from_millis(1500)).await;
+    fired(&db, "TD", 1).await;
     assert_eq!(db.get_pv("DST2").unwrap(), EpicsValue::Double(2.0));
     assert_eq!(db.get_pv("TD.SENT").unwrap(), EpicsValue::Double(2.0));
 }
@@ -650,9 +672,9 @@ async fn the_cooldown_write_fires_the_forward_link() {
     assert_eq!(cnt(&db, "CNT"), 1.0);
     put(&db, "TL", "VAL", 2.0).await;
     assert_eq!(cnt(&db, "CNT"), 1.0);
-    epics_base_rs::runtime::task::sleep(Duration::from_millis(1000)).await;
+    fired(&db, "TL", 1).await;
     assert_eq!(cnt(&db, "CNT"), 2.0);
-    epics_base_rs::runtime::task::sleep(Duration::from_millis(1100)).await;
+    fired(&db, "TL", 2).await;
     assert_eq!(cnt(&db, "CNT"), 2.0);
     put(&db, "TM", "VAL", 4.0).await;
     assert_eq!(cnt(&db, "CNT2"), 0.0);
@@ -674,14 +696,14 @@ async fn the_cooldown_forward_link_runs_ahead_of_the_reset() {
     put(&db, "TK", "VAL", 2.0).await;
     put(&db, "TK", "SYNC", 1.0).await;
     assert_eq!(get(&db, "K"), 1.0);
-    epics_base_rs::runtime::task::sleep(Duration::from_millis(1200)).await;
+    fired(&db, "TK", 1).await;
     assert_eq!(get(&db, "K"), 2.0);
     assert_eq!(get(&db, "K.A"), 0.0);
     assert_eq!(
         db.get_record("TK").unwrap().read().common.sevr as u16,
         INVALID
     );
-    epics_base_rs::runtime::task::sleep(Duration::from_millis(1000)).await;
+    fired(&db, "TK", 2).await;
     assert_eq!(get(&db, "K"), 2.0);
 }
 
@@ -701,9 +723,9 @@ async fn the_cooldown_raises_udf_ahead_of_the_reset() {
     put(&db, "TU", "VAL", 2.0).await;
     put(&db, "WU", "VAL", 1.0).await;
     assert_eq!(alarm(&db), (NO_ALARM, NO_ALARM));
-    epics_base_rs::runtime::task::sleep(Duration::from_millis(1200)).await;
+    fired(&db, "TU", 1).await;
     assert_eq!(alarm(&db), (UDF_ALARM, INVALID));
-    epics_base_rs::runtime::task::sleep(Duration::from_millis(1000)).await;
+    fired(&db, "TU", 2).await;
     assert_eq!(alarm(&db), (UDF_ALARM, INVALID));
 }
 
@@ -741,6 +763,6 @@ async fn child_tpro_cooldown() {
     let db = ioc().await;
     put(&db, "TT", "VAL", 1.0).await;
     put(&db, "TT", "VAL", 2.0).await;
-    epics_base_rs::runtime::task::sleep(Duration::from_millis(1500)).await;
+    fired(&db, "TT", 1).await;
     assert_eq!(db.get_pv("DST2").unwrap(), EpicsValue::Double(2.0));
 }

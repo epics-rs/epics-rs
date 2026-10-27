@@ -134,13 +134,19 @@ record(bo, "SB") {
         .unwrap();
     assert_eq!(db.get_pv("ST").unwrap(), EpicsValue::Long(1));
 
-    epics_base_rs::runtime::task::sleep(Duration::from_millis(700)).await;
+    // The fire's process writes ST last, after it dropped VAL.
+    epics_base_rs::runtime::task::timeout(fact_budget::FACT_BUDGET, async {
+        while db.get_pv("ST").unwrap() != EpicsValue::Long(0) {
+            epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the HIGH timer never drove the output back to zero");
     assert_eq!(
         db.get_pv("SB").unwrap(),
         EpicsValue::Enum(0),
         "the HIGH timer must still drive the momentary bo back to Done"
     );
-    assert_eq!(db.get_pv("ST").unwrap(), EpicsValue::Long(0));
 }
 
 /// The pass past the write arms and nothing else: the action

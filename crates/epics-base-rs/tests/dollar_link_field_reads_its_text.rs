@@ -3,6 +3,8 @@
 //! whatever the request, while its DBR type is DBR_CHAR. Pinned to
 //! oracleStdIoc (R7.0.10.1 + calc) for the same records.
 
+use std::time::Duration;
+
 use epics_base_rs::server::database::{ProcStack, PvDatabase};
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::records::{scalcout::ScalcoutRecord, sseq::SseqRecord};
@@ -38,6 +40,19 @@ fn text(db: &PvDatabase, pv: &str) -> String {
     }
 }
 
+/// Until `rec` leaves PACT: sseq runs even DLY 0 links from a callback
+/// (`sseqRecord.c:443-448`), after its process returns.
+async fn idle(db: &PvDatabase, rec: &str) {
+    let cell = db.get_record(rec).unwrap();
+    epics_base_rs::runtime::task::timeout(fact_budget::FACT_BUDGET, async {
+        while cell.read().is_processing() {
+            epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{rec} never left PACT"));
+}
+
 #[epics_macros_rs::epics_test]
 async fn a_dollar_link_field_reads_its_text_at_every_request_like_softioc() {
     let db = IocBuilder::new()
@@ -57,6 +72,7 @@ async fn a_dollar_link_field_reads_its_text_at_every_request_like_softioc() {
             .or_else(epics_base_rs::error::CaError::unless_process_status)
             .unwrap();
     }
+    idle(&db, "SQ").await;
     // A number, or the text; SEVR 3 is INVALID and STAT 14 LINK_ALARM.
     let get = |pv: &str| match db.get_pv(pv).unwrap() {
         EpicsValue::String(_) | EpicsValue::CharArray(_) => text(&db, pv),

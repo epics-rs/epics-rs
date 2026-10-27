@@ -34,6 +34,18 @@ async fn dbpf(db: &PvDatabase, field: &str, v: &str) {
         .await;
 }
 
+/// Until X leaves PACT: the ODLY expiry runs from a callback.
+async fn idle(db: &PvDatabase) {
+    let cell = db.get_record("X").unwrap();
+    epics_base_rs::runtime::task::timeout(fact_budget::FACT_BUDGET, async {
+        while cell.read().is_processing() {
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("X never left PACT");
+}
+
 /// UDF/STAT/SEVR of X, and one more X field.
 fn snap(db: &PvDatabase, field: &str) -> (u8, u16, u16, f64) {
     let extra = db.get_pv(format!("X.{field}")).unwrap().to_f64().unwrap();
@@ -93,7 +105,7 @@ async fn the_delayed_exec_output_writes_udf_after_check_alarms() {
     )
     .await;
     db.process_record("X").await.unwrap();
-    sleep(Duration::from_millis(300)).await;
+    idle(&db).await;
     assert_eq!(snap(&db, "OVAL"), (0, 17, 3, 1.0));
 
     let db = ioc(
@@ -101,9 +113,9 @@ async fn the_delayed_exec_output_writes_udf_after_check_alarms() {
     )
     .await;
     db.process_record("X").await.unwrap();
-    sleep(Duration::from_millis(300)).await;
+    idle(&db).await;
     assert_eq!(snap(&db, "LALM"), (0, 3, 3, 1.0));
     dbpf(&db, "OCAL", "A[").await;
-    sleep(Duration::from_millis(300)).await;
+    idle(&db).await;
     assert_eq!(snap(&db, "LALM"), (0, 3, 3, 1.0));
 }

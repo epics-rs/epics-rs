@@ -138,6 +138,19 @@ async fn poll_put(cell: &Arc<Mutex<Option<EpicsValue>>>, label: &str) -> EpicsVa
     panic!("{label}: LNK1 was never written");
 }
 
+/// Until `name` leaves PACT: the sequence finishes from a callback, after
+/// the kick returns.
+async fn idle(db: &PvDatabase, name: &str) {
+    let cell = db.get_record(name).unwrap();
+    epics_base_rs::runtime::task::timeout(fact_budget::FACT_BUDGET, async {
+        while cell.read().is_processing() {
+            epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{name} never left PACT"));
+}
+
 /// Settle long enough that a write, had one been issued, would have landed.
 async fn settle() {
     epics_base_rs::runtime::task::sleep(Duration::from_millis(120)).await;
@@ -337,6 +350,7 @@ async fn unresolved_destination_is_not_written_at_all() {
     db.add_record("SSEQ_UN", Box::new(sseq)).await.unwrap();
 
     kick(&db, "SSEQ_UN").await;
+    idle(&db, "SSEQ_UN").await;
     settle().await;
 
     assert_eq!(
@@ -387,11 +401,10 @@ async fn resolved_external_string_destination_takes_the_string_view() {
     db.add_record("SSEQ_EX", Box::new(sseq)).await.unwrap();
 
     kick(&db, "SSEQ_EX").await;
-    settle().await;
 
     assert_eq!(
-        *last_put.lock().unwrap(),
-        Some(EpicsValue::String("4.500".into())),
+        poll_put(&last_put, "resolved external string").await,
+        EpicsValue::String("4.500".into()),
         "a connected CA string channel takes DBR_STRING from STRn (PREC=3)"
     );
 }

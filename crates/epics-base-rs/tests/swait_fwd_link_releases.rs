@@ -49,6 +49,11 @@ async fn put(db: &PvDatabase, rec: &str, field: &str, v: f64) {
         .unwrap();
 }
 
+/// Neither in a cycle nor owed one.
+fn idle(db: &PvDatabase, rec: &str) -> bool {
+    num(db, &format!("{rec}.PACT")) == 0.0 && num(db, &format!("{rec}.RPRO")) == 0.0
+}
+
 async fn settle(db: &PvDatabase, done: impl Fn(&PvDatabase) -> bool) {
     let deadline = Instant::now() + fact_budget::FACT_BUDGET;
     while !done(db) && Instant::now() < deadline {
@@ -83,15 +88,15 @@ async fn the_put_callback_forwards_the_putf() {
     let db = ioc(PB_DB, "PB:S").await;
     // PB:S's FLNK lands on PB:T in its delay, from the put callback, with the
     // put's PUTF: PB:T takes an RPRO and runs again (dbDbLink.c:475-487).
-    let t0 = Instant::now();
+    // Each PB:T cycle counts once, from its ODLY callback's FLNK.
+    let counted = |n: f64| settle(&db, move |db| num(db, "PB:CNT") >= n && idle(db, "PB:T"));
     put(&db, "PB:T", "PROC", 1.0).await;
     put(&db, "PB:S", "PROC", 1.0).await;
-    sleep_until(t0, 2.5).await;
+    counted(2.0).await;
     let out = num(&db, "PB:CNT");
-    let t0 = Instant::now();
     put(&db, "PB:T", "PROC", 1.0).await;
     put(&db, "PB:N", "PROC", 1.0).await;
-    sleep_until(t0, 2.5).await;
+    counted(4.0).await;
     assert_eq!(
         (out, num(&db, "PB:CNT")),
         (2.0, 4.0),
@@ -110,14 +115,17 @@ async fn the_put_callback_restarts_the_rpro() {
     sleep_until(t0, 0.1).await;
     put(&db, "RP:S", "PROC", 1.0).await;
     let rpro = num(&db, "RP:S.RPRO");
-    let mut seen = Vec::new();
-    for at in [1.0, 2.0, 4.0] {
-        sleep_until(t0, at).await;
-        seen.push((num(&db, "RP:CNT"), num(&db, "RP:TC")));
-    }
+    // RP:S counts from RP:T's put callback, after RP:T's own count; the
+    // rerun's next count is an RP:T delay away.
+    settle(&db, |db| num(db, "RP:CNT") >= 1.0).await;
+    let first = (num(&db, "RP:CNT"), num(&db, "RP:TC"));
+    settle(&db, |db| {
+        num(db, "RP:CNT") >= 2.0 && idle(db, "RP:S") && idle(db, "RP:T")
+    })
+    .await;
     assert_eq!(
-        (rpro, seen),
-        (1.0, vec![(0.0, 0.0), (1.0, 1.0), (2.0, 2.0)]),
-        "RP:S.RPRO after the second put; RP:CNT and RP:TC at 1, 2 and 4 s"
+        (rpro, first, (num(&db, "RP:CNT"), num(&db, "RP:TC"))),
+        (1.0, (1.0, 1.0), (2.0, 2.0)),
+        "RP:S.RPRO after the second put; RP:CNT and RP:TC at RP:S's first count and at the end"
     );
 }

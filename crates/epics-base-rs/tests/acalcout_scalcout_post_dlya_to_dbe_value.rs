@@ -11,7 +11,6 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use epics_base_rs::server::database::filters::{FilteredMonitorEvent, SubscriptionFilter};
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -114,12 +113,22 @@ async fn dlya_posts_to_dbe_value_alone_as_oracle_ioc_does() {
             .unwrap();
     }
     for _ in 0..2 {
+        let mut puts = Vec::new();
         for record in ["AC", "SC"] {
-            db.put_record_field_from_ca(record, "PROC", EpicsValue::String("1".into()))
-                .await
-                .unwrap();
+            puts.push(
+                db.put_record_field_from_ca(record, "PROC", EpicsValue::String("1".into()))
+                    .await
+                    .unwrap(),
+            );
         }
-        epics_base_rs::runtime::task::sleep(Duration::from_millis(600)).await;
+        // Each completes when its ODLY callback has written the output.
+        for put in puts {
+            if let Some(rx) = put.into_handle() {
+                let _ = epics_base_rs::runtime::task::timeout(fact_budget::FACT_BUDGET, rx)
+                    .await
+                    .expect("the delayed cycle never completed");
+            }
+        }
     }
     let got: Vec<String> = streams.iter().map(|s| by_pv(&s.lock().unwrap())).collect();
     assert_eq!(got[0], VALUE, "DBE_VALUE");

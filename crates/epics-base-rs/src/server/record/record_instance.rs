@@ -17743,7 +17743,14 @@ mod mlis_tests {
         db.put_record_field_from_ca_no_notify("CL:PTR", "PROC", EpicsValue::Short(1))
             .await
             .unwrap();
-        crate::runtime::task::sleep(std::time::Duration::from_millis(300)).await;
+        // The ODLY callback's pass clears DLYA, then PACT.
+        crate::runtime::task::timeout(fact_budget::FACT_BUDGET, async {
+            while rec.read().is_processing() {
+                crate::runtime::task::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("CL:PTR never left PACT");
         assert_eq!(NAME_BYTE_COMPARES.with(|n| n.get()), 0);
         assert_eq!(drained(&mut rx).len(), 2, "DLYA set and cleared");
     }

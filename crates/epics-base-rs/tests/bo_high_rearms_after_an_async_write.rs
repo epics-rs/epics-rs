@@ -75,13 +75,31 @@ async fn on_port(
     (db, writes)
 }
 
+/// Until the port has taken `n` writes and R has left PACT after the last:
+/// each completes from the port thread, after the put returns.
+async fn settled(db: &PvDatabase, writes: &Mutex<Vec<String>>, n: usize) {
+    let cell = db.get_record("R").unwrap();
+    epics_base_rs::runtime::task::timeout(fact_budget::FACT_BUDGET, async {
+        while writes.lock().unwrap().len() < n || cell.read().is_processing() {
+            epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "R never settled on {n} writes: {:?}",
+            writes.lock().unwrap()
+        )
+    });
+}
+
 #[epics_macros_rs::epics_test]
 async fn the_high_reset_writes_again() {
     let (db, writes) = on_port(Box::new(BoRecord::default()), Duration::from_millis(20)).await;
     db.put_record_field_from_ca_no_notify("R", "VAL", EpicsValue::Enum(1))
         .await
         .unwrap();
-    epics_base_rs::runtime::task::sleep(Duration::from_millis(800)).await;
+    settled(&db, &writes, 2).await;
     assert_eq!(
         writes.lock().unwrap().len(),
         2,
@@ -103,6 +121,9 @@ async fn a_val_put_during_pact_disarms_high(record: Box<dyn Record>) {
     db.put_record_field_from_ca_no_notify("R", "VAL", EpicsValue::Enum(0))
         .await
         .unwrap();
+    settled(&db, &writes, 2).await;
+    // A timer the first pass armed would fire 0.2 s on; nothing orders after
+    // a timer never armed, so a window past HIGH stands for it.
     epics_base_rs::runtime::task::sleep(Duration::from_millis(1000)).await;
     assert_eq!(*writes.lock().unwrap(), ["Enum(1)", "Enum(0)"]);
     assert_eq!(db.get_pv("R.VAL").ok().and_then(|v| v.to_f64()), Some(0.0));

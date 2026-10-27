@@ -13,6 +13,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::database::filters::{FilteredMonitorEvent, SubscriptionFilter};
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::recgbl::EventMask;
@@ -97,6 +98,18 @@ enum Drive {
     LocalRefusal { steps: usize, record: &'static str },
 }
 
+/// Until `rec` leaves PACT.
+async fn idle(db: &PvDatabase, rec: &str) {
+    let cell = db.get_record(rec).unwrap();
+    epics_base_rs::runtime::task::timeout(fact_budget::FACT_BUDGET, async {
+        while cell.read().is_processing() {
+            epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{rec} never left PACT"));
+}
+
 async fn softioc_pin(case: &str, drive: Drive) {
     let dir = format!(
         "{}/tests/testdata/alarm_post_order/{case}",
@@ -153,24 +166,27 @@ async fn softioc_pin(case: &str, drive: Drive) {
     };
     for step in lines.take(steps) {
         let mut words = step.split_whitespace();
-        if let Some(secs) = step.strip_prefix("sleep ") {
-            epics_base_rs::runtime::task::sleep(std::time::Duration::from_secs_f64(
-                secs.parse().unwrap(),
-            ))
-            .await;
+        // softIoc's `sleep` outlasted the ODLY in flight: its stream carries
+        // that cycle's finish.
+        if step.starts_with("sleep ") {
+            for pv in monitor.split_whitespace() {
+                idle(&db, pv.split('.').next().unwrap()).await;
+            }
             continue;
         }
         assert_eq!(words.next(), Some("caput"));
         let pv = words.next().unwrap();
         let (rec, field) = pv.split_once('.').unwrap_or((pv, "VAL"));
         let value = words.next().unwrap();
+        // softIoc's caput reached an idle record: the refusal case's first
+        // cycle had run out its 0.1 s ODLY.
+        idle(&db, rec).await;
         db.put_record_field_from_ca(rec, field, EpicsValue::String(value.into()))
             .await
             .unwrap();
-        // Outlasts the 0.1 s ODLY the refusal case's first cycle runs.
-        epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(250)).await;
     }
     if let Drive::LocalRefusal { record, .. } = drive {
+        idle(&db, record).await;
         let cell = db.get_record(record).unwrap();
         let mut inst = cell.write();
         inst.enter_pact();

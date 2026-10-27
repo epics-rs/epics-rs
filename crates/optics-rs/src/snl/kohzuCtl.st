@@ -953,7 +953,6 @@ state busyChanged {
 	} state thChanged
 	when (kohzuMoving > 0) {
 		if (kohzuCtlDebug) %%printf("kohzuCtl:busyChanged\n to Moving but unclear why");
-		E = EReq;
 	} state eChanged
 	when (kohzuMoving == 0) {
 		if (kohzuCtlDebug) %%printf("kohzuCtl:busyChanged\n to Done");

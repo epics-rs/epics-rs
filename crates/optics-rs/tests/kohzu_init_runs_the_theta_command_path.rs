@@ -474,7 +474,7 @@ async fn use_set_and_motor_sets(ioc: &PvDatabase) -> [f64; 4] {
     ]
 }
 
-/// updateSet (kohzuCtl.st:1483-1548) runs on the connect-time monitors with UseSet first,
+/// updateSet (kohzuCtl.st:1482-1547) runs on the connect-time monitors with UseSet first,
 /// so UseSet's value wins: a preset motor .SET is put back (C kohzuIoc
 /// oracle: th.SET=Set before seq gives all Use).
 #[epics_base_rs::epics_test]
@@ -730,7 +730,7 @@ async fn a_setpoint_put_during_a_move_is_dropped() {
 
 /// Readbacks at the yOffset pass's own Y and Z for theta 10 leave every
 /// motor nothing to do, so thTime is 0: Move keeps each speed, where C put
-/// 0/0, a NaN, into Y's and Z's VELO (`kohzuCtl.st:1105-1115`). th.VELO
+/// 0/0, a NaN, into Y's and Z's VELO (`kohzuCtl.st:1104-1114`). th.VELO
 /// stays only if the pass took that thTime = 0 branch.
 #[epics_base_rs::epics_test]
 async fn a_move_with_nothing_to_do_keeps_the_motor_speeds() {
@@ -750,7 +750,7 @@ async fn a_move_with_nothing_to_do_keeps_the_motor_speeds() {
 }
 
 /// Theta at VELO 0, as speed control leaves it after a move without theta
-/// travel, takes zero time (`kohzuCtl.st:1081-1091`): Z is the slowest to
+/// travel, takes zero time (`kohzuCtl.st:1080-1090`): Z is the slowest to
 /// theta 20, so it keeps its speed and theta and Y get their travel over
 /// Z's time. C took an infinite thTime and put 0 into every VELO.
 #[epics_base_rs::epics_test]
@@ -874,7 +874,7 @@ async fn shows(sub: &mut DbSubscription, want: f64) {
 }
 
 /// The next move puts back the speeds VELO holds, though this move's speed
-/// echo is in only after its restore (C defect, kohzuCtl.st:1074-1080).
+/// echo is in only after its restore (C defect, kohzuCtl.st:1073-1079).
 #[epics_base_rs::epics_test]
 async fn a_speed_echo_after_its_restore_leaves_the_next_move_the_old_speeds() {
     let ioc = boot_speeds().await;
@@ -934,7 +934,7 @@ async fn a_motor_set_put_twice_leaves_use_set_at_the_second() {
 }
 
 /// UseSet off again before the first pass's .SET echoes are in stays off:
-/// the late echoes are not mirrored back (C defect, kohzuCtl.st:1493-1497).
+/// the late echoes are not mirrored back (C defect, kohzuCtl.st:1492-1496).
 #[epics_base_rs::epics_test]
 async fn a_late_motor_set_echo_is_not_mirrored_back_to_use_set() {
     let ioc = boot([10.0, -17.77, 100.78]).await;
@@ -951,7 +951,7 @@ async fn a_late_motor_set_echo_is_not_mirrored_back_to_use_set() {
 }
 
 /// The same for th.SET off again before the UseSet echo is in
-/// (C defect, kohzuCtl.st:1493-1497).
+/// (C defect, kohzuCtl.st:1492-1496).
 #[epics_base_rs::epics_test]
 async fn a_late_use_set_echo_is_not_mirrored_back_to_the_motor_set() {
     let ioc = boot([10.0, -17.77, 100.78]).await;
@@ -1121,7 +1121,7 @@ fn trace_of(test: &str) -> Vec<String> {
 }
 
 /// With kohzuCtlDebug set at boot, the boot passes print C's lines; the
-/// rolled-back moveKohzu arm prints none (kohzuCtl.st:1140-1146).
+/// rolled-back moveKohzu arm prints none (kohzuCtl.st:1139-1145).
 #[epics_base_rs::epics_test]
 async fn debug_prints_c_lines() {
     if std::env::var_os(CHILD).is_none() {
@@ -1242,7 +1242,7 @@ async fn an_empty_geom_is_geometry_1() {
 
 /// Geometry 2 keeps the db's yOffset (`Kohzu_yOffsetAO` DOL 1) and puts
 /// Y = yOffset/(2 cos theta), Z = yOffset/(2 sin theta)
-/// (`kohzuCtl.st:1032-1033`; values from that formula, not a C IOC run).
+/// (`kohzuCtl.st:1031-1032`; values from that formula, not a C IOC run).
 #[epics_base_rs::epics_test]
 async fn geom_2_0_moves_y_and_z_by_geometry_2() {
     let theta = 10.0 / RAD_CONV;

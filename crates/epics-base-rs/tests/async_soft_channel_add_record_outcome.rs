@@ -34,7 +34,7 @@ record(ai, "A6") { field(DTYP, "Async Soft Channel") field(INP, "SRC CP") }
 /// completion re-enters, which clears PACT; a record left active stays so.
 async fn settle(db: &PvDatabase, name: &str) {
     let rec = db.get_record(name).unwrap();
-    let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let until = std::time::Instant::now() + fact_budget::FACT_BUDGET;
     while rec.read().is_processing() && std::time::Instant::now() < until {
         epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(5)).await;
     }

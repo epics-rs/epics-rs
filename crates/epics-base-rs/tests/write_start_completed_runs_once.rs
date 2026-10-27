@@ -55,7 +55,8 @@ async fn a_write_completed_in_write_begin_is_not_written_again() {
     db.put_record_field_from_ca_no_notify("AO", "VAL", EpicsValue::Double(1.0))
         .await
         .unwrap();
-    for _ in 0..500 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         {
             let rec = db.get_record("AO").unwrap();
             let inst = rec.read();

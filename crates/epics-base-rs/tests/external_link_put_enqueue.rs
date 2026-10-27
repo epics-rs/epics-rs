@@ -526,12 +526,12 @@ async fn a_blocked_link_does_not_stall_other_links() {
             settled.notified().await;
         }
     };
-    if epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(30), fast_done)
+    if epics_base_rs::runtime::task::timeout(fact_budget::FACT_BUDGET, fast_done)
         .await
         .is_err()
     {
         panic!(
-            "FAST:OUT not completed 30 s after it reached the lset; completed = {:?}",
+            "FAST:OUT not completed within the fact budget after it reached the lset; completed = {:?}",
             completed.lock().unwrap()
         );
     }

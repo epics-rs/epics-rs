@@ -91,7 +91,7 @@ fn assert_no_pass_early(armed: Instant, seen: &[Instant]) {
 /// further [`PASS`]: a slow host runs the pass late, not never.
 async fn events(rxs: &mut [EventReader], least: &[usize]) -> Vec<usize> {
     let mut got = vec![0; rxs.len()];
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
     loop {
         for (n, rx) in got.iter_mut().zip(rxs.iter_mut()) {
             *n += drain(rx);
@@ -261,7 +261,7 @@ record(sseq, "Q") {
         db.put_record_field_from_ca("Q", field, EpicsValue::String(value.into()))
             .await
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + fact_budget::FACT_BUDGET;
         while types(&db) != short(want) && Instant::now() < deadline {
             epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;
         }

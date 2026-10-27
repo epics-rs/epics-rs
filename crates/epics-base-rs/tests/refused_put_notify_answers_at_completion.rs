@@ -4,8 +4,6 @@
 //! end. A blocking PVA put hears the failure there too, as pvxs
 //! `doneCallback` does (`ioc/singlesource.cpp:262-263`).
 
-use std::time::Duration;
-
 use epics_base_rs::server::database::{ProcessMode, PvDatabase};
 use epics_base_rs::server::records::calcout::CalcoutRecord;
 use epics_base_rs::types::EpicsValue;
@@ -37,7 +35,7 @@ async fn a_refusal_on_an_async_cycle_completes_failed_after_it() {
         .completion
         .into_handle()
         .expect("the refused put still drove the async ODLY cycle");
-    let done = epics_base_rs::runtime::task::timeout(Duration::from_secs(5), done)
+    let done = epics_base_rs::runtime::task::timeout(fact_budget::FACT_BUDGET, done)
         .await
         .unwrap();
     assert!(done.is_err(), "the completion carries the refusal");
@@ -54,7 +52,7 @@ async fn a_blocking_client_put_reports_the_refusal_at_completion() {
         ProcessMode::Passive,
         true,
     );
-    let put = epics_base_rs::runtime::task::timeout(Duration::from_secs(5), put)
+    let put = epics_base_rs::runtime::task::timeout(fact_budget::FACT_BUDGET, put)
         .await
         .unwrap();
     assert!(put.is_err(), "the refused put is an error to the client");

@@ -139,7 +139,8 @@ fn alarm(db: &PvDatabase, name: &str) -> (u16, AlarmSeverity) {
 }
 
 async fn idle(db: &PvDatabase, name: &str) {
-    for _ in 0..400 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if !pact(db, name) {
             return;
         }

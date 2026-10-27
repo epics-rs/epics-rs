@@ -3210,7 +3210,7 @@ mod tests {
             })
             .collect();
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
         while done.load(Ordering::SeqCst) < 2 {
             assert!(
                 std::time::Instant::now() < deadline,

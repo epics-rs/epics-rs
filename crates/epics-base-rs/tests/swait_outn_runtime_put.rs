@@ -49,7 +49,8 @@ fn num(db: &PvDatabase, pv: &str) -> f64 {
 }
 
 async fn settle_outv(db: &PvDatabase, want: u16) {
-    for _ in 0..400 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if db.get_pv("W.OUTV").ok() == Some(EpicsValue::Enum(want)) {
             return;
         }
@@ -60,7 +61,8 @@ async fn settle_outv(db: &PvDatabase, want: u16) {
 
 /// Wait until `pv` reads `want`: the output is a CA put.
 async fn settle(db: &PvDatabase, pv: &str, want: f64) {
-    for _ in 0..400 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if num(db, pv) == want {
             return;
         }

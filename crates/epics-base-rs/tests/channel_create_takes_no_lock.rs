@@ -41,8 +41,8 @@ fn create(
     })
 }
 
-async fn join_within<T>(thread: &std::thread::JoinHandle<T>, secs: u64, what: &str) {
-    let deadline = Instant::now() + Duration::from_secs(secs);
+async fn join_within<T>(thread: &std::thread::JoinHandle<T>, what: &str) {
+    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
     while !thread.is_finished() {
         assert!(Instant::now() < deadline, "{what}");
         epics_base_rs::runtime::task::sleep(Duration::from_millis(10)).await;
@@ -71,7 +71,7 @@ async fn a_held_record_is_addressed_without_waiting_for_the_hold() {
     held_rx.recv().unwrap();
     let made = [create(&db, "B"), create(&db, "W"), create(&db, "S.VAL$")];
     for chan in &made {
-        join_within(chan, 10, "channel_create waited for the hold").await;
+        join_within(chan, "channel_create waited for the hold").await;
     }
     go_tx.send(()).unwrap();
     holder.join().unwrap();
@@ -123,8 +123,8 @@ async fn a_holder_creating_a_channel_does_not_deadlock_with_the_targets_holder()
             made
         })
     };
-    join_within(&x_holder, 20, "the holders deadlocked").await;
-    join_within(&b_holder, 20, "the holders deadlocked").await;
+    join_within(&x_holder, "the holders deadlocked").await;
+    join_within(&b_holder, "the holders deadlocked").await;
     b_holder.join().unwrap();
     assert_eq!(x_holder.join().unwrap(), Some(DbFieldType::Double));
 }

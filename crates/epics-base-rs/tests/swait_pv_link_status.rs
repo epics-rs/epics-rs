@@ -38,7 +38,8 @@ async fn process(db: &PvDatabase, rec: &str) {
 /// Wait until `rec.f` reads `want`: each link searches on its own task and
 /// its status lands from a callback band.
 async fn settle_until(db: &PvDatabase, rec: &str, f: &str, want: u16) {
-    for _ in 0..400 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if field(db, rec, f).await == Some(EpicsValue::Enum(want)) {
             return;
         }
@@ -141,7 +142,8 @@ async fn r9_76_put_to_a_pv_name_reclassifies_it() {
 
 /// Wait until `rec.f` reads `want` — the OUT write is a CA put.
 async fn settle_val(db: &PvDatabase, rec: &str, f: &str, want: f64) {
-    for _ in 0..400 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if field(db, rec, f).await == Some(EpicsValue::Double(want)) {
             return;
         }
@@ -156,7 +158,8 @@ async fn settle_val(db: &PvDatabase, rec: &str, f: &str, want: f64) {
 /// Process `rec` until `target.VAL` reads `want`: a link's value lands on its
 /// first monitor, after its status reads PV_OK, and shows nowhere else.
 async fn process_until(db: &PvDatabase, rec: &str, target: &str, want: f64) {
-    for _ in 0..400 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         process(db, rec).await;
         epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(5)).await;
         if field(db, target, "VAL").await == Some(EpicsValue::Double(want)) {

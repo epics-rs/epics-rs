@@ -47,7 +47,8 @@ async fn a_manager_started_twice_saves_its_list_once() {
     let second = mgr.clone().start(db.clone());
     let set = mgr.sets()[0].0.clone();
     let want = (SrStatus::Warn, ".savB file was bad");
-    for _ in 0..150 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         let status = set.list_status();
         if (status.code, status.text.as_str()) == want {
             break;

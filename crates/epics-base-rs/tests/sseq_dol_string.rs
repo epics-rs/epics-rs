@@ -20,7 +20,8 @@ use epics_base_rs::server::records::stringout::StringoutRecord;
 use epics_base_rs::types::{EpicsValue, PvString};
 
 async fn poll_field(db: &PvDatabase, record: &str, field: &str, label: &str) -> EpicsValue {
-    for _ in 0..400 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if let Some(rec) = db.get_record(record) {
             let v = rec.read().record.get_field(field);
             if let Some(v) = v {

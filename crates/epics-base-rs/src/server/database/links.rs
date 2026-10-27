@@ -7233,7 +7233,7 @@ mod db_link_addr_tests {
             let v = read(&cycle, &link);
             let _ = tx.send((r.is_ok(), v));
         });
-        let done = rx.recv_timeout(std::time::Duration::from_secs(5));
+        let done = rx.recv_timeout(fact_budget::FACT_BUDGET);
         drop(held);
         assert_eq!(
             done.expect("a settled cycle took the simple_pvs lock"),

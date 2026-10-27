@@ -215,7 +215,8 @@ async fn r17_4_a_dol_read_posts_the_read_view_with_log_and_the_derived_view_with
     db.process_record_with_links("VPP", &mut visited)
         .await
         .unwrap();
-    for _ in 0..400 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if let Some(EpicsValue::Double(v)) = db
             .get_record("VPP_DST")
             .unwrap()

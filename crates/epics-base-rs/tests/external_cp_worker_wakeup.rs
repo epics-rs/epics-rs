@@ -40,9 +40,9 @@ impl CounterLset {
     }
 }
 
-/// Spin until `done`, failing after 5 s.
+/// Spin until `done`, failing after the fact budget.
 fn until(done: impl Fn() -> bool, what: &str) {
-    let end = Instant::now() + Duration::from_secs(5);
+    let end = Instant::now() + fact_budget::FACT_BUDGET;
     while !done() {
         assert!(Instant::now() < end, "timed out waiting until {what}");
         std::thread::yield_now();

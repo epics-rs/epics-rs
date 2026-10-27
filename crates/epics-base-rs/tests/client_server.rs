@@ -258,7 +258,7 @@ async fn test_monitor_receives_updates() {
     let mut monitor = ch.subscribe().await.unwrap();
 
     // First callback is the current value
-    let snap = tokio::time::timeout(Duration::from_secs(3), monitor.recv())
+    let snap = tokio::time::timeout(fact_budget::FACT_BUDGET, monitor.recv())
         .await
         .unwrap()
         .unwrap()
@@ -270,7 +270,7 @@ async fn test_monitor_receives_updates() {
         .await
         .unwrap();
 
-    let snap = tokio::time::timeout(Duration::from_secs(3), monitor.recv())
+    let snap = tokio::time::timeout(fact_budget::FACT_BUDGET, monitor.recv())
         .await
         .unwrap()
         .unwrap()

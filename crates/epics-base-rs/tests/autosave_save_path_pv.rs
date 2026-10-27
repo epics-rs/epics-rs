@@ -160,7 +160,8 @@ async fn an_unresolved_path_pv_warns_on_the_first_pass() {
     // The same pass's connect_list (:955) and then enable_list (:973)
     // rewrite the text, not the code.
     let want = (SrStatus::Warn, "Enabling list...");
-    for _ in 0..40 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         let status = set.list_status();
         if (status.code, status.text.as_str()) == want {
             break;

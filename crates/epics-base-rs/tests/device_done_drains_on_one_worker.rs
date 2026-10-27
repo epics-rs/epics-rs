@@ -100,7 +100,7 @@ async fn passes_owed_mid_run_are_drained_by_that_run() {
     epics_base_rs::runtime::task::spawn_blocking_background(band, move |_| {
         done.reprocess(band).unwrap();
         started_rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(fact_budget::FACT_BUDGET)
             .expect("the first pass ran");
         for _ in 1..PASSES {
             done.reprocess(band).unwrap();
@@ -109,7 +109,8 @@ async fn passes_owed_mid_run_are_drained_by_that_run() {
     .await
     .unwrap();
 
-    for _ in 0..400 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if ran.lock().unwrap().len() >= PASSES {
             break;
         }

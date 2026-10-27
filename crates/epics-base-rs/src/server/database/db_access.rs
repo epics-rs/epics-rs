@@ -1378,7 +1378,8 @@ mod multi_monitor_tests {
         .unwrap();
         let mut monitor = DbMultiMonitor::new(&db, &["X".to_string()]).await;
         DbChannel::new(&db, "X").put_i16_process(0).await.unwrap();
-        let changes = crate::runtime::task::timeout(Duration::from_secs(1), monitor.wait_changes());
+        let changes =
+            crate::runtime::task::timeout(fact_budget::FACT_BUDGET, monitor.wait_changes());
         assert_eq!(changes.await.ok(), Some(vec![("X".to_string(), 0.0)]));
     }
 }
@@ -1523,7 +1524,7 @@ mod tests {
     }
 
     fn wait_until(what: &str, done: impl Fn() -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + fact_budget::FACT_BUDGET;
         while !done() {
             assert!(Instant::now() < deadline, "timed out waiting for {what}");
             std::thread::sleep(Duration::from_millis(1));

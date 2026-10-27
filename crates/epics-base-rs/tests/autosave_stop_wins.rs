@@ -62,7 +62,7 @@ async fn saves_after_the_manager_drops(strategy: SaveStrategy) -> (u64, bool) {
         if Arc::strong_count(&set) == 1 {
             break true;
         }
-        if start.elapsed() > Duration::from_secs(5) {
+        if start.elapsed() > fact_budget::FACT_BUDGET {
             break false;
         }
         sleep(Duration::from_millis(10)).await;

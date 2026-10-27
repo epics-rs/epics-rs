@@ -15,7 +15,6 @@
 //! what makes this a sink defect and not a record defect.
 
 use std::collections::HashMap;
-use std::time::Duration;
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -103,7 +102,7 @@ async fn the_sink_arms_the_sdel_watchdog() {
         .unwrap();
     while val_rx.try_recv().is_ok() {}
 
-    let event = epics_base_rs::runtime::task::timeout(Duration::from_secs(2), val_rx.recv())
+    let event = epics_base_rs::runtime::task::timeout(fact_budget::FACT_BUDGET, val_rx.recv())
         .await
         .expect("a record born with SDEL > 0 must have its watchdog armed at creation")
         .expect("subscription alive");

@@ -120,9 +120,9 @@ record(calc, "HOLD") {
     );
 }
 
-/// Wait up to `secs` for `pv` to read `want`.
-async fn reads_within(db: &PvDatabase, pv: &str, want: f64, secs: u64) -> bool {
-    let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+/// Wait up to the fact budget for `pv` to read `want`.
+async fn reads_within(db: &PvDatabase, pv: &str, want: f64) -> bool {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
     while num(db, pv) != want {
         if std::time::Instant::now() >= deadline {
             return false;
@@ -170,7 +170,7 @@ record(calc, "HOLD") { field(INPA, "SRC CP") field(CALC, "A") }
 
     assert!(ca_run.is_ok(), "dbCaRun waited on the refused link");
     assert!(
-        reads_within(&db, "HOLD", 5.0, 3).await,
+        reads_within(&db, "HOLD", 5.0).await,
         "HOLD's first pass waited on the refused link"
     );
 }
@@ -216,9 +216,9 @@ record(calc, "LATE") { field(CALC, "A") }
     let (busy, is_busy) = std::sync::mpsc::channel();
     let hold = spawn_blocking_background(CallbackPriority::High, move |_| {
         busy.send(()).unwrap();
-        let _ = held.recv_timeout(Duration::from_secs(30));
+        let _ = held.recv();
     });
-    is_busy.recv_timeout(Duration::from_secs(10)).unwrap();
+    is_busy.recv_timeout(fact_budget::FACT_BUDGET).unwrap();
     pulse.try_send(()).unwrap();
     let opened = db.external_link_opens_completed();
     db.put_record_field_from_ca("LATE", "INPA", EpicsValue::String("BUSY CP".into()))
@@ -231,13 +231,13 @@ record(calc, "LATE") { field(CALC, "A") }
     db.put_record_field_from_ca("SRC", "VAL", EpicsValue::Double(7.0))
         .await
         .unwrap();
-    let processed = reads_within(&db, "HOLD", 7.0, 3).await;
+    let processed = reads_within(&db, "HOLD", 7.0).await;
     let _ = release.send(());
     let _ = hold.await;
 
     assert!(processed, "HOLD's process waited on LATE's first event");
     assert!(
-        reads_within(&db, "LATE", 1.0, 5).await,
+        reads_within(&db, "LATE", 1.0).await,
         "LATE's first event read BUSY once its pump ran"
     );
 }

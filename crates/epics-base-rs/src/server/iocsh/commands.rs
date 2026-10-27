@@ -9451,7 +9451,8 @@ record(lso, "SOD") { field(SIZV, "128") }
 
         // The event record's post runs on a callback task.
         run_cmd(&ctx, "dbpf", &["EP.PROC", "1"]);
-        for _ in 0..500 {
+        let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+        while std::time::Instant::now() < deadline {
             if headers(&ctx).len() == 4 {
                 break;
             }
@@ -12410,7 +12411,8 @@ record(ai, "AE") { field(DTYP, "Async Soft Channel") field(INP, "EQ.DO1") }"#,
         let sleep = |ms| std::thread::sleep(std::time::Duration::from_millis(ms));
         // The DLY1 windows end on the delay thread's clock, not this one's.
         let settle = |pv: &str, want: &str| {
-            for _ in 0..2000 {
+            let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+            while std::time::Instant::now() < deadline {
                 if gf(pv) == want {
                     return;
                 }

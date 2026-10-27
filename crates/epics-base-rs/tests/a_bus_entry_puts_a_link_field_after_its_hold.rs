@@ -8,7 +8,6 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Barrier, mpsc};
-use std::time::Duration;
 
 use epics_base_rs::error::DbResult;
 use epics_base_rs::server::database::{AsyncDbHandle, FieldPut, PvDatabase};
@@ -88,7 +87,7 @@ fn entry(
 fn finished(rx: &mpsc::Receiver<(&'static str, Answer)>, n: usize) -> Vec<(&'static str, Answer)> {
     let mut out: Vec<_> = (0..n)
         .map(|_| {
-            rx.recv_timeout(Duration::from_secs(20))
+            rx.recv_timeout(fact_budget::FACT_BUDGET)
                 .expect("an entry is stuck in its link put")
         })
         .collect();

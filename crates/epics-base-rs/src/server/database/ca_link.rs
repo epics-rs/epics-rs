@@ -1551,7 +1551,7 @@ record(ao, "OUT") { field(OUT, "SRC CA") }
         );
 
         assert_eq!(db.inner.ca_links.get_cached_value(out), None);
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
         while db.inner.ca_links.get_cached_value(out).is_none() {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -1615,7 +1615,7 @@ record(ao, "OUT") { field(OUT, "SRC CA") }
                 crate::runtime::task::block_on_sync(open).unwrap();
             }
         });
-        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        entered.recv_timeout(fact_budget::FACT_BUDGET).unwrap();
         let (held_tx, held) = std::sync::mpsc::channel();
         let (release, release_rx) = std::sync::mpsc::channel::<()>();
         let holder = std::thread::spawn({
@@ -1640,7 +1640,7 @@ record(ao, "OUT") { field(OUT, "SRC CA") }
         }
         release.send(()).unwrap();
         holder.join().unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
         while monitors() == 0 {
             assert!(std::time::Instant::now() < deadline, "the open subscribes");
             crate::runtime::task::sleep(Duration::from_millis(5)).await;
@@ -1650,7 +1650,7 @@ record(ao, "OUT") { field(OUT, "SRC CA") }
     }
 
     async fn until(done: impl Fn() -> bool, what: &str) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
         while !done() {
             assert!(
                 std::time::Instant::now() < deadline,

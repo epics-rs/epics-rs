@@ -134,7 +134,7 @@ mod tests {
         db.scan_control().run();
         let started = || {
             started
-                .recv_timeout(Duration::from_secs(10))
+                .recv_timeout(fact_budget::FACT_BUDGET)
                 .expect("a read starts")
         };
 
@@ -155,7 +155,7 @@ mod tests {
         );
 
         release.send(()).unwrap();
-        crate::runtime::task::timeout(Duration::from_secs(10), turn)
+        crate::runtime::task::timeout(fact_budget::FACT_BUDGET, turn)
             .await
             .expect("the turn is answered once the queued interrupt is processed");
     }

@@ -82,7 +82,7 @@ fn process_on_scan_thread(db: &Arc<PvDatabase>, rec: &'static str, n: usize) {
         }
         tx.send(()).unwrap();
     });
-    rx.recv_timeout(Duration::from_secs(20))
+    rx.recv_timeout(fact_budget::FACT_BUDGET)
         .expect("the cycle wedged");
 }
 

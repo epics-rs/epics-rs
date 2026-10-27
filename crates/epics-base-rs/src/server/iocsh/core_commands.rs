@@ -1644,7 +1644,8 @@ mod tests {
                 })
                 .unwrap();
             let id = id_rx.recv().unwrap();
-            for _ in 0..500 {
+            let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+            while std::time::Instant::now() < deadline {
                 if crate::runtime::task::thread_by_id(id).is_some_and(|t| t.is_suspended()) {
                     break;
                 }
@@ -1671,7 +1672,7 @@ mod tests {
             assert_eq!(out, "", "{token}");
             assert_eq!(err, "", "{token}");
             woke_rx
-                .recv_timeout(std::time::Duration::from_secs(5))
+                .recv_timeout(fact_budget::FACT_BUDGET)
                 .unwrap_or_else(|e| panic!("{token} must wake the thread: {e}"));
             join.join().unwrap();
         }

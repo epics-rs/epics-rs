@@ -62,7 +62,7 @@ async fn mode_at(value: f64) -> (Arc<PvDatabase>, AcfCell) {
         .await
         .unwrap();
     let cell = new_acf_cell_watching(Some(parse_acf(ACF).unwrap()), &db);
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
     while cell.load_full().unwrap().asg[b"OPS".as_slice()].inp_bad() != 0 {
         assert!(Instant::now() < deadline, "gate:mode never delivered");
         sleep(Duration::from_millis(10)).await;

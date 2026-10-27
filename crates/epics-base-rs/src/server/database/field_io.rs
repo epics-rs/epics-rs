@@ -5775,7 +5775,7 @@ mod tests {
             .await
             .expect("CA put to CALC1.VAL must succeed");
 
-        let got = crate::runtime::task::timeout(std::time::Duration::from_secs(1), sub.recv_f64())
+        let got = crate::runtime::task::timeout(fact_budget::FACT_BUDGET, sub.recv_f64())
             .await
             .expect("a DBE_VALUE monitor must fire for a direct VAL put to a non-pp record");
         assert_eq!(got, Some(5.0));

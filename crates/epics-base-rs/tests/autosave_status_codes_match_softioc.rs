@@ -173,7 +173,8 @@ impl Rig {
 }
 
 async fn next_post(db: &PvDatabase, name: &str, rx: &mut EventReader) -> (f64, u16, u16) {
-    for _ in 0..400 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if let Ok(e) = rx.try_recv() {
             let v = e
                 .delivered_value(&db.get_record(name).unwrap().read(), "VAL")
@@ -182,7 +183,7 @@ async fn next_post(db: &PvDatabase, name: &str, rx: &mut EventReader) -> (f64, u
         }
         sleep(Duration::from_millis(10)).await;
     }
-    panic!("no post within 4 s");
+    panic!("no post within the fact budget");
 }
 
 fn backup(enable_savb: bool) -> BackupConfig {

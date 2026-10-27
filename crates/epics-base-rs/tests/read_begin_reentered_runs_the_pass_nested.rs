@@ -225,7 +225,8 @@ async fn a_reentered_pass_then_pending_leaves_the_record_pact() {
     std::thread::spawn(move || done.reprocess(band).unwrap())
         .join()
         .unwrap();
-    for _ in 0..400 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if !processing(&ioc.db) {
             break;
         }

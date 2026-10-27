@@ -43,7 +43,7 @@ async fn a_string_that_is_not_a_number_alarms_and_writes_nothing() {
     open_links(&db).await;
 
     // A number converts and lands, once the link is up.
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
     while num(&db, "TGT") != 12.5 && Instant::now() < deadline {
         put_src(&db, "12.5").await;
         epics_base_rs::runtime::task::sleep(Duration::from_millis(50)).await;
@@ -60,7 +60,7 @@ async fn a_string_that_is_not_a_number_alarms_and_writes_nothing() {
     // The empty string is the scalar row's zero, not a refusal.
     put_src(&db, "").await;
     assert_eq!(num(&db, "SRC.SEVR"), 0.0);
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
     while num(&db, "TGT") != 0.0 && Instant::now() < deadline {
         epics_base_rs::runtime::task::sleep(Duration::from_millis(10)).await;
     }
@@ -76,7 +76,7 @@ async fn open_links(db: &epics_base_rs::server::database::PvDatabase) {
             let Some(link) = link.external() else {
                 continue;
             };
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
             while db.external_link_metadata(link).is_none() {
                 assert!(
                     std::time::Instant::now() < deadline,

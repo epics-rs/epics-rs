@@ -92,7 +92,8 @@ async fn kick(db: &PvDatabase, name: &str) {
 }
 
 async fn poll_short(db: &PvDatabase, pv: &str, want: i16, label: &str) {
-    for _ in 0..400 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if let Ok(EpicsValue::Short(v)) = db.get_pv(pv)
             && v == want
         {
@@ -112,7 +113,8 @@ async fn poll_short(db: &PvDatabase, pv: &str, want: i16, label: &str) {
 /// write is a queued [`ProcessAction::WriteDbLink`] (`sseq.rs:772-780`) the
 /// framework runs after `process()` returns.
 async fn poll_double(db: &PvDatabase, pv: &str, want: f64, label: &str) {
-    for _ in 0..400 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if let Ok(EpicsValue::Double(v)) = db.get_pv(pv)
             && (v - want).abs() < 1e-10
         {

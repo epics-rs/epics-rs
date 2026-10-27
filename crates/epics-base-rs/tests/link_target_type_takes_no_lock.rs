@@ -30,8 +30,8 @@ async fn ioc(db: &str) -> Arc<PvDatabase> {
     db
 }
 
-async fn join_within<T>(thread: &std::thread::JoinHandle<T>, secs: u64, what: &str) {
-    let deadline = Instant::now() + Duration::from_secs(secs);
+async fn join_within<T>(thread: &std::thread::JoinHandle<T>, what: &str) {
+    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
     while !thread.is_finished() {
         assert!(Instant::now() < deadline, "{what}");
         epics_base_rs::runtime::task::sleep(Duration::from_millis(10)).await;
@@ -80,7 +80,7 @@ async fn a_held_target_is_typed_without_waiting_for_the_hold() {
             ]
         })
     };
-    join_within(&typed, 10, "link_target_field_type waited for the hold").await;
+    join_within(&typed, "link_target_field_type waited for the hold").await;
     go.send(()).unwrap();
     holder.join().unwrap();
     assert_eq!(
@@ -96,7 +96,7 @@ async fn a_repointed_link_is_classified_while_its_target_is_held() {
     db.put_record_field_from_ca_no_notify("S", "INPA", EpicsValue::String("T CA".into()))
         .await
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
     let mut status = None;
     while Instant::now() < deadline {
         status = db.get_pv("S.INAV").ok().and_then(|v| v.to_f64());
@@ -139,8 +139,8 @@ async fn a_holder_typing_a_link_does_not_deadlock_with_the_targets_holder() {
         });
         typed
     });
-    join_within(&x_holder, 20, "the holders deadlocked").await;
-    join_within(&b_holder, 20, "the holders deadlocked").await;
+    join_within(&x_holder, "the holders deadlocked").await;
+    join_within(&b_holder, "the holders deadlocked").await;
     b_holder.join().unwrap();
     assert_eq!(x_holder.join().unwrap(), Some(DbfCode::Double));
 }

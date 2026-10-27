@@ -76,7 +76,7 @@ async fn ioc() -> Arc<PvDatabase> {
             let Some(link) = link.external() else {
                 continue;
             };
-            let deadline = Instant::now() + Duration::from_secs(10);
+            let deadline = Instant::now() + fact_budget::FACT_BUDGET;
             while db.external_link_metadata(link).is_none() {
                 assert!(Instant::now() < deadline, "{record}.{field} connects");
                 epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;
@@ -108,7 +108,7 @@ fn allocs(db: &Arc<PvDatabase>, rec: &'static str) -> usize {
         COUNTING.with(|c| c.set(false));
         tx.send(ALLOCS.with(Cell::get)).unwrap();
     });
-    rx.recv_timeout(Duration::from_secs(20))
+    rx.recv_timeout(fact_budget::FACT_BUDGET)
         .expect("the cycle wedged")
 }
 

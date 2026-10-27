@@ -36,7 +36,8 @@ fn num(db: &PvDatabase, pv: &str) -> f64 {
 }
 
 async fn wait_idle(db: &PvDatabase, rec: &str) {
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         epics_base_rs::runtime::task::sleep(Duration::from_millis(50)).await;
         if num(db, &format!("{rec}.PACT")) == 0.0 {
             return;
@@ -90,7 +91,7 @@ async fn the_source_joins_the_reader_put_notify() {
         panic!("the put-notify must wait for the PP source's ODLY");
     };
     assert_eq!(num(&db, "BUSY.PACT"), 1.0);
-    let ended = epics_base_rs::runtime::task::timeout(Duration::from_secs(5), done)
+    let ended = epics_base_rs::runtime::task::timeout(fact_budget::FACT_BUDGET, done)
         .await
         .expect("the put-notify never ended");
     assert!(ended.is_ok(), "the put-notify completed");

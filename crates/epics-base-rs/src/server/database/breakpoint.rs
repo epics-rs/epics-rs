@@ -1562,7 +1562,8 @@ mod tests {
     /// how a shell user waits too: the stop happens on the continuation
     /// thread, which the shell has no handle on.
     fn await_stop(table: &BreakpointTable, pred: impl Fn(Option<&str>) -> bool) -> Option<String> {
-        for _ in 0..400 {
+        let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+        while Instant::now() < deadline {
             {
                 let stack = table.lock();
                 let at = stack

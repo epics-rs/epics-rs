@@ -18,7 +18,7 @@ use std::time::Duration;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::types::EpicsValue;
 
-const WATCHDOG: Duration = Duration::from_secs(10);
+const WATCHDOG: Duration = fact_budget::FACT_BUDGET;
 
 /// Never let a regression hang CI: run on a scratch thread with a deadline and
 /// re-raise a panic as a panic.

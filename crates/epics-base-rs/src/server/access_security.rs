@@ -4056,7 +4056,7 @@ ASG(DEFAULT) {
         let (ticked, tick) = channel();
         spawn_background(CallbackPriority::Medium, async move {
             let alive = refresh_hags_once(&weak, move |c| {
-                let _ = held.recv_timeout(Duration::from_secs(5));
+                let _ = held.recv();
                 let mut moved = c.clone();
                 moved.hag.insert(b"h".to_vec(), bs(&["127.0.0.1"]));
                 Some(moved)
@@ -4070,9 +4070,9 @@ ASG(DEFAULT) {
         spawn_background(CallbackPriority::Medium, async move {
             let _ = ran.send(());
         });
-        let free = beside.recv_timeout(Duration::from_secs(3)).is_ok();
+        let free = beside.recv_timeout(fact_budget::FACT_BUDGET).is_ok();
         release.send(()).unwrap();
-        let alive = tick.recv_timeout(Duration::from_secs(10)).unwrap();
+        let alive = tick.recv_timeout(fact_budget::FACT_BUDGET).unwrap();
         set_as_check_client_ip(false);
         assert!(free, "the HAG lookup parked cbMedium");
         assert!(alive);
@@ -4104,11 +4104,11 @@ ASG(DEFAULT) {
             .await;
             let _ = ticked.send(alive);
         });
-        in_lookup.recv_timeout(Duration::from_secs(5)).unwrap();
+        in_lookup.recv_timeout(fact_budget::FACT_BUDGET).unwrap();
         let reload = std::sync::Arc::new(parse_acf("ASG(RELOADED) { RULE(1, READ) }\n").unwrap());
         cell.store(Some(reload.clone()));
         release.send(()).unwrap();
-        let alive = tick.recv_timeout(Duration::from_secs(10)).unwrap();
+        let alive = tick.recv_timeout(fact_budget::FACT_BUDGET).unwrap();
         set_as_check_client_ip(false);
         assert!(alive);
         assert!(
@@ -5949,7 +5949,7 @@ mod as_ca_task_tests {
 
     /// Poll `DEFAULT`'s published state until `done` holds.
     async fn wait_state(cell: &AcfCell, done: impl Fn(&AsgState) -> bool) -> Arc<AsgState> {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
         loop {
             let state = cell.load_full().unwrap().asg[b"DEFAULT".as_slice()].state();
             if done(&state) {
@@ -6085,7 +6085,7 @@ mod as_ca_task_tests {
         let (go, wait) = std::sync::mpsc::channel::<()>();
         let path = fifo.clone();
         let writer = std::thread::spawn(move || {
-            let waited = wait.recv_timeout(std::time::Duration::from_secs(5)).is_ok();
+            let waited = wait.recv_timeout(fact_budget::FACT_BUDGET).is_ok();
             std::fs::write(path, "ASG(DEFAULT) { RULE(1, READ) }\n").unwrap();
             waited
         });
@@ -6123,7 +6123,7 @@ mod as_ca_task_tests {
             crate::runtime::task::CallbackPriority::Medium,
             async move { installing.install_async(cfg).await },
         );
-        crate::runtime::task::timeout(std::time::Duration::from_secs(5), installed)
+        crate::runtime::task::timeout(fact_budget::FACT_BUDGET, installed)
             .await
             .expect("install_async never returned")
             .unwrap();
@@ -6360,7 +6360,7 @@ mod as_ca_task_tests {
             out.into_inner()
         }
         async fn wait_until(want: bool) {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
             while table().contains("asCaTask") != want {
                 assert!(
                     std::time::Instant::now() < deadline,

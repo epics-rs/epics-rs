@@ -6,7 +6,6 @@ use epics_base_rs::server::ioc_app::ioc_shutdown;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use std::collections::HashMap;
 use std::sync::{Mutex, mpsc};
-use std::time::Duration;
 
 #[epics_macros_rs::epics_test]
 async fn a_shutdown_from_a_periodic_record_returns() {
@@ -29,6 +28,6 @@ async fn a_shutdown_from_a_periodic_record_returns() {
         .unwrap();
     assert!(ioc.run().await, "a built IOC runs");
     // Blocking here is sound: a sweep needs no runtime.
-    let status = rx.recv_timeout(Duration::from_secs(10));
+    let status = rx.recv_timeout(fact_budget::FACT_BUDGET);
     assert_eq!(status, Ok(0), "iocShutdown on the scan thread hung");
 }

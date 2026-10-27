@@ -63,7 +63,7 @@ async fn child_restore() {
             let db = config.db.clone();
             // iocInit returns, and a manual script reaches fdbrestore.
             epics_base_rs::server::db_server::announce_serving("probe");
-            let deadline = Instant::now() + Duration::from_secs(30);
+            let deadline = Instant::now() + fact_budget::FACT_BUDGET;
             while db.get_pv("LS2.LEN").unwrap().to_f64() != Some(200.0) {
                 assert!(Instant::now() < deadline, "LS2 never restored");
                 sleep(Duration::from_millis(20)).await;

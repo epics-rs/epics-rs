@@ -35,7 +35,7 @@ async fn a_state_name_put_through_a_local_ca_link_selects_that_state() {
     db.put_record_field_from_ca("SRC", "VAL", EpicsValue::String("two".into()))
         .await
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
     while num(&db, "TGT") != 2.0 && Instant::now() < deadline {
         epics_base_rs::runtime::task::sleep(Duration::from_millis(10)).await;
     }
@@ -52,7 +52,7 @@ async fn open_links(db: &PvDatabase) {
             let Some(link) = link.external() else {
                 continue;
             };
-            let deadline = Instant::now() + Duration::from_secs(10);
+            let deadline = Instant::now() + fact_budget::FACT_BUDGET;
             while db.external_link_metadata(link).is_none() {
                 assert!(Instant::now() < deadline, "{record}.{field} connects");
                 epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;

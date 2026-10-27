@@ -4,8 +4,6 @@
 //! own status — `notifyOK` for a written non-pp field, `notifyError` for a
 //! refused one (`:528-530`).
 
-use std::time::Duration;
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::records::calcout::CalcoutRecord;
 use epics_base_rs::types::EpicsValue;
@@ -42,7 +40,7 @@ async fn replay(field: &str, value: EpicsValue) -> (Option<bool>, Option<bool>) 
     }
     let mut outcomes = Vec::new();
     for done in handles {
-        let done = epics_base_rs::runtime::task::timeout(Duration::from_secs(5), done).await;
+        let done = epics_base_rs::runtime::task::timeout(fact_budget::FACT_BUDGET, done).await;
         outcomes.push(done.ok().map(|r| r.is_ok()));
     }
     assert_eq!(outcomes[0], Some(true), "the first put owns a clean cycle");

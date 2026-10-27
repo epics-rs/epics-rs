@@ -188,7 +188,8 @@ async fn loaded_sdly_defers_the_simulated_aai_read() {
     );
 
     // After the delay the deferred continuation lands the SIOL array.
-    for _ in 0..200 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(10)).await;
         if field(&db, "ARR:AAI").await == EpicsValue::DoubleArray(vec![10.0, 20.0, 30.0].into()) {
             return;

@@ -64,7 +64,7 @@ async fn child_save() {
         .startup_script(script.to_str().unwrap())
         .run_outcome(move |config| async move {
             epics_base_rs::server::db_server::announce_serving("probe");
-            let deadline = Instant::now() + Duration::from_secs(30);
+            let deadline = Instant::now() + fact_budget::FACT_BUDGET;
             while !std::fs::read_to_string(&sav).is_ok_and(|t| t.ends_with("<END>\n")) {
                 assert!(Instant::now() < deadline, "no save");
                 sleep(Duration::from_millis(20)).await;

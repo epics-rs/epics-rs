@@ -137,7 +137,7 @@ async fn an_active_target_takes_rpro_without_lcnt() {
             epics_base_rs::runtime::task::sleep(Duration::from_millis(10)).await;
         }
     };
-    epics_base_rs::runtime::task::timeout(Duration::from_secs(5), idle)
+    epics_base_rs::runtime::task::timeout(fact_budget::FACT_BUDGET, idle)
         .await
         .unwrap();
     db.put_record_field_from_ca_no_notify("CO", "PROC", EpicsValue::Long(1))

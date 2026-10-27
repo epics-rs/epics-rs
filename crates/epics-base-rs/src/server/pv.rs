@@ -3181,7 +3181,7 @@ mod pending_tests {
         assert!(poll_once(read.as_mut()).await.is_pending());
 
         assert!(pv.destroy());
-        let ended = crate::runtime::task::timeout(std::time::Duration::from_secs(10), read).await;
+        let ended = crate::runtime::task::timeout(fact_budget::FACT_BUDGET, read).await;
         assert!(matches!(ended, Ok(Err(CaError::Disconnected))));
     }
 

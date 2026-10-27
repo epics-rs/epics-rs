@@ -3223,7 +3223,8 @@ async fn test_put_to_pact_record_sets_rpro_and_second_value_reaches_device() {
     // Device callback completes cycle 1. recGblFwdLink consumes RPRO and
     // queues the reprocess (a detached task, C's scanOnce ring).
     db.complete_async_record("ASYNC_OUT").await.unwrap();
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if writes.lock().unwrap().len() >= 2 {
             break;
         }
@@ -3830,7 +3831,7 @@ async fn test_reprocess_after_continuation_bypasses_pact_guard() {
     // loaded machine puts that construction plus a 20 ms timer well past
     // any interval short enough to be worth writing. The deadline is a
     // failure bound, not the expected latency (20.7 ms, idle Linux).
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
     while process_count.load(Ordering::SeqCst) < 2 && std::time::Instant::now() < deadline {
         epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(1)).await;
     }
@@ -4349,7 +4350,8 @@ async fn test_fire_and_forget_put_parks_no_notify_write_notify_stays_legal() {
     // makes the record PACT again — and the callback belongs to THAT cycle, the
     // first one that actually saw 2.0.
     db.complete_async_record("PN_FF").await.unwrap();
-    for _ in 0..2000 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         let rec = db.get_record("PN_FF").unwrap();
         let inst = rec.read();
         if inst.is_processing() && inst.record.get_field("VAL") == Some(EpicsValue::Double(2.0)) {
@@ -4491,7 +4493,7 @@ async fn scan_once_is_not_joined_to_put_notify_completion() {
     // continuation is: the scanOnce is a spawned cycle, so how long it takes
     // to land is the machine's business, and a fixed settle only encodes the
     // load the test was written under.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
     while count.load(Ordering::SeqCst) < 2 && std::time::Instant::now() < deadline {
         epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(1)).await;
     }
@@ -6016,7 +6018,8 @@ async fn test_dfanout_out_link_write_success_no_link_alarm() {
 /// recursion", `seqRecord.c:210-215`), so the group work and `asyncFinish`
 /// (`:219-241`) run after `process_record_with_links` returns.
 async fn settle_seq(db: &PvDatabase, rec: &str) {
-    for _ in 0..400 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if !db.get_record(rec).unwrap().read().is_processing() {
             return;
         }
@@ -6323,7 +6326,8 @@ async fn test_write_db_link_runs_before_flnk_target_reads_fresh() {
 /// completes via spawned per-step re-entries, so the kicking call returns
 /// before the later steps' `LNKn` writes happen.
 async fn poll_atomic_reaches(label: &str, counter: &Arc<AtomicU32>, want: u32) {
-    for _ in 0..400 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if counter.load(Ordering::SeqCst) >= want {
             epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(30)).await;
             return;
@@ -6339,7 +6343,8 @@ async fn poll_atomic_reaches(label: &str, counter: &Arc<AtomicU32>, want: u32) {
 /// Poll a PV until it equals `want`, with a timeout. Used to wait out the
 /// sseq machine's per-step `DLYn` delays + async re-entries.
 async fn poll_pv_double(db: &PvDatabase, pv: &str, want: f64) {
-    for _ in 0..400 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if let Ok(EpicsValue::Double(v)) = db.get_pv(pv) {
             if (v - want).abs() < 1e-10 {
                 return;
@@ -8398,11 +8403,10 @@ async fn test_histogram_sdel_watchdog_posts_val() {
         .unwrap();
 
     // The tick must post VAL and zero MCNT.
-    let event =
-        epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(2), val_rx.recv())
-            .await
-            .expect("SDEL watchdog must post VAL within one period")
-            .expect("subscription alive");
+    let event = epics_base_rs::runtime::task::timeout(fact_budget::FACT_BUDGET, val_rx.recv())
+        .await
+        .expect("SDEL watchdog must post VAL")
+        .expect("subscription alive");
     match &event.delivered_value(&rec.read(), "VAL").unwrap() {
         EpicsValue::ULongArray(v) => assert_eq!(
             v,
@@ -8421,11 +8425,10 @@ async fn test_histogram_sdel_watchdog_posts_val() {
     db.put_record_field_from_ca("HI_WDOG", "SGNL", EpicsValue::Double(6.0))
         .await
         .unwrap();
-    let event =
-        epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(2), val_rx.recv())
-            .await
-            .expect("the watchdog re-arms itself (C: callbackRequestDelayed at the tail)")
-            .expect("subscription alive");
+    let event = epics_base_rs::runtime::task::timeout(fact_budget::FACT_BUDGET, val_rx.recv())
+        .await
+        .expect("the watchdog re-arms itself (C: callbackRequestDelayed at the tail)")
+        .expect("subscription alive");
     match &event.delivered_value(&rec.read(), "VAL").unwrap() {
         EpicsValue::ULongArray(v) => assert_eq!(v, &vec![1, 1]),
         other => panic!("VAL must be ULongArray (C DBF_ULONG), got {other:?}"),

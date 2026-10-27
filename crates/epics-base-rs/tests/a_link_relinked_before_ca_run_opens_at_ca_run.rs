@@ -36,7 +36,7 @@ record(ao, "TGT2") { field(VAL, "7") }
     db.process_cp_links_on_connect().await;
 
     let num = |pv: &str| db.get_pv(pv).unwrap().to_f64().unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
     loop {
         db.put_record_field_from_ca("SRC", "VAL", EpicsValue::Double(5.0))
             .await

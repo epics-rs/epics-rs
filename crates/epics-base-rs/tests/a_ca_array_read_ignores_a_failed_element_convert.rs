@@ -87,7 +87,7 @@ async fn delivered_any(db: &PvDatabase, rec: &str, field: &str, want: &[EpicsVal
         .find_map(|(f, _, link)| (f == field).then_some(link))
         .unwrap();
     let link = link.external().expect("a CA link");
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
     loop {
         let got = lset.get_cached_value(LinkRef::new(link.name, link.open));
         if got.as_ref().is_some_and(|got| want.contains(got)) {
@@ -112,7 +112,7 @@ async fn open_links(db: &PvDatabase) {
             let Some(link) = link.external() else {
                 continue;
             };
-            let deadline = Instant::now() + Duration::from_secs(10);
+            let deadline = Instant::now() + fact_budget::FACT_BUDGET;
             while db.external_link_metadata(link).is_none() {
                 assert!(Instant::now() < deadline, "{record}.{field} connects");
                 epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;

@@ -38,7 +38,8 @@ async fn a_long_flnk_chain_runs_on_a_callback_thread() {
 
     db.process_record("HEAD").await.unwrap();
     let last = format!("C{HOPS}");
-    for _ in 0..200 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if db.get_pv(&last).unwrap() == EpicsValue::Double(1.0) {
             return;
         }

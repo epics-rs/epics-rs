@@ -106,7 +106,8 @@ async fn the_labels_a_property_post_announces_are_the_ones_read_on_it() {
     db.put_record_field_from_ca_no_notify("E", "PROC", EpicsValue::Long(1))
         .await
         .unwrap();
-    for _ in 0..400 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if reader.try_recv().is_ok() {
             assert_eq!(labels(&db).first().map(String::as_str), Some("Idle"));
             return;

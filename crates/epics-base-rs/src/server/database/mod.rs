@@ -4951,7 +4951,7 @@ mod tests {
                 answer_tx.send(answers).unwrap();
             })
         };
-        let answers = answer_rx.recv_timeout(std::time::Duration::from_secs(2));
+        let answers = answer_rx.recv_timeout(fact_budget::FACT_BUDGET);
         release_tx.send(()).unwrap();
         holder.join().unwrap();
         asker.join().unwrap();
@@ -5542,10 +5542,10 @@ mod tests {
         // could hang because T1 holds simple_pvs.write and waits
         // for records.read while T2 holds records.write and waits
         // for simple_pvs.read.
-        let r1 = crate::runtime::task::timeout(std::time::Duration::from_secs(2), h1)
+        let r1 = crate::runtime::task::timeout(fact_budget::FACT_BUDGET, h1)
             .await
             .expect("add_pv must not block on add_record");
-        let r2 = crate::runtime::task::timeout(std::time::Duration::from_secs(2), h2)
+        let r2 = crate::runtime::task::timeout(fact_budget::FACT_BUDGET, h2)
             .await
             .expect("add_record must not block on add_pv");
         let r1 = r1.unwrap();
@@ -5797,7 +5797,7 @@ mod tests {
         let db = PvDatabase::new();
         db.ioc_init().await;
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
         while !table().contains("dbCaLink") {
             assert!(
                 std::time::Instant::now() < deadline,

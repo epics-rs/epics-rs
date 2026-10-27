@@ -36,7 +36,8 @@ async fn process(db: &PvDatabase, name: &str) {
 /// that, then read — "the same cycle" is the seq's cycle, not the caller's
 /// call.
 async fn settle(db: &PvDatabase, name: &str) {
-    for _ in 0..400 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if !db
             .get_record(name)
             .expect("record exists")

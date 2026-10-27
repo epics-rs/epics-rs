@@ -629,7 +629,7 @@ mod tests {
             let mut guard = rec.write();
             release.send(()).unwrap();
             resumed
-                .recv_timeout(Duration::from_secs(5))
+                .recv_timeout(fact_budget::FACT_BUDGET)
                 .expect("put 1's task resumed");
             // The few instructions from the hold to the post's lock.
             std::thread::sleep(Duration::from_millis(50));
@@ -720,7 +720,7 @@ mod tests {
             let mut guard = rec.write();
             release.send(()).unwrap();
             resumed
-                .recv_timeout(Duration::from_secs(5))
+                .recv_timeout(fact_budget::FACT_BUDGET)
                 .expect("init's task resumed");
             std::thread::sleep(Duration::from_millis(50));
             guard
@@ -793,7 +793,7 @@ mod tests {
 
         release.send(()).unwrap();
         resumed
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(fact_budget::FACT_BUDGET)
             .expect("the put's task resumed");
     }
 

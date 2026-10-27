@@ -2484,7 +2484,7 @@ mod tests {
                 crate::runtime::task::yield_now().await;
                 u2.flow_ctrl_off();
             });
-        let got = crate::runtime::task::timeout(std::time::Duration::from_secs(2), reader.recv())
+        let got = crate::runtime::task::timeout(fact_budget::FACT_BUDGET, reader.recv())
             .await
             .expect("EVENTS_ON must wake the suspended reader")
             .expect("the held entry is delivered");
@@ -2516,7 +2516,7 @@ mod tests {
         assert_eq!(reader_a.queue().n_duplicates(), 1);
 
         user.flow_ctrl_on();
-        let got = crate::runtime::task::timeout(std::time::Duration::from_secs(2), reader_a.recv())
+        let got = crate::runtime::task::timeout(fact_budget::FACT_BUDGET, reader_a.recv())
             .await
             .expect("a duplicate anywhere on the queue must release the drain")
             .expect("A's entry is delivered");
@@ -2864,7 +2864,7 @@ mod tests {
             f();
             let _ = tx.send(());
         });
-        rx.recv_timeout(std::time::Duration::from_secs(10))
+        rx.recv_timeout(fact_budget::FACT_BUDGET)
             .expect("deadlocked: user state dropped under the EvQue lock");
     }
 

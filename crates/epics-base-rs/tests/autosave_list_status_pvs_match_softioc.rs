@@ -103,8 +103,8 @@ fn posts(db: &PvDatabase, name: &str, rx: &mut EventReader) -> Vec<(String, u16)
     out
 }
 
-/// Add each reader's posts to its `seen` until `done` holds of them, or 30 s
-/// pass: the save task reports on its own one-second passes, later under
+/// Add each reader's posts to its `seen` until `done` holds of them, or the fact
+/// budget runs out: the save task reports on its own one-second passes, later under
 /// load. The caller's assertion names what was missing.
 async fn until(
     db: &PvDatabase,
@@ -113,7 +113,7 @@ async fn until(
     seen: &mut [Vec<(String, u16)>],
     done: impl Fn(&[Vec<(String, u16)>]) -> bool,
 ) {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
     loop {
         for ((name, rx), seen) in names.iter().zip(rx.iter_mut()).zip(seen.iter_mut()) {
             seen.extend(posts(db, name, rx));

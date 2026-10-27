@@ -33,7 +33,7 @@ async fn the_ioc_init_caller_flushes_its_own_errlog_lines() {
     });
     errlog_vprintf(format_args!("errlog worker held\n"));
     entered
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(fact_budget::FACT_BUDGET)
         .expect("worker entered the listener");
 
     let bridge = BlockingBridge::capture();
@@ -64,7 +64,8 @@ async fn the_ioc_init_caller_flushes_its_own_errlog_lines() {
 
     release.send(()).unwrap();
     let mut at_return = None;
-    for _ in 0..1000 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if let Ok(text) = done.try_recv() {
             at_return = Some(text);
             break;

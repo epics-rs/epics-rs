@@ -110,7 +110,7 @@ async fn a_job_after_the_failed_ioc_init_runs_on_a_main_of_its_own() {
         std::thread::current().name().map(str::to_owned)
     })
     .unwrap();
-    let name = epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(10), later)
+    let name = epics_base_rs::runtime::task::timeout(fact_budget::FACT_BUDGET, later)
         .await
         .expect("the job waited behind the parked _main_")
         .unwrap();

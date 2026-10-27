@@ -143,7 +143,7 @@ async fn a_pending_interrupt_processes_before_the_first_event() {
         busy.send(()).unwrap();
         let _ = held.recv_timeout(Duration::from_secs(30));
     });
-    is_busy.recv_timeout(Duration::from_secs(10)).unwrap();
+    is_busy.recv_timeout(fact_budget::FACT_BUDGET).unwrap();
     pulse.try_send(()).unwrap();
     pulse.try_send(()).unwrap();
     let releaser = std::thread::spawn(move || {

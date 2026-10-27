@@ -129,7 +129,8 @@ async fn completes_on(prio: i16) -> Vec<String> {
         .join()
         .unwrap();
 
-    for _ in 0..500 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if !db.get_record("AI").unwrap().read().is_processing() {
             break;
         }

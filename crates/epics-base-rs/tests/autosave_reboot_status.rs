@@ -57,7 +57,8 @@ async fn reboot_pvs(dir: &std::path::Path, lines: &[&str]) -> (f64, String, Stri
         .join()
         .unwrap();
         // SR_rebootTime is the task's last put at its start.
-        for _ in 0..100 {
+        let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+        while std::time::Instant::now() < deadline {
             if is_time(&read(&config.db).2) {
                 break;
             }

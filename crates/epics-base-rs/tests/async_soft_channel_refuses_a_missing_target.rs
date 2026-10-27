@@ -200,7 +200,7 @@ async fn a_put_notify_parked_on_a_detached_record_waits_for_the_next_cycle() {
     db.put_record_field_from_ca_no_notify("ACB", "PROC", EpicsValue::Long(1))
         .await
         .unwrap();
-    epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(5), rx)
+    epics_base_rs::runtime::task::timeout(fact_budget::FACT_BUDGET, rx)
         .await
         .expect("the next cycle restarts the put-notify")
         .expect("the completion sender must not be dropped");

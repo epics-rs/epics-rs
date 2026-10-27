@@ -109,7 +109,8 @@ mod tests {
             .unwrap()
             .0;
         db.scan_once(b"ONCE");
-        for _ in 0..200 {
+        let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+        while std::time::Instant::now() < deadline {
             if !RAN_ON.lock().unwrap().is_empty() {
                 break;
             }

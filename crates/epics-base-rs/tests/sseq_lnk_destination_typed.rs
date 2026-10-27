@@ -129,7 +129,8 @@ async fn kick(db: &PvDatabase, name: &str) {
 /// Poll the probe until it has been written, then return the value. The sseq
 /// machine fires each step in a spawned re-entry, so the kick returns first.
 async fn poll_put(cell: &Arc<Mutex<Option<EpicsValue>>>, label: &str) -> EpicsValue {
-    for _ in 0..400 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if let Some(v) = cell.lock().unwrap().clone() {
             return v;
         }

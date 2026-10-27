@@ -386,7 +386,7 @@ async fn holders_borrowing_set_mates_without_a_view_do_not_wait_on_each_other() 
     // H is AI's set-mate, AOR AO's.
     read("AI", "H", "AOR.HOPR");
     read("AO", "AOR", "H.HOPR");
-    let wait = std::time::Duration::from_secs(10);
+    let wait = fact_budget::FACT_BUDGET;
     let got: Vec<_> = (0..2)
         .map(|_| done_rx.recv_timeout(wait).expect("both holders finish"))
         .collect();
@@ -422,7 +422,7 @@ async fn two_holders_reading_each_other_without_a_view_both_read() {
     };
     read("AI", "AO.HOPR");
     read("AO", "AI.HOPR");
-    let wait = std::time::Duration::from_secs(10);
+    let wait = fact_budget::FACT_BUDGET;
     for _ in 0..2 {
         let (me, got) = done_rx.recv_timeout(wait).expect("both holders read");
         assert_eq!(got, Some(EpicsValue::Double(10.0)), "{me}");
@@ -463,7 +463,7 @@ async fn a_holder_serves_a_read_owed_before_it_waits() {
     };
     read("M", "AO.HOPR", 20);
     read("AO", "AI.HOPR", 100);
-    let wait = std::time::Duration::from_secs(10);
+    let wait = fact_budget::FACT_BUDGET;
     for _ in 0..3 {
         let (me, got) = done_rx.recv_timeout(wait).expect("all three finish");
         assert_eq!(got, Some(EpicsValue::Double(10.0)), "{me}");
@@ -501,7 +501,7 @@ async fn a_read_whose_holder_waits_on_the_reader_is_refused() {
             done.send(("AO", got.flatten())).unwrap();
         });
     }
-    let wait = std::time::Duration::from_secs(10);
+    let wait = fact_budget::FACT_BUDGET;
     for _ in 0..2 {
         let (me, got) = done_rx.recv_timeout(wait).expect("both threads finish");
         assert_eq!(got, None, "{me}");
@@ -542,7 +542,7 @@ async fn a_read_whose_holder_waits_behind_another_on_the_reader_is_refused() {
             done.send(("AO", got.flatten())).unwrap();
         });
     }
-    let wait = std::time::Duration::from_secs(10);
+    let wait = fact_budget::FACT_BUDGET;
     for _ in 0..3 {
         let (me, got) = done_rx.recv_timeout(wait).expect("all three finish");
         assert_eq!(got, None, "{me}");

@@ -82,7 +82,8 @@ fn set_config(save_path: PathBuf) -> SaveSetConfig {
 }
 
 async fn first_post(db: &PvDatabase, name: &str, rx: &mut EventReader) -> (EpicsValue, u16, u16) {
-    for _ in 0..500 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if let Ok(e) = rx.try_recv() {
             return (
                 e.delivered_value(&db.get_record(name).unwrap().read(), "VAL")
@@ -93,7 +94,7 @@ async fn first_post(db: &PvDatabase, name: &str, rx: &mut EventReader) -> (Epics
         }
         sleep(Duration::from_millis(10)).await;
     }
-    panic!("no post within 5 s");
+    panic!("no post within the fact budget");
 }
 
 /// The heartbeat toggles once per reporting pass, `(SR_heartbeat + 1) % 2`

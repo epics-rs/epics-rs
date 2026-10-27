@@ -82,9 +82,10 @@ async fn trigger_bo(osv: i16, ivoa: i16) -> (PvDatabase, Trigger) {
     (db, dev)
 }
 
-/// Whether `R` leaves PACT within two seconds.
+/// Whether `R` leaves PACT within the fact budget.
 async fn idle(db: &PvDatabase) -> bool {
-    for _ in 0..400 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if !db.get_record("R").unwrap().read().is_processing() {
             return true;
         }
@@ -132,7 +133,8 @@ async fn a_put_during_pact_posts_nothing() {
         .await
         .unwrap();
     dev.release();
-    for _ in 0..400 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if dev.held.lock().unwrap().is_some() {
             break;
         }

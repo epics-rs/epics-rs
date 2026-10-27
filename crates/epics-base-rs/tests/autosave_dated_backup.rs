@@ -84,7 +84,8 @@ async fn every_list_gets_a_dated_backup_from_its_pvs() {
     let task = mgr.clone().start(db.clone());
     sleep(Duration::from_millis(500)).await;
     assert!(dated(dir.path(), "a").is_empty(), "inside the period");
-    for _ in 0..40 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if !dated(dir.path(), "a").is_empty() && !dated(dir.path(), "b").is_empty() {
             break;
         }
@@ -148,7 +149,8 @@ async fn a_dated_backup_that_cannot_be_written_fails_the_list() {
     );
     let task = mgr.clone().start(db.clone());
     let set = mgr.sets()[0].0.clone();
-    for _ in 0..40 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if set.list_status().code == SrStatus::Fail {
             break;
         }
@@ -180,7 +182,8 @@ async fn a_dated_backup_restarts_the_period() {
     );
     let task = mgr.clone().start(db.clone());
     let mut first = Vec::new();
-    for _ in 0..60 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         first = dated(dir.path(), "a");
         if !first.is_empty() {
             break;

@@ -55,7 +55,8 @@ fn read(db: &PvDatabase, pv: &str) -> i16 {
 }
 
 async fn settled(db: &PvDatabase, pv: &str, want: i16) {
-    for _ in 0..400 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if db.get_pv(pv).ok().and_then(|v| v.to_f64()) == Some(f64::from(want)) {
             return;
         }

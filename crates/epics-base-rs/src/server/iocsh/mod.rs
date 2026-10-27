@@ -2019,7 +2019,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || tx.send(make_shell().run_main_prompt()).unwrap());
         assert_eq!(
-            rx.recv_timeout(std::time::Duration::from_secs(10)),
+            rx.recv_timeout(fact_budget::FACT_BUDGET),
             Ok(Ok(())),
             "the second prompt read stdin"
         );
@@ -4300,7 +4300,7 @@ mod tests {
             halted.show_line()
         );
         assert!(halted.resume(), "epicsThreadResume must find it suspended");
-        rx.recv_timeout(std::time::Duration::from_secs(5))
+        rx.recv_timeout(fact_budget::FACT_BUDGET)
             .expect("epicsThreadResume must release the halted shell");
     }
 

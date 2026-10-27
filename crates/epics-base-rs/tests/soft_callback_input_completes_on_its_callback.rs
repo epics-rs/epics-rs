@@ -106,7 +106,8 @@ async fn an_async_soft_input_completes_on_the_band_its_prio_names_now() {
         .join()
         .unwrap();
 
-    for _ in 0..500 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if !db.get_record("AI").unwrap().read().is_processing() {
             break;
         }

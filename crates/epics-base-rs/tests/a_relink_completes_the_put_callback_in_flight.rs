@@ -98,7 +98,7 @@ async fn the_old_links_late_answer_does_not_complete_the_next_cycle() {
     // completes runs `process()` later, from a callback (`dbLink.c:450-457`):
     // in C as here, a cycle started before that pass is the one it ends. The
     // pass commits cycle 1's alarm, so A leaves its init UDF/INVALID there.
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
     while db.get_pv("A.SEVR").unwrap().to_f64() != Some(0.0) {
         assert!(
             Instant::now() < deadline,

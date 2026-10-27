@@ -33,7 +33,7 @@ async fn the_script_after_iocinit_runs_with_the_task_saving() {
         .startup_script(d.join("st.cmd").to_str().unwrap())
         .run_outcome(move |_| async move {
             epics_base_rs::server::db_server::announce_serving("probe");
-            let deadline = Instant::now() + Duration::from_secs(30);
+            let deadline = Instant::now() + fact_budget::FACT_BUDGET;
             loop {
                 let text = std::fs::read_to_string(&sav).unwrap_or_default();
                 if text.lines().any(|l| l == "A 3") {

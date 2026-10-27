@@ -153,7 +153,8 @@ async fn seq_posts_from_its_own_copies_as_softioc_does() {
             .await
             .unwrap();
         // The groups run from the callback task; wait for `asyncFinish`.
-        for _ in 0..400 {
+        let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+        while std::time::Instant::now() < deadline {
             if !cell.read().is_processing() {
                 break;
             }

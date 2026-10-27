@@ -4,8 +4,6 @@
 //! (`dbNotify.c:528-530`). One case per refusal site: a pp field's conversion
 //! and the PROC intercept's.
 
-use std::time::Duration;
-
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::records::calcout::CalcoutRecord;
 use epics_base_rs::types::EpicsValue;
@@ -39,7 +37,7 @@ async fn queued_refusal_succeeds(field: &str) -> bool {
         .into_handle()
         .expect("the queued put waits for its replay");
 
-    let wait = Duration::from_secs(5);
+    let wait = fact_budget::FACT_BUDGET;
     assert!(
         epics_base_rs::runtime::task::timeout(wait, first)
             .await

@@ -106,7 +106,7 @@ async fn an_async_soft_input_reads_its_inp_link() {
     // The reading lands in the completion's pass, which clears PACT.
     for name in ["A:AI", "A:LI"] {
         let rec = db.get_record(name).unwrap();
-        let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let until = std::time::Instant::now() + fact_budget::FACT_BUDGET;
         while rec.read().is_processing() {
             assert!(std::time::Instant::now() < until, "{name} never completed");
             epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(5)).await;

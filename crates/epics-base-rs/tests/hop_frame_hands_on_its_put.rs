@@ -129,7 +129,7 @@ async fn a_hop_frames_put_carries_its_wait_set_on() {
                 .is_err(),
             "{rule}: completed before T3B's ODLY ran out"
         );
-        epics_base_rs::runtime::task::timeout(Duration::from_secs(3), rx)
+        epics_base_rs::runtime::task::timeout(fact_budget::FACT_BUDGET, rx)
             .await
             .expect("completes once T3B finishes")
             .unwrap();

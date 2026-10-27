@@ -55,7 +55,7 @@ async fn a_local_ca_link_reads_an_unnamed_mbbi_state_as_its_empty_string() {
     assert_eq!(num(&db, "S.STAT"), 14.0, "LINK");
     assert_eq!(num(&db, "S.SEVR"), 3.0, "INVALID");
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
     loop {
         process(&db, "S").await;
         if num(&db, "S.SEVR") == 0.0 || Instant::now() > deadline {
@@ -100,7 +100,7 @@ async fn a_local_string_monitors_event_is_the_links_alarm_and_time() {
         .expect("O has an OUT link");
     let out = out.external().expect("a CA link");
     let link = LinkRef::new(out.name, out.open);
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
     let got = loop {
         if let EnumString::Got(s) = lset.get_cached_enum_string(link) {
             break s.as_str_lossy().into_owned();
@@ -126,7 +126,7 @@ async fn open_links(db: &PvDatabase) {
             let Some(link) = link.external() else {
                 continue;
             };
-            let deadline = Instant::now() + Duration::from_secs(10);
+            let deadline = Instant::now() + fact_budget::FACT_BUDGET;
             while db.external_link_metadata(link).is_none() {
                 assert!(Instant::now() < deadline, "{record}.{field} connects");
                 epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;

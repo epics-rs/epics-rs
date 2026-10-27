@@ -355,6 +355,18 @@ monitor zSpeed;
 evflag  zMotVel_mon;
 sync    zSpeed zMotVel_mon;
 
+/* C defect: put thSpeed, th2Speed and zSpeed themselves, which are
+ * monitored: the echo of the previous speed put could land before a put,
+ * which then wrote that speed. The puts go through these. */
+double  thSpeedCmd;
+assign  thSpeedCmd to "{P}{M_THETA}.VELO";
+
+double  th2SpeedCmd;
+assign  th2SpeedCmd to "{P}{M_THETA2}.VELO";
+
+double  zSpeedCmd;
+assign  zSpeedCmd to "{P}{M_Z}.VELO";
+
 double  thetaMotRdbk;
 assign  thetaMotRdbk to "{P}{M_THETA}.RBV";
 monitor thetaMotRdbk;
@@ -405,6 +417,21 @@ assign  zMotSet to "{P}{M_Z}.SET";
 monitor zMotSet;
 evflag  zMotSet_mon;
 sync    zMotSet zMotSet_mon;
+
+/* C defect: put useSetMode and the motor .SET flags themselves, which
+ * are monitored: the echo of the previous put could land before a put,
+ * which then wrote that flag. The puts go through these. */
+short   useSetModeCmd;
+assign  useSetModeCmd to "{P}ml_monoUseSet";
+
+short   thetaMotSetCmd;
+assign  thetaMotSetCmd to "{P}{M_THETA}.SET";
+
+short   theta2MotSetCmd;
+assign  theta2MotSetCmd to "{P}{M_THETA2}.SET";
+
+short   zMotSetCmd;
+assign  zMotSetCmd to "{P}{M_Z}.SET";
 
 /* tweaking PV's */
 double  ETweakVal;
@@ -976,10 +1003,13 @@ state move_ml_mono {
 		thSpeed = newThSpeed;
 		th2Speed = newThSpeed;
 		zSpeed = newZSpeed;
-		pvPut(thSpeed);
-		pvPut(th2Speed);
+		thSpeedCmd = newThSpeed;
+		th2SpeedCmd = newThSpeed;
+		zSpeedCmd = newZSpeed;
+		pvPut(thSpeedCmd);
+		pvPut(th2SpeedCmd);
 		if (ccMode == MODE_NORMAL) {
-			pvPut(zSpeed);
+			pvPut(zSpeedCmd);
 		}
 		thetaMotCmd = thetaMotDesired;
 		theta2MotCmd = theta2MotDesired;
@@ -1093,9 +1123,12 @@ state thetaMotStopped {
 		thSpeed = oldThSpeed;
 		th2Speed = oldTh2Speed;
 		zSpeed = oldZSpeed;
-		pvPut(thSpeed);
-		pvPut(th2Speed);
-		pvPut(zSpeed);
+		thSpeedCmd = oldThSpeed;
+		th2SpeedCmd = oldTh2Speed;
+		zSpeedCmd = oldZSpeed;
+		pvPut(thSpeedCmd);
+		pvPut(th2SpeedCmd);
+		pvPut(zSpeedCmd);
 		causedMove = 0;
 	} state waitForCmndEnter
 
@@ -1313,37 +1346,43 @@ state init {
 state update {
 	when (efTestAndClear(useSetMode_mon)) {
 		if (thetaMotSet != useSetMode) {
-			thetaMotSet = useSetMode;
-			pvPut(thetaMotSet);
+			thetaMotSetCmd = useSetMode;
+			thetaMotSet = thetaMotSetCmd;
+			pvPut(thetaMotSetCmd);
 		}
 		if (theta2MotSet != useSetMode) {
-			theta2MotSet = useSetMode;
-			pvPut(theta2MotSet);
+			theta2MotSetCmd = useSetMode;
+			theta2MotSet = theta2MotSetCmd;
+			pvPut(theta2MotSetCmd);
 		}
 		if (zMotSet != useSetMode) {
-			zMotSet = useSetMode;
-			pvPut(zMotSet);
+			zMotSetCmd = useSetMode;
+			zMotSet = zMotSetCmd;
+			pvPut(zMotSetCmd);
 		}
 	} state update
 
 	when (efTestAndClear(thetaMotSet_mon)) {
 		if (useSetMode != thetaMotSet) {
-			useSetMode = thetaMotSet;
-			pvPut(useSetMode);
+			useSetModeCmd = thetaMotSet;
+			useSetMode = useSetModeCmd;
+			pvPut(useSetModeCmd);
 		}
 	} state update
 
 	when (efTestAndClear(theta2MotSet_mon)) {
 		if (useSetMode != theta2MotSet) {
-			useSetMode = theta2MotSet;
-			pvPut(useSetMode);
+			useSetModeCmd = theta2MotSet;
+			useSetMode = useSetModeCmd;
+			pvPut(useSetModeCmd);
 		}
 	} state update
 
 	when (efTestAndClear(zMotSet_mon)) {
 		if (useSetMode != zMotSet) {
-			useSetMode = zMotSet;
-			pvPut(useSetMode);
+			useSetModeCmd = zMotSet;
+			useSetMode = useSetModeCmd;
+			pvPut(useSetModeCmd);
 		}
 	} state update
 }

@@ -395,6 +395,18 @@ monitor zSpeed;
 evflag  zMotVel_mon;
 sync    zSpeed zMotVel_mon;
 
+/* C defect: put thSpeed, ySpeed and zSpeed themselves, which are
+ * monitored: the echo of the previous speed put could land before a put,
+ * which then wrote that speed. The puts go through these. */
+double  thSpeedCmd;
+assign  thSpeedCmd to "{P}{M_THETA}.VELO";
+
+double  ySpeedCmd;
+assign  ySpeedCmd to "{P}{M_Y}.VELO";
+
+double  zSpeedCmd;
+assign  zSpeedCmd to "{P}{M_Z}.VELO";
+
 short speedControl;
 assign  speedControl to "{P}{MONO}SpeedCtrl";
 monitor speedControl;
@@ -442,6 +454,21 @@ assign  zMotSet to "{P}{M_Z}.SET";
 monitor zMotSet;
 evflag  zMotSet_mon;
 sync    zMotSet zMotSet_mon;
+
+/* C defect: put useSetMode and the motor .SET flags themselves, which
+ * are monitored: the echo of the previous put could land before a put,
+ * which then wrote that flag. The puts go through these. */
+short   useSetModeCmd;
+assign  useSetModeCmd to "{P}{MONO}UseSet";
+
+short   thetaMotSetCmd;
+assign  thetaMotSetCmd to "{P}{M_THETA}.SET";
+
+short   yMotSetCmd;
+assign  yMotSetCmd to "{P}{M_Y}.SET";
+
+short   zMotSetCmd;
+assign  zMotSetCmd to "{P}{M_Z}.SET";
 
 /* yOffset (y dist from incident/exit beams to center of rotation) */
 double  yOffset;
@@ -954,12 +981,15 @@ state moveKohzu {
 				thSpeed = newThSpeed;
 				ySpeed = newYSpeed;
 				zSpeed = newZSpeed;
-				pvPut(thSpeed);
+				thSpeedCmd = newThSpeed;
+				ySpeedCmd = newYSpeed;
+				zSpeedCmd = newZSpeed;
+				pvPut(thSpeedCmd);
 				if (ccMode == 0 || ccMode == 2) {
-					pvPut(ySpeed);
+					pvPut(ySpeedCmd);
 				}
 				if (ccMode == 0 || ccMode == 3) {
-					pvPut(zSpeed);
+					pvPut(zSpeedCmd);
 				}
 			}
 			thetaMotCmd = thetaMotDesired;
@@ -1085,9 +1115,12 @@ state thetaMotStopped {
 			thSpeed = oldThSpeed;
 			ySpeed = oldYSpeed;
 			zSpeed = oldZSpeed;
-			pvPut(thSpeed);
-			pvPut(ySpeed);
-			pvPut(zSpeed);
+			thSpeedCmd = oldThSpeed;
+			ySpeedCmd = oldYSpeed;
+			zSpeedCmd = oldZSpeed;
+			pvPut(thSpeedCmd);
+			pvPut(ySpeedCmd);
+			pvPut(zSpeedCmd);
 		}
 		if (kohzuCtlDebug) %%printf("kohzuCtl:thetaMotStopped: ySpeed = %f\n", ySpeed);
 		causedMove = 0;
@@ -1293,37 +1326,43 @@ state init {
 state update {
 	when (efTestAndClear(useSetMode_mon)) {
 		if (thetaMotSet != useSetMode) {
-			thetaMotSet = useSetMode;
-			pvPut(thetaMotSet);
+			thetaMotSetCmd = useSetMode;
+			thetaMotSet = thetaMotSetCmd;
+			pvPut(thetaMotSetCmd);
 		}
 		if (yMotSet != useSetMode) {
-			yMotSet = useSetMode;
-			pvPut(yMotSet);
+			yMotSetCmd = useSetMode;
+			yMotSet = yMotSetCmd;
+			pvPut(yMotSetCmd);
 		}
 		if (zMotSet != useSetMode) {
-			zMotSet = useSetMode;
-			pvPut(zMotSet);
+			zMotSetCmd = useSetMode;
+			zMotSet = zMotSetCmd;
+			pvPut(zMotSetCmd);
 		}
 	} state update
 
 	when (efTestAndClear(thetaMotSet_mon)) {
 		if (useSetMode != thetaMotSet) {
-			useSetMode = thetaMotSet;
-			pvPut(useSetMode);
+			useSetModeCmd = thetaMotSet;
+			useSetMode = useSetModeCmd;
+			pvPut(useSetModeCmd);
 		}
 	} state update
 
 	when (efTestAndClear(yMotSet_mon)) {
 		if (useSetMode != yMotSet) {
-			useSetMode = yMotSet;
-			pvPut(useSetMode);
+			useSetModeCmd = yMotSet;
+			useSetMode = useSetModeCmd;
+			pvPut(useSetModeCmd);
 		}
 	} state update
 
 	when (efTestAndClear(zMotSet_mon)) {
 		if (useSetMode != zMotSet) {
-			useSetMode = zMotSet;
-			pvPut(useSetMode);
+			useSetModeCmd = zMotSet;
+			useSetMode = useSetModeCmd;
+			pvPut(useSetModeCmd);
 		}
 	} state update
 }

@@ -467,7 +467,8 @@ sync    zMotSet zMotSet_mon;
 
 /* C defect: put useSetMode and the motor .SET flags themselves, which
  * are monitored: the echo of the previous put could land before a put,
- * which then wrote that flag. The puts go through these. */
+ * which then wrote that flag. The puts, and updateSet's gets, go
+ * through these. */
 short   useSetModeCmd;
 assign  useSetModeCmd to "{P}KohzuUseSetBO";
 
@@ -479,6 +480,13 @@ assign  yMotSetCmd to "{P}{M_Y}.SET";
 
 short   zMotSetCmd;
 assign  zMotSetCmd to "{P}{M_Z}.SET";
+
+/* Each flag as updateSet last put or took it, and the one it mirrors. */
+short   useSetModeLast;
+short   thetaMotSetLast;
+short   yMotSetLast;
+short   zMotSetLast;
+short   mirrorSet;
 
 /* tweaking PV's */
 double  ETweakVal;
@@ -1470,49 +1478,65 @@ state update {
 ss updateSet {
 state init {
 	when () {
+		useSetModeLast = useSetMode;
+		thetaMotSetLast = thetaMotSet;
+		yMotSetLast = yMotSet;
+		zMotSetLast = zMotSet;
 	} state update
 }
 
+/* C defect: compared a flag's monitored value with the others', which
+ * can hold the late echo of an earlier mirror put, and mirrored that
+ * echo back as a new setting. An arm takes its flag only while the PV
+ * still holds it, and mirror compares with the values updateSet last
+ * put or took, never with a monitored one. */
 state update {
 	when (efTestAndClear(useSetMode_mon)) {
-		if (thetaMotSet != useSetMode) {
-			thetaMotSetCmd = useSetMode;
-			thetaMotSet = thetaMotSetCmd;
-			pvPut(thetaMotSetCmd);
-		}
-		if (yMotSet != useSetMode) {
-			yMotSetCmd = useSetMode;
-			yMotSet = yMotSetCmd;
-			pvPut(yMotSetCmd);
-		}
-		if (zMotSet != useSetMode) {
-			zMotSetCmd = useSetMode;
-			zMotSet = zMotSetCmd;
-			pvPut(zMotSetCmd);
-		}
-	} state update
+		pvGet(useSetModeCmd);
+		if (useSetModeCmd == useSetMode) useSetModeLast = useSetMode;
+		mirrorSet = useSetModeLast;
+	} state mirror
 
 	when (efTestAndClear(thetaMotSet_mon)) {
-		if (useSetMode != thetaMotSet) {
-			useSetModeCmd = thetaMotSet;
-			useSetMode = useSetModeCmd;
-			pvPut(useSetModeCmd);
-		}
-	} state update
+		pvGet(thetaMotSetCmd);
+		if (thetaMotSetCmd == thetaMotSet) thetaMotSetLast = thetaMotSet;
+		mirrorSet = thetaMotSetLast;
+	} state mirror
 
 	when (efTestAndClear(yMotSet_mon)) {
-		if (useSetMode != yMotSet) {
-			useSetModeCmd = yMotSet;
-			useSetMode = useSetModeCmd;
-			pvPut(useSetModeCmd);
-		}
-	} state update
+		pvGet(yMotSetCmd);
+		if (yMotSetCmd == yMotSet) yMotSetLast = yMotSet;
+		mirrorSet = yMotSetLast;
+	} state mirror
 
 	when (efTestAndClear(zMotSet_mon)) {
-		if (useSetMode != zMotSet) {
-			useSetModeCmd = zMotSet;
-			useSetMode = useSetModeCmd;
+		pvGet(zMotSetCmd);
+		if (zMotSetCmd == zMotSet) zMotSetLast = zMotSet;
+		mirrorSet = zMotSetLast;
+	} state mirror
+}
+
+state mirror {
+	when () {
+		if (useSetModeLast != mirrorSet) {
+			useSetModeLast = mirrorSet;
+			useSetModeCmd = mirrorSet;
 			pvPut(useSetModeCmd);
+		}
+		if (thetaMotSetLast != mirrorSet) {
+			thetaMotSetLast = mirrorSet;
+			thetaMotSetCmd = mirrorSet;
+			pvPut(thetaMotSetCmd);
+		}
+		if (yMotSetLast != mirrorSet) {
+			yMotSetLast = mirrorSet;
+			yMotSetCmd = mirrorSet;
+			pvPut(yMotSetCmd);
+		}
+		if (zMotSetLast != mirrorSet) {
+			zMotSetLast = mirrorSet;
+			zMotSetCmd = mirrorSet;
+			pvPut(zMotSetCmd);
 		}
 	} state update
 }

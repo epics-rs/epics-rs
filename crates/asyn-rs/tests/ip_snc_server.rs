@@ -95,11 +95,27 @@ async fn boot() -> Ioc {
     let scan = ScanOwner::start(db.clone());
     asyn_rs::register_test_ip_server_dbd();
     sh(&db, &format!("seq ipSNCServer, \"P=ipsnc:, PORT={name}\"")).await;
-    Ioc {
+    let ioc = Ioc {
         db,
         port,
         _scan: scan,
-    }
+    };
+    // waitConnect's put follows initialize's registerInterruptUser, and the
+    // listener announces a connection only to the users it has then
+    // (drvAsynIPServerPort.c:388-398).
+    assert!(
+        ioc.eventually(|ioc| ioc
+            .db
+            .get_record("ipsnc:connected")
+            .unwrap()
+            .read()
+            .common
+            .udf
+            == 0)
+            .await,
+        "waitConnect's put"
+    );
+    ioc
 }
 
 impl Ioc {

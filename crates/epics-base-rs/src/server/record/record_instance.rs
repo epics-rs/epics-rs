@@ -5497,6 +5497,9 @@ pub(crate) struct RecordCold {
     /// cycle's [`crate::server::record::ProcessAction::PutAfterEpilogue`], so
     /// no other cycle pays for it.
     alarm_reset: crate::server::recgbl::EventMask,
+    /// The timers [`crate::server::record::ProcessAction::DelayedCallbackAfter`]
+    /// arms, apart from `reprocess_generation`.
+    delayed_callbacks: crate::server::database::DelayedCallbackTimers,
 }
 
 impl RecordCold {
@@ -8681,8 +8684,14 @@ impl RecordInstance {
                 info: HashMap::new(),
                 q_form: None,
                 alarm_reset: crate::server::recgbl::EventMask::NONE,
+                delayed_callbacks: Default::default(),
             }),
         }
+    }
+
+    /// The timers of this record's own `CALLBACK`s.
+    pub(crate) fn delayed_callbacks(&self) -> &crate::server::database::DelayedCallbackTimers {
+        &self.cold.delayed_callbacks
     }
 
     /// Record what this cycle's `recGblResetAlarms` returned. See

@@ -2475,8 +2475,15 @@ pub enum ProcessAction {
     /// `process()` to consume, so a foreign scan, a caput or a FLNK arriving
     /// inside the delay window cannot take what the timer owns. The
     /// [`DelayedCallback`] travels with the timer, as C's function pointer
-    /// does with its `CALLBACK`.
+    /// does with its `CALLBACK`. Arming restarts that callback's timer only;
+    /// the record's other callbacks and its async re-entry stay pending.
     DelayedCallbackAfter(std::time::Duration, DelayedCallback),
+
+    /// C `epicsTimerCancel` on one of the record's own `CALLBACK`s
+    /// (`scalerRecord.c:645`): a pending [`Self::DelayedCallbackAfter`] timer
+    /// on that callback fires nothing. The record's other callbacks and its
+    /// async re-entry stay pending.
+    CancelDelayedCallback(DelayedCallback),
 
     /// C throttle's `callbackRequestDelayed(&delayFuncCb, ..)`
     /// (`throttleRecord.c:593`), whose handler runs `valuePut` under
@@ -3016,10 +3023,26 @@ impl<T> IntoIterator for CycleList<T> {
 /// timer was armed on, handed back to [`Record::delayed_callback_fire`]. A
 /// record with one callback (bo, busy) arms [`Self::ONLY`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DelayedCallback(pub u8);
+pub struct DelayedCallback(u8);
 
 impl DelayedCallback {
-    pub const ONLY: Self = Self(0);
+    /// How many callbacks one record can arm: scaler's update, delay and
+    /// autocount (`scalerRecord.c:269-294`) are the most.
+    pub const COUNT: usize = 3;
+    pub const ONLY: Self = Self::new(0);
+
+    /// The record's callback `id`, below [`Self::COUNT`].
+    pub const fn new(id: u8) -> Self {
+        assert!(
+            (id as usize) < Self::COUNT,
+            "DelayedCallback id out of range"
+        );
+        Self(id)
+    }
+
+    pub(crate) const fn index(self) -> usize {
+        self.0 as usize
+    }
 }
 
 /// What the [`ProcessAction::DelayedCallbackAfter`] timer does once the

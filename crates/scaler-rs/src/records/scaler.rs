@@ -64,13 +64,13 @@ pub type ScalerDset = Arc<Mutex<Box<dyn ScalerDriver>>>;
 ///
 /// C `pupdateCallback`, whose `updateCallbackFunc` (`scalerRecord.c:203-214`)
 /// calls `updateCounts` and never processes the record.
-const UPDATE_CALLBACK: DelayedCallback = DelayedCallback(0);
+const UPDATE_CALLBACK: DelayedCallback = DelayedCallback::new(0);
 /// C `pdelayCallback`, whose `delayCallbackFunc` (`:216-231`) starts a user
 /// count DLY seconds after the CNT write.
-const DELAY_CALLBACK: DelayedCallback = DelayedCallback(1);
+const DELAY_CALLBACK: DelayedCallback = DelayedCallback::new(1);
 /// C `pautoCallback`, whose `autoCallbackFunc` (`:233-239`) ends the
 /// autocount hold.
-const AUTO_CALLBACK: DelayedCallback = DelayedCallback(2);
+const AUTO_CALLBACK: DelayedCallback = DelayedCallback::new(2);
 
 pub struct ScalerRecord {
     // --- Control/Status ---
@@ -998,7 +998,8 @@ impl Record for ScalerRecord {
                             USER_STATE_WAITING => {
                                 // C:643-647 — `if (pdelayCallback->timer)
                                 // epicsTimerCancel(...)`.
-                                self.special_actions.push(ProcessAction::CancelReprocess);
+                                self.special_actions
+                                    .push(ProcessAction::CancelDelayedCallback(DELAY_CALLBACK));
                                 self.us = USER_STATE_IDLE;
                             }
                             USER_STATE_REQSTART => {

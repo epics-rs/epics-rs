@@ -55,7 +55,9 @@ pub use processing::{
     FieldPut, HeldInstance, InitHold, InputLinkTexts, PostItem, PostRule, ProcStack,
     ProcessCallback, TokenWatch, hop_floor,
 };
-pub(crate) use processing::{NotifiedRead, ReadPolicy, seed_record_constants};
+pub(crate) use processing::{
+    DelayedCallbackTimers, NotifiedRead, ReadPolicy, seed_record_constants,
+};
 #[cfg(feature = "test-hooks")]
 pub use record_lock::fresh_hold_hook;
 pub(crate) use record_lock::{

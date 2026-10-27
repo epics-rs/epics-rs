@@ -130,8 +130,9 @@ use crate::server::record::record_instance::{
     FieldMetaSource, ForwardTarget, FwdLink, FwdLinkRest, LinkScanMove, ScanAdd, ScanMove,
 };
 use crate::server::record::{
-    CycleHooks, CycleLink, InputFetchPolicy, NotifyWaitSet, OwnFrame, OwnRecord, PactExit,
-    RawSoftEntry, RecordCell, RecordInstance, RecordMut, SoftRead, SoftReading, StampPoint,
+    CycleHooks, CycleLink, DelayedCallback, InputFetchPolicy, NotifyWaitSet, OwnFrame, OwnRecord,
+    PactExit, RawSoftEntry, RecordCell, RecordInstance, RecordMut, SoftRead, SoftReading,
+    StampPoint,
 };
 use crate::types::{DbFieldType, EpicsValue, PvString, RecordName};
 
@@ -708,6 +709,47 @@ pub struct TokenWatch {
 impl TokenWatch {
     pub(crate) fn is_current(&self) -> bool {
         self.generation.load(Ordering::Acquire) == self.epoch
+    }
+}
+
+/// The timers of a record's [`DelayedCallback`]s, one generation each and
+/// none shared with `reprocess_generation`: C gives every `CALLBACK` its own
+/// timer, so arming or cancelling one leaves the record's others and its
+/// async re-entry pending.
+#[derive(Default)]
+pub(crate) struct DelayedCallbackTimers(Arc<[AtomicU64; DelayedCallback::COUNT]>);
+
+impl DelayedCallbackTimers {
+    /// C `callbackRequestDelayed` on one `CALLBACK`: supersede its pending
+    /// timer and answer the one that replaces it.
+    fn arm(&self, name: &[u8], callback: DelayedCallback) -> DelayedCallbackArm {
+        let epoch = PvDatabase::advance_generation(&self.0[callback.index()]);
+        DelayedCallbackArm {
+            name: RecordName::from(name),
+            timers: self.0.clone(),
+            callback,
+            epoch,
+        }
+    }
+
+    /// C `epicsTimerCancel` on one `CALLBACK`.
+    fn cancel(&self, callback: DelayedCallback) {
+        PvDatabase::advance_generation(&self.0[callback.index()]);
+    }
+}
+
+/// One pending timer of a [`DelayedCallback`], current until that callback
+/// is armed again or cancelled.
+struct DelayedCallbackArm {
+    name: RecordName,
+    timers: Arc<[AtomicU64; DelayedCallback::COUNT]>,
+    callback: DelayedCallback,
+    epoch: u64,
+}
+
+impl DelayedCallbackArm {
+    fn is_current(&self) -> bool {
+        self.timers[self.callback.index()].load(Ordering::Acquire) == self.epoch
     }
 }
 
@@ -4412,39 +4454,42 @@ impl PvDatabase {
     /// The fire runs [`Self::delayed_callback_in`] in one frame of the record
     /// gate (C `dbScanLock`). The handler's mutation is therefore reachable
     /// from the timer alone: no record flag survives the arm, so no other
-    /// process cycle can consume the one-shot. Re-arming mints a fresh token
-    /// for the same `callback`, exactly as C's re-`callbackRequestDelayed`
-    /// replaces the pending delayed callback.
+    /// process cycle can consume the one-shot. Re-arming `callback` replaces
+    /// its pending timer, exactly as C's re-`callbackRequestDelayed` does, and
+    /// leaves the record's other callbacks alone ([`DelayedCallbackTimers`]).
     fn schedule_delayed_callback(
         &self,
         name: &[u8],
         rec: InFrame<'_>,
         delay: std::time::Duration,
-        callback: crate::server::record::DelayedCallback,
+        callback: DelayedCallback,
     ) {
-        let mut token = Self::mint_async_token_in(name, rec);
+        let mut arm = rec.read().delayed_callbacks().arm(name, callback);
         let prio = rec.read().common.callback_priority();
         let db = self.clone();
         crate::runtime::task::spawn_background(prio, async move {
             let mut delay = delay;
             loop {
                 crate::runtime::task::sleep_background(delay).await;
-                // A newer arm (or a cancel) superseded this timer while it
-                // slept — the same `AsyncToken` gate `ReprocessAfter` uses.
-                if !token.is_current() || !db.accepts_reentry() {
+                if !db.accepts_reentry() {
                     return;
                 }
-                let Some(rec) = db.get_record_no_resolve(&token.name) else {
+                let Some(rec) = db.get_record_no_resolve(&arm.name) else {
                     return;
                 };
                 let rearm = {
                     let gate = FrameGate::Taken(db.lock_instance(&rec));
-                    db.delayed_callback_in(&token.name, gate.frame(&rec), callback)
+                    // Tested under the gate every arm and cancel of the
+                    // callback holds, so neither lands between test and fire.
+                    if !arm.is_current() {
+                        return;
+                    }
+                    db.delayed_callback_in(&arm.name, gate.frame(&rec), arm.callback)
                 };
                 let Some((fresh, again)) = rearm else {
                     return;
                 };
-                token = fresh;
+                arm = fresh;
                 delay = again;
             }
         });
@@ -4458,8 +4503,8 @@ impl PvDatabase {
         &self,
         name: &[u8],
         rec: InFrame<'_>,
-        callback: crate::server::record::DelayedCallback,
-    ) -> Option<(AsyncToken, std::time::Duration)> {
+        callback: DelayedCallback,
+    ) -> Option<(DelayedCallbackArm, std::time::Duration)> {
         let outcome = rec.write().delayed_callback_fire_and_drain(callback);
         match outcome {
             crate::server::record::DelayedCallbackOutcome::Reprocess => {
@@ -4475,7 +4520,7 @@ impl PvDatabase {
                 None
             }
             crate::server::record::DelayedCallbackOutcome::Rearm(again) => {
-                Some((Self::mint_async_token_in(name, rec), again))
+                Some((rec.read().delayed_callbacks().arm(name, callback), again))
             }
             crate::server::record::DelayedCallbackOutcome::Drop => None,
         }
@@ -10108,6 +10153,9 @@ impl PvDatabase {
                     // `delayed_callback_fire`, not in `process()`, so only
                     // this timer can perform it.
                     self.schedule_delayed_callback(record_name, rec, delay, callback);
+                }
+                ProcessAction::CancelDelayedCallback(callback) => {
+                    rec.read().delayed_callbacks().cancel(callback);
                 }
                 ProcessAction::ValuePutAfter(delay) => {
                     self.schedule_value_put(record_name, rec, delay);

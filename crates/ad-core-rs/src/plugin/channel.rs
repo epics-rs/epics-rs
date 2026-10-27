@@ -997,16 +997,16 @@ mod tests {
     async fn a_refused_array_never_wakes_the_queued_count_updater() {
         let owner = ArrayOwner::new();
         let pool = DriverPool::for_driver(1_000_000, &owner);
-        owner.queued().set_updater(std::thread::current());
         let (sender, _receiver) = ndarray_channel("TEST", 1);
         sender.publish(owned_array(&pool)).await;
-        std::thread::park_timeout(Duration::ZERO);
+        assert!(owner.queued().take_signal());
 
         let outcome = sender.publish(owned_array(&pool)).await;
         assert_eq!(outcome, PublishOutcome::DroppedQueueFull);
-        let start = std::time::Instant::now();
-        std::thread::park_timeout(Duration::from_millis(200));
-        assert!(start.elapsed() >= Duration::from_millis(200));
+        // The latch is what the updater posts on; a timed park can return
+        // without an unpark, so it cannot show there was none.
+        assert!(!owner.queued().take_signal());
+        assert_eq!(owner.queued().get(), 1);
     }
 
     #[tokio::test]

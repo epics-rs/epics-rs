@@ -131,9 +131,16 @@ async fn arming_one_callback_leaves_another_pending() {
     let rig = Rig::new().await;
     rig.process(vec![arm(10, REFRESH)]).await;
     rig.refreshes(1, "the refresh runs").await;
+    let armed = Instant::now();
     rig.process(vec![arm(5000, START)]).await;
     rig.refreshes(5, "the START arm left the refresh running")
         .await;
+    // No coalescing stretches five 10 ms refreshes to START's 5 s; a timer
+    // shared with START defers them to it.
+    assert!(
+        armed.elapsed() < Duration::from_secs(5),
+        "the refreshes waited for START's deadline"
+    );
 }
 
 #[epics_macros_rs::epics_test]
@@ -153,10 +160,11 @@ async fn cancelling_one_callback_leaves_another_pending() {
 #[epics_macros_rs::epics_test]
 async fn rearming_a_callback_restarts_only_its_own_timer() {
     let rig = Rig::new().await;
-    rig.process(vec![arm(100, START)]).await;
-    epics_base_rs::runtime::task::sleep(Duration::from_millis(50)).await;
-    rig.process(vec![arm(100, START)]).await;
-    epics_base_rs::runtime::task::sleep(Duration::from_millis(80)).await;
+    rig.process(vec![arm(500, START)]).await;
+    // A first timer that survived the re-arm is due before the probe; the
+    // re-arm is due 400 ms after it, which no late wake makes due together.
+    rig.process(vec![arm(600, REFRESH), arm(1000, START)]).await;
+    rig.refreshes(1, "the probe fires").await;
     assert_eq!(
         rig.starts.load(Ordering::Relaxed),
         0,
@@ -167,5 +175,6 @@ async fn rearming_a_callback_restarts_only_its_own_timer() {
         "the re-armed START fires",
     )
     .await;
+    rig.refreshes(2, "the probe keeps running").await;
     assert_eq!(rig.starts.load(Ordering::Relaxed), 1);
 }

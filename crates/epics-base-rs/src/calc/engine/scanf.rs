@@ -232,4 +232,25 @@ mod tests {
             (b"7", "%d%%%s", text(b"\x07")),
         ]);
     }
+
+    /// `%lc`, `%ls` and `%l[` store `wchar_t`s into `tmpstr`, so `strNcpy`
+    /// keeps the first character. In the C locale a byte at or above 0x80 is
+    /// a conversion error for `%lc` and `%ls`, and `%l[` leaves its
+    /// `wchar_t` unwritten.
+    #[cfg(target_endian = "little")]
+    #[test]
+    fn a_wide_conversion_stores_wchar_t_into_tmpstr() {
+        check(&[
+            (b"abc", "%lc", text(b"a")),
+            (b"abc", "%ls", text(b"a")),
+            (b"abc", "%l[a-z]", text(b"a")),
+            (b"abc", "%3lc", text(b"a")),
+            (b"\xe9", "%lc", None),
+            (b"a\xe9b", "%ls", None),
+            (b"a\xe9", "%l[a-z]", text(b"a")),
+            (b"a\xe9b,", "%l[^,]", text(b"a")),
+            (b"\xe9", "%l[^,]", text(b"")),
+            (b"a", "%lc%%%d", num(97.0)),
+        ]);
+    }
 }

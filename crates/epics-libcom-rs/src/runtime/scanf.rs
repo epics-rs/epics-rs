@@ -17,8 +17,13 @@ pub struct Scanned<'a>(Repr<'a>);
 enum Repr<'a> {
     /// A number's object representation, its first `.1` bytes.
     Num([u8; 8], usize),
-    /// `%c`'s bytes, or `%s`'s and `%[`'s and a terminator after them.
-    Bytes(&'a [u8], bool),
+    /// The characters a `c`, `s` or `[` conversion read, as `char`s or as
+    /// glibc's 4-byte `wchar_t`s, and for `s` and `[` a terminator after them.
+    Text {
+        chars: &'a [u8],
+        wide: bool,
+        terminated: bool,
+    },
 }
 
 impl Scanned<'_> {
@@ -27,10 +32,30 @@ impl Scanned<'_> {
     pub fn write_over(&self, object: &mut [u8]) {
         match self.0 {
             Repr::Num(b, n) => put(object, 0, &b[..n]),
-            Repr::Bytes(b, terminated) => {
-                put(object, 0, b);
+            Repr::Text {
+                chars,
+                wide: false,
+                terminated,
+            } => {
+                put(object, 0, chars);
                 if terminated {
-                    put(object, b.len(), &[0]);
+                    put(object, chars.len(), &[0]);
+                }
+            }
+            Repr::Text {
+                chars,
+                wide: true,
+                terminated,
+            } => {
+                for (i, &c) in chars.iter().enumerate() {
+                    // A byte past ASCII has no `wchar_t` in the C locale:
+                    // `%l[` steps over its slot.
+                    if c.is_ascii() {
+                        put(object, 4 * i, &u32::from(c).to_ne_bytes());
+                    }
+                }
+                if terminated {
+                    put(object, 4 * chars.len(), &[0; 4]);
                 }
             }
         }
@@ -427,9 +452,9 @@ fn c_str(b: &[u8]) -> &[u8] {
 /// -1 when the input ends before the first.
 ///
 /// The destinations take the values in turn, each as its [`ScanTarget`]
-/// stores it. A conversion with no destination left, `%m` allocation,
-/// positional `%n$`, and a wide `%lc`, `%ls` or `%l[` end the scan as a
-/// mismatch does.
+/// stores it. `%lc`, `%ls` and `%l[` read in the C locale, where a byte
+/// past ASCII is no character. A conversion with no destination left, `%m`
+/// allocation and positional `%n$` end the scan as a mismatch does.
 pub fn sscanf(input: impl AsRef<[u8]>, fmt: impl AsRef<[u8]>, out: &[&dyn ScanTarget]) -> c_int {
     let input = c_str(input.as_ref());
     let fmt = c_str(fmt.as_ref());
@@ -497,11 +522,25 @@ pub fn sscanf(input: impl AsRef<[u8]>, fmt: impl AsRef<[u8]>, out: &[&dyn ScanTa
             return done;
         };
         f += 1;
-        if skip_space || !matches!(conv, b'[' | b'c' | b'n') {
+        if skip_space || !matches!(conv, b'[' | b'c' | b'C' | b'n') {
             r.skip_space();
             skip_space = false;
         }
-        let wide = matches!(modifier, Modifier::Long | Modifier::LongLong);
+        let wide =
+            matches!(modifier, Modifier::Long | Modifier::LongLong) || matches!(conv, b'C' | b'S');
+        // glibc has stored what a failing `c`, `s` or `[` conversion read,
+        // uncounted.
+        let mut store_read = |chars| {
+            if !suppress {
+                let target = targets.next().ok_or(Stop::Conv)?;
+                target.store(Scanned(Repr::Text {
+                    chars,
+                    wide,
+                    terminated: false,
+                }));
+            }
+            Ok(())
+        };
         let value: Result<Option<Scanned<'_>>, Stop> = (|| match conv {
             b'%' => match r.inchar() {
                 None => Err(Stop::Input),
@@ -512,29 +551,38 @@ pub fn sscanf(input: impl AsRef<[u8]>, fmt: impl AsRef<[u8]>, out: &[&dyn ScanTa
                 }
             },
             b'n' => Ok(Some(int(r.at as u64, modifier.size()))),
-            b'c' if !wide => {
+            b'c' | b'C' => {
                 let start = r.at;
-                r.inchar().ok_or(Stop::Input)?;
-                let mut width = if width < 0 { 1 } else { width };
-                loop {
-                    width -= 1;
-                    if width <= 0 || r.inchar().is_none() {
-                        break;
-                    }
-                }
-                let chars = Scanned(Repr::Bytes(&input[start..r.at], false));
-                if width > 0 {
-                    // Short of `width`: glibc has stored what it read, then
-                    // fails the input. glibc before 2.42 counted the
-                    // conversion (BZ #12701), which is not copied.
-                    if !suppress {
-                        targets.next().ok_or(Stop::Conv)?.store(chars);
-                    }
+                let mut c = r.inchar();
+                if c.is_none() {
                     return Err(Stop::Input);
                 }
-                Ok(Some(chars))
+                let mut width = if width < 0 { 1 } else { width };
+                while let Some(ch) = c {
+                    if wide && !ch.is_ascii() {
+                        store_read(&input[start..r.at - 1])?;
+                        return Err(Stop::Conv);
+                    }
+                    width -= 1;
+                    if width <= 0 {
+                        break;
+                    }
+                    c = r.inchar();
+                }
+                if width > 0 {
+                    // Short of `width`: glibc fails the input. glibc before
+                    // 2.42 counted the conversion (BZ #12701), which is not
+                    // copied.
+                    store_read(&input[start..r.at])?;
+                    return Err(Stop::Input);
+                }
+                Ok(Some(Scanned(Repr::Text {
+                    chars: &input[start..r.at],
+                    wide,
+                    terminated: false,
+                })))
             }
-            b's' if !wide => {
+            b's' | b'S' => {
                 let start = r.at;
                 let mut c = r.inchar();
                 if c.is_none() {
@@ -545,6 +593,10 @@ pub fn sscanf(input: impl AsRef<[u8]>, fmt: impl AsRef<[u8]>, out: &[&dyn ScanTa
                         r.ungetc(c);
                         break;
                     }
+                    if wide && !ch.is_ascii() {
+                        store_read(&input[start..r.at - 1])?;
+                        return Err(Stop::Conv);
+                    }
                     if width > 0 {
                         width -= 1;
                         if width == 0 {
@@ -553,9 +605,13 @@ pub fn sscanf(input: impl AsRef<[u8]>, fmt: impl AsRef<[u8]>, out: &[&dyn ScanTa
                     }
                     c = r.inchar();
                 }
-                Ok(Some(Scanned(Repr::Bytes(&input[start..r.at], true))))
+                Ok(Some(Scanned(Repr::Text {
+                    chars: &input[start..r.at],
+                    wide,
+                    terminated: true,
+                })))
             }
-            b'[' if !wide => {
+            b'[' => {
                 let (set, not_in) = scan_set(fmt, &mut f).ok_or(Stop::Conv)?;
                 let start = r.at;
                 let mut c = r.inchar();
@@ -581,7 +637,11 @@ pub fn sscanf(input: impl AsRef<[u8]>, fmt: impl AsRef<[u8]>, out: &[&dyn ScanTa
                 if r.at == start {
                     return Err(Stop::Conv);
                 }
-                Ok(Some(Scanned(Repr::Bytes(&input[start..r.at], true))))
+                Ok(Some(Scanned(Repr::Text {
+                    chars: &input[start..r.at],
+                    wide,
+                    terminated: true,
+                })))
             }
             b'd' | b'i' | b'o' | b'u' | b'x' | b'X' | b'b' | b'p' => {
                 let base = match conv {
@@ -796,13 +856,13 @@ mod tests {
     /// probe prints it: a byte is written iff it comes out the same over a
     /// 0xaa and a 0x55 fill, and an unwritten one before the last written
     /// prints as `..`.
-    fn stores(input: &[u8], fmt: &str) -> (c_int, String) {
+    fn stores(input: &[u8], fmt: &[u8]) -> (c_int, String) {
         let run = |fill| {
             let p = RefCell::new([fill; 24]);
             (sscanf(input, fmt, &[&p]), p.into_inner())
         };
         let ((n, a), (m, b)) = (run(0xaa), run(0x55));
-        assert_eq!(n, m, "{fmt:?}");
+        assert_eq!(n, m, "{}", fmt.escape_ascii());
         let end = (0..a.len())
             .rev()
             .find(|&i| a[i] == b[i])
@@ -816,14 +876,15 @@ mod tests {
         (n, bytes)
     }
 
-    fn check_stores(rows: &[(&str, &[u8], c_int, &str)]) {
+    fn check_stores(rows: &[(&[u8], &[u8], c_int, &str)]) {
         let failed: Vec<String> = rows
             .iter()
             .filter_map(|&(fmt, input, n, bytes)| {
                 let got = stores(input, fmt);
                 (got != (n, bytes.into())).then(|| {
                     format!(
-                        "{fmt} \"{}\": C {n} {bytes}, rs {got:?}",
+                        "{} \"{}\": C {n} {bytes}, rs {got:?}",
+                        fmt.escape_ascii(),
                         input.escape_ascii()
                     )
                 })
@@ -839,59 +900,119 @@ mod tests {
     #[test]
     fn a_conversion_stores_its_own_width() {
         check_stores(&[
-            ("%hhd", b"200", 1, "c8"),
-            ("%hhd", b"128", 1, "80"),
-            ("%hhd", b"-1", 1, "ff"),
-            ("%hhd", b"300", 1, "2c"),
-            ("%hhd", b"-129", 1, "7f"),
-            ("%hhi", b"0x80", 1, "80"),
-            ("%hhi", b"0b11111111", 1, "ff"),
-            ("%hhu", b"255", 1, "ff"),
-            ("%hhu", b"256", 1, "00"),
-            ("%hhu", b"-1", 1, "ff"),
-            ("%hhx", b"1ff", 1, "ff"),
-            ("%hho", b"777", 1, "ff"),
-            ("%hhb", b"111111111", 1, "ff"),
-            ("%hd", b"70000", 1, "7011"),
-            ("%hu", b"-1", 1, "ffff"),
-            ("%d", b"99999999999", 1, "ffe77648"),
-            ("%u", b"-1", 1, "ffffffff"),
-            ("%ld", b"-2", 1, "feffffffffffffff"),
-            ("%lld", b"-2", 1, "feffffffffffffff"),
-            ("%jd", b"-2", 1, "feffffffffffffff"),
-            ("%zd", b"-2", 1, "feffffffffffffff"),
-            ("%td", b"-2", 1, "feffffffffffffff"),
-            ("%qd", b"-2", 1, "feffffffffffffff"),
-            ("%Ld", b"-2", 1, "feffffffffffffff"),
-            ("abc%hhn", b"abc", 0, "03"),
-            ("abc%hn", b"abc", 0, "0300"),
-            ("abc%n", b"abc", 0, "03000000"),
-            ("abc%ln", b"abc", 0, "0300000000000000"),
-            ("abc%lln", b"abc", 0, "0300000000000000"),
-            ("abc%jn", b"abc", 0, "0300000000000000"),
-            ("abc%zn", b"abc", 0, "0300000000000000"),
-            ("%p", b"0x10", 1, "1000000000000000"),
-            ("%p", b"(nil)", 1, "0000000000000000"),
-            ("%f", b"1.5", 1, "0000c03f"),
-            ("%hf", b"1.5", 1, "0000c03f"),
-            ("%hhf", b"1.5", 1, "0000c03f"),
-            ("%lf", b"1.5", 1, "000000000000f83f"),
-            ("%jf", b"1.5", 1, "000000000000f83f"),
-            ("%zf", b"1.5", 1, "000000000000f83f"),
-            ("%tf", b"1.5", 1, "000000000000f83f"),
-            ("%f", b"-nan(5)", 1, "0500c0ff"),
-            ("%lf", b"-nan(5)", 1, "050000000000f8ff"),
-            ("%c", b"abc", 1, "61"),
-            ("%3c", b"abc", 1, "616263"),
-            ("%3c", b"ab", -1, "6162"),
-            ("%s", b"abc", 1, "61626300"),
-            ("%3s", b"abcdef", 1, "61626300"),
-            ("%[a-z]", b"abc1", 1, "61626300"),
-            ("%*s", b"abc", 0, ""),
-            ("%hlc", b"a", 0, ""),
-            ("%s", b"a\xe9b", 1, "61e96200"),
-            ("%c", b"\xe9", 1, "e9"),
-            ("%[^,]", b"a\xe9b,", 1, "61e96200"),
+            (b"%hhd", b"200", 1, "c8"),
+            (b"%hhd", b"128", 1, "80"),
+            (b"%hhd", b"-1", 1, "ff"),
+            (b"%hhd", b"300", 1, "2c"),
+            (b"%hhd", b"-129", 1, "7f"),
+            (b"%hhi", b"0x80", 1, "80"),
+            (b"%hhi", b"0b11111111", 1, "ff"),
+            (b"%hhu", b"255", 1, "ff"),
+            (b"%hhu", b"256", 1, "00"),
+            (b"%hhu", b"-1", 1, "ff"),
+            (b"%hhx", b"1ff", 1, "ff"),
+            (b"%hho", b"777", 1, "ff"),
+            (b"%hhb", b"111111111", 1, "ff"),
+            (b"%hd", b"70000", 1, "7011"),
+            (b"%hu", b"-1", 1, "ffff"),
+            (b"%d", b"99999999999", 1, "ffe77648"),
+            (b"%u", b"-1", 1, "ffffffff"),
+            (b"%ld", b"-2", 1, "feffffffffffffff"),
+            (b"%lld", b"-2", 1, "feffffffffffffff"),
+            (b"%jd", b"-2", 1, "feffffffffffffff"),
+            (b"%zd", b"-2", 1, "feffffffffffffff"),
+            (b"%td", b"-2", 1, "feffffffffffffff"),
+            (b"%qd", b"-2", 1, "feffffffffffffff"),
+            (b"%Ld", b"-2", 1, "feffffffffffffff"),
+            (b"abc%hhn", b"abc", 0, "03"),
+            (b"abc%hn", b"abc", 0, "0300"),
+            (b"abc%n", b"abc", 0, "03000000"),
+            (b"abc%ln", b"abc", 0, "0300000000000000"),
+            (b"abc%lln", b"abc", 0, "0300000000000000"),
+            (b"abc%jn", b"abc", 0, "0300000000000000"),
+            (b"abc%zn", b"abc", 0, "0300000000000000"),
+            (b"%p", b"0x10", 1, "1000000000000000"),
+            (b"%p", b"(nil)", 1, "0000000000000000"),
+            (b"%f", b"1.5", 1, "0000c03f"),
+            (b"%hf", b"1.5", 1, "0000c03f"),
+            (b"%hhf", b"1.5", 1, "0000c03f"),
+            (b"%lf", b"1.5", 1, "000000000000f83f"),
+            (b"%jf", b"1.5", 1, "000000000000f83f"),
+            (b"%zf", b"1.5", 1, "000000000000f83f"),
+            (b"%tf", b"1.5", 1, "000000000000f83f"),
+            (b"%f", b"-nan(5)", 1, "0500c0ff"),
+            (b"%lf", b"-nan(5)", 1, "050000000000f8ff"),
+            (b"%c", b"abc", 1, "61"),
+            (b"%3c", b"abc", 1, "616263"),
+            (b"%3c", b"ab", -1, "6162"),
+            (b"%s", b"abc", 1, "61626300"),
+            (b"%3s", b"abcdef", 1, "61626300"),
+            (b"%[a-z]", b"abc1", 1, "61626300"),
+            (b"%*s", b"abc", 0, ""),
+            (b"%hlc", b"a", 0, ""),
+            (b"%s", b"a\xe9b", 1, "61e96200"),
+            (b"%c", b"\xe9", 1, "e9"),
+            (b"%[^,]", b"a\xe9b,", 1, "61e96200"),
+        ]);
+    }
+
+    /// `%lc`, `%ls` and `%l[` store 4-byte `wchar_t`s in the C locale, where
+    /// a byte past ASCII fails `%lc` and `%ls` after what they read and is a
+    /// slot `%l[` steps over: (format, input, return, bytes), measured with
+    /// glibc 2.43 on x86_64.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[test]
+    fn a_wide_conversion_stores_wchar_t() {
+        check_stores(&[
+            (b"%lc", b"abc", 1, "61000000"),
+            (b"%3lc", b"abc", 1, "610000006200000063000000"),
+            (b"%2lc", b"a", -1, "61000000"),
+            (b"%5lc", b"ab", -1, "6100000062000000"),
+            (b"%lc", b"", -1, ""),
+            (b"%lc", b" a", 1, "20000000"),
+            (b"%C", b"ab", 1, "61000000"),
+            (b"%C", b" a", 1, "20000000"),
+            (b"%2C", b"ab", 1, "6100000062000000"),
+            (b"%llc", b"a", 1, "61000000"),
+            (b"%jc", b"ab", 1, "61000000"),
+            (b"%hc", b"ab", 1, "61"),
+            (b"%ls", b"abc", 1, "61000000620000006300000000000000"),
+            (b"%ls", b" ab cd", 1, "610000006200000000000000"),
+            (b"%3ls", b"abcdef", 1, "61000000620000006300000000000000"),
+            (b"%S", b"ab", 1, "610000006200000000000000"),
+            (b"%S", b" ab", 1, "610000006200000000000000"),
+            (b"%3S", b"abcd", 1, "61000000620000006300000000000000"),
+            (b"%lls", b"ab", 1, "610000006200000000000000"),
+            (b"%zs", b"ab", 1, "610000006200000000000000"),
+            (b"%hhs", b"ab", 1, "616200"),
+            (b"%ls", b"", -1, ""),
+            (b"%*ls", b"abc", 0, ""),
+            (b"%l[a-z]", b"abc1", 1, "61000000620000006300000000000000"),
+            (b"%l[a-z]", b"1", 0, ""),
+            (b"%2l[a-z]", b"abc", 1, "610000006200000000000000"),
+            (b"%ll[a-z]", b"ab", 1, "610000006200000000000000"),
+            (b"%tl[a-z]", b"ab", 0, ""),
+            (b"%lc", b"\xe9", 0, ""),
+            (b"%2lc", b"a\xe9", 0, "61000000"),
+            (b"%lc", b"\x80", 0, ""),
+            (b"%lc", b"\x7f", 1, "7f000000"),
+            (b"%lc%n", b"\xe9", 0, ""),
+            (b"%ls", b"\xe9", 0, ""),
+            (b"%ls", b" \xe9", 0, ""),
+            (b"%ls", b"a\xe9b", 0, "61000000"),
+            (b"%ls", b"ab\x80", 0, "6100000062000000"),
+            (b"%l[^,]", b"a\xe9b,", 1, "61000000........6200000000000000"),
+            (b"%l[a-z]", b"a\xe9", 1, "6100000000000000"),
+            (b"%l[^\xe9]", b"ab\xe9", 1, "610000006200000000000000"),
+            (b"%l[\x80-\xff]", b"\xe9a", 1, "........00000000"),
+            (b"%l[^,]", b"\xe9", 1, "........00000000"),
+            (b"%2l[^,]", b"\xe9ab", 1, "........6100000000000000"),
+            (
+                b"%l[a\xe9]",
+                b"aa\xe9a",
+                1,
+                "6100000061000000........6100000000000000",
+            ),
         ]);
     }
 }

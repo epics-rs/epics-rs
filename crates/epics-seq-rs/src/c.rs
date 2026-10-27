@@ -1209,6 +1209,27 @@ mod tests {
         same_as_glibc_scan!("abc", "%[0-9]", S);
         same_as_glibc_scan!("abc", "%2[a-z]%c", S, c_char);
         same_as_glibc_scan!("abc", "%[a-z", S);
+        // Wide characters in the C locale.
+        type W = [c_char; 32];
+        same_as_glibc_scan!("abc", "%lc", i32);
+        same_as_glibc_scan!(" a", "%lc", i32);
+        same_as_glibc_scan!("abc", "%3lc", W);
+        same_as_glibc_scan!(" ab cd", "%ls%n", W, i32);
+        same_as_glibc_scan!("abcdef", "%3ls %S", W, W);
+        same_as_glibc_scan!("ab", "%C%Lc", i32, i32);
+        same_as_glibc_scan!(" a  b", "%C%S", i32, W);
+        same_as_glibc_scan!("abc1", "%l[a-z]%n", W, i32);
+        same_as_glibc_scan!("1", "%l[a-z]", W);
+        same_as_glibc_scan!("abc", "%2l[a-z]", W);
+        same_as_glibc_scan!("", "%lc", i32);
+        same_as_glibc_scan!("", "%ls", W);
+        same_as_glibc_scan!("abc", "%*ls%n", i32);
+        same_as_glibc_scan!("ab", "%hlc", i32);
+        same_as_glibc_scan!("\u{e9}", "%lc", i32);
+        same_as_glibc_scan!("a\u{e9}", "%2lc", W);
+        same_as_glibc_scan!("a\u{e9}b", "%ls", W);
+        same_as_glibc_scan!("a\u{e9}b,", "%l[^,]%n", W, i32);
+        same_as_glibc_scan!("\u{e9}a", "%l[^a]", W);
         // Literals, whitespace, `%%`, `%n` and the end of input.
         same_as_glibc_scan!("a  %  b", "a %% %c%n", c_char, i32);
         same_as_glibc_scan!("a b", "a%c", c_char);

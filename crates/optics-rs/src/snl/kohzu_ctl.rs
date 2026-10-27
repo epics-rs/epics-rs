@@ -225,7 +225,7 @@ macro_rules! seqg_escaped {
 
 epics_seq_rs::include_program!("kohzuCtl");
 
-/// `kohzuCtl_calc2dSpacing` (`kohzuCtl.st:1471-1495`), by the name the SNL
+/// `kohzuCtl_calc2dSpacing` (`kohzuCtl.st:1486-1510`), by the name the SNL
 /// code calls, on the `-r` block.
 #[allow(non_snake_case)]
 fn kohzuCtl_calc2dSpacing() -> f64 {
@@ -234,7 +234,7 @@ fn kohzuCtl_calc2dSpacing() -> f64 {
     s.store(&v.opAlert, &v.avg, &v.nint, &v.seqMsg1)
 }
 
-/// initSequence's block (`kohzuCtl.st:547-570`, `kohzuCtl_soft.st:503-526`):
+/// initSequence's block (`kohzuCtl.st:557-580`, `kohzuCtl_soft.st:512-535`):
 /// each motor is `{P}{M_x}`, or "??????" when either macro is undefined,
 /// and geom is 2 only for a GEOM whose first character is '2'.
 pub(crate) fn name_motors<V: ProgramVars>(

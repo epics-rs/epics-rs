@@ -115,11 +115,17 @@ double  D;
 assign  D to "{P}{MONO}2dSpacing";
 
 /* E, Lambda, and Theta */
+/* C defect: monitored E and lambda themselves, so a request landing
+ * between a pass's assign and its put was put as the pass's value.
+ * Requests land in EReq and lambdaReq, which the request arms take. */
 double  E;
 assign  E to "{P}{MONO}E";
-monitor E;
+
+double  EReq;
+assign  EReq to "{P}{MONO}E";
+monitor EReq;
 evflag  E_mon;
-sync    E E_mon;
+sync    EReq E_mon;
 
 double  EHi;
 assign  EHi to "{P}{MONO}E.HLM";
@@ -132,9 +138,12 @@ assign  ERdbk to "{P}{MONO}ERdbk";
 
 double  lambda;
 assign  lambda to "{P}{MONO}Lambda";
-monitor lambda;
+
+double  lambdaReq;
+assign  lambdaReq to "{P}{MONO}Lambda";
+monitor lambdaReq;
 evflag  lambda_mon;
-sync    lambda lambda_mon;
+sync    lambdaReq lambda_mon;
 
 double  lambdaHi;
 assign  lambdaHi to "{P}{MONO}Lambda.HLM";
@@ -668,10 +677,12 @@ state waitForCmnd {
 
 	when (efTestAndClear(E_mon)) {
 		if (kohzuCtlDebug) %%printf("kohzuCtl:waitForCmnd:E_mon\n");
+		E = EReq;
 	} state eChanged
 
 	when (efTestAndClear(lambda_mon)) {
 		if (kohzuCtlDebug) %%printf("kohzuCtl:waitForCmnd:lambda_mon\n");
+		lambda = lambdaReq;
 	} state lChanged
 
 	when (efTestAndClear(theta_mon)) {

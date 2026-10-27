@@ -2,7 +2,7 @@
 //! the connect-time monitors its waitForCmndEnter leaves set, in its order:
 //! thetaLimits, the theta readback (thetaMotStopped `!causedMove`), then
 //! yOffset. Unlike kohzuCtl, a manual-mode pass that would violate a limit
-//! is not rolled back (`kohzuCtl_soft.st:924`). A zero readback holds init
+//! is not rolled back (`kohzuCtl_soft.st:935`). A zero readback holds init
 //! in chkMotorLimits.
 //!
 //! Expected values are a C kohzuIoc's (sequencer 2.2.9, optics, motorSim
@@ -29,7 +29,7 @@ use std::time::Duration;
 const KOHZU_DB: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/db/kohzuSeq_soft.db");
 /// GEOM is left to the program's own `GEOM=1` (`kohzuCtl_soft.st:1`).
 const SEQ_MACROS: &str = "P=K:,MONO=m:,M_THETA=th,M_Y=y,M_Z=z";
-/// initSequence's radConv (`kohzuCtl_soft.st:491`).
+/// initSequence's radConv (`kohzuCtl_soft.st:500`).
 const RAD_CONV: f64 = 57.2958;
 // kohzuSeq_soft.db has no SpeedCtrl record for the one kohzuCtl_soft assigns.
 const MOTORS: &str = r#"
@@ -385,7 +385,7 @@ async fn use_set_and_motor_sets(ioc: &PvDatabase) -> [f64; 4] {
     ]
 }
 
-/// updateSet (kohzuCtl_soft.st:1276-1319) runs on the connect-time monitors with UseSet first,
+/// updateSet (kohzuCtl_soft.st:1287-1330) runs on the connect-time monitors with UseSet first,
 /// so UseSet's value wins: a preset motor .SET is put back (C kohzuIoc
 /// oracle: th.SET=Set before seq gives all Use).
 #[epics_base_rs::epics_test]
@@ -464,7 +464,7 @@ async fn idle(db: &PvDatabase, ack: &str, msg1: &str) {
 }
 
 /// Run `posts` once the sequencer has passed waitForCmndEnter's efClears
-/// (kohzuCtl_soft.st:576-619): `ack` sends it there, and the enter's `opAck = 0` follows them.
+/// (kohzuCtl_soft.st:585-628): `ack` sends it there, and the enter's `opAck = 0` follows them.
 /// Its puts are queued, so no record lock can hold it inside the enter.
 async fn post_after_enter(db: &PvDatabase, ack: &str, posts: impl FnOnce(&PvDatabase)) {
     idle(db, ack, "K:m:SeqMsg1").await;
@@ -512,6 +512,22 @@ async fn an_e_put_below_1e_12_off_still_moves() {
     eventually_near(&ioc, "K:y.VAL", -17.77).await;
 }
 
+/// A lambda request landing while an E pass puts lambda is taken by its own
+/// pass or dropped, never put as the E pass's lambda: E stays the one for
+/// ThetaSet.
+#[epics_base_rs::epics_test]
+async fn a_lambda_request_during_an_e_pass_leaves_e_for_theta_set() {
+    let ioc = boot([10.0, -17.77, 100.78]).await;
+    ready(&ioc, "y offset changed to 17.500000").await;
+    let d = f64_of(&ioc, "K:m:2dSpacing").await;
+    post(&ioc, "K:m:E", EpicsValue::Double(12.0));
+    eventually_near(&ioc, "K:m:Theta", RAD_CONV * (12.3984244 / 12.0 / d).asin()).await;
+    post(&ioc, "K:m:Lambda", EpicsValue::Double(0.9));
+    task::sleep(Duration::from_secs(2)).await;
+    let theta = f64_of(&ioc, "K:m:ThetaSet").await;
+    assert_near(&ioc, "K:m:E", 12.3984244 / (d * (theta / RAD_CONV).sin())).await;
+}
+
 /// A theta request landing between thChanged and calcMovements is taken by
 /// its own pass or dropped, never moved to as the pass's ThetaSet: E stays
 /// the one for ThetaSet.
@@ -551,7 +567,7 @@ async fn a_moving_write_with_no_monitor_is_not_cleared() {
 
 /// Readbacks at the yOffset pass's own Y and Z for theta 10 leave every
 /// motor nothing to do, so thTime is 0: Put keeps each speed, where C put
-/// 0/0, a NaN, into Y's and Z's VELO (`kohzuCtl_soft.st:899-909`).
+/// 0/0, a NaN, into Y's and Z's VELO (`kohzuCtl_soft.st:910-920`).
 /// th.VELO stays only if the pass took that thTime = 0 branch.
 #[epics_base_rs::epics_test]
 async fn a_move_with_nothing_to_do_keeps_the_motor_speeds() {
@@ -572,7 +588,7 @@ async fn a_move_with_nothing_to_do_keeps_the_motor_speeds() {
 }
 
 /// Theta at VELO 0, as speed control leaves it after a move without theta
-/// travel, takes zero time (`kohzuCtl_soft.st:875-885`): Z is the slowest
+/// travel, takes zero time (`kohzuCtl_soft.st:886-896`): Z is the slowest
 /// to theta 20, so it keeps its speed and theta and Y get their travel over
 /// Z's time. C took an infinite thTime and put 0 into every VELO.
 #[epics_base_rs::epics_test]
@@ -608,7 +624,7 @@ async fn a_zero_theta_speed_takes_no_time() {
 }
 
 /// initSequence's escaped block names each motor `{P}{M_x}`
-/// (`kohzuCtl_soft.st:504-522`) and publishes the names.
+/// (`kohzuCtl_soft.st:513-531`) and publishes the names.
 #[epics_base_rs::epics_test]
 async fn init_names_the_motors_from_p_and_their_macros() {
     let ioc = boot([10.0, -17.77, 100.78]).await;

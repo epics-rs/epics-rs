@@ -3,8 +3,9 @@
 //! parameter library in place and build the file name in stack buffers
 //! (NDPluginFile.cpp:201-364, :715-789).
 //!
-//! Each test counts every thread, so they take [`SERIAL`] in turn; frames
-//! are published as `plugin_path_allocates_nothing` publishes them.
+//! Each test counts every thread but libtest's, so they take [`SERIAL`] in
+//! turn; frames are published as `plugin_path_allocates_nothing` publishes
+//! them.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -31,6 +32,7 @@ use asyn_rs::interrupt::InterruptFilter;
 use asyn_rs::param::ParamValue;
 use asyn_rs::port::{InterfaceMask, PortDriverBase};
 use epics_libcom_rs::runtime::interrupt_accept::InterruptGate;
+use epics_libcom_rs::runtime::task::test_block_on;
 use parking_lot::Mutex;
 
 static ALLOCS: AtomicUsize = AtomicUsize::new(0);
@@ -41,20 +43,40 @@ thread_local! {
     /// The driver's own work on the publishing thread, which is not the
     /// plugin path.
     static EXEMPT: Cell<bool> = const { Cell::new(false) };
+    /// 0 not yet asked, 1 libtest's `main`, which only waits for the test's
+    /// thread, 2 any other thread. Asking may itself allocate; that reentry
+    /// reads 1 and is not counted.
+    static HARNESS: Cell<u8> = const { Cell::new(0) };
+}
+
+fn harness() -> bool {
+    HARNESS.with(|h| match h.get() {
+        0 => {
+            h.set(1);
+            let yes = std::thread::current().name() == Some("main");
+            h.set(if yes { 1 } else { 2 });
+            yes
+        }
+        v => v == 1,
+    })
 }
 
 struct Counting;
 
 impl Counting {
     fn note(&self) {
-        if COUNTING.load(Ordering::Relaxed) && !EXEMPT.try_with(Cell::get).unwrap_or(false) {
+        if COUNTING.load(Ordering::Relaxed)
+            && !EXEMPT.try_with(Cell::get).unwrap_or(false)
+            && !harness()
+        {
             ALLOCS.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
 
 // SAFETY: forwards every call to `System` unchanged; the counter and the
-// const-initialised thread-local never allocate.
+// const-initialised thread-locals never allocate, and the one name lookup
+// reenters as libtest's thread.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         self.note();
@@ -321,12 +343,13 @@ fn plugin<P: NDPluginProcess>(port: &str, processor: P) -> PluginRuntimeHandle {
         Arc::new(WiringRegistry::new()),
         DEFAULT_PLUGIN_THREADS,
     );
+    let gate = InterruptGate::opened();
     claim
-        .publish(
-            plugin.port_runtime().port_handle().clone(),
-            &InterruptGate::opened(),
-        )
+        .publish(plugin.port_runtime().port_handle().clone(), &gate)
         .unwrap();
+    // The boot flush is the gate's job, which iocInit's dbCaRun step waits
+    // for too; left running, its thread starts inside the count.
+    test_block_on(gate.jobs_settled());
     write_i32(&plugin, plugin.plugin_params.enable_callbacks, 1);
     plugin
 }
@@ -456,7 +479,7 @@ fn steady_allocs(
 
 #[test]
 fn reading_a_frames_begin_sets_allocates_nothing() {
-    let _serial = SERIAL.lock();
+    let _serial = exempt(|| SERIAL.lock());
     let reason = Arc::new(AtomicUsize::new(usize::MAX));
     let read = Arc::new(AtomicI32::new(0));
     let plugin = plugin(
@@ -479,7 +502,7 @@ fn reading_a_frames_begin_sets_allocates_nothing() {
 
 #[test]
 fn setting_a_frames_params_allocates_nothing() {
-    let _serial = SERIAL.lock();
+    let _serial = exempt(|| SERIAL.lock());
     let write_message = Arc::new(AtomicUsize::new(usize::MAX));
     let num_captured = Arc::new(AtomicUsize::new(usize::MAX));
     let plugin = plugin(
@@ -505,7 +528,7 @@ fn setting_a_frames_params_allocates_nothing() {
 
 #[test]
 fn handing_a_frame_on_allocates_nothing() {
-    let _serial = SERIAL.lock();
+    let _serial = exempt(|| SERIAL.lock());
     let plugin = plugin("ZALLOC_HANDON", Handing { attributes: None });
     let allocs = steady_allocs(&plugin, &[], |_| true);
     assert_eq!(allocs, 0, "{FRAMES} frames after {WARM} warm-up ones");
@@ -513,7 +536,7 @@ fn handing_a_frame_on_allocates_nothing() {
 
 #[test]
 fn evaluating_a_plugins_attributes_for_its_writer_allocates_only_the_lend() {
-    let _serial = SERIAL.lock();
+    let _serial = exempt(|| SERIAL.lock());
     let num_captured = Arc::new(AtomicUsize::new(usize::MAX));
     let written = Arc::new(Mutex::new(NDAttributeList::new()));
     let plugin = plugin(
@@ -546,7 +569,7 @@ fn evaluating_a_plugins_attributes_for_its_writer_allocates_only_the_lend() {
 
 #[test]
 fn a_streamed_frame_allocates_nothing_in_the_file_plugin() {
-    let _serial = SERIAL.lock();
+    let _serial = exempt(|| SERIAL.lock());
     let bare = streamed("ZALLOC_STREAM", &[], None);
     assert_eq!(bare, 0, "{FRAMES} bare frames after {WARM} warm-up ones");
     let attributed = streamed("ZALLOC_ASTREAM", &DRIVER_ATTRIBUTES, None);

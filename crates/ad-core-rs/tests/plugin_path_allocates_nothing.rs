@@ -9,11 +9,11 @@
 //! hands its input on, copied into a free buffer as C's
 //! `endProcessCallbacks` copies it (NDPluginDriver.cpp:285), to a plugin
 //! that only counts. Everything the publish sets off is counted, on
-//! every thread; only the driver's own fill of the frame is not. A frame
-//! with driver attributes allocates nothing either, where C's copy news
-//! each one (NDArrayPool.cpp:301, NDAttribute.cpp:113). A plugin with its
-//! own attributes file evaluates the set under its port lent to its thread,
-//! and that lend is all it allocates.
+//! every thread but libtest's; only the driver's own fill of the frame is
+//! not. A frame with driver attributes allocates nothing either, where C's
+//! copy news each one (NDArrayPool.cpp:301, NDAttribute.cpp:113). A
+//! plugin with its own attributes file evaluates the set under its port
+//! lent to its thread, and that lend is all it allocates.
 //!
 //! Each frame waits for both ports to apply its posts, as C's plugin thread
 //! writes them under the port lock before it takes the next array. A port
@@ -40,6 +40,7 @@ use asyn_rs::interrupt::InterruptFilter;
 use asyn_rs::param::ParamValue;
 use asyn_rs::port::{InterfaceMask, PortFlags};
 use epics_libcom_rs::runtime::interrupt_accept::InterruptGate;
+use epics_libcom_rs::runtime::task::test_block_on;
 
 static ALLOCS: AtomicUsize = AtomicUsize::new(0);
 static COUNTING: AtomicBool = AtomicBool::new(false);
@@ -48,20 +49,40 @@ thread_local! {
     /// The driver's own work on the publishing thread, which is not the
     /// plugin path.
     static EXEMPT: Cell<bool> = const { Cell::new(false) };
+    /// 0 not yet asked, 1 libtest's `main`, which only waits for the test's
+    /// thread, 2 any other thread. Asking may itself allocate; that reentry
+    /// reads 1 and is not counted.
+    static HARNESS: Cell<u8> = const { Cell::new(0) };
+}
+
+fn harness() -> bool {
+    HARNESS.with(|h| match h.get() {
+        0 => {
+            h.set(1);
+            let yes = std::thread::current().name() == Some("main");
+            h.set(if yes { 1 } else { 2 });
+            yes
+        }
+        v => v == 1,
+    })
 }
 
 struct Counting;
 
 impl Counting {
     fn note(&self) {
-        if COUNTING.load(Ordering::Relaxed) && !EXEMPT.try_with(Cell::get).unwrap_or(false) {
+        if COUNTING.load(Ordering::Relaxed)
+            && !EXEMPT.try_with(Cell::get).unwrap_or(false)
+            && !harness()
+        {
             ALLOCS.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
 
 // SAFETY: forwards every call to `System` unchanged; the counter and the
-// const-initialised thread-local never allocate.
+// const-initialised thread-locals never allocate, and the one name lookup
+// reenters as libtest's thread.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         self.note();
@@ -247,14 +268,15 @@ fn steady_allocs(ports: [&str; 2], attributes: &[&str], file: Option<&str>) -> u
     );
     wire_downstream(&forward, sink.array_sender().clone());
     // An IOC past iocInit, whose callParamCallbacks post.
+    let gate = InterruptGate::opened();
     for (claim, plugin) in claims.into_iter().zip([&forward, &sink]) {
         claim
-            .publish(
-                plugin.port_runtime().port_handle().clone(),
-                &InterruptGate::opened(),
-            )
+            .publish(plugin.port_runtime().port_handle().clone(), &gate)
             .unwrap();
     }
+    // The boot flushes are the gate's jobs, which iocInit's dbCaRun step
+    // waits for too; left running, their threads start inside the count.
+    test_block_on(gate.jobs_settled());
     if let Some(xml) = file {
         forward
             .port_runtime()

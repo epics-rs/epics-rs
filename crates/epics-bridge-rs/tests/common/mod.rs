@@ -2,6 +2,7 @@
 //! rs IOC's shell output with a softIocPVX capture. Each test binary
 //! re-runs itself on its own `ioc_child` test, which calls [`ioc_child`].
 
+use std::fs::File;
 use std::io::Write;
 use std::net::{Ipv4Addr, TcpListener};
 use std::path::Path;
@@ -32,6 +33,10 @@ pub fn free_port() -> u16 {
 }
 
 /// An IOC child on `db` serving PVA on `port`, finding PVs at `servers`.
+///
+/// Its stdout and stderr go to `{name}.out` and `{name}.err` in `dir`: a
+/// pipe nobody reads blocks the shell once its prompts and report headers
+/// fill it, at 8 KiB when the user is past `fs.pipe-user-pages-soft`.
 pub fn spawn_ioc(dir: &Path, name: &str, db: &str, port: u16, servers: &str) -> Child {
     let db_path = dir.join(format!("{name}.db"));
     std::fs::write(&db_path, db).unwrap();
@@ -41,6 +46,7 @@ pub fn spawn_ioc(dir: &Path, name: &str, db: &str, port: u16, servers: &str) -> 
         format!("dbLoadRecords(\"{}\")\niocInit\n", db_path.display()),
     )
     .unwrap();
+    let log = |ext: &str| File::create(dir.join(format!("{name}.{ext}"))).unwrap();
     Command::new(std::env::current_exe().unwrap())
         .args(["ioc_child", "--exact", "--nocapture"])
         .env(CHILD, &stcmd)
@@ -54,8 +60,8 @@ pub fn spawn_ioc(dir: &Path, name: &str, db: &str, port: u16, servers: &str) -> 
         .env("EPICS_PVA_AUTO_ADDR_LIST", "NO")
         .env("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1")
         .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(log("out"))
+        .stderr(log("err"))
         .spawn()
         .expect("spawn the IOC child")
 }

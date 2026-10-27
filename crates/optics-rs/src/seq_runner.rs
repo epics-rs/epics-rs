@@ -217,9 +217,9 @@ mod tests {
     }
 
     /// initSequence puts the `Y_OFF` macro into the y offset
-    /// (`ml_monoCtl.st:571-582`), and updatePsuedo puts the y motor readback,
+    /// (`ml_monoCtl.st:574-585`), and updatePsuedo puts the y motor readback,
     /// 0 here, once the readback's first monitor sets `yMotRdbk_mon`, as every
-    /// monitor sets its synced flag (`seq_ca.c:328-329`, `ml_monoCtl.st:1281-1284`).
+    /// monitor sets its synced flag (`seq_ca.c:328-329`, `ml_monoCtl.st:1282-1285`).
     /// The two state sets run on their own threads, so either put may be the
     /// last, but each puts its own value, where C could put one twice.
     #[epics_base_rs::epics_test]
@@ -232,7 +232,7 @@ mod tests {
         seq_start("ml_monoCtl", "P=Y:,M_THETA=th,Y_OFF=40", &bridge, &db).unwrap();
         let mut posts = Vec::new();
         for _ in 0..300 {
-            // initSequence's puts end on the y motor's name (`ml_monoCtl.st:588`)
+            // initSequence's puts end on the y motor's name (`ml_monoCtl.st:591`)
             let init_done = db.get_pv("Y:ml_monoYPv").unwrap().text_g() == "Y:m10";
             while let Ok(e) = sub.try_recv_event() {
                 posts.push(e.value().as_value().and_then(|v| v.to_f64()));

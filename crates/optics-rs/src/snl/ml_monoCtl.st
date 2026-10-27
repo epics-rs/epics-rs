@@ -330,6 +330,7 @@ sync    zMotCmdMon zMotCmdMon_mon;
 
 double  thTime;
 double  oldThSpeed;
+assign  oldThSpeed to "{P}{M_THETA}.VELO";
 double  newThSpeed;
 double  thSpeed;
 assign  thSpeed to "{P}{M_THETA}.VELO";
@@ -339,6 +340,7 @@ sync    thSpeed thetaMotVel_mon;
 
 /* double  th2Time; assume same as thTime */
 double  oldTh2Speed;
+assign  oldTh2Speed to "{P}{M_THETA2}.VELO";
 double  newTh2Speed;
 double  th2Speed;
 assign  th2Speed to "{P}{M_THETA2}.VELO";
@@ -348,6 +350,7 @@ sync    th2Speed theta2MotVel_mon;
 
 double  zTime;
 double  oldZSpeed;
+assign  oldZSpeed to "{P}{M_Z}.VELO";
 double  newZSpeed;
 double  zSpeed;
 assign  zSpeed to "{P}{M_Z}.VELO";
@@ -960,18 +963,22 @@ state calcMovements {
 		pvPut(zMotDesired);
 
 		/***** Calculate required speeds ******/
-		oldThSpeed = thSpeed;
-		oldTh2Speed = th2Speed;
-		oldZSpeed = zSpeed;
+		/* C defect: took the old speeds from thSpeed, th2Speed and zSpeed,
+		 * whose monitors can still hold the previous move's speed after its
+		 * restore, which this move's restore then put back. They are read
+		 * from VELO, and the monitored ones only feed the VelEcho mirrors. */
+		pvGet(oldThSpeed);
+		pvGet(oldTh2Speed);
+		pvGet(oldZSpeed);
 		/* C defect: divided by each motor's speed, which speed control
 		 * itself sets to 0 for a motor with no travel. A zero speed gave
 		 * an inf time, which made every speed 0, or 0/0, a NaN, which
 		 * failed the comparison below and sent theta's speed through a
 		 * division by it. A motor with no speed takes zero time. */
 		zTime = 0.0;
-		if (zSpeed > 0) zTime = fabs(zMotDesired-zMotRdbk)/zSpeed;
+		if (oldZSpeed > 0) zTime = fabs(zMotDesired-zMotRdbk)/oldZSpeed;
 		thTime = 0.0;
-		if (thSpeed > 0) thTime = fabs(theta-thetaMotRdbk)/thSpeed;
+		if (oldThSpeed > 0) thTime = fabs(theta-thetaMotRdbk)/oldThSpeed;
 		/* Frozen motors take zero time to move. (tmm) */
 		if (ccMode == MODE_FREEZE_Z) {
 			/* channel-cut mode: Z frozen */
@@ -979,19 +986,19 @@ state calcMovements {
 		}
 		/*** Test for longest time ***/
 		if (thTime >= zTime) {
-			newThSpeed = thSpeed;
-			newTh2Speed = th2Speed;
+			newThSpeed = oldThSpeed;
+			newTh2Speed = oldTh2Speed;
 			/* C defect: divided by thTime when it was 0, putting 0/0, a NaN,
 			 * into Z's VELO when neither motor had to move. */
 			if (thTime > 0) {
 				newZSpeed = fabs(zMotDesired-zMotRdbk)/thTime;
 			} else {
-				newZSpeed = zSpeed;
+				newZSpeed = oldZSpeed;
 			}
 		} else {
 			newThSpeed = fabs(theta-thetaMotRdbk)/zTime;
 			newTh2Speed = newThSpeed;
-			newZSpeed = zSpeed;
+			newZSpeed = oldZSpeed;
 		}
 
 	} state move_ml_mono
@@ -1000,9 +1007,6 @@ state calcMovements {
 state move_ml_mono {
 	when (autoMode || putVals || useSetMode) {
 		if (ml_monoCtlDebug) %%printf("ml_monoCtl:move_ml_mono:auto|put\n");
-		thSpeed = newThSpeed;
-		th2Speed = newThSpeed;
-		zSpeed = newZSpeed;
 		thSpeedCmd = newThSpeed;
 		th2SpeedCmd = newThSpeed;
 		zSpeedCmd = newZSpeed;
@@ -1120,9 +1124,6 @@ state thetaMotStopped {
 			%%printf("ml_monoCtl:thetaMotStopped:causedMove (done=%d,moving=%d)\n",
 			%%	ml_monoDone, ml_monoMoving);
 		}
-		thSpeed = oldThSpeed;
-		th2Speed = oldTh2Speed;
-		zSpeed = oldZSpeed;
 		thSpeedCmd = oldThSpeed;
 		th2SpeedCmd = oldTh2Speed;
 		zSpeedCmd = oldZSpeed;

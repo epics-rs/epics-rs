@@ -2,7 +2,7 @@
 //! the connect-time monitors its waitForCmndEnter leaves set, in its order:
 //! thetaLimits, the theta readback (thetaMotStopped `!causedMove`), then
 //! yOffset. Unlike kohzuCtl, a manual-mode pass that would violate a limit
-//! is not rolled back (`kohzuCtl_soft.st:962`). A zero readback holds init
+//! is not rolled back (`kohzuCtl_soft.st:969`). A zero readback holds init
 //! in chkMotorLimits.
 //!
 //! Expected values are a C kohzuIoc's (sequencer 2.2.9, optics, motorSim
@@ -29,7 +29,7 @@ use std::time::Duration;
 const KOHZU_DB: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/db/kohzuSeq_soft.db");
 /// GEOM is left to the program's own `GEOM=1` (`kohzuCtl_soft.st:1`).
 const SEQ_MACROS: &str = "P=K:,MONO=m:,M_THETA=th,M_Y=y,M_Z=z";
-/// initSequence's radConv (`kohzuCtl_soft.st:527`).
+/// initSequence's radConv (`kohzuCtl_soft.st:530`).
 const RAD_CONV: f64 = 57.2958;
 // kohzuSeq_soft.db has no SpeedCtrl record for the one kohzuCtl_soft assigns.
 const MOTORS: &str = r#"
@@ -385,7 +385,7 @@ async fn use_set_and_motor_sets(ioc: &PvDatabase) -> [f64; 4] {
     ]
 }
 
-/// updateSet (kohzuCtl_soft.st:1320-1369) runs on the connect-time monitors with UseSet first,
+/// updateSet (kohzuCtl_soft.st:1321-1370) runs on the connect-time monitors with UseSet first,
 /// so UseSet's value wins: a preset motor .SET is put back (C kohzuIoc
 /// oracle: th.SET=Set before seq gives all Use).
 #[epics_base_rs::epics_test]
@@ -464,7 +464,7 @@ async fn idle(db: &PvDatabase, ack: &str, msg1: &str) {
 }
 
 /// Run `posts` once the sequencer has passed waitForCmndEnter's efClears
-/// (kohzuCtl_soft.st:612-655): `ack` sends it there, and the enter's `opAck = 0` follows them.
+/// (kohzuCtl_soft.st:615-658): `ack` sends it there, and the enter's `opAck = 0` follows them.
 /// Its puts are queued, so no record lock can hold it inside the enter.
 async fn post_after_enter(db: &PvDatabase, ack: &str, posts: impl FnOnce(&PvDatabase)) {
     idle(db, ack, "K:m:SeqMsg1").await;
@@ -567,7 +567,7 @@ async fn a_moving_write_with_no_monitor_is_not_cleared() {
 
 /// Readbacks at the yOffset pass's own Y and Z for theta 10 leave every
 /// motor nothing to do, so thTime is 0: Put keeps each speed, where C put
-/// 0/0, a NaN, into Y's and Z's VELO (`kohzuCtl_soft.st:937-947`).
+/// 0/0, a NaN, into Y's and Z's VELO (`kohzuCtl_soft.st:944-954`).
 /// th.VELO stays only if the pass took that thTime = 0 branch.
 #[epics_base_rs::epics_test]
 async fn a_move_with_nothing_to_do_keeps_the_motor_speeds() {
@@ -588,7 +588,7 @@ async fn a_move_with_nothing_to_do_keeps_the_motor_speeds() {
 }
 
 /// Theta at VELO 0, as speed control leaves it after a move without theta
-/// travel, takes zero time (`kohzuCtl_soft.st:913-923`): Z is the slowest
+/// travel, takes zero time (`kohzuCtl_soft.st:920-930`): Z is the slowest
 /// to theta 20, so it keeps its speed and theta and Y get their travel over
 /// Z's time. C took an infinite thTime and put 0 into every VELO.
 #[epics_base_rs::epics_test]
@@ -668,7 +668,7 @@ async fn boot_speeds() -> Kohzu {
 }
 
 /// The motors done before the echo of Move's th.VELO put is in get their
-/// old speeds back (C defect, kohzuCtl_soft.st:398-408).
+/// old speeds back (C defect, kohzuCtl_soft.st:401-411).
 #[epics_base_rs::epics_test]
 async fn a_move_done_before_its_speed_echo_puts_the_old_speeds_back() {
     let ioc = boot_speeds().await;
@@ -682,7 +682,7 @@ async fn a_move_done_before_its_speed_echo_puts_the_old_speeds_back() {
 }
 
 /// A move started before the echo of the previous move's speed restore is
-/// in gets its own speeds (C defect, kohzuCtl_soft.st:398-408).
+/// in gets its own speeds (C defect, kohzuCtl_soft.st:401-411).
 #[epics_base_rs::epics_test]
 async fn a_move_before_the_restore_echo_puts_its_own_speeds() {
     let ioc = boot_speeds().await;
@@ -701,9 +701,51 @@ async fn a_move_before_the_restore_echo_puts_its_own_speeds() {
     eventually_near(&ioc, "K:th.VELO", th_speed(30.0)).await;
 }
 
+/// Wait for an event of `sub` at `want`.
+async fn shows(sub: &mut DbSubscription, want: f64) {
+    loop {
+        let got = task::timeout(Duration::from_secs(10), sub.recv_f64())
+            .await
+            .unwrap_or_else(|_| panic!("no event at {want}"))
+            .unwrap();
+        if (got - want).abs() <= 1e-4 * want.abs().max(1.0) {
+            return;
+        }
+    }
+}
+
+/// The next move puts back the speeds VELO holds, though this move's speed
+/// echo is in only after its restore (C defect, kohzuCtl_soft.st:913-919).
+#[epics_base_rs::epics_test]
+async fn a_speed_echo_after_its_restore_leaves_the_next_move_the_old_speeds() {
+    let ioc = boot_speeds().await;
+    let mut vel = DbSubscription::subscribe(&ioc, "K:m:ThetaVel")
+        .await
+        .unwrap();
+    put_process(&ioc, "K:m:Theta", 20.0).await;
+    eventually_near(&ioc, "K:th.VELO", th_speed(20.0)).await;
+    // The move takes its time.
+    task::sleep(Duration::from_millis(1500)).await;
+    post_dmov(&ioc, true);
+    eventually_near(&ioc, "K:th.VELO", 1.0).await;
+    // The next move starts once the speed echo is in.
+    shows(&mut vel, th_speed(20.0)).await;
+    post_after_enter(&ioc, "K:m:OperAck", |db| {
+        post_dmov(db, false);
+        post(db, "K:m:Theta", EpicsValue::Double(30.0));
+    })
+    .await;
+    // Z's VAL is Move's last motor put.
+    eventually_near(&ioc, "K:z.VAL", 17.5 / (30.0 / RAD_CONV).sin()).await;
+    post_dmov(&ioc, true);
+    for (pv, speed) in SPEEDS {
+        eventually_near(&ioc, pv, speed).await;
+    }
+}
+
 /// UseSet put twice leaves every motor .SET at the second value, though
 /// the first pass's .SET echo is in only during the second pass's put
-/// (C defect, kohzuCtl_soft.st:458-471).
+/// (C defect, kohzuCtl_soft.st:461-474).
 #[epics_base_rs::epics_test]
 async fn use_set_put_twice_leaves_the_motor_sets_at_the_second() {
     let ioc = boot([10.0, -17.77, 100.78]).await;
@@ -719,7 +761,7 @@ async fn use_set_put_twice_leaves_the_motor_sets_at_the_second() {
 }
 
 /// The same for a motor .SET put twice and the UseSet echo
-/// (C defect, kohzuCtl_soft.st:458-471).
+/// (C defect, kohzuCtl_soft.st:461-474).
 #[epics_base_rs::epics_test]
 async fn a_motor_set_put_twice_leaves_use_set_at_the_second() {
     let ioc = boot([10.0, -17.77, 100.78]).await;
@@ -733,7 +775,7 @@ async fn a_motor_set_put_twice_leaves_use_set_at_the_second() {
 }
 
 /// initSequence's escaped block names each motor `{P}{M_x}`
-/// (`kohzuCtl_soft.st:540-558`) and publishes the names.
+/// (`kohzuCtl_soft.st:543-561`) and publishes the names.
 #[epics_base_rs::epics_test]
 async fn init_names_the_motors_from_p_and_their_macros() {
     let ioc = boot([10.0, -17.77, 100.78]).await;

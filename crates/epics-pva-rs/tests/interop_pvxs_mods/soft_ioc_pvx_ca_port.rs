@@ -16,14 +16,13 @@ fn a_held_ca_port_is_rerun_on_a_fresh_one() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = dir.path().join("t.db");
     std::fs::write(&db, "record(ai, \"CAP:AI\") {}\n").expect("write db");
-    let held = named_port::free_for_tcp_and_udp();
-    let _thief = std::net::UdpSocket::bind(("127.0.0.1", held)).expect("hold the CA port");
+    let held = named_port::HeldPort::closed_udp();
 
     let logs = PvxsLogs::in_dir(dir.path(), "ioc");
     let mut ca_ports = Vec::new();
     let build = || {
         let ca = if ca_ports.is_empty() {
-            held
+            held.port
         } else {
             named_port::free_for_tcp_and_udp()
         };
@@ -42,7 +41,7 @@ fn a_held_ca_port_is_rerun_on_a_fresh_one() {
     // lost it, and that every later rerun was one `start_pvxs` itself
     // reruns on (`port_collision`): a UDP, TCP or PVA steal, not a whim.
     assert!(ca_ports.len() >= 2, "no rerun: {ca_ports:?}");
-    assert_eq!(ca_ports[0], held, "{ca_ports:?}");
+    assert_eq!(ca_ports[0], held.port, "{ca_ports:?}");
     let first = logs.kept(1).text();
     assert!(
         first.contains(named_port::verdict::NO_TCP_SERVER),

@@ -342,9 +342,8 @@ mod tests {
     #[ignore = "needs softIoc on PATH (EPICS base); runs in --profile interop"]
     fn a_held_udp_port_spends_the_candidate() {
         require_tool("softIoc");
-        let port = named_port::free_for_tcp_and_udp();
-        let _held = std::net::UdpSocket::bind(("127.0.0.1", port)).expect("hold the UDP port");
+        let held = named_port::HeldPort::closed_udp();
         let db = db_file("record(ai, \"T:AI\") {}\n");
-        assert!(softioc_on(&db, None, port).is_none());
+        assert!(softioc_on(&db, None, held.port).is_none());
     }
 }

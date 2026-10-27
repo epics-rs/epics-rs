@@ -690,7 +690,9 @@ mod sys {
     fn await_connect(socket: &socket2::Socket, timeout: Duration) -> io::Result<()> {
         // One poll, no EINTR retry: C fails the connect on any return but 1
         // (drvAsynIPPort.c:555), a signal included. A sub-millisecond timeout
-        // polls 1 ms where C's `(int)(1000 * connectTimeout)` (:547) polls 0.
+        // polls 1 ms, the floor C's readIt and writeIt give their polls
+        // (:662-664, :792-794); C's connect `(int)(1000 * connectTimeout)`
+        // (:547) has none and polls 0.
         if !super::poll_ready(socket, super::Readiness::Writable, Some(timeout))? {
             return Err(io::ErrorKind::TimedOut.into());
         }

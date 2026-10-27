@@ -3529,6 +3529,46 @@ mod tests {
         );
     }
 
+    /// The read bound hands `poll_ready` its budget unrounded, so 500 us
+    /// polls 1 ms rather than probing. Unix only: WSAPoll may end a 1 ms wait
+    /// at 386 us (fork run 40470677640).
+    #[cfg(unix)]
+    #[test]
+    fn a_sub_millisecond_read_bound_polls_a_whole_millisecond() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let _accepted = listener.accept().unwrap();
+
+        let start = std::time::Instant::now();
+        client.bound_next_read(Some(Duration::from_micros(500)));
+        let took = start.elapsed();
+        assert!(
+            took >= Duration::from_millis(1),
+            "a 500 us read bound must poll, not probe: took {took:?}"
+        );
+    }
+
+    /// The write side of the same rule, on a socket that takes no bytes.
+    #[cfg(unix)]
+    #[test]
+    fn a_sub_millisecond_write_deadline_polls_a_whole_millisecond() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let _accepted = listener.accept().unwrap();
+        fill_until_refused(&client);
+
+        let start = std::time::Instant::now();
+        let ready = client
+            .wait_writable(Some(start + Duration::from_micros(900)))
+            .unwrap();
+        let took = start.elapsed();
+        assert!(!ready, "a filled socket must not turn writable");
+        assert!(
+            took >= Duration::from_millis(1),
+            "a 900 us write deadline must poll, not probe: took {took:?}"
+        );
+    }
+
     #[test]
     fn zero_timeout_read_polls_without_disconnect() {
         // C drvAsynIPPort.c::readIt: a `timeout == 0` read becomes a 1 ms
@@ -4021,6 +4061,21 @@ mod tests {
         assert!(
             took >= Duration::from_millis(950) && took < Duration::from_millis(1400),
             "asynSetAutoConnectTimeout 1 bounds the connect at 1 s, took {took:?}"
+        );
+        assert_eq!(
+            err.message(),
+            format!("Can't connect to {device}: {}", connect_in_progress_text())
+        );
+
+        // Not C's 0 ms connect probe: a sub-millisecond bound polls 1 ms.
+        // WSAPoll may end that 1 ms at 386 us (fork run 40470677640).
+        set_auto_connect_timeout(0.0005);
+        let (_took, err) = attempt();
+        set_auto_connect_timeout(0.5);
+        #[cfg(unix)]
+        assert!(
+            _took >= Duration::from_millis(1),
+            "asynSetAutoConnectTimeout 0.0005 must poll, not probe: took {_took:?}"
         );
         assert_eq!(
             err.message(),

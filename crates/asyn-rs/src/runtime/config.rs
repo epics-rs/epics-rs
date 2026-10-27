@@ -29,13 +29,22 @@ pub fn auto_connect_timeout() -> Duration {
     }
 }
 
-/// The bound on an IP port's TCP connect — C `connectIt`'s
-/// `msConnectTimeout = (int)(1000 * connectTimeout)` handed to `poll`
-/// (drvAsynIPPort.c:546-555), read at every connect. A negative value is
-/// `poll`'s wait-forever, the longest wait an `int` of milliseconds spells.
+/// The bound on an IP port's TCP connect — C `connectIt`'s `connectTimeout`
+/// handed to `poll` (drvAsynIPPort.c:546-555), read at every connect. Not
+/// rounded: `poll_ready` owns the whole-millisecond interval, and polls a
+/// sub-millisecond value 1 ms where C's `(int)(1000 * connectTimeout)` polls
+/// 0. A negative value is `poll`'s wait-forever, the longest wait an `int` of
+/// milliseconds spells.
 pub fn connect_poll_timeout() -> Duration {
-    let ms = (1000.0 * auto_connect_timeout_secs()) as i32;
-    Duration::from_millis(if ms < 0 { i32::MAX } else { ms } as u64)
+    let longest = Duration::from_millis(i32::MAX as u64);
+    let secs = auto_connect_timeout_secs();
+    if ((1000.0 * secs) as i32) < 0 {
+        longest
+    } else if secs > 0.0 {
+        Duration::try_from_secs_f64(secs).map_or(longest, |t| t.min(longest))
+    } else {
+        Duration::ZERO
+    }
 }
 
 /// C `pasynManager->setAutoConnectTimeout(double)` — the iocsh
@@ -134,15 +143,23 @@ mod auto_connect_timeout_tests {
 
     /// One C double, two readers that part on its sign: the registration
     /// wait does not wait on a negative value (asynManager.c:2137), the
-    /// connect poll waits forever (drvAsynIPPort.c:547-555), and `(int)`
-    /// truncates both to whole milliseconds first.
+    /// connect poll waits forever (drvAsynIPPort.c:547-555).
     #[test]
     fn the_auto_connect_timeout_readers_part_on_the_sign() {
+        let longest = Duration::from_millis(i32::MAX as u64);
         for (secs, wait, poll) in [
             (0.5, Duration::from_millis(500), Duration::from_millis(500)),
-            (0.0004, Duration::from_micros(400), Duration::ZERO),
+            (
+                0.0004,
+                Duration::from_micros(400),
+                Duration::from_micros(400),
+            ),
             (0.0, Duration::ZERO, Duration::ZERO),
-            (-1.0, Duration::ZERO, Duration::from_millis(i32::MAX as u64)),
+            (f64::NAN, Duration::ZERO, Duration::ZERO),
+            (f64::INFINITY, Duration::ZERO, longest),
+            // C's `(int)` makes this a 0 ms poll, not a wait-forever.
+            (-0.0004, Duration::ZERO, Duration::ZERO),
+            (-1.0, Duration::ZERO, longest),
         ] {
             set_auto_connect_timeout(secs);
             assert_eq!(auto_connect_timeout(), wait, "registration wait at {secs}");

@@ -1044,7 +1044,9 @@ mod tests {
             (moving, idle)
         });
         assert_eq!(moving, 3);
-        assert_eq!(idle, 4);
+        // The idle passes never end: the hour's would stop at the woken pass
+        // and its forced fast poll, and a late observer sees more than four.
+        assert!(idle >= 4, "{idle} passes on the new idle period");
     }
 
     /// An add the poller never took fails, and a later add of the same motor

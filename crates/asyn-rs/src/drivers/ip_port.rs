@@ -307,9 +307,10 @@ const SEND_DONTWAIT: libc::c_int = libc::MSG_DONTWAIT;
 ///
 /// `Ok(false)` is C's `asynTimeout`; it does NOT prove `deadline` has passed.
 /// The interval given to `poll` is [`socket::poll_ready`]'s whole
-/// milliseconds of the budget still left, so a sub-millisecond remainder
-/// truncates and the wait can end up to 1 ms early. That is C's own arithmetic — `writePollmsec = (int)(timeout *
-/// 1000.0)` (`drvAsynIPPort.c:662-664`) — and C likewise returns `asynTimeout`
+/// milliseconds of the budget still left, so its sub-millisecond part
+/// truncates and the wait can end up to 1 ms early. That is C's own
+/// arithmetic — `writePollmsec = (int)(timeout * 1000.0)`
+/// (`drvAsynIPPort.c:662-664`) — and C likewise returns `asynTimeout`
 /// straight off `pollstatus == 0` without re-reading any deadline (`:697`).
 /// Reproducing the early edge is deliberate; a caller needing the deadline
 /// held exactly must re-check it, not this trait.
@@ -3572,8 +3573,8 @@ mod tests {
     #[test]
     fn zero_timeout_read_polls_without_disconnect() {
         // C drvAsynIPPort.c::readIt: a `timeout == 0` read becomes a 1 ms
-        // poll (line 742) and the disconnect-on-read-timeout teardown is
-        // gated on `timeout > 0` (line 799). So a zero-timeout read of a
+        // poll (:792-793) and the disconnect-on-read-timeout teardown is
+        // gated on `timeout > 0` (:853). So a zero-timeout read of a
         // silent socket must return asynTimeout WITHOUT a hard
         // Duration::ZERO error and WITHOUT tearing the connection down,
         // even with disconnectOnReadTimeout enabled.

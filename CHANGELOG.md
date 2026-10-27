@@ -7,6 +7,7 @@
 - VxWorks is no longer a target: `epics_embedded_target` is RTEMS alone, and `scripts/vxworks-check.sh` and the `embedded-image.sh vxworks` image are gone.
 - libcom: `worker_pool::ObjectArenaExhausted` removed, with the per-thread VxWorks reservation overhead and mutex-object gate it reported.
 - `epics-rtems-boot`: `stats::register_task` and the VxWorks stats backend removed.
+- libcom: `runtime::socket::poll_ready(socket, want, ms: i32)` → `poll_ready(socket, want, timeout: Option<Duration>)`, `None` waiting forever and a positive timeout polling at least 1 ms.
 
 ## v0.32.0 — 2026-10-22
 

@@ -46,7 +46,7 @@ pub mod serial_port;
 ///
 /// C reaches the same place from the other side: `readIt`/`writeIt` compute
 /// `pollmsec = (int)(timeout * 1000.0)` and then `if (pollmsec == 0) pollmsec =
-/// 1` (`drvAsynIPPort.c:741-743`, `:662-664`). Rounding every positive budget
+/// 1` (`drvAsynIPPort.c:792-794`, `:662-664`). Rounding every positive budget
 /// up is that floor generalised — C only ever sees the caller's timeout here,
 /// whereas the deadline loops also feed this a remainder. Each of those C
 /// triples ends `if (pollmsec < 0) pollmsec = -1`, the wait-forever case a

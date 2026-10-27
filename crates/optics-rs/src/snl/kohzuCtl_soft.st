@@ -297,13 +297,16 @@ monitor yLls;
 monitor zHls;
 monitor zLls;
 
+/* C defect: monitored the values calcMovements puts here, so the move
+ * took what the PV held by then: the late echo of an earlier pass's put,
+ * or a user's edit, driven at the speeds computed for the calculated
+ * value. The move goes where calcMovements put; an edit before it is
+ * dropped. */
 double  thetaMotDesired;
 assign  thetaMotDesired to "{P}{MONO}ThetaSet";
-monitor thetaMotDesired;
 
 double  yMotDesired;
 assign  yMotDesired to "{P}{MONO}YSet";
-monitor yMotDesired;
 double  yMotDesiredHi;
 assign  yMotDesiredHi to "{P}{MONO}YSet.DRVH";
 double  yMotDesiredLo;
@@ -311,7 +314,6 @@ assign  yMotDesiredLo to "{P}{MONO}YSet.DRVL";
 
 double  zMotDesired;
 assign  zMotDesired to "{P}{MONO}ZSet";
-monitor zMotDesired;
 
 double  thetaMotHiLim;
 assign  thetaMotHiLim to "{P}{M_THETA}.HLM";

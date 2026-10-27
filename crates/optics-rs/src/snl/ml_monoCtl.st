@@ -256,17 +256,19 @@ short   zLls;
 assign  zLls to "{P}{M_Z}.LLS";
 monitor zLls;
 
+/* C defect: monitored the values calcMovements puts here, so the move
+ * took what the PV held by then: the late echo of an earlier pass's put,
+ * or a user's edit, driven at the speeds computed for the calculated
+ * value. The move goes where calcMovements put; an edit before it is
+ * dropped. */
 double  thetaMotDesired;
 assign  thetaMotDesired to "{P}ml_monoThetaSet";
-monitor thetaMotDesired;
 
 double  theta2MotDesired;
 assign  theta2MotDesired to "{P}ml_monoTheta2Set";
-monitor theta2MotDesired;
 
 double  zMotDesired;
 assign  zMotDesired to "{P}ml_monoZSet";
-monitor zMotDesired;
 
 double  thetaMotHiLim;
 assign  thetaMotHiLim to "{P}{M_THETA}.HLM";

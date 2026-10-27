@@ -160,8 +160,7 @@ pub struct Strtod {
     /// Bytes consumed: C's `endptr - str`. 0 is "no conversion performed".
     pub len: usize,
     /// C `errno == ERANGE`: the text named a nonzero number that does not fit —
-    /// overflow (the value is infinite) or underflow (subnormal, or zero); or
-    /// a `nan(...)` payload too big for `strtoull`.
+    /// overflow (the value is infinite) or underflow (subnormal, or zero).
     pub erange: bool,
 }
 
@@ -212,8 +211,7 @@ fn magnitude(s: &[u8]) -> Option<(f64, usize, bool)> {
     if starts_ci(s, b"nan") {
         let n = nan_char_sequence(&s[3..]);
         let payload = if n == 0 { &[][..] } else { &s[4..2 + n] };
-        let (nan, erange) = nan_payload(payload);
-        return Some((nan, 3 + n, erange));
+        return Some((nan_payload(payload), 3 + n, false));
     }
     let hex_digit_at = |k: usize| s.get(k).is_some_and(u8::is_ascii_hexdigit);
     if s.len() > 2
@@ -257,34 +255,29 @@ fn nan_char_sequence(s: &[u8]) -> usize {
 
 /// glibc's `SET_NAN_PAYLOAD`: the sequence, when `strtoull(seq, &end, 0)`
 /// reads all of it, goes in the mantissa below the quiet bit; a zero
-/// payload leaves the default NaN. strtoull's ERANGE stays in errno.
-fn nan_payload(seq: &[u8]) -> (f64, bool) {
+/// payload leaves the default NaN. A payload that overflows `strtoull` is
+/// not an ERANGE of `strtod` (C11 7.22.1.3p10 is about the value); glibc
+/// before 2.41 leaked strtoull's errno (BZ #32045), which is not copied.
+fn nan_payload(seq: &[u8]) -> f64 {
     let (digits, radix) = match seq {
         [b'0', x, d, ..] if *x | 0x20 == b'x' && d.is_ascii_hexdigit() => (&seq[2..], 16),
         [b'0', ..] => (seq, 8),
         _ => (seq, 10),
     };
-    let mut mant = 0u64;
-    let mut erange = false;
+    let mut mant = Some(0u64);
     let mut read = 0;
     for d in digits.iter().map_while(|&b| (b as char).to_digit(radix)) {
-        match mant
-            .checked_mul(radix as u64)
-            .and_then(|m| m.checked_add(d as u64))
-        {
-            Some(m) => mant = m,
-            None => erange = true,
-        }
+        mant = mant
+            .and_then(|m| m.checked_mul(radix as u64))
+            .and_then(|m| m.checked_add(d as u64));
         read += 1;
     }
-    if erange {
-        mant = u64::MAX;
-    }
-    let mant = mant & ((1 << 51) - 1);
+    // strtoull saturates.
+    let mant = mant.unwrap_or(u64::MAX) & ((1 << 51) - 1);
     if read != digits.len() || mant == 0 {
-        return (f64::NAN, erange);
+        return f64::NAN;
     }
-    (f64::from_bits(f64::NAN.to_bits() | mant), erange)
+    f64::from_bits(f64::NAN.to_bits() | mant)
 }
 
 /// `0x` significand and optional `p` exponent; the caller checked a hex digit
@@ -950,7 +943,9 @@ mod tests {
     /// `strtod` against the C library's on every edge the ports disagreed on:
     /// hex floats (`0x.8`, a bare `0x`, `p` with no digit), the `inf`/`nan`
     /// words and `nan(...)`'s character set, leading C whitespace (`\v`
-    /// included), an exponent with no digits, and both ERANGE sides.
+    /// included), an exponent with no digits, and both ERANGE sides. Only
+    /// rows every glibc agrees on; the rest are pinned in
+    /// `nan_payload_overflow_is_not_erange`.
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     #[test]
     fn strtod_matches_c_strtod() {
@@ -987,8 +982,6 @@ mod tests {
             b"nan(0xg)",
             b"nan(2251799813685248)",
             b"nan(2251799813685249)",
-            b"nan(99999999999999999999999)",
-            b"nan(99999999999999999999999z)",
             b"nan(a-b)",
             b"nan(",
             b"nan()",
@@ -1030,6 +1023,21 @@ mod tests {
             assert_eq!(r.len, len, "length of {shown:?}");
             assert_eq!(r.erange, erange, "ERANGE of {shown:?}");
             assert_eq!(r.value.to_bits(), v.to_bits(), "value of {shown:?}");
+        }
+    }
+
+    /// glibc 2.43 `strtod`: `(text, length, bits)`, never ERANGE. glibc 2.39
+    /// sets ERANGE on both (BZ #32045).
+    #[test]
+    fn nan_payload_overflow_is_not_erange() {
+        let rows: &[(&str, usize, u64)] = &[
+            ("nan(99999999999999999999999)", 28, 0x7fff_ffff_ffff_ffff),
+            ("nan(99999999999999999999999z)", 29, 0x7ff8_0000_0000_0000),
+        ];
+        for &(text, len, bits) in rows {
+            let r = strtod(text.as_bytes());
+            assert_eq!((r.len, r.value.to_bits()), (len, bits), "{text}");
+            assert!(!r.erange, "ERANGE of {text}");
         }
     }
 

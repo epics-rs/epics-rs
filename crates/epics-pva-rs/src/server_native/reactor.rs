@@ -85,7 +85,7 @@
 use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
 use epics_base_rs::runtime::accept::AcceptBackoff;
@@ -98,7 +98,7 @@ use super::blocking::{
 };
 use super::config::PvaServerConfig;
 use super::peers::{PeerEntry, PeerRegistry};
-use super::search_engine::random_guid;
+use super::search_engine::{SearchReplier, random_guid};
 use super::serv_iface::ServListeners;
 use super::shared_pv::SharedSource;
 use super::source::{ChannelInvalidator, DynSource};
@@ -416,7 +416,9 @@ impl ReactorPvaServer {
         self.connections.live()
     }
 
-    /// Answer UDP SEARCHes on `socket` until [`shutdown`](Self::shutdown).
+    /// Answer UDP SEARCHes on `socket` until [`shutdown`](Self::shutdown),
+    /// from the first one: a server that must stay silent until it serves
+    /// reads its sockets through [`super::serving::PvaSockets`].
     ///
     /// The same blocking responder the thread-per-connection driver runs, on a
     /// thread of its own: one socket with a 200 ms stop tick is not what the
@@ -427,11 +429,20 @@ impl ReactorPvaServer {
     /// the accept loop's — give it a *different* thread from
     /// [`serve`](Self::serve).
     pub fn serve_udp_search(&self, socket: SearchSocket) -> PvaResult<()> {
+        let udp_port = socket
+            .local_addr()
+            .map_or(self.config.udp_port, |a| a.port());
+        let replier = OnceLock::from(SearchReplier {
+            source: self.source.clone(),
+            tcp_port: self.config.tcp_port,
+            guid: self.config.guid,
+            protocol: "tcp",
+        });
         handle_udp_search_blocking(
             socket,
-            &self.source,
-            &self.config,
-            self.config.tcp_port,
+            &self.config.ignore_addrs,
+            udp_port,
+            &replier,
             &self.shutdown,
         )
     }

@@ -3011,7 +3011,8 @@ impl<T> IntoIterator for CycleList<T> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DelayedCallbackOutcome {
     /// C's `else` branch (`boRecord.c:115-117`): the handler made its change,
-    /// so re-enter `process()` now.
+    /// so `dbProcess` the record now — a fresh pass, not the async
+    /// continuation [`ProcessAction::ReprocessAfter`] runs.
     Reprocess,
     /// C's `if (prec->pact)` branch (`boRecord.c:107-114`): the record is
     /// mid-async-cycle, so the handler changed nothing and the timer is re-armed
@@ -6279,9 +6280,7 @@ pub trait Record: RecordAny + Send + Sync + 'static {
     ///
     /// This hook is the ONLY place the one-shot's mutation may happen: keeping
     /// it out of `process()` is what stops an unrelated process cycle from
-    /// consuming it. Default: re-enter `process()` and change nothing, so a
-    /// record that emits the action without overriding still behaves as a plain
-    /// [`ProcessAction::ReprocessAfter`].
+    /// consuming it. Default: change nothing and process the record again.
     fn delayed_callback_fire(&mut self, _pact: bool) -> DelayedCallbackOutcome {
         DelayedCallbackOutcome::Reprocess
     }

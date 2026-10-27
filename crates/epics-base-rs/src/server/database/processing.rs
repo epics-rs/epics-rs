@@ -4457,8 +4457,11 @@ impl PvDatabase {
         let outcome = rec.write().record.delayed_callback_fire(pact);
         match outcome {
             crate::server::record::DelayedCallbackOutcome::Reprocess => {
+                // C's `dbProcess` with PACT clear: a fresh pass, not an async
+                // continuation, so an Async Soft Channel `write_bo` puts the
+                // zero instead of taking its put as done.
                 let target = ProcessTarget::Resolved(name, rec.unframed());
-                let _ = self.run_process_frame(target, &mut ProcStack::new(), false, true, false);
+                let _ = self.run_process_frame(target, &mut ProcStack::new(), false, false, false);
                 None
             }
             crate::server::record::DelayedCallbackOutcome::Rearm(again) => {

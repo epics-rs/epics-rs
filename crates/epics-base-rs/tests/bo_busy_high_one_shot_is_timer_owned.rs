@@ -149,6 +149,51 @@ record(bo, "SB") {
     );
 }
 
+/// The timer's pass is C `myCallbackFunc`'s `dbProcess` with PACT clear, so
+/// `devBoSoftCallback.c::write_bo` runs in full: `dbPutLinkAsync` answers
+/// `S_db_noLSET` on a DB link and `dbPutLink` writes the zero. Run as an
+/// async-put continuation, the pass took the put as already done and OUT kept
+/// the pulse.
+#[epics_macros_rs::epics_test]
+async fn the_high_zero_of_an_async_soft_channel_bo_reaches_out() {
+    const ASYNC: &str = r#"
+record(longin, "AT") { }
+record(bo, "AB") {
+    field(DTYP, "Async Soft Channel")
+    field(HIGH, "0.15")
+    field(OUT, "AT.VAL PP")
+}
+"#;
+    let db = IocBuilder::new()
+        .db_string(ASYNC, &std::collections::HashMap::new())
+        .unwrap()
+        .build()
+        .await
+        .unwrap()
+        .0;
+
+    db.put_pv("AB", EpicsValue::Enum(1)).await.unwrap();
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
+    db.process_record_with_links("AB", &mut visited)
+        .await
+        .unwrap();
+    assert_eq!(db.get_pv("AT").unwrap(), EpicsValue::Long(1));
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while db.get_pv("AB").unwrap() != EpicsValue::Enum(0) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the HIGH timer never fired"
+        );
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(
+        db.get_pv("AT").unwrap(),
+        EpicsValue::Long(0),
+        "the HIGH timer's zero must reach an Async Soft Channel bo's DB OUT"
+    );
+}
+
 /// The pass past the write arms and nothing else: the action
 /// `after_write_actions` emits is the delayed callback, and the record keeps
 /// no cell for a later cycle to consume.

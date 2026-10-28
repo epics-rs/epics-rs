@@ -1265,7 +1265,7 @@ impl SscanRecord {
             return;
         };
         let name = self.name.clone();
-        let wait = std::time::Duration::from_secs_f64(f64::from(secs).max(0.0));
+        let wait = epics_base_rs::runtime::time::duration_from_secs(f64::from(secs));
         epics_base_rs::runtime::task::spawn_background_after(self.prio, wait, async move {
             with_sscan(&h, &name, |s, _| {
                 if s.dly_gen == generation {

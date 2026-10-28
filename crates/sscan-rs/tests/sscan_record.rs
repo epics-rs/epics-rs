@@ -250,6 +250,41 @@ async fn an_operator_abort_stops_the_scan() {
     assert_eq!(f64_of(&db, "S.EXSC"), 0.0);
 }
 
+/// A db-loaded delay skips `special()`'s rounding and reaches
+/// `callbackRequestDelayed` as written. One past `Duration`'s range never
+/// fires (`duration_from_secs`), so the scan holds at its first point and
+/// still answers an abort.
+async fn an_unrepresentable_delay_holds_the_scan(field: &str, secs: &str) {
+    let scan = ONE_D.replace("}", &format!("  field({field}, \"{secs}\")\n}}"));
+    let db = ioc(&scan).await;
+    connected(&db, "S", &["P1NV", "D01NV", "T1NV"]).await;
+    // The callback pool catches a panic on `cbLow`, so only the hook sees
+    // one. Process-global is safe: nextest runs one process per test.
+    let panics = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = panics.clone();
+    std::panic::set_hook(Box::new(move |info| {
+        sink.lock().unwrap().push(info.to_string());
+    }));
+    start(&db, "S").await;
+    sleep(Duration::from_millis(300)).await;
+    let _ = std::panic::take_hook();
+    assert_eq!(*panics.lock().unwrap(), Vec::<String>::new());
+    assert_eq!(f64_of(&db, "S.CPT"), 0.0, "{field}={secs} never fires");
+    assert_eq!(f64_of(&db, "S.BUSY"), 1.0);
+    put_field(&db, "S", "EXSC", EpicsValue::Short(0)).await;
+    wait_until("S.BUSY", || f64_of(&db, "S.BUSY") == 0.0).await;
+}
+
+#[epics_base_rs::epics_test]
+async fn a_finite_pdly_past_duration_range_holds_the_scan() {
+    an_unrepresentable_delay_holds_the_scan("PDLY", "1e30").await;
+}
+
+#[epics_base_rs::epics_test]
+async fn an_infinite_ddly_holds_the_scan() {
+    an_unrepresentable_delay_holds_the_scan("DDLY", "inf").await;
+}
+
 #[epics_base_rs::epics_test]
 async fn a_pause_holds_the_scan_until_rescinded() {
     let db = ioc(ONE_D).await;

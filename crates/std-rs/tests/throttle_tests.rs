@@ -622,130 +622,54 @@ fn test_real_out_link_reports_success_and_writes() {
 }
 
 // ============================================================
-// BUG 5 — a CA put of DLY = +inf / NaN must not panic the record.
-//
-// `process()` models the delay with `Duration::from_secs_f64`,
-// which panics on a non-finite argument. `put_field` rejects a
-// non-finite DLY so the record task cannot panic.
+// C stores any DLY verbatim (throttleRecord.c `special()` :392-409 only
+// clamps a negative one to 0), and `callbackRequestDelayed` takes it as
+// is. A delay past `Duration`'s range — +inf, NaN, 1e300 — converts
+// through `duration_from_secs` to `Duration::MAX`: armed, never fires.
 // ============================================================
 
-#[test]
-fn test_dly_infinity_rejected() {
-    let mut rec = ThrottleRecord::default();
-    assert!(
-        rec.put_field("DLY", EpicsValue::Double(f64::INFINITY))
-            .is_err(),
-        "a CA put of DLY = +inf must be rejected, not stored"
-    );
-    assert_eq!(rec.dly, 0.0, "DLY must keep its prior finite value");
+/// The cooldown `actions` armed, if any.
+fn cooldown(actions: &[ProcessAction]) -> Option<std::time::Duration> {
+    actions.iter().find_map(|a| match a {
+        ProcessAction::ValuePutAfter(d) => Some(*d),
+        _ => None,
+    })
 }
 
 #[test]
-fn test_dly_neg_infinity_rejected() {
-    let mut rec = ThrottleRecord::default();
-    assert!(
-        rec.put_field("DLY", EpicsValue::Double(f64::NEG_INFINITY))
-            .is_err(),
-        "a CA put of DLY = -inf must be rejected"
-    );
-    assert_eq!(rec.dly, 0.0);
+fn an_unrepresentable_dly_is_stored_and_arms_a_cooldown_that_never_fires() {
+    for dly in [f64::INFINITY, f64::NAN, 1e300] {
+        let mut rec = ThrottleRecord::default();
+        rec.out = "OUTPUT:PV".into();
+        rec.put_field("DLY", EpicsValue::Double(dly)).unwrap();
+        rec.special("DLY", true, &Default::default()).unwrap();
+        assert_eq!(rec.dly.to_bits(), dly.to_bits(), "DLY={dly} stored as put");
+
+        rec.val = 1.0;
+        let actions = process_ok(&mut rec);
+        assert_eq!(rec.sent, 1.0, "DLY={dly}: the first value goes out");
+        assert_eq!(rec.wait, 0);
+        assert_eq!(cooldown(&actions), Some(std::time::Duration::MAX));
+    }
 }
 
 #[test]
-fn test_dly_nan_rejected() {
-    let mut rec = ThrottleRecord::default();
-    assert!(
-        rec.put_field("DLY", EpicsValue::Double(f64::NAN)).is_err(),
-        "a CA put of DLY = NaN must be rejected"
-    );
-    assert_eq!(rec.dly, 0.0);
-}
-
-#[test]
-fn test_dly_infinity_does_not_panic_process() {
-    // Even if a non-finite DLY somehow reached the record, a
-    // subsequent process() must not panic. With the put_field guard,
-    // DLY stays finite, so process() with the rejected-then-unchanged
-    // DLY=0.0 runs cleanly.
+fn a_negative_infinite_dly_is_clamped_to_zero() {
     let mut rec = ThrottleRecord::default();
     rec.out = "OUTPUT:PV".into();
-    let _ = rec.put_field("DLY", EpicsValue::Double(f64::INFINITY));
-    rec.val = 1.0;
-    // Must not panic.
-    rec.process().unwrap();
-}
-
-#[test]
-fn test_dly_huge_finite_rejected() {
-    // A huge-but-finite f64 like 1e300 passes an `is_finite()` check
-    // yet is far too large for `Duration::from_secs_f64` to represent
-    // (panic: "value is either too big or NaN"). put_field must reject
-    // it so it never reaches `process()`.
-    let mut rec = ThrottleRecord::default();
-    assert!(
-        rec.put_field("DLY", EpicsValue::Double(1e300)).is_err(),
-        "a CA put of DLY = 1e300 must be rejected, not stored"
-    );
-    assert_eq!(rec.dly, 0.0, "DLY must keep its prior finite value");
-}
-
-#[test]
-fn test_dly_huge_finite_does_not_panic_process() {
-    // Regression: a CA put of DLY = 1e300
-    // (finite, so it slipped past the old `is_finite()` guard) was
-    // stored and then panicked the record task at
-    // `Duration::from_secs_f64(self.dly)` because `self.dly > 0.0` is
-    // true for 1e300. After the fix the put is rejected, DLY keeps its
-    // prior value (0.0), and a full process() cycle that reaches the
-    // send path completes without panicking.
-    let mut rec = ThrottleRecord::default();
-    rec.out = "OUTPUT:PV".into();
-    assert!(
-        rec.put_field("DLY", EpicsValue::Double(1e300)).is_err(),
-        "DLY = 1e300 must be rejected"
-    );
-    assert_eq!(rec.dly, 0.0, "rejected put must leave DLY unchanged");
-
-    rec.val = 1.0;
-    // process() reaches the `self.dly > 0.0` branch decision and the
-    // immediate-send path; with DLY = 0.0 it builds no Duration and
-    // must not panic.
-    process_ok(&mut rec);
-    assert_eq!(rec.sent, 1.0, "value must have been sent");
-    assert_eq!(rec.wait, 0, "no delay armed, WAIT stays clear");
-}
-
-#[test]
-fn test_dly_huge_finite_assigned_directly_does_not_panic_process() {
-    // Belt-and-braces: if a huge DLY were assigned to `self.dly` by
-    // some path other than put_field, process() must still not panic.
-    // `process()` builds `Duration::from_secs_f64(self.dly)` whenever
-    // `self.dly > 0.0`, so a guard that lived only in put_field would
-    // not cover this. The clamp lives in the writer/`special()` gate;
-    // exercise a process() cycle after a special() clamp to prove the
-    // armed-delay path is safe.
-    let mut rec = ThrottleRecord::default();
-    rec.out = "OUTPUT:PV".into();
-    rec.dly = 1e300;
+    rec.put_field("DLY", EpicsValue::Double(f64::NEG_INFINITY))
+        .unwrap();
     rec.special("DLY", true, &Default::default()).unwrap();
-    assert!(
-        rec.dly.is_finite() && rec.dly <= 86_400.0,
-        "special() must clamp a huge DLY to a Duration-safe ceiling, got {}",
-        rec.dly
-    );
-
+    assert_eq!(rec.dly, 0.0);
     rec.val = 1.0;
-    // self.dly > 0.0 now, so process() builds a Duration and arms the
-    // delay timer. Must not panic.
-    let outcome = rec.process().unwrap();
-    report_put(&mut rec, &outcome.actions, false);
-    // The value was written on this immediate cycle; the timer is armed
-    // but nothing is queued, so WAIT is clear (C `valuePut`:575).
-    assert_eq!(
-        rec.wait, 0,
-        "a positive DLY arms the delay but the value is written -> WAIT clear"
-    );
-    let _ = outcome;
+    assert_eq!(cooldown(&process_ok(&mut rec)), None, "DLY 0 arms nothing");
+}
+
+#[test]
+fn an_unrepresentable_dly_put_during_a_cooldown_re_arms_it_never_firing() {
+    let mut rec = armed(1.0);
+    let actions = put_dly(&mut rec, 1e300);
+    assert_eq!(cooldown(&actions), Some(std::time::Duration::MAX));
 }
 
 // ============================================================

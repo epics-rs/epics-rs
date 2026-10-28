@@ -12,7 +12,6 @@ use epics_base_rs::server::records::link_status::{
     LinkStatusPosts, link_is_external, post_link_status,
 };
 use epics_base_rs::types::{EpicsValue, PvString};
-use epics_libcom_rs::cfmt::CFloat;
 
 // `menu(throttleSTS)` indices (throttleRecord.dbd) — STS is set only by a
 // real link operation (`valuePut`/`valueSync`), never by the limit block.
@@ -225,50 +224,6 @@ impl Default for ThrottleRecord {
     }
 }
 
-/// Upper bound (exclusive) on the `DLY` field, in seconds.
-///
-/// `process()` converts `self.dly` into a `std::time::Duration` via
-/// `Duration::from_secs_f64`, which panics not only on a non-finite
-/// argument but on any finite value too large for a `Duration` to
-/// represent (≈ `u64::MAX` seconds ≈ 1.8e19, message "value is either
-/// too big or NaN"). A CA put of e.g. `DLY = 1e300` is a perfectly
-/// finite f64 and would otherwise slip past an `is_finite()` guard and
-/// panic the record task.
-///
-/// A throttle delay of 24 hours is already far past any realistic
-/// device-protection interval, so this finite cap is the operational
-/// ceiling for `DLY`. It is also orders of magnitude below the
-/// `Duration` overflow point, so any `self.dly` accepted by the writer
-/// guard is guaranteed safe for `Duration::from_secs_f64`.
-const MAX_DLY: f64 = 86_400.0;
-
-/// Validate a candidate `DLY` value (seconds).
-///
-/// Returns `Ok(())` only for a value that can never make
-/// `Duration::from_secs_f64(self.dly)` panic in `process()`: it must
-/// be finite and at most [`MAX_DLY`]. A negative value is accepted
-/// here — C `special()` clamps it to 0 and `process()` treats any
-/// `dly <= 0.0` as "no delay" without constructing a `Duration` — so
-/// negativity is not a panic hazard. This is the single guard every
-/// writer of `self.dly` must pass through to hold the invariant
-/// "`self.dly` can never make `Duration::from_secs_f64` panic".
-fn validate_dly(v: f64) -> CaResult<()> {
-    if !v.is_finite() {
-        return Err(CaError::InvalidValue(format!(
-            "throttle DLY must be finite, got {}",
-            CFloat(v).g()
-        )));
-    }
-    if v > MAX_DLY {
-        return Err(CaError::InvalidValue(format!(
-            "throttle DLY must not exceed {} seconds, got {}",
-            CFloat(MAX_DLY).g(),
-            CFloat(v).g()
-        )));
-    }
-    Ok(())
-}
-
 /// C `checkLink`'s walk: OUT, then SINP (throttleRecord.c:702-747).
 static THROTTLE_LINK_CHECK: LinkCheckSpec = LinkCheckSpec {
     links: &[("OUT", "OV"), ("SINP", "SIV")],
@@ -415,11 +370,10 @@ impl ThrottleRecord {
         // that round trip — with DLY = 0 there is no cooldown, so the next
         // value goes straight out — rather than spawning a timer task per put
         // whose only job is to switch a flag back off.
-        if self.dly > 0.0 {
+        let delay = epics_base_rs::runtime::time::duration_from_secs(self.dly);
+        if !delay.is_zero() {
             self.delay_active = true;
-            actions.push(ProcessAction::ValuePutAfter(
-                std::time::Duration::from_secs_f64(self.dly),
-            ));
+            actions.push(ProcessAction::ValuePutAfter(delay));
         } else {
             self.delay_active = false;
         }
@@ -556,26 +510,14 @@ impl Record for ThrottleRecord {
             // effect at once. `take_special_actions` carries that re-anchor
             // out as a fresh `ValuePutAfter`; minting its token supersedes
             // the pending one, which IS C's `callbackCancelDelayed`.
-            //
-            // `special()` runs after the field write. `put_field("DLY")`
-            // already rejects non-finite and huge-but-finite values via
-            // `validate_dly`, so a CA/db path can never leave `self.dly`
-            // out of range here. The clamp below additionally enforces
-            // the `Duration::from_secs_f64` invariant for any other
-            // writer of `self.dly` (e.g. in-process callers), so every
-            // reader downstream of `special()` is safe.
             "DLY" => {
                 if self.dly < 0.0 {
                     self.dly = 0.0;
                     self.posts |= POST_DLY;
-                } else if validate_dly(self.dly).is_err() {
-                    // Non-finite or >= MAX_DLY: clamp to the operational
-                    // ceiling so `process()` never panics.
-                    self.dly = MAX_DLY;
                 }
                 if self.delay_active {
                     self.special_actions.push(ProcessAction::ValuePutAfter(
-                        std::time::Duration::from_secs_f64(self.dly),
+                        epics_base_rs::runtime::time::duration_from_secs(self.dly),
                     ));
                 }
             }
@@ -710,20 +652,6 @@ impl Record for ThrottleRecord {
             },
             "DLY" => match value {
                 EpicsValue::Double(v) => {
-                    // C `throttleRecord.c` models the delay with
-                    // `Duration::from_secs_f64(self.dly)` in `process()`,
-                    // which panics not only on a non-finite argument but
-                    // on any finite value too large for a `Duration`
-                    // (≈ 1.8e19; message "value is either too big or
-                    // NaN"). C's `special()` DLY handler (lines 392-409)
-                    // only ever anticipated a negative delay; a CA put of
-                    // `+inf`, `NaN`, or a huge-but-finite f64 like `1e300`
-                    // is not a value any real delay can represent. Reject
-                    // it here, at the single writer of `self.dly`, so the
-                    // record task can never panic — `validate_dly` is the
-                    // gate that holds the invariant "`self.dly` can never
-                    // make `Duration::from_secs_f64` panic".
-                    validate_dly(v)?;
                     self.dly = v;
                     Ok(())
                 }
@@ -1087,23 +1015,5 @@ mod menu_choice_tests {
         assert_eq!(menu("SIV"), Some(ov));
         assert_eq!(menu("SYNC"), Some(&["Idle", "Process"][..]));
         assert_eq!(menu("VAL"), None);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn validate_dly_names_the_value_as_c_percent_g() {
-        let text = |v| match validate_dly(v) {
-            Err(CaError::InvalidValue(msg)) => msg,
-            other => panic!("{other:?}"),
-        };
-        assert_eq!(text(f64::NAN), "throttle DLY must be finite, got nan");
-        assert_eq!(
-            text(1e20),
-            "throttle DLY must not exceed 86400 seconds, got 1e+20"
-        );
     }
 }

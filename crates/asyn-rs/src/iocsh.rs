@@ -1403,8 +1403,9 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
             "asynWaitConnect portName timeout - block until the port is connected",
             move |args: &[ArgValue], _ctx: &CommandContext| {
                 let port = arg_str(args, 0)?;
-                let timeout =
-                    crate::runtime::config::event_wait_timeout(arg_f64(args, 1).unwrap_or(0.0));
+                let timeout = epics_libcom_rs::runtime::sync::event_wait_timeout(
+                    arg_f64(args, 1).unwrap_or(0.0),
+                );
                 let Ok(handle) = shell_connect_device(&mgr_r, port.as_deref()) else {
                     // An unbound user's asynPrint goes to the global trace;
                     // printf's "%s" of NULL is glibc's "(null)".

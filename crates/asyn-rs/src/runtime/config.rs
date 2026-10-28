@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::services::PortServices;
+use epics_libcom_rs::runtime::sync::event_wait_timeout;
 
 /// C `pasynBase->autoConnectTimeout` (asynManager.c:110), initialised to
 /// `DEFAULT_AUTOCONNECT_TIMEOUT` = 0.5 s (:49, :509) and rewritten by
@@ -22,19 +23,6 @@ fn auto_connect_timeout_secs() -> f64 {
 /// `event_wait_timeout`.
 pub fn auto_connect_timeout() -> Duration {
     event_wait_timeout(auto_connect_timeout_secs())
-}
-
-/// A C `epicsEventWaitWithTimeout` timeout as posix `convertDoubleToWakeTime`
-/// (libcom osdTime.cpp:92-127) clamps it: a negative one is 0 and anything past
-/// ten years is ten years. NaN slips past both of C's tests into an undefined
-/// `time_t` cast; it is 0 here.
-pub(crate) fn event_wait_timeout(secs: f64) -> Duration {
-    const TEN_YEARS: f64 = 60.0 * 60.0 * 24.0 * 3652.5;
-    if secs > 0.0 {
-        Duration::from_secs_f64(secs.min(TEN_YEARS))
-    } else {
-        Duration::ZERO
-    }
 }
 
 /// The bound on an IP port's TCP connect — C `connectIt`'s `connectTimeout`

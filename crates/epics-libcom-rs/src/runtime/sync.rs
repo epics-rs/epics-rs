@@ -950,9 +950,18 @@ pub struct EpicsEvent {
     cv: std::sync::Condvar,
 }
 
-/// `convertDoubleToWakeTime`'s cap on a timeout: ten years
-/// (`osdTime.cpp:97-100`).
-const EPICS_EVENT_MAX_TIMEOUT: f64 = 60.0 * 60.0 * 24.0 * 3652.5;
+/// A C `epicsEventWaitWithTimeout` timeout as posix `convertDoubleToWakeTime`
+/// clamps it (`osdTime.cpp:97-100`): a negative one is 0 and anything past ten
+/// years is ten years. NaN slips past both of C's tests into an undefined
+/// `time_t` cast; it is 0 here.
+pub fn event_wait_timeout(secs: f64) -> std::time::Duration {
+    const TEN_YEARS: f64 = 60.0 * 60.0 * 24.0 * 3652.5;
+    if secs > 0.0 {
+        std::time::Duration::from_secs_f64(secs.min(TEN_YEARS))
+    } else {
+        std::time::Duration::ZERO
+    }
+}
 
 impl EpicsEvent {
     /// `epicsEventCreate(epicsEventEmpty)`.
@@ -992,14 +1001,7 @@ impl EpicsEvent {
     /// for the next wait, as C (`osdEvent.c:134-138`). `secs` at or below 0, or NaN, polls; above
     /// ten years it is ten years, as C caps it.
     pub fn wait_timeout(&self, secs: f64) -> bool {
-        let secs = if secs.is_nan() {
-            0.0
-        } else {
-            secs.clamp(0.0, EPICS_EVENT_MAX_TIMEOUT)
-        };
-        let Some(deadline) =
-            std::time::Instant::now().checked_add(std::time::Duration::from_secs_f64(secs))
-        else {
+        let Some(deadline) = std::time::Instant::now().checked_add(event_wait_timeout(secs)) else {
             self.wait();
             return true;
         };
@@ -1973,6 +1975,23 @@ mod tests {
         };
         assert!(ev.wait_timeout(f64::INFINITY));
         signaller.join().unwrap();
+    }
+
+    #[test]
+    fn event_wait_timeout_clamps_as_convert_double_to_wake_time() {
+        use std::time::Duration;
+        let ten_years = Duration::from_secs(60 * 60 * 24 * 36525 / 10);
+        for (secs, want) in [
+            (0.5, Duration::from_millis(500)),
+            (0.0, Duration::ZERO),
+            (-1.0, Duration::ZERO),
+            (f64::NEG_INFINITY, Duration::ZERO),
+            (f64::NAN, Duration::ZERO),
+            (f64::INFINITY, ten_years),
+            (1e300, ten_years),
+        ] {
+            assert_eq!(super::event_wait_timeout(secs), want, "{secs}");
+        }
     }
 
     #[test]

@@ -104,7 +104,7 @@ async fn boot(port: &str, motors: &[(&str, &str)], check: impl AsyncFnOnce(&PvDa
         .await
         .unwrap();
     for tx in &polls {
-        tx.send(PollCommand::ForcePoll).await.unwrap();
+        tx.send(PollCommand::ForcePoll(None)).await.unwrap();
     }
     let deadline = Instant::now() + Duration::from_secs(10);
     for rec in motors.iter().map(|(name, _)| name) {

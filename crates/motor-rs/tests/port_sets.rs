@@ -390,7 +390,9 @@ fn a_pass_blocked_on_a_deferred_move_release_polls_after_its_done_0() {
         std::thread::spawn(move || port.write_int32_blocking(index::DEFER_MOVES, 1, 0))
     };
     entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    wake.unwrap().try_send(PollCommand::ForcePoll).unwrap();
+    wake.unwrap()
+        .try_send(PollCommand::ForcePoll(None))
+        .unwrap();
     // The pass is now waiting on the release's lock.
     std::thread::sleep(Duration::from_millis(200));
     release_tx.send(()).unwrap();

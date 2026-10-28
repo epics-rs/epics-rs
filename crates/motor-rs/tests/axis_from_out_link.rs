@@ -905,7 +905,7 @@ record(motor, "K:b") { field(DTYP, "asynMotor") field(OUT, "@asyn(TWIN,0)") fiel
     .await;
     db.scan_control().run();
     poll_cmd_tx
-        .send(motor_rs::poll_loop::PollCommand::ForcePoll)
+        .send(motor_rs::poll_loop::PollCommand::ForcePoll(None))
         .await
         .unwrap();
     assert_eq!(field(&db, "K:b.PACT"), EpicsValue::Char(0));

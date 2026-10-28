@@ -453,7 +453,10 @@ async fn a_move_write_posts_before_the_pass_it_wakes() {
         .unwrap();
     until("the woken pass", || seen.lock().unwrap().len() >= 2).await;
     // m0 once more: every post m1's records had by now.
-    m0.0.poll_cmd_tx.send(PollCommand::ForcePoll).await.unwrap();
+    m0.0.poll_cmd_tx
+        .send(PollCommand::ForcePoll(None))
+        .await
+        .unwrap();
     until("the forced poll", || seen.lock().unwrap().len() >= 3).await;
     m0.0.poll_cmd_tx.send(PollCommand::Shutdown).await.unwrap();
     poller.await.unwrap();

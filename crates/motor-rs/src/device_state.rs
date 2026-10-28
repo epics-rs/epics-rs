@@ -463,6 +463,46 @@ struct Bound {
 /// process.
 pub type Pulses = Vec<tokio::sync::mpsc::Sender<()>>;
 
+impl Bound {
+    /// The record's `statusCallback`, `motor_callback` or devMotorSim
+    /// callback with `status`, adding the pulse it asks for to `pulses`.
+    fn call_back(&self, status: &StampedStatus, pulses: &mut Pulses) {
+        let Ok(mut ds) = self.device_state.lock() else {
+            return;
+        };
+        print_status_callback(&self.trace, &ds, &status.status);
+        let record = self.trace.record();
+        match ds.callbacks.dset {
+            MotorDset::DevMotorAsyn => {
+                drop(ds);
+                let locked = status.clone();
+                call_back(
+                    &self.device_state,
+                    record,
+                    move |ds| ds.status_callback(locked),
+                    |ds| ds.copy_post(status),
+                );
+            }
+            MotorDset::MotordevCom => {
+                ds.copy_post(status);
+                drop(ds);
+                let process = |_: &mut MotorDeviceState| IoIntrAction::Process;
+                call_back(
+                    &self.device_state,
+                    record,
+                    process,
+                    MotorDeviceState::init_callback,
+                );
+            }
+            MotorDset::DevMotorSim => {
+                if ds.motor_sim_callback(status) {
+                    pulses.push(self.io_intr.clone());
+                }
+            }
+        }
+    }
+}
+
 impl AxisSubscribers {
     pub fn new() -> Self {
         Self::default()
@@ -480,10 +520,32 @@ impl AxisSubscribers {
         io_intr: tokio::sync::mpsc::Sender<()>,
         trace: Arc<MotorTrace>,
     ) -> RecordId {
+        self.bind(device_state, io_intr, trace, true)
+    }
+
+    /// Bind a record motor_init_record_com refused: it reads nothing at
+    /// init, its `callback_changed` NO until a callback reaches it
+    /// (motordevCom.cc:204-247).
+    pub(crate) fn attach_refused(
+        &self,
+        device_state: SharedDeviceState,
+        io_intr: tokio::sync::mpsc::Sender<()>,
+        trace: Arc<MotorTrace>,
+    ) -> RecordId {
+        self.bind(device_state, io_intr, trace, false)
+    }
+
+    fn bind(
+        &self,
+        device_state: SharedDeviceState,
+        io_intr: tokio::sync::mpsc::Sender<()>,
+        trace: Arc<MotorTrace>,
+        seeded: bool,
+    ) -> RecordId {
         let mut subscribed = self.lock();
         if let Ok(mut ds) = device_state.lock() {
             ds.stamps = subscribed.stamps.clone();
-            if let Some(latest) = &subscribed.latest {
+            if let Some(latest) = subscribed.latest.as_ref().filter(|_| seeded) {
                 ds.seed(latest);
             }
         }
@@ -534,39 +596,22 @@ impl AxisSubscribers {
         let status = StampedStatus { seq, status };
         let mut pulses = Pulses::new();
         for bound in &subscribed.records {
-            let Ok(mut ds) = bound.device_state.lock() else {
-                continue;
-            };
-            print_status_callback(&bound.trace, &ds, &status.status);
-            let record = bound.trace.record();
-            match ds.callbacks.dset {
-                MotorDset::DevMotorAsyn => {
-                    drop(ds);
-                    let locked = status.clone();
-                    call_back(
-                        &bound.device_state,
-                        record,
-                        move |ds| ds.status_callback(locked),
-                        |ds| ds.copy_post(&status),
-                    );
-                }
-                MotorDset::MotordevCom => {
-                    ds.copy_post(&status);
-                    drop(ds);
-                    let process = |_: &mut MotorDeviceState| IoIntrAction::Process;
-                    call_back(
-                        &bound.device_state,
-                        record,
-                        process,
-                        MotorDeviceState::init_callback,
-                    );
-                }
-                MotorDset::DevMotorSim => {
-                    if ds.motor_sim_callback(&status) {
-                        pulses.push(bound.io_intr.clone());
-                    }
-                }
-            }
+            bound.call_back(&status, &mut pulses);
+        }
+        subscribed.latest = Some(status);
+        pulses
+    }
+
+    /// [`Self::post`] to `record` alone: motordrvCom's `callbackRequest`
+    /// on the one record whose message it answers (motordrvCom.cc:300-318,
+    /// :441-471).
+    pub(crate) fn post_to(&self, record: RecordId, status: MotorStatus) -> Pulses {
+        let mut subscribed = self.lock();
+        let seq = subscribed.stamps.after(0);
+        let status = StampedStatus { seq, status };
+        let mut pulses = Pulses::new();
+        if let Some(bound) = subscribed.records.get(record) {
+            bound.call_back(&status, &mut pulses);
         }
         subscribed.latest = Some(status);
         pulses

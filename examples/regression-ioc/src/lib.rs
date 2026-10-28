@@ -138,7 +138,7 @@ impl RegressionIoc {
             .await?;
 
         // Arm motor polling after iocInit (C arms the poller post-PINI).
-        let _ = poll_cmd_tx.try_send(PollCommand::ForcePoll);
+        let _ = poll_cmd_tx.try_send(PollCommand::ForcePoll(None));
 
         // Scanning is core-owned (C iocInit), not the servers': the scan
         // owner runs the PINI pass and the periodic scan-%g threads for

@@ -958,7 +958,10 @@ mod tests {
             tokio::time::sleep(settle).await;
             // The startup pass.
             log.lock().unwrap().clear();
-            poll_cmd_tx.send(PollCommand::ForcePoll).await.unwrap();
+            poll_cmd_tx
+                .send(PollCommand::ForcePoll(None))
+                .await
+                .unwrap();
             logged(&log, 2).await;
             tokio::time::sleep(settle).await;
             let forced = std::mem::take(&mut *log.lock().unwrap());
@@ -1009,7 +1012,7 @@ mod tests {
             assert_eq!(startup, ["A", "B"], "the startup pass");
             second
                 .poll_cmd_tx
-                .send(PollCommand::ForcePoll)
+                .send(PollCommand::ForcePoll(None))
                 .await
                 .unwrap();
             logged(&log, 1).await;

@@ -152,11 +152,13 @@ impl AxisSlot {
     }
 
     /// Bind one more record: its own mailbox, seeded from the address's
-    /// cache, its own trace, and a place on the subscriber list.
+    /// cache unless motor_init_record_com refused it, its own trace, and a
+    /// place on the subscriber list.
     pub(crate) fn attach(
         self: &Arc<Self>,
         user: TraceUser,
         timeout: Duration,
+        refusal: Option<&'static str>,
     ) -> MotorDeviceSupport {
         let device_state = new_shared_state();
         let (io_intr_tx, io_intr_rx) = mpsc::channel(16);
@@ -171,10 +173,15 @@ impl AxisSlot {
         if let Ok(mut ds) = device_state.lock() {
             ds.set_dset(dset);
         }
-        let record =
-            self.subscribers
-                .attach(device_state.clone(), io_intr_tx.clone(), trace.clone());
-        MotorDeviceSupport::with_link(
+        let (state, io_intr, record_trace) =
+            (device_state.clone(), io_intr_tx.clone(), trace.clone());
+        let record = match refusal {
+            None => self.subscribers.attach(state, io_intr, record_trace),
+            Some(_) => self
+                .subscribers
+                .attach_refused(state, io_intr, record_trace),
+        };
+        let mut support = MotorDeviceSupport::with_link(
             trace,
             timeout,
             AxisLink::Bound {
@@ -183,7 +190,9 @@ impl AxisSlot {
             },
             device_state,
             (io_intr_tx, io_intr_rx),
-        )
+        );
+        support.refusal = refusal;
+        support
     }
 }
 
@@ -407,7 +416,7 @@ impl MotorAxis {
     /// Poll now and post: the drvMotorAsyn stand-in's GET_INFO.
     #[cfg(test)]
     pub(crate) fn force_poll(&self) {
-        let _ = self.poll_cmd_tx.try_send(PollCommand::ForcePoll);
+        let _ = self.poll_cmd_tx.try_send(PollCommand::ForcePoll(None));
     }
 
     /// The queue of its poller's poll requests.
@@ -422,7 +431,18 @@ impl MotorAxis {
 
     /// Bind one more record at the axis's slot (`AxisSlot::attach`).
     pub fn attach(&self) -> MotorDeviceSupport {
-        let mut support = self.slot.attach(self.user.clone(), self.timeout);
+        self.bind(None)
+    }
+
+    /// Bind a model-1 record motor_init_record_com refused because another
+    /// record holds the signal. C keeps it, and its transactions reach the
+    /// motor task as any record's do (motordevCom.cc:244-262).
+    pub(crate) fn attach_in_use(&self) -> MotorDeviceSupport {
+        self.bind(Some(IN_USE))
+    }
+
+    fn bind(&self, refusal: Option<&'static str>) -> MotorDeviceSupport {
+        let mut support = self.slot.attach(self.user.clone(), self.timeout, refusal);
         support.disables_ntm = self.disables_ntm;
         support.port.build_trans = self.build_trans.clone();
         support
@@ -442,11 +462,17 @@ enum AxisLink {
     /// (`if (brdptr == NULL) return(ERROR)`, devESP300.cc:182-184) and
     /// `motor_end_trans_com` ends every transaction (motordevCom.cc:497-508).
     NoCard,
+    /// A signal its card lacks: the motor task answers each transaction
+    /// with RA_PROBLEM and zeroed positions, calling the record back and
+    /// never the driver (motordrvCom.cc:491-498). The list holds the record
+    /// alone.
+    NoSignal(AxisSubscribers),
 }
 
-/// `motor_init_record_com`'s refusal of a card that does not exist
-/// (motordevCom.cc:231-235).
+/// `motor_init_record_com`'s refusals (motordevCom.cc:231-247).
 const NO_CARD: &str = "motor_init_record_com(): card does not exist!";
+const NO_SIGNAL: &str = "motor_init_record_com(): signal does not exist!";
+const IN_USE: &str = "motor_init_record_com(): motor already in use!";
 
 /// motordevCom's `MAX_TIMEOUT`, init_record_com's wait for its round's
 /// answer (motordrvCom.h:58).
@@ -456,6 +482,7 @@ const INIT_TIMEOUT: Duration = Duration::from_secs(5);
 enum Unreached {
     Missing(MissingAxis),
     NoCard,
+    NoSignal(AxisSubscribers),
 }
 
 /// What `motor_end_trans_com` did to the record, for the record to apply.
@@ -512,6 +539,8 @@ pub struct MotorDeviceSupport {
     io_intr_rx: Option<mpsc::Receiver<()>>,
     initialized: bool,
     disables_ntm: bool,
+    /// Why `motor_init_record_com` refused the record, which C keeps.
+    refusal: Option<&'static str>,
     /// The DMOV posts `motor_end_trans_com` made in the last `write`.
     posts: Vec<DevicePost>,
 }
@@ -568,6 +597,7 @@ impl MotorDeviceSupport {
             io_intr_rx: Some(io_intr_rx),
             initialized: false,
             disables_ntm: false,
+            refusal: None,
             posts: Vec::new(),
         }
     }
@@ -589,20 +619,48 @@ impl MotorDeviceSupport {
             card,
             signal,
         };
-        Self::with_link(
+        let mut support = Self::with_link(
             Arc::new(MotorTrace::with_user(user)),
             Duration::ZERO,
             AxisLink::NoCard,
             device_state,
             mpsc::channel(16),
-        )
+        );
+        support.refusal = Some(NO_CARD);
+        support
+    }
+
+    /// A model-1 record on a signal its card lacks. C keeps it: its init
+    /// fails, and the motor task answers each later transaction.
+    pub(crate) fn no_signal(device: &'static str, card: i32, signal: i32) -> Self {
+        let device_state = new_shared_state();
+        if let Ok(mut ds) = device_state.lock() {
+            ds.set_dset(MotorDset::MotordevCom);
+        }
+        let trace = Arc::new(MotorTrace::with_user(TraceUser::Model1 {
+            device,
+            card,
+            signal,
+        }));
+        let (io_intr_tx, io_intr_rx) = mpsc::channel(16);
+        let records = AxisSubscribers::new();
+        records.attach_refused(device_state.clone(), io_intr_tx.clone(), trace.clone());
+        let mut support = Self::with_link(
+            trace,
+            Duration::ZERO,
+            AxisLink::NoSignal(records),
+            device_state,
+            (io_intr_tx, io_intr_rx),
+        );
+        support.refusal = Some(NO_SIGNAL);
+        support
     }
 
     /// Hand the driver a model-1 record's VME_IO parm, which C devices read
-    /// from `mr->out.value.vmeio.parm` (devMVP2001.cc:262, :361). Only a
-    /// bound card gets one, so the transaction passes.
+    /// from `mr->out.value.vmeio.parm` (devMVP2001.cc:262, :361). Only the
+    /// record that holds the signal sends one; it is no transaction of C's.
     pub(crate) fn send_out_parm(&self, parm: String) {
-        if !parm.is_empty() {
+        if !parm.is_empty() && self.refusal.is_none() {
             let _ = self.port.send(
                 vec![MotorCommand::OutParm {
                     parm: PvString::from_bytes(parm),
@@ -684,7 +742,7 @@ impl CommandPort {
         }
 
         if actions.force_poll {
-            self.send_poll(PollCommand::ForcePoll);
+            self.force_poll();
         }
         if let Some(ref delay) = actions.schedule_delay {
             self.schedule_delay(delay);
@@ -712,11 +770,11 @@ impl CommandPort {
             && !self.trace.is_motor_interface()
             && match &self.link {
                 AxisLink::Bound { slot, .. } => slot.controller().is_some_and(|c| c.serving()),
-                AxisLink::Missing(_) | AxisLink::NoCard => false,
+                AxisLink::Missing(_) | AxisLink::NoCard | AxisLink::NoSignal(_) => false,
             };
         if !served {
-            // init_record refuses a record with no card before its writes
-            // (motordevCom.cc:231-235), so none ends here.
+            // init_record refuses a record with no card or signal before its
+            // writes (motordevCom.cc:231-241), so none ends here.
             let _ = self.queue(commands, false, None);
             return false;
         }
@@ -755,6 +813,20 @@ impl CommandPort {
             }
             Err(Unreached::Missing(missing)) => missing,
             Err(Unreached::NoCard) => return EndTrans::NoCard,
+            Err(Unreached::NoSignal(records)) => {
+                // The motor task's callbackRequest runs on the callback
+                // pool, which waits for the record this pass holds.
+                spawn_blocking_background(CallbackPriority::Medium, move |_| {
+                    let problem = MotorStatus {
+                        problem: true,
+                        ..MotorStatus::default()
+                    };
+                    for pulse in records.post(problem) {
+                        let _ = pulse.try_send(());
+                    }
+                });
+                return EndTrans::Passed;
+            }
         };
         crate::poll_loop::refuse_commands(&self.trace, missing, &commands);
         // asynCallback runs for a refused write as for any other, on the
@@ -781,6 +853,7 @@ impl CommandPort {
                 .ok_or(Unreached::Missing(MissingAxis::Controller)),
             AxisLink::Missing(missing) => Err(Unreached::Missing(*missing)),
             AxisLink::NoCard => Err(Unreached::NoCard),
+            AxisLink::NoSignal(records) => Err(Unreached::NoSignal(records.clone())),
         }
     }
 
@@ -810,10 +883,13 @@ impl CommandPort {
         Ok(ds.init_status())
     }
 
-    /// Send this record's poll request; a missing axis or card has no poller.
-    fn send_poll(&self, command: PollCommand) {
-        if let Ok((axis, _)) = self.axis() {
-            let _ = axis.poll_cmd_tx.try_send(command);
+    /// Ask the poller to poll now on this record's behalf; a missing axis,
+    /// card or signal has no poller.
+    fn force_poll(&self) {
+        if let Ok((axis, record)) = self.axis() {
+            let _ = axis
+                .poll_cmd_tx
+                .try_send(PollCommand::ForcePoll(Some(record)));
         }
     }
 
@@ -886,13 +962,13 @@ impl DeviceSupport for MotorDeviceSupport {
             }
         }
 
-        if let AxisLink::NoCard = self.port.link {
+        if let Some(refusal) = self.refusal {
             // motor_init_record_com refuses the record before reading it.
             let name = self.port.trace.record();
             epics_base_rs::server::recgbl::rec_gbl_record_error(
                 "Illegal field value",
                 name,
-                NO_CARD,
+                refusal,
             );
             if let Some(rec) = record
                 .as_any_mut()
@@ -900,7 +976,7 @@ impl DeviceSupport for MotorDeviceSupport {
             {
                 crate::record::motor_failed_dset_init(rec, true);
             }
-            return Err(epics_base_rs::error::CaError::InvalidValue(NO_CARD.into()));
+            return Err(epics_base_rs::error::CaError::InvalidValue(refusal.into()));
         }
 
         if let Err(Unreached::Missing(missing)) = self.port.axis() {

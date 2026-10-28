@@ -319,7 +319,10 @@ async fn test_poll_loop_lifecycle() {
     let poll_handle = tokio::spawn(poll_loop.start());
 
     // Start polling
-    poll_cmd_tx.send(PollCommand::ForcePoll).await.unwrap();
+    poll_cmd_tx
+        .send(PollCommand::ForcePoll(None))
+        .await
+        .unwrap();
 
     // Wait for the poll loop's first process of the record.
     let read = reads.wait(Duration::from_millis(500)).await;
@@ -370,7 +373,10 @@ async fn test_zero_idle_interval_is_event_only_not_busy_spin() {
     // channel and masks itself.
     tokio::spawn(async move { while io_intr_rx.recv().await.is_some() {} });
 
-    poll_cmd_tx.send(PollCommand::ForcePoll).await.unwrap();
+    poll_cmd_tx
+        .send(PollCommand::ForcePoll(None))
+        .await
+        .unwrap();
 
     // seq starts at 1 (init), +1 for the startup pass's post of its changed
     // status to the record already bound (asynMotorController.cpp:630,
@@ -447,7 +453,10 @@ async fn test_idle_poll_change_detection_suppresses_unchanged_reposts() {
     // The startup pass posts its changed status to the bound record
     // (asynMotorController.cpp:630, asynMotorAxis.cpp:318-320; seq 1→2);
     // ForcePoll forces one more → 3.
-    poll_cmd_tx.send(PollCommand::ForcePoll).await.unwrap();
+    poll_cmd_tx
+        .send(PollCommand::ForcePoll(None))
+        .await
+        .unwrap();
     assert!(wait_until(Duration::from_secs(10), || seq(&device_state) >= 3).await);
     tokio::time::sleep(Duration::from_millis(80)).await;
     assert_eq!(
@@ -458,7 +467,10 @@ async fn test_idle_poll_change_detection_suppresses_unchanged_reposts() {
 
     // A second ForcePoll is a FORCED poll → re-posts even though the status
     // is byte-identical → seq 3→4.
-    poll_cmd_tx.send(PollCommand::ForcePoll).await.unwrap();
+    poll_cmd_tx
+        .send(PollCommand::ForcePoll(None))
+        .await
+        .unwrap();
     assert!(wait_until(Duration::from_secs(10), || seq(&device_state) >= 4).await);
     tokio::time::sleep(Duration::from_millis(80)).await;
     assert_eq!(
@@ -865,7 +877,10 @@ async fn failed_poll_posts_comms_error_status() {
     // A healthy poll first, so the failure has a last-known status to carry
     // forward (C's parameter library keeps every field the failed poll never
     // wrote).
-    poll_cmd_tx.send(PollCommand::ForcePoll).await.unwrap();
+    poll_cmd_tx
+        .send(PollCommand::ForcePoll(None))
+        .await
+        .unwrap();
     assert!(
         !reads.wait(Duration::from_millis(500)).await.is_empty(),
         "the healthy poll must notify"
@@ -1105,7 +1120,7 @@ async fn a_failure_raising_no_bit_posts_only_when_forced() {
         healthy.seq,
         "background polls post nothing"
     );
-    axis.poll.send(PollCommand::ForcePoll).await.unwrap();
+    axis.poll.send(PollCommand::ForcePoll(None)).await.unwrap();
     assert!(
         wait_until(Duration::from_secs(2), || {
             axis.latest().is_some_and(|s| s.seq > healthy.seq)
@@ -1329,7 +1344,7 @@ async fn blocked_driver_does_not_stall_the_ioc_runtime() {
     // keeps serving its other tasks.
     setup
         .poll_cmd_tx
-        .send(PollCommand::ForcePoll)
+        .send(PollCommand::ForcePoll(None))
         .await
         .unwrap();
     let start = Instant::now();
@@ -1449,7 +1464,7 @@ async fn a_poller_started_from_the_shell_runs_while_the_runtime_blocks() {
     setup.device_support.write(&mut setup.record).unwrap();
     setup
         .poll_cmd_tx
-        .send(PollCommand::ForcePoll)
+        .send(PollCommand::ForcePoll(None))
         .await
         .unwrap();
 
@@ -1673,7 +1688,10 @@ async fn force_poll_does_not_reload_the_forced_fast_polls() {
     // Startup: the startup poll and its 5 forced fast polls.
     settled(6).await;
 
-    poll_cmd_tx.send(PollCommand::ForcePoll).await.unwrap();
+    poll_cmd_tx
+        .send(PollCommand::ForcePoll(None))
+        .await
+        .unwrap();
     settled(7).await;
 
     motor_cmd_tx

@@ -1,6 +1,6 @@
 //! swait's INAN..INLN are `recDynLink` inputs (`swaitRecord.c:358`): INxV is
 //! the channel's connection state, so a name with a link modifier names no
-//! PV, a put sets PV BAD at once and PV OK when the search connects, and a
+//! PV, a put posts PV BAD and then PV OK when the search connects, and a
 //! blank name is cleared to empty (`special`, `:513-519`).
 //!
 //! oracleSwaitIoc (calc R3-7-5), PV:W `INAN "SQ:T PP"`, `INBN NOSUCH:PV`,
@@ -13,6 +13,14 @@
 //! pv blank No PV  []                              PV:C.INCN "  ", INCN after
 //! pv set-now PV BAD                               PV:C.INCN SQ:T2, at once
 //! pv set-later PV OK                              0.3 s later
+//! ```
+//!
+//! The read at once is a race in C too: `special` posts PV BAD before
+//! `recDynLinkAddInput` "because SearchCallback could happen immediatley"
+//! (`:535-536`), on recDynInp above the CA server's priority. What C fixes is
+//! the order of the posts, PV BAD then PV OK, and that is what is checked.
+//!
+//! ```text
 //! pv bad PV BAD                                   PV:C.INCN NOSUCH:PV
 //! ```
 
@@ -20,6 +28,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use epics_base_rs::server::database::PvDatabase;
+use epics_base_rs::server::database::db_access::DbSubscription;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::records::swait::SwaitRecord;
 use epics_base_rs::types::EpicsValue;
@@ -128,16 +137,28 @@ async fn an_input_name_is_a_channel_search() {
     put(&db, "PV:C", "INCN", "  ").await;
     wait(200).await;
     let blank = (num(&db, "PV:C.INCV"), text(&db, "PV:C.INCN"));
+    let mut incv = DbSubscription::subscribe(&db, "PV:C.INCV").await.unwrap();
     put(&db, "PV:C", "INCN", "SQ:T2").await;
-    let set_now = num(&db, "PV:C.INCV");
-    settle(&db, |db| num(db, "PV:C.INCV") == PV_OK).await;
-    let set_later = num(&db, "PV:C.INCV");
+    let mut set = Vec::new();
+    for _ in 0..2 {
+        set.push(
+            epics_base_rs::runtime::task::timeout(fact_budget::FACT_BUDGET, incv.recv_f64())
+                .await
+                .ok()
+                .flatten(),
+        );
+    }
     put(&db, "PV:C", "INCN", "NOSUCH:PV").await;
     wait(300).await;
     let bad = num(&db, "PV:C.INCV");
     assert_eq!(
-        (clear, blank, set_now, set_later, bad),
-        (NO_PV, (NO_PV, String::new()), PV_NC, PV_OK, PV_NC),
-        "PV:C.INCV after INCN \"\", \"  \" (and INCN), SQ:T2 at once and later, NOSUCH:PV"
+        (clear, blank, set, bad),
+        (
+            NO_PV,
+            (NO_PV, String::new()),
+            vec![Some(PV_NC), Some(PV_OK)],
+            PV_NC
+        ),
+        "PV:C.INCV after INCN \"\", \"  \" (and INCN), its posts on SQ:T2, after NOSUCH:PV"
     );
 }

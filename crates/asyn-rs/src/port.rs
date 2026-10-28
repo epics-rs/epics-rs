@@ -893,16 +893,17 @@ impl PortDriverBase {
         interrupt_mask: InterfaceMask,
     ) -> Self {
         let max_addr = max_addr.max(1);
+        // asynCommon is always registered (asynPortDriver.cpp:4015).
+        let interface_mask = interface_mask | InterfaceMask::COMMON;
         Self {
             port_name: port_name.into(),
             max_addr,
             flags,
             get_address: port_get_address,
-            // asynCommon is always registered (asynPortDriver.cpp:4015).
-            interface_mask: interface_mask | InterfaceMask::COMMON,
+            interface_mask,
             interrupt_mask,
             params: ParamList::new(max_addr),
-            interrupts: InterruptManager::with_sources(interrupt_mask),
+            interrupts: InterruptManager::with_masks(interface_mask, interrupt_mask),
             callback_thread: false,
             // C `dpCommonInit` (asynManager.c:523): every port starts down and
             // comes up through its driver's connect, which registration queues.
@@ -951,7 +952,8 @@ impl PortDriverBase {
         &mut self,
         gate: Arc<epics_libcom_rs::runtime::interrupt_accept::InterruptGate>,
     ) {
-        self.interrupts = InterruptManager::owned_by(gate, self.interrupt_mask);
+        self.interrupts =
+            InterruptManager::owned_by(gate, self.interface_mask, self.interrupt_mask);
     }
 
     /// The EOS entry the given `asynUser` addr selects — see [`eos_device_key`].

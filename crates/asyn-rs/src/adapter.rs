@@ -7537,7 +7537,7 @@ mod tests {
         for (sources, live) in [(InterfaceMask::INT32, true), (InterfaceMask::NONE, false)] {
             let mut ads = make_adapter_on(
                 ScanType::Passive,
-                Arc::new(InterruptManager::with_sources(sources)),
+                Arc::new(InterruptManager::with_masks(InterfaceMask::ALL, sources)),
             );
             ads.set_asyn_readback(true);
             ads.init(&mut BoRecord::new(0)).unwrap();

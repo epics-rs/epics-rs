@@ -5126,8 +5126,8 @@ mod tests {
 
     impl NDPluginProcess for ServingProcessor {
         const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
-        const INTERFACE_MASK: InterfaceMask = InterfaceMask::NONE;
-        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::FLOAT64_ARRAY;
+        const INTERFACE_MASK: InterfaceMask = InterfaceMask::FLOAT64_ARRAY;
+        const INTERRUPT_MASK: InterfaceMask = Self::INTERFACE_MASK;
         fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
             ProcessResult::forward(array, vec![])
         }

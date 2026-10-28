@@ -5988,7 +5988,7 @@ impl PvDatabase {
         self.inner.ca_links.sync().await;
     }
 
-    /// `record`'s pump's turn requests (see [`Self::io_intr_turn`]).
+    /// `record`'s pump's turn requests (see [`Self::ask_io_intr_turn`]).
     pub(crate) fn register_io_intr_pump(
         &self,
         record: &std::sync::Arc<crate::server::record::RecordCell>,
@@ -5997,13 +5997,14 @@ impl PvDatabase {
         self.inner.io_intr_turns.register(record)
     }
 
-    /// Return once `record`'s I/O Intr pump has processed every interrupt
-    /// queued to it now; at once for a record with no pump.
-    pub(crate) async fn io_intr_turn(
+    /// A turn on `record`'s I/O Intr pump, answered once the pump has
+    /// processed every interrupt queued to it now; `None` for a record with
+    /// no pump.
+    pub(crate) fn ask_io_intr_turn(
         &self,
         record: &std::sync::Arc<crate::server::record::RecordCell>,
-    ) {
-        self.inner.io_intr_turns.turn(record).await;
+    ) -> Option<crate::runtime::sync::oneshot::Receiver<()>> {
+        self.inner.io_intr_turns.ask(record)
     }
 
     /// A put to `holder`'s link `field`: C `dbPutFieldLink` drops the old

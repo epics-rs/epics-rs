@@ -481,6 +481,12 @@ impl LinkPutQueue {
         self.reactor.as_ref()
     }
 
+    /// Wake the owner for a local link action (`addAction`'s
+    /// `epicsEventSignal(workListEvent)`, `dbCa.c:159-160`).
+    pub(super) fn wake(&self) {
+        self.work.notify_one();
+    }
+
     /// Stage `value` on `key`, coalescing latest-wins onto any pending value
     /// (C `dbCa.c:582-583`). Returns the completion receiver for a
     /// [`PutWaiter::Notify`] put — the caller awaits it, which is the
@@ -999,7 +1005,7 @@ async fn owner_loop(
         let notified = work.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
-        let serviced = {
+        let (serviced, ran) = {
             let Some(q) = queue.upgrade() else { return };
             match q.network() {
                 Some(reactor) => {
@@ -1010,7 +1016,22 @@ async fn owner_loop(
                     while let Some((key, init)) = q.take_ready_open() {
                         let Some(inner) = db.upgrade() else { return };
                         let lset = resolve_lset(&inner, key.scheme);
+                        let ca_links = inner.ca_links.clone();
                         drop(inner);
+                        // A channel this database serves opens here, as
+                        // `dbCaTask`'s own `CA_CONNECT`: local links connect,
+                        // and are monitored, in the order they were added.
+                        let init = if key.scheme == "ca" && !key.link.is_removed() {
+                            match ca_links.connect_served(key.link_ref(), init).await {
+                                Ok(()) => {
+                                    q.finish_open(key);
+                                    continue;
+                                }
+                                Err(init) => init,
+                            }
+                        } else {
+                            init
+                        };
                         let q2 = q.clone();
                         reactor.spawn(async move {
                             match lset {
@@ -1056,6 +1077,14 @@ async fn owner_loop(
                     }
                 }
             }
+            // `dbCaTask` services no link action before `dbCaRun`
+            // (`dbCa.c:1171-1173`).
+            let ran = ca_run.as_ref().is_some_and(|gate| gate.has_run());
+            if ran && let Some(inner) = db.upgrade() {
+                let ca_links = inner.ca_links.clone();
+                drop(inner);
+                ca_links.service_actions();
+            }
             // `dbCaTask` is paused until `dbCaRun`, and a first event's
             // `CA_DBPROCESS` is queued behind every link's monitor queued by
             // then (`dbCa.c:1171-1173`, `:1209-1236`): the queue waits whole,
@@ -1073,19 +1102,21 @@ async fn owner_loop(
             }
             // The strong reference must not survive the await below, or the
             // queue could never drop and its teardown would never run.
-            serviced
+            (serviced, ran)
         };
-        // The poll's read, not a fresh one: a gate serviced since the poll
-        // skipped the CP slots ends `monitors_serviced` at once, where a
-        // fresh read would park on `work`, which their queued wakes never
-        // signal again.
-        match ca_run.as_ref().filter(|_| !serviced) {
+        // The poll's reads, not fresh ones: a gate serviced or run since the
+        // poll skipped the CP slots or the link actions ends its wait at
+        // once, where a fresh read would park on `work`, which their queued
+        // wakes never signal again.
+        match ca_run.as_ref().filter(|_| !serviced || !ran) {
             Some(gate) => {
-                let serviced = gate.monitors_serviced();
-                tokio::pin!(serviced);
+                let monitors = gate.monitors_serviced();
+                let reached = gate.reached();
+                tokio::pin!(monitors, reached);
                 std::future::poll_fn(|cx| {
                     if notified.as_mut().poll(cx).is_ready()
-                        || serviced.as_mut().poll(cx).is_ready()
+                        || (!serviced && monitors.as_mut().poll(cx).is_ready())
+                        || (!ran && reached.as_mut().poll(cx).is_ready())
                     {
                         std::task::Poll::Ready(())
                     } else {

@@ -606,6 +606,42 @@ pub fn post_single_event(
     }
 }
 
+/// [`add_event`]'s attach without its first event, for a record `field`
+/// subscriber of client id 0 (a link's): it takes now the place on the
+/// record's monitor list C's `db_event_enable` gives it
+/// (`dbEvent.c:508-517`), and no post until [`enable_event`].
+pub(crate) fn add_event_disabled(
+    record: &Arc<RecordCell>,
+    field: &str,
+    user: &EventUser,
+    native_type: DbFieldType,
+    mask: u16,
+    context: &DeliveryContext,
+    pre_chain: FilterChain,
+) -> Result<EventReader, SubscribeRefused> {
+    let mut instance = record.write();
+    let rx = instance.add_subscriber_on(user, field, 0, native_type, mask, context)?;
+    for filt in pre_chain {
+        instance.attach_filter_to_last_subscriber(field, filt);
+    }
+    instance.set_subscriber_active(rx.id(), false);
+    Ok(rx)
+}
+
+/// C `db_event_enable` and `db_post_single_event` for the
+/// [`add_event_disabled`] subscriber holding slot `id`, in one scan-lock
+/// hold as [`add_event`]'s.
+pub(crate) fn enable_event(
+    db: &PvDatabase,
+    record: &Arc<RecordCell>,
+    field: &str,
+    id: crate::server::event_queue::AttachId,
+) {
+    let _scan_lock = db.lock_instance(record);
+    record.read().set_subscriber_active(id, true);
+    post_single_event(db, record, field, id);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

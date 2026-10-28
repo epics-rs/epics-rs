@@ -2538,10 +2538,12 @@ pub struct RecordCell {
     /// move ([`Self::settle_addr_facts`]) and read with no lock.
     string_typed: std::sync::atomic::AtomicU64,
     /// C `paddr->no_elements` of each `SPC_DBADDR` field, by its index in
-    /// `rdes.fields`: what `cvt_dbaddr` answers, settled with
-    /// [`Self::string_typed`] so `dbNameToAddr` reads it with no lock, as C
-    /// reads `prec->nelm`. The capacity fields are `SPC_NOMOD`.
-    dbaddr_counts: arc_swap::ArcSwap<Vec<(u16, u32)>>,
+    /// `rdes.fields`: what `cvt_dbaddr` answers, so `dbNameToAddr` reads it
+    /// with no lock, as C reads `prec->nelm`. A capacity can follow a field a
+    /// client writes (acalcout `SIZE`, `NUSE`), so a store that can move one
+    /// re-reads them ([`Settle::Counts`]); a create that finds the record
+    /// busy counts what the last committed put left.
+    dbaddr_counts: Box<[(u16, std::sync::atomic::AtomicU32)]>,
     /// The `field_type` `cvt_dbaddr` gives each [`FieldDesc::runtime_typed`]
     /// field of `rdes.fields`, in order: settled with [`Self::string_typed`]
     /// so `dbNameToAddr` types another thread's record with no lock, as C
@@ -2564,6 +2566,11 @@ pub struct RecordCell {
     /// as text; settled with [`Self::string_typed`], after the load has set
     /// the info tags.
     form_string: AtomicBool,
+    /// The [`PutFacts`] of a field off `rdes.fields`, by whether it is the
+    /// primary field (`Record::is_udf_defining_put`'s default answer); their
+    /// settle is `Counts` for a type with [`Self::dbaddr_counts`] and no
+    /// [`Record::dbaddr_capacity_inputs`].
+    off_list_facts: [PutFacts; 2],
     /// pvxs `MappingInfo::nsecMask` of `info(Q:time:tag)`
     /// ([`RecordInstance::qtime_nsec_mask`]), which pvxs reads with no lock
     /// once per channel (`typeutils.cpp:79-88`); settled with
@@ -2584,20 +2591,32 @@ fn long_string_size_of(inst: &RecordInstance) -> u32 {
 }
 
 /// [`RecordCell::dbaddr_counts`] of `inst`.
-fn dbaddr_counts_of(inst: &RecordInstance) -> Vec<(u16, u32)> {
+fn dbaddr_counts_of(inst: &RecordInstance) -> Box<[(u16, std::sync::atomic::AtomicU32)]> {
     let rec = &*inst.record;
     rec.field_list()
         .iter()
         .enumerate()
         .filter(|(_, f)| !f.long_string && rec.field_is_dbaddr(f.name))
-        .map(|(i, f)| {
-            let count = rec
-                .dbaddr_count(f.name)
-                .or_else(|| inst.resolve_field(f.name).map(|v| v.count() as u32))
-                .unwrap_or(1);
-            (i as u16, count)
-        })
+        .map(|(i, f)| (i as u16, dbaddr_count_of(inst, f.name).into()))
         .collect()
+}
+
+/// [`Record::dbaddr_capacity_inputs`] of a type with
+/// [`RecordCell::dbaddr_counts`], `None` for one with no entry to move.
+fn counts_inputs(
+    inst: &RecordInstance,
+    counts: &[(u16, std::sync::atomic::AtomicU32)],
+) -> Option<Option<&'static [&'static str]>> {
+    (!counts.is_empty()).then(|| inst.record.dbaddr_capacity_inputs())
+}
+
+/// One [`RecordCell::dbaddr_counts`] entry of `inst`: a type with no
+/// [`super::Record::dbaddr_capacity`] answer counts the value it holds.
+fn dbaddr_count_of(inst: &RecordInstance, field: &str) -> u32 {
+    inst.record
+        .dbaddr_count(field)
+        .or_else(|| inst.resolve_field(field).map(|v| v.count() as u32))
+        .unwrap_or(1)
 }
 
 /// [`RecordCell::string_typed`] of `inst`.
@@ -2756,7 +2775,9 @@ impl FieldAddr {
         Self::resolve_at(rec, field).0
     }
 
-    /// [`Self::resolve_in`] and the field's index in `rdes.fields`.
+    /// [`Self::resolve_in`] and the index in `rdes.fields` of the field it
+    /// names, which indexes `put_facts`: the facts follow the desc, as the
+    /// lean store follows the slot.
     fn resolve_at(rec: &RecordCell, field: &str) -> (Self, Option<usize>) {
         // One scan of the type's own list answers both the desc and, by the
         // same index, the slot; only a miss falls to `dbCommon`.
@@ -2781,7 +2802,7 @@ impl FieldAddr {
             "{}.{field}: a field slot must name a declared, readable field",
             rec.rdes().record_type
         );
-        (addr, at.filter(|_| declared))
+        (addr, at)
     }
 
     /// The record's own handle for the field ([`Record::field_slot`]), when
@@ -2872,14 +2893,54 @@ impl SlotKind {
     }
 }
 
-/// What a put needs of the record at a declared field, asked by
+/// What the cell re-reads after a put at a field: C's `cvt_dbaddr` answers
+/// from the record at each create, and the cell keeps its answers for a
+/// create with no lock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Settle {
+    Nothing,
+    /// [`RecordCell::dbaddr_counts`]: the field is a
+    /// [`Record::dbaddr_capacity_inputs`] one, or the type names none.
+    Counts,
+    /// Every address fact ([`RecordCell::settle_addr_facts`]): the field's
+    /// `special()` retypes ([`Record::special_retypes`]).
+    All,
+}
+
+impl Settle {
+    /// A field's settle, `inputs` being [`counts_inputs`].
+    fn of(record: &dyn Record, inputs: Option<Option<&[&str]>>, field: &str) -> Self {
+        if record.special_retypes(field) {
+            Self::All
+        } else if inputs.is_some_and(|l| l.is_none_or(|l| l.contains(&field))) {
+            Self::Counts
+        } else {
+            Self::Nothing
+        }
+    }
+}
+
+/// [`RecordCold::recounts`]: the [`Settle::Counts`] fields of a store no
+/// `special()` follows, which leaves nothing retyped.
+#[derive(Clone, Copy)]
+enum Recounts {
+    Never,
+    /// [`Record::dbaddr_capacity_inputs`].
+    Of(&'static [&'static str]),
+    Every,
+}
+
+/// What a put needs of the record at a field of `rdes.fields`, asked by
 /// [`RecordCell::new`] while it owns the instance.
 #[derive(Clone, Copy)]
 struct PutFacts {
-    /// The slot's [`SlotMut`](super::record_trait::SlotMut) variant.
-    kind: Option<SlotKind>,
+    /// The slot's [`SlotMut`](super::record_trait::SlotMut) variant a lean
+    /// store writes; `None` for no slot, or for a put with a [`Settle`],
+    /// which only the general arm makes.
+    lean: Option<SlotKind>,
     /// [`Record::is_udf_defining_put`], C `dbIsValueField`.
     udf: bool,
+    settle: Settle,
 }
 
 /// `putStringString`'s copy length for a `DBF_STRING` field: `field_size -
@@ -2888,20 +2949,31 @@ fn str_cap(desc: &FieldDesc) -> u16 {
     desc.size.clamp(1, 40) - 1
 }
 
-/// Each declared field's [`PutFacts`], with every `Str` slot reserved to its
-/// cap here, so a lean store never grows it under a hold.
+/// Each field's [`PutFacts`], with every `Str` slot reserved to its cap
+/// here, so a lean store never grows it under a hold. `inputs` is
+/// [`counts_inputs`].
 fn put_facts(
     inst: &mut RecordInstance,
     slots: &[Option<super::record_trait::FieldSlot>],
+    inputs: Option<Option<&[&str]>>,
 ) -> Box<[PutFacts]> {
     use super::record_trait::SlotMut;
     let fields = inst.record.field_list();
+    debug_assert!(
+        inputs
+            .flatten()
+            .unwrap_or_default()
+            .iter()
+            .all(|name| fields.iter().any(|f| f.name == *name)),
+        "{}: a dbaddr_capacity_inputs name off its field list",
+        inst.record.record_type()
+    );
     fields
         .iter()
         .zip(slots)
-        .map(|(desc, slot)| PutFacts {
-            udf: inst.record.is_udf_defining_put(desc.name),
-            kind: slot
+        .map(|(desc, slot)| {
+            let settle = Settle::of(&*inst.record, inputs, desc.name);
+            let kind = slot
                 .and_then(|slot| inst.record.slot_mut(slot))
                 .map(|m| match m {
                     SlotMut::Str(s) => {
@@ -2910,7 +2982,12 @@ fn put_facts(
                         SlotKind::Str
                     }
                     m => SlotKind::of(&m),
-                }),
+                });
+            PutFacts {
+                udf: inst.record.is_udf_defining_put(desc.name),
+                settle,
+                lean: kind.filter(|_| settle == Settle::Nothing),
+            }
         })
         .collect()
 }
@@ -2985,6 +3062,9 @@ pub(crate) struct PutAddr {
     /// The value field when it is `pp(TRUE)`, whose put-time post the
     /// processing cycle makes instead (`dbput_post_put_field`).
     post_suppressed: bool,
+    /// [`PutFacts::settle`], made by the general arm once `special()` is
+    /// done ([`RecordCell::settle_after_put`]).
+    settle: Settle,
 }
 
 /// What [`RecordInstance::notify_field_written_if_changed_at`] compares a put
@@ -2997,17 +3077,7 @@ impl PutAddr {
     /// [`FieldAddr::resolve_in`].
     pub(crate) fn resolve_in(rec: &RecordCell, field: &str) -> Self {
         let (addr, at) = FieldAddr::resolve_at(rec, field);
-        let facts = at.map(|i| rec.put_facts[i]);
-        let put = match (addr.desc, addr.slot, facts.and_then(|f| f.kind)) {
-            (Some(desc), Some(slot), Some(kind)) => {
-                lean_put_fn(rec.rdes().record_type, desc, slot, kind)
-            }
-            _ => PutFn::General,
-        };
-        // A type with no field list still has `Record::is_udf_defining_put`'s
-        // default answer, its primary field.
-        let udf = facts.map_or(field == rec.rdes().primary_field, |f| f.udf);
-        Self::of(rec, field, addr, put, udf)
+        Self::of(rec, field, addr, rec.put_facts_at(at, field))
     }
 
     /// A by-name put's address: [`RecordCell::put_name`]'s field, through
@@ -3035,22 +3105,28 @@ impl PutAddr {
         if addr.desc.is_some_and(|d| !rec.takes_string_view(d)) {
             return None;
         }
-        let udf = at.map_or(field == rec.rdes().primary_field, |i| rec.put_facts[i].udf);
         let addr = FieldAddr {
             slot: None,
             char_view: true,
             ..addr
         };
         // A name-only `DBF_NOACCESS` row is neither class `$` takes.
-        let at = Self::of(rec, field, addr, PutFn::General, udf);
+        let at = Self::of(rec, field, addr, rec.put_facts_at(at, field));
         (!at.noaccess).then_some(at)
     }
 
-    fn of(rec: &RecordCell, field: &str, addr: FieldAddr, put: PutFn, udf: bool) -> Self {
+    /// `facts` is the field's [`PutFacts`]; a lean put also needs the slot,
+    /// which a `$` name drops.
+    fn of(rec: &RecordCell, field: &str, addr: FieldAddr, facts: &PutFacts) -> Self {
         let rdes = rec.rdes();
         PutAddr {
-            put,
-            udf_defining: udf,
+            put: match (addr.desc, addr.slot, facts.lean) {
+                (Some(desc), Some(slot), Some(kind)) => {
+                    lean_put_fn(rdes.record_type, desc, slot, kind)
+                }
+                _ => PutFn::General,
+            },
+            udf_defining: facts.udf,
             dbaddr: addr
                 .desc
                 .is_some_and(|d| d.declared_special == super::record_trait::Special::DbAddr),
@@ -3061,6 +3137,7 @@ impl PutAddr {
             ),
             watched: RecordInstance::field_posts_property(addr.desc),
             post_suppressed: field == rdes.primary_field && rdes.is_pp(field),
+            settle: facts.settle,
             field: addr,
         }
     }
@@ -3099,6 +3176,12 @@ impl PutAddr {
     /// Whether `dbPut` leaves this field's put-time post to the cycle.
     pub(crate) fn post_suppressed(&self) -> bool {
         self.post_suppressed
+    }
+
+    /// What the cell re-reads after the put.
+    #[inline(always)]
+    pub(crate) fn settle(&self) -> Settle {
+        self.settle
     }
 }
 
@@ -3584,6 +3667,21 @@ impl RecordCell {
         live_borrows::count()
     }
 
+    /// Each [`Self::dbaddr_counts`] entry as `(field, held, counted now)`,
+    /// for a census that the writers keep them coherent.
+    #[doc(hidden)]
+    pub fn dbaddr_counts_census(&self) -> Vec<(&'static str, u32, u32)> {
+        let inst = self.read();
+        self.dbaddr_counts
+            .iter()
+            .map(|(at, held)| {
+                let field = self.rdes.fields[usize::from(*at)].name;
+                let held = held.load(std::sync::atomic::Ordering::Relaxed);
+                (field, held, dbaddr_count_of(&inst, field))
+            })
+            .collect()
+    }
+
     /// The cell for `instance`, registered at record-table `index` if given.
     pub(crate) fn new(
         mut instance: RecordInstance,
@@ -3609,6 +3707,22 @@ impl RecordCell {
             .map(|f| instance.record.field_slot(f.name))
             .collect();
         let dbaddr_counts = dbaddr_counts_of(&instance);
+        let inputs = counts_inputs(&instance, &dbaddr_counts);
+        let put_facts = put_facts(&mut instance, &slots, inputs);
+        let settle = match inputs {
+            Some(None) => Settle::Counts,
+            _ => Settle::Nothing,
+        };
+        let off_list_facts = [false, true].map(|udf| PutFacts {
+            lean: None,
+            udf,
+            settle,
+        });
+        instance.cold.recounts = match inputs {
+            None | Some(Some([])) => Recounts::Never,
+            Some(Some(inputs)) => Recounts::Of(inputs),
+            Some(None) => Recounts::Every,
+        };
         Self {
             lock_record: crate::server::database::LockRecord::bootstrap(),
             borrow: std::sync::atomic::AtomicIsize::new(0),
@@ -3616,7 +3730,7 @@ impl RecordCell {
             bkpt: instance.common.bkpt.share(),
             rdes: RecordDesc::of(&*instance.record),
             name: instance.name.clone(),
-            put_facts: put_facts(&mut instance, &slots),
+            put_facts,
             slots,
             multi_input_val_slots: instance
                 .record
@@ -3638,7 +3752,8 @@ impl RecordCell {
             cvt_resolved: (0..dbaddr_counts.len().div_ceil(64))
                 .map(|_| std::sync::atomic::AtomicU64::new(0))
                 .collect(),
-            dbaddr_counts: arc_swap::ArcSwap::from_pointee(dbaddr_counts),
+            dbaddr_counts,
+            off_list_facts,
             runtime_types: arc_swap::ArcSwap::from_pointee(runtime_types_of(&instance)),
             long_string_size: std::sync::atomic::AtomicU32::new(long_string_size_of(&instance)),
             form_string: AtomicBool::new(crate::server::database::char_view::form_string_of(
@@ -3700,11 +3815,51 @@ impl RecordCell {
     pub(crate) fn settle_addr_facts(&self, inst: &RecordInstance) {
         use std::sync::atomic::Ordering::Relaxed;
         self.string_typed.store(string_typed_mask(inst), Relaxed);
-        self.dbaddr_counts.store(Arc::new(dbaddr_counts_of(inst)));
+        for (at, count) in &self.dbaddr_counts {
+            count.store(
+                dbaddr_count_of(inst, self.rdes.fields[usize::from(*at)].name),
+                Relaxed,
+            );
+        }
         self.runtime_types.store(Arc::new(runtime_types_of(inst)));
         self.long_string_size
             .store(long_string_size_of(inst), Relaxed);
         self.settle_info_facts(inst);
+    }
+
+    /// The [`PutFacts`] of the field at `at` in `rdes.fields`, or of
+    /// `field` off it.
+    #[inline(always)]
+    fn put_facts_at(&self, at: Option<usize>, field: &str) -> &PutFacts {
+        match at {
+            Some(i) => &self.put_facts[i],
+            None => &self.off_list_facts[usize::from(field == self.rdes.primary_field)],
+        }
+    }
+
+    /// The re-read a `dbPut` at a field owes once its `special()` is done:
+    /// [`PutAddr::settle`].
+    #[inline(always)]
+    pub(crate) fn settle_after_put(&self, inst: &RecordInstance, settle: Settle) {
+        match settle {
+            Settle::Nothing => {}
+            Settle::Counts => self.republish_dbaddr_counts(inst),
+            Settle::All => self.settle_addr_facts(inst),
+        }
+    }
+
+    /// Re-read [`Self::dbaddr_counts`] from `inst` after a store that can
+    /// move them, with no allocation: the capacities
+    /// [`super::Record::dbaddr_capacity`] answers. An entry the type leaves
+    /// to its value moves only with the type selectors, which
+    /// [`Self::settle_addr_facts`] re-reads.
+    pub(crate) fn republish_dbaddr_counts(&self, inst: &RecordInstance) {
+        for (at, count) in &self.dbaddr_counts {
+            let field = self.rdes.fields[usize::from(*at)].name;
+            if let Some(n) = inst.record.dbaddr_capacity(field) {
+                count.store(n, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
     }
 
     /// Re-read [`Self::form_string`] and [`Self::nsec_mask`], the facts taken
@@ -3737,7 +3892,8 @@ impl RecordCell {
     /// C `dbNameToAddr(name, &addr)` on this record succeeding, answered with
     /// `addr.no_elements` (1, or an array field's capacity), with no lock:
     /// the field is resolved against the type's declaration and the capacity
-    /// was settled at init. `None` is a field the type does not declare.
+    /// is the one the record's last `dbPut` left ([`Self::dbaddr_counts`]).
+    /// `None` is a field the type does not declare.
     pub fn no_elements(&self, field: &str) -> Option<u32> {
         let named = |f: &&FieldDesc| f.name.eq_ignore_ascii_case(field);
         let Some(i) = self.rdes.fields.iter().position(|f| named(&f)) else {
@@ -3747,12 +3903,11 @@ impl RecordCell {
                 || self.names_bare_noaccess(field))
             .then_some(1);
         };
-        let counts = self.dbaddr_counts.load();
         Some(
-            counts
+            self.dbaddr_counts
                 .iter()
                 .find(|(at, _)| usize::from(*at) == i)
-                .map_or(1, |(_, n)| *n),
+                .map_or(1, |(_, n)| n.load(std::sync::atomic::Ordering::Relaxed)),
         )
     }
 
@@ -3796,8 +3951,7 @@ impl RecordCell {
     pub(crate) fn resolve_addr(self: &Arc<Self>, field: &str) -> Option<u32> {
         use std::sync::atomic::Ordering::{Relaxed, Release};
         let count = self.no_elements(field)?;
-        let counts = self.dbaddr_counts.load();
-        let at = counts.iter().position(|(at, _)| {
+        let at = self.dbaddr_counts.iter().position(|(at, _)| {
             self.rdes.fields[usize::from(*at)]
                 .name
                 .eq_ignore_ascii_case(field)
@@ -3834,7 +3988,7 @@ impl RecordCell {
             while owed != 0 {
                 let entry = word * 64 + owed.trailing_zeros() as usize;
                 owed &= owed - 1;
-                let (at, _) = self.dbaddr_counts.load()[entry];
+                let (at, _) = self.dbaddr_counts[entry];
                 inst.record
                     .cvt_dbaddr(self.rdes.fields[usize::from(at)].name);
             }
@@ -5419,6 +5573,9 @@ pub(crate) struct RecordCold {
     /// The cell holding this instance — none for one not yet in a cell — for
     /// the PACT field's read of [`RecordCell::hold_chain_pact`]'s flag.
     cell: std::sync::Weak<RecordCell>,
+    /// The stores that move the cell's [`RecordCell::dbaddr_counts`]. Set
+    /// with the cell.
+    recounts: Recounts,
     /// The by-name function registry this record's PENDING `init_record` pass
     /// 1 will resolve INAM/SNAM against — C `registryFunctionFind`, reading a
     /// process-global table from inside `init_record`.
@@ -8138,7 +8295,24 @@ impl RecordInstance {
         self.debug_assert_not_slotted(field, &value);
         let put = self.record.put_field_internal(field, value);
         self.refresh_dol_mode(field);
+        self.recount_after_store(field);
         put
+    }
+
+    /// The cell's counts re-read after a store of `field` that no
+    /// `special()` follows; the `dbPut` funnels
+    /// ([`Self::put_declared_field`], [`Self::put_link_field`],
+    /// [`Self::put_common_field_prepared`]) leave it to `dbPut`, which
+    /// settles after its `special()` ([`RecordCell::settle_after_put`]).
+    pub(crate) fn recount_after_store(&self, field: &str) {
+        let moves = match self.cold.recounts {
+            Recounts::Never => false,
+            Recounts::Of(inputs) => inputs.contains(&field),
+            Recounts::Every => true,
+        };
+        if let Some(cell) = moves.then(|| self.cold.cell.upgrade()).flatten() {
+            cell.republish_dbaddr_counts(self);
+        }
     }
 
     /// The funnel for a put of a field the record TYPE declares (as opposed
@@ -8168,6 +8342,7 @@ impl RecordInstance {
             None => Err(CaError::FieldNotFound(field.to_string())),
         };
         self.refresh_dol_mode(field);
+        self.recount_after_store(field);
         stored
     }
 
@@ -8183,12 +8358,14 @@ impl RecordInstance {
                 if let Some(write) = self.link_slots.install(link) {
                     self.slot_written(write);
                 }
+                self.recount_after_store(field);
                 Ok(())
             }
             None => {
                 self.debug_assert_not_slotted(field, &value);
                 let put = self.record.load_field(field, value);
                 self.refresh_dol_mode(field);
+                self.recount_after_store(field);
                 put
             }
         }
@@ -8225,6 +8402,7 @@ impl RecordInstance {
         if let Some(write) = self.link_slots.install(link) {
             self.slot_written(write);
         }
+        self.recount_after_store(field);
         Ok(Some(field))
     }
 
@@ -8687,6 +8865,7 @@ impl RecordInstance {
             ran_arm: CyclePlan::General,
             cold: Box::new(RecordCold {
                 cell: std::sync::Weak::new(),
+                recounts: Recounts::Never,
                 init_subroutines: None,
                 db: Default::default(),
                 io_intr_pump: None,
@@ -10908,6 +11087,7 @@ impl RecordInstance {
         let put = self
             .put_common_field_with(name, value, bound, &mut link)
             .map(|moved| moved.unlent(self));
+        self.recount_after_store(name);
         let scan = match link.as_mut() {
             Some(link) => self.take_link_scan(link).unlent(self),
             None => CommonFieldPutResult::NoChange,
@@ -10937,7 +11117,9 @@ impl RecordInstance {
         value: EpicsValue,
         link: &mut Option<PreparedCommonLink>,
     ) -> CaResult<ScanMove> {
-        self.put_common_field_with(name, value, MenuBound::DbLoad, link)
+        let put = self.put_common_field_with(name, value, MenuBound::DbLoad, link);
+        self.recount_after_store(name);
+        put
     }
 
     /// C `dbPutFieldLink`'s `isDevLink` arm (`dbAccess.c:1127-1131`,
@@ -14375,6 +14557,7 @@ mod record_cell_layout_tests {
             cvt_resolved,
             long_string_size,
             form_string,
+            off_list_facts,
             nsec_mask,
         });
         packed_in_order(cell);
@@ -18528,7 +18711,7 @@ record(stringout, "SOI") { field(OMSL, "closed_loop") field(DOL, "BAD MS")
             let rec = db.get_record("R").unwrap();
             let rdes = rec.rdes();
             for (i, desc) in rdes.fields.iter().enumerate() {
-                let (Some(slot), Some(recorded)) = (rec.slots[i], rec.put_facts[i].kind) else {
+                let (Some(slot), Some(recorded)) = (rec.slots[i], rec.put_facts[i].lean) else {
                     continue;
                 };
                 if lean_put_fn(rdes.record_type, desc, slot, recorded) == PutFn::General {

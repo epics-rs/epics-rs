@@ -1336,6 +1336,10 @@ impl Record for WaveformRecord {
         Some(self.val_capacity() as u32)
     }
 
+    fn dbaddr_capacity_inputs(&self) -> Option<&'static [&'static str]> {
+        Some(&[])
+    }
+
     /// `aao` is an output record; the rest of the array family read
     /// from INP. Output records take the device-write path in
     /// processing.rs (or fall through to the soft-link write when the

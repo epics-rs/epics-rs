@@ -726,6 +726,10 @@ impl Record for McaRecord {
         Some(self.capacity() as u32)
     }
 
+    fn dbaddr_capacity_inputs(&self) -> Option<&'static [&'static str]> {
+        Some(&[])
+    }
+
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         if let Some((i, member)) = roi_field(name) {
             let r = &self.roi[i];

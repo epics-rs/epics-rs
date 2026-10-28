@@ -1032,6 +1032,10 @@ impl Record for CompressRecord {
         Some(self.nsam.max(0) as u32)
     }
 
+    fn dbaddr_capacity_inputs(&self) -> Option<&'static [&'static str]> {
+        Some(&[])
+    }
+
     fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
         match field {
             "ALG" => Some(COMPRESS_ALG_CHOICES),

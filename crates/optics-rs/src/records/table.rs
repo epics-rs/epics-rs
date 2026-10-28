@@ -2661,6 +2661,10 @@ impl Record for TableRecord {
         StampPoint::AfterLinkWrites
     }
 
+    fn dbaddr_capacity_inputs(&self) -> Option<&'static [&'static str]> {
+        Some(&[])
+    }
+
     fn set_async_context(&mut self, name: epics_base_rs::types::RecordName, db: AsyncDbHandle) {
         self.async_ctx = Some((name, db));
     }

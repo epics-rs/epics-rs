@@ -3501,6 +3501,268 @@ mod tests {
         assert_eq!(db.get_pv("M.AMEM").unwrap(), EpicsValue::Long(8));
     }
 
+    /// C `cvt_dbaddr` recomputes `no_elements` per create when `SIZE=NUSE`
+    /// (`aCalcoutRecord.c:627-631`), so a create after a `NUSE` put sees it.
+    #[epics_macros_rs::epics_test]
+    async fn size_nuse_count_follows_a_runtime_nuse() {
+        use crate::server::database::filters::db_channel_create;
+        use crate::server::ioc_builder::IocBuilder;
+        use crate::server::records::acalcout::AcalcoutRecord;
+        use crate::types::EpicsValue;
+        let db = IocBuilder::new()
+            .register_record_type("acalcout", || Box::new(AcalcoutRecord::new()))
+            .db_string(
+                r#"record(acalcout, "M") { field(NELM, "10") field(NUSE, "4") field(SIZE, "NUSE") }"#,
+                &std::collections::HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap()
+            .0;
+        let cell = db.get_record("M").unwrap();
+        assert_eq!(cell.no_elements("AA"), Some(4));
+        db.put_pv("M.NUSE", EpicsValue::Long(7)).await.unwrap();
+        db_channel_create(&db, b"M.AA").unwrap();
+        assert_eq!(cell.no_elements("AA"), Some(7));
+    }
+
+    /// Boundary: a create that finds the record busy, which cannot run
+    /// `cvt_dbaddr`'s count, still counts the window the last `dbPut` of
+    /// `SIZE` or `NUSE` left — on a field already resolved and on a fresh one.
+    #[epics_macros_rs::epics_test]
+    async fn a_busy_create_counts_the_last_put_window() {
+        use crate::server::ioc_builder::IocBuilder;
+        use crate::server::records::acalcout::AcalcoutRecord;
+        use crate::types::EpicsValue;
+        let db = IocBuilder::new()
+            .register_record_type("acalcout", || Box::new(AcalcoutRecord::new()))
+            .db_string(
+                r#"record(acalcout, "M") { field(NELM, "10") field(NUSE, "4") }"#,
+                &std::collections::HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap()
+            .0;
+        let cell = db.get_record("M").unwrap();
+        assert_eq!(cell.resolve_addr("AA"), Some(10));
+        db.put_pv("M.SIZE", EpicsValue::String("NUSE".into()))
+            .await
+            .unwrap();
+        let busy = cell.write();
+        assert_eq!(cell.resolve_addr("AA"), Some(4));
+        assert_eq!(cell.resolve_addr("BB"), Some(4));
+        drop(busy);
+        db.put_pv("M.NUSE", EpicsValue::Long(6)).await.unwrap();
+        let busy = cell.write();
+        assert_eq!(cell.resolve_addr("AA"), Some(6));
+        drop(busy);
+    }
+
+    /// Boundary: a type off the `.dbd` tables that names no
+    /// `Record::dbaddr_capacity_inputs` has a busy create count what a put to
+    /// any field left, here a plain one; one that names its input settles
+    /// after a put there, as a declared type does.
+    #[epics_macros_rs::epics_test]
+    async fn an_off_table_type_recounts_after_a_counted_put() {
+        use crate::error::{CaError, CaResult};
+        use crate::server::ioc_builder::IocBuilder;
+        use crate::server::record::{FieldDesc, Record};
+        use crate::types::{DbFieldType, EpicsValue};
+        static FIELDS: [FieldDesc; 2] = [
+            FieldDesc::new("BUF", DbFieldType::Double, false),
+            FieldDesc::new("N", DbFieldType::Long, false),
+        ];
+        /// `BUF` counts `N`; the type is `.1` and names `.2` its inputs.
+        struct Window(i32, &'static str, Option<&'static [&'static str]>);
+        impl Record for Window {
+            fn record_type(&self) -> &'static str {
+                self.1
+            }
+            fn get_field(&self, name: &str) -> Option<EpicsValue> {
+                match name {
+                    "BUF" => Some(EpicsValue::DoubleArray(vec![0.0].into())),
+                    "N" => Some(EpicsValue::Long(self.0)),
+                    _ => None,
+                }
+            }
+            fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
+                let ("N", EpicsValue::Long(n)) = (name, value) else {
+                    return Err(CaError::FieldNotFound(name.into()));
+                };
+                self.0 = n;
+                Ok(())
+            }
+            fn dbaddr_capacity_inputs(&self) -> Option<&'static [&'static str]> {
+                self.2
+            }
+            fn declared_fields(&self) -> &'static [FieldDesc] {
+                &FIELDS
+            }
+            fn declared_dbaddr_fields(&self) -> Option<&'static [&'static str]> {
+                Some(&["BUF"])
+            }
+            fn dbaddr_capacity(&self, field: &str) -> Option<u32> {
+                (field == "BUF").then_some(self.0 as u32)
+            }
+        }
+        let db = IocBuilder::new()
+            .register_record_type("window", || Box::new(Window(2, "window", None)))
+            .register_record_type("windown", || Box::new(Window(2, "windown", Some(&["N"]))))
+            .db_string(
+                r#"record(window, "W") {} record(windown, "V") {}"#,
+                &std::collections::HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap()
+            .0;
+        for name in ["W", "V"] {
+            let cell = db.get_record(name).unwrap();
+            assert_eq!(cell.resolve_addr("BUF"), Some(2), "{name}");
+            db.put_pv_no_process(&format!("{name}.N"), EpicsValue::Long(5))
+                .await
+                .unwrap();
+            let busy = cell.write();
+            assert_eq!(cell.resolve_addr("BUF"), Some(5), "{name}");
+            drop(busy);
+        }
+    }
+
+    /// Boundary: a named input the lean store could write — a plain
+    /// `DBF_DOUBLE` slot of a declared field — takes the general arm, which
+    /// re-reads the counts; the unnamed sibling keeps the lean arm. A static
+    /// restore stores the input raw through its slot, and recounts too.
+    #[epics_macros_rs::epics_test]
+    async fn a_slotted_capacity_input_takes_the_general_put() {
+        use crate::error::{CaError, CaResult};
+        use crate::server::ioc_builder::IocBuilder;
+        use crate::server::record::dbd_generated::slots::waveform;
+        use crate::server::record::record_instance::{PutAddr, PutFn};
+        use crate::server::record::{DeclaredStore, FieldSlot, Record, SlotMut, SlotRef};
+        use crate::types::EpicsValue;
+        /// A waveform whose VAL counts SDLY, with SDLY and HASH slotted:
+        /// both are plain fields of the base `.dbd`.
+        struct Sized {
+            sdly: f64,
+            hash: u32,
+        }
+        impl Record for Sized {
+            fn record_type(&self) -> &'static str {
+                "waveform"
+            }
+            fn get_field(&self, name: &str) -> Option<EpicsValue> {
+                match name {
+                    "VAL" => Some(EpicsValue::DoubleArray(vec![0.0].into())),
+                    "SDLY" => Some(EpicsValue::Double(self.sdly)),
+                    "HASH" => Some(EpicsValue::ULong(self.hash)),
+                    _ => None,
+                }
+            }
+            fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
+                match (name, value) {
+                    ("SDLY", EpicsValue::Double(v)) => self.sdly = v,
+                    ("HASH", EpicsValue::ULong(v)) => self.hash = v,
+                    _ => return Err(CaError::FieldNotFound(name.into())),
+                }
+                Ok(())
+            }
+            fn dbaddr_capacity(&self, field: &str) -> Option<u32> {
+                (field == "VAL").then_some(self.sdly as u32)
+            }
+            fn dbaddr_capacity_inputs(&self) -> Option<&'static [&'static str]> {
+                Some(&["SDLY"])
+            }
+            fn slot_ref(&self, slot: FieldSlot) -> Option<SlotRef<'_>> {
+                match slot {
+                    waveform::SDLY => Some(SlotRef::F64(&self.sdly)),
+                    waveform::HASH => Some(SlotRef::U32(&self.hash)),
+                    _ => None,
+                }
+            }
+            fn slot_mut(&mut self, slot: FieldSlot) -> Option<SlotMut<'_>> {
+                match slot {
+                    waveform::SDLY => Some(SlotMut::F64(&mut self.sdly)),
+                    waveform::HASH => Some(SlotMut::U32(&mut self.hash)),
+                    _ => None,
+                }
+            }
+            fn declared_store(&self, slot: FieldSlot) -> Option<DeclaredStore> {
+                self.slot_ref(slot).map(|_| DeclaredStore::Member)
+            }
+        }
+        let db = IocBuilder::new()
+            .register_record_type("waveform", || Box::new(Sized { sdly: 0.0, hash: 0 }))
+            .db_string(
+                r#"record(waveform, "S") { field(SDLY, "2") }"#,
+                &std::collections::HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap()
+            .0;
+        let cell = db.get_record("S").unwrap();
+        assert!(matches!(
+            PutAddr::resolve_in(&cell, "HASH").put(),
+            PutFn::U32(_)
+        ));
+        assert_eq!(PutAddr::resolve_in(&cell, "SDLY").put(), PutFn::General);
+        assert_eq!(cell.resolve_addr("VAL"), Some(2));
+        db.put_pv_no_process("S.HASH", EpicsValue::ULong(9))
+            .await
+            .unwrap();
+        db.put_pv_no_process("S.SDLY", EpicsValue::Double(5.0))
+            .await
+            .unwrap();
+        let busy = cell.write();
+        assert_eq!(cell.resolve_addr("VAL"), Some(5));
+        drop(busy);
+        db.put_pv_static("S.SDLY", "7").await.unwrap();
+        let busy = cell.write();
+        assert_eq!(cell.resolve_addr("VAL"), Some(7));
+        drop(busy);
+    }
+
+    /// Boundary: a store no `special()` follows — a device post, a static
+    /// restore — re-reads the counts as a `dbPut` does, for each input.
+    #[epics_macros_rs::epics_test]
+    async fn a_post_or_restore_of_a_capacity_input_recounts() {
+        use crate::server::ioc_builder::IocBuilder;
+        use crate::server::records::acalcout::AcalcoutRecord;
+        use crate::types::EpicsValue;
+        let db = IocBuilder::new()
+            .register_record_type("acalcout", || Box::new(AcalcoutRecord::new()))
+            .db_string(
+                r#"record(acalcout, "M") { field(NELM, "10") field(NUSE, "4") }"#,
+                &std::collections::HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap()
+            .0;
+        let cell = db.get_record("M").unwrap();
+        let counted = || {
+            let _busy = cell.write();
+            cell.resolve_addr("AA")
+        };
+        assert_eq!(counted(), Some(10));
+        db.put_pv_menu_index("M.SIZE", 1).await.unwrap();
+        assert_eq!(counted(), Some(4), "SIZE restore");
+        db.post_fields("M", vec![("NUSE".into(), EpicsValue::Long(6))])
+            .unwrap();
+        assert_eq!(counted(), Some(6), "NUSE post");
+        db.put_pv_static("M.NUSE", "7").await.unwrap();
+        assert_eq!(counted(), Some(7), "NUSE restore");
+        db.put_pv_array_static("M.NUSE", EpicsValue::Long(3))
+            .unwrap();
+        assert_eq!(counted(), Some(3), "NUSE array restore");
+    }
+
     /// Boundary `built == false`: a record adopted before `iocInit` waits on
     /// the bootstrap set, as C's null `lset` does until `dbLockInitRecords`.
     #[test]

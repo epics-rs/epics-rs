@@ -457,6 +457,10 @@ impl Record for MbboRecord {
         true
     }
 
+    fn dbaddr_capacity_inputs(&self) -> Option<&'static [&'static str]> {
+        Some(&[])
+    }
+
     fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
         crate::server::record::CycleHooks::WRITE_POSTED
     }

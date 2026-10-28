@@ -832,6 +832,10 @@ impl Record for ScalcoutRecord {
         true
     }
 
+    fn dbaddr_capacity_inputs(&self) -> Option<&'static [&'static str]> {
+        Some(&[])
+    }
+
     fn has_array_monitor_post(&self) -> bool {
         false
     }

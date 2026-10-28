@@ -5785,6 +5785,17 @@ pub trait Record: RecordAny + Send + Sync + 'static {
         None
     }
 
+    /// The [`Self::field_list`] fields a put can move a
+    /// [`Self::dbaddr_capacity`] answer by: any store of one (a `dbPut`, a
+    /// device post, a restore) re-reads the record's lock-free channel
+    /// counts, as C's `cvt_dbaddr` counts the record at each create.
+    /// `Some(&[])` is a type whose capacities read only what `init_record`
+    /// fixes; `None`, the default, is a type that has not said, whose every
+    /// store re-reads them.
+    fn dbaddr_capacity_inputs(&self) -> Option<&'static [&'static str]> {
+        None
+    }
+
     /// What C's `cvt_dbaddr` DOES to the record before answering — acalcout
     /// `calloc`s and charges the buffer it hands out (`aCalcoutRecord.c:589-617`).
     /// Run only when a channel or address resolves on the `SPC_DBADDR` field
@@ -6606,7 +6617,10 @@ pub trait Record: RecordAny + Send + Sync + 'static {
     /// `cvt_dbaddr` gives a [`FieldDesc::runtime_typed`] field: `mbbo`'s
     /// state fields, which move `sdef` and so VAL's type. The put owner
     /// (`field_io`) then settles the record's address facts again
-    /// (`RecordCell::settle_addr_facts`). Default: false.
+    /// (`RecordCell::settle_addr_facts`). Asked once per
+    /// [`Self::field_list`] field when the record's cell is built, so the
+    /// answer is the field's alone; a field off the list never retypes.
+    /// Default: false.
     fn special_retypes(&self, _put_field: &str) -> bool {
         false
     }

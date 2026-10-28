@@ -1760,6 +1760,11 @@ impl Record for AcalcoutRecord {
         Some(self.dbaddr_no_elements() as u32)
     }
 
+    /// `NELM` is `SPC_NOMOD`; a client moves the window.
+    fn dbaddr_capacity_inputs(&self) -> Option<&'static [&'static str]> {
+        Some(&["SIZE", "NUSE"])
+    }
+
     /// `cvt_dbaddr`'s first act is the allocation (`aCalcoutRecord.c:589-617`):
     /// the record cannot hand out a `pfield` for a buffer it has not
     /// `calloc`'d, so a channel resolving on AVAL, AA..LL or OAV charges it.

@@ -730,6 +730,10 @@ impl Record for ASubRecord {
         }
     }
 
+    fn dbaddr_capacity_inputs(&self) -> Option<&'static [&'static str]> {
+        Some(&[])
+    }
+
     fn dbaddr_stored_as_scalar(&self, field: &str) -> bool {
         match parse_channel(field) {
             Some((Chan::Value, idx)) => !self.a[idx].is_array(),

@@ -5501,6 +5501,10 @@ impl Record for AsynRecord {
         }
     }
 
+    fn dbaddr_capacity_inputs(&self) -> Option<&'static [&'static str]> {
+        Some(&[])
+    }
+
     /// `post_fields_with_mask` writes a posted ERRS back through this path;
     /// it goes straight to `store_errs`, since the default's coercion
     /// would allocate the `ERR_SIZE` buffer `get_field` serves.

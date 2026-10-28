@@ -1377,6 +1377,10 @@ impl Record for SscanRecord {
         Some(self.mpts.max(0) as u32)
     }
 
+    fn dbaddr_capacity_inputs(&self) -> Option<&'static [&'static str]> {
+        Some(&[])
+    }
+
     fn field_metadata_override(&self, field: &str) -> Option<FieldMetadataOverride> {
         let (units, precision, limits) = self.metadata(own_index(field)?);
         Some(FieldMetadataOverride {

@@ -2979,6 +2979,8 @@ impl PvDatabase {
                 None => inst.put_declared_field(field, value),
             };
             let _ = inst.special(field, true);
+            // A link's `special()` never retypes; the counts may still move.
+            inst.recount_after_store(field);
             put
         };
         debug_assert!(put.is_ok(), "{field} is a link field with no writer");

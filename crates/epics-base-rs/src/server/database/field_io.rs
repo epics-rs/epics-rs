@@ -3082,6 +3082,7 @@ impl PvDatabase {
             if let Some(element) = src.element() {
                 let old_nord = array_nord_before_put(&instance, field);
                 if instance.record.put_primary_element0(element) {
+                    rec.settle_after_put(&instance, at.settle());
                     finish_put(&mut instance, field, at, &old_nord, origin, &mut burst);
                     return Ok(None);
                 }
@@ -3183,10 +3184,9 @@ impl PvDatabase {
                 Ok(r) => common_result = r,
                 Err(e) => status = Err(e),
             }
-            if instance.record.special_retypes(field) {
-                rec.settle_addr_facts(&instance);
-            }
         }
+        // C's `cvt_dbaddr` answers from the record as each create finds it.
+        rec.settle_after_put(&instance, at.settle());
         self.remove_put_link(&instance, field, before);
         if status.is_ok() && link_put {
             self.open_put_link(&mut instance, field);
@@ -5122,7 +5122,12 @@ impl PvDatabase {
         let _gate = self.acquire_put_gate(base, &field, Some(&value));
         let owned = crate::server::db_loader::record_owns_field(&*rec.read().record, &field);
         match owned {
-            true => rec.write().put_declared_field(&field, value),
+            true => {
+                let mut inst = rec.write();
+                let put = inst.put_declared_field(&field, value);
+                inst.recount_after_store(&field);
+                put
+            }
             false => self.put_common_static(base, &rec, &field, value),
         }
     }

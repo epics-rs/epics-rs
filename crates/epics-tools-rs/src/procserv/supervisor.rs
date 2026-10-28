@@ -38,7 +38,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::{DateTime, Local};
-use epics_base_rs::runtime::task::{Instant, Sleep};
+use epics_base_rs::runtime::task::{self, Instant, Sleep};
 use tokio::sync::mpsc;
 
 use crate::procserv::child::{ChildEvent, ChildExit, ChildHandle, ChildSpec};
@@ -981,7 +981,7 @@ impl SupervisorState {
             None => self.config.holdoff,
         };
         self.pending_restart = Some(PendingRestart {
-            due: Sleep::until(Instant::now() + remaining),
+            due: Sleep::until(task::deadline_from_now(remaining)),
         });
     }
 
@@ -1437,6 +1437,26 @@ mod tests {
             state.pending_restart.is_some(),
             "a spawn failure must schedule a holdoff retry, not give up"
         );
+    }
+
+    /// `--holdoff` takes any u64 of seconds. C reads it through `atoi` into an
+    /// int (procServ.cc:316) and adds it to `time(0)`; a deadline past the
+    /// clock's range must saturate, not panic the supervisor on its first
+    /// restart.
+    #[tokio::test]
+    async fn an_unbounded_holdoff_schedules_without_overflow() {
+        use epics_base_rs::runtime::task::Instant;
+        let mut cfg = min_config();
+        cfg.holdoff = Duration::from_secs(u64::MAX);
+        let mut state = SupervisorState::for_test(cfg);
+        state.schedule_restart(None);
+        let due = state
+            .pending_restart
+            .as_ref()
+            .expect("scheduled")
+            .due
+            .deadline();
+        assert!(due > Instant::now() + Duration::from_secs(365 * 86_400));
     }
 
     #[tokio::test]

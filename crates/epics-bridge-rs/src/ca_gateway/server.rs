@@ -895,7 +895,7 @@ impl GatewayServer {
         let upstream_for_cleanup = upstream.clone();
         let stats_for_cleanup = stats.clone();
         let cleanup_handle = reactor.spawn(async move {
-            let mut tick = epics_base_rs::runtime::task::interval(cleanup_interval.get());
+            let mut tick = epics_base_rs::runtime::task::interval(cleanup_interval);
             tick.tick().await; // first tick is immediate, skip
             loop {
                 tick.tick().await;
@@ -919,7 +919,7 @@ impl GatewayServer {
         let stats_for_refresh = stats.clone();
         let db_for_stats = shadow_db.clone();
         let stats_handle = reactor.spawn(async move {
-            let mut tick = epics_base_rs::runtime::task::interval(stats_interval.get());
+            let mut tick = epics_base_rs::runtime::task::interval(stats_interval);
             tick.tick().await;
             loop {
                 tick.tick().await;
@@ -936,7 +936,7 @@ impl GatewayServer {
             let stats_hb = stats.clone();
             let db_hb = shadow_db.clone();
             Some(reactor.spawn(async move {
-                let mut tick = epics_base_rs::runtime::task::interval(period.get());
+                let mut tick = epics_base_rs::runtime::task::interval(period);
                 tick.tick().await;
                 loop {
                     tick.tick().await;

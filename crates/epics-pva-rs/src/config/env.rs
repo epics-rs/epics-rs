@@ -1185,6 +1185,15 @@ pub fn echo_period_secs(tcp_timeout_secs: f64) -> f64 {
     (tcp_timeout_secs * 3.0 / 8.0).clamp(1.0, 15.0)
 }
 
+/// [`echo_period_secs`] as the period both echo tickers arm; its 1 s floor
+/// is the `Period` floor.
+pub fn echo_period(tcp_timeout: Duration) -> epics_base_rs::runtime::task::Period {
+    epics_base_rs::runtime::task::Period::at_least(
+        Duration::from_secs_f64(echo_period_secs(tcp_timeout.as_secs_f64())),
+        epics_base_rs::runtime::task::Period::from_secs(std::num::NonZeroU64::MIN),
+    )
+}
+
 /// The EFFECTIVE TCP inactivity timeout for a *configured*
 /// `EPICS_PVA_CONN_TMO` value: the `tmoScale` (4/3) followed by pvxs
 /// `enforceTimeout` (`config.cpp:373-391`), which C applies to the SCALED

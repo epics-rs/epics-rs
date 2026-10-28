@@ -783,7 +783,7 @@ pub fn requeue_background() -> impl Future<Output = ()> {
 
 /// Periodic ticker on the process-global delayed-callback timer — the
 /// [`interval`] counterpart for work spawned by [`spawn_background`].
-pub fn interval_background(period: Duration) -> crate::runtime::background::TimerInterval {
+pub fn interval_background(period: Period) -> crate::runtime::background::TimerInterval {
     crate::runtime::background::timer_sleep::interval(&background().timer().handle(), period)
 }
 
@@ -1387,10 +1387,10 @@ impl Interval {
     }
 }
 
-/// Build a periodic ticker firing every `period`. A zero period panics, as
-/// `tokio::time::interval` does: it would be a ticker in a spin loop.
-pub fn interval(period: Duration) -> Interval {
-    assert!(!period.is_zero(), "`period` must be non-zero.");
+/// Build a periodic ticker firing every `period`. `Period` has no zero, the
+/// spin loop that `tokio::time::interval` refuses with a panic.
+pub fn interval(period: Period) -> Interval {
+    let period = period.get();
     Interval {
         period,
         next: deadline_from_now(period),
@@ -1417,6 +1417,19 @@ impl Period {
 
     pub const fn from_secs(secs: std::num::NonZeroU64) -> Self {
         Self(Duration::from_secs(secs.get()))
+    }
+
+    pub const fn from_millis(millis: std::num::NonZeroU64) -> Self {
+        Self(Duration::from_millis(millis.get()))
+    }
+
+    /// The shortest period, one nanosecond.
+    pub const MIN: Self = Self(Duration::from_nanos(1));
+
+    /// `period`, raised to `floor` when shorter: the total conversion for a
+    /// computed `Duration` whose own lower bound is a `Period`.
+    pub fn at_least(period: Duration, floor: Period) -> Self {
+        Self(period.max(floor.0))
     }
 
     pub const fn get(self) -> Duration {
@@ -4900,7 +4913,7 @@ mod tests {
     fn an_interval_on_a_thread_with_no_runtime_ticks() {
         let started = std::time::Instant::now();
         park_on(async {
-            let mut every = interval(Duration::from_millis(10));
+            let mut every = interval(Period::new(Duration::from_millis(10)).unwrap());
             every.tick().await;
             every.tick().await;
             every.tick().await;
@@ -4920,7 +4933,7 @@ mod tests {
     fn a_dropped_tick_leaves_its_timer_armed_for_the_next() {
         let timer = background().timer().handle();
         let mut cx = Context::from_waker(Waker::noop());
-        let mut every = interval(Duration::from_secs(180));
+        let mut every = interval(Period::new(Duration::from_secs(180)).unwrap());
         assert!(Box::pin(every.tick()).as_mut().poll(&mut cx).is_ready());
         let (before, armed, due) = (
             timer.scheduled_count(),
@@ -4952,7 +4965,7 @@ mod tests {
     fn an_interval_bursts_to_catch_up_after_a_stall() {
         let mut cx = Context::from_waker(Waker::noop());
         let period = Duration::from_millis(50);
-        let mut every = interval(period);
+        let mut every = interval(Period::new(period).unwrap());
         assert!(Box::pin(every.tick()).as_mut().poll(&mut cx).is_ready());
         std::thread::sleep(8 * period);
         for n in 1..=4 {
@@ -4963,24 +4976,29 @@ mod tests {
         }
     }
 
-    /// tokio's contract, kept on both backends: a zero period would be a
-    /// ticker in a spin loop.
-    #[test]
-    #[should_panic(expected = "`period` must be non-zero.")]
-    fn a_zero_period_interval_is_refused() {
-        let _ = interval(Duration::ZERO);
-    }
-
-    /// A `Period` is what `interval` accepts: zero has none, the smallest
-    /// `Duration` and the smallest whole second each have one.
+    /// A `Period` is what `interval` accepts, and no public constructor builds
+    /// a zero one: `new` refuses it, the `NonZeroU64` constructors cannot be
+    /// handed it, and `at_least` lifts it to its floor.
     #[test]
     fn a_period_is_a_non_zero_duration() {
         assert_eq!(Period::new(Duration::ZERO), None);
         let ns = Duration::from_nanos(1);
         assert_eq!(Period::new(ns).map(Period::get), Some(ns));
+        assert_eq!(Period::MIN.get(), ns);
         assert_eq!(
             Period::from_secs(std::num::NonZeroU64::MIN).get(),
             Duration::from_secs(1)
+        );
+        assert_eq!(
+            Period::from_millis(std::num::NonZeroU64::MIN).get(),
+            Duration::from_millis(1)
+        );
+        assert_eq!(Period::at_least(Duration::ZERO, Period::MIN), Period::MIN);
+        let floor = Period::from_millis(std::num::NonZeroU64::new(100).unwrap());
+        assert_eq!(Period::at_least(Duration::from_millis(99), floor), floor);
+        assert_eq!(
+            Period::at_least(Duration::from_millis(101), floor).get(),
+            Duration::from_millis(101)
         );
     }
 
@@ -5013,7 +5031,7 @@ mod tests {
             "the premise: nothing has started the background facility yet"
         );
         let started = Instant::now();
-        let mut every = interval(Duration::from_millis(10));
+        let mut every = interval(Period::new(Duration::from_millis(10)).unwrap());
         every.tick().await;
         every.tick().await;
         every.tick().await;

@@ -22,9 +22,12 @@
 #![cfg(feature = "discovery-dns-update")]
 
 use std::net::SocketAddr;
+use std::num::NonZeroU64;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
+
+use epics_base_rs::runtime::task::Period;
 
 use hickory_client::client::{AsyncClient, ClientHandle, Signer};
 use hickory_client::error::ClientError;
@@ -69,10 +72,12 @@ pub struct DnsRegistration {
     /// TTL on every record we add.
     pub ttl: Duration,
     /// How often to refresh the records to keep them fresh.
-    pub keepalive: Duration,
+    pub keepalive: Period,
     /// Optional TSIG key for authenticated UPDATE.
     pub tsig: Option<TsigKey>,
 }
+
+const DEFAULT_KEEPALIVE: Period = Period::from_secs(NonZeroU64::new(30).unwrap());
 
 impl Default for DnsRegistration {
     fn default() -> Self {
@@ -84,7 +89,7 @@ impl Default for DnsRegistration {
             port: 5064,
             txt: Vec::new(),
             ttl: Duration::from_secs(60),
-            keepalive: Duration::from_secs(30),
+            keepalive: DEFAULT_KEEPALIVE,
             tsig: None,
         }
     }
@@ -109,7 +114,7 @@ impl DnsUpdater {
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let reg_clone = reg.clone();
         let handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(reg_clone.keepalive);
+            let mut interval = epics_base_rs::runtime::task::interval(reg_clone.keepalive);
             interval.tick().await; // first tick fires immediately; skip
             loop {
                 tokio::select! {

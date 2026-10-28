@@ -41,13 +41,13 @@ impl LivenessClock {
 
     /// A periodic ticker with `runtime::task::interval`'s semantics: the
     /// first tick is immediate and missed ticks burst.
-    pub(crate) fn interval(&self, period: Duration) -> LivenessTicker {
+    pub(crate) fn interval(&self, period: epics_base_rs::runtime::task::Period) -> LivenessTicker {
         match self {
             Self::System => LivenessTicker::System(epics_base_rs::runtime::task::interval(period)),
             #[cfg(test)]
             Self::Manual(clock) => LivenessTicker::Manual {
                 next: clock.now_nanos(),
-                period: period.as_nanos() as u64,
+                period: period.get().as_nanos() as u64,
                 clock: clock.clone(),
             },
         }

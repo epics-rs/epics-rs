@@ -172,7 +172,7 @@ pub struct Timer {
 }
 
 impl Timer {
-    pub fn periodic(period: std::time::Duration) -> Self {
+    pub fn periodic(period: epics_base_rs::runtime::task::Period) -> Self {
         Self {
             interval: epics_base_rs::runtime::task::interval(period),
         }
@@ -201,7 +201,9 @@ mod tests {
     fn a_timer_on_a_thread_with_no_runtime_ticks() {
         std::thread::spawn(|| {
             epics_base_rs::runtime::task::block_on_sync(async {
-                let mut timer = Timer::periodic(std::time::Duration::from_millis(5));
+                let mut timer = Timer::periodic(epics_base_rs::runtime::task::Period::from_millis(
+                    std::num::NonZeroU64::new(5).unwrap(),
+                ));
                 timer.tick().await;
                 timer.tick().await;
             })

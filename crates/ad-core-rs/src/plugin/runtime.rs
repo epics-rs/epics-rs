@@ -34,7 +34,9 @@ use asyn_rs::runtime::config::RuntimeConfig;
 use asyn_rs::runtime::port::{PortRuntimeHandle, create_port_runtime, port_runtime_unavailable};
 use asyn_rs::trace::TraceMask;
 use asyn_rs::user::AsynUser;
-use epics_libcom_rs::runtime::task::{MandatoryThread, StackSizeClass, StackSpec, ThreadPriority};
+use epics_libcom_rs::runtime::task::{
+    MandatoryThread, Period, StackSizeClass, StackSpec, ThreadPriority,
+};
 
 use asyn_rs::port_handle::{CallbacksAfter, CallbacksGate, PortHandle};
 use asyn_rs::request::SectionScope;
@@ -4126,6 +4128,19 @@ fn source_slot(sources: &mut [(String, i32)], addr: i32) -> Option<(usize, &mut 
     sources.get_mut(index).map(|slot| (index, slot))
 }
 
+/// The sort-flush timer while no sort flush is armed.
+const SORT_FLUSH_IDLE: Period = Period::from_secs(std::num::NonZeroU64::new(3600).unwrap());
+
+/// The sort-flush period for a positive `SortTime`. One that rounds to zero
+/// flushes every nanosecond, as C `sortingTask` sleeping it flushes
+/// continuously (NDPluginDriver.cpp:649).
+fn sort_flush_period(sort_time: f64) -> Period {
+    Period::at_least(
+        epics_libcom_rs::runtime::time::duration_from_secs(sort_time),
+        Period::MIN,
+    )
+}
+
 fn plugin_data_loop<P: NDPluginProcess>(
     shared: Arc<parking_lot::Mutex<SharedProcessorInner>>,
     processor: Arc<P>,
@@ -4167,7 +4182,7 @@ fn plugin_data_loop<P: NDPluginProcess>(
     crate::runtime::block_on_for_thread(async {
         // Sort flush timer — starts disabled (very long interval).
         // Re-created when sort_time changes.
-        let mut sort_flush_interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+        let mut sort_flush_interval = epics_libcom_rs::runtime::task::interval(SORT_FLUSH_IDLE);
         let mut sort_flush_active = false;
         // Last published QueueFree value — only flush the queue params when it
         // changes, so a steady queue depth does not spam param callbacks.
@@ -4624,10 +4639,9 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                     } else {
                                         sort_flush_active = sort_time > 0.0;
                                         if sort_flush_active {
-                                            let dur = epics_libcom_rs::runtime::time::duration_from_secs(
-                                                sort_time,
+                                            sort_flush_interval = epics_libcom_rs::runtime::task::interval(
+                                                sort_flush_period(sort_time),
                                             );
-                                            sort_flush_interval = tokio::time::interval(dur);
                                         }
                                         None
                                     }
@@ -4648,8 +4662,8 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                 let sort_mode = shared.lock().delivery.set_sort_time(t);
                                 if sort_mode != 0 && t > 0.0 {
                                     sort_flush_active = true;
-                                    let dur = epics_libcom_rs::runtime::time::duration_from_secs(t);
-                                    sort_flush_interval = tokio::time::interval(dur);
+                                    sort_flush_interval =
+                                        epics_libcom_rs::runtime::task::interval(sort_flush_period(t));
                                 } else {
                                     sort_flush_active = false;
                                 }
@@ -4744,6 +4758,17 @@ mod tests {
     use super::*;
     use crate::ndarray::{NDDataType, NDDimension};
     use crate::plugin::channel::ndarray_channel;
+
+    /// A `SortTime` that `Duration` rounds to zero still arms a flush; a
+    /// zero period was `tokio::time::interval`'s panic.
+    #[test]
+    fn a_sort_time_below_a_nanosecond_flushes_every_nanosecond() {
+        assert_eq!(sort_flush_period(1e-10), Period::MIN);
+        assert_eq!(
+            sort_flush_period(0.25).get(),
+            std::time::Duration::from_millis(250)
+        );
+    }
 
     /// # Invariant
     ///

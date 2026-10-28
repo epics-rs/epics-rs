@@ -647,8 +647,9 @@ impl ChannelSource for ControlSource {
         let me = self.clone();
         let pv_name = name.to_vec();
         self.reactor.spawn(async move {
-            let mut tick =
-                epics_base_rs::runtime::task::interval(std::time::Duration::from_secs(1));
+            let mut tick = epics_base_rs::runtime::task::interval(
+                epics_base_rs::runtime::task::Period::from_secs(std::num::NonZeroU64::MIN),
+            );
             tick.tick().await; // skip the immediate fire — server emits
             // initial via get_value.
             let mut last: Option<PvField> = None;

@@ -782,7 +782,7 @@ impl ChannelCache {
         });
         let weak = Arc::downgrade(&cache);
         let task = cache.reactor.spawn(async move {
-            let mut tick = epics_base_rs::runtime::task::interval(cleanup_interval.get());
+            let mut tick = epics_base_rs::runtime::task::interval(cleanup_interval);
             tick.tick().await; // skip first immediate tick
             loop {
                 tick.tick().await;

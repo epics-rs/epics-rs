@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::num::NonZeroU64;
 use std::time::{Duration, Instant};
 
 // The UDP SEARCH transport is available on **every** backend.
@@ -37,7 +38,7 @@ use tokio::io::AsyncReadExt;
 // The `runtime::task` seam, not `tokio::time::interval`: this engine is
 // compiled for the RTEMS target, where the periodic ticker is the delayed
 // callback timer and there is no tokio timer to drive tokio's own.
-use epics_base_rs::runtime::task::interval;
+use epics_base_rs::runtime::task::{Period, interval};
 
 use crate::protocol::*;
 
@@ -332,19 +333,28 @@ fn resolve_max_search_period_secs() -> f64 {
 /// beacon-poke `FAST_TICK` path. If libca-style short-wait discovery
 /// becomes a goal, the fix is an RTT-derived early-retry path for
 /// `Initial` searches, not a change to this normal-cadence tick.
-fn normal_tick() -> Duration {
+fn normal_tick() -> Period {
     normal_tick_for(max_search_period_secs())
 }
 
 /// `tick = period / N_SEARCH_BUCKETS`, split out so the env-boundary tests
 /// can drive it from an uncached period.
-fn normal_tick_for(period_secs: f64) -> Duration {
-    crate::estdlib::duration_from_secs(period_secs / N_SEARCH_BUCKETS as f64)
+fn normal_tick_for(period_secs: f64) -> Period {
+    Period::at_least(
+        crate::estdlib::duration_from_secs(period_secs / N_SEARCH_BUCKETS as f64),
+        MIN_NORMAL_TICK,
+    )
 }
+
+/// The tick at the resolver's 60 s lower limit: 60 / `N_SEARCH_BUCKETS`.
+const MIN_NORMAL_TICK: Period = Period::from_secs(NonZeroU64::new(2).unwrap());
 
 /// Fast-mode tick cadence after a beacon poke. One full bucket
 /// revolution fits in `N_SEARCH_BUCKETS * FAST_TICK = 6 s`.
-const FAST_TICK: Duration = Duration::from_millis(200);
+const FAST_TICK: Period = Period::from_millis(NonZeroU64::new(200).unwrap());
+
+/// `EPICS_CA_DNS_REFRESH_SECS` when unset, zero or not a number.
+const DEFAULT_DNS_REFRESH: Period = Period::from_secs(NonZeroU64::new(60).unwrap());
 
 /// Maximum bytes per outbound UDP datagram.
 const MAX_UDP_SEND: usize = 1024;
@@ -1049,11 +1059,10 @@ async fn run_engine(
     // default 60 s balances responsiveness against DNS load. Literal
     // IP entries (`hostname == None`) short-circuit inside
     // `refresh_dns` so the cost is bounded by hostname count.
-    let dns_refresh_secs: u64 = epics_base_rs::runtime::env::get_lossy("EPICS_CA_DNS_REFRESH_SECS")
+    let dns_refresh = epics_base_rs::runtime::env::get_lossy("EPICS_CA_DNS_REFRESH_SECS")
         .and_then(|s| s.parse().ok())
-        .filter(|&n: &u64| n > 0)
-        .unwrap_or(60);
-    let mut dns_refresh = interval(Duration::from_secs(dns_refresh_secs));
+        .map_or(DEFAULT_DNS_REFRESH, Period::from_secs);
+    let mut dns_refresh = interval(dns_refresh);
     dns_refresh.tick().await; // skip immediate fire
 
     loop {
@@ -2328,7 +2337,7 @@ mod tests {
             "unset env must default to C's 300 s, not the old 30 s"
         );
         assert_eq!(
-            normal_tick_for(resolve_max_search_period_secs()),
+            normal_tick_for(resolve_max_search_period_secs()).get(),
             Duration::from_secs(10)
         );
 
@@ -2341,7 +2350,7 @@ mod tests {
             "a configured 45 s must clamp UP to C's 60 s lower bound"
         );
         assert_eq!(
-            normal_tick_for(resolve_max_search_period_secs()),
+            normal_tick_for(resolve_max_search_period_secs()).get(),
             Duration::from_secs(2)
         );
 
@@ -2349,7 +2358,7 @@ mod tests {
         unsafe { std::env::set_var("EPICS_CA_MAX_SEARCH_PERIOD", "120") };
         assert_eq!(resolve_max_search_period_secs(), 120.0);
         assert_eq!(
-            normal_tick_for(resolve_max_search_period_secs()),
+            normal_tick_for(resolve_max_search_period_secs()).get(),
             Duration::from_secs(4)
         );
 
@@ -2668,7 +2677,7 @@ mod tests {
     #[test]
     fn fast_tick_revolution_covers_full_ring() {
         // FAST_TICK * N_SEARCH_BUCKETS should be ~6 s (matches pvxs poke cadence).
-        let revolution = FAST_TICK * N_SEARCH_BUCKETS as u32;
+        let revolution = FAST_TICK.get() * N_SEARCH_BUCKETS as u32;
         assert!(revolution >= Duration::from_secs(5));
         assert!(revolution <= Duration::from_secs(7));
     }

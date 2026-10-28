@@ -70,6 +70,7 @@ use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use super::delayed_timer::{TimerHandle, WakeKey};
+use crate::runtime::task::Period;
 
 /// Shared between a [`Sleep`] and its armed timer callback.
 struct SleepState {
@@ -222,7 +223,8 @@ pub struct TimerInterval {
 
 /// Build a periodic ticker firing every `period`, backed by `timer` — the
 /// runtime-free mirror of `tokio::time::interval`.
-pub fn interval(timer: &TimerHandle, period: Duration) -> TimerInterval {
+pub fn interval(timer: &TimerHandle, period: Period) -> TimerInterval {
+    let period = period.get();
     let next = crate::runtime::time::deadline_from_now(period);
     TimerInterval {
         period,
@@ -298,7 +300,7 @@ mod tests {
         drop(s);
         // The ticker anchors its first deadline the same way, and
         // advances it with the same owner.
-        let mut every = interval(&timer.handle(), Duration::MAX);
+        let mut every = interval(&timer.handle(), Period::new(Duration::MAX).unwrap());
         every.next = crate::runtime::time::deadline_after(every.next, every.period);
         assert_eq!(count.load(Ordering::SeqCst), 0);
     }
@@ -417,7 +419,7 @@ mod tests {
         let waker = Waker::from(Arc::new(CountWaker(Arc::new(AtomicUsize::new(0)))));
         let mut cx = Context::from_waker(&waker);
 
-        let mut iv = interval(&h, Duration::from_secs(180));
+        let mut iv = interval(&h, Period::new(Duration::from_secs(180)).unwrap());
         let due = iv.next;
         // The first tick is immediate and arms nothing; the rest are 180 s out.
         let mut first = Box::pin(iv.tick());
@@ -475,7 +477,7 @@ mod tests {
         let start = Instant::now();
         drive(
             async move {
-                let mut iv = interval(&th, period);
+                let mut iv = interval(&th, Period::new(period).unwrap());
                 iv.tick().await; // first tick: immediate
                 let after_first = start.elapsed();
                 assert!(
@@ -505,7 +507,7 @@ mod tests {
         let th = timer.handle();
         drive(
             async move {
-                let mut iv = interval(&th, period);
+                let mut iv = interval(&th, Period::new(period).unwrap());
                 iv.tick().await; // immediate; deadlines land at 30/60/90/120ms
                 // Stall well past four deadlines.
                 sleep(&th, Duration::from_millis(140)).await;

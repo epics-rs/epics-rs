@@ -170,9 +170,9 @@ struct Args {
     #[arg(
         long = "dns-update-keepalive",
         value_name = "SECONDS",
-        default_value_t = 30
+        default_value = "30"
     )]
-    dns_update_keepalive: u64,
+    dns_update_keepalive: std::num::NonZeroU64,
 
     /// Startup script run BEFORE iocInit, as C softIoc runs its
     /// positional `st.cmd` argument (`softMain.cpp:222-241`: the script
@@ -1290,7 +1290,9 @@ impl ServerOptions {
                         .unwrap_or_else(epics_base_rs::runtime::net::ca_server_port),
                     txt: Vec::new(),
                     ttl: std::time::Duration::from_secs(args.dns_update_ttl),
-                    keepalive: std::time::Duration::from_secs(args.dns_update_keepalive),
+                    keepalive: epics_base_rs::runtime::task::Period::from_secs(
+                        args.dns_update_keepalive,
+                    ),
                     tsig,
                 })
             } else {

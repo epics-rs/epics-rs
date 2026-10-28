@@ -32,7 +32,6 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use epics_base_rs::error::CaResult;
 use epics_base_rs::server::database::PvDatabase;
@@ -196,10 +195,13 @@ async fn parse_and_build(script: &str) -> CaResult<(BareIoc, Option<String>)> {
     Ok((ioc.build_ioc().await?, group_file))
 }
 
+const SIMULATOR_PERIOD: epics_base_rs::runtime::task::Period =
+    epics_base_rs::runtime::task::Period::from_millis(std::num::NonZeroU64::new(500).unwrap());
+
 fn spawn_simulator(reactor: &epics_base_rs::runtime::task::Reactor, db: Arc<PvDatabase>) {
     reactor.spawn(async move {
         let mut tick = 0.0_f64;
-        let mut interval = epics_base_rs::runtime::task::interval(Duration::from_millis(500));
+        let mut interval = epics_base_rs::runtime::task::interval(SIMULATOR_PERIOD);
         loop {
             interval.tick().await;
             tick += 0.1;

@@ -71,7 +71,7 @@ use tokio::sync::{mpsc, oneshot};
 // actually runs on — hosted that is tokio's, which is virtual under
 // `start_paused`. Taking `Instant` from the seam alongside the timer is what
 // keeps the two from being different timelines.
-use epics_base_rs::runtime::task::{Instant, Sleep, interval, sleep, timeout};
+use epics_base_rs::runtime::task::{Instant, Period, Sleep, interval, sleep, timeout};
 use tracing::debug;
 use tracing::warn;
 
@@ -288,7 +288,8 @@ pub const BEACON_TIMEOUT: Duration = Duration::from_secs(360);
 
 /// Period of the beacon-cleanup tick. pvxs runs `tickBeaconClean` every
 /// 180s; we match.
-pub const BEACON_CLEAN_INTERVAL: Duration = Duration::from_secs(180);
+pub const BEACON_CLEAN_INTERVAL: Period =
+    Period::from_secs(std::num::NonZeroU64::new(180).unwrap());
 
 /// How long the engine collects extra SEARCH_RESPONSE entries after the
 /// first one for a given pv name (used by [`SearchCommand::FindAll`]).
@@ -3075,10 +3076,7 @@ async fn ns_run_once(
     // bookkeeping — and leaves a ≥10 s window in which no PV can be resolved
     // at all. The host never showed it: a tokio-side NS circuit is just as
     // silent, but the churn only costs a reconnect there.
-    let echo_interval = Duration::from_secs_f64(crate::config::env::echo_period_secs(
-        tcp_timeout.as_secs_f64(),
-    ));
-    let mut echo_tick = interval(echo_interval);
+    let mut echo_tick = interval(crate::config::env::echo_period(tcp_timeout));
     echo_tick.tick().await; // `interval` fires immediately; skip that one
     let mut last_rx = Instant::now();
     let mut reassembly = SegmentAssembler::default();

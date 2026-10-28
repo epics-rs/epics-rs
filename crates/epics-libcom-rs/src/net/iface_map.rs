@@ -143,7 +143,7 @@ impl IfaceMap {
     pub fn spawn_refresh(
         &self,
         reactor: &crate::runtime::task::Reactor,
-        period: Duration,
+        period: crate::runtime::task::Period,
     ) -> crate::runtime::task::TaskHandle<()> {
         let me = self.clone();
         reactor.spawn(async move {
@@ -523,7 +523,10 @@ mod tests {
         let initial = map.inner.lock().last_refresh;
         let reactor =
             crate::runtime::task::Reactor::current().expect("the test driver enters an executor");
-        let handle = map.spawn_refresh(&reactor, Duration::from_millis(50));
+        let handle = map.spawn_refresh(
+            &reactor,
+            crate::runtime::task::Period::new(Duration::from_millis(50)).unwrap(),
+        );
         crate::runtime::task::sleep(Duration::from_millis(200)).await;
         let after = map.inner.lock().last_refresh;
         assert!(

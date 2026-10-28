@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## v0.33.0 — 2026-10-29
+
+Minor release; the pinned toolchain stays at 1.99.1. VxWorks is no
+longer a target. asyn's ipSNCServer, mca's SIS38XX_SNL and motorUtil
+are ported, and pvalink moves into `epics-pva-rs`.
 
 ### Breaking
 
@@ -9,6 +13,45 @@
 - `epics-rtems-boot`: `stats::register_task` and the VxWorks stats backend removed.
 - libcom: `runtime::socket::poll_ready(socket, want, ms: i32)` → `poll_ready(socket, want, timeout: Option<Duration>)`, `None` waiting forever and a positive timeout polling at least 1 ms.
 - `epics-snc-rs` is folded into `epics-seq-rs` as `epics_seq_rs::snc` under feature `snc`, with the `snc-rs` binary; the run-time is the default feature `runtime`. A build script takes `epics-seq-rs = { default-features = false, features = ["snc"] }` and calls `epics_seq_rs::snc::build::compile_dir`.
+- Record links: `ca://x` and `pva://x` are CA PV names handed to the CA link verbatim, as C's dbParseLink has no URL scheme; a PVA link is `{pva:...}`.
+- `Record`: `delayed_callback_fire(pact)` → `delayed_callback_fire(callback, pact)` beside `ProcessAction::DelayedCallbackAfter(Duration, DelayedCallback)`; `set_out_link_write_status(field, value, failed: bool)` → `(field, value, status: DbResult, dpvt: &Dpvt)`; `input_link_failure_is_inert` removed; `OutTarget::field_type` → `Option<DbfCode>` and its `constant_type`, `is_ca_link` and `puts_as_string` removed; `seed_input_links(pairs)` → `seed_input_links(pairs, SeedGuard)`.
+- Links: `ParsedLink::link_type_after_init(raw, ftype)` → `link_type_after_init()`; `ParsedLink::is_db`, `LinkType::Empty`, `link_field_type` and `LinkMetadata::enum_choices` removed; `LinkMetadata::from_ca_attributes` drops `labels`; `ClientMonitor` → `ClientSubscription` and `InProcessChannel::subscribe` returns `InProcessSubscription`, every callback of a `CaClientContext` running on its one event context (`events()`); `InProcessChannel::put_callback` takes an `issued` closure whose result it returns.
+- `AsyncDbHandle`: `db_get`, `get_dbr_string` and `name_to_dbaddr` take `Option<OwnRecord<'_>>` for the `(&[u8], &dyn Record)` pair; `has_pv(name, held)` → `has_pv(name)`; `link_target_field_type`, `parsed_link_target_field_type` and `DbAddr::field_type` → `DbfCode`.
+- base `char_view`: `plain_re_view`, `PvaDollar::of` and the free `channel_field_type` (now `ChannelAddr::channel_field_type`) removed; `pvxs_form_string(inst, field, view: Option<&CharView>, dollar)` → `pvxs_form_string(field, q_form, view: Option<&CharAddr>, dollar)`; `DollarView::of_text_channel(view, final_elements)` → `of_text_channel(view: Option<&CharAddr>, no_elements, filters)`.
+- base: `FilterChain::apply_to_read_value` and `apply_to_event_value` removed, `apply_to_read_log` added; `SubscriptionFilter::final_field_type` removed, `log_type` added; `calc::seed_random_from_time` and `snapshot::apply_nsec_mask` removed; `link_status::post_link_status` returns `Option<i16>` and `LinkCheckTail::pass(statuses: &[i16])` → `pass(db_links: u64)`.
+- asyn: `port::OctetWriteRule` returns `AsynResult<()>`; `CallbacksGate::open` takes a `SectionScope`; `SyncIOHandle::timeout()` → `Option<Duration>`, `None` for `waiting_forever`.
+- areaDetector arrays: `NDDataBuffer` enum → untyped struct read through `view()`/`view_mut()` (`NDDataView`/`NDDataViewMut`) or `as_slice::<T>()` and built by `from_vec`/`from_slice`; `NDArray`'s `data` and `data_size` fields → `data()`, `data_mut() -> NDDataMut`, `data_size()`; `DriverArray` is no longer `DerefMut` (`fill() -> NDArrayMut`) and `PersistentArray::refill` returns `NDArrayMut`; `NDArrayPool::alloc_with`, `DriverPool::alloc_with`, `color::convert_data_type_into` and `convert::convert_type_into` removed; `NDDataBuffer::copy_from` is crate-private.
+- areaDetector attributes: `ADDriverBase::attach_attributes`, `DriverAttributes::attach` and `ArrayOwner::get_attributes` take `&mut NDAttributeList` for `&mut NDArray`; `DriverAttributes::param_reads` and `update_with` fill a caller's `&mut ParamReads` / `&mut NDAttributeList`; `ArrayOwner::evaluate_attributes_blocking(Vec)` → `get_attributes_blocking(&mut list, &[PendingParam]) -> bool` and `param_reads_blocking(Vec) -> Option` → `param_reads_blocking(&[PendingParam], &mut ParamReads) -> bool`; `ArrayOwner::persistent`/`refill` and `NDArrayDriverBase::update_time_stamps` hand `PersistentArrayMut`/`NDArrayMut`; `AttributeView::evaluate` → `with_evaluated(f)`.
+- areaDetector plugins: `NDFileWriter::read_file()` → `read_file(&NDArrayPool)` and `set_plugin_attributes(NDAttributeList)` → `set_plugin_attributes(&NDAttributeList)`; `ProcessResult::output_arrays` `Vec` → `Frame` (`SmallVec<[_; 1]>`) and `ProcessResult::arrays` takes `impl Into<Frame<_>>`; `NDArrayOutput::publish` and `ArrayPublisher::publish` return `()`; `WriteVerdict::succeed` removed, a refused write staying refused; `FilePluginController::delete_driver_file` removed, DeleteDriverFile being read live.
+- CA client: `CaChannel::get()`, `CaChannel::put(&EpicsValue)`, `CaChannel::get_many` and `CaClient::get_many` removed, every awaitable get and put taking a bound (`get_with_timeout`, `put_with_timeout`); `get_with_dbr_type`, `get_with_metadata`, `get_with_metadata_count`, `put_string` and `put_string_array` take `timeout: Duration`.
+- `epics-bridge-rs`: `UpstreamManager::get(name)` → `get(name, timeout)`; `qsrv::pvif::snapshot_to_nt_scalar`, `snapshot_to_nt_enum`, `snapshot_to_nt_scalar_array` and `snapshot_to_pv_structure` take `nsec_mask: u64`; `MemberChannel::value_in` removed.
+- PVA: `server::run_pva_ioc(IocRunConfig)` is private, `run_pva_ioc_app(app)` the entry; `iocsh::pvxs_base_registrar_with_enable2` removed, `qsrv2_enabled` added; `channel_shape::channel_final_elements` removed and `ChannelShape`/`ChannelValue::of_channel`/`of_record_channel` → `of_addr(&ChannelAddr, ..)`; `PvaServerDriver::serve_udp_search` removed and `SearchSockets`'s `v4`/`v6` fields private.
+- sequencer: `c::strcpy`, `strncpy`, `strcat` and `sprintf` take `impl CDst` for `&impl Place<B>`; `c::Scanned` is libcom's opaque `runtime::scanf::Scanned`, its `Int`/`UInt`/`Double`/`Str`/`Chars` variants gone; `types::CharPtr` `Option<Arc<[u8]>>` → `var::Ptr<c_char>`; `var::Indexed` requires `elems` and `elems_mut`; `EventGate::run`, `stop` and `call` removed and `PvVar::monitor_on` drops its `gate`.
+- libcom: `task::interval`, `task::interval_background`, `background::timer_sleep::interval`, the gateway's `cleanup_interval` / `ChannelCache::new` / `DEFAULT_CLEANUP_INTERVAL`, PVA's `BEACON_CLEAN_INTERVAL` and `util::Timer::periodic` take `task::Period`, a non-zero `Duration`, for `Duration`.
+- asyn interfaces: `Capability`, `octet_transport_capabilities`, `PortHandle::set_interfaces` and `InterfaceMask::UNMIGRATED_*` removed, `InterfaceMask::capabilities()` → `interfaces()` / `has(iface)`, `InterruptManager::with_sources(sources)` → `with_masks(interfaces, sources)`; `SyncIOHandle::from_handle` refuses an interface the port lacks.
+- motor: `Model1Motor` no longer extends `AsynMotor`; it is `Send + Sync` with its own `poll`, `poll_failure` and `update_delay`, and a model-1 driver registers through `register_model1_device_disabling_ntm` where C's device support clears NTM.
+- StreamDevice: `cstr::c_sscanf_hex(s, width)` → `c_sscanf_hex(s)`.
+
+### New
+
+- asyn-rs `snl::ip_snc_server` (testIPServer's `ipSNCServer.st`, `register_test_ip_server_dbd`); mca-rs `snl::sis38xx_snl` (`SIS38XX_SNL.st`, `register_sis38xx_dbd`).
+- motor-rs `motor_util`: `motorUtilInit`, `listMovingMotors` and `printChIDlist`; `MOTOR_DIR`, whose `db/` holds motorApp/Db.
+- `epics_pva_rs::pvalink`, the `{pva:}` link that `run_pva_ioc_app` and `pvxs_ioc_builder` register as `pva` (`epics_bridge_rs::pvalink` re-exports it), and `epics_pva_rs::epics_convert`.
+- libcom `runtime::scanf`: glibc 2.43's `sscanf`, which every sscanf in the workspace goes through.
+- libcom `runtime::task`: `Period`, `Sleep` (`until`, `reset`), `spawn_background_after`, `requeue_background` and `event_wait_timeout`, which clamps a seconds value as `epicsEventWaitWithTimeout` does.
+- areaDetector: `WiringRegistry::set_multi_device`, the `ASYN_MULTIDEVICE` flag alone deciding whether a subscription's address selects an output.
+- `IocApplication::run_outcome` → `RunOutcome::{Served, NeverInitialised}`; asyn `SyncIOHandle::waiting_forever`, C's negative timeout.
+- sequencer: `var::Ptr` (C's `T *`), `Field`, `View` and `UnionBytes`; `arith`, C's usual arithmetic conversions; `c::malloc`, `strchr`, `strstr`, `epicsStrtok_r`, `atol`, `epicsSnprintf` and `truth`; `StateSet::database`.
+
+### Fixed
+
+- pvalink: a channel has one put, ended at `Connection::down`; there is no 5 s client deadline, and a plain write returns at put start.
+
+### Highlights
+
+- An `NDDataBuffer` is untyped storage in 8-byte-aligned chunks, so a pooled buffer serves any element type, and a recycled array keeps its dims and attribute storage on `NDArrayPool`'s free list.
+- `par_util` runs one rayon pool per L3 domain, entered only where `pool_wins` says the split beats the serial time.
+- JPEG decodes in place with zune-jpeg, and `file_tiff` decode reads as libtiff 4.0.6 does, BigTIFF and big-endian included.
 
 ## v0.32.0 — 2026-10-22
 

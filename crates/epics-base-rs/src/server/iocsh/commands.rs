@@ -1085,6 +1085,8 @@ fn name_to_addr(ctx: &CommandContext, pname: &[u8]) -> Option<DbAddr> {
                 None => FldDes::Attribute(inst.attribute(field)?),
             }
         };
+        // `dbEntryToAddr`'s `cvt_dbaddr` runs before the `$` is judged.
+        ctx.db().resolve_addr(&rec, field);
         let addr = DbAddr {
             rec,
             record: parts.record.to_vec(),
@@ -15918,5 +15920,37 @@ Total 3 records, 2 aliases
         let (file, console) = shell.file_and_console("dbStateShowAll");
         assert_eq!(file, "");
         assert!(console.ends_with("'tstdout_x' : FALSE\n"), "{console}");
+    }
+
+    /// C `dbgf` resolves with `dbNameToAddr`, whose `dbEntryToAddr` runs
+    /// `cvt_dbaddr`: naming M.AA charges its buffer.
+    #[test]
+    fn dbgf_charges_the_array_it_names() {
+        // RTEMS-EXEC-MODEL-ALLOW(1): the acalcout type is registered through IocBuilder, whose build is async; runs and passes in the exec-backend suite.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let db = rt.block_on(async {
+            crate::server::ioc_builder::IocBuilder::new()
+                .register_record_type("acalcout", || {
+                    Box::new(crate::server::records::acalcout::AcalcoutRecord::new())
+                })
+                .db_string(
+                    r#"record(acalcout, "M") {}"#,
+                    &std::collections::HashMap::new(),
+                )
+                .unwrap()
+                .build()
+                .await
+                .unwrap()
+                .0
+        });
+        let bridge = {
+            let _guard = rt.enter();
+            crate::runtime::task::BlockingBridge::capture()
+        };
+        let ctx = CommandContext::new(db.clone(), bridge);
+        let out = run_cmd(&ctx, "dbgf", &["M.AA"]);
+        let amem = db.get_pv("M.AMEM").unwrap();
+        std::mem::forget(rt);
+        assert_eq!(amem, EpicsValue::Long(8), "dbgf printed {out:?}");
     }
 }

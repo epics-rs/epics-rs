@@ -4563,9 +4563,10 @@ mod tests {
             )
         };
         if std::env::var_os(CHILD).is_some() {
-            // asynOctetSyncIO checks asynCommon before asynOctet, so a port
-            // missing either fails the first connect (drvModbusAsyn.cpp:294).
-            struct Declared(PortDriverBase, Vec<asyn_rs::interfaces::Capability>);
+            // A port without asynOctet fails the first connect
+            // (drvModbusAsyn.cpp:294); every port has asynCommon
+            // (asynPortDriver.cpp:4015).
+            struct Declared(PortDriverBase);
             impl PortDriver for Declared {
                 fn base(&self) -> &PortDriverBase {
                     &self.0
@@ -4573,44 +4574,26 @@ mod tests {
                 fn base_mut(&mut self) -> &mut PortDriverBase {
                     &mut self.0
                 }
-                fn capabilities(&self) -> Vec<asyn_rs::interfaces::Capability> {
-                    self.1.clone()
-                }
             }
-            use asyn_rs::interfaces::Capability as C;
-            let mut runtimes = Vec::new();
-            for (octet, caps) in [
-                ("OCTET_NO_OCTET", vec![C::Connect, C::Flush, C::Option]),
-                (
-                    "OCTET_NO_COMMON",
-                    vec![C::OctetRead, C::OctetWrite, C::Option],
-                ),
-            ] {
-                let driver = Declared(
-                    PortDriverBase::new(
-                        octet,
-                        1,
-                        PortFlags::default(),
-                        InterfaceMask::NONE,
-                        InterfaceMask::NONE,
-                    ),
-                    caps,
-                );
-                let (rt, _jh) = create_port_runtime_unclaimed(driver, RuntimeConfig::default())
-                    .expect("octet runtime must start");
-                asyn_rs::asyn_record::register_port(
-                    octet,
-                    rt.port_handle().clone(),
-                    &asyn_rs::registry::open_owner(),
-                )
-                .expect("the octet port must publish");
-                runtimes.push(rt);
-            }
+            let driver = Declared(PortDriverBase::new(
+                "OCTET_NO_OCTET",
+                1,
+                PortFlags::default(),
+                InterfaceMask::OPTION,
+                InterfaceMask::NONE,
+            ));
+            let (rt, _jh) = create_port_runtime_unclaimed(driver, RuntimeConfig::default())
+                .expect("octet runtime must start");
+            asyn_rs::asyn_record::register_port(
+                "OCTET_NO_OCTET",
+                rt.port_handle().clone(),
+                &asyn_rs::registry::open_owner(),
+            )
+            .expect("the octet port must publish");
             for (port, octet, function) in [
                 ("MB_HALF_FN", "NO_SUCH_OCTET", 99),
                 ("MB_HALF_OCTET", "NO_SUCH_OCTET", 3),
                 ("MB_HALF_NO_OCTET", "OCTET_NO_OCTET", 3),
-                ("MB_HALF_NO_COMMON", "OCTET_NO_COMMON", 3),
             ] {
                 assert!(matches!(
                     configure(port, octet, function, "UINT16"),
@@ -4648,7 +4631,6 @@ mod tests {
             "drvModbusAsyn::drvModbusAsyn port MB_HALF_FN unsupported Modbus function 99",
             "drvModbusAsyn::drvModbusAsyn port MB_HALF_OCTET can't connect to asynOctet on Octet server NO_SUCH_OCTET.",
             "drvModbusAsyn::drvModbusAsyn port MB_HALF_NO_OCTET can't connect to asynOctet on Octet server OCTET_NO_OCTET.",
-            "drvModbusAsyn::drvModbusAsyn port MB_HALF_NO_COMMON can't connect to asynOctet on Octet server OCTET_NO_COMMON.",
         ] {
             assert!(
                 stderr.lines().any(|l| l.ends_with(line)),

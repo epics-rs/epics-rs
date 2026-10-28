@@ -466,23 +466,8 @@ mod tests {
     }
 
     #[test]
-    fn vxi11_registers_the_gpib_port_interfaces() {
-        use crate::interfaces::Capability;
-
-        let drv = DrvVxi11Port::configure("v", "192.0.2.1", 0, "", "gpib0", 0, true).unwrap();
-        let caps = drv.capabilities();
-        for cap in [
-            Capability::Gpib,
-            Capability::Int32Read,
-            Capability::Int32Write,
-            Capability::OctetRead,
-            Capability::OctetWrite,
-            Capability::Option,
-        ] {
-            assert!(caps.contains(&cap), "vxi11 must declare {cap:?}");
-        }
-
-        let mut drv = drv;
+    fn vxi11_int32_defaults_name_their_direction() {
+        let mut drv = DrvVxi11Port::configure("v", "192.0.2.1", 0, "", "gpib0", 0, true).unwrap();
         let mut user = AsynUser::default();
         // CBUG-B10: C's asynInt32Base `readDefault` reported "write is not
         // supported" (a copy-paste from `writeDefault`) until asyn #237

@@ -9,7 +9,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use asyn_rs::error::{AsynError, AsynResult, AsynStatus};
-use asyn_rs::interfaces::Capability;
 use asyn_rs::param::ParamType;
 use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
@@ -24,7 +23,6 @@ type Creates = Arc<Mutex<HashMap<String, usize>>>;
 struct Counting {
     base: PortDriverBase,
     creates: Creates,
-    enum_iface: bool,
     /// The create, counted per drvInfo, that fails.
     fail_at: Option<usize>,
 }
@@ -48,13 +46,6 @@ impl PortDriver for Counting {
         }
         self.base().drv_user_create(req)
     }
-    fn capabilities(&self) -> Vec<Capability> {
-        let mut caps = InterfaceMask::UNMIGRATED_ALL.capabilities();
-        if !self.enum_iface {
-            caps.retain(|c| !matches!(c, Capability::EnumRead | Capability::EnumWrite));
-        }
-        caps
-    }
 }
 
 const PARAMS: [(&str, ParamType); 8] = [
@@ -77,12 +68,23 @@ async fn ioc(
     records: &str,
 ) -> (Creates, Arc<PvDatabase>, PortRuntimeHandle) {
     let db = Arc::new(PvDatabase::new());
+    let enum_mask = if enum_iface {
+        InterfaceMask::ENUM
+    } else {
+        InterfaceMask::NONE
+    };
     let mut base = PortDriverBase::new(
         port,
         1,
         PortFlags::default(),
-        InterfaceMask::INT32 | InterfaceMask::OCTET | InterfaceMask::ENUM | InterfaceMask::DRV_USER,
-        InterfaceMask::INT32 | InterfaceMask::ENUM,
+        InterfaceMask::INT32
+            | InterfaceMask::INT64
+            | InterfaceMask::UINT32_DIGITAL
+            | InterfaceMask::FLOAT64
+            | InterfaceMask::OCTET
+            | InterfaceMask::DRV_USER
+            | enum_mask,
+        InterfaceMask::INT32 | enum_mask,
     );
     for (name, kind) in PARAMS {
         base.create_param(name, kind).unwrap();
@@ -91,7 +93,6 @@ async fn ioc(
     let driver = Counting {
         base,
         creates: creates.clone(),
-        enum_iface,
         fail_at,
     };
     let (runtime, _actor) =

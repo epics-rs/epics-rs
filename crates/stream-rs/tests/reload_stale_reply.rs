@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use asyn_rs::interfaces::{Capability, InterfaceMask, octet_transport_capabilities};
+use asyn_rs::interfaces::InterfaceMask;
 use asyn_rs::manager::{PortManager, claim_port_driver};
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::request::RequestOp;
@@ -73,9 +73,6 @@ impl PortDriver for Device {
     }
     fn base_mut(&mut self) -> &mut PortDriverBase {
         &mut self.base
-    }
-    fn capabilities(&self) -> Vec<Capability> {
-        octet_transport_capabilities()
     }
     fn connect(&mut self, user: &AsynUser) -> asyn_rs::error::AsynResult<()> {
         self.base_mut().set_addr_connected(user.addr, true);
@@ -152,7 +149,7 @@ fn a_reply_of_a_run_the_reload_aborted_does_not_reach_the_next_protocol() {
         "VPORT",
         1,
         flags,
-        InterfaceMask::OCTET,
+        InterfaceMask::OCTET_TRANSPORT,
         InterfaceMask::OCTET,
     );
     let manager = PortManager::new();

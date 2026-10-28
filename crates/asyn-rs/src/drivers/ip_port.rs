@@ -2377,10 +2377,10 @@ mod tests {
     fn new_configured_no_auto_connect_matches_the_oracle_port_model() {
         let drv = DrvAsynIPPort::new_configured("ORACLEASYN", "localhost:1", true, false).unwrap();
 
-        // (1) Interface set — the exact octet-transport capabilities, no extras.
+        // (1) Interface set — exactly the octet transport's, no extras.
         assert_eq!(
-            drv.capabilities(),
-            crate::interfaces::octet_transport_capabilities()
+            drv.base().interface_mask(),
+            crate::interfaces::InterfaceMask::OCTET_TRANSPORT
         );
 
         // (2) Disconnected, noAutoConnect — nothing arms the reconnect timer,

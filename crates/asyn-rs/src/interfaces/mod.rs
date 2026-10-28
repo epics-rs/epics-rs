@@ -10,7 +10,7 @@ pub mod int64;
 pub mod motor;
 // No `option` module: the asynOption interface has no trait of its own. A
 // driver implements it by overriding `PortDriver::get_option` / `set_option`
-// and declaring `Capability::Option`, which is what `PortHandle::has_interface`
+// and declaring `InterfaceMask::OPTION`, which is what `PortHandle::has_interface`
 // (and so asynRecord's OPTIONIV) reads. The former `AsynOption` trait duplicated
 // those two methods and no driver implemented it.
 pub mod uint32_digital;
@@ -133,120 +133,6 @@ impl std::fmt::Display for InterfaceType {
     }
 }
 
-/// Type-safe capability enum for declaring what a port driver supports.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Capability {
-    Int32Read,
-    Int32Write,
-    Int64Read,
-    Int64Write,
-    Float64Read,
-    Float64Write,
-    OctetRead,
-    OctetWrite,
-    UInt32DigitalRead,
-    UInt32DigitalWrite,
-    EnumRead,
-    EnumWrite,
-    GenericPointerRead,
-    GenericPointerWrite,
-    Int8ArrayRead,
-    Int8ArrayWrite,
-    Int16ArrayRead,
-    Int16ArrayWrite,
-    Int32ArrayRead,
-    Int32ArrayWrite,
-    Int64ArrayRead,
-    Int64ArrayWrite,
-    Float32ArrayRead,
-    Float32ArrayWrite,
-    Float64ArrayRead,
-    Float64ArrayWrite,
-    Motor,
-    Gpib,
-    /// The `asynOption` interface (`get_option` / `set_option`). C drivers
-    /// register it explicitly (`option.interfaceType = asynOptionType` in
-    /// drvAsynIPPort.c:1079, drvAsynSerialPort.c:1098, drvVxi11.c:1777,
-    /// drvAsynFTDIPort.cpp:582) and asynRecord's `optioniv` is the result of
-    /// `findInterface(asynOptionType)` (asynRecord.c:1177-1186).
-    Option,
-    /// The `asynDrvUser` interface — see [`InterfaceType::DrvUser`]. A driver
-    /// that declares it can resolve a `drvInfo` string to a parameter reason
-    /// ([`crate::port::PortDriver::drv_user_create`]); a driver that does not
-    /// leaves every client at reason 0, and asynRecord reports
-    /// `"asynDrvUser not supported but drvInfo not blank"` for a non-empty
-    /// DRVINFO (asynRecord.c:1258-1266).
-    DrvUser,
-    Flush,
-    Connect,
-}
-
-impl Capability {
-    /// Return the interface type this capability belongs to.
-    pub fn interface_type(&self) -> InterfaceType {
-        match self {
-            Self::Int32Read | Self::Int32Write => InterfaceType::Int32,
-            Self::Int64Read | Self::Int64Write => InterfaceType::Int64,
-            Self::Float64Read | Self::Float64Write => InterfaceType::Float64,
-            Self::OctetRead | Self::OctetWrite => InterfaceType::Octet,
-            Self::UInt32DigitalRead | Self::UInt32DigitalWrite => InterfaceType::UInt32Digital,
-            Self::EnumRead | Self::EnumWrite => InterfaceType::Enum,
-            Self::GenericPointerRead | Self::GenericPointerWrite => InterfaceType::GenericPointer,
-            Self::Int8ArrayRead | Self::Int8ArrayWrite => InterfaceType::Int8Array,
-            Self::Int16ArrayRead | Self::Int16ArrayWrite => InterfaceType::Int16Array,
-            Self::Int32ArrayRead | Self::Int32ArrayWrite => InterfaceType::Int32Array,
-            Self::Int64ArrayRead | Self::Int64ArrayWrite => InterfaceType::Int64Array,
-            Self::Float32ArrayRead | Self::Float32ArrayWrite => InterfaceType::Float32Array,
-            Self::Float64ArrayRead | Self::Float64ArrayWrite => InterfaceType::Float64Array,
-            Self::Motor => InterfaceType::Motor,
-            Self::Gpib => InterfaceType::Gpib,
-            Self::Option => InterfaceType::Option,
-            Self::DrvUser => InterfaceType::DrvUser,
-            Self::Flush | Self::Connect => InterfaceType::Common,
-        }
-    }
-
-    /// True if this is a read capability.
-    pub fn is_read(&self) -> bool {
-        matches!(
-            self,
-            Self::Int32Read
-                | Self::Int64Read
-                | Self::Float64Read
-                | Self::OctetRead
-                | Self::UInt32DigitalRead
-                | Self::EnumRead
-                | Self::GenericPointerRead
-                | Self::Int8ArrayRead
-                | Self::Int16ArrayRead
-                | Self::Int32ArrayRead
-                | Self::Int64ArrayRead
-                | Self::Float32ArrayRead
-                | Self::Float64ArrayRead
-        )
-    }
-
-    /// True if this is a write capability.
-    pub fn is_write(&self) -> bool {
-        matches!(
-            self,
-            Self::Int32Write
-                | Self::Int64Write
-                | Self::Float64Write
-                | Self::OctetWrite
-                | Self::UInt32DigitalWrite
-                | Self::EnumWrite
-                | Self::GenericPointerWrite
-                | Self::Int8ArrayWrite
-                | Self::Int16ArrayWrite
-                | Self::Int32ArrayWrite
-                | Self::Int64ArrayWrite
-                | Self::Float32ArrayWrite
-                | Self::Float64ArrayWrite
-        )
-    }
-}
-
 /// C's `interfaceMask` / `interruptMask` bits (asynPortDriver.h:24-39). An
 /// `asynPortDriver` registers exactly the interfaces its mask names
 /// (asynPortDriver.cpp:4055-4071), which is what asynRecord's OPTIONIV, UI32IV,
@@ -276,19 +162,14 @@ impl InterfaceMask {
     /// asynPortDriver mask names.
     pub const GPIB: Self = Self(0x1_0000);
 
-    /// A port not yet given its C driver's mask (asynPortDriver.cpp:4055-4071):
-    /// the scalar set every port declared before masks existed. Each use is a
-    /// site still to migrate.
-    pub const UNMIGRATED_ALL: Self = Self::COMMON
-        .or(Self::DRV_USER)
-        .or(Self::OPTION)
-        .or(Self::INT32)
-        .or(Self::UINT32_DIGITAL)
-        .or(Self::FLOAT64)
-        .or(Self::OCTET)
-        .or(Self::GENERIC_POINTER)
-        .or(Self::ENUM)
-        .or(Self::INT64);
+    /// A byte transport's interfaces: `asynCommon` + `asynOctet` + `asynOption`,
+    /// exactly what drvAsynIPPort / drvAsynSerialPort / drvAsynFTDIPort register
+    /// (drvAsynIPPort.c:1091-1109). No register interface, so a record pointed
+    /// at one with IFACE=Int32 gets C's "No asynInt32 interface" rather than a
+    /// silent cache read. No `asynDrvUser` either — a byte transport has no
+    /// parameters to name, so every client stays at reason 0 and asynRecord
+    /// refuses a non-blank DRVINFO (asynRecord.c:1258-1266).
+    pub const OCTET_TRANSPORT: Self = Self::COMMON.or(Self::OPTION).or(Self::OCTET);
 
     /// Every bit: a mask that restricts nothing.
     pub const ALL: Self = Self(u32::MAX);
@@ -329,39 +210,30 @@ impl InterfaceMask {
         self.0 & other.0 == other.0
     }
 
-    /// The capabilities of the interfaces this mask names.
-    pub fn capabilities(self) -> Vec<Capability> {
-        use Capability::*;
-        let table: [(Self, &[Capability]); 17] = [
-            (Self::INT32, &[Int32Read, Int32Write]),
-            (Self::INT64, &[Int64Read, Int64Write]),
-            (Self::FLOAT64, &[Float64Read, Float64Write]),
-            (Self::OCTET, &[OctetRead, OctetWrite]),
-            (
-                Self::UINT32_DIGITAL,
-                &[UInt32DigitalRead, UInt32DigitalWrite],
-            ),
-            (Self::ENUM, &[EnumRead, EnumWrite]),
-            (
-                Self::GENERIC_POINTER,
-                &[GenericPointerRead, GenericPointerWrite],
-            ),
-            (Self::INT8_ARRAY, &[Int8ArrayRead, Int8ArrayWrite]),
-            (Self::INT16_ARRAY, &[Int16ArrayRead, Int16ArrayWrite]),
-            (Self::INT32_ARRAY, &[Int32ArrayRead, Int32ArrayWrite]),
-            (Self::INT64_ARRAY, &[Int64ArrayRead, Int64ArrayWrite]),
-            (Self::FLOAT32_ARRAY, &[Float32ArrayRead, Float32ArrayWrite]),
-            (Self::FLOAT64_ARRAY, &[Float64ArrayRead, Float64ArrayWrite]),
-            (Self::OPTION, &[Option]),
-            (Self::DRV_USER, &[DrvUser]),
-            (Self::GPIB, &[Gpib]),
-            (Self::COMMON, &[Flush, Connect]),
-        ];
-        table
-            .iter()
-            .filter(|(bit, _)| self.contains(*bit))
-            .flat_map(|(_, caps)| caps.iter().copied())
-            .collect()
+    /// The interfaces this mask names.
+    pub fn interfaces(self) -> impl Iterator<Item = InterfaceType> {
+        use InterfaceType::*;
+        [
+            Common,
+            DrvUser,
+            Option,
+            Int32,
+            UInt32Digital,
+            Float64,
+            Octet,
+            Int8Array,
+            Int16Array,
+            Int32Array,
+            Float32Array,
+            Float64Array,
+            GenericPointer,
+            Enum,
+            Int64,
+            Int64Array,
+            Gpib,
+        ]
+        .into_iter()
+        .filter(move |&iface| Self::of(iface).is_some_and(|bit| self.contains(bit)))
     }
 }
 
@@ -370,20 +242,6 @@ impl std::ops::BitOr for InterfaceMask {
     fn bitor(self, other: Self) -> Self {
         self.or(other)
     }
-}
-
-/// The interface set of a byte-transport port: `asynCommon` + `asynOctet` +
-/// `asynOption`, exactly what drvAsynIPPort / drvAsynSerialPort /
-/// drvAsynFTDIPort register (drvAsynIPPort.c:1091-1109). No register interface,
-/// so a record pointed at one with IFACE=Int32 gets C's "No asynInt32 interface"
-/// rather than a silent cache read. No `asynDrvUser` either — a byte transport
-/// has no parameters to name, so every client stays at reason 0 and asynRecord
-/// refuses a non-blank DRVINFO (asynRecord.c:1258-1266).
-pub fn octet_transport_capabilities() -> Vec<Capability> {
-    InterfaceMask::COMMON
-        .or(InterfaceMask::OPTION)
-        .or(InterfaceMask::OCTET)
-        .capabilities()
 }
 
 #[cfg(test)]
@@ -433,50 +291,16 @@ mod interface_type_tests {
         );
     }
 
-    #[test]
-    fn capability_interface_type() {
-        assert_eq!(Capability::Int32Read.interface_type(), InterfaceType::Int32);
-        assert_eq!(
-            Capability::Float64Write.interface_type(),
-            InterfaceType::Float64
-        );
-        assert_eq!(Capability::Motor.interface_type(), InterfaceType::Motor);
-    }
-
-    #[test]
-    fn capability_read_write() {
-        assert!(Capability::Int32Read.is_read());
-        assert!(!Capability::Int32Read.is_write());
-        assert!(Capability::Int32Write.is_write());
-        assert!(!Capability::Int32Write.is_read());
-    }
-
-    /// The unmigrated set is the one every port declared before masks: the
-    /// scalars, no arrays, no Motor.
-    #[test]
-    fn unmigrated_all_has_scalars() {
-        let caps = InterfaceMask::UNMIGRATED_ALL.capabilities();
-        assert!(caps.contains(&Capability::Int32Read));
-        assert!(caps.contains(&Capability::Float64Write));
-        assert!(caps.contains(&Capability::OctetRead));
-        assert!(!caps.contains(&Capability::Motor));
-        assert!(!caps.contains(&Capability::Int32ArrayRead));
-    }
-
     /// A mask names exactly its interfaces: no asynOption or asynUInt32Digital
     /// unless asked for (asynPortDriver.cpp:4060, :4069).
     #[test]
     fn a_mask_declares_only_its_interfaces() {
-        let caps = (InterfaceMask::COMMON | InterfaceMask::INT32 | InterfaceMask::INT32_ARRAY)
-            .capabilities();
-        let types: std::collections::BTreeSet<_> = caps
-            .iter()
-            .map(|c| c.interface_type().asyn_name())
-            .collect();
-        assert_eq!(
-            types.into_iter().collect::<Vec<_>>(),
-            ["asynCommon", "asynInt32", "asynInt32Array"]
-        );
+        let types: Vec<_> =
+            (InterfaceMask::COMMON | InterfaceMask::INT32 | InterfaceMask::INT32_ARRAY)
+                .interfaces()
+                .map(|t| t.asyn_name())
+                .collect();
+        assert_eq!(types, ["asynCommon", "asynInt32", "asynInt32Array"]);
     }
 
     /// R11-48: only a port that can resolve a drvInfo string declares
@@ -484,15 +308,11 @@ mod interface_type_tests {
     /// what makes asynRecord force REASON=0 there (asynRecord.c:1258-1266).
     #[test]
     fn only_a_parameter_library_port_declares_drv_user() {
-        assert!(
-            InterfaceMask::UNMIGRATED_ALL
-                .capabilities()
-                .contains(&Capability::DrvUser)
+        assert!(!InterfaceMask::OCTET_TRANSPORT.contains(InterfaceMask::DRV_USER));
+        assert_eq!(
+            InterfaceMask::of(InterfaceType::DrvUser),
+            Some(InterfaceMask::DRV_USER)
         );
-        assert!(!octet_transport_capabilities().contains(&Capability::DrvUser));
-        assert_eq!(Capability::DrvUser.interface_type(), InterfaceType::DrvUser);
-        assert!(!Capability::DrvUser.is_read());
-        assert!(!Capability::DrvUser.is_write());
     }
 
     #[test]

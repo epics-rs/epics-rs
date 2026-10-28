@@ -3897,11 +3897,6 @@ mod tests {
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.base
             }
-            fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
-                InterfaceMask::COMMON
-                    .or(InterfaceMask::OCTET)
-                    .capabilities()
-            }
         }
         let mgr = Arc::new(PortManager::new());
         let owner = crate::registry::open_owner();
@@ -3913,7 +3908,13 @@ mod tests {
         mgr.register_port_unclaimed(opt("opt_off"), &owner).unwrap();
         mgr.register_port_unclaimed(
             NoOptPort {
-                base: shell_test_base("opt_none"),
+                base: PortDriverBase::new(
+                    "opt_none",
+                    1,
+                    PortFlags::default(),
+                    InterfaceMask::OCTET,
+                    InterfaceMask::NONE,
+                ),
             },
             &owner,
         )

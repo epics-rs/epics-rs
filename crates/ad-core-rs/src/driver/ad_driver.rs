@@ -493,12 +493,11 @@ mod tests {
             )
             .unwrap(),
         );
-        let mut types: Vec<_> = asyn_rs::port::PortDriver::capabilities(&d)
-            .iter()
-            .map(|c| c.interface_type())
+        let mut types: Vec<_> = asyn_rs::port::PortDriver::base(&d)
+            .interface_mask()
+            .interfaces()
             .collect();
         types.sort_by_key(|t| t.asyn_name());
-        types.dedup();
         assert_eq!(
             types,
             [

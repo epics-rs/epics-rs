@@ -7117,11 +7117,15 @@ mod tests {
     }
     impl TestPort {
         fn new() -> Self {
+            Self::registering(InterfaceMask::INT32 | InterfaceMask::ENUM | InterfaceMask::DRV_USER)
+        }
+
+        fn registering(interfaces: InterfaceMask) -> Self {
             let mut base = PortDriverBase::new(
                 "test",
                 1,
                 PortFlags::default(),
-                InterfaceMask::INT32 | InterfaceMask::ENUM | InterfaceMask::DRV_USER,
+                interfaces,
                 InterfaceMask::NONE,
             );
             base.create_param("VAL", ParamType::Int32).unwrap();
@@ -7256,7 +7260,14 @@ mod tests {
     }
 
     fn make_adapter_on(scan: ScanType, interrupts: Arc<InterruptManager>) -> AsynDeviceSupport {
-        let driver = TestPort::new();
+        make_adapter_for(TestPort::new(), scan, interrupts)
+    }
+
+    fn make_adapter_for(
+        driver: TestPort,
+        scan: ScanType,
+        interrupts: Arc<InterruptManager>,
+    ) -> AsynDeviceSupport {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(driver), rx);
         let actor_link = actor.link();
@@ -9313,18 +9324,17 @@ mod tests {
     /// asynEnum registers nothing.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn enum_registers_without_a_table() {
-        use crate::interfaces::Capability;
         use epics_base_rs::server::records::mbbi::MbbiRecord;
         for (enum_iface, registered) in [(true, true), (false, false)] {
-            let mut ads = make_adapter(ScanType::Passive);
-            if !enum_iface {
-                let caps: Vec<Capability> = InterfaceMask::UNMIGRATED_ALL
-                    .capabilities()
-                    .into_iter()
-                    .filter(|c| c.interface_type() != InterfaceType::Enum)
-                    .collect();
-                ads.handle.set_interfaces(caps);
+            let mut interfaces = InterfaceMask::INT32 | InterfaceMask::DRV_USER;
+            if enum_iface {
+                interfaces = interfaces | InterfaceMask::ENUM;
             }
+            let mut ads = make_adapter_for(
+                TestPort::registering(interfaces),
+                ScanType::Passive,
+                Arc::new(InterruptManager::new()),
+            );
             ads.init(&mut MbbiRecord::new(0)).unwrap();
             assert!(
                 ads.enum_applied.lock().is_none(),
@@ -10739,9 +10749,6 @@ mod tests {
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.0
             }
-            fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
-                crate::interfaces::octet_transport_capabilities()
-            }
             fn read_octet(
                 &mut self,
                 _user: &AsynUser,
@@ -10761,8 +10768,8 @@ mod tests {
                 "r11_48_dev",
                 1,
                 PortFlags::default(),
+                InterfaceMask::OCTET_TRANSPORT,
                 InterfaceMask::OCTET,
-                InterfaceMask::NONE,
             )),
             RuntimeConfig::default(),
         )

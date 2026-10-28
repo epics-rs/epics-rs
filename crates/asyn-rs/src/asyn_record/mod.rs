@@ -3875,9 +3875,8 @@ impl AsynRecord {
                 // asynRecord.c:1177-1240 — and records what it found. A pure-octet
                 // transport therefore reads back i32iv/ui32iv/f64iv = 0, and
                 // `performIO` refuses I/O on an interface the port does not have
-                // (:1328-1360). The port's answer is the driver's own
-                // `capabilities()` declaration, taken at registration — see
-                // `PortHandle::has_interface`.
+                // (:1328-1360). The port's answer is the driver's interface
+                // mask — see `PortHandle::has_interface`.
                 let has = |iface| i32::from(entry.handle.has_interface(iface));
                 self.octetiv = has(crate::interfaces::InterfaceType::Octet);
                 self.i32iv = has(crate::interfaces::InterfaceType::Int32);
@@ -6975,7 +6974,7 @@ mod tests {
                     name,
                     1,
                     PortFlags::default(),
-                    InterfaceMask::INT32 | InterfaceMask::OCTET | InterfaceMask::GPIB,
+                    crate::interfaces::gpib::GPIB_PORT_INTERFACES,
                     InterfaceMask::NONE,
                 ),
                 calls,
@@ -7001,9 +7000,6 @@ mod tests {
         }
         fn base_mut(&mut self) -> &mut PortDriverBase {
             &mut self.base
-        }
-        fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
-            crate::interfaces::gpib::GPIB_PORT_INTERFACES.capabilities()
         }
         fn gpib_universal_cmd(&mut self, _user: &mut AsynUser, cmd: u8) -> AsynResult<()> {
             self.calls.lock().unwrap().universal.push(cmd);
@@ -7155,7 +7151,6 @@ mod tests {
     /// (:821, :825).
     #[test]
     fn a_port_without_asyngpib_refuses_ucmd_and_acmd() {
-        use crate::interfaces::octet_transport_capabilities;
         use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 
         struct OctetTransport(PortDriverBase);
@@ -7166,9 +7161,6 @@ mod tests {
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.0
             }
-            fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
-                octet_transport_capabilities()
-            }
         }
 
         let port_name = "r10_55_no_gpib";
@@ -7177,8 +7169,8 @@ mod tests {
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::OPTION | InterfaceMask::OCTET,
-                InterfaceMask::NONE,
+                InterfaceMask::OCTET_TRANSPORT,
+                InterfaceMask::OCTET,
             )),
             RuntimeConfig::default(),
         )
@@ -9567,15 +9559,13 @@ mod tests {
         let actor_link = actor.link();
         std::thread::spawn(actor.registered());
         let trace = Arc::new(TraceManager::new());
-        let mut handle = PortHandle::new(
+        let handle = PortHandle::new(
             tx,
             port_name.into(),
             Arc::new(InterruptManager::new()),
             actor_link,
             trace.clone(),
         );
-        // echoDriver's interfaces: asynCommon and asynOctet.
-        handle.set_interfaces(crate::interfaces::octet_transport_capabilities());
         register_port(port_name, handle, &crate::registry::open_owner()).unwrap();
         let path = std::env::temp_dir().join(format!("as15-trace-{}", std::process::id()));
         let file = std::fs::File::create(&path).unwrap();
@@ -9620,7 +9610,6 @@ mod tests {
     /// them: ERRS reads "queueRequest failed" and the fields keep their puts.
     #[test]
     fn a_refused_cycle_leaves_the_callbacks_work_undone() {
-        use crate::interfaces::octet_transport_capabilities;
         use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 
         struct OctetTransport(PortDriverBase);
@@ -9631,9 +9620,6 @@ mod tests {
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.0
             }
-            fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
-                octet_transport_capabilities()
-            }
         }
 
         let port_name = "refused_cycle";
@@ -9642,8 +9628,8 @@ mod tests {
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::OPTION | InterfaceMask::OCTET,
-                InterfaceMask::NONE,
+                InterfaceMask::OCTET_TRANSPORT,
+                InterfaceMask::OCTET,
             )),
             RuntimeConfig::default(),
         )
@@ -12101,7 +12087,6 @@ A.TMSK 1
     async fn special_callbacks_post_after_the_put_as_the_oracle_does() {
         // C `callbackInit`: no build arms the bands for a bare database.
         epics_base_rs::runtime::task::background_init();
-        use crate::interfaces::Capability;
         use crate::interpose::eos::EosInterpose;
         use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
@@ -12154,14 +12139,6 @@ A.CNCT Disconnect
             }
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.0
-            }
-            fn capabilities(&self) -> Vec<Capability> {
-                vec![
-                    Capability::OctetRead,
-                    Capability::OctetWrite,
-                    Capability::Flush,
-                    Capability::Connect,
-                ]
             }
         }
 
@@ -12396,7 +12373,6 @@ A.OEOS
     async fn special_readback_runs_in_the_same_port_callback() {
         // C `callbackInit`: no build arms the bands for a bare database.
         epics_base_rs::runtime::task::background_init();
-        use crate::interfaces::Capability;
         use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
@@ -12416,9 +12392,6 @@ A.OEOS
             }
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.base
-            }
-            fn capabilities(&self) -> Vec<Capability> {
-                vec![Capability::OctetRead, Capability::OctetWrite]
             }
             fn set_input_eos(&mut self, _user: &AsynUser, eos: &[u8]) -> AsynResult<()> {
                 if eos == b"\r" {
@@ -12817,9 +12790,6 @@ A.OEOS
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.0
             }
-            fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
-                crate::interfaces::octet_transport_capabilities()
-            }
         }
 
         let port_name = "test_errs_post_order";
@@ -12827,8 +12797,8 @@ A.OEOS
             port_name,
             1,
             PortFlags::default(),
-            InterfaceMask::OPTION,
-            InterfaceMask::NONE,
+            InterfaceMask::OCTET_TRANSPORT,
+            InterfaceMask::OCTET,
         );
         base.init_connected(false);
         base.init_auto_connect(false);
@@ -12978,9 +12948,6 @@ A.OEOS
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.0
             }
-            fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
-                crate::interfaces::octet_transport_capabilities()
-            }
             fn get_option(
                 &self,
                 _user: &crate::user::AsynUser,
@@ -13001,8 +12968,8 @@ A.OEOS
             port_name,
             1,
             PortFlags::default(),
-            InterfaceMask::OPTION | InterfaceMask::OCTET,
-            InterfaceMask::NONE,
+            InterfaceMask::OCTET_TRANSPORT,
+            InterfaceMask::OCTET,
         );
         // See `connect_device_reads_the_eos_back_from_the_driver`: an EOS is
         // only settable on a port carrying C's `asynInterposeEos` (R18-71).
@@ -13802,7 +13769,6 @@ A.OEOS
     /// support instead of being refused.
     #[test]
     fn connect_device_reads_the_ports_interface_registry() {
-        use crate::interfaces::octet_transport_capabilities;
         use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
@@ -13817,9 +13783,6 @@ A.OEOS
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.0
             }
-            fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
-                octet_transport_capabilities()
-            }
         }
 
         let port_name = "r9_53_octet_transport";
@@ -13828,8 +13791,8 @@ A.OEOS
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::OPTION | InterfaceMask::OCTET,
-                InterfaceMask::NONE,
+                InterfaceMask::OCTET_TRANSPORT,
+                InterfaceMask::OCTET,
             )),
             RuntimeConfig::default(),
         )
@@ -13885,7 +13848,6 @@ A.OEOS
     /// the driver and the negotiation used a private 2 s.
     #[test]
     fn an_option_put_reaches_the_driver_with_the_records_tmot() {
-        use crate::interfaces::{Capability, octet_transport_capabilities};
         use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
@@ -13901,9 +13863,6 @@ A.OEOS
             }
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.0
-            }
-            fn capabilities(&self) -> Vec<Capability> {
-                octet_transport_capabilities()
             }
             fn set_option(
                 &mut self,
@@ -13922,8 +13881,8 @@ A.OEOS
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::OPTION | InterfaceMask::OCTET,
-                InterfaceMask::NONE,
+                InterfaceMask::OCTET_TRANSPORT,
+                InterfaceMask::OCTET,
             )),
             RuntimeConfig::default(),
         )
@@ -13957,7 +13916,6 @@ A.OEOS
     /// the driver.
     #[test]
     fn option_and_eos_are_refused_on_a_port_that_lacks_the_interface() {
-        use crate::interfaces::Capability;
         use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
@@ -13971,9 +13929,6 @@ A.OEOS
             }
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.0
-            }
-            fn capabilities(&self) -> Vec<Capability> {
-                vec![Capability::OctetRead, Capability::OctetWrite]
             }
         }
 
@@ -14255,9 +14210,6 @@ A.OEOS
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.0
             }
-            fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
-                crate::interfaces::octet_transport_capabilities()
-            }
         }
 
         let (rt, jh) = create_port_runtime_unclaimed(
@@ -14265,8 +14217,8 @@ A.OEOS
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::OPTION | InterfaceMask::OCTET,
-                InterfaceMask::NONE,
+                InterfaceMask::OCTET_TRANSPORT,
+                InterfaceMask::OCTET,
             )),
             RuntimeConfig::default(),
         )
@@ -14392,9 +14344,6 @@ A.OEOS
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.0
             }
-            fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
-                crate::interfaces::octet_transport_capabilities()
-            }
         }
 
         for (port_name, connected) in [("w10_d3_eos_up", true), ("w10_d3_eos_down", false)] {
@@ -14402,8 +14351,8 @@ A.OEOS
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::OPTION | InterfaceMask::OCTET,
-                InterfaceMask::NONE,
+                InterfaceMask::OCTET_TRANSPORT,
+                InterfaceMask::OCTET,
             );
             base.init_auto_connect(false);
             base.init_connected(connected);
@@ -14513,7 +14462,6 @@ A.OEOS
     /// blank buffers over the fields (:1997-1998, :2016-2024).
     #[test]
     fn an_eos_put_without_asyn_octet_reads_back_blank() {
-        use crate::interfaces::Capability;
         use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
@@ -14525,9 +14473,6 @@ A.OEOS
             }
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.0
-            }
-            fn capabilities(&self) -> Vec<Capability> {
-                vec![Capability::Int32Read, Capability::Int32Write]
             }
         }
         let port_name = "as10_no_octet";
@@ -15314,7 +15259,6 @@ A.OEOS
     /// which leaves the record off the scan list (asynRecord.c:625-628).
     #[test]
     fn arming_io_intr_against_a_port_without_the_iface_reports_the_c_text() {
-        use crate::interfaces::octet_transport_capabilities;
         use crate::param::ParamValue;
         use crate::port::PortFlags;
         use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
@@ -15327,9 +15271,6 @@ A.OEOS
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.0
             }
-            fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
-                octet_transport_capabilities()
-            }
         }
 
         let port_name = "r11_46_no_int32";
@@ -15338,8 +15279,8 @@ A.OEOS
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::OPTION | InterfaceMask::OCTET,
-                InterfaceMask::NONE,
+                InterfaceMask::OCTET_TRANSPORT,
+                InterfaceMask::OCTET,
             )),
             RuntimeConfig::default(),
         )

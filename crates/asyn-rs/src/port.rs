@@ -3308,12 +3308,9 @@ pub trait PortDriver: Any + Send + Sync {
 
     /// Whether this driver registered `asynOctet` — C's
     /// `pasynStdInterfaces->octet.pinterface != NULL`, which is set from the
-    /// constructor's `interfaceMask` (asynPortDriver.cpp:4062). The Rust analogue
-    /// of that mask is [`Self::capabilities`].
+    /// constructor's `interfaceMask` (asynPortDriver.cpp:4062).
     fn has_octet_interface(&self) -> bool {
-        self.capabilities()
-            .iter()
-            .any(|c| c.interface_type() == crate::interfaces::InterfaceType::Octet)
+        self.base().interface_mask().contains(InterfaceMask::OCTET)
     }
 
     // --- Scalar I/O (cache-based defaults, timeout not applicable) ---
@@ -3761,7 +3758,7 @@ pub trait PortDriver: Any + Send + Sync {
     // The four command methods of C's `asynGpib` interface (asynGpibDriver.h:47-51),
     // which asynGpib.c passes straight through to the driver's `asynGpibPort`
     // (asynGpib.c:472-496). A driver that implements them declares
-    // [`crate::interfaces::Capability::Gpib`], and that declaration is what a
+    // [`crate::interfaces::InterfaceMask::GPIB`], and that declaration is what a
     // client's `findInterface(asynGpibType)` answers — asynRecord reads it into
     // GPIBIV and refuses UCMD/ACMD when it is 0 (asynRecord.c:1232-1241,
     // :1647-1651).
@@ -3840,19 +3837,6 @@ pub trait PortDriver: Any + Send + Sync {
     /// Default: [`PortDriverBase::drv_user_create`].
     fn drv_user_create(&mut self, req: &DrvUserRequest) -> AsynResult<DrvUserInfo> {
         self.base().drv_user_create(req)
-    }
-
-    // --- Capabilities ---
-
-    /// Declare the capabilities this driver supports. Default: those of the
-    /// interfaces in [`PortDriverBase::interface_mask`].
-    fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
-        self.base().interface_mask().capabilities()
-    }
-
-    /// Check if this driver supports a specific capability.
-    fn supports(&self, cap: crate::interfaces::Capability) -> bool {
-        self.capabilities().contains(&cap)
     }
 
     fn init(&mut self) -> AsynResult<()> {
@@ -6893,17 +6877,14 @@ pub(crate) mod tests {
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.base
             }
-            fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
-                crate::interfaces::octet_transport_capabilities()
-            }
         }
 
         let mut base = PortDriverBase::new(
             "eos_rep",
             1,
             PortFlags::default(),
-            InterfaceMask::NONE,
-            InterfaceMask::NONE,
+            InterfaceMask::OCTET_TRANSPORT,
+            InterfaceMask::OCTET,
         );
         // See `a_single_device_port_collapses_every_addr_onto_one_eos`: the
         // EOS layer is what makes a terminator settable at all (R18-71).

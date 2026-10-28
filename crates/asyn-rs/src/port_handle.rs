@@ -25,7 +25,7 @@ use tokio::runtime::RuntimeFlavor;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{AsynError, AsynResult, AsynStatus};
-use crate::interfaces::{Capability, InterfaceType};
+use crate::interfaces::{InterfaceMask, InterfaceType};
 use crate::interrupt::InterruptManager;
 use crate::port::QueueGate;
 use crate::port::{DrvUserInfo, DrvUserRequest, PortDriver};
@@ -383,15 +383,14 @@ pub struct PortHandle {
     multi_device: bool,
     max_addr: i32,
     get_address: crate::port::GetAddress,
-    /// The port's interface registry — the driver's own
-    /// [`crate::port::PortDriver::capabilities`] declaration, recorded when the
-    /// port is registered. C's asynManager keeps the same thing as the list of
+    /// The port's interface registry — the driver's
+    /// [`crate::port::PortDriverBase::interface_mask`], taken from the actor's
+    /// link. C's asynManager keeps the same thing as the list of
     /// `registerInterface` calls the driver made, and clients ask for it with
     /// `findInterface` (asynManager.c:1470-1514); asynRecord uses it to fill
     /// OCTETIV / I32IV / UI32IV / F64IV / OPTIONIV / GPIBIV
-    /// (asynRecord.c:1177-1240). Registration-time, not a runtime query: a
-    /// driver cannot gain or lose an interface after `registerInterface`.
-    interfaces: Arc<[Capability]>,
+    /// (asynRecord.c:1177-1240).
+    interfaces: InterfaceMask,
     /// The trace manager the port's driver was bound to
     /// (`PortServices::bind` at `create_port_runtime`) — C's per-port
     /// `tracePvt`, reached through the port. The registry publishes this one
@@ -423,7 +422,7 @@ pub struct WeakPortHandle {
     multi_device: bool,
     max_addr: i32,
     get_address: crate::port::GetAddress,
-    interfaces: Arc<[Capability]>,
+    interfaces: InterfaceMask,
     trace: Arc<TraceManager>,
     sync_lock: crate::port_actor::SyncLock,
     input_eos: crate::port_actor::InputEos,
@@ -454,7 +453,7 @@ impl WeakPortHandle {
             multi_device: self.multi_device,
             max_addr: self.max_addr,
             get_address: self.get_address,
-            interfaces: self.interfaces.clone(),
+            interfaces: self.interfaces,
             trace: self.trace.clone(),
             sync_lock: self.sync_lock.clone(),
             input_eos: self.input_eos.clone(),
@@ -500,9 +499,7 @@ impl PortHandle {
             multi_device: false,
             max_addr: 1,
             get_address: crate::port::port_get_address,
-            interfaces: crate::interfaces::InterfaceMask::UNMIGRATED_ALL
-                .capabilities()
-                .into(),
+            interfaces: actor.interfaces,
             trace,
             sync_lock: actor.sync_lock,
             input_eos: actor.input_eos,
@@ -525,7 +522,7 @@ impl PortHandle {
             multi_device: self.multi_device,
             max_addr: self.max_addr,
             get_address: self.get_address,
-            interfaces: self.interfaces.clone(),
+            interfaces: self.interfaces,
             trace: self.trace.clone(),
             sync_lock: self.sync_lock.clone(),
             input_eos: self.input_eos.clone(),
@@ -549,19 +546,10 @@ impl PortHandle {
         }
     }
 
-    /// Record the driver's declared interface set — see `Self::interfaces`.
-    /// Called by the runtime layer at handle construction, from the driver's own
-    /// [`crate::port::PortDriver::capabilities`].
-    pub fn set_interfaces(&mut self, interfaces: Vec<Capability>) {
-        self.interfaces = interfaces.into();
-    }
-
     /// Does the port implement this interface? The port's `findInterface`
     /// (asynManager.c:1470-1514).
     pub fn has_interface(&self, iface: InterfaceType) -> bool {
-        self.interfaces
-            .iter()
-            .any(|cap| cap.interface_type() == iface)
+        InterfaceMask::of(iface).is_some_and(|bit| self.interfaces.contains(bit))
     }
 
     /// Set whether this port can perform blocking I/O.
@@ -2368,10 +2356,7 @@ mod tests {
                 "handle_test",
                 1,
                 PortFlags::default(),
-                InterfaceMask::INT32
-                    | InterfaceMask::FLOAT64
-                    | InterfaceMask::OCTET
-                    | InterfaceMask::GPIB,
+                InterfaceMask::INT32 | InterfaceMask::FLOAT64 | InterfaceMask::OCTET,
                 InterfaceMask::NONE,
             );
             base.create_param("VAL", ParamType::Int32).unwrap();
@@ -4577,13 +4562,6 @@ mod tests {
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.0
             }
-            fn capabilities(&self) -> Vec<Capability> {
-                vec![
-                    Capability::Gpib,
-                    Capability::OctetRead,
-                    Capability::OctetWrite,
-                ]
-            }
             fn gpib_universal_cmd(&mut self, user: &mut AsynUser, cmd: u8) -> AsynResult<()> {
                 CALLS
                     .lock()
@@ -4606,14 +4584,13 @@ mod tests {
         }
 
         // A GPIB link is multi-device; a single-device port hands -1 (getAddr).
-        let mut handle = make_handle(GpibDrv(PortDriverBase::new(
+        let handle = make_handle(GpibDrv(PortDriverBase::new(
             "gpib_vtable",
             32,
             PortFlags::default(),
-            InterfaceMask::GPIB,
+            InterfaceMask::GPIB | InterfaceMask::OCTET,
             InterfaceMask::NONE,
         )));
-        handle.set_interfaces(vec![Capability::Gpib]);
         assert!(handle.has_interface(InterfaceType::Gpib), "findInterface");
 
         handle

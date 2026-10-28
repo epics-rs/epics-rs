@@ -1016,9 +1016,6 @@ mod tests {
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.0
             }
-            fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
-                crate::interfaces::octet_transport_capabilities()
-            }
         }
 
         let (rt, _jh) = create_port_runtime_unclaimed(
@@ -1026,8 +1023,8 @@ mod tests {
                 "syncnodrvuser",
                 1,
                 PortFlags::default(),
-                InterfaceMask::NONE,
-                InterfaceMask::NONE,
+                InterfaceMask::OCTET_TRANSPORT,
+                InterfaceMask::OCTET,
             )),
             RuntimeConfig::default(),
         )
@@ -1180,9 +1177,9 @@ mod tests {
         assert_eq!(live.read_int32(0).unwrap(), 7);
     }
 
-    /// A published port declaring exactly `caps`.
-    fn port_with(name: &str, caps: Vec<crate::interfaces::Capability>) {
-        struct Declared(PortDriverBase, Vec<crate::interfaces::Capability>);
+    /// A published port registering exactly `interfaces`.
+    fn port_with(name: &str, interfaces: InterfaceMask) {
+        struct Declared(PortDriverBase);
         impl PortDriver for Declared {
             fn base(&self) -> &PortDriverBase {
                 &self.0
@@ -1190,20 +1187,17 @@ mod tests {
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.0
             }
-            fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
-                self.1.clone()
-            }
         }
         let mut base = PortDriverBase::new(
             name,
             1,
             PortFlags::default(),
-            InterfaceMask::OCTET,
+            interfaces,
             InterfaceMask::NONE,
         );
         base.create_param("V", ParamType::Int32).unwrap();
         PortManager::new()
-            .register_port_unclaimed(Declared(base, caps), &crate::registry::open_owner())
+            .register_port_unclaimed(Declared(base), &crate::registry::open_owner())
             .unwrap();
     }
 
@@ -1217,29 +1211,10 @@ mod tests {
         }
     }
 
-    /// asynOctetSyncIO.c:124-130: a port without asynCommon refuses the
-    /// connect, and the user it hands back transfers nothing.
-    #[test]
-    fn an_octet_connect_to_a_port_without_asyn_common_is_refused() {
-        use crate::interfaces::Capability::*;
-        port_with("sync_no_common", vec![OctetRead, OctetWrite]);
-        let (sio, status) = SyncIOHandle::connect_port(
-            "sync_no_common",
-            0,
-            Duration::from_secs(1),
-            InterfaceType::Octet,
-        );
-        let refused = "asynCommon interface not supported";
-        assert_eq!(refusal(status.unwrap_err()), refused);
-        assert_eq!(refusal(sio.write_octet(0, b"x").unwrap_err()), refused);
-        assert_eq!(refusal(sio.port().err().unwrap()), refused);
-    }
-
     /// asynOctetSyncIO.c:131-137: asynCommon present, asynOctet missing.
     #[test]
     fn an_octet_connect_to_a_port_without_asyn_octet_is_refused() {
-        use crate::interfaces::Capability::*;
-        port_with("sync_no_octet", vec![Int32Read, Int32Write, Connect]);
+        port_with("sync_no_octet", InterfaceMask::INT32);
         let (sio, status) = SyncIOHandle::connect_port(
             "sync_no_octet",
             0,
@@ -1254,22 +1229,10 @@ mod tests {
         );
     }
 
-    /// asynCommonSyncIO.c:76-80 checks asynCommon alone, in its own words.
+    /// asynCommonSyncIO.c:76-80 checks asynCommon alone.
     #[test]
     fn a_common_connect_needs_only_asyn_common() {
-        use crate::interfaces::Capability::*;
-        port_with("sync_common_absent", vec![OctetRead, OctetWrite]);
-        let (_, status) = SyncIOHandle::connect_port(
-            "sync_common_absent",
-            0,
-            Duration::from_secs(1),
-            InterfaceType::Common,
-        );
-        assert_eq!(
-            refusal(status.unwrap_err()),
-            "interface asynCommon is not supported by port"
-        );
-        port_with("sync_common_only", vec![Connect]);
+        port_with("sync_common_only", InterfaceMask::NONE);
         let (_, status) = SyncIOHandle::connect_port(
             "sync_common_only",
             0,
@@ -1283,10 +1246,7 @@ mod tests {
     /// asynInt32SyncIO.c, asynFloat64SyncIO.c, asynUInt32DigitalSyncIO.c.
     #[test]
     fn each_syncio_refuses_its_missing_interface_in_its_own_words() {
-        port_with(
-            "sync_transport_only",
-            crate::interfaces::octet_transport_capabilities(),
-        );
+        port_with("sync_transport_only", InterfaceMask::OCTET_TRANSPORT);
         for (iface, refused) in [
             (
                 InterfaceType::Int32,

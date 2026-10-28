@@ -19,7 +19,7 @@ use epics_libcom_rs::runtime::task::block_on_thread_loop;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{AsynError, AsynResult, AsynStatus};
-use crate::interfaces::InterfaceType;
+use crate::interfaces::{InterfaceMask, InterfaceType};
 use crate::interpose::EomReason;
 use crate::interrupt::InterruptValue;
 use crate::param::ParamValue;
@@ -212,11 +212,13 @@ impl InputEos {
 }
 
 /// What a [`crate::port_handle::PortHandle`] takes from the actor behind its
-/// channel: the actor's identity, for the re-entrancy guard, and the port's
-/// [`QueueGate`], for C `queueRequest`'s refusals on the queueing thread.
+/// channel: the actor's identity, for the re-entrancy guard, the port's
+/// [`QueueGate`], for C `queueRequest`'s refusals on the queueing thread, and
+/// the interfaces its driver registered.
 #[derive(Clone)]
 pub(crate) struct ActorLink {
     pub(crate) id: ActorId,
+    pub(crate) interfaces: InterfaceMask,
     /// The queue the actor drains [`RequestCell`]s from.
     pub(crate) cells: Arc<CellQueue>,
     pub(crate) gate: QueueGate,
@@ -228,13 +230,15 @@ pub(crate) struct ActorLink {
 
 impl ActorLink {
     /// A link for a handle whose channel has no actor behind it (a test
-    /// fixture): a fresh id no thread publishes, and an open gate.
+    /// fixture): a fresh id no thread publishes, an open gate, and no driver
+    /// whose interfaces it could carry.
     #[cfg(test)]
     pub(crate) fn unowned() -> Self {
         let cells = Arc::new(CellQueue::default());
         cells.close();
         Self {
             id: ActorId::new(),
+            interfaces: InterfaceMask::NONE,
             cells,
             gate: QueueGate::open(),
             devices: crate::port::DeviceTable::detached(),
@@ -1374,6 +1378,7 @@ impl PortActor {
     pub(crate) fn link(&self) -> ActorLink {
         ActorLink {
             id: self.id,
+            interfaces: self.driver.base().interface_mask(),
             cells: Arc::clone(&self.cells),
             gate: self.driver.base().queue_gate(),
             devices: self.driver.base().device_table(),
@@ -1883,14 +1888,12 @@ impl PortActor {
                     let _ = writeln!(out, "        asynOctet");
                 }
             }
-            let mut ifaces: Vec<&'static str> = self
-                .driver
-                .capabilities()
-                .iter()
-                .map(|c| c.interface_type().asyn_name())
+            let mut ifaces: Vec<&'static str> = base
+                .interface_mask()
+                .interfaces()
+                .map(|t| t.asyn_name())
                 .collect();
             ifaces.sort_unstable();
-            ifaces.dedup();
             if !ifaces.is_empty() {
                 let _ = writeln!(out, "    interfaceList");
                 for name in ifaces {
@@ -6888,9 +6891,6 @@ mod tests {
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.0
             }
-            fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
-                crate::interfaces::octet_transport_capabilities()
-            }
         }
 
         let build = || {
@@ -6902,8 +6902,8 @@ mod tests {
                     can_block: true,
                     ..PortFlags::default()
                 },
-                InterfaceMask::NONE,
-                InterfaceMask::NONE,
+                InterfaceMask::OCTET_TRANSPORT,
+                InterfaceMask::OCTET,
             );
             base.init_auto_connect(true);
             base.init_connected(false);
@@ -7166,10 +7166,10 @@ mod tests {
     /// interrupt clients (:3695-3708).
     #[test]
     fn the_default_driver_block_is_asyn_port_drivers() {
-        use crate::interfaces::{Capability, InterfaceType};
+        use crate::interfaces::InterfaceType;
         use crate::interrupt::InterruptFilter;
 
-        struct Drv(PortDriverBase, Vec<Capability>);
+        struct Drv(PortDriverBase);
         impl PortDriver for Drv {
             fn base(&self) -> &PortDriverBase {
                 &self.0
@@ -7177,29 +7177,26 @@ mod tests {
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.0
             }
-            fn capabilities(&self) -> Vec<Capability> {
-                self.1.clone()
-            }
         }
 
-        let build = |caps: Vec<Capability>| {
+        let build = |interfaces: InterfaceMask| {
             let mut base = PortDriverBase::new(
                 "drv_rep",
                 1,
                 PortFlags::default(),
-                InterfaceMask::NONE,
+                interfaces,
                 InterfaceMask::INT32,
             );
             base.create_param("VAL", ParamType::Int32).unwrap();
             base.install_octet_interpose(Box::new(crate::interpose::eos::EosInterpose::default()));
-            let mut drv = Drv(base, caps);
+            let mut drv = Drv(base);
             drv.set_input_eos(&AsynUser::default(), b"\r\n").unwrap();
             drv
         };
 
         // No octet interface → no EOS lines. C reads them off
         // `pasynStdInterfaces->octet.pinterface`, which such a port never set.
-        let mut int32_only = build(vec![Capability::Int32Read]);
+        let mut int32_only = build(InterfaceMask::INT32);
         let mut out = String::new();
         int32_only.report(&mut out, 1);
         assert!(out.starts_with("Port: drv_rep\n"), "{out}");
@@ -7235,7 +7232,7 @@ mod tests {
         assert_eq!(out0, "Port: drv_rep\n");
 
         // An octet port reports the terminators it actually has.
-        let mut octet = build(crate::interfaces::octet_transport_capabilities());
+        let mut octet = build(InterfaceMask::OCTET_TRANSPORT);
         let mut out = String::new();
         octet.report(&mut out, 1);
         assert!(
@@ -7244,7 +7241,7 @@ mod tests {
         );
 
         // details >= 3: one line per interrupt client, and none below 3.
-        let mut with_client = build(vec![Capability::Int32Read]);
+        let mut with_client = build(InterfaceMask::INT32);
         let (_sub, _rx) = with_client
             .0
             .interrupts

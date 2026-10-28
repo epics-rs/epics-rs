@@ -306,10 +306,6 @@ pub fn create_port_runtime_boxed(
     let multi_device = driver.base().flags.multi_device;
     let max_addr = driver.base().max_addr as i32;
     let get_address = driver.base().get_address_rule();
-    // The driver's interface declaration, taken once here — C's port
-    // registration is where `registerInterface` is called too, and the set never
-    // changes afterwards (asynManager.c:2104-2140).
-    let interfaces = driver.capabilities();
     let runtime_hooks = std::mem::take(&mut driver.base_mut().runtime_hooks);
 
     // Event broadcast
@@ -400,7 +396,6 @@ pub fn create_port_runtime_boxed(
     port_handle.set_can_block(can_block);
     port_handle.set_callback_thread(callback_thread);
     port_handle.set_capabilities(multi_device, max_addr, get_address);
-    port_handle.set_interfaces(interfaces);
     for hook in runtime_hooks {
         hook(&port_handle);
     }

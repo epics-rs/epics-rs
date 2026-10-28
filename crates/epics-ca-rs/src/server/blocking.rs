@@ -96,9 +96,12 @@
 //! (`EventTaskControl::WriteComplete`); the event thread awaits it in its
 //! `select` and writes the deferred WRITE_NOTIFY reply under the SAME send lock,
 //! so the dispatch thread stays responsive and there is ONE owner of async
-//! socket writes. The one thing that does park the dispatch thread is the
-//! channel-level wait below, which is C parking the client's receive thread on
-//! `blockSem` — and it is the event thread's reply that releases it. A plain fire-and-forget WRITE is always synchronous (no reply).
+//! socket writes. The one thing that does park the dispatch thread is a
+//! postponed request, waited out in `rerun_after` with the client lock let go
+//! — among them the channel-level wait below, which is C parking the client's
+//! receive thread on `blockSem`. The event thread's reply releases it, and
+//! that thread takes the client lock to retire a destroyed channel, so no
+//! wait is ever taken under it. A plain fire-and-forget WRITE is always synchronous (no reply).
 //! `command_drives_without_spawn` stays a *fail-closed* allowlist for
 //! everything not handled by a dedicated branch.
 //!
@@ -143,7 +146,6 @@ use epics_base_rs::runtime::task::{
 };
 use epics_base_rs::runtime::worker_pool::{AcquireError, Worker, WorkerPool, WorkerRole};
 use epics_base_rs::server::database::PvDatabase;
-use epics_base_rs::server::pv::IoBlocked;
 use tokio::sync::mpsc;
 
 use crate::protocol::{
@@ -157,11 +159,12 @@ use crate::server::outbox::{self, OutboxDrain};
 use crate::server::recv::{Admit, Gate, RecvAccumulator};
 use crate::server::stats::ServerStats;
 use crate::server::tcp::{
-    CancelInfo, ChannelTarget, ClientState, Dispatched, EventTaskControl, MonitorDelivery,
-    RegisteredSubscription, SubscriptionDelivery, SubscriptionOutcome, WriteHeadOutcome,
-    cancel_subscription_reply, dispatch_message, is_peer_disconnect, log_circuit,
-    print_forcing_disconnect, refuse_bad_tcp_command, register_subscription, report_gate_error,
-    retire_destroyed_channels, run_event_task, serve_write_head,
+    AdmittedPut, Blocked, CancelInfo, ChannelTarget, ClientDestroys, ClientState, Dispatched,
+    EventTaskControl, LockedClient, MonitorDelivery, RegisteredSubscription, SubscriptionDelivery,
+    SubscriptionOutcome, WriteHeadOutcome, cancel_subscription_reply, dispatch_message,
+    is_peer_disconnect, log_circuit, print_forcing_disconnect, refuse_bad_tcp_command,
+    register_subscription, report_gate_error, resume_dispatch, resume_write, run_event_task,
+    serve_write_head,
 };
 use crate::server::udp::{self, SearchReplyBatch};
 
@@ -1323,21 +1326,21 @@ pub(crate) fn hand_off_subscription(
     let _ = ev_tx.send(EventTaskControl::Add(Box::new(MonitorDelivery {
         reader: r.reader,
         target: r.target,
-        cid: r.cid,
     })));
 }
 
 /// Finish the monitors a channel retirement in the shared handlers cancelled
 /// (`ClientState::take_retired_subscriptions`): their gates are revoked, but
-/// the producers are this driver's.
+/// the producers are this driver's. `cancel` drops each reader from the event
+/// thread.
 fn finish_retired_subscriptions(
     state: &mut ClientState,
     blk_subs: &mut HashMap<epics_base_rs::server::event_queue::AttachId, BlockingSub>,
-    ev_tx: &mpsc::UnboundedSender<EventTaskControl>,
+    mut cancel: impl FnMut(epics_base_rs::server::event_queue::AttachId),
 ) {
     for id in state.take_retired_subscriptions() {
         if let Some(sub) = blk_subs.remove(&id) {
-            let _ = ev_tx.send(EventTaskControl::Cancel(id));
+            cancel(id);
             match &sub.target {
                 ChannelTarget::SimplePv(pv) => {
                     pv.remove_subscriber(id);
@@ -1350,31 +1353,71 @@ fn finish_retired_subscriptions(
     }
 }
 
-/// Before a postponed request runs again, retire the channels a destroy left
-/// behind, as the async server's postponed arm does: a destroy signals the
-/// postponing PV before anything retires them. Returns once the event thread
-/// has staged each `CA_PROTO_SERVER_DISCONN` behind the writes it owes that
-/// channel, so the re-run's reply follows them.
-fn retire_destroyed_before_rerun(
-    state: &mut ClientState,
-    blk_subs: &mut HashMap<epics_base_rs::server::event_queue::AttachId, BlockingSub>,
+/// One client's channel table and what changes with it, under the lock pcas
+/// calls `casClientMutex`: the dispatch thread holds it for each batch of
+/// requests (`casStrmClient.cc:117`), the event thread to retire what a
+/// destroy left (`eventSysProcess`, `casCoreClient.h:173-177`).
+struct BlockingClient {
+    state: ClientState,
+    /// The blocking driver's own subscription registry (see [`BlockingSub`]).
+    /// Keyed by slot, never sub_id, which a client may install twice.
+    subs: HashMap<epics_base_rs::server::event_queue::AttachId, BlockingSub>,
+    /// The dispatch thread's queued replies. A retirement drains them first,
+    /// so they keep their place ahead of its `CA_PROTO_SERVER_DISCONN`: pcas
+    /// has one `out` buffer.
+    drain: OutboxDrain,
+    /// The circuit's send buffer, which `drain` writes to.
+    send_lock: Arc<Mutex<SendBuf>>,
+}
+
+/// Take the client lock from a thread with no runtime.
+fn lock_client(
+    client: &tokio::sync::Mutex<BlockingClient>,
+) -> CaResult<tokio::sync::MutexGuard<'_, BlockingClient>> {
+    block_on_sync(client.lock()).map_err(|_| {
+        CaError::Protocol(
+            "blocking CA driver: client lock not blockable in this thread context".into(),
+        )
+    })
+}
+
+/// Wait out a postponed request with the client lock let go, as pcas lets
+/// `casClientMutex` go when `processMsg` returns with the request held, then
+/// have the event thread retire what a destroy left before the request runs
+/// again: a destroy signals the postponing PV before its wake-up reaches the
+/// event thread. Returns the lock taken again, and the admitted put to resume
+/// ([`Blocked::into_resume`]); `None` runs the request again from the top.
+fn resume_after<'a>(
+    guard: tokio::sync::MutexGuard<'a, BlockingClient>,
+    client: &'a tokio::sync::Mutex<BlockingClient>,
+    mut blocked: Blocked,
     ev_tx: &mpsc::UnboundedSender<EventTaskControl>,
-    peer: SocketAddr,
-) {
-    // Not blockable here, the re-run refuses the same.
-    let Ok(cids) = block_on_sync(retire_destroyed_channels(state, peer, None)) else {
-        return;
-    };
-    if cids.is_empty() {
-        return;
+) -> CaResult<(
+    tokio::sync::MutexGuard<'a, BlockingClient>,
+    Option<AdmittedPut>,
+)> {
+    drop(guard);
+    // Not blockable here, the resumed request refuses the same.
+    let _ = block_on_sync(blocked.signalled());
+    let (ack, swept) = tokio::sync::oneshot::channel();
+    if ev_tx.send(EventTaskControl::Sweep(ack)).is_ok() {
+        let _ = block_on_sync(swept);
     }
-    finish_retired_subscriptions(state, blk_subs, ev_tx);
-    for cid in cids {
-        let _ = ev_tx.send(EventTaskControl::Retire(cid));
+    Ok((lock_client(client)?, blocked.into_resume()))
+}
+
+impl LockedClient for BlockingClient {
+    fn state(&mut self) -> &mut ClientState {
+        &mut self.state
     }
-    let (ack, staged) = tokio::sync::oneshot::channel();
-    if ev_tx.send(EventTaskControl::Staged(ack)).is_ok() {
-        let _ = block_on_sync(staged);
+
+    fn channels_retired(&mut self) -> bool {
+        if drain_outbox_locked(&self.send_lock, &mut self.drain).is_err() {
+            return false;
+        }
+        // The destroy ended their readers on the event thread.
+        finish_retired_subscriptions(&mut self.state, &mut self.subs, |_| {});
+        true
     }
 }
 
@@ -1494,7 +1537,7 @@ fn handle_client_blocking(
     let mut reader: &TcpStream = &stream;
     let send_lock = Arc::new(Mutex::new(SendBuf::new(stream.clone())));
 
-    let (outbox, mut drain) = outbox::channel();
+    let (outbox, drain) = outbox::channel();
     let mut state = ClientState::new(acf, tcp_port, db.clone());
     state.apply_connection_identity(peer, None, None);
 
@@ -1529,6 +1572,18 @@ fn handle_client_blocking(
     let event_send_lock = send_lock.clone();
     let event_user = state.event_user();
     let event_minor = state.circuit_minor();
+    let client = Arc::new(tokio::sync::Mutex::new(BlockingClient {
+        state,
+        subs: HashMap::new(),
+        drain,
+        send_lock: send_lock.clone(),
+    }));
+    // Subscribed before any channel exists, so no destroy goes unseen.
+    let destroys = ClientDestroys {
+        client: client.clone(),
+        wake: db.pv_destroyed_events(),
+        peer,
+    };
     let event_job = event_worker.run(move || {
         // C `event_task` registers itself (`dbEvent.c:1027`) and removes on the
         // way out (`:1093`). Unbounded: it parks on this client's monitor
@@ -1539,7 +1594,15 @@ fn handle_client_blocking(
             None,
         );
         let sink = EventSendBuf(event_send_lock);
-        if block_on_sync(run_event_task(event_user, ev_rx, sink, event_minor)).is_err() {
+        if block_on_sync(run_event_task(
+            event_user,
+            ev_rx,
+            destroys,
+            sink,
+            event_minor,
+        ))
+        .is_err()
+        {
             tracing::error!(
                 target: "epics_ca_rs::server::blocking",
                 %peer,
@@ -1547,11 +1610,6 @@ fn handle_client_blocking(
             );
         }
     });
-
-    // The blocking driver's own subscription registry (see [`BlockingSub`]).
-    // Keyed by slot, never sub_id, which a client may install twice.
-    let mut blk_subs: HashMap<epics_base_rs::server::event_queue::AttachId, BlockingSub> =
-        HashMap::new();
 
     // Run the read/dispatch loop in a closure so the producer teardown + event-
     // thread join below runs on EVERY exit path (EOF, peer-disconnect, idle,
@@ -1571,11 +1629,14 @@ fn handle_client_blocking(
             // next iteration (the client is then idle, so FIONREAD == 0), while a
             // pipelined burst coalesces into one write.
             match blocking_io::pending_bytes(reader) {
-                Ok(0) | Err(_) => match drain_outbox_locked(&send_lock, &mut drain) {
-                    Ok(()) => {}
-                    Err(ref e) if is_peer_disconnect(e.kind()) => break,
-                    Err(e) => return Err(CaError::Io(e)),
-                },
+                Ok(0) | Err(_) => {
+                    let drained = drain_outbox_locked(&send_lock, &mut lock_client(&client)?.drain);
+                    match drained {
+                        Ok(()) => {}
+                        Err(ref e) if is_peer_disconnect(e.kind()) => break,
+                        Err(e) => return Err(CaError::Io(e)),
+                    }
+                }
                 Ok(_) => { /* more bytes pending: hold to coalesce pipelined replies */ }
             }
 
@@ -1620,22 +1681,28 @@ fn handle_client_blocking(
             // was dispatched and then advanced the cursor off an 8-byte
             // boundary, mis-framing every later message for the life of the
             // circuit.
+            //
+            // The batch runs under the client lock, as pcas `processMsg` holds
+            // `casClientMutex` across its input (`casStrmClient.cc:117`).
+            let mut guard = lock_client(&client)?;
             loop {
-                let (hdr, payload) = match accumulated.next_message(state.client_minor_version()) {
+                let c = &mut *guard;
+                let (hdr, payload) = match accumulated.next_message(c.state.client_minor_version())
+                {
                     Gate::NeedMore => break,
                     Gate::Deliver { hdr, payload } => (hdr, payload),
                     Gate::Refuse(err) => {
                         // C `RSRV_OK`: the peer keeps every channel and
                         // subscription it holds; only this message is lost.
-                        report_gate_error(&outbox, &state, peer, &err);
+                        report_gate_error(&outbox, &c.state, peer, &err);
                         continue;
                     }
                     Gate::TearDown { error, reason } => {
                         // C `RSRV_ERROR`: send what C sends, flush it, close.
                         if let Some(err) = error {
-                            report_gate_error(&outbox, &state, peer, &err);
+                            report_gate_error(&outbox, &c.state, peer, &err);
                         }
-                        let _ = drain_outbox_locked(&send_lock, &mut drain);
+                        let _ = drain_outbox_locked(&send_lock, &mut c.drain);
                         print_forcing_disconnect(peer);
                         return Err(reason);
                     }
@@ -1659,31 +1726,27 @@ fn handle_client_blocking(
                     // queues the initial value on the circuit's ring, and hands back
                     // the live reader WITHOUT spawning (this thread has no runtime). The
                     // per-channel cap consults the blocking driver's own map
-                    // (`blk_subs`), not the async `subscriptions`.
+                    // (`c.subs`), not the async `subscriptions`.
                     let sid = hdr.cid;
                     let outcome = block_on_sync(register_subscription(
                         &hdr,
                         &payload,
-                        &state,
+                        &c.state,
                         &outbox,
                         SubscriptionDelivery::HandOff,
-                        || blk_subs.values().filter(|s| s.channel_sid == sid).count(),
+                        || c.subs.values().filter(|s| s.channel_sid == sid).count(),
                     ));
                     match outcome {
                         Ok(Ok(SubscriptionOutcome::HandedOff(r))) => {
-                            hand_off_subscription(&mut state, &mut blk_subs, &ev_tx, r);
+                            hand_off_subscription(&mut c.state, &mut c.subs, &ev_tx, r);
                         }
                         Ok(Ok(SubscriptionOutcome::Circuit(_))) => {
                             unreachable!("HandOff mode never spawns a task")
                         }
-                        Ok(Ok(SubscriptionOutcome::Refused)) => {}
-                        // No broadcast wakes this driver, so the request that
-                        // found the PV gone hands the retirement over.
-                        Ok(Ok(SubscriptionOutcome::ChannelGone { cid })) => {
-                            let _ = ev_tx.send(EventTaskControl::Retire(cid));
+                        Ok(Ok(SubscriptionOutcome::Refused | SubscriptionOutcome::ChannelGone)) => {
                         }
                         Ok(Err(e)) => {
-                            let _ = drain_outbox_locked(&send_lock, &mut drain);
+                            let _ = drain_outbox_locked(&send_lock, &mut c.drain);
                             print_forcing_disconnect(peer);
                             return Err(e);
                         }
@@ -1698,9 +1761,10 @@ fn handle_client_blocking(
                 } else if hdr.cmmd == CA_PROTO_EVENT_CANCEL {
                     // Shared cancel wire logic (bad-SID / bad-mon-id / ACK), reading
                     // the addressed subscription from the blocking driver's own map.
-                    let sub_info = state
+                    let sub_info = c
+                        .state
                         .find_subscription(hdr.cid, hdr.available)
-                        .and_then(|id| blk_subs.get(&id).map(|s| (id, s)))
+                        .and_then(|id| c.subs.get(&id).map(|s| (id, s)))
                         .map(|(id, s)| CancelInfo {
                             id,
                             channel_sid: s.channel_sid,
@@ -1708,10 +1772,10 @@ fn handle_client_blocking(
                             data_count: s.data_count,
                             monitor: s.monitor.clone(),
                         });
-                    match cancel_subscription_reply(&hdr, &state, &outbox, sub_info) {
+                    match cancel_subscription_reply(&hdr, &c.state, &outbox, sub_info) {
                         Ok(id) => {
-                            state.unlink_subscription(hdr.cid, id);
-                            if let Some(sub) = blk_subs.remove(&id) {
+                            c.state.unlink_subscription(hdr.cid, id);
+                            if let Some(sub) = c.subs.remove(&id) {
                                 // Stop the producer: drop the reader on the event
                                 // thread, then remove the subscriber from record/PV.
                                 let _ = ev_tx.send(EventTaskControl::Cancel(id));
@@ -1728,7 +1792,7 @@ fn handle_client_blocking(
                         Err(e) => {
                             // The CA_PROTO_ERROR is queued; ship it, then end the
                             // circuit (C `event_cancel_reply` RSRV_ERROR).
-                            let _ = drain_outbox_locked(&send_lock, &mut drain);
+                            let _ = drain_outbox_locked(&send_lock, &mut c.drain);
                             print_forcing_disconnect(peer);
                             return Err(e);
                         }
@@ -1744,21 +1808,30 @@ fn handle_client_blocking(
                     // thread), so an async record returns `AsyncPending` and this
                     // thread returns at once, staying responsive to further
                     // commands.
-                    // A write the PV postponed blocks this thread, which reads
-                    // nothing more, until the PV signals; then it is served
-                    // again (pcas `S_casApp_postponeAsyncIO`). The event
-                    // thread keeps sending meanwhile.
-                    let mut postponed: Option<IoBlocked> = None;
+                    // A postponed write blocks this thread, which reads
+                    // nothing more, until the PV or the channel's previous
+                    // put-callback signals; then the PV's is served again
+                    // (pcas `S_casApp_postponeAsyncIO`) and the put callback
+                    // resumes where it waited. The event thread keeps
+                    // sending meanwhile.
+                    let mut postponed: Option<Blocked> = None;
                     loop {
-                        // Not blockable here, the head below refuses the same.
-                        if let Some(mut blocked) = postponed.take() {
-                            let _ = block_on_sync(blocked.signalled());
-                            retire_destroyed_before_rerun(&mut state, &mut blk_subs, &ev_tx, peer);
+                        let mut resume = None;
+                        if let Some(blocked) = postponed.take() {
+                            (guard, resume) = resume_after(guard, &client, blocked, &ev_tx)?;
                         }
-                        match block_on_sync(serve_write_head(&hdr, &payload, &state, &db, &outbox))
-                        {
+                        let c = &mut *guard;
+                        let head = match resume {
+                            Some(put) => block_on_sync(resume_write(
+                                &hdr, &payload, put, &c.state, &db, &outbox,
+                            )),
+                            None => block_on_sync(serve_write_head(
+                                &hdr, &payload, &c.state, &db, &outbox,
+                            )),
+                        };
+                        match head {
                             Ok(Ok(WriteHeadOutcome::Postponed(blocked))) => {
-                                let _ = drain_outbox_locked(&send_lock, &mut drain);
+                                let _ = drain_outbox_locked(&send_lock, &mut c.drain);
                                 postponed = Some(blocked);
                                 continue;
                             }
@@ -1782,7 +1855,7 @@ fn handle_client_blocking(
                                 // A protocol violation (bad SID/type/payload) queued its
                                 // error frame; ship it, then end the circuit — same rule
                                 // as the async server (RSRV_ERROR).
-                                let _ = drain_outbox_locked(&send_lock, &mut drain);
+                                let _ = drain_outbox_locked(&send_lock, &mut c.drain);
                                 print_forcing_disconnect(peer);
                                 return Err(e);
                             }
@@ -1804,24 +1877,37 @@ fn handle_client_blocking(
                     // the first poll. Spawning commands are gated out above; the
                     // gateway read-hook GET is unreachable for a local record.
                     // A postponed request blocks this thread as a WRITE does.
-                    let mut postponed: Option<IoBlocked> = None;
+                    let mut postponed: Option<Blocked> = None;
                     loop {
-                        if let Some(mut blocked) = postponed.take() {
-                            let _ = block_on_sync(blocked.signalled());
-                            retire_destroyed_before_rerun(&mut state, &mut blk_subs, &ev_tx, peer);
+                        let mut resume = None;
+                        if let Some(blocked) = postponed.take() {
+                            (guard, resume) = resume_after(guard, &client, blocked, &ev_tx)?;
                         }
-                        match block_on_sync(dispatch_message(
-                            &hdr,
-                            &payload,
-                            &mut state,
-                            &db,
-                            &outbox,
-                            peer,
-                            None,
-                            SubscriptionDelivery::HandOff,
-                        )) {
+                        let c = &mut *guard;
+                        let dispatched = match resume {
+                            Some(put) => block_on_sync(resume_dispatch(
+                                &hdr,
+                                &payload,
+                                put,
+                                &mut c.state,
+                                &db,
+                                &outbox,
+                                SubscriptionDelivery::HandOff,
+                            )),
+                            None => block_on_sync(dispatch_message(
+                                &hdr,
+                                &payload,
+                                &mut c.state,
+                                &db,
+                                &outbox,
+                                peer,
+                                None,
+                                SubscriptionDelivery::HandOff,
+                            )),
+                        };
+                        match dispatched {
                             Ok(Ok(Dispatched::Postponed(blocked))) => {
-                                let _ = drain_outbox_locked(&send_lock, &mut drain);
+                                let _ = drain_outbox_locked(&send_lock, &mut c.drain);
                                 postponed = Some(blocked);
                                 continue;
                             }
@@ -1834,12 +1920,14 @@ fn handle_client_blocking(
                                 // whole `db_cancel_event`-then-confirm order of C
                                 // `clear_channel_reply` (`camessage.c:1890-1912`)
                                 // holds on this driver too.
-                                finish_retired_subscriptions(&mut state, &mut blk_subs, &ev_tx);
+                                finish_retired_subscriptions(&mut c.state, &mut c.subs, |id| {
+                                    let _ = ev_tx.send(EventTaskControl::Cancel(id));
+                                });
                             }
                             Ok(Err(e)) => {
                                 // Ship anything an earlier handler in this burst (or
                                 // this handler's own error frame) queued, then end.
-                                let _ = drain_outbox_locked(&send_lock, &mut drain);
+                                let _ = drain_outbox_locked(&send_lock, &mut c.drain);
                                 print_forcing_disconnect(peer);
                                 return Err(e);
                             }
@@ -1863,10 +1951,10 @@ fn handle_client_blocking(
                         &outbox,
                         &hdr,
                         peer,
-                        state.channel_addr(hdr.cid),
-                        state.client_minor_version(),
+                        c.state.channel_addr(hdr.cid),
+                        c.state.client_minor_version(),
                     );
-                    let _ = drain_outbox_locked(&send_lock, &mut drain);
+                    let _ = drain_outbox_locked(&send_lock, &mut c.drain);
                     print_forcing_disconnect(peer);
                     return Err(e);
                 }
@@ -1882,14 +1970,17 @@ fn handle_client_blocking(
 
     // Producer teardown (runs on every exit path): drop each subscriber from
     // its record/PV so no dangling `EvQue` post target survives this client —
-    // the blocking analogue of `dispatch_message`'s disconnect drain.
-    for (id, sub) in blk_subs.drain() {
-        match &sub.target {
-            ChannelTarget::SimplePv(pv) => {
-                pv.remove_subscriber(id);
-            }
-            ChannelTarget::RecordField { record, .. } => {
-                record.write().remove_subscriber(id);
+    // the blocking analogue of `dispatch_message`'s disconnect drain. Not
+    // blockable here only inside a runtime, which this thread never enters.
+    if let Ok(mut c) = lock_client(&client) {
+        for (id, sub) in c.subs.drain() {
+            match &sub.target {
+                ChannelTarget::SimplePv(pv) => {
+                    pv.remove_subscriber(id);
+                }
+                ChannelTarget::RecordField { record, .. } => {
+                    record.write().remove_subscriber(id);
+                }
             }
         }
     }
@@ -4217,7 +4308,7 @@ mod tests {
         c.write_all(&create_chan_frame(CID, "BLK:WIO")).unwrap();
         let cc = read_until_cmmd(&mut c, CA_PROTO_CREATE_CHAN);
         let sid = u32::from_be_bytes([cc[12], cc[13], cc[14], cc[15]]);
-        // The monitor whose end of stream retires the channel on this driver.
+        // A monitor, so the retirement has a subscription to finish too.
         c.write_all(&event_add_double_frame_masked(sid, 1, 1))
             .unwrap();
         let _ = read_until_cmmd(&mut c, CA_PROTO_EVENT_ADD);
@@ -5858,6 +5949,104 @@ mod tests {
         accept.join().unwrap();
     }
 
+    /// A put callback waiting on its channel's previous one is postponed with
+    /// the client lock released, so a PV destroy that wakes the event thread
+    /// meanwhile cannot stall the completion that ends the wait: C waits for
+    /// `blockSem` outside `putNotifyLock` (camessage.c:1711-1712).
+    #[test]
+    fn a_pv_destroy_does_not_stall_a_put_callback_its_successor_waits_on() {
+        use crate::protocol::ECA_NORMAL;
+        let db = seed_async_db("BLK:ASYD");
+        block_on_sync(db.add_pv("BLK:OTHER", EpicsValue::Double(0.0)))
+            .expect("no runtime on test thread")
+            .expect("add_pv");
+        let server =
+            Arc::new(BlockingCaServer::bind("127.0.0.1:0", db.clone(), new_acf()).unwrap());
+        let addr = server.local_addr().unwrap();
+        let srv = server.clone();
+        let accept = thread::spawn(move || srv.serve());
+
+        let (mut c, sid) = connected_client(addr, "BLK:ASYD");
+        c.write_all(&write_notify_frame(sid, 1, DBR_DOUBLE_MON, 1.0))
+            .unwrap();
+        thread::sleep(Duration::from_millis(200));
+        c.write_all(&write_notify_frame(sid, 2, DBR_DOUBLE_MON, 2.0))
+            .unwrap();
+        thread::sleep(Duration::from_millis(200));
+        block_on_sync(db.remove_simple_pv("BLK:OTHER"))
+            .expect("no runtime on test thread")
+            .expect("was registered");
+        thread::sleep(Duration::from_millis(200));
+        block_on_sync(db.complete_async_record("BLK:ASYD"))
+            .unwrap()
+            .unwrap();
+
+        // Well inside C's 60 s, so a stall shows as a read timeout, not as
+        // the late ECA_PUTCBINPROG it would end in.
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let answered: Vec<(u32, u32)> = (0..2)
+            .map(|_| {
+                let wn = read_until_cmmd(&mut c, CA_PROTO_WRITE_NOTIFY);
+                (
+                    u32::from_be_bytes([wn[8], wn[9], wn[10], wn[11]]),
+                    u32::from_be_bytes([wn[12], wn[13], wn[14], wn[15]]),
+                )
+            })
+            .collect();
+        assert_eq!(answered, [(ECA_NORMAL, 1), (ECA_NORMAL, 2)]);
+
+        server.shutdown();
+        accept.join().unwrap();
+    }
+
+    /// A put callback whose channel is retired while it waits on its
+    /// predecessor resumes after the sweep and is answered as a request
+    /// arriving after the retirement is: ECA_BADCHID, circuit kept.
+    #[test]
+    fn a_put_callback_whose_channel_retires_during_its_wait_is_refused_badchid() {
+        use crate::protocol::{CA_PROTO_SERVER_DISCONN, ECA_BADCHID, ECA_PUTFAIL};
+        let db = seed_async_db("BLK:ASYR");
+        let server =
+            Arc::new(BlockingCaServer::bind("127.0.0.1:0", db.clone(), new_acf()).unwrap());
+        let addr = server.local_addr().unwrap();
+        let srv = server.clone();
+        let accept = thread::spawn(move || srv.serve());
+
+        let (mut c, sid) = connected_client(addr, "BLK:ASYR");
+        c.write_all(&write_notify_frame(sid, 1, DBR_DOUBLE_MON, 1.0))
+            .unwrap();
+        thread::sleep(Duration::from_millis(200));
+        c.write_all(&write_notify_frame(sid, 2, DBR_DOUBLE_MON, 2.0))
+            .unwrap();
+        thread::sleep(Duration::from_millis(200));
+        assert!(block_on_sync(db.remove_record("BLK:ASYR")).expect("no runtime on test thread"));
+
+        let mut frames = Vec::new();
+        loop {
+            let f = read_one_frame(&mut c);
+            let word = |at: usize| u32::from_be_bytes([f[at], f[at + 1], f[at + 2], f[at + 3]]);
+            let cmmd = u16::from_be_bytes([f[0], f[1]]);
+            frames.push((cmmd, word(8), word(12)));
+            if (cmmd, word(12)) == (CA_PROTO_WRITE_NOTIFY, 2) {
+                break;
+            }
+        }
+        assert_eq!(
+            frames,
+            [
+                (CA_PROTO_WRITE_NOTIFY, ECA_PUTFAIL, 1),
+                (CA_PROTO_SERVER_DISCONN, 0x1234, 0),
+                (CA_PROTO_WRITE_NOTIFY, ECA_BADCHID, 2),
+            ]
+        );
+
+        c.write_all(&CaHeader::new(CA_PROTO_ECHO).to_bytes())
+            .unwrap();
+        let _ = read_until_cmmd(&mut c, CA_PROTO_ECHO);
+        server.shutdown();
+        accept.join().unwrap();
+    }
+
     /// With ca-gateway's `maxSimlWriteIO` (100) put callbacks in flight, the
     /// next write blocks the dispatch thread until one ends; then it goes and
     /// the request behind it is answered (gateVc.cc:1483).
@@ -6034,6 +6223,183 @@ mod tests {
         server.shutdown();
         accept.join().unwrap();
     }
+
+    /// Remove `name` on a thread of its own, holding the destroy's wake-up
+    /// back from the moment the PV is destroyed until `release` is sent. The
+    /// returned receiver yields once the PV is destroyed.
+    fn remove_holding_the_wake_up(
+        db: &Arc<PvDatabase>,
+        name: &'static str,
+    ) -> (
+        thread::JoinHandle<()>,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (destroyed_tx, destroyed) = std::sync::mpsc::channel::<()>();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let remover = thread::spawn({
+            let db = db.clone();
+            move || {
+                let _armed = epics_base_rs::server::database::destroy_signal_hook::arm(move || {
+                    let _ = destroyed_tx.send(());
+                    let _ = held.recv();
+                });
+                block_on_sync(db.remove_simple_pv(name))
+                    .expect("no async runtime on this thread")
+                    .expect("was registered");
+            }
+        });
+        (remover, destroyed, release)
+    }
+
+    /// `(cmmd, cid field, available field)` of the frames before EOF.
+    fn frames_to_eof(c: &mut TcpStream) -> Vec<(u16, u32, u32)> {
+        let mut acc: Vec<u8> = Vec::new();
+        c.read_to_end(&mut acc).expect("the circuit reaches EOF");
+        let mut seen = Vec::new();
+        let mut i = 0;
+        while i + CaHeader::SIZE <= acc.len() {
+            let (h, size) = CaHeader::from_bytes_extended(&acc[i..]).expect("header");
+            seen.push((h.cmmd, h.cid, h.available));
+            i += size + h.actual_postsize();
+        }
+        seen
+    }
+
+    /// A destroyed channel with no monitor and no request behind it is
+    /// retired by the destroy's wake-up alone, its put callback answered
+    /// first: pcas commits the `CA_PROTO_SERVER_DISCONN` from its event
+    /// system (`channelDestroyEventNotify`, `casStrmClient.cc:2171-2209`),
+    /// whatever the client sends. Before the wake-up reached this driver's
+    /// event thread, nothing here retired such a channel until the circuit
+    /// ended.
+    #[test]
+    fn an_unmonitored_destroyed_channel_is_retired_without_a_request() {
+        use epics_base_rs::server::pv::WriteForward;
+        let db = seed_db(&[("BLK:NOMON", EpicsValue::Double(0.0))]);
+        let (sent_tx, sent) = std::sync::mpsc::channel::<()>();
+        let open = Arc::new(Mutex::new(Vec::new()));
+        simple_pv(&db, "BLK:NOMON").set_write_hook(Arc::new({
+            let open = open.clone();
+            move |_value, _ctx| {
+                let open = open.clone();
+                let sent_tx = sent_tx.clone();
+                Box::pin(async move {
+                    let forward: WriteForward = Box::new(move |done| {
+                        open.lock().unwrap().extend(done);
+                        let _ = sent_tx.send(());
+                        Ok(())
+                    });
+                    Ok(forward)
+                })
+            }
+        }));
+        let server =
+            Arc::new(BlockingCaServer::bind("127.0.0.1:0", db.clone(), new_acf()).unwrap());
+        let addr = server.local_addr().unwrap();
+        let srv = server.clone();
+        let accept = thread::spawn(move || srv.serve());
+
+        let (mut c, sid) = connected_client(addr, "BLK:NOMON");
+        // A liveness bound only: every assertion is over frames read.
+        c.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        c.write_all(&write_notify_frame(sid, 7, DBR_DOUBLE_MON, 3.0))
+            .unwrap();
+        sent.recv().expect("sent upstream");
+
+        let (remover, destroyed, release) = remove_holding_the_wake_up(&db, "BLK:NOMON");
+        destroyed.recv().expect("the PV is destroyed");
+        release.send(()).expect("the hook waits");
+        let seen: Vec<_> = (0..3)
+            .map(|_| {
+                let f = read_one_frame(&mut c);
+                (
+                    u16::from_be_bytes([f[0], f[1]]),
+                    u32::from_be_bytes([f[8], f[9], f[10], f[11]]),
+                    u32::from_be_bytes([f[12], f[13], f[14], f[15]]),
+                )
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                (CA_PROTO_WRITE_NOTIFY, crate::protocol::ECA_PUTFAIL, 7),
+                (
+                    crate::protocol::CA_PROTO_ERROR,
+                    0x1234,
+                    crate::protocol::ECA_NOCONVERT
+                ),
+                (crate::protocol::CA_PROTO_SERVER_DISCONN, 0x1234, 0),
+            ]
+        );
+        remover.join().expect("removed");
+
+        c.shutdown(std::net::Shutdown::Write).unwrap();
+        let rest = frames_to_eof(&mut c);
+        assert!(rest.is_empty(), "retired once, then {rest:?}");
+        server.shutdown();
+        accept.join().unwrap();
+    }
+
+    /// An EVENT_ADD on a channel whose PV is destroyed leaves the channel to
+    /// the destroy's sweep, which takes it out of the table: a request on its
+    /// sid afterwards is refused ECA_BADCHID, as pcas refuses one its
+    /// `chanTable` no longer holds. The EVENT_ADD used to send the event
+    /// thread a retirement of its own, which staged the
+    /// `CA_PROTO_SERVER_DISCONN` and left the channel served.
+    #[test]
+    fn an_event_add_on_a_destroyed_channel_leaves_it_to_the_sweep() {
+        let db = seed_db(&[("BLK:EAG", EpicsValue::Double(0.0))]);
+        let server =
+            Arc::new(BlockingCaServer::bind("127.0.0.1:0", db.clone(), new_acf()).unwrap());
+        let addr = server.local_addr().unwrap();
+        let srv = server.clone();
+        let accept = thread::spawn(move || srv.serve());
+
+        let (mut c, sid) = connected_client(addr, "BLK:EAG");
+        // A liveness bound only: every assertion is over frames read.
+        c.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        let (remover, destroyed, release) = remove_holding_the_wake_up(&db, "BLK:EAG");
+        destroyed.recv().expect("the PV is destroyed");
+
+        c.write_all(&event_add_double_frame_masked(sid, 1, 1))
+            .unwrap();
+        c.write_all(&CaHeader::new(CA_PROTO_ECHO).to_bytes())
+            .unwrap();
+        let mut before_echo = Vec::new();
+        loop {
+            let frame = read_one_frame(&mut c);
+            let cmmd = u16::from_be_bytes([frame[0], frame[1]]);
+            if cmmd == CA_PROTO_ECHO {
+                break;
+            }
+            before_echo.push(cmmd);
+        }
+        assert!(
+            before_echo.is_empty(),
+            "the EVENT_ADD retires nothing itself, got {before_echo:?}"
+        );
+
+        release.send(()).expect("the hook waits");
+        let frame = read_until_cmmd(&mut c, crate::protocol::CA_PROTO_SERVER_DISCONN);
+        assert_eq!(
+            u32::from_be_bytes([frame[8], frame[9], frame[10], frame[11]]),
+            0x1234
+        );
+        remover.join().expect("removed");
+
+        c.write_all(&write_notify_frame(sid, 9, DBR_DOUBLE_MON, 3.0))
+            .unwrap();
+        c.shutdown(std::net::Shutdown::Write).unwrap();
+        assert_eq!(
+            frames_to_eof(&mut c),
+            [(CA_PROTO_WRITE_NOTIFY, crate::protocol::ECA_BADCHID, 9)],
+            "the sid left the table, and the channel is retired once"
+        );
+        server.shutdown();
+        accept.join().unwrap();
+    }
+
     /// C `clear_channel_reply` (`rsrv/camessage.c:1890-1903`) drains the
     /// channel's `eventq` and calls `db_cancel_event` on every subscription
     /// before it sends the delete-confirmed echo, so a cleared channel stops

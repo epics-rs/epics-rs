@@ -13,6 +13,7 @@ use epics_base_rs::types::{DbFieldType, EpicsValue};
 
 use super::*;
 use crate::protocol::MAX_TCP;
+use crate::server::tcp::DestroyedCids;
 use std::sync::atomic::AtomicUsize;
 
 /// A socket that records each write call, or refuses every one once broken.
@@ -175,6 +176,7 @@ fn updates_built_in_place_are_the_frames_built_apart() {
         let mut task = pin!(run_event_task(
             user,
             ctl_rx,
+            DestroyedCids::default(),
             sink,
             crate::server::tcp::CircuitMinor::new(CA_MINOR_VERSION)
         ));
@@ -187,6 +189,7 @@ fn updates_built_in_place_are_the_frames_built_apart() {
         let mut task = pin!(run_event_task(
             user,
             ctl_rx,
+            DestroyedCids::default(),
             copies.clone(),
             crate::server::tcp::CircuitMinor::new(CA_MINOR_VERSION)
         ));
@@ -213,8 +216,8 @@ fn poll_once<F: Future>(fut: std::pin::Pin<&mut F>) -> Poll<F::Output> {
     fut.poll(&mut Context::from_waker(Waker::noop()))
 }
 
-/// `k` SimplePvs, each with one monitor reader on `user`, handed over as
-/// `Add`s for cids `0..k`.
+/// `k` SimplePvs, each with one monitor reader on `user`, for the channels
+/// with cids `0..k`.
 fn monitored_pvs(db: &PvDatabase, user: &Arc<EventUser>, k: u32) -> Vec<MonitorDelivery> {
     (0..k)
         .map(|cid| {
@@ -235,7 +238,6 @@ fn monitored_pvs(db: &PvDatabase, user: &Arc<EventUser>, k: u32) -> Vec<MonitorD
             MonitorDelivery {
                 reader,
                 target: ChannelTarget::SimplePv(pv),
-                cid,
             }
         })
         .collect()
@@ -249,15 +251,19 @@ fn destroy(db: &PvDatabase, k: u32) {
     }
 }
 
-/// The `Add` arm: channels destroyed before their `Add` arrives are `k`
-/// ready SERVER_DISCONN frames, one write.
+/// The sweep: `k` channels destroyed together are `k` ready SERVER_DISCONN
+/// frames, one write, and the `Add`s still queued for them stage nothing.
 #[test]
-fn retirements_handed_over_together_reach_the_wire_in_one_write() {
+fn retirements_swept_together_reach_the_wire_in_one_write() {
     for k in [1u32, 3] {
         let db = PvDatabase::new();
         let user = Arc::new(EventUser::new());
         let subs = monitored_pvs(&db, &user, k);
         destroy(&db, k);
+        let destroyed = DestroyedCids::default();
+        for cid in 0..k {
+            destroyed.destroy(cid);
+        }
         let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
         for d in subs {
             ctl_tx.send(EventTaskControl::Add(Box::new(d))).unwrap();
@@ -267,6 +273,7 @@ fn retirements_handed_over_together_reach_the_wire_in_one_write() {
         let mut task = pin!(run_event_task(
             user,
             ctl_rx,
+            destroyed,
             sink,
             crate::server::tcp::CircuitMinor::new(CA_MINOR_VERSION)
         ));
@@ -281,9 +288,10 @@ fn retirements_handed_over_together_reach_the_wire_in_one_write() {
 }
 
 /// The `Ended` arm: live monitors whose channels are destroyed together end
-/// `k` streams at once, one write.
+/// `k` streams and stage nothing; the sweep the destruction wakes retires
+/// the `k` channels in one write.
 #[test]
-fn streams_ended_together_reach_the_wire_in_one_write() {
+fn streams_ended_together_leave_their_channels_to_the_sweep() {
     for k in [1u32, 3] {
         let db = PvDatabase::new();
         let user = Arc::new(EventUser::new());
@@ -292,11 +300,13 @@ fn streams_ended_together_reach_the_wire_in_one_write() {
         for d in subs {
             ctl_tx.send(EventTaskControl::Add(Box::new(d))).unwrap();
         }
+        let destroyed = DestroyedCids::default();
         let wire = Arc::new(Wire::default());
         let sink = EventSendBuf(Arc::new(Mutex::new(SendBuf::new(wire.clone()))));
         let mut task = pin!(run_event_task(
             user,
             ctl_rx,
+            destroyed.clone(),
             sink,
             crate::server::tcp::CircuitMinor::new(CA_MINOR_VERSION)
         ));
@@ -304,8 +314,13 @@ fn streams_ended_together_reach_the_wire_in_one_write() {
         assert!(wire.writes().is_empty(), "live monitors owe no frame");
         destroy(&db, k);
         assert!(poll_once(task.as_mut()).is_pending());
+        assert!(wire.writes().is_empty(), "an ended stream owes no frame");
+        for cid in 0..k {
+            destroyed.destroy(cid);
+        }
+        assert!(poll_once(task.as_mut()).is_pending());
         let writes = wire.writes();
-        assert_eq!(writes.len(), 1, "{k} ended streams, one write");
+        assert_eq!(writes.len(), 1, "{k} retirements, one write");
         assert_eq!(writes[0].len(), 16 * k as usize);
         drop(ctl_tx);
         assert!(poll_once(task.as_mut()).is_ready());
@@ -387,7 +402,6 @@ fn gated_circuit_monitored_pvs(
                 .send(EventTaskControl::Add(Box::new(MonitorDelivery {
                     reader,
                     target: ChannelTarget::SimplePv(pv.clone()),
-                    cid,
                 })))
                 .unwrap();
             (pv, monitor)
@@ -409,6 +423,7 @@ fn updates_ready_together_reach_the_wire_in_one_write() {
     let mut task = pin!(run_event_task(
         user,
         ctl_rx,
+        DestroyedCids::default(),
         sink,
         crate::server::tcp::CircuitMinor::new(CA_MINOR_VERSION)
     ));
@@ -451,6 +466,7 @@ fn the_last_event_of_a_drained_queue_sends_what_is_staged() {
     let mut task = pin!(run_event_task(
         user,
         ctl_rx,
+        DestroyedCids::default(),
         calls.clone(),
         crate::server::tcp::CircuitMinor::new(CA_MINOR_VERSION)
     ));
@@ -477,6 +493,7 @@ fn a_cancelled_last_event_sends_nothing() {
     let mut task = pin!(run_event_task(
         user,
         ctl_rx,
+        DestroyedCids::default(),
         calls.clone(),
         crate::server::tcp::CircuitMinor::new(CA_MINOR_VERSION)
     ));
@@ -515,16 +532,18 @@ impl crate::server::tcp::EventSink for GoneCalls {
 
 /// The send at the end of a drained queue is where a peer that went away
 /// after the last successful send shows up first, and it ends the task there:
-/// a retirement already waiting in the control queue is never staged.
+/// a retirement already waiting to be swept is never staged.
 #[test]
 fn a_failed_send_at_a_drained_queue_ends_the_task() {
     let user = Arc::new(EventUser::new());
     let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
     let pvs = circuit_monitored_pvs(1, &user, &ctl_tx);
     let sink = GoneCalls::default();
+    let destroyed = DestroyedCids::default();
     let mut task = pin!(run_event_task(
         user,
         ctl_rx,
+        destroyed.clone(),
         sink.clone(),
         crate::server::tcp::CircuitMinor::new(CA_MINOR_VERSION)
     ));
@@ -533,15 +552,9 @@ fn a_failed_send_at_a_drained_queue_ends_the_task() {
     sink.0.0.lock().unwrap().clear();
     sink.1.store(true, Ordering::Relaxed);
     pvs[0].set(EpicsValue::Double(1.0));
-    // A channel destroyed before its `Add` arrives, on another circuit's
-    // queue: its retirement is one staged frame, reached only if the task
-    // outlives the drained-queue send.
-    let db = PvDatabase::new();
-    let retired = monitored_pvs(&db, &Arc::new(EventUser::new()), 1);
-    destroy(&db, 1);
-    for d in retired {
-        ctl_tx.send(EventTaskControl::Add(Box::new(d))).unwrap();
-    }
+    // Another channel's retirement is one staged frame, reached only if the
+    // task outlives the drained-queue send.
+    destroyed.destroy(7);
     assert!(
         poll_once(task.as_mut()).is_ready(),
         "the control sender is still held, so only the send error can end it"
@@ -579,6 +592,7 @@ fn a_failed_update_stage_ends_the_task() {
     let mut task = pin!(run_event_task(
         user,
         ctl_rx,
+        DestroyedCids::default(),
         sink.clone(),
         crate::server::tcp::CircuitMinor::new(CA_MINOR_VERSION)
     ));
@@ -603,20 +617,17 @@ fn a_failed_update_stage_ends_the_task() {
 /// before waiting, and a gone peer there ends the task too.
 #[test]
 fn a_failed_send_before_waiting_ends_the_task() {
-    let db = PvDatabase::new();
     let user = Arc::new(EventUser::new());
-    let subs = monitored_pvs(&db, &user, 1);
-    destroy(&db, 1);
-    let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
-    for d in subs {
-        ctl_tx.send(EventTaskControl::Add(Box::new(d))).unwrap();
-    }
+    let destroyed = DestroyedCids::default();
+    destroyed.destroy(0);
+    let (_ctl_tx, ctl_rx) = mpsc::unbounded_channel();
     let wire = Arc::new(Wire::default());
     wire.broken.store(true, Ordering::Relaxed);
     let sink = EventSendBuf(Arc::new(Mutex::new(SendBuf::new(wire.clone()))));
     let mut task = pin!(run_event_task(
         user,
         ctl_rx,
+        destroyed,
         sink,
         crate::server::tcp::CircuitMinor::new(CA_MINOR_VERSION)
     ));
@@ -640,6 +651,7 @@ fn delivering_events_through_the_real_sink_allocates_nothing() {
     let mut task = pin!(run_event_task(
         user,
         ctl_rx,
+        DestroyedCids::default(),
         sink,
         crate::server::tcp::CircuitMinor::new(CA_MINOR_VERSION)
     ));

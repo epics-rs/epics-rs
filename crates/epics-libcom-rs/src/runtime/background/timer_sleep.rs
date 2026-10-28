@@ -120,6 +120,24 @@ pub fn sleep_until(timer: &TimerHandle, deadline: Instant) -> Sleep {
     }
 }
 
+impl Sleep {
+    /// Re-arm for `deadline` in place — `tokio::time::Sleep::reset`. The held
+    /// entry is given back and the cell replaced, not cleared: a callback the
+    /// timer thread already dequeued still holds the old cell and would
+    /// otherwise mark the new deadline fired.
+    pub(crate) fn reset(&mut self, deadline: Instant) {
+        if let Some(key) = self.entry.take() {
+            self.timer.cancel_wake(key);
+        }
+        self.state = Arc::new(Mutex::new(SleepState {
+            fired: false,
+            waker: None,
+        }));
+        self.deadline = deadline;
+        self.armed = false;
+    }
+}
+
 impl Future for Sleep {
     type Output = ();
 
@@ -186,8 +204,8 @@ impl Drop for Sleep {
     }
 }
 
-/// A periodic ticker over the delayed-callback timer — the RTEMS backend for
-/// [`crate::runtime::task::interval`]. Mirrors `tokio::time::Interval` with its
+/// A periodic ticker over the delayed-callback timer — the backend for
+/// [`crate::runtime::task::interval_background`]. Mirrors `tokio::time::Interval` with its
 /// default `MissedTickBehavior::Burst`: the first tick is immediate and tick
 /// deadlines are anchored at construction (`start + period`, `start + 2·period`,
 /// …), so an overdue tick fires immediately and successive overdue ticks burst

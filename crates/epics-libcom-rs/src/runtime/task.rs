@@ -1255,44 +1255,103 @@ pub async fn sleep_until(deadline: Instant) {
 }
 
 /// Periodic ticker — the seam replacement for `tokio::time::interval`, so no
-/// production site names `tokio::time` directly (decision A2). The hosted build
-/// wraps `tokio::time::Interval`, preserving its default
-/// `MissedTickBehavior::Burst` catch-up and immediate first tick; the RTEMS
-/// build substitutes the runtime-free
-/// [`crate::runtime::background::timer_sleep::TimerInterval`], which reproduces
-/// the same semantics over the delayed-callback timer.
-#[cfg(tokio_backend)]
+/// production site names `tokio::time` directly (decision A2), with tokio's
+/// defaults: an immediate first tick and `MissedTickBehavior::Burst` catch-up.
+///
+/// One body for both backends, on the timer the polling thread can reach (see
+/// [`sleep_on_reachable_timer`]): the hosted half wrapped
+/// `tokio::time::Interval`, which panics on a thread with no runtime.
 pub struct Interval {
-    inner: tokio::time::Interval,
+    period: Duration,
+    /// Next tick deadline, anchored at construction so catch-up bursts.
+    next: Instant,
+    first: bool,
+    /// Armed on the first wait and re-armed in place after each tick, as
+    /// tokio's `Interval` does, so a `tick()` dropped by a losing `select!` arm
+    /// leaves it armed and the next `tick()` arms no timer.
+    delay: Option<TickTimer>,
 }
 
+/// One re-armable sleep on the timer the arming thread can reach.
+enum TickTimer {
+    #[cfg(tokio_backend)]
+    Runtime(std::pin::Pin<Box<tokio::time::Sleep>>),
+    Background(crate::runtime::background::Sleep),
+}
+
+impl TickTimer {
+    fn until(deadline: Instant) -> Self {
+        #[cfg(tokio_backend)]
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return Self::Runtime(Box::pin(tokio::time::sleep_until(deadline)));
+        }
+        Self::Background(crate::runtime::background::timer_sleep::sleep_until(
+            &background().timer().handle(),
+            std_instant(deadline),
+        ))
+    }
+
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        match self {
+            #[cfg(tokio_backend)]
+            Self::Runtime(s) => s.as_mut().poll(cx),
+            Self::Background(s) => std::pin::Pin::new(s).poll(cx),
+        }
+    }
+
+    fn reset(&mut self, deadline: Instant) {
+        match self {
+            #[cfg(tokio_backend)]
+            Self::Runtime(s) => s.as_mut().reset(deadline),
+            Self::Background(s) => s.reset(std_instant(deadline)),
+        }
+    }
+}
+
+/// A deadline on the background timer's clock. Only a thread with no runtime
+/// arms that timer, and there tokio's clock is the wall clock.
 #[cfg(tokio_backend)]
+fn std_instant(deadline: Instant) -> std::time::Instant {
+    deadline.into_std()
+}
+#[cfg(exec_backend)]
+fn std_instant(deadline: Instant) -> std::time::Instant {
+    deadline
+}
+
 impl Interval {
     /// Complete at the next tick. The first tick is immediate (tokio parity);
     /// callers that want to skip it await `tick()` once up front.
     pub async fn tick(&mut self) {
-        self.inner.tick().await;
+        std::future::poll_fn(|cx| self.poll_tick(cx)).await
+    }
+
+    fn poll_tick(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        if self.first {
+            self.first = false;
+            return Poll::Ready(());
+        }
+        let next = self.next;
+        let delay = self.delay.get_or_insert_with(|| TickTimer::until(next));
+        std::task::ready!(delay.poll(cx));
+        // From the previous deadline, not from now, so an overdue deadline
+        // stays in the past and the next tick bursts.
+        self.next = deadline_after(self.next, self.period);
+        delay.reset(self.next);
+        Poll::Ready(())
     }
 }
 
-/// RTEMS: the periodic ticker is the runtime-free `TimerInterval` (same
-/// immediate-first-tick + Burst catch-up semantics, same `tick()` surface).
-#[cfg(exec_backend)]
-pub type Interval = crate::runtime::background::timer_sleep::TimerInterval;
-
-/// Build a periodic ticker firing every `period` — the seam replacement for
-/// `tokio::time::interval`.
-#[cfg(tokio_backend)]
+/// Build a periodic ticker firing every `period`. A zero period panics, as
+/// `tokio::time::interval` does: it would be a ticker in a spin loop.
 pub fn interval(period: Duration) -> Interval {
+    assert!(!period.is_zero(), "`period` must be non-zero.");
     Interval {
-        inner: tokio::time::interval(period),
+        period,
+        next: deadline_from_now(period),
+        first: true,
+        delay: None,
     }
-}
-
-/// RTEMS: build the periodic ticker on the delayed-callback timer.
-#[cfg(exec_backend)]
-pub fn interval(period: Duration) -> Interval {
-    crate::runtime::background::timer_sleep::interval(&background().timer().handle(), period)
 }
 
 /// The timeout's error — "the deadline elapsed before the future completed".
@@ -4767,6 +4826,81 @@ mod tests {
         assert!(started.elapsed() >= Duration::from_millis(10));
     }
 
+    #[test]
+    fn an_interval_on_a_thread_with_no_runtime_ticks() {
+        let started = std::time::Instant::now();
+        park_on(async {
+            let mut every = interval(Duration::from_millis(10));
+            every.tick().await;
+            every.tick().await;
+            every.tick().await;
+        });
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_millis(20) && waited < Duration::from_secs(2),
+            "the re-armed third tick came two periods in (waited {waited:?})"
+        );
+    }
+
+    /// A `tick()` that loses a `select!` race is dropped mid-wait. The ticker
+    /// keeps its timer armed through that drop, so the next `tick()` arms
+    /// nothing and the deadline stays put: the per-iteration cost of a loop
+    /// that selects on it.
+    #[test]
+    fn a_dropped_tick_leaves_its_timer_armed_for_the_next() {
+        let timer = background().timer().handle();
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut every = interval(Duration::from_secs(180));
+        assert!(Box::pin(every.tick()).as_mut().poll(&mut cx).is_ready());
+        let (before, armed, due) = (
+            timer.scheduled_count(),
+            background_timer_scheduled_total(),
+            every.next,
+        );
+        for _ in 0..8 {
+            let mut t = Box::pin(every.tick());
+            assert!(t.as_mut().poll(&mut cx).is_pending());
+            drop(t);
+            assert_eq!(
+                timer.scheduled_count(),
+                before + 1,
+                "one entry, held by the ticker across dropped ticks"
+            );
+        }
+        assert_eq!(
+            background_timer_scheduled_total(),
+            armed + 1,
+            "armed once, not once per poll"
+        );
+        assert_eq!(every.next, due, "a pending poll moved the tick");
+    }
+
+    /// `MissedTickBehavior::Burst`: deadlines stay anchored at construction,
+    /// so after a stall every overdue tick is ready at once, not re-spaced a
+    /// period from now.
+    #[test]
+    fn an_interval_bursts_to_catch_up_after_a_stall() {
+        let mut cx = Context::from_waker(Waker::noop());
+        let period = Duration::from_millis(50);
+        let mut every = interval(period);
+        assert!(Box::pin(every.tick()).as_mut().poll(&mut cx).is_ready());
+        std::thread::sleep(8 * period);
+        for n in 1..=4 {
+            assert!(
+                Box::pin(every.tick()).as_mut().poll(&mut cx).is_ready(),
+                "overdue tick {n} waited"
+            );
+        }
+    }
+
+    /// tokio's contract, kept on both backends: a zero period would be a
+    /// ticker in a spin loop.
+    #[test]
+    #[should_panic(expected = "`period` must be non-zero.")]
+    fn a_zero_period_interval_is_refused() {
+        let _ = interval(Duration::ZERO);
+    }
+
     /// The other half of the same boundary: a runtime thread must still take
     /// tokio's timer, because that is the only one that moves with tokio's
     /// clock — which `#[tokio::test(start_paused = true)]` makes virtual. The
@@ -4782,6 +4916,25 @@ mod tests {
         );
         let r = timeout(Duration::from_millis(10), std::future::pending::<()>()).await;
         assert!(r.is_err());
+        assert!(
+            BACKGROUND.get().is_none(),
+            "a runtime thread armed tokio's timer, not the background one"
+        );
+    }
+
+    #[cfg(tokio_backend)]
+    #[tokio::test]
+    async fn an_interval_on_a_runtime_thread_keeps_the_runtime_s_timer() {
+        assert!(
+            BACKGROUND.get().is_none(),
+            "the premise: nothing has started the background facility yet"
+        );
+        let started = Instant::now();
+        let mut every = interval(Duration::from_millis(10));
+        every.tick().await;
+        every.tick().await;
+        every.tick().await;
+        assert!(started.elapsed() >= Duration::from_millis(20));
         assert!(
             BACKGROUND.get().is_none(),
             "a runtime thread armed tokio's timer, not the background one"

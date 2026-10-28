@@ -3471,6 +3471,36 @@ mod tests {
         assert_eq!(amem(&cell), Some(EpicsValue::Long(8)));
     }
 
+    /// Per-operation PVA creates on a busy set owe its record one
+    /// `cvt_dbaddr`, not one each (`RecordCell::cvt_resolved`).
+    #[epics_macros_rs::epics_test]
+    async fn repeated_creates_on_a_busy_set_owe_once() {
+        use crate::server::database::filters::db_channel_create;
+        use crate::server::ioc_builder::IocBuilder;
+        use crate::server::records::acalcout::AcalcoutRecord;
+        use crate::types::EpicsValue;
+        let db = IocBuilder::new()
+            .register_record_type("acalcout", || Box::new(AcalcoutRecord::new()))
+            .db_string(
+                r#"record(acalcout, "M") {}"#,
+                &std::collections::HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap()
+            .0;
+        let cell = db.get_record("M").unwrap();
+        let busy = cell.write();
+        for _ in 0..50 {
+            db_channel_create(&db, b"M.AA").unwrap();
+        }
+        let owed = cell.lock_record().set().owed.lock().unwrap().len();
+        drop(busy);
+        assert_eq!(owed, 1);
+        assert_eq!(db.get_pv("M.AMEM").unwrap(), EpicsValue::Long(8));
+    }
+
     /// Boundary `built == false`: a record adopted before `iocInit` waits on
     /// the bootstrap set, as C's null `lset` does until `dbLockInitRecords`.
     #[test]

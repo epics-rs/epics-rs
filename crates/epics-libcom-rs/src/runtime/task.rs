@@ -1354,6 +1354,31 @@ pub fn interval(period: Duration) -> Interval {
     }
 }
 
+/// A period [`interval`] accepts: a `Duration` that is not zero. A config
+/// field of this type cannot carry the zero that panics the ticker inside the
+/// task it is handed to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Period(Duration);
+
+impl Period {
+    /// `None` for a zero `period`.
+    pub const fn new(period: Duration) -> Option<Self> {
+        if period.is_zero() {
+            None
+        } else {
+            Some(Self(period))
+        }
+    }
+
+    pub const fn from_secs(secs: std::num::NonZeroU64) -> Self {
+        Self(Duration::from_secs(secs.get()))
+    }
+
+    pub const fn get(self) -> Duration {
+        self.0
+    }
+}
+
 /// The timeout's error — "the deadline elapsed before the future completed".
 ///
 /// The seam's own type on **both** backends, where the hosted half used to
@@ -4899,6 +4924,19 @@ mod tests {
     #[should_panic(expected = "`period` must be non-zero.")]
     fn a_zero_period_interval_is_refused() {
         let _ = interval(Duration::ZERO);
+    }
+
+    /// A `Period` is what `interval` accepts: zero has none, the smallest
+    /// `Duration` and the smallest whole second each have one.
+    #[test]
+    fn a_period_is_a_non_zero_duration() {
+        assert_eq!(Period::new(Duration::ZERO), None);
+        let ns = Duration::from_nanos(1);
+        assert_eq!(Period::new(ns).map(Period::get), Some(ns));
+        assert_eq!(
+            Period::from_secs(std::num::NonZeroU64::MIN).get(),
+            Duration::from_secs(1)
+        );
     }
 
     /// The other half of the same boundary: a runtime thread must still take

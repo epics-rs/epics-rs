@@ -17,11 +17,13 @@
 //! }
 //! ```
 
+use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use epics_base_rs::runtime::task::Period;
 use epics_base_rs::server::database::PvDatabase;
 use tokio::sync::RwLock;
 
@@ -142,11 +144,11 @@ pub struct GatewayConfig {
     /// include a trailing `:`. Empty disables stats (and control) PVs.
     pub stats_prefix: String,
     /// Cleanup sweep interval.
-    pub cleanup_interval: Duration,
+    pub cleanup_interval: Period,
     /// Statistics refresh interval.
-    pub stats_interval: Duration,
+    pub stats_interval: Period,
     /// Heartbeat increment interval. `None` disables the heartbeat PV.
-    pub heartbeat_interval: Option<Duration>,
+    pub heartbeat_interval: Option<Period>,
     /// Reconnect beacon-anomaly inhibit window (C `-reconnect_inhibit`,
     /// gateServer.cc:414-432). Minimum spacing between upstream-reconnect
     /// beacon anomalies. Defaults to 5 minutes
@@ -227,9 +229,9 @@ impl Default for GatewayConfig {
             timeouts: CacheTimeouts::default(),
             // Bare C `-prefix`; the `:` separator is inserted at publish.
             stats_prefix: "gateway".to_string(),
-            cleanup_interval: Duration::from_secs(10),
-            stats_interval: Duration::from_secs(10),
-            heartbeat_interval: Some(Duration::from_secs(1)),
+            cleanup_interval: Period::from_secs(NonZeroU64::new(10).unwrap()),
+            stats_interval: Period::from_secs(NonZeroU64::new(10).unwrap()),
+            heartbeat_interval: Some(Period::from_secs(NonZeroU64::MIN)),
             // C++ GATE_RECONNECT_INHIBIT default (BeaconAnomaly::new).
             reconnect_inhibit: Duration::from_secs(60 * 5),
             read_only: false,
@@ -893,7 +895,7 @@ impl GatewayServer {
         let upstream_for_cleanup = upstream.clone();
         let stats_for_cleanup = stats.clone();
         let cleanup_handle = reactor.spawn(async move {
-            let mut tick = epics_base_rs::runtime::task::interval(cleanup_interval);
+            let mut tick = epics_base_rs::runtime::task::interval(cleanup_interval.get());
             tick.tick().await; // first tick is immediate, skip
             loop {
                 tick.tick().await;
@@ -917,7 +919,7 @@ impl GatewayServer {
         let stats_for_refresh = stats.clone();
         let db_for_stats = shadow_db.clone();
         let stats_handle = reactor.spawn(async move {
-            let mut tick = epics_base_rs::runtime::task::interval(stats_interval);
+            let mut tick = epics_base_rs::runtime::task::interval(stats_interval.get());
             tick.tick().await;
             loop {
                 tick.tick().await;
@@ -934,7 +936,7 @@ impl GatewayServer {
             let stats_hb = stats.clone();
             let db_hb = shadow_db.clone();
             Some(reactor.spawn(async move {
-                let mut tick = epics_base_rs::runtime::task::interval(period);
+                let mut tick = epics_base_rs::runtime::task::interval(period.get());
                 tick.tick().await;
                 loop {
                     tick.tick().await;

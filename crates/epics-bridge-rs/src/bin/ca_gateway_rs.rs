@@ -13,11 +13,14 @@
 // lints this file in full.
 #![cfg_attr(exec_backend, allow(dead_code, unused_imports))]
 
+use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
 
+#[cfg(tokio_backend)]
+use epics_base_rs::runtime::task::Period;
 #[cfg(tokio_backend)]
 use epics_bridge_rs::ca_gateway::{GatewayConfig, GatewayServer};
 use epics_bridge_rs::ca_gateway::{PutLogScope, RestartPolicy, supervise};
@@ -139,13 +142,15 @@ struct Args {
     #[arg(long, default_value_t = 1)]
     heartbeat_interval: u64,
 
+    // Both periods feed `runtime::task::interval`, which panics on zero; C
+    // has neither option, so 0 is refused here.
     /// Cleanup interval in seconds.
-    #[arg(long, default_value_t = 10)]
-    cleanup_interval: u64,
+    #[arg(long, default_value = "10")]
+    cleanup_interval: NonZeroU64,
 
     /// Statistics refresh interval in seconds.
-    #[arg(long, default_value_t = 10)]
-    stats_interval: u64,
+    #[arg(long, default_value = "10")]
+    stats_interval: NonZeroU64,
 
     /// Upstream connect timeout in seconds (C `-connect_timeout`): how
     /// long a first search waits for the upstream IOC before the shadow
@@ -406,13 +411,9 @@ async fn async_main(args: Args) -> ExitCode {
                 .clone()
                 .unwrap_or_else(epics_bridge_rs::ca_gateway::default_stats_prefix)
         },
-        cleanup_interval: std::time::Duration::from_secs(args.cleanup_interval),
-        stats_interval: std::time::Duration::from_secs(args.stats_interval),
-        heartbeat_interval: if args.heartbeat_interval == 0 {
-            None
-        } else {
-            Some(std::time::Duration::from_secs(args.heartbeat_interval))
-        },
+        cleanup_interval: Period::from_secs(args.cleanup_interval),
+        stats_interval: Period::from_secs(args.stats_interval),
+        heartbeat_interval: NonZeroU64::new(args.heartbeat_interval).map(Period::from_secs),
         read_only: args.read_only,
         // C `cacheMode` / `-no_cache` (gateway.cc:238/1162): NoCache
         // forwards each get to the IOC and gates the upstream monitor on
@@ -487,4 +488,30 @@ fn main() -> ExitCode {
          downstream CA server need a tokio reactor. Rebuild without that \
          feature.",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Both periods feed `runtime::task::interval`, which panics on zero. C
+    /// has neither option, so 0 is a usage error and 1 is the floor.
+    #[test]
+    fn a_zero_cleanup_or_stats_interval_is_a_usage_error() {
+        for flag in ["--cleanup-interval", "--stats-interval"] {
+            let e = Args::try_parse_from(["ca-gateway-rs", flag, "0"]).expect_err(flag);
+            assert_eq!(e.kind(), clap::error::ErrorKind::ValueValidation, "{flag}");
+            assert_eq!(e.exit_code(), 2, "{flag}");
+        }
+        let args = Args::try_parse_from([
+            "ca-gateway-rs",
+            "--cleanup-interval",
+            "1",
+            "--stats-interval",
+            "1",
+        ])
+        .expect("1 s is the floor");
+        assert_eq!(u64::from(args.cleanup_interval), 1);
+        assert_eq!(u64::from(args.stats_interval), 1);
+    }
 }

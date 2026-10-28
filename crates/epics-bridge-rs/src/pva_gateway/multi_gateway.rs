@@ -77,6 +77,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use epics_base_rs::runtime::task::Period;
 use epics_pva_rs::client::PvaClient;
 use epics_pva_rs::server_native::{CompositeSource, PvaServer, PvaServerConfig};
 
@@ -123,7 +124,7 @@ struct DownstreamSpec {
 pub struct MultiTenantPvaGatewayBuilder {
     upstreams: Vec<UpstreamTenant>,
     downstreams: Vec<DownstreamSpec>,
-    cleanup_interval: Duration,
+    cleanup_interval: Period,
     connect_timeout: Duration,
     max_cache_entries: usize,
     max_subscribers: usize,
@@ -231,7 +232,7 @@ impl MultiTenantPvaGatewayBuilder {
         self
     }
 
-    pub fn cleanup_interval(mut self, d: Duration) -> Self {
+    pub fn cleanup_interval(mut self, d: Period) -> Self {
         self.cleanup_interval = d;
         self
     }

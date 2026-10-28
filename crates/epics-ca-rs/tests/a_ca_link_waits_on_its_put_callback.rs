@@ -56,14 +56,18 @@ async fn iocs() -> (Arc<PvDatabase>, Arc<PvDatabase>) {
         .build()
         .await
         .expect("target CA server");
-    let port = server.udp_port();
+    let port = server.tcp_port();
     let remote = server.database().clone();
     tokio::spawn(async move { server.run().await });
+    // Reached over a name server, not a UDP search: a later same-user fanout
+    // socket on 127.0.0.1 (pvxs `Config::isolated` binds 127.0.0.1:0 with
+    // SO_REUSEPORT set first) can take the search port and swallow every
+    // SEARCH, while the TCP listener cannot be shared.
     // SAFETY: `#[serial(epics_env)]` keeps every env-touching test apart.
     unsafe {
-        std::env::set_var("EPICS_CA_ADDR_LIST", format!("127.0.0.1:{port}"));
+        std::env::set_var("EPICS_CA_NAME_SERVERS", format!("127.0.0.1:{port}"));
+        std::env::set_var("EPICS_CA_ADDR_LIST", "");
         std::env::set_var("EPICS_CA_AUTO_ADDR_LIST", "NO");
-        std::env::set_var("EPICS_CA_SERVER_PORT", port.to_string());
     }
     let reactor = epics_base_rs::runtime::task::Reactor::current().expect("test runtime");
     let ioc = IocBuilder::new()

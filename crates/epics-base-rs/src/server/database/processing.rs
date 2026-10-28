@@ -1386,6 +1386,18 @@ impl AsyncDbHandle {
         super::CaClientContext::from_weak(self.inner.clone())
     }
 
+    /// The database's `recDynLink` queues and their threads. `None` once
+    /// the database is gone.
+    pub(crate) fn rec_dyn_links(&self) -> Option<Arc<crate::server::rec_dyn_link::RecDynLinks>> {
+        let inner = self.inner.upgrade()?;
+        let links = inner.rec_dyn_links.get_or_init(|| {
+            Arc::new(crate::server::rec_dyn_link::RecDynLinks::new(
+                self.ca_client(),
+            ))
+        });
+        Some(links.clone())
+    }
+
     /// C `dbScanLock`, the record's own code, `dbScanUnlock`, from a thread
     /// that holds no record: asynRecord's `exceptCallback` (asynRecord.c:911-916).
     /// The marks `f` leaves are posted under the same hold. A no-op if the

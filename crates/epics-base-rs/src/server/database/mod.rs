@@ -966,6 +966,8 @@ struct PvDatabaseInner {
     /// record's advisory write gate, exactly as `dbCaTask` does
     /// (`dbCa.c:1093-1260`). See [`link_put_queue`].
     link_puts: Arc<link_put_queue::LinkPutQueue>,
+    /// `recDynInp` and `recDynOut`, made by the first `recDynLink` add.
+    rec_dyn_links: std::sync::OnceLock<Arc<crate::server::rec_dyn_link::RecDynLinks>>,
     /// True once the ScanScheduler has been started for this DB.
     /// Prevents duplicate scan tasks when multiple protocol servers (CA + PVA)
     /// both try to start scanning on the same DB.
@@ -1574,6 +1576,7 @@ impl PvDatabase {
                     link_sets: SnapshotCell::new(link_sets),
                     ca_links,
                     link_puts: Arc::new(link_put_queue::LinkPutQueue::default()),
+                    rec_dyn_links: std::sync::OnceLock::new(),
                     records: RecursiveReadLock::new(HashMap::new()),
                     record_table: record_table::RecordTable::default(),
                     scan_index: scan_index::ScanIndex::new(),

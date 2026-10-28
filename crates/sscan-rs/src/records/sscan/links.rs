@@ -18,7 +18,7 @@ use crate::rec_dyn_link::{
     ACCESS_READ, ACCESS_WRITE, CaType, Deliver, FATAL_ERROR, Io, LinkEvent, LinkHost, LinkSpec,
 };
 
-/// Link events in arrival order. A link task records its event here without
+/// Link events in arrival order. A `recDynLink` thread records an event here without
 /// the record's lock, then applies the queue under it; `special`, which runs
 /// under that lock, applies it itself while it waits for a connect.
 #[derive(Default)]
@@ -56,9 +56,10 @@ impl Inbox {
 use super::*;
 
 impl SscanRecord {
-    /// The closure a link's task hands its events to: queued, then applied
-    /// under the record's lock from a callback worker, so the link reactor
-    /// never waits on that lock and keeps feeding a `special` that holds it.
+    /// The closure a link's events are handed to: queued, then applied
+    /// under the record's lock from a callback worker, so the `recDynLink`
+    /// threads never wait on that lock and keep feeding a `special` that
+    /// holds it.
     fn deliver(&self, li: usize) -> Option<Deliver> {
         let h = self.handle.clone()?;
         let name = self.name.clone();
@@ -673,7 +674,7 @@ mod tests {
         });
         let h = db.async_handle();
         let (done, waited) = tokio::sync::oneshot::channel();
-        // Off this runtime, which may be the one the link's task runs on.
+        // Off this runtime, which may be the one a network link runs on.
         std::thread::spawn(move || {
             with_sscan(&h, "S", |s: &mut SscanRecord, own| {
                 s.pvn[T1_OUT] = PvString::from_bytes(b"M");

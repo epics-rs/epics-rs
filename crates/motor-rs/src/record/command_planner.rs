@@ -1848,12 +1848,14 @@ impl MotorRecord {
     }
 
     /// Whether `build_trans` would queue a GET_INFO: it returns ERROR with
-    /// no device, or, devMotorAsyn's, with the record in COMM_ALARM
-    /// (devMotorAsyn.c:530-532).
+    /// no device or no card (devESP300.cc:182-184), or, devMotorAsyn's, with
+    /// the record in COMM_ALARM (devMotorAsyn.c:530-532).
     fn can_get_info(&self) -> bool {
-        self.device_state.as_ref().is_some_and(|state| {
-            !self.internal.comm_alarm || state.lock().is_ok_and(|ds| !ds.refuses_in_comm_alarm())
-        })
+        self.port.as_ref().is_none_or(|port| port.builds())
+            && self.device_state.as_ref().is_some_and(|state| {
+                !self.internal.comm_alarm
+                    || state.lock().is_ok_and(|ds| !ds.refuses_in_comm_alarm())
+            })
     }
 
     /// C's STUP GET_INFO, both sites (1819-1829, 2550-2558): STUP goes BUSY

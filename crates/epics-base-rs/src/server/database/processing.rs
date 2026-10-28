@@ -8717,9 +8717,18 @@ impl PvDatabase {
                                     Ok(WriteStart::Completed) => false,
                                     // C prints nothing for a failed `write_ao`
                                     // (`aoRecord.c:565`, `dbAccess.c:612`).
-                                    Ok(WriteStart::Synchronous) => dev
-                                        .write_common(&mut *instance.record, &mut instance.common)
-                                        .is_err(),
+                                    Ok(WriteStart::Synchronous) => {
+                                        let failed = dev
+                                            .write_common(
+                                                &mut *instance.record,
+                                                &mut instance.common,
+                                            )
+                                            .is_err();
+                                        if facts.device_posts {
+                                            instance.post_device_values(dev.take_device_posts());
+                                        }
+                                        failed
+                                    }
                                     Err(_) => true,
                                 };
                                 if write_failed {

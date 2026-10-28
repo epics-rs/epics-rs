@@ -494,9 +494,9 @@ enum Failure {
         addr: i32,
         num_axes: i32,
     },
-    /// `motor_init_record_com`'s four refusals.
+    /// `motor_init_record_com`'s refusals but the missing card, whose
+    /// record [`MotorDeviceSupport::no_card`] keeps.
     BadBus,
-    NoCard,
     NoSignal,
     InUse,
     /// devMotorSim's three refusals: OUT not VME_IO, no drvet by the parm's
@@ -582,15 +582,13 @@ fn bind_model1(device: &'static str, out: &str) -> Result<MotorDeviceSupport, Fa
     let ParsedLink::Hw(HwLink::VmeIo { card, signal, parm }) = parse_link_v2(out) else {
         return Err(Failure::BadBus);
     };
-    let card = i32::from(card);
-    let support =
-        take(Controller::Card { device, card }, i32::from(signal)).map_err(
-            |taken| match taken {
-                Taken::NoController => Failure::NoCard,
-                Taken::NoAxis => Failure::NoSignal,
-                Taken::InUse => Failure::InUse,
-            },
-        )?;
+    let (card, signal) = (i32::from(card), i32::from(signal));
+    let support = match take(Controller::Card { device, card }, signal) {
+        Ok(support) => support,
+        Err(Taken::NoController) => return Ok(MotorDeviceSupport::no_card(device, card, signal)),
+        Err(Taken::NoAxis) => return Err(Failure::NoSignal),
+        Err(Taken::InUse) => return Err(Failure::InUse),
+    };
     support.send_out_parm(parm);
     Ok(support)
 }
@@ -774,7 +772,6 @@ impl DeviceSupport for Unbound {
                 failed_init(record, false);
                 return Err(CaError::InvalidValue(message.into()));
             }
-            Failure::NoCard => "motor_init_record_com(): card does not exist!",
             Failure::NoSignal => "motor_init_record_com(): signal does not exist!",
             Failure::InUse => "motor_init_record_com(): motor already in use!",
         };

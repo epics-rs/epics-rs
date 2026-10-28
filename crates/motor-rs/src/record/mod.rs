@@ -6,16 +6,17 @@ mod state_machine;
 mod status_update;
 
 use epics_base_rs::error::CaResult;
+use epics_base_rs::server::device_support::DevicePost;
 use epics_base_rs::server::record::{
-    CycleMarks, CyclePostMask, FieldDesc, FieldIx, LinkType, MonitorValueClasses, MonitorValueGate,
-    ParsedLink, ProcessAction, ProcessActions, ProcessOutcome, Record, ResolvedInputLinks,
-    load_constant_link_scalar, parse_link_v2,
+    CycleMarks, CyclePostMask, EventMask, FieldDesc, FieldIx, LinkType, MonitorValueClasses,
+    MonitorValueGate, ParsedLink, ProcessAction, ProcessActions, ProcessOutcome, Record,
+    ResolvedInputLinks, load_constant_link_scalar, parse_link_v2,
 };
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
 use crate::coordinate;
 use crate::device_state::*;
-use crate::device_support::{DialLimitReset, LimitBuild};
+use crate::device_support::{DialLimitReset, EndTrans, LimitBuild};
 use crate::fields::*;
 use crate::flags::*;
 
@@ -271,7 +272,10 @@ impl MotorRecord {
             return false;
         };
         if let Some(port) = &self.port {
-            port.send(commands, false);
+            let end = port.send(commands, false);
+            if let Some(post) = self.end_trans(end) {
+                self.internal.put_post_values.push_back(post);
+            }
         }
         true
     }
@@ -290,6 +294,26 @@ impl MotorRecord {
         self.port
             .as_ref()
             .is_some_and(|port| port.send_init(commands))
+    }
+
+    /// What `motor_end_trans_com` did to the record (motordevCom.cc:497-508):
+    /// with no card it sets DMOV and RA_PROBLEM, and posts DMOV there and
+    /// then, outside `monitor()`. The post is returned for the caller's
+    /// context to make: the device's in a pass, the put's in `special()`.
+    #[must_use]
+    pub(crate) fn end_trans(&mut self, end: EndTrans) -> Option<DevicePost> {
+        match end {
+            EndTrans::Passed => None,
+            EndTrans::NoCard => {
+                self.stat.dmov = 1;
+                self.stat.msta.insert(MstaFlags::PROBLEM);
+                Some(DevicePost {
+                    field: "DMOV",
+                    mask: EventMask::VALUE | EventMask::LOG,
+                    value: EpicsValue::Short(self.stat.dmov),
+                })
+            }
+        }
     }
 
     /// C `set_dial_highlimit`/`set_dial_lowlimit` (4236-4325): send the
@@ -945,6 +969,13 @@ impl Record for MotorRecord {
             std::mem::take(&mut self.internal.put_posted)
         };
         CycleMarks::of(&MONITOR_POSTS, u128::from(bits))
+    }
+
+    fn take_cycle_posted_value(&mut self) -> Option<(FieldIx, EventMask, EpicsValue)> {
+        let post = self.internal.put_post_values.pop_front()?;
+        let [ix] =
+            epics_base_rs::server::record::declared_set(dbd_generated::MOTOR_FIELDS, [post.field]);
+        Some((ix, post.mask, post.value))
     }
 
     /// C `monitor()`'s RBV (motorRecord.cc:3468-3507): posted only when

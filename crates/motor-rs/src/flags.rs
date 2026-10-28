@@ -565,6 +565,48 @@ impl MotorCommand {
         )
     }
 
+    /// Whether this command closes its C transaction: every INIT_MSG ..
+    /// SEND_MSG in motorRecord.cc, and each of motordevCom.cc's init
+    /// transactions (:326-376), carries one such command, after the speed
+    /// writes, CDIR and PREM/POST it reads.
+    pub fn ends_transaction(&self) -> bool {
+        match self {
+            Self::SetVelocity { .. }
+            | Self::SetVelBase { .. }
+            | Self::SetAccel { .. }
+            | Self::MoveDirection { .. }
+            | Self::MoveStrings { .. }
+            | Self::RecordFields(_) => false,
+            Self::MoveAbsolute { .. }
+            | Self::MoveRelative { .. }
+            | Self::MoveVelocity { .. }
+            | Self::JogVelocity { .. }
+            | Self::Home { .. }
+            | Self::MoveToHome
+            | Self::Stop { .. }
+            | Self::SetPosition { .. }
+            | Self::InitPosition { .. }
+            | Self::SetEncoderPosition { .. }
+            | Self::SetEncoderRatio { .. }
+            | Self::InitEncoderRatio { .. }
+            | Self::SetClosedLoop { .. }
+            | Self::DeferMoves { .. }
+            | Self::Poll
+            | Self::OutParm { .. }
+            | Self::Primitive { .. }
+            | Self::ProfileInitialize { .. }
+            | Self::ProfileDefine { .. }
+            | Self::ProfileBuild
+            | Self::ProfileExecute
+            | Self::ProfileAbort
+            | Self::ProfileReadback
+            | Self::SetPidGain { .. }
+            | Self::SetHighLimit { .. }
+            | Self::SetLowLimit { .. }
+            | Self::Driver(_) => true,
+        }
+    }
+
     /// The ratio an encoder-ratio write carries.
     pub fn encoder_ratio(&self) -> Option<f64> {
         match *self {

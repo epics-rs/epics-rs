@@ -1090,8 +1090,8 @@ pub trait DeviceSupport: Send + Sync + 'static {
     }
 
     /// Whether this device posts monitors itself: after `init_common`,
-    /// `get_ioint_info`, `io_intr_callback` and `write_begin_common` the
-    /// record's holder posts
+    /// `get_ioint_info`, `io_intr_callback`, `write_begin_common` and
+    /// `write_common` the record's holder posts
     /// [`Self::take_device_posts`] while it still holds the record, before
     /// the record's own `monitor()`. A process cycle reads it when the
     /// record's cycle plan is resolved, so `false` costs a cycle nothing.

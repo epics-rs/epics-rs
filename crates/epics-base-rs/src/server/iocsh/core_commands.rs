@@ -2136,7 +2136,7 @@ mod tests {
 
     /// C `date "%Q"` prints `%Q`: `strftime` copies an unknown conversion
     /// out and cannot fail. Measured against
-    /// `~/work/epics-base/bin/linux-x86_64/softIoc`; the port panicked the
+    /// `$EPICS_BASE/bin/linux-x86_64/softIoc`; the port panicked the
     /// shell thread instead.
     #[test]
     fn an_unknown_conversion_prints_itself_instead_of_panicking() {

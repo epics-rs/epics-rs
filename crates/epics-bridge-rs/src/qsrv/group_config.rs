@@ -1,7 +1,7 @@
 //! Group PV JSON configuration parser.
 //!
 //! Parses C++ QSRV-compatible group definitions from JSON.
-//! See `~/epics-base/modules/pva2pva/pdbApp/configparse.cpp` for the
+//! See `$EPICS_BASE/modules/pva2pva/pdbApp/configparse.cpp` for the
 //! original C++ parser.
 //!
 //! # JSON format

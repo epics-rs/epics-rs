@@ -26,12 +26,14 @@
 //! the pair boots, the denominator is the `.dbd` surface, an unmeasured channel
 //! is an ERROR, and at least one channel can reach AGREED.
 //!
-//! Requires the built pvxs tree (`PVXS_BIN`, or the default path). If it is
-//! absent the tests fail loudly rather than skipping — a silently skipped
-//! oracle is exactly the false-clean this project exists to escape.
+//! Requires the built pvxs tree (`PVXS_BIN`, `EPICS_ORACLE_PVX_IOC_BIN`) and
+//! the fat dbd (`EPICS_ORACLE_DBD`). If one is absent the tests fail loudly
+//! rather than skipping — a silently skipped oracle is exactly the
+//! false-clean this project exists to escape.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 
 use epics_oracle_rs::dbd::Dbd;
 use epics_oracle_rs::diff::Verdict;
@@ -49,8 +51,12 @@ const RT: &str = "bi";
 fn tools() -> PvxTools {
     PvxTools::discover().expect(
         "the pvxs tree must be built for the PVA oracle to have ground truth; \
-         set PVXS_BIN if it is not at the default path",
+         set PVXS_BIN and EPICS_ORACLE_PVX_IOC_BIN",
     )
+}
+
+fn dbd_path() -> PathBuf {
+    CTools::dbd_path().expect("set EPICS_ORACLE_DBD to the fat dbd")
 }
 
 /// The surface restricted to one record type, built from the **real** `.dbd`.
@@ -60,7 +66,7 @@ fn tools() -> PvxTools {
 /// denominator under test is still the `.dbd`'s — that is the claim being
 /// pinned — just narrowed to the one type these tests can afford to boot.
 fn surface_of(record_type: &str) -> Surface {
-    let dbd = Dbd::parse_file(&CTools::dbd_path()).unwrap_or_else(|e| {
+    let dbd = Dbd::parse_file(&dbd_path()).unwrap_or_else(|e| {
         panic!("the fat dbd must be readable for the denominator to exist: {e}")
     });
     let supported: BTreeSet<String> = [record_type.to_string()].into_iter().collect();
@@ -87,7 +93,7 @@ fn sweep_fields(record_type: &str, keep: &[&str]) -> (Surface, PvaReport) {
 /// One `recordtype(...)` block from the fat `.dbd`, carrying only `keep`'s
 /// fields — verbatim, so every type, size and `special` is the real one.
 fn trimmed_recordtype(record_type: &str, keep: &[&str]) -> String {
-    let text = std::fs::read_to_string(CTools::dbd_path()).expect("the fat dbd must be readable");
+    let text = std::fs::read_to_string(dbd_path()).expect("the fat dbd must be readable");
     let head = format!("recordtype({record_type}) {{");
     let start = text
         .find(&head)
@@ -149,7 +155,7 @@ fn sweep_surface(record_type: &str, surface: Surface) -> (Surface, PvaReport) {
         &mut allowlist,
     );
     let report = pvaread::report(
-        &CTools::dbd_path().display().to_string(),
+        &dbd_path().display().to_string(),
         &surface,
         cases,
         &allowlist,

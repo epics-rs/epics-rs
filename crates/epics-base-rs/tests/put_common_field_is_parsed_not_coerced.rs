@@ -14,7 +14,7 @@
 //! # The put-notify subtlety (measured against the compiled softIoc)
 //!
 //! For a REJECTED PROC conversion the two CA put paths DIFFER, and it is not a
-//! guess — both were run against `/home/stevek/work/epics-base`:
+//! guess — both were run against `$EPICS_BASE`:
 //!
 //! ```text
 //! caput    T:AI.PROC 256   -> "write request failed"; STAT=UDF   (dbPutField: no process)

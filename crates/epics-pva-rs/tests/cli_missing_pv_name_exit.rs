@@ -3,7 +3,7 @@
 //! clap exits 2 on a usage error. No pvAccess tool does — and the three
 //! that check for a missing PV name check it themselves rather than
 //! leaving it to `getopt`, so the message is theirs too. Captured from
-//! `/home/stevek/work/epics-base/bin/linux-x86_64`:
+//! `$EPICS_BASE/bin/linux-x86_64`:
 //!
 //! ```text
 //! $ pvget      ; echo $?     ->            0

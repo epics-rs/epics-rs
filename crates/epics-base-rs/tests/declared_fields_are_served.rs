@@ -12,7 +12,7 @@
 //! join. It walks every declared field of every record type and demands the port
 //! answer for it.
 //!
-//! Measured against `/home/stevek/work/epics-base/bin/linux-x86_64/softIoc`:
+//! Measured against `$EPICS_BASE/bin/linux-x86_64/softIoc`:
 //!
 //! ```text
 //! record(mbbi, "T:MBBI")  { }                      caget T:MBBI.SDEF  -> 0

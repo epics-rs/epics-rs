@@ -1646,7 +1646,7 @@ mod adjudicate_tests {
     fn a_put_that_never_reached_a_server_is_an_error_not_a_refusal() {
         let tools = CTools::discover().expect(
             "the C EPICS tree must be built for the oracle to have ground truth; \
-             set EPICS_BASE_BIN if it is not at the default path",
+             set EPICS_BASE_BIN and EPICS_ORACLE_IOC_BIN",
         );
         let dead_claim = crate::ioc::claim_port().expect("a port to aim at");
         let dead = dead_claim.port();
@@ -1780,7 +1780,7 @@ recordtype(ai) {
         let surface = Surface::build(&dbd, &types);
         let tools = CTools::discover().expect(
             "the C EPICS tree must be built for the oracle to have ground truth; \
-             set EPICS_BASE_BIN if it is not at the default path",
+             set EPICS_BASE_BIN and EPICS_ORACLE_IOC_BIN",
         );
         let runner = Runner::new(tools, dbd, workdir(None).expect("workdir"));
 

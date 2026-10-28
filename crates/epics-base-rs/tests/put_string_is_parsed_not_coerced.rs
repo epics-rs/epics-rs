@@ -26,7 +26,7 @@
 //! # Ground truth
 //!
 //! Every expectation below was MEASURED against the compiled softIoc
-//! (`/home/stevek/work/epics-base/bin/linux-x86_64`), `caput -c` followed by
+//! (`$EPICS_BASE/bin/linux-x86_64`), `caput -c` followed by
 //! `caget`; none was computed by hand.
 //!
 //! ```text

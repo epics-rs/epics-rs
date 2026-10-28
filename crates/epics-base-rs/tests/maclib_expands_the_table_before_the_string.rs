@@ -24,7 +24,7 @@
 //!     translates the raw value again, under the STRING's seat.
 //!
 //! Every expected byte below was captured from `softIoc` built from
-//! `~/work/epics-base` (`R7.0.10`), loading a `.substitutions` that carries
+//! `$EPICS_BASE` (`R7.0.10`), loading a `.substitutions` that carries
 //! the macro definitions raw into `dbLoadRecords` and a `.db` whose
 //! `field(DESC, …)` is split across lines so the loader echoes back what it
 //! refused to set. The strings passed here are those `.db` lines verbatim,

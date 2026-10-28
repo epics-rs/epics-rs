@@ -15,7 +15,7 @@
 //! `AMIN(AA[1,3])` answered 0 (a tail zero) where C answers 20.
 //!
 //! Every expectation below is the output of a driver compiled from
-//! `/home/stevek/work/epics-modules/calc/calcApp/src/{aCalcPerform,aCalcPostfix,calcUtil}.c`.
+//! `$EPICS_MODULES/calc/calcApp/src/{aCalcPerform,aCalcPostfix,calcUtil}.c`.
 
 use epics_base_rs::calc::{ArrayInputs, ArrayStackValue, acalc};
 

@@ -2,7 +2,7 @@
 //! and edge-case input.
 //!
 //! Every expectation here is MEASURED, not derived: each script was run
-//! through `~/work/epics-base/bin/linux-x86_64/softIoc`
+//! through `$EPICS_BASE/bin/linux-x86_64/softIoc`
 //! (R7.0.10-146-g8f5015b663d764ad75df) with stdin on `/dev/null`, and the
 //! bytes below are that run's two streams with the ANSI colour stripped
 //! and `softMain`'s trailing interactive prompt removed — `softMain.cpp`

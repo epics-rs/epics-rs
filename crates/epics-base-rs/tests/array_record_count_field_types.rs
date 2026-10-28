@@ -22,7 +22,7 @@
 //! `dbDBRnewToDBRold[DBR_ULONG] = DBR_DOUBLE`).
 //!
 //! Ground truth — `cainfo` against the compiled softIoc
-//! (`/home/stevek/work/epics-base/bin/linux-x86_64`):
+//! (`$EPICS_BASE/bin/linux-x86_64`):
 //!
 //! ```text
 //! WF.NELM  DBF_DOUBLE     SA.NELM  DBF_DOUBLE     CMP.NSAM  DBF_DOUBLE

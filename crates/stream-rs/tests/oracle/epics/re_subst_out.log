@@ -1,5 +1,5 @@
 -	drvStreamInit()
--	StreamProtocolParser::path = /home/stevek/work/_tgt/reviewer6/pcre/crates/stream-rs/tests/oracle/epics
+-	StreamProtocolParser::path = <dir>
 _main_	streamInitRecord(rec): SEVR=0
 _main_	streamInitRecord(rec): create new Stream object
 _main_	streamInitRecord(rec): calling initRecord

@@ -11,7 +11,7 @@
 //! afterwards, which cannot express any of that: every definition saw the same
 //! enclosing scope, so a forward reference silently read the OUTER value.
 //!
-//! Measured on `softIoc` built from `~/work/epics-base` (`R7.0.10`), with an
+//! Measured on `softIoc` built from `$EPICS_BASE` (`R7.0.10`), with an
 //! outer `A=outer` supplied to `dbLoadRecords`. The value is read back out of a
 //! numeric field, because a `.db` that loads cleanly prints nothing at all:
 //!

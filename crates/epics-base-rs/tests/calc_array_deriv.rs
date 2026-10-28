@@ -14,7 +14,7 @@
 //! where C fits 5, and no expression agreed with C except on a straight line.
 //!
 //! Every expectation below is the output of a driver compiled from
-//! `/home/stevek/work/epics-modules/calc/calcApp/src/{aCalcPerform,aCalcPostfix,calcUtil}.c`.
+//! `$EPICS_MODULES/calc/calcApp/src/{aCalcPerform,aCalcPostfix,calcUtil}.c`.
 
 use epics_base_rs::calc::{ArrayInputs, ArrayStackValue, CalcError, acalc};
 

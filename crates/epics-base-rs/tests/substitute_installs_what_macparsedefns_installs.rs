@@ -12,7 +12,7 @@
 //! (`macUtil.c:199-227`).
 //!
 //! Four rules of that round trip this port did not have. Measured with
-//! `msi` built from `~/work/epics-base` (`R7.0.10`):
+//! `msi` built from `$EPICS_BASE` (`R7.0.10`):
 //!
 //! | `substitute` line | msi | this port, before |
 //! |---|---|---|

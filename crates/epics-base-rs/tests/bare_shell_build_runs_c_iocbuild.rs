@@ -23,7 +23,7 @@
 //! The port's `NotOurs` arm — every `CaServerBuilder` binary and every bare
 //! `PvDatabase` shell — closed the record load and returned, leaving
 //! `iocState` at `iocVoid`. Measured against
-//! `~/work/epics-base/bin/linux-x86_64/softIoc`, that lost the whole
+//! `$EPICS_BASE/bin/linux-x86_64/softIoc`, that lost the whole
 //! lifecycle: `iocBuild` then `iocRun` answered `iocRun: WARNING IOC not
 //! paused` where C answers `iocRun: All initialization complete`; a second
 //! `iocBuild` was accepted where C refuses it; `iocPause` after `iocInit`

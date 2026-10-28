@@ -6,7 +6,7 @@ Displays the beam profile from the NDStdArrays plugin and
 key simulation readback PVs.
 
 Usage:
-    /Users/stevek/mamba/envs/bs2026.1/bin/python pydm_viewer.py
+    python pydm_viewer.py    # a Python with pydm
 """
 
 import os

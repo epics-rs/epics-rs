@@ -67,9 +67,10 @@ enum Phase {
     about = "Differential oracle: boots the C softIoc and the Rust IOC on the same .db and diffs observable CA behavior"
 )]
 struct Args {
-    /// The expanded dbd that supplies the denominator.
-    #[arg(long, default_value_os_t = CTools::dbd_path())]
-    dbd: PathBuf,
+    /// The expanded dbd that supplies the denominator (default:
+    /// `EPICS_ORACLE_DBD`).
+    #[arg(long)]
+    dbd: Option<PathBuf>,
 
     /// Which probes to run.
     #[arg(long, value_enum, default_value_t = Phase::All)]
@@ -92,6 +93,15 @@ struct Args {
     /// Expected-deviation allowlist (defaults to the shipped file).
     #[arg(long)]
     allowlist: Option<PathBuf>,
+}
+
+impl Args {
+    fn dbd(&self) -> Result<PathBuf, String> {
+        match &self.dbd {
+            Some(path) => Ok(path.clone()),
+            None => CTools::dbd_path().map_err(|e| e.to_string()),
+        }
+    }
 }
 
 #[tokio::main]
@@ -118,7 +128,8 @@ async fn run() -> Result<ExitCode, String> {
     // Ground truth must exist. Without it there is nothing to diff against, and
     // pretending otherwise would be the worst possible failure mode.
     let tools = CTools::discover().map_err(|e| e.to_string())?;
-    let dbd = Dbd::parse_file(&args.dbd)?;
+    let dbd_path = args.dbd()?;
+    let dbd = Dbd::parse_file(&dbd_path)?;
 
     let mut allowlist = match &args.allowlist {
         Some(p) => Allowlist::load(p)?,
@@ -222,7 +233,7 @@ async fn run() -> Result<ExitCode, String> {
 
     let report = Report {
         denominator: Denominator {
-            dbd: args.dbd.display().to_string(),
+            dbd: dbd_path.display().to_string(),
             record_types_in_dbd: surface.covered_types.len() + surface.unimplemented_types.len(),
             record_types_covered: surface.covered_types.clone(),
             record_types_unimplemented: surface.unimplemented_types.clone(),
@@ -282,7 +293,8 @@ async fn run_pva_read(args: &Args) -> Result<ExitCode, String> {
     // Ground truth must exist. Without it there is nothing to diff against, and
     // pretending otherwise would be the worst possible failure mode.
     let tools = PvxTools::discover().map_err(|e| e.to_string())?;
-    let dbd = Dbd::parse_file(&args.dbd)?;
+    let dbd_path = args.dbd()?;
+    let dbd = Dbd::parse_file(&dbd_path)?;
 
     // Which record types the port implements is MEASURED, not read out of its
     // source -- the same probe the CA phases use, for the same reason.
@@ -307,7 +319,7 @@ async fn run_pva_read(args: &Args) -> Result<ExitCode, String> {
     // as the deviation having stopped.
     allowlist.note_types_driven(&types, &surface.covered_types);
     let cases = pvaread::probe(&tools, &workdir(None)?, &surface, &types, &mut allowlist);
-    let report = pvaread::report(&args.dbd.display().to_string(), &surface, cases, &allowlist);
+    let report = pvaread::report(&dbd_path.display().to_string(), &surface, cases, &allowlist);
     report.counts.check()?;
 
     if let Some(p) = &args.json {
@@ -327,7 +339,8 @@ async fn run_pva_read(args: &Args) -> Result<ExitCode, String> {
 async fn run_pva_monitor(args: &Args) -> Result<ExitCode, String> {
     // Ground truth must exist. Without it there is nothing to diff against.
     let tools = PvxTools::discover().map_err(|e| e.to_string())?;
-    let dbd = Dbd::parse_file(&args.dbd)?;
+    let dbd_path = args.dbd()?;
+    let dbd = Dbd::parse_file(&dbd_path)?;
 
     epics_base_rs::stderr_println!("probing which record types the port implements...");
     let supported = probe_supported_record_types(&dbd).await?;
@@ -350,7 +363,7 @@ async fn run_pva_monitor(args: &Args) -> Result<ExitCode, String> {
     // as the deviation having stopped.
     allowlist.note_types_driven(&types, &surface.covered_types);
     let cases = pvamonitor::probe(&tools, &workdir(None)?, &surface, &types, &mut allowlist);
-    let report = pvamonitor::report(&args.dbd.display().to_string(), &surface, cases, &allowlist);
+    let report = pvamonitor::report(&dbd_path.display().to_string(), &surface, cases, &allowlist);
     report.counts.check()?;
 
     if let Some(p) = &args.json {

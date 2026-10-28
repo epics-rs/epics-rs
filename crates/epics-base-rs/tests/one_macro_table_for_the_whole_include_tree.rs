@@ -13,7 +13,7 @@
 //! This port built a `MacroTable` per LINE inside `expand_includes_inner`
 //! and kept a per-file `HashMap` copy of the macros beside it. Four things
 //! followed, all measured against `softIoc`/`msi` built from
-//! `~/work/epics-base` (`R7.0.10`):
+//! `$EPICS_BASE` (`R7.0.10`):
 //!
 //! | shape | C | this port, before |
 //! |---|---|---|

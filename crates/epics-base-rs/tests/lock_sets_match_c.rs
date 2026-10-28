@@ -2,7 +2,7 @@
 //! per record.
 //!
 //! GROUND TRUTH — the built C `softIoc` (7.0.10.1-DEV,
-//! `/home/stevek/work/epics-base/bin/linux-x86_64/softIoc`) on
+//! `$EPICS_BASE/bin/linux-x86_64/softIoc`) on
 //!
 //! ```text
 //! record(calc, "R:A") { field(INPA, "R:B") field(CALC, "A+1") field(FLNK, "R:B") }

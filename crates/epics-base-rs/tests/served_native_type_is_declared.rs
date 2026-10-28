@@ -15,7 +15,7 @@
 //! update is a protocol violation even if each half is individually plausible.
 //!
 //! `tests/fixtures/c_native_types.tsv` is measured, not derived: `cainfo`
-//! against `/home/stevek/work/epics-base/bin/linux-x86_64/softIoc`. See its
+//! against `$EPICS_BASE/bin/linux-x86_64/softIoc`. See its
 //! header for the instantiation the array records were probed under. Where the
 //! port and the fixture disagree, the port is wrong.
 

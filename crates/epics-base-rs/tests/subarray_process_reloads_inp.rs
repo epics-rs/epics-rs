@@ -23,7 +23,7 @@
 //! (R15-78) — so INDX was inert on exactly the two configurations C documents.
 //!
 //! Every expectation below was taken from a built softIoc
-//! (`/home/stevek/work/epics-base/bin/linux-x86_64/softIoc`) driving the same
+//! (`$EPICS_BASE/bin/linux-x86_64/softIoc`) driving the same
 //! record definitions over CA.
 
 use epics_base_rs::server::ioc_builder::IocBuilder;

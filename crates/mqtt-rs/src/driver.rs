@@ -913,7 +913,7 @@ mod tests {
     /// `*nbytesTransferred` for an embedded-NUL octet write.
     ///
     /// C, at the declared autoparam pin (`v2.1.0`, `2159559`,
-    /// `/home/stevek/work/epics-modules/autoparamDriver`):
+    /// `$EPICS_MODULES/autoparamDriver`):
     /// `Autoparam::Driver::writeOctet` (`autoparamDriver.cpp:1484-1500`) sets
     /// `*nActual = nChars` **unconditionally** at `:1495`, commented "Only
     /// complete writes are supported" (`:1494`), *before* it dispatches to the

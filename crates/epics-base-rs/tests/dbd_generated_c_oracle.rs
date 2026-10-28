@@ -8,7 +8,7 @@
 //!
 //! `tests/fixtures/c_native_types.tsv` is *measured*: it is `cainfo` run against
 //! every field of every base record type on
-//! `/home/stevek/work/epics-base/bin/linux-x86_64/softIoc`. See its header for
+//! `$EPICS_BASE/bin/linux-x86_64/softIoc`. See its header for
 //! the instantiation (NELM=10, FTVL=DOUBLE, ...) the array records were probed
 //! under. If the generator and this fixture disagree, the generator is wrong —
 //! the fixture is what C serves.

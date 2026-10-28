@@ -15,8 +15,8 @@
 # Requires EPICS_BASE and EPICS_MODULES to point at the C reference trees.
 set -uo pipefail
 
-BASE=${EPICS_BASE:-/home/stevek/work/epics-base}
-MODULES=${EPICS_MODULES:-/home/stevek/work/epics-modules}
+BASE=${EPICS_BASE:?set EPICS_BASE to the built C epics-base}
+MODULES=${EPICS_MODULES:?set EPICS_MODULES to the C module tree}
 C_IOC=$BASE/bin/linux-x86_64/softIoc
 R_IOC=${R_IOC:-$PWD/target/debug/softioc-rs}
 

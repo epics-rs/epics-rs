@@ -7,7 +7,7 @@
 //! is no encoding in C for "the record states no limit".
 //!
 //! This port's `Snapshot` has one — NaN — and it was reaching the renderer.
-//! Measured against `~/work/epics-base/bin/linux-x86_64/softIoc` on a record
+//! Measured against `$EPICS_BASE/bin/linux-x86_64/softIoc` on a record
 //! with no alarm limits, C prints
 //!
 //! ```text

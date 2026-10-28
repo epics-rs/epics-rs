@@ -24,7 +24,7 @@
 //! looks at it again.
 //!
 //! Every expected byte below was captured from `softIoc` built from
-//! `~/work/epics-base` (`R7.0.10`), loading these exact files. ANSI is stripped
+//! `$EPICS_BASE` (`R7.0.10`), loading these exact files. ANSI is stripped
 //! before comparing, for the reason the sibling gate
 //! `db_load_diagnostics_say_where` gives: whether the escapes are emitted is a
 //! property of the console predicate and has its own gate.

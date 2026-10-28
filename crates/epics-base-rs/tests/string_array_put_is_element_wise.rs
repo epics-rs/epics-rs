@@ -28,7 +28,7 @@
 //! destroying the record's contents.
 //!
 //! Expectations are head-to-head against the built softIoc
-//! (`/home/stevek/work/epics-base/bin/linux-x86_64`), same `.db`, C `caput`:
+//! (`$EPICS_BASE/bin/linux-x86_64`), same `.db`, C `caput`:
 //!
 //! ```text
 //! caput -a WV 3 7 8 9      -> WV = 7 8 9 0 0    NORD = 3

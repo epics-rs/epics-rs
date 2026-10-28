@@ -182,7 +182,7 @@ jobs:
     # ── TLS-capable pvxs ───────────────────────────────────────
     # The 1.5.x tags have no TLS (`pvxinfo -D` lacks
     # EPICS_PVA_TLS_KEYCHAIN); it lives on upstream's `tls` branch. Pinned to
-    # the commit the local `~/work/pvxs-tls` checkout is built from, so a
+    # the commit the local TLS pvxs checkout is built from, so a
     # branch move cannot change what `interop_tls_*` verify. Both tests fail,
     # not skip, without it. Its libpvxs SONAME is 1.5.3's, so neither lib
     # dir may go on LD_LIBRARY_PATH or into ldconfig: the first one listed

@@ -1,5 +1,5 @@
 -	drvStreamInit()
--	StreamProtocolParser::path = /home/stevek/work/_tgt/monitor/trial/crates/stream-rs/tests/oracle/epics
+-	StreamProtocolParser::path = <dir>
 _main_	streamInitRecord(rec): SEVR=0
 _main_	streamInitRecord(rec): create new Stream object
 _main_	streamInitRecord(rec): calling initRecord
@@ -7,7 +7,7 @@ _main_	Stream::initRecord rec: parse link string "nosuch.proto p P"
 _main_	Stream::initRecord rec: filename="nosuch.proto" protocol="p" bus="P" addr=0 params=""
 _main_	Stream::initRecord rec: attachBus("P", 0, "")
 _main_	Stream::initRecord rec: parse("nosuch.proto", "p")
-_main_	Can't find readable file 'nosuch.proto' in '/home/stevek/work/_tgt/monitor/trial/crates/stream-rs/tests/oracle/epics'
+_main_	Can't find readable file 'nosuch.proto' in '<dir>'
 _main_	while reading protocol 'p' for 'rec'
 _main_	rec: Protocol parse error
 _main_	rec: Record initialization failed

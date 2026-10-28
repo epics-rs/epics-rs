@@ -15440,7 +15440,7 @@ Total 2 records, 2 aliases
     /// in makes them the same thing.
     ///
     /// MEASURED on `softIoc` 7.0.10.1-DEV
-    /// (`/home/stevek/work/epics-base/bin/linux-x86_64/softIoc`) over this
+    /// (`$EPICS_BASE/bin/linux-x86_64/softIoc`) over this
     /// exact `.db`:
     ///
     /// ```text

@@ -2,7 +2,7 @@
 # compiled EPICS softIoc (EPICS 7.0.10.1-DEV, R7.0.10-55-g2d8a6f91a).
 #
 # Measured, not derived: one record of each base record type was loaded into
-#   /home/stevek/work/epics-base/bin/linux-x86_64/softIoc
+#   $EPICS_BASE/bin/linux-x86_64/softIoc
 # and `cainfo` was run against every field the .dbd declares. 2558 fields
 # resolved, 0 failures. Array records were instantiated with NELM=10
 # FTVL=DOUBLE (waveform/aai/aao), NSAM=10 (compress), NELM=10 (histogram),

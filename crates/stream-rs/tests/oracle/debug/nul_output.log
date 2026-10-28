@@ -1,5 +1,5 @@
 drvStreamInit()
-StreamProtocolParser::path = /home/stevek/work/_tgt/reviewer6/sbase/crates/stream-rs/tests/oracle/debug
+StreamProtocolParser::path = <dir>
 streamInitRecord(rec): SEVR=3
 streamInitRecord(rec): create new Stream object
 streamInitRecord(rec): calling initRecord

@@ -8,7 +8,7 @@
 //! with any alarm or diagnostic.
 //!
 //! GROUND TRUTH — the built C `softIoc` (7.0.10.1-DEV,
-//! `/home/stevek/work/epics-base/bin/linux-x86_64/softIoc`), same `.db` as
+//! `$EPICS_BASE/bin/linux-x86_64/softIoc`), same `.db` as
 //! below, each record processed once by `dbpf <rec>.PROC 1`:
 //!
 //! ```text

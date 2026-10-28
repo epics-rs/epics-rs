@@ -7,7 +7,7 @@
 //! (`softMain.cpp:239-243`). `iocRun` never ran, so RSRV was never started and
 //! the process answers nothing.
 //!
-//! Measured against `/home/stevek/work/epics-base/bin/linux-x86_64/softIoc`
+//! Measured against `$EPICS_BASE/bin/linux-x86_64/softIoc`
 //! R7.0.10.1-DEV, `-a <unreadable>.acf -d test.db`:
 //!
 //! * interactive, stdin `/dev/null` — reaches `epics> ` and exits **0**

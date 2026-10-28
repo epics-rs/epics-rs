@@ -1,7 +1,7 @@
 //! A record type's DTYP menu is its `device()` lines in the order they arrive,
 //! so std's devTimeOfDay choices sit after asyn's when the IOC wires asyn's
 //! devices before std's, even with std's record types registered first.
-//! Ground truth: `oracleIoc` (`~/work/epics-modules/oracle-ioc`: base, asyn,
+//! Ground truth: `oracleIoc` (`$EPICS_MODULES/oracle-ioc`: base, asyn,
 //! std, calc), its `dbDumpDevice` of ai and stringin, addresses masked.
 
 use std::collections::HashMap;

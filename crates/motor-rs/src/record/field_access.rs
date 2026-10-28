@@ -1099,7 +1099,7 @@ pub(crate) fn motor_put_field(
 fn motor_store_field(rec: &mut MotorRecord, name: &str, value: EpicsValue) -> CaResult<()> {
     match name {
         // A position write keeps its source: was_position_restored reads
-        // it, and initial_readback drops it before any pass.
+        // it, and the init readback drops it before any pass.
         "VAL" => as_f64(value, name).map(|v| {
             rec.pos.val = v;
             rec.last_write = Some(CommandSource::Val);

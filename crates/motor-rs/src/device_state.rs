@@ -117,6 +117,9 @@ pub struct Callbacks {
     dset: MotorDset,
     /// The record's database, which [`call_back`] locks it in.
     db: Option<RecordDb>,
+    /// motordevCom's `ptrans->initSem` while init_record_com's round waits
+    /// for its GET_INFO answer (motordevCom.cc:317-381).
+    init_sem: Option<std::sync::mpsc::SyncSender<()>>,
 }
 
 /// The C device support a record's callbacks run as.
@@ -293,6 +296,27 @@ impl MotorDeviceState {
     /// so counts no move pending either.
     pub(crate) fn comm_alarm(&self) -> bool {
         self.callbacks.comm_alarm && self.refuses_in_comm_alarm()
+    }
+
+    /// init_record_com's `initSem` and its swap to `motor_init_callback`
+    /// (motordevCom.cc:317-321): the next callback signals the receiver.
+    pub(crate) fn arm_init_callback(&mut self) -> std::sync::mpsc::Receiver<()> {
+        let (sem, wait) = std::sync::mpsc::sync_channel(1);
+        self.callbacks.init_sem = Some(sem);
+        wait
+    }
+
+    /// The swap back to `motor_callback` (motordevCom.cc:382-386).
+    pub(crate) fn disarm_init_callback(&mut self) {
+        self.callbacks.init_sem = None;
+    }
+
+    /// C `motor_init_callback` (motordevCom.cc:563-585) past the post's
+    /// copy: signal `initSem`, an event that coalesces repeated signals.
+    fn init_callback(&mut self) {
+        if let Some(sem) = &self.callbacks.init_sem {
+            let _ = sem.try_send(());
+        }
     }
 
     /// `finishDevSup` ran: callbacks process the record from now on.
@@ -530,7 +554,12 @@ impl AxisSubscribers {
                     ds.copy_post(&status);
                     drop(ds);
                     let process = |_: &mut MotorDeviceState| IoIntrAction::Process;
-                    call_back(&bound.device_state, record, process, |_| {});
+                    call_back(
+                        &bound.device_state,
+                        record,
+                        process,
+                        MotorDeviceState::init_callback,
+                    );
                 }
                 MotorDset::DevMotorSim => {
                     if ds.motor_sim_callback(&status) {

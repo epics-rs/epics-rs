@@ -674,6 +674,28 @@ fn device_init_queues_the_rstm_restore_before_the_limits() {
     );
 }
 
+/// devMotorAsyn's build_trans refuses PRIMITIVE (devMotorAsyn.c:606-609)
+/// and init_controller sends no INIT, so a model-3 axis gets none at init.
+#[test]
+fn device_init_sends_no_init_string_to_an_asyn_axis() {
+    let mut rec = make_record();
+    rec.put_field("INIT", EpicsValue::String("X".into()))
+        .unwrap();
+    let commands = device_init(
+        &mut rec,
+        MotorStatus {
+            done: true,
+            ..Default::default()
+        },
+    );
+    assert!(
+        !commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::Primitive { .. })),
+        "{commands:?}"
+    );
+}
+
 #[test]
 fn startup_closed_loop_omsl_skips_readback_adoption() {
     // C init_record (705-714): under OMSL=closed_loop the DOL link owns

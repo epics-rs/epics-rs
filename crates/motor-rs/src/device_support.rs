@@ -447,6 +447,10 @@ enum AxisLink {
 /// (motordevCom.cc:231-235).
 const NO_CARD: &str = "motor_init_record_com(): card does not exist!";
 
+/// motordevCom's `MAX_TIMEOUT`, init_record_com's wait for its round's
+/// answer (motordrvCom.h:58).
+const INIT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Why a record's requests reach no axis.
 enum Unreached {
     Missing(MissingAxis),
@@ -829,6 +833,42 @@ impl CommandPort {
     }
 }
 
+impl MotorDeviceSupport {
+    /// motor_init_record_com's round (motordevCom.cc:315-387): program the
+    /// card, GET_INFO, and wait up to MAX_TIMEOUT for the answer, which
+    /// `motor_init_callback` leaves for init_record's `update_values`.
+    fn init_round(
+        &self,
+        rec: &mut crate::record::MotorRecord,
+        commands: Vec<MotorCommand>,
+    ) -> CaResult<()> {
+        let lock_error =
+            |e| epics_base_rs::error::CaError::InvalidValue(format!("device state lock: {e}"));
+        let answered = self
+            .port
+            .device_state
+            .lock()
+            .map_err(lock_error)?
+            .arm_init_callback();
+        for command in commands.into_iter().chain([MotorCommand::Poll]) {
+            rec.send_init(command);
+        }
+        if answered.recv_timeout(INIT_TIMEOUT).is_err() {
+            epics_base_rs::server::recgbl::rec_gbl_record_error(
+                &epics_base_rs::server::recgbl::DevSupStatus::NoInit.text(),
+                self.port.trace.record(),
+                "dev_NoInit (init_record_com: callback2 timeout",
+            );
+        }
+        self.port
+            .device_state
+            .lock()
+            .map_err(lock_error)?
+            .disarm_init_callback();
+        Ok(())
+    }
+}
+
 impl DeviceSupport for MotorDeviceSupport {
     fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
         // Inject device_state into MotorRecord (for template-created records)
@@ -876,7 +916,7 @@ impl DeviceSupport for MotorDeviceSupport {
         }
 
         // The RSTM/loadpos(#231)/MRES(#196) restore decision is owned
-        // entirely by `init_controller` (status_update.rs), whose
+        // entirely by `restores_position` (status_update.rs), whose
         // `InitPosition` is sent below.
         //
         // C `devMotorAsyn.c::init_controller` (166-239) reseeds only when
@@ -897,7 +937,8 @@ impl DeviceSupport for MotorDeviceSupport {
         // cache reads as C's calloc-zeroed status.
         let status = self.port.init_status()?;
 
-        // C init_record: the dset's init_controller, each of its commands a
+        // C init_record: the dset's init (devMotorAsyn's init_controller,
+        // motordevCom's motor_init_record_com round), each of its commands a
         // transaction of its own (motordevCom.cc:327-343), then
         // update_values (motorRecord.cc:690), which reads what the writes
         // that ran posted, process_motor_info(initcall) and the drive sync,
@@ -907,12 +948,20 @@ impl DeviceSupport for MotorDeviceSupport {
             .and_then(|a| a.downcast_mut::<crate::record::MotorRecord>());
         let mut loaded = None;
         if let Some(rec) = rec.as_deref_mut() {
-            let (commands, load) = rec.init_controller(&status);
-            loaded = load;
-            for command in commands {
-                let position = matches!(command, MotorCommand::InitPosition { .. });
-                if rec.send_init(command) && position {
-                    loaded = None;
+            if self.port.trace.is_model1() {
+                // Its round's answer, which update_values reads, shows any
+                // position load.
+                if let Some(commands) = rec.init_record_com(&status) {
+                    self.init_round(rec, commands)?;
+                }
+            } else {
+                let (commands, load) = rec.init_controller(&status);
+                loaded = load;
+                for command in commands {
+                    let position = matches!(command, MotorCommand::InitPosition { .. });
+                    if rec.send_init(command) && position {
+                        loaded = None;
+                    }
                 }
             }
         }

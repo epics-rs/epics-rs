@@ -706,6 +706,9 @@ pub enum DevSupStatus {
     /// `S_dev_badInitRet` — the dset's `init_record` returned a status its
     /// record has no arm for.
     BadInitRet,
+    /// `S_dev_NoInit` — device support gave up waiting for its device at
+    /// init.
+    NoInit,
 }
 
 impl DevSupStatus {
@@ -716,6 +719,7 @@ impl DevSupStatus {
             Self::NoDset => (514 << 16) | 3,
             Self::MissingSup => (514 << 16) | 5,
             Self::BadInitRet => (514 << 16) | 11,
+            Self::NoInit => (514 << 16) | 19,
         }
     }
 

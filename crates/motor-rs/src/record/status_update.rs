@@ -102,8 +102,8 @@ impl MotorRecord {
     /// C `process_motor_info(pmr, initcall)` (motorRecord.cc:3652+) takes the
     /// init flag explicitly; the URIP RDBL scaling is gated `else if
     /// (urip==Yes && initcall==false)` (3682), so the init readback seeds RRBV
-    /// from the motor position rather than the external link. The init path
-    /// (`initial_readback`) therefore calls
+    /// from the motor position rather than the external link. The init paths
+    /// (`initial_readback`, `init_readback`) therefore call
     /// `process_motor_info_initcall(.., true)`.
     pub fn process_motor_info(&mut self, status: &asyn_rs::interfaces::motor::MotorStatus) {
         self.process_motor_info_initcall(status, false);
@@ -379,14 +379,6 @@ impl MotorRecord {
         let autosaved_dval = self.pos.dval;
         let autosaved_rval = self.pos.rval;
 
-        // motordevCom sends INIT before anything else (motordevCom.cc:
-        // 309-327); devMotorAsyn has no INIT, and its drivers ignore it.
-        if !self.links.init.is_empty() {
-            commands.push(MotorCommand::Primitive {
-                init: self.links.init.clone(),
-            });
-        }
-
         // devMotorSim has no init_controller (devMotorSim.c init_record):
         // no ratio download and no position restore.
         let init_controller = !self.trace().is_motor_interface();
@@ -402,43 +394,8 @@ impl MotorRecord {
             commands.push(MotorCommand::InitEncoderRatio { ratio });
         }
 
-        // C: devMotorAsyn.c init_controller — RSTM restore decision.
-        // rdbd = max(|RDBD|, |MRES|); dval_non_zero_pos_near_zero is true when
-        // the autosaved DVAL is meaningful but the driver currently sits near
-        // zero (i.e. the controller lost its position across the IOC restart).
-        //
-        // C compares `fabs(status.position * mres)` — the motor position,
-        // not DRBV, which follows the encoder when UEIP=Yes. `use_rel` reads
-        // UEIP before process_motor_info overrides it for a missing encoder.
-        let rdbd = self.retry.rdbd.abs().max(self.conv.mres.abs());
-        let motor_dial = status.position * self.conv.mres;
-        let dval_non_zero_pos_near_zero =
-            autosaved_dval.abs() > rdbd && self.conv.mres != 0.0 && motor_dial.abs() < rdbd;
-        let mut restore = init_controller
-            && self
-                .conv
-                .rstm
-                .should_restore(self.use_relative_moves(), dval_non_zero_pos_near_zero);
-
-        // epics-modules/motor #231 — if LOAD_POS is blocked for this axis
-        // (absolute encoder), never push a SetPosition; adopt driver readback.
-        if restore && self.conv.loadpos_blocked {
-            restore = false;
-        }
-
-        // epics-modules/motor #196 — guard against an MRES change since the
-        // autosave was written. If both DVAL and RVAL were autosaved, they
-        // must satisfy DVAL ≈ RVAL * MRES under the *current* MRES. A mismatch
-        // means MRES changed; restoring would place the axis at the wrong
-        // position, so skip the restore and adopt the driver readback instead.
-        if restore && autosaved_rval != 0 {
-            let rval_implied_dval = autosaved_rval as f64 * self.conv.mres;
-            // C init_controller has no such check, so nothing to print.
-            if (rval_implied_dval - autosaved_dval).abs() > rdbd {
-                restore = false;
-            }
-        }
-
+        let restore = init_controller
+            && self.restores_position(status.position, autosaved_dval, autosaved_rval);
         if restore {
             // Tell the driver to redefine its current position to the
             // autosaved DVAL.
@@ -446,6 +403,7 @@ impl MotorRecord {
                 position: self.raw_position(autosaved_dval),
             });
         } else {
+            let rdbd = self.retry.rdbd.abs().max(self.conv.mres.abs());
             self.trace().print(
                 asyn_rs::trace::TraceMask::FLOW,
                 self.trace().status_reason(),
@@ -460,6 +418,100 @@ impl MotorRecord {
             );
         }
         (commands, restore.then_some(autosaved_dval))
+    }
+
+    /// C `motor_init_record_com`'s programming (motordevCom.cc:270-347),
+    /// decided before init_record's `process_motor_info` from the status
+    /// its `get_axis_info` read: None when it programs nothing, else what
+    /// it sends, each its own transaction, ahead of the round's GET_INFO.
+    pub(crate) fn init_record_com(
+        &mut self,
+        status: &asyn_rs::interfaces::motor::MotorStatus,
+    ) -> Option<Vec<MotorCommand>> {
+        // No put precedes init_record in C: a pass-0 restore is a plain
+        // field write, not a move.
+        self.last_write = None;
+        self.finish_init();
+
+        let mut commands = Vec::new();
+        if !self.links.init.is_empty() {
+            commands.push(MotorCommand::Primitive {
+                init: self.links.init.clone(),
+            });
+        }
+        // C sends the encoder and motor pulses per unit, whose ratio this
+        // is, only for an encoder in use, defending the division in the
+        // record's own fields.
+        if status.has_encoder && self.conv.ueip {
+            if self.conv.mres.abs() < 1e-9 {
+                self.conv.mres = 1.0;
+            }
+            if self.conv.eres.abs() < 1e-9 {
+                self.conv.eres = self.conv.mres;
+            }
+            commands.push(MotorCommand::InitEncoderRatio {
+                ratio: (self.conv.mres / self.conv.eres).abs(),
+            });
+        }
+        if self.restores_position(status.position, self.pos.dval, self.pos.rval) {
+            commands.push(MotorCommand::InitPosition {
+                position: self.raw_position(self.pos.dval),
+            });
+        }
+        if status.gain_support {
+            let gains = [
+                (PidGainKind::Proportional, self.pid.pcof),
+                (PidGainKind::Integral, self.pid.icof),
+                (PidGainKind::Derivative, self.pid.dcof),
+            ];
+            commands.extend(
+                gains
+                    .into_iter()
+                    .filter(|&(_, gain)| gain > 0.0)
+                    .map(|(kind, gain)| MotorCommand::SetPidGain { kind, gain }),
+            );
+        }
+        (status.gain_support || !commands.is_empty()).then_some(commands)
+    }
+
+    /// The RSTM switch (motordevCom.cc:291-311, devMotorAsyn.c:199-220) on
+    /// the motor's raw position: whether init pushes the autosaved DVAL
+    /// into the driver.
+    fn restores_position(
+        &self,
+        motor_position: f64,
+        autosaved_dval: f64,
+        autosaved_rval: i32,
+    ) -> bool {
+        // rdbd = max(|RDBD|, |MRES|); dval_non_zero_pos_near_zero is true when
+        // the autosaved DVAL is meaningful but the driver currently sits near
+        // zero (i.e. the controller lost its position across the IOC restart).
+        //
+        // C compares `fabs(status.position * mres)` — the motor position,
+        // not DRBV, which follows the encoder when UEIP=Yes. `use_rel` reads
+        // UEIP before process_motor_info overrides it for a missing encoder.
+        let rdbd = self.retry.rdbd.abs().max(self.conv.mres.abs());
+        let motor_dial = motor_position * self.conv.mres;
+        let dval_non_zero_pos_near_zero =
+            autosaved_dval.abs() > rdbd && self.conv.mres != 0.0 && motor_dial.abs() < rdbd;
+        let restore = self
+            .conv
+            .rstm
+            .should_restore(self.use_relative_moves(), dval_non_zero_pos_near_zero);
+
+        // epics-modules/motor #231 — if LOAD_POS is blocked for this axis
+        // (absolute encoder), never push a SetPosition; adopt driver readback.
+        //
+        // epics-modules/motor #196 — guard against an MRES change since the
+        // autosave was written. If both DVAL and RVAL were autosaved, they
+        // must satisfy DVAL ≈ RVAL * MRES under the *current* MRES. A mismatch
+        // means MRES changed; restoring would place the axis at the wrong
+        // position, so skip the restore and adopt the driver readback instead.
+        // C init_controller has no such check, so nothing to print.
+        restore
+            && !self.conv.loadpos_blocked
+            && (autosaved_rval == 0
+                || (autosaved_rval as f64 * self.conv.mres - autosaved_dval).abs() <= rdbd)
     }
 
     /// C `init_record` from `update_values` on (motorRecord.cc:690-733):

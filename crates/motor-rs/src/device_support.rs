@@ -215,8 +215,6 @@ pub struct MotorAxis {
     params: Model2Params,
     report: Option<Arc<dyn AxisReport>>,
     build_trans: Option<Arc<dyn BuildTrans>>,
-    /// The driver's [`asyn_rs::interfaces::motor::Model1Motor::disables_ntm`].
-    disables_ntm: bool,
     /// C `asynMotorAxis::referencingModeMove_`, which
     /// `asynMotorEnableMoveToHome` sets.
     referencing_mode_move: Arc<std::sync::atomic::AtomicI32>,
@@ -295,7 +293,6 @@ impl MotorAxis {
             params: Model2Params::default(),
             report: None,
             build_trans: None,
-            disables_ntm: false,
             referencing_mode_move: Arc::default(),
         }
     }
@@ -303,11 +300,6 @@ impl MotorAxis {
     /// The controller poll its controller's UPDATE_STATUS write runs.
     pub(crate) fn with_controller_poll(mut self, poll: SharedControllerPoll) -> Self {
         self.controller_poll = poll;
-        self
-    }
-
-    pub(crate) fn disabling_ntm(mut self, disables_ntm: bool) -> Self {
-        self.disables_ntm = disables_ntm;
         self
     }
 
@@ -325,7 +317,6 @@ impl MotorAxis {
             params: self.params.clone(),
             report: self.report.clone(),
             build_trans: self.build_trans.clone(),
-            disables_ntm: self.disables_ntm,
             referencing_mode_move: self.referencing_mode_move.clone(),
         }
     }
@@ -443,7 +434,6 @@ impl MotorAxis {
 
     fn bind(&self, refusal: Option<&'static str>) -> MotorDeviceSupport {
         let mut support = self.slot.attach(self.user.clone(), self.timeout, refusal);
-        support.disables_ntm = self.disables_ntm;
         support.port.build_trans = self.build_trans.clone();
         support
     }
@@ -538,6 +528,8 @@ pub struct MotorDeviceSupport {
     _timeout: Duration,
     io_intr_rx: Option<mpsc::Receiver<()>>,
     initialized: bool,
+    /// Whether the record's model-1 DTYP sets NTM to NO at init
+    /// ([`crate::devices::register_model1_device_disabling_ntm`]).
     disables_ntm: bool,
     /// Why `motor_init_record_com` refused the record, which C keeps.
     refusal: Option<&'static str>,
@@ -654,6 +646,11 @@ impl MotorDeviceSupport {
         );
         support.refusal = Some(NO_SIGNAL);
         support
+    }
+
+    pub(crate) fn disabling_ntm(mut self, disables_ntm: bool) -> Self {
+        self.disables_ntm = disables_ntm;
+        self
     }
 
     /// Hand the driver a model-1 record's VME_IO parm, which C devices read

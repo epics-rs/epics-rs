@@ -678,13 +678,6 @@ pub trait Model1Motor: Send + Sync {
         self.poll(user, status)
     }
 
-    /// Whether the model-1 device support forces the record's NTM to NO at
-    /// init_record because the device does its own backlash
-    /// (devEMC18011.cc:127-129, devPIE816.cc:130, devMDT695.cc:129).
-    fn disables_ntm(&self) -> bool {
-        false
-    }
-
     /// Whether a model-1 `set_status` counts a pass whose position did not
     /// change as no motion (`no_motion_count++`), which motor_task does not
     /// call back. drvEMC18011.cc:356-358 disables it, so every pass of a

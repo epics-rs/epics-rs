@@ -648,12 +648,11 @@ impl MotorTaskBuilder {
         timeout: Duration,
         capacity: usize,
     ) -> ControllerAxis {
-        let disables_ntm = motor.lock().is_ok_and(|m| m.disables_ntm());
         let poll = SharedControllerPoll::default();
         let (axis, place) = MotorAxis::placed(user, None, timeout, Arc::default(), &poll, capacity)
             .expect("a new slot is no controller's");
         self.axes.push(Axis::task(place, motor));
-        ControllerAxis::of(axis.disabling_ntm(disables_ntm))
+        ControllerAxis::of(axis)
     }
 
     /// The task over the axes.

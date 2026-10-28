@@ -380,7 +380,8 @@ pub fn dp_common_key(multi_device: bool, addr: i32) -> Option<i32> {
 /// for a user at `addr`: `pasynManager->getAddr` is -1 on a port without
 /// `ASYN_MULTIDEVICE`, whatever the user asked for, and for a user at any
 /// negative address, which `connectDevice` gives no device; -1 is list 0. A
-/// request and an interrupt client resolve through this one rule.
+/// request and an interrupt client resolve through this one rule; a driver's
+/// own post address does not (see [`driver_list`]).
 pub fn param_list(multi_device: bool, addr: i32) -> i32 {
     if multi_device && addr >= 0 { addr } else { 0 }
 }
@@ -419,7 +420,7 @@ use crate::interpose::{
     EomReason, EosSet, OctetInterpose, OctetInterposeStack, OctetNext, OctetReadResult,
 };
 use crate::interrupt::{InterruptManager, InterruptValue, OctetFanOut};
-use crate::param::{EnumEntry, InterruptReason, ParamList, ParamType, ParamValue};
+use crate::param::{EnumEntry, InterruptReason, ParamList, ParamType, ParamValue, driver_list};
 use crate::trace::TraceManager;
 use crate::user::{AsynUser, ConnectCheck};
 
@@ -2675,11 +2676,8 @@ impl PortDriverBase {
         // C stamps every callback with getTimeStamp (asynPortDriver.cpp:610-637).
         let ts = self.time_stamp;
         let interrupts = &self.interrupts;
-        // A C driver calls back on the list `getAddress` resolved, never on
-        // getAddr's -1, and its single-device clients filter on that list.
-        let list = param_list(self.flags.multi_device, addr);
         self.params.flush_changed(addr, |params, reason| {
-            let post = scalar_callback(params, reason, addr, list, ts)?;
+            let post = scalar_callback(params, reason, addr, ts)?;
             let fired = post.is_some();
             if let Some(iv) = post {
                 interrupts.notify(iv);
@@ -2699,9 +2697,8 @@ impl PortDriverBase {
             return Ok(());
         }
         if self.params.take_changed_single(reason, addr)? {
-            let list = param_list(self.flags.multi_device, addr);
             let ts = self.time_stamp;
-            if let Some(iv) = scalar_callback(&mut self.params, reason, addr, list, ts)? {
+            if let Some(iv) = scalar_callback(&mut self.params, reason, addr, ts)? {
                 self.interrupts.notify(iv);
             }
         }
@@ -2751,8 +2748,7 @@ impl PortDriverBase {
         let ts = self.time_stamp;
         self.interrupts.notify(InterruptValue {
             reason,
-            // The list, as `call_param_callbacks` fires.
-            addr: param_list(self.flags.multi_device, addr),
+            addr: driver_list(addr),
             value,
             timestamp: ts,
             uint32_changed_mask,
@@ -2851,7 +2847,7 @@ impl PortDriverBase {
         let alarm_severity = self.get_param_alarm_severity(reason, addr).unwrap_or(0);
         self.interrupts.notify(InterruptValue {
             reason,
-            addr: param_list(self.flags.multi_device, addr),
+            addr: driver_list(addr),
             value,
             timestamp: self.time_stamp,
             uint32_changed_mask: 0,
@@ -3122,7 +3118,6 @@ fn scalar_callback(
     params: &mut ParamList,
     reason: usize,
     addr: i32,
-    list: i32,
     timestamp: SystemTime,
 ) -> AsynResult<Option<InterruptValue>> {
     let value = params.get_value(reason, addr)?;
@@ -3140,7 +3135,7 @@ fn scalar_callback(
         .unwrap_or((AsynStatus::Success, 0, 0));
     Ok(Some(InterruptValue {
         reason,
-        addr: list,
+        addr: driver_list(addr),
         value,
         timestamp,
         uint32_changed_mask,
@@ -5021,6 +5016,64 @@ pub(crate) mod tests {
                 .is_err(),
             "a scalar has no array interface"
         );
+    }
+
+    /// A driver's post address is compared raw with each client's resolved
+    /// list (asynPortDriver.cpp:1848-1852): -1 is list 0, -2 is no list.
+    #[test]
+    fn a_post_at_minus_two_reaches_no_list_zero_client() {
+        use crate::interrupt::{InterruptFilter, InterruptValue};
+        use crate::param::ParamValue;
+        use std::sync::{Arc, Mutex};
+
+        let mut base = PortDriverBase::new(
+            "test_post_minus_two",
+            1,
+            PortFlags {
+                multi_device: true,
+                ..PortFlags::default()
+            },
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        base.own_interrupts(InterruptGate::opened());
+        let wave = base.create_param("WAVE", ParamType::Int32Array).unwrap();
+        let mode = base.create_param("MODE", ParamType::Int32).unwrap();
+        let seen: Arc<Mutex<Vec<(usize, i32)>>> = Arc::default();
+        let sink = seen.clone();
+        let _sub = base
+            .interrupts
+            .register_sync_callback(
+                InterruptFilter {
+                    addr: Some(0),
+                    ..Default::default()
+                },
+                move |iv: &InterruptValue| sink.lock().unwrap().push((iv.reason, iv.addr)),
+            )
+            .unwrap();
+        let array = || ParamValue::Int32Array(vec![1].into());
+        let int32 = |b: &PortDriverBase, addr| {
+            b.notify_interface_value(
+                mode,
+                addr,
+                InterfaceType::Int32,
+                ParamValue::Int32(1),
+                0,
+                AsynStatus::Success,
+            )
+        };
+
+        base.do_callbacks_array(wave, -2, array()).unwrap();
+        int32(&base, -2);
+        base.do_callbacks_enum(mode, -2, Vec::new().into()).unwrap();
+        base.set_int32_param(mode, 0, 2).unwrap();
+        assert!(base.call_param_callbacks(-2).is_err());
+        assert_eq!(*seen.lock().unwrap(), []);
+
+        base.do_callbacks_array(wave, -1, array()).unwrap();
+        int32(&base, 0);
+        base.call_param_callbacks(-1).unwrap();
+        assert_eq!(*seen.lock().unwrap(), [(wave, 0), (mode, 0), (mode, 0)]);
     }
 
     /// asynPortDriver's own readGenericPointer and writeGenericPointer

@@ -172,6 +172,16 @@ impl PortDriver for TestScopeDriver {
         buf[..n].copy_from_slice(&data[..n]);
         Ok(n)
     }
+
+    fn read_enum(&mut self, user: &AsynUser) -> AsynResult<(usize, Arc<[EnumEntry]>)> {
+        self.base.get_enum_param(user.reason, user.addr)
+    }
+
+    fn write_enum(&mut self, user: &mut AsynUser, index: usize) -> AsynResult<()> {
+        self.base
+            .set_enum_index_param(user.reason, user.addr, index)?;
+        self.base.call_param_callbacks(user.addr)
+    }
 }
 
 // ============================================================

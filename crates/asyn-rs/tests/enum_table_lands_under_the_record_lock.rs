@@ -52,6 +52,9 @@ impl PortDriver for EnumPort {
         self.writes.lock().unwrap().push(value);
         Ok(())
     }
+    fn read_enum(&mut self, user: &AsynUser) -> AsynResult<(usize, Arc<[EnumEntry]>)> {
+        self.base.get_enum_param(user.reason, user.addr)
+    }
 }
 
 fn entry(s: &str, value: i32, severity: u16) -> EnumEntry {

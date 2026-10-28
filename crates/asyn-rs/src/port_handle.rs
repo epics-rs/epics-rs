@@ -5197,6 +5197,9 @@ mod tests {
                 buf[..n].copy_from_slice(&a[..n]);
                 Ok(n)
             }
+            fn read_enum(&mut self, user: &AsynUser) -> AsynResult<(usize, Arc<[EnumEntry]>)> {
+                self.base.params.get_enum(user.reason, user.addr)
+            }
         }
         let mut base = PortDriverBase::new(
             "handle_test",

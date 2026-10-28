@@ -9098,6 +9098,12 @@ mod tests {
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.base
             }
+            fn read_enum(
+                &mut self,
+                user: &AsynUser,
+            ) -> AsynResult<(usize, std::sync::Arc<[crate::param::EnumEntry]>)> {
+                self.base.get_enum_param(user.reason, user.addr)
+            }
         }
 
         let mut base = PortDriverBase::new(

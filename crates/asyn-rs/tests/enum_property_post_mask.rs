@@ -29,6 +29,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use asyn_rs::asyn_record::register_port;
+use asyn_rs::error::AsynResult;
 use asyn_rs::interrupt::InterruptValue;
 use asyn_rs::param::{EnumEntry, ParamType, ParamValue};
 use asyn_rs::port::InterfaceMask;
@@ -36,6 +37,7 @@ use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::port_handle::PortHandle;
 use asyn_rs::runtime::config::RuntimeConfig;
 use asyn_rs::runtime::port::create_port_runtime_unclaimed;
+use asyn_rs::user::AsynUser;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::event_queue::EventReader;
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -76,6 +78,9 @@ impl PortDriver for EnumPort {
     }
     fn base_mut(&mut self) -> &mut PortDriverBase {
         &mut self.base
+    }
+    fn read_enum(&mut self, user: &AsynUser) -> AsynResult<(usize, Arc<[EnumEntry]>)> {
+        self.base.get_enum_param(user.reason, user.addr)
     }
 }
 

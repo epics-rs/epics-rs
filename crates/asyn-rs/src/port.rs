@@ -3498,28 +3498,32 @@ pub trait PortDriver: Any + Send + Sync {
         base.params.get_uint32_interrupt(user.reason, addr, reason)
     }
 
-    // --- Enum I/O (cache-based defaults) ---
+    // --- Enum I/O (default: not implemented, as in C) ---
 
-    fn read_enum(&mut self, user: &AsynUser) -> AsynResult<(usize, Arc<[EnumEntry]>)> {
-        self.base().params.get_enum(user.reason, user.addr)
+    fn read_enum(&mut self, _user: &AsynUser) -> AsynResult<(usize, Arc<[EnumEntry]>)> {
+        Err(AsynError::Status {
+            status: AsynStatus::Error,
+            message: "asynPortDriver:readEnum not implemented".into(),
+        })
     }
 
-    fn write_enum(&mut self, user: &mut AsynUser, index: usize) -> AsynResult<()> {
-        self.base_mut()
-            .params
-            .set_enum_index(user.reason, user.addr, index)?;
-        self.base_mut().call_param_callbacks(user.addr)
+    /// C's asynEnum has no index write; this refuses as its `writeEnum` does.
+    fn write_enum(&mut self, _user: &mut AsynUser, _index: usize) -> AsynResult<()> {
+        Err(AsynError::Status {
+            status: AsynStatus::Error,
+            message: "asynPortDriver:writeEnum not implemented".into(),
+        })
     }
 
     fn write_enum_choices(
         &mut self,
-        user: &mut AsynUser,
-        choices: Arc<[EnumEntry]>,
+        _user: &mut AsynUser,
+        _choices: Arc<[EnumEntry]>,
     ) -> AsynResult<()> {
-        self.base_mut()
-            .params
-            .set_enum_choices(user.reason, user.addr, choices)?;
-        self.base_mut().call_param_callbacks(user.addr)
+        Err(AsynError::Status {
+            status: AsynStatus::Error,
+            message: "asynPortDriver:writeEnum not implemented".into(),
+        })
     }
 
     // --- GenericPointer I/O (default: not implemented, as in C) ---
@@ -4791,52 +4795,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_default_read_write_enum() {
-        use crate::param::EnumEntry;
-
-        let mut base = PortDriverBase::new(
-            "test_enum",
-            1,
-            PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
-        );
-        base.create_param("MODE", ParamType::Enum).unwrap();
-
-        struct EnumDriver {
-            base: PortDriverBase,
-        }
-        impl PortDriver for EnumDriver {
-            fn base(&self) -> &PortDriverBase {
-                &self.base
-            }
-            fn base_mut(&mut self) -> &mut PortDriverBase {
-                &mut self.base
-            }
-        }
-
-        let mut drv = EnumDriver { base };
-        let choices: Arc<[EnumEntry]> = Arc::from(vec![
-            EnumEntry {
-                string: "Off".into(),
-                value: 0,
-                severity: 0,
-            },
-            EnumEntry {
-                string: "On".into(),
-                value: 1,
-                severity: 0,
-            },
-        ]);
-        let mut user = AsynUser::new(0);
-        drv.write_enum_choices(&mut user, choices).unwrap();
-        drv.write_enum(&mut user, 1).unwrap();
-        let (idx, ch) = drv.read_enum(&AsynUser::new(0)).unwrap();
-        assert_eq!(idx, 1);
-        assert_eq!(ch[1].string, "On");
-    }
-
-    #[test]
     fn test_enum_callback() {
         use crate::param::{EnumEntry, ParamValue};
 
@@ -5074,6 +5032,60 @@ pub(crate) mod tests {
         int32(&base, 0);
         base.call_param_callbacks(-1).unwrap();
         assert_eq!(*seen.lock().unwrap(), [(wave, 0), (mode, 0), (mode, 0)]);
+    }
+
+    /// asynPortDriver's own readEnum and writeEnum refuse
+    /// (asynPortDriver.cpp:3464-3469, :3494-3499), whatever the param holds.
+    #[test]
+    fn the_default_enum_io_is_not_implemented() {
+        use crate::param::EnumEntry;
+
+        struct EnumDriver {
+            base: PortDriverBase,
+        }
+        impl PortDriver for EnumDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+        }
+
+        let mut base = PortDriverBase::new(
+            "test_enum_default",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        let mode = base.create_param("MODE", ParamType::Enum).unwrap();
+        let mut drv = EnumDriver { base };
+        let mut user = AsynUser::new(mode);
+        let not_implemented = |e: AsynError, op: &str| {
+            assert_eq!(
+                (e.status(), e.message()),
+                (
+                    AsynStatus::Error,
+                    format!("asynPortDriver:{op} not implemented")
+                )
+            );
+        };
+
+        let held = drv.base.params.get_enum(mode, 0).unwrap();
+        not_implemented(drv.read_enum(&user).unwrap_err(), "readEnum");
+        let choices: Arc<[EnumEntry]> = vec![EnumEntry {
+            string: "A".into(),
+            value: 0,
+            severity: 0,
+        }]
+        .into();
+        not_implemented(
+            drv.write_enum_choices(&mut user, choices).unwrap_err(),
+            "writeEnum",
+        );
+        not_implemented(drv.write_enum(&mut user, 0).unwrap_err(), "writeEnum");
+        assert_eq!(drv.base.params.get_enum(mode, 0).unwrap(), held);
     }
 
     /// asynPortDriver's own readGenericPointer and writeGenericPointer

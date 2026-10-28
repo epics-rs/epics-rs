@@ -12,6 +12,7 @@
 // itself, which the backend does not remove.
 
 use epics_libcom_rs::SharedArray;
+use epics_libcom_rs::runtime::time::deadline_from_now;
 
 use crate::param::ParamValue;
 use std::any::Any;
@@ -327,7 +328,7 @@ impl AsyncCompletionHandle {
     pub fn wait_blocking(self, timeout: Duration) -> AsynResult<RequestResult> {
         guard_reentrant(self.actor, &self.port_name, "wait_blocking")?;
         let port_name = self.port_name.clone();
-        block_on_reply_until(self, Instant::now() + timeout).unwrap_or_else(|| {
+        block_on_reply_until(self, deadline_from_now(timeout)).unwrap_or_else(|| {
             Err(AsynError::Status {
                 status: AsynStatus::Timeout,
                 message: format!(
@@ -3251,6 +3252,16 @@ mod tests {
                 device(crate::user::ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED),
             )
             .expect("the reason waives the device refusal below Connect priority");
+    }
+
+    /// `Duration::MAX` is a wait that never expires, not an `Instant` overflow.
+    #[test]
+    fn wait_blocking_takes_duration_max() {
+        let (handle, _reads) = slow_port(Duration::ZERO);
+        let read = handle
+            .try_submit(RequestOp::Int32Read, AsynUser::new(0))
+            .unwrap();
+        assert_eq!(read.wait_blocking(Duration::MAX).unwrap().int_val, Some(7));
     }
 
     /// A synchronous port has no queue to park a request on: one whose port

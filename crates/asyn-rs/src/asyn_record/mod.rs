@@ -4029,9 +4029,8 @@ impl AsynRecord {
     /// wait forever and every driver wait built from it is unbounded (DRV-42).
     /// It used to fall back to the bounded [`crate::user::DEFAULT_TIMEOUT`], so
     /// a record told to wait forever timed out after a second and raised a
-    /// READ/WRITE alarm C never raises. A non-finite or out-of-range TMOT still
-    /// takes that fallback — C's `(int)` cast of such a value is undefined
-    /// behaviour, so there is no C semantics to port.
+    /// READ/WRITE alarm C never raises. A NaN TMOT waits forever as well, and
+    /// one past ten years takes C's event-wait cap.
     ///
     /// The mapping itself belongs to [`crate::user::timeout_from_secs`], the
     /// crate-wide owner of `f64 seconds` → `AsynUser::timeout`; this method only
@@ -10464,15 +10463,15 @@ mod tests {
             "negative TMOT is C's unbounded wait, not a bounded default"
         );
         assert_eq!(plan_timeout(-0.001), None);
-        // The values `Duration` cannot carry keep the bounded fallback. C casts
-        // these with `(int)`, which is undefined behaviour, so there is no C
-        // semantics here.
-        assert_eq!(plan_timeout(f64::NAN), Some(Duration::from_secs(1)));
-        assert_eq!(plan_timeout(f64::INFINITY), Some(Duration::from_secs(1)));
+        // The serial driver's sign test sends -inf and NaN, which fails both
+        // its `> 0` and `== 0` tests, to the unbounded wait; +inf takes C's
+        // ten-year event-wait cap.
+        assert_eq!(plan_timeout(f64::NAN), None);
         assert_eq!(
-            plan_timeout(f64::NEG_INFINITY),
-            Some(Duration::from_secs(1))
+            plan_timeout(f64::INFINITY),
+            Some(Duration::from_secs(60 * 60 * 24 * 36525 / 10))
         );
+        assert_eq!(plan_timeout(f64::NEG_INFINITY), None);
     }
 
     /// R9-46, end to end: the TMOT the operator set is the timeout the driver's

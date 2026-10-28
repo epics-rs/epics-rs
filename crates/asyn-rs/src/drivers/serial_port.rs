@@ -8,6 +8,8 @@
 use std::os::unix::io::RawFd;
 use std::time::{Duration, Instant};
 
+use epics_libcom_rs::runtime::time::deadline_from_now;
+
 use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::exception::AsynException;
 use crate::interpose::{EomReason, OctetNext, OctetReadResult};
@@ -783,7 +785,7 @@ fn write_until(
 impl SerialIoState {
     fn recv(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<(usize, EomReason)> {
         let fd = self.fd_or_err()?;
-        let n = read_until(&fd, buf, user.timeout.map(|t| Instant::now() + t))?;
+        let n = read_until(&fd, buf, user.timeout.map(deadline_from_now))?;
         self.n_read += n as u64; // C parity: tty->nRead += thisRead
         // C parity: CNT only when the requested count was reached.
         let eom = if n >= buf.len() {
@@ -813,12 +815,7 @@ impl OctetNext for SerialIoState {
         // replaces it, so each `write` returns immediately with what fit (or
         // EAGAIN) and the poll/deadline loop bounds the whole write.
         let mut total = 0usize;
-        let result = write_until(
-            &fd,
-            data,
-            user.timeout.map(|t| Instant::now() + t),
-            &mut total,
-        );
+        let result = write_until(&fd, data, user.timeout.map(deadline_from_now), &mut total);
         self.n_written += total as u64; // C parity: tty->nWritten += thisWrite
 
         match result {
@@ -3641,6 +3638,28 @@ mod tests {
             elapsed >= Duration::from_micros(400),
             "a 500 us TMOT must wait, not poll non-blocking: returned in {elapsed:?}"
         );
+
+        drv.disconnect(&AsynUser::default()).ok();
+    }
+
+    /// A driver may fill `AsynUser::timeout` with `Duration::MAX`: the read and
+    /// write deadlines never fire rather than overflowing `Instant`.
+    #[test]
+    fn pty_a_duration_max_timeout_reads_and_writes() {
+        let (master, slave, slave_name) = create_pty_pair();
+        let _guard = PtyGuard { master, slave };
+
+        let mut drv = DrvAsynSerialPort::new("pty_max", &slave_name).unwrap();
+        drv.connect(&AsynUser::default()).unwrap();
+
+        let mut user = AsynUser::new(0).with_timeout(Duration::MAX);
+        assert_eq!(drv.write_octet(&mut user, b"hello").unwrap(), 5);
+        let msg = b"world";
+        unsafe { libc::write(master, msg.as_ptr() as *const libc::c_void, msg.len()) };
+        let mut buf = [0u8; 5];
+        let n = drv.io_read_octet(&user, &mut buf).into_count().unwrap();
+        assert!(n > 0);
+        assert_eq!(&buf[..n], &msg[..n]);
 
         drv.disconnect(&AsynUser::default()).ok();
     }

@@ -56,6 +56,7 @@ use std::time::{Duration, Instant, SystemTime};
 // poison-tolerant: a panic in a worker thread cannot poison the lock
 // and take out the port (std::sync::Mutex would).
 use epics_libcom_rs::runtime::socket;
+use epics_libcom_rs::runtime::time::deadline_from_now;
 use parking_lot::Mutex;
 
 use crate::asyn_trace;
@@ -1495,7 +1496,7 @@ impl PortDriver for DrvAsynIPServerPort {
             let poll = socket_poll_timeout(user.timeout);
             // A caller that asked to wait forever gets no budget either — its
             // slots are bounded by nothing, exactly as C's negative timeout is.
-            let cap = user.timeout.map(|t| Instant::now() + t);
+            let cap = user.timeout.map(deadline_from_now);
             for (i, slot) in self.slots.iter().enumerate() {
                 if !slot.is_occupied() {
                     continue;
@@ -4088,5 +4089,31 @@ mod tests {
                 "slot {i} was torn down by a write timeout"
             );
         }
+    }
+
+    /// A driver may fill `AsynUser::timeout` with `Duration::MAX`: the
+    /// broadcast's budget never runs out rather than overflowing `Instant`.
+    #[test]
+    fn a_duration_max_broadcast_writes() {
+        use std::io::Read as _;
+
+        let mut srv = DrvAsynIPServerPort::new("srv_bcast_max", "127.0.0.1:0").unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server_side, peer) = listener.accept().unwrap();
+        srv.slots[0].assign(server_side, peer, "test").unwrap();
+
+        let mut user = AsynUser {
+            addr: -1,
+            timeout: Some(Duration::MAX),
+            ..AsynUser::default()
+        };
+        srv.write_octet(&mut user, b"hi").unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut got = [0u8; 2];
+        client.read_exact(&mut got).unwrap();
+        assert_eq!(&got, b"hi");
     }
 }

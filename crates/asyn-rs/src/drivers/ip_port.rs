@@ -8,6 +8,7 @@ use std::net::{TcpStream, UdpSocket};
 use std::time::Duration;
 
 use epics_libcom_rs::runtime::socket;
+use epics_libcom_rs::runtime::time::deadline_from_now;
 
 use super::option_parse::{invalid_option_value, parse_yn_option, sscanf_int};
 use crate::error::{AsynError, AsynResult, AsynStatus};
@@ -521,7 +522,7 @@ pub(super) fn write_with_retry(
     while offset < data.len() {
         // `poll == None` is C's negative timeout — an unbounded wait, which
         // only the caller's own budget (`cap`) can cut short.
-        let deadline = match (poll.map(|p| std::time::Instant::now() + p), cap) {
+        let deadline = match (poll.map(deadline_from_now), cap) {
             (Some(pass), Some(cap)) => Some(pass.min(cap)),
             (Some(pass), None) => Some(pass),
             (None, cap) => cap,
@@ -822,7 +823,7 @@ impl IpIoState {
                 // C polls `POLLOUT` before the datagram too — `writeIt` shares
                 // one loop across `SOCK_DGRAM` and `SOCK_STREAM`
                 // (`drvAsynIPPort.c:680-702`).
-                let deadline = poll.map(|p| std::time::Instant::now() + p);
+                let deadline = poll.map(deadline_from_now);
                 match socket.wait_writable(deadline) {
                     Ok(true) => {}
                     Ok(false) => {
@@ -3747,6 +3748,37 @@ mod tests {
             "the retry bound did not hold: {:?}",
             started.elapsed()
         );
+    }
+
+    /// A driver may fill `AsynUser::timeout` with `Duration::MAX`: its poll
+    /// deadline never fires rather than overflowing `Instant`.
+    #[test]
+    fn a_duration_max_poll_writes() {
+        let peer = DribblePeer {
+            chunk: 6,
+            delay: Duration::ZERO,
+        };
+        let n = write_with_retry(&peer, b"abcdef", Some(Duration::MAX), None).unwrap();
+        assert_eq!(n, 6);
+    }
+
+    /// The same for a datagram, whose `POLLOUT` wait builds its own deadline.
+    #[test]
+    fn a_duration_max_timeout_sends_a_datagram() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let server_port = server.local_addr().unwrap().port();
+        let mut drv =
+            DrvAsynIPPort::new("udp_max", &format!("127.0.0.1:{server_port} udp")).unwrap();
+        drv.connect(&AsynUser::default()).unwrap();
+
+        let mut user = AsynUser::new(0).with_timeout(Duration::MAX);
+        assert_eq!(drv.write_octet(&mut user, b"ping").unwrap(), 4);
+        let mut buf = [0u8; 8];
+        let (n, _) = server.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"ping");
     }
 
     /// The caller's own budget still caps the transfer where one exists — the

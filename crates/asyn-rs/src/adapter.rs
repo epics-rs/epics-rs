@@ -6157,23 +6157,27 @@ mod tests {
     /// `Duration::from_secs_f64` panicked on exactly those, aborting the thread
     /// at record init. The sentinel is now carried, not substituted.
     #[test]
-    fn test_parse_negative_timeout_waits_forever_and_non_finite_is_bounded() {
+    fn test_parse_negative_or_nan_timeout_waits_forever_and_inf_is_capped() {
         // A negative link timeout is C's "wait forever" and reaches the driver
-        // as one (DRV-42); it used to take the bounded default here.
-        for spec in ["@asyn(PORT, 0, -1) DRV", "@asyn(PORT, 0, -0.5) DRV"] {
+        // as one (DRV-42); it used to take the bounded default here. NaN fails
+        // the serial driver's `> 0` and `== 0` tests, so it waits forever too.
+        for spec in [
+            "@asyn(PORT, 0, -1) DRV",
+            "@asyn(PORT, 0, -0.5) DRV",
+            "@asyn(PORT, 0, NaN) DRV",
+        ] {
             let link = parse_asyn_link(spec).expect(spec);
             assert_eq!(link.timeout, None, "{spec}");
             assert_eq!(link.drv_info, "DRV", "{spec}");
         }
-        // The values C itself has no defined behaviour for keep the bounded
-        // fallback.
-        for spec in [
-            "@asyn(PORT, 0, inf) DRV",
-            "@asyn(PORT, 0, NaN) DRV",
-            "@asyn(PORT, 0, 1e30) DRV",
+        // Past ten years C's event wait caps it at ten years.
+        let ten_years = Duration::from_secs(60 * 60 * 24 * 36525 / 10);
+        for (spec, want) in [
+            ("@asyn(PORT, 0, inf) DRV", ten_years),
+            ("@asyn(PORT, 0, 1e30) DRV", ten_years),
         ] {
             let link = parse_asyn_link(spec).expect(spec);
-            assert_eq!(link.timeout, Some(DEFAULT_TIMEOUT), "{spec}");
+            assert_eq!(link.timeout, Some(want), "{spec}");
             assert_eq!(link.drv_info, "DRV", "{spec}");
         }
         // A representable timeout still passes through verbatim.

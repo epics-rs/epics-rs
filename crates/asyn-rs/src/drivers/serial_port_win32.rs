@@ -16,6 +16,7 @@
 use std::time::{Duration, Instant};
 
 use epics_libcom_rs::cfmt::CFloat;
+use epics_libcom_rs::runtime::time::deadline_from_now;
 
 use windows_sys::Win32::Devices::Communication::{
     COMMTIMEOUTS, ClearCommBreak, DCB, EVENPARITY, GetCommState, NOPARITY, ODDPARITY, ONESTOPBIT,
@@ -348,7 +349,7 @@ impl OctetNext for SerialIoStateWin32 {
         // timeout bounds each call. `None` is C's negative timeout: no timer is
         // started at all (`writeTimeout > 0`, drvAsynSerialPortWin32.c:508), so
         // the loop runs until every byte is out.
-        let deadline = user.timeout.map(|t| Instant::now() + t);
+        let deadline = user.timeout.map(deadline_from_now);
         // C parity (drvAsynSerialPortWin32.c writeIt, drvAsynSerialPort.c:843):
         // the bytes the port accepted are reported alongside the failing status,
         // never dropped — carry `total` out on the error via
@@ -1257,6 +1258,24 @@ mod tests {
             assert_eq!(e.status(), AsynStatus::Error, "got {e:?}");
             assert_eq!(e.message(), r"\\.\COM1 disconnected:");
         }
+    }
+
+    /// A driver may fill `AsynUser::timeout` with `Duration::MAX`: the write's
+    /// deadline never fires rather than overflowing `Instant`. `WriteFile`
+    /// takes a file handle as it takes a comm handle.
+    #[test]
+    fn a_duration_max_timeout_writes() {
+        use std::os::windows::io::AsRawHandle;
+
+        let path = std::env::temp_dir().join(format!("asyn_w32_max_{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        let mut io = SerialIoStateWin32::new();
+        io.handle_val = Some(file.as_raw_handle() as isize);
+        let mut user = AsynUser::new(0).with_timeout(Duration::MAX);
+        let n = OctetNext::write(&mut io, &mut user, b"abc");
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(n.unwrap(), 3);
     }
 
     /// R7-50: C-Win32 guards getOption AND setOption on the closed handle

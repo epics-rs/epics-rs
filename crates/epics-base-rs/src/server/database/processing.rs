@@ -445,10 +445,9 @@ impl DeviceDone {
     /// (`aoRecord.c:585`).
     pub(crate) fn complete_after(&self, delay: std::time::Duration) {
         let done = self.clone();
-        let priority = self.priority();
-        crate::runtime::task::spawn_background(priority, async move {
-            crate::runtime::task::sleep_background(delay).await;
-            let _ = done.complete(priority);
+        // The task is C's ProcessCallback, so it drains the pass itself.
+        crate::runtime::task::spawn_background_after(self.priority(), delay, async move {
+            done.complete_now();
         });
     }
 
@@ -4426,7 +4425,7 @@ impl PvDatabase {
     }
 
     /// Schedule a delayed re-process of `name` — the single owner of the
-    /// "mint a fresh [`AsyncToken`], sleep, then fire" pattern. Used by both
+    /// "mint a fresh [`AsyncToken`], wait, then fire" pattern. Used by both
     /// [`ProcessAction::ReprocessAfter`](crate::server::record::ProcessAction::ReprocessAfter) (record-driven owner re-entry: ODLY
     /// output delay, swait, sequence DLYn) and the `SDLY` async-simulation
     /// defer ([`SimOutcome::DeferRead`]). Minting advances the record's
@@ -4441,8 +4440,7 @@ impl PvDatabase {
         let token = Self::mint_async_token_in(name, rec);
         let prio = rec.read().common.callback_priority();
         let db = self.clone();
-        crate::runtime::task::spawn_background(prio, async move {
-            crate::runtime::task::sleep_background(delay).await;
+        crate::runtime::task::spawn_background_after(prio, delay, async move {
             let _ = token.fire(&db).await;
         });
     }
@@ -4467,10 +4465,8 @@ impl PvDatabase {
         let mut arm = rec.read().delayed_callbacks().arm(name, callback);
         let prio = rec.read().common.callback_priority();
         let db = self.clone();
-        crate::runtime::task::spawn_background(prio, async move {
-            let mut delay = delay;
+        crate::runtime::task::spawn_background_after(prio, delay, async move {
             loop {
-                crate::runtime::task::sleep_background(delay).await;
                 if !db.accepts_reentry() {
                     return;
                 }
@@ -4490,7 +4486,7 @@ impl PvDatabase {
                     return;
                 };
                 arm = fresh;
-                delay = again;
+                crate::runtime::task::sleep_background(again).await;
             }
         });
     }
@@ -4534,8 +4530,7 @@ impl PvDatabase {
         let token = Self::mint_async_token_in(name, rec);
         let prio = rec.read().common.callback_priority();
         let db = self.clone();
-        crate::runtime::task::spawn_background(prio, async move {
-            crate::runtime::task::sleep_background(delay).await;
+        crate::runtime::task::spawn_background_after(prio, delay, async move {
             if !token.is_current() {
                 return;
             }
@@ -4612,19 +4607,24 @@ impl PvDatabase {
 
     /// [`Self::arm_watchdog`] for a caller inside the record's frame.
     pub(crate) fn arm_watchdog_in(&self, frame: InFrame<'_>) {
-        let (generation, epoch, prio) = {
+        let (generation, epoch, prio, interval) = {
             let instance = frame.read();
-            if instance.record.watchdog_interval().is_none() {
+            let Some(interval) = instance.record.watchdog_interval() else {
                 // Bumping the generation still cancels a watchdog left running
                 // by an earlier arm — an SDEL put to 0 comes through here.
                 instance
                     .watchdog_generation
                     .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                 return;
-            }
+            };
             let generation = instance.watchdog_generation.clone();
             let epoch = generation.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
-            (generation, epoch, instance.common.callback_priority())
+            (
+                generation,
+                epoch,
+                instance.common.callback_priority(),
+                interval,
+            )
         };
         let rec = frame.unframed().clone();
         // C `histogramRecord.c::wdogCallback` stamps with `recGblGetTimeStamp`
@@ -4632,49 +4632,48 @@ impl PvDatabase {
         // a live watchdog never keeps the database alive — the tick simply
         // stamps without TSEL if the database is already gone.
         let db = self.async_handle();
-        crate::runtime::task::spawn_background(prio, async move {
+        crate::runtime::task::spawn_background_after(prio, interval, async move {
             loop {
-                let interval = {
-                    let instance = rec.read();
-                    match instance.record.watchdog_interval() {
-                        Some(d) => d,
-                        // C: `if (prec->sdel > 0)` fails -> no re-arm.
-                        None => return,
-                    }
-                };
-                crate::runtime::task::sleep_background(interval).await;
-                // A newer arm superseded this task while it slept.
+                // A newer arm superseded this task while it waited.
                 if generation.load(std::sync::atomic::Ordering::Acquire) != epoch {
                     return;
                 }
-                // C `wdogCallback`'s one `dbScanLock` (`histogramRecord.c:
-                // 112-116`): the count reset, the stamp and the post share
-                // it, so no pass of the record lands between them.
-                let gate = FrameGate::of_held(rec.lock_record());
-                let frame = gate.frame(&rec);
-                let fields = frame.write().record.watchdog_fire();
-                if fields.is_empty() {
-                    // C `wdogCallback`: `mcnt == 0` -> no stamp, no post; the
-                    // timer still re-arms. C tests `prec->mcnt` before it even
-                    // takes `dbScanLock` (`histogramRecord.c:111-112`), so no
-                    // TSEL read happens on an empty tick either.
-                    continue;
+                'tick: {
+                    // C `wdogCallback`'s one `dbScanLock` (`histogramRecord.c:
+                    // 112-116`): the count reset, the stamp and the post share
+                    // it, so no pass of the record lands between them.
+                    let gate = FrameGate::of_held(rec.lock_record());
+                    let frame = gate.frame(&rec);
+                    let fields = frame.write().record.watchdog_fire();
+                    if fields.is_empty() {
+                        // C `wdogCallback`: `mcnt == 0` -> no stamp, no post;
+                        // the timer still re-arms. C tests `prec->mcnt` before
+                        // it even takes `dbScanLock` (`histogramRecord.c:
+                        // 111-112`), so no TSEL read happens on an empty tick
+                        // either.
+                        break 'tick;
+                    }
+                    let tsel = match db.db() {
+                        // A tick is a chain of its own, as C's `wdogCallback` is.
+                        Some(db) => db.read_tsel(frame, &mut ProcStack::new()),
+                        None => super::TselStamp::None,
+                    };
+                    let mut instance = frame.write();
+                    let inst = &mut *instance;
+                    tsel.stamp(&inst.name, &mut inst.common, || false);
+                    for field in fields {
+                        instance.notify_field(
+                            field,
+                            crate::server::recgbl::EventMask::VALUE
+                                | crate::server::recgbl::EventMask::LOG,
+                        );
+                    }
                 }
-                let tsel = match db.db() {
-                    // A tick is a chain of its own, as C's `wdogCallback` is.
-                    Some(db) => db.read_tsel(frame, &mut ProcStack::new()),
-                    None => super::TselStamp::None,
+                let Some(interval) = rec.read().record.watchdog_interval() else {
+                    // C: `if (prec->sdel > 0)` fails -> no re-arm.
+                    return;
                 };
-                let mut instance = frame.write();
-                let inst = &mut *instance;
-                tsel.stamp(&inst.name, &mut inst.common, || false);
-                for field in fields {
-                    instance.notify_field(
-                        field,
-                        crate::server::recgbl::EventMask::VALUE
-                            | crate::server::recgbl::EventMask::LOG,
-                    );
-                }
+                crate::runtime::task::sleep_background(interval).await;
             }
         });
     }

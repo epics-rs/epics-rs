@@ -5255,12 +5255,13 @@ impl PvDatabase {
                 // re-takes THIS record's L1 gate per group, and
                 // `complete_async_in` as `asyncFinish` inside the last
                 // group's gate. The walk task is `pcb->callback`: its spawn
-                // is the first group's `callbackRequest`, and each later
-                // group's is a `requeue_background` to the band's tail after
-                // its DLY — so another record's groups queued meanwhile run
-                // between two of this one's, as on C. Which of the three
-                // queues that walk runs on is C `seqRecord.c:145-146`, re-read
-                // at the top of every `process()` — "Set callback from PRIO",
+                // is the first group's `callbackRequest(Delayed)`, and each
+                // later group's a `requeue_background`, or a `sleep_background`
+                // for a DLY, to the band's tail — so another record's groups
+                // queued meanwhile run between two of this one's, as on C.
+                // Which of the three queues that walk runs on is C
+                // `seqRecord.c:145-146`, re-read at the top of every
+                // `process()` — "Set callback from PRIO",
                 // `callbackSetPriority(prec->prio, &pcb->callback)` — so the
                 // band is taken here, under the same write lock that sets PACT.
                 if !active.is_empty() {
@@ -5272,17 +5273,26 @@ impl PvDatabase {
                     };
                     let db = self.clone();
                     let rec = Arc::clone(rec.unframed());
-                    crate::runtime::task::spawn_background(prio, async move {
+                    let group_delay = |dly: f64| {
+                        if dly > 0.0 {
+                            crate::runtime::time::duration_from_secs(dly)
+                        } else {
+                            std::time::Duration::ZERO
+                        }
+                    };
+                    let first = group_delay(active[0].dly);
+                    let walk = move || async move {
                         let last = active.len() - 1;
                         for (index, grp) in active.iter().enumerate() {
-                            let delay = if grp.dly > 0.0 {
-                                crate::runtime::time::duration_from_secs(grp.dly)
-                            } else {
-                                std::time::Duration::ZERO
-                            };
-                            // The spawn is the first group's request.
-                            if index > 0 || !delay.is_zero() {
-                                crate::runtime::task::requeue_background(delay).await;
+                            let delay = group_delay(grp.dly);
+                            // The spawn is the first group's request; a later
+                            // one's is `processNextLink`'s choice again.
+                            if index > 0 {
+                                if delay.is_zero() {
+                                    crate::runtime::task::requeue_background().await;
+                                } else {
+                                    crate::runtime::task::sleep_background(delay).await;
+                                }
                             }
                             // C `processCallback`'s `dbScanLock` /
                             // `dbScanUnlock` pair (`seqRecord.c:252`, `:274`)
@@ -5300,7 +5310,14 @@ impl PvDatabase {
                                 }
                             });
                         }
-                    });
+                    };
+                    // `processNextLink`'s own choice (`seqRecord.c:210-215`),
+                    // made before the walk is built so it is not moved twice.
+                    if first.is_zero() {
+                        crate::runtime::task::spawn_background(prio, walk());
+                    } else {
+                        crate::runtime::task::spawn_background_after(prio, first, walk());
+                    }
                     return MultiOutDispatch::went_async();
                 }
                 // `active` is empty: C's `if (!i) return asyncFinish(prec)`

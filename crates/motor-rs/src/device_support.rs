@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use epics_base_rs::error::CaResult;
 use epics_base_rs::runtime::task::{
-    CallbackPriority, sleep_background, spawn_background, spawn_blocking_background,
+    CallbackPriority, spawn_background_after, spawn_blocking_background,
 };
 use epics_base_rs::server::device_support::{DeviceInitOutcome, DeviceReadOutcome, DeviceSupport};
 use epics_base_rs::server::record::{Record, ScanType};
@@ -749,8 +749,7 @@ impl CommandPort {
         let (id, duration) = (delay.id, delay.duration);
         let device_state = self.device_state.clone();
         let io_intr_tx = self.io_intr_tx.clone();
-        spawn_background(self.prio, async move {
-            sleep_background(duration).await;
+        spawn_background_after(self.prio, duration, async move {
             let pulse = device_state.lock().is_ok_and(|mut ds| ds.delay_expired(id));
             if pulse {
                 let _ = io_intr_tx.send(()).await;

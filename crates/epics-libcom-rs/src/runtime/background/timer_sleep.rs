@@ -38,6 +38,12 @@
 //! timer entry is armed lazily on the **first poll** — a `Sleep` that is
 //! created and dropped without ever being awaited schedules nothing.
 //!
+//! The first poll never completes. A deadline already lapsed by then arms no
+//! entry: the poll wakes its own task and returns `Pending`, as C's timer
+//! queue still requests a lapsed `callbackRequestDelayed` through the
+//! callback queue. A band task looping on a lapsed wait so goes to the band's
+//! tail every turn instead of holding it.
+//!
 //! A [`Sleep`] **owns** the queue entry it arms: [`TimerHandle::schedule_wake`]
 //! hands back a [`WakeKey`], and [`Sleep`]'s `Drop` both clears the stored waker
 //! and cancels that key. Clearing the waker is what makes the cancel clean — a
@@ -99,8 +105,8 @@ pub fn sleep(timer: &TimerHandle, dur: Duration) -> Sleep {
 }
 
 /// A future completing at `deadline` — mirrors `tokio::time::sleep_until`. A
-/// deadline already in the past makes the future ready on its first poll
-/// without arming a timer entry.
+/// deadline already in the past arms no timer entry; the first poll still
+/// yields once.
 pub fn sleep_until(timer: &TimerHandle, deadline: Instant) -> Sleep {
     Sleep {
         deadline,
@@ -127,11 +133,18 @@ impl Future for Sleep {
             if st.fired {
                 return Poll::Ready(());
             }
-            // Deadline already reached (past-deadline construction, or the
-            // clock crossed it before the timer callback landed): complete now.
             if Instant::now() >= this.deadline {
                 st.fired = true;
-                return Poll::Ready(());
+                // A later poll is the clock crossing the deadline before the
+                // timer callback landed. A first one yields: see the module
+                // docs.
+                if this.armed {
+                    return Poll::Ready(());
+                }
+                this.armed = true;
+                drop(st);
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
             }
             st.waker = Some(cx.waker().clone());
         }
@@ -280,20 +293,25 @@ mod tests {
         );
     }
 
+    /// A lapsed deadline yields once through the task's own wake, and arms
+    /// nothing.
     #[test]
-    fn sleep_until_past_deadline_is_immediately_ready() {
+    fn sleep_until_past_deadline_yields_once_then_is_ready() {
         let pool = CallbackPool::new();
         let timer = DelayedTimer::new(pool.handle());
+        let h = timer.handle();
         let past = Instant::now() - Duration::from_secs(1);
 
         let count = Arc::new(AtomicUsize::new(0));
         let waker = Waker::from(Arc::new(CountWaker(Arc::clone(&count))));
         let mut cx = Context::from_waker(&waker);
 
-        let mut s = Box::pin(sleep_until(&timer.handle(), past));
+        let mut s = Box::pin(sleep_until(&h, past));
+        assert!(s.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(h.scheduled_count(), 0);
         assert!(s.as_mut().poll(&mut cx).is_ready());
-        // Nothing was armed, so nothing ever wakes the waker.
-        assert_eq!(count.load(Ordering::SeqCst), 0);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 
     #[test]

@@ -87,3 +87,50 @@ async fn zero_delay_groups_of_two_seqs_alternate() {
          and SB's groups alternate as on C softIoc"
     );
 }
+
+/// C `processNextLink` requests a first group with DLY>0 through
+/// `callbackRequestDelayed` (`seqRecord.c:210-213`), whose timer starts at
+/// the record's pass: on a band held past DLY the group runs as soon as the
+/// band frees, before a request queued after the delay lapsed.
+#[epics_macros_rs::epics_test]
+async fn first_group_delay_runs_from_the_pass() {
+    use epics_base_rs::runtime::task::{CallbackPriority, spawn_background};
+    const DLY: Duration = Duration::from_millis(200);
+    let db = IocBuilder::new()
+        .db_string(
+            r#"
+record(calc, "T") { field(CALC, "VAL+1") }
+record(seq, "S") { field(SELM, "All") field(DLY0, "0.2") field(LNK0, "T.PROC") }
+"#,
+            &std::collections::HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap()
+        .0;
+    let (started_tx, started) = std::sync::mpsc::channel();
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    drop(spawn_background(CallbackPriority::Low, async move {
+        started_tx.send(()).unwrap();
+        let _ = held.recv();
+    }));
+    started.recv_timeout(Duration::from_secs(3)).unwrap();
+
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
+    db.process_record_with_links("S", &mut visited)
+        .await
+        .unwrap();
+    epics_base_rs::runtime::task::sleep(DLY * 2).await;
+    let t = db.get_record("T").unwrap();
+    let seen = spawn_background(CallbackPriority::Low, async move {
+        t.read().record.val().and_then(|v| v.to_f64()).unwrap()
+    });
+    release.send(()).unwrap();
+    assert_eq!(
+        seen.await.unwrap(),
+        1.0,
+        "the first group waited DLY0 from the band's pick-up, not from S's pass"
+    );
+    wait_idle(&db, &["S"]).await;
+}

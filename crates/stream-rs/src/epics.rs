@@ -35,9 +35,7 @@ use std::time::Duration;
 
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::runtime::background::{CallbackBody, CallbackCell};
-use epics_base_rs::runtime::task::{
-    CallbackPriority, request_cell, sleep_background, spawn_background,
-};
+use epics_base_rs::runtime::task::{CallbackPriority, request_cell, spawn_background_after};
 use epics_base_rs::server::database::{
     AsyncDbHandle, DbAddr, DeviceDone, DeviceDoneSource, FieldPut, HeldInstance, InitHold,
     ProcessCallback, UnheldLinkPut,
@@ -1527,8 +1525,8 @@ impl StreamCoreHooks for StreamHooks {
         };
         let shared = Arc::downgrade(&self.shared);
         let prio = CallbackPriority::from_record_prio(self.shared.prio.load(Ordering::Relaxed));
-        drop(spawn_background(prio, async move {
-            sleep_background(Duration::from_millis(timeout_ms)).await;
+        let delay = Duration::from_millis(timeout_ms);
+        drop(spawn_background_after(prio, delay, async move {
             let current = shared
                 .upgrade()
                 .is_some_and(|s| s.timer_start.load(Ordering::Acquire) == start);

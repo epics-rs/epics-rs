@@ -688,6 +688,36 @@ where
     spawn_future(&background().callbacks().handle(), priority, future)
 }
 
+/// [`spawn_background`] `delay` from now — C `callbackRequestDelayed`
+/// (`callback.c:410-419`). The timer starts at this call and `future` joins
+/// the tail of `priority`'s band when it fires, so a band busy past the delay
+/// runs it next rather than only then starting the wait. A zero delay is
+/// [`spawn_background`] itself: C's timer queue fires it at once into
+/// `callbackRequest`, as for the SDLY of 0 an output passes
+/// (`aoRecord.c:585`).
+pub fn spawn_background_after<F>(
+    priority: CallbackPriority,
+    delay: Duration,
+    future: F,
+) -> BackgroundTaskHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    use crate::runtime::background::spawn_future_after;
+    if delay.is_zero() {
+        return spawn_background(priority, future);
+    }
+    let exec = background();
+    spawn_future_after(
+        &exec.callbacks().handle(),
+        &exec.timer().handle(),
+        priority,
+        delay,
+        future,
+    )
+}
+
 /// [`spawn_background`] for a blocking closure — runs it on a callback-pool
 /// worker of the named band, holding that worker for the whole run. For work
 /// that belongs on the band (C `callbackRequest`); `f` gets the [`OnBand`]
@@ -715,8 +745,13 @@ pub fn request_cell<B: crate::runtime::background::CallbackBody>(
     background().callbacks().request_cell(priority, cell)
 }
 
-/// Sleep on the process-global delayed-callback timer — C
-/// `callbackRequestDelayed` (callback.c:410) — measured on `std::time`.
+/// Wait `duration` on the process-global delayed-callback timer, measured on
+/// `std::time` — C `callbackRequestDelayed` (`callback.c:410-419`) of the
+/// running callback from its own body. Like C's timer queue, the wait never
+/// completes on its first poll (see
+/// [`timer_sleep`](crate::runtime::background::timer_sleep)): a delay lapsed by
+/// then puts a [`spawn_background`] task back at the tail of its band, so a
+/// loop of lapsed re-arms never holds the band.
 ///
 /// The delay counterpart to [`spawn_background`]: a tail deferred there must
 /// wait on a timer that exists without a runtime, which `tokio::time` does not.
@@ -724,25 +759,17 @@ pub async fn sleep_background(duration: Duration) {
     crate::runtime::background::timer_sleep::sleep(&background().timer().handle(), duration).await;
 }
 
-/// Resume the running [`spawn_background`] task from the tail of its band,
-/// `delay` from now — C `callbackRequestDelayed`, or `callbackRequest` for a
-/// zero delay, of the running callback from its own body
-/// (`seqRecord.c:211-215`). It runs again only after every request queued
-/// before it, through the band exactly once: a delay that lapses before its
-/// timer arms, which [`sleep_background`] completes inline, requeues instead.
+/// Resume the running [`spawn_background`] task from the tail of its band — C
+/// `callbackRequest` of the running callback from its own body
+/// (`seqRecord.c:215`). It runs again only after every request queued before
+/// it, as from [`sleep_background`] of a zero delay, without building a timer
+/// wait.
 ///
 /// Not [`yield_now`]: on the tokio backend that defers to tokio's scheduler,
 /// whereas this is the band's FIFO on either backend.
-pub async fn requeue_background(delay: Duration) {
-    if !delay.is_zero() {
-        let mut sleep = std::pin::pin!(sleep_background(delay));
-        let armed = std::future::poll_fn(|cx| Poll::Ready(sleep.as_mut().poll(cx).is_pending()));
-        if armed.await {
-            // The timer's wake is the band request.
-            return sleep.await;
-        }
-    }
-    YieldNow(false).await;
+#[inline]
+pub fn requeue_background() -> impl Future<Output = ()> {
+    YieldNow(false)
 }
 
 /// Periodic ticker on the process-global delayed-callback timer — the
@@ -4307,14 +4334,16 @@ mod tests {
         );
     }
 
-    /// A requeued band task resumes behind what was queued meanwhile, for a
-    /// zero delay and for a positive one, lapsed before its timer arms or not.
+    /// A band task resumes behind what was queued meanwhile, from
+    /// [`requeue_background`] and from [`sleep_background`] of a zero delay
+    /// and of a positive one, lapsed by its first poll or not.
     #[epics_macros_rs::epics_test]
-    async fn requeue_background_resumes_behind_the_band() {
+    async fn band_waits_resume_behind_the_band() {
         for delay in [
-            Duration::ZERO,
-            Duration::from_nanos(1),
-            Duration::from_millis(5),
+            None,
+            Some(Duration::ZERO),
+            Some(Duration::from_nanos(1)),
+            Some(Duration::from_millis(5)),
         ] {
             let order = Arc::new(std::sync::Mutex::new(Vec::new()));
             let log = Arc::clone(&order);
@@ -4324,7 +4353,10 @@ mod tests {
                 drop(spawn_background(CallbackPriority::Low, async move {
                     other.lock().unwrap().push("queued");
                 }));
-                requeue_background(delay).await;
+                match delay {
+                    None => requeue_background().await,
+                    Some(delay) => sleep_background(delay).await,
+                }
                 log.lock().unwrap().push("second");
             });
             timeout(Duration::from_secs(3), walk)
@@ -4337,6 +4369,56 @@ mod tests {
                 "{delay:?}"
             );
         }
+    }
+
+    /// The delay of [`spawn_background_after`] runs from the call, as C
+    /// `callbackRequestDelayed`'s timer does: on a band held past the delay
+    /// the task waits only for the band, and runs ahead of work queued after
+    /// its timer fired.
+    #[epics_macros_rs::epics_test]
+    async fn spawn_background_after_times_the_delay_from_the_request() {
+        const DELAY: Duration = Duration::from_millis(200);
+        let (started_tx, started) = std::sync::mpsc::channel();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        drop(spawn_background(CallbackPriority::Low, async move {
+            started_tx.send(()).unwrap();
+            let _ = held.recv();
+        }));
+        timeout(Duration::from_secs(3), async {
+            while started.try_recv().is_err() {
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the band is held");
+
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = Arc::clone(&order);
+        let delayed = spawn_background_after(CallbackPriority::Low, DELAY, async move {
+            log.lock().unwrap().push("delayed");
+            std::time::Instant::now()
+        });
+        sleep(DELAY * 2).await;
+        let log = Arc::clone(&order);
+        let queued = spawn_background(CallbackPriority::Low, async move {
+            log.lock().unwrap().push("queued");
+        });
+        let freed = std::time::Instant::now();
+        release.send(()).unwrap();
+        let ran = timeout(Duration::from_secs(3), delayed)
+            .await
+            .unwrap()
+            .unwrap();
+        timeout(Duration::from_secs(3), queued)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(*order.lock().unwrap(), ["delayed", "queued"]);
+        let waited = ran.saturating_duration_since(freed);
+        assert!(
+            waited < DELAY / 2,
+            "ran {waited:?} after the band freed, a delay timed from the pick-up"
+        );
     }
 
     /// A process that never started a runtime still gets a blocking pool.

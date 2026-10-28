@@ -127,24 +127,25 @@ impl PvDatabase {
     fn arm_link_check(&self, name: &[u8], delay: Duration) {
         let db = self.clone();
         let name = crate::types::RecordName::from(name);
-        crate::runtime::task::spawn_background(
+        crate::runtime::task::spawn_background_after(
             crate::runtime::task::CallbackPriority::Low,
+            delay,
             async move {
-                let mut delay = delay;
                 loop {
-                    crate::runtime::task::sleep_background(delay).await;
-                    let Some(rec) = db.get_record_no_resolve(&name) else {
-                        return;
-                    };
-                    let mut instance = rec.write();
-                    let Some(check) = instance.record.link_check() else {
-                        return;
-                    };
-                    check.state.scheduled = false;
-                    if !db.check_links(&mut instance) {
-                        return;
+                    {
+                        let Some(rec) = db.get_record_no_resolve(&name) else {
+                            return;
+                        };
+                        let mut instance = rec.write();
+                        let Some(check) = instance.record.link_check() else {
+                            return;
+                        };
+                        check.state.scheduled = false;
+                        if !db.check_links(&mut instance) {
+                            return;
+                        }
                     }
-                    delay = LINK_RECHECK;
+                    crate::runtime::task::sleep_background(LINK_RECHECK).await;
                 }
             },
         );

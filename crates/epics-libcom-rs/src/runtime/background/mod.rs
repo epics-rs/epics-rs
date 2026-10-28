@@ -54,7 +54,7 @@ pub use callback_executor::{
 pub use delayed_timer::{DelayedTimer, TimerHandle};
 pub use future_exec::{
     AbortHandle, DEFAULT_SPAWN_PRIORITY, JoinError, JoinFuture, OnBand, spawn_blocking_offloaded,
-    spawn_blocking_on, spawn_future,
+    spawn_blocking_on, spawn_future, spawn_future_after,
 };
 pub use timer_sleep::{Sleep, TimerInterval};
 

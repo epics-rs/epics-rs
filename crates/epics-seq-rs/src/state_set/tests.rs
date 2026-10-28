@@ -1598,10 +1598,21 @@ fn e2e_a_put_callback_in_the_blocker_holds_up_no_other_put() {
     });
     assert_eq!(on, PvStat::Ok);
     until("first monitor", || landed.load(Ordering::SeqCst) == 1);
-    let put_callback = || busy.put_callback(PvType::Short, 1, EpicsValue::Short(1), |_| {});
-    assert_eq!(put_callback(), PvStat::Ok, "ss1");
+    let ss1_done = Arc::new(AtomicU32::new(0));
+    let done = Arc::clone(&ss1_done);
+    let ss1 = busy.put_callback(PvType::Short, 1, EpicsValue::Short(1), move |_| {
+        done.fetch_add(1, Ordering::SeqCst);
+    });
+    assert_eq!(ss1, PvStat::Ok, "ss1");
+    let released = AtomicBool::new(false);
     std::thread::scope(|s| {
-        let ss2 = s.spawn(|| (put_callback(), busy.message()));
+        // ss2 returns once ss1's record completes, but ss1's callback, which
+        // leaves the message, may still be running: `putNotifyCompletion`
+        // signals the blocker before it calls the user callback.
+        let ss2 = s.spawn(|| {
+            let stat = busy.put_callback(PvType::Short, 1, EpicsValue::Short(1), |_| {});
+            (stat, released.load(Ordering::SeqCst))
+        });
         std::thread::sleep(std::time::Duration::from_millis(100));
         put_from_another_thread("rv:q", 2.0);
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -1614,11 +1625,13 @@ fn e2e_a_put_callback_in_the_blocker_holds_up_no_other_put() {
             "ss3 took {took:?}"
         );
         until("the post", || landed.load(Ordering::SeqCst) == 2);
+        released.store(true, Ordering::SeqCst);
         put_from_another_thread("rv:busy4", 0.0);
-        let (stat, message) = ss2.join().unwrap();
+        let (stat, after_ss1) = ss2.join().unwrap();
+        until("ss1's callback", || ss1_done.load(Ordering::SeqCst) == 1);
         assert_eq!(
-            (stat, message.as_deref()),
-            (PvStat::Ok, Some("Normal successful completion")),
+            (stat, after_ss1, busy.message().as_deref()),
+            (PvStat::Ok, true, Some("Normal successful completion")),
             "ss2"
         );
     });

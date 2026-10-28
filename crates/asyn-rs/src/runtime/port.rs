@@ -722,6 +722,26 @@ mod tests {
         assert_eq!(handle.read_int32_blocking(0, 0).unwrap(), 7);
     }
 
+    /// `connectDevice` gives a user at a negative address no device
+    /// (asynManager.c:1351), so on a multi-device port `getAddr` reports -1
+    /// for -2 as for -1, and `getAddress` reads list 0.
+    #[test]
+    fn a_negative_address_reaches_address_0_on_a_multi_device_port() {
+        let port = TestPort::with_flags(
+            "rt_negative_addr",
+            PortFlags {
+                multi_device: true,
+                ..PortFlags::default()
+            },
+        );
+        let (runtime, _jh) = create_port_runtime_unclaimed(port, RuntimeConfig::default())
+            .expect("the port runtime thread must start");
+        let handle = runtime.port_handle();
+        assert_eq!(handle.param_list(-2), 0);
+        handle.write_int32_blocking(0, 0, 7).unwrap();
+        assert_eq!(handle.read_int32_blocking(0, -2).unwrap(), 7);
+    }
+
     /// getStringParam's text, without the NUL readOctet counts, cut to
     /// `max_chars - 1` (asynPortDriver.cpp:551-552).
     #[test]

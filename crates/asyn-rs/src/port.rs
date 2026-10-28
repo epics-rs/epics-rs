@@ -378,10 +378,11 @@ pub fn dp_common_key(multi_device: bool, addr: i32) -> Option<i32> {
 
 /// The parameter list C's `getAddress` (asynPortDriver.cpp:1901-1906) takes
 /// for a user at `addr`: `pasynManager->getAddr` is -1 on a port without
-/// `ASYN_MULTIDEVICE`, whatever the user asked for, and -1 is list 0. A
+/// `ASYN_MULTIDEVICE`, whatever the user asked for, and for a user at any
+/// negative address, which `connectDevice` gives no device; -1 is list 0. A
 /// request and an interrupt client resolve through this one rule.
 pub fn param_list(multi_device: bool, addr: i32) -> i32 {
-    if multi_device && addr != -1 { addr } else { 0 }
+    if multi_device && addr >= 0 { addr } else { 0 }
 }
 
 /// What C `getAddress` reads of its port: whether `getAddr` reports the

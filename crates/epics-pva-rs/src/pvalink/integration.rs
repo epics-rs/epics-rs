@@ -4478,13 +4478,11 @@ mod tests {
             .server_addr(server.tcp_addr())
             .timeout(std::time::Duration::from_secs(3))
             .build();
-        resolver.registry.insert_for_test(
-            &out_cfg,
-            std::sync::Arc::new(PvaLink::for_test_with_client(
-                PvaLinkConfig::clone(&out_cfg),
-                client,
-            )),
-        );
+        let link = std::sync::Arc::new(PvaLink::for_test_with_client(
+            PvaLinkConfig::clone(&out_cfg),
+            client,
+        ));
+        resolver.registry.insert_for_test(&out_cfg, link.clone());
         LinkSet::put_value(
             &resolver,
             lref(b"INT:PV"),
@@ -4493,7 +4491,7 @@ mod tests {
         )
         .await
         .expect("a real into an int channel is put");
-        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        link.put_landed().await;
         let PvField::Structure(s) = pv.current().expect("PV has a value") else {
             panic!("expected structure value");
         };
@@ -4561,14 +4559,14 @@ mod tests {
             PvaLinkConfig::clone(&out_cfg),
             client,
         ));
-        resolver.registry.insert_for_test(&out_cfg, link);
+        resolver.registry.insert_for_test(&out_cfg, link.clone());
 
         // Drive the OUT path through the resolver's LinkSet impl.
         LinkSet::put_value(&resolver, lref(pv_name.as_bytes()), value, LinkPutOp::Plain)
             .await
             .expect("typed array OUT write must succeed");
 
-        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        link.put_landed().await;
 
         let current = pv.current().expect("PV has a current value");
         let PvField::Structure(s) = current else {

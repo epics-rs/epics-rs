@@ -504,7 +504,8 @@ pub async fn op_get_raw(
 /// those pre-reads; removing it exposed every bare-`ensure_active`
 /// one-shot site as an unbounded hang.) `pvmonitor*` loops keep
 /// using the bare `ensure_active` because their natural cancel path
-/// is `SubscriptionHandle` drop, not a timeout.
+/// is `SubscriptionHandle` drop, not a timeout; so does
+/// [`op_put_begin_unbounded`], which its owner drops at the disconnect.
 pub(crate) async fn ensure_active_with_op_timeout(
     channel: &Arc<Channel>,
     op_timeout: Duration,
@@ -2029,6 +2030,7 @@ where
 /// other op, [`PutOp::commit`] is not (`clientget.cpp:380-404`,
 /// `state==Exec && !autoExec`) — a circuit lost between the phases answers
 /// [`PvaError::Disconnected`] and the caller decides whether to begin again.
+/// [`op_put_begin_unbounded`]'s op is neither re-queued nor timed.
 ///
 /// Dropping an uncommitted `PutOp` sends DESTROY_REQUEST and releases the
 /// ioid through its `IoidGuard`.
@@ -2042,7 +2044,8 @@ pub struct PutOp {
     order: ByteOrder,
     intro: Arc<FieldDesc>,
     present: Option<(PvField, BitSet)>,
-    op_timeout: Duration,
+    /// `None` for [`op_put_begin_unbounded`]'s op.
+    op_timeout: Option<Duration>,
 }
 
 impl std::fmt::Debug for PutOp {
@@ -2068,9 +2071,21 @@ pub async fn op_put_begin(
     op_timeout: Duration,
 ) -> PvaResult<PutOp> {
     requeue_on_disconnect(channel, op_timeout, |budget| {
-        op_put_begin_attempt(channel, request, fetch_present, budget)
+        op_put_begin_attempt(channel, request, fetch_present, Some(budget))
     })
     .await
+}
+
+/// [`op_put_begin`] with no deadline and no re-queue, its [`PutOp::commit`]
+/// untimed too: for an owner that ends the put at the channel's disconnect,
+/// the event a re-queue would wait out, as pvxs's pvalink `op_put.reset()`
+/// does (`ioc/pvalink_channel.cpp:367`). pvxs's client puts carry no deadline.
+pub(crate) async fn op_put_begin_unbounded(
+    channel: &Arc<Channel>,
+    request: Option<&crate::pv_request::PvRequestExpr>,
+    fetch_present: bool,
+) -> PvaResult<PutOp> {
+    op_put_begin_attempt(channel, request, fetch_present, None).await
 }
 
 /// One attempt of [`op_put_begin`]; [`requeue_on_disconnect`] runs it again
@@ -2079,9 +2094,12 @@ async fn op_put_begin_attempt(
     channel: &Arc<Channel>,
     request: Option<&crate::pv_request::PvRequestExpr>,
     fetch_present: bool,
-    op_timeout: Duration,
+    op_timeout: Option<Duration>,
 ) -> PvaResult<PutOp> {
-    let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
+    let (server, sid) = match op_timeout {
+        Some(op_timeout) => ensure_active_with_op_timeout(channel, op_timeout).await?,
+        None => channel.ensure_active().await?,
+    };
     let order = server.byte_order();
     let big_endian = matches!(order, ByteOrder::Big);
     let codec = PvaCodec { big_endian };
@@ -2098,7 +2116,7 @@ async fn op_put_begin_attempt(
 
     let init_req = codec.build_put_init(sid, ioid, &pv_req);
     server.send_for_channel(sid, init_req).await?;
-    let init_frame = await_frame(&mut stream, op_timeout).await?;
+    let init_frame = await_frame_within(&mut stream, op_timeout).await?;
     let init = match decode_op_or_reset(&server, &init_frame, None)? {
         OpResponse::Init(i) => i,
         other => {
@@ -2119,7 +2137,7 @@ async fn op_put_begin_attempt(
     let present = if fetch_present {
         let get_oput = codec.build_put_get(sid, ioid);
         server.send_for_channel(sid, get_oput).await?;
-        let snap_frame = await_frame(&mut stream, op_timeout).await?;
+        let snap_frame = await_frame_within(&mut stream, op_timeout).await?;
         match decode_op_or_reset(&server, &snap_frame, Some(&intro))? {
             OpResponse::Data(d) if d.status.is_success() => Some((d.value, d.changed)),
             _ => None,
@@ -2188,7 +2206,7 @@ impl PutOp {
         // the ioid — the same finalizer every abandoned op reaches.
         server.send_for_channel(sid, frame).await?;
 
-        let done_frame = await_frame(&mut stream, op_timeout).await?;
+        let done_frame = await_frame_within(&mut stream, op_timeout).await?;
         let result = match decode_op_or_reset(&server, &done_frame, Some(&intro))? {
             OpResponse::Status(s) => {
                 if s.status.is_success() {
@@ -4322,6 +4340,17 @@ async fn await_frame(
         .map_err(|_| PvaError::Timeout)?
         .ok_or(PvaError::Disconnected)?;
     Ok(frame)
+}
+
+/// [`await_frame`], with no deadline when `op_timeout` is `None`.
+async fn await_frame_within(
+    stream: &mut mpsc::UnboundedReceiver<super::decode::Frame>,
+    op_timeout: Option<Duration>,
+) -> PvaResult<super::decode::Frame> {
+    match op_timeout {
+        Some(op_timeout) => await_frame(stream, op_timeout).await,
+        None => stream.recv().await.ok_or(PvaError::Disconnected),
+    }
 }
 
 /// Outcome of [`recv_monitor_init`].

@@ -31,7 +31,9 @@ pub(crate) use opener::ChannelOpener;
 /// exposes **no** per-link timeout option (neither does pvxs's
 /// `pvaLinkConfig`), so one client-level timeout is the whole surface; a
 /// per-link timeout, if one is ever added, must be passed to the
-/// per-operation call instead of forking the shared client.
+/// per-operation call instead of forking the shared client. A link's put
+/// is not bounded by it: it ends at its result, the put replacing it or the
+/// channel's disconnect, as pvxs's.
 const PVALINK_CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Registry cache key.

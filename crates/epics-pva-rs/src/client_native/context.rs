@@ -1713,6 +1713,19 @@ impl PvaClient {
             .await
     }
 
+    /// [`Self::pvput_begin`] with no deadline on the put
+    /// ([`op_put_begin_unbounded`](crate::client_native::ops_v2::op_put_begin_unbounded)),
+    /// for a caller that ends it at the channel's disconnect.
+    pub(crate) async fn pvput_begin_unbounded(
+        &self,
+        pv_name: &str,
+        request: Option<&crate::pv_request::PvRequestExpr>,
+        fetch_present: bool,
+    ) -> PvaResult<PutOp> {
+        let ch = self.channel(pv_name).await?;
+        crate::client_native::ops_v2::op_put_begin_unbounded(&ch, request, fetch_present).await
+    }
+
     /// PUT a pre-built [`PvField`] with a custom pvRequest. Like
     /// `pvput_pv_field` but INIT carries the caller's record options
     /// (`process`, `block`). DATA still targets `"value"`.

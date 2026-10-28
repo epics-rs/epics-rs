@@ -100,6 +100,13 @@ fn a_refused_pva_link_put_prints_the_pvxs_line() {
     sh.capture_until("dbjlr WR 0", "conn=T Put");
     remote.kill().unwrap();
     let _ = remote.wait();
+    // The disconnect ends the put, pvxs's `op_put.reset()`
+    // (`ioc/pvalink_channel.cpp:369`): no report shows one without the other.
+    let text = sh.capture_when("dbjlr WR 0", |text| text.contains("conn=F"));
+    assert!(
+        text.ends_with("conn=F\n"),
+        "the put outlived the disconnect:\n{text}"
+    );
     sh.capture_until("dbjlr WR 1", "conn=F #disconn=1");
     std::thread::sleep(Duration::from_millis(500));
     sh.line("exit");

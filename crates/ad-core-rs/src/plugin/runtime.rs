@@ -3745,6 +3745,7 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
     // would also register address 0, but direct callers must not bypass the
     // registry). A downstream plugin at NDArrayAddr N gets only what is
     // posted at address N, as on C's per-address interrupt list.
+    wiring.set_multi_device(port_name, port_handle.is_multi_device());
     for (addr, output) in array_outputs.iter().enumerate() {
         wiring.register_output_at(port_name, addr as i32, output.clone());
     }
@@ -7371,6 +7372,54 @@ mod tests {
         }
     }
 
+    /// ASYN_MULTIDEVICE, not the address count, decides whether NDArrayAddr
+    /// selects an output (asynManager.c:2006 `getAddr`).
+    #[test]
+    fn a_one_address_port_resolves_other_addresses_by_its_flag() {
+        struct One<const MULTI: bool>;
+        impl<const MULTI: bool> NDPluginProcess for One<MULTI> {
+            const ASYN_FLAGS: PortFlags = if MULTI {
+                ASYN_MULTIDEVICE
+            } else {
+                ASYN_CANBLOCK
+            };
+            const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+            const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS;
+            fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
+                ProcessResult::forward(array, vec![])
+            }
+            fn plugin_type(&self) -> &str {
+                "One"
+            }
+        }
+        let wiring = test_wiring();
+        let (_multi, _jh) = create_plugin_runtime(
+            &asyn_rs::asyn_record::claim_port("ONE_MULTI").unwrap(),
+            One::<true>,
+            1_000_000,
+            1,
+            0,
+            "",
+            wiring.clone(),
+            DEFAULT_PLUGIN_THREADS,
+        );
+        let (_single, _jh) = create_plugin_runtime(
+            &asyn_rs::asyn_record::claim_port("ONE_SINGLE").unwrap(),
+            One::<false>,
+            1_000_000,
+            1,
+            0,
+            "",
+            wiring.clone(),
+            DEFAULT_PLUGIN_THREADS,
+        );
+        assert!(wiring.output_at("ONE_MULTI", 1).is_none());
+        assert!(Arc::ptr_eq(
+            &wiring.output_at("ONE_SINGLE", 1).unwrap(),
+            &wiring.output_at("ONE_SINGLE", 0).unwrap()
+        ));
+    }
+
     #[test]
     fn an_array_a_write_posts_at_an_address_reaches_only_that_address() {
         let wiring = test_wiring();
@@ -8398,6 +8447,7 @@ mod tests {
         // reaches the plugin.
         let wiring = test_wiring();
         let drv0 = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
+        wiring.set_multi_device("LATE_DRV", true);
         wiring.register_output("LATE_DRV", drv0.clone());
         let (downstream_sender, mut downstream_rx) = ndarray_channel("LATE_SINK", 10);
         let mut output = NDArrayOutput::new();

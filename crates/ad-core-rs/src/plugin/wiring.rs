@@ -3,7 +3,7 @@
 //! Maps port names to their `NDArrayOutput`, enabling plugins to dynamically
 //! change their upstream data source by writing to the NDArrayPort PV.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use super::channel::{NDArrayOutput, NDArraySender, WeakNDArraySender};
@@ -29,28 +29,29 @@ struct Subscription {
     placement: Placement,
 }
 
+/// What a port publishes, and how asyn resolves the address a client
+/// connects with.
+#[derive(Default)]
+struct Port {
+    /// C's `ASYN_MULTIDEVICE`. Without it asyn ignores the address a client
+    /// connects with (asynManager.c:2006 `getAddr` returns -1, and
+    /// asynPortDriver.cpp:3359 delivers -1 as address 0), however many
+    /// addresses the driver posts at.
+    multi_device: bool,
+    outputs: HashMap<i32, SharedOutput>,
+}
+
 #[derive(Default)]
 struct State {
-    outputs: HashMap<String, SharedOutput>,
-    /// Ports registered with more than one address. Any other port is
-    /// single-address, where asyn ignores the address a client connects
-    /// with (asynManager.c:2006 `getAddr` returns -1, and
-    /// asynPortDriver.cpp:3359 delivers -1 as address 0).
-    multi_addr: HashSet<String>,
+    ports: HashMap<String, Port>,
     subscriptions: Vec<Subscription>,
 }
 
 impl State {
-    fn key(&self, port: &str, addr: i32) -> String {
-        if addr == 0 || !self.multi_addr.contains(port) {
-            port.to_string()
-        } else {
-            format!("{port}:{addr}")
-        }
-    }
-
     fn resolve(&self, port: &str, addr: i32) -> Option<SharedOutput> {
-        self.outputs.get(&self.key(port, addr)).cloned()
+        let port = self.ports.get(port)?;
+        let addr = asyn_rs::port::param_list(port.multi_device, addr);
+        port.outputs.get(&addr).cloned()
     }
 
     /// Put subscription `i` in the output its `(port, addr)` resolves to now.
@@ -79,6 +80,19 @@ impl State {
         };
         true
     }
+
+    /// Re-place every subscription to `port_name`, dropping those whose
+    /// plugin is gone.
+    fn place_port(&mut self, port_name: &str) {
+        let mut i = 0;
+        while i < self.subscriptions.len() {
+            if self.subscriptions[i].port != port_name || self.place(i) {
+                i += 1;
+            } else {
+                self.subscriptions.swap_remove(i);
+            }
+        }
+    }
 }
 
 /// Instance-scoped registry of the outputs published at each `(port, addr)`
@@ -103,29 +117,40 @@ impl WiringRegistry {
     }
 
     /// Register the output a driver publishes at `addr`, and move every
-    /// subscription to `port_name` into the output it now resolves to.
+    /// subscription to `port_name` into the output it now resolves to. A port
+    /// is single-device until [`Self::set_multi_device`] says otherwise.
     pub fn register_output_at(&self, port_name: &str, addr: i32, output: SharedOutput) {
         let mut state = self.state.lock().unwrap();
-        if addr != 0 {
-            state.multi_addr.insert(port_name.to_string());
-        }
-        let key = state.key(port_name, addr);
-        state.outputs.insert(key, output);
-        let mut i = 0;
-        while i < state.subscriptions.len() {
-            if state.subscriptions[i].port != port_name || state.place(i) {
-                i += 1;
-            } else {
-                state.subscriptions.swap_remove(i);
-            }
-        }
+        state
+            .ports
+            .entry(port_name.to_string())
+            .or_default()
+            .outputs
+            .insert(addr, output);
+        state.place_port(port_name);
+    }
+
+    /// Record `port_name`'s `ASYN_MULTIDEVICE` flag, which alone decides
+    /// whether a subscription's address selects an output, and move every
+    /// subscription to it into the output it now resolves to.
+    pub fn set_multi_device(&self, port_name: &str, multi_device: bool) {
+        let mut state = self.state.lock().unwrap();
+        state
+            .ports
+            .entry(port_name.to_string())
+            .or_default()
+            .multi_device = multi_device;
+        state.place_port(port_name);
     }
 
     /// True if `port` publishes NDArrays at any address: C's
     /// asynGenericPointer interface, which is per port, not per address.
     pub fn publishes(&self, port: &str) -> bool {
         let state = self.state.lock().unwrap();
-        state.outputs.contains_key(port) || state.multi_addr.contains(port)
+        state
+            .ports
+            .get(port)
+            .is_some_and(|port| !port.outputs.is_empty())
     }
 
     /// The output published at `(port, addr)`, if any.
@@ -216,6 +241,7 @@ mod tests {
         let registry = WiringRegistry::new();
         let image = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
         let signal = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
+        registry.set_multi_device("DRV", true);
         registry.register_output("DRV", image.clone());
         registry.register_output_at("DRV", 3, signal.clone());
 
@@ -223,6 +249,23 @@ mod tests {
         registry.subscribe(&sender, "DRV", 3).unwrap();
         assert_eq!(signal.lock().num_senders(), 1);
         assert_eq!(image.lock().num_senders(), 0);
+    }
+
+    #[test]
+    fn a_multi_device_port_resolves_only_the_addresses_it_publishes() {
+        // ADMythen: maxAddr 1, ASYN_MULTIDEVICE (mythen.cpp:1279).
+        let registry = WiringRegistry::new();
+        let output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
+        registry.set_multi_device("DRV", true);
+        registry.register_output("DRV", output.clone());
+
+        let (at1, _rx1) = ndarray_channel("AT1", 10);
+        registry.subscribe(&at1, "DRV", 1).unwrap();
+        assert_eq!(output.lock().num_senders(), 0);
+        // -1 is a client without a device, which reads address 0.
+        let (none, _rx) = ndarray_channel("NONE", 10);
+        registry.subscribe(&none, "DRV", -1).unwrap();
+        assert_eq!(output.lock().num_senders(), 1);
     }
 
     #[test]
@@ -304,18 +347,20 @@ mod tests {
     }
 
     #[test]
-    fn a_subscription_moves_when_its_port_becomes_multi_address() {
-        // Before address 3 is registered, (DRV, 3) reads as the
-        // single-address port's output; once it is, it is address 3's.
+    fn a_subscription_moves_when_its_port_becomes_multi_device() {
+        // While DRV is single-device, (DRV, 3) reads address 0 whatever is
+        // posted at 3; once it is multi-device, it is address 3's.
         let registry = WiringRegistry::new();
         let image = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
+        let signal = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
         registry.register_output("DRV", image.clone());
+        registry.register_output_at("DRV", 3, signal.clone());
         let (sender, _rx) = ndarray_channel("CONSUMER", 10);
         registry.subscribe(&sender, "DRV", 3).unwrap();
         assert_eq!(image.lock().num_senders(), 1);
+        assert_eq!(signal.lock().num_senders(), 0);
 
-        let signal = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
-        registry.register_output_at("DRV", 3, signal.clone());
+        registry.set_multi_device("DRV", true);
         assert_eq!(image.lock().num_senders(), 0);
         assert_eq!(signal.lock().num_senders(), 1);
     }
@@ -323,6 +368,7 @@ mod tests {
     #[test]
     fn a_pending_subscription_does_not_outlive_its_plugin() {
         let registry = WiringRegistry::new();
+        registry.set_multi_device("DRV", true);
         registry.register_output(
             "DRV",
             Arc::new(parking_lot::Mutex::new(NDArrayOutput::new())),

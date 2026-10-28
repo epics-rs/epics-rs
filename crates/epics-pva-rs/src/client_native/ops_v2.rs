@@ -505,7 +505,7 @@ pub async fn op_get_raw(
 /// one-shot site as an unbounded hang.) `pvmonitor*` loops keep
 /// using the bare `ensure_active` because their natural cancel path
 /// is `SubscriptionHandle` drop, not a timeout; so does
-/// [`op_put_begin_unbounded`], which its owner drops at the disconnect.
+/// `op_put_begin_unbounded`, which its owner drops at the disconnect.
 pub(crate) async fn ensure_active_with_op_timeout(
     channel: &Arc<Channel>,
     op_timeout: Duration,
@@ -2030,7 +2030,7 @@ where
 /// other op, [`PutOp::commit`] is not (`clientget.cpp:380-404`,
 /// `state==Exec && !autoExec`) — a circuit lost between the phases answers
 /// [`PvaError::Disconnected`] and the caller decides whether to begin again.
-/// [`op_put_begin_unbounded`]'s op is neither re-queued nor timed.
+/// `op_put_begin_unbounded`'s op is neither re-queued nor timed.
 ///
 /// Dropping an uncommitted `PutOp` sends DESTROY_REQUEST and releases the
 /// ioid through its `IoidGuard`.
@@ -2044,7 +2044,7 @@ pub struct PutOp {
     order: ByteOrder,
     intro: Arc<FieldDesc>,
     present: Option<(PvField, BitSet)>,
-    /// `None` for [`op_put_begin_unbounded`]'s op.
+    /// `None` for `op_put_begin_unbounded`'s op.
     op_timeout: Option<Duration>,
 }
 

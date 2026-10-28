@@ -1268,7 +1268,7 @@ pub async fn sleep_until(deadline: Instant) {
 /// defaults: an immediate first tick and `MissedTickBehavior::Burst` catch-up.
 ///
 /// One body for both backends, on the timer the polling thread can reach (see
-/// [`sleep_on_reachable_timer`]): the hosted half wrapped
+/// `sleep_on_reachable_timer`): the hosted half wrapped
 /// `tokio::time::Interval`, which panics on a thread with no runtime.
 pub struct Interval {
     period: Duration,

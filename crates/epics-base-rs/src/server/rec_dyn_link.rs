@@ -1,7 +1,7 @@
 //! `recDynLink.c`: a record's own CA channels, opened by name at runtime.
 //!
 //! As in C, every link of a database goes through two threads,
-//! `recDynInp` and `recDynOut` ([`RecDynLinks`]), each draining its own
+//! `recDynInp` and `recDynOut` (`RecDynLinks`), each draining its own
 //! bounded queue in the order the calls were made: an input's search on the
 //! first; an output's search and every get and put on the second. A name
 //! the database serves is `dbContext`'s channel, whose search connects at

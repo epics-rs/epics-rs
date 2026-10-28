@@ -1714,7 +1714,7 @@ impl PvaClient {
     }
 
     /// [`Self::pvput_begin`] with no deadline on the put
-    /// ([`op_put_begin_unbounded`](crate::client_native::ops_v2::op_put_begin_unbounded)),
+    /// (`op_put_begin_unbounded`),
     /// for a caller that ends it at the channel's disconnect.
     pub(crate) async fn pvput_begin_unbounded(
         &self,

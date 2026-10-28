@@ -276,6 +276,22 @@ impl MotorRecord {
         true
     }
 
+    /// One of init_controller's writes, sent as [`Self::send_special`] sends
+    /// and returning once it ran where its port runs it then
+    /// ([`CommandPort::send_init`](crate::device_support::CommandPort::send_init)).
+    /// Whether it ran.
+    pub(crate) fn send_init(&mut self, command: MotorCommand) -> bool {
+        if self.port.is_none() {
+            return false;
+        }
+        let Some(commands) = self.transaction(vec![command]) else {
+            return false;
+        };
+        self.port
+            .as_ref()
+            .is_some_and(|port| port.send_init(commands))
+    }
+
     /// C `set_dial_highlimit`/`set_dial_lowlimit` (4236-4325): send the
     /// dial limit, then, built or not, set the raw limit to what was sent
     /// and the one user limit it maps to (HLM for a high dial limit under

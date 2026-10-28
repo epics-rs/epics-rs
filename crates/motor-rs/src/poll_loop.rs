@@ -29,12 +29,32 @@ pub type MotorCommandSender = mpsc::UnboundedSender<ToAxis>;
 pub enum ToAxis {
     /// A record pass's commands, for the poller to run.
     Batch(CommandBatch),
+    /// devMotorAsyn init_controller's SyncIO writes, which return once the
+    /// driver has run them (devMotorAsyn.c:190, :223): a batch whose sender
+    /// waits on its [`Ran`].
+    Synced(CommandBatch, Ran),
     /// What a controller-port write already ran on the port thread set on
     /// the axis, for the poller to post.
     Written(Written),
     /// A model-2 driver's parameter callback: the status drvMotorAsyn's
     /// `intCallback` hands every record on the axis (drvMotorAsyn.c:822-920).
     Callback(MotorStatus),
+}
+
+/// Told once the poller has run a [`ToAxis::Synced`] batch; dropped unrun,
+/// it tells its waiter the batch never ran.
+#[derive(Debug)]
+pub struct Ran(std::sync::mpsc::SyncSender<()>);
+
+impl Ran {
+    pub(crate) fn new() -> (Self, std::sync::mpsc::Receiver<()>) {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        (Self(tx), rx)
+    }
+
+    fn ran(self) {
+        let _ = self.0.send(());
+    }
 }
 
 impl From<CommandBatch> for ToAxis {
@@ -117,9 +137,9 @@ struct PlaceState {
 
 struct AxisQueue {
     inbox: PollerInbox,
-    /// Batches [`Axis::take_posts`] took off `inbox`, to run ahead of
+    /// Record passes [`Axis::take_posts`] took off `inbox`, to run ahead of
     /// anything still on it.
-    batches: std::collections::VecDeque<CommandBatch>,
+    batches: std::collections::VecDeque<ToAxis>,
 }
 
 /// The [`Place`] the axes at an address hold, gone with the last of them.
@@ -256,6 +276,9 @@ pub(crate) struct SharedControllerPoll {
     /// kept for the next wait.
     wake: Arc<tokio::sync::Notify>,
     first_polls: FirstPolls,
+    /// [`MotorPollLoop::start`] has given the poller its thread, which runs
+    /// what is queued with no harness to drive it.
+    serving: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// A controller's [`FirstPollPending`]s, each one listed in the process's.
@@ -333,6 +356,11 @@ impl SharedControllerPoll {
     /// Whether `other` is this controller's.
     pub(crate) fn is(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.state, &other.state)
+    }
+
+    /// Whether the poller's thread runs what is queued on its axes.
+    pub(crate) fn serving(&self) -> bool {
+        self.serving.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Count a first poll pending on this controller until the guard drops.
@@ -1010,7 +1038,7 @@ impl Axis {
         self.places.iter().enumerate().find_map(|(at, place)| {
             let mut queue = place.queue();
             let message = match queue.batches.pop_front() {
-                Some(batch) => batch.into(),
+                Some(message) => message,
                 None => queue.inbox.commands.try_recv().ok()?,
             };
             Some((at, message))
@@ -1054,6 +1082,10 @@ impl Axis {
     fn receive(&mut self, place: usize, message: ToAxis, controller_poll: &SharedControllerPoll) {
         match message {
             ToAxis::Batch(batch) => self.execute(place, &batch, controller_poll),
+            ToAxis::Synced(batch, ran) => {
+                self.execute(place, &batch, controller_poll);
+                ran.ran();
+            }
             ToAxis::Written(written) => self.take_written(written),
             ToAxis::Callback(status) => self.post(status),
         }
@@ -1072,7 +1104,9 @@ impl Axis {
                 match message {
                     Ok(ToAxis::Written(written)) => self.take_written(written),
                     Ok(ToAxis::Callback(status)) => self.post(status),
-                    Ok(ToAxis::Batch(batch)) => self.places[at].queue().batches.push_back(batch),
+                    Ok(message @ (ToAxis::Batch(_) | ToAxis::Synced(..))) => {
+                        self.places[at].queue().batches.push_back(message)
+                    }
                     Err(_) => break,
                 }
             }
@@ -1926,6 +1960,7 @@ impl MotorPollLoop {
     pub fn start(self) -> PollerThread {
         let startup = (!self.is_motor_task()).then(|| self.controller_poll.first_poll_pending());
         let (done_tx, done_rx) = oneshot::channel::<()>();
+        let serving = self.controller_poll.serving.clone();
         // C startPoller (asynMotorController.cpp:572-575).
         let spawned = spawn_dedicated_thread(
             "motorPoller".into(),
@@ -1937,7 +1972,10 @@ impl MotorPollLoop {
             },
         );
         match spawned {
-            Ok(_) => PollerThread(Some(done_rx)),
+            Ok(_) => {
+                serving.store(true, std::sync::atomic::Ordering::SeqCst);
+                PollerThread(Some(done_rx))
+            }
             Err(e) => {
                 thread_create_refused(&e);
                 PollerThread(None)
@@ -1956,8 +1994,8 @@ impl MotorPollLoop {
         for (index, axis) in axes.iter().enumerate() {
             for (at, place) in axis.places.iter().enumerate() {
                 let mut queue = place.queue();
-                if let Some(batch) = queue.batches.pop_front() {
-                    return Poll::Ready(Wake::Batch(index, at, batch.into()));
+                if let Some(message) = queue.batches.pop_front() {
+                    return Poll::Ready(Wake::Batch(index, at, message));
                 }
                 if let Poll::Ready(Some(message)) = queue.inbox.commands.poll_recv(cx) {
                     return Poll::Ready(Wake::Batch(index, at, message));

@@ -343,33 +343,46 @@ impl MotorRecord {
     /// devMotorAsyn.c `init_controller`), run from the device init and never
     /// on a process pass: C processes a record only from its callbacks, and
     /// a record on a missing axis never gets one. The commands it returns
-    /// are init_controller's writes.
+    /// are init_controller's writes, which have not run: the readback is
+    /// `status`, and a position load among them stands in for it.
+    pub fn initial_readback(
+        &mut self,
+        status: &asyn_rs::interfaces::motor::MotorStatus,
+    ) -> ProcessEffects {
+        let (commands, loaded) = self.init_controller(status);
+        self.init_readback(status, loaded);
+        ProcessEffects {
+            commands,
+            ..ProcessEffects::default()
+        }
+    }
+
+    /// C `init_record` up to motorRecord's `update_values` (motorRecord.cc:
+    /// 646-690): the dset's init on the status `readGenericPointer` read,
+    /// devMotorAsyn's `init_controller` (devMotorAsyn.c:166-239). Its writes,
+    /// and the autosaved DVAL the position load among them restores.
     ///
     /// On entry `self.pos.dval` holds the autosave-restored target (or 0 if
     /// none). C: `devMotorAsyn.c::init_controller` consults RSTM to decide
     /// whether to push that value back into the driver instead of adopting
     /// the driver's current readback.
-    pub fn initial_readback(
+    pub(crate) fn init_controller(
         &mut self,
         status: &asyn_rs::interfaces::motor::MotorStatus,
-    ) -> ProcessEffects {
-        let mut effects = ProcessEffects::default();
+    ) -> (Vec<MotorCommand>, Option<f64>) {
+        let mut commands = Vec::new();
         // No put precedes init_record in C: a pass-0 restore is a plain
         // field write, not a move.
         self.last_write = None;
         self.finish_init();
 
-        // Capture the autosaved target before the driver readback overwrites it.
         let autosaved_dval = self.pos.dval;
         let autosaved_rval = self.pos.rval;
-        // C init_record runs `process_motor_info(pmr, true)` — the init call
-        // skips URIP RDBL scaling and seeds the readback from motor position.
-        self.process_motor_info_initcall(status, true);
 
         // motordevCom sends INIT before anything else (motordevCom.cc:
         // 309-327); devMotorAsyn has no INIT, and its drivers ignore it.
         if !self.links.init.is_empty() {
-            effects.commands.push(MotorCommand::Primitive {
+            commands.push(MotorCommand::Primitive {
                 init: self.links.init.clone(),
             });
         }
@@ -386,9 +399,7 @@ impl MotorRecord {
             self.conv.mres / self.conv.eres
         };
         if init_controller {
-            effects
-                .commands
-                .push(MotorCommand::InitEncoderRatio { ratio });
+            commands.push(MotorCommand::InitEncoderRatio { ratio });
         }
 
         // C: devMotorAsyn.c init_controller — RSTM restore decision.
@@ -397,7 +408,8 @@ impl MotorRecord {
         // zero (i.e. the controller lost its position across the IOC restart).
         //
         // C compares `fabs(status.position * mres)` — the motor position,
-        // not DRBV, which follows the encoder when UEIP=Yes.
+        // not DRBV, which follows the encoder when UEIP=Yes. `use_rel` reads
+        // UEIP before process_motor_info overrides it for a missing encoder.
         let rdbd = self.retry.rdbd.abs().max(self.conv.mres.abs());
         let motor_dial = status.position * self.conv.mres;
         let dval_non_zero_pos_near_zero =
@@ -430,7 +442,7 @@ impl MotorRecord {
         if restore {
             // Tell the driver to redefine its current position to the
             // autosaved DVAL.
-            effects.commands.push(MotorCommand::InitPosition {
+            commands.push(MotorCommand::InitPosition {
                 position: self.raw_position(autosaved_dval),
             });
         } else {
@@ -447,16 +459,31 @@ impl MotorRecord {
                 ),
             );
         }
+        (commands, restore.then_some(autosaved_dval))
+    }
+
+    /// C `init_record` from `update_values` on (motorRecord.cc:690-733):
+    /// `process_motor_info(pmr, true)` on `status`, the readback the init
+    /// writes left, then VAL/DVAL/RVAL from it unless closed-loop OMSL.
+    /// `loaded` is the DVAL of a position load that has not run, which the
+    /// readback does not show yet.
+    pub(crate) fn init_readback(
+        &mut self,
+        status: &asyn_rs::interfaces::motor::MotorStatus,
+        loaded: Option<f64>,
+    ) {
+        // C init_record runs `process_motor_info(pmr, true)` — the init call
+        // skips URIP RDBL scaling and seeds the readback from motor position.
+        self.process_motor_info_initcall(status, true);
+
         // C init_record loads a CONSTANT DOL into VAL (677-681) and then
         // adopts the readback into VAL/DVAL/RVAL unless closed-loop OMSL
-        // (706-714), where the drive values stay the DOL's. init_controller's
-        // restore has set the readback to the autosaved DVAL.
+        // (706-714), where the drive values stay the DOL's.
         if self.links.omsl != 1 {
-            if restore {
-                self.pos.dval = autosaved_dval;
-                self.pos.val =
-                    coordinate::dial_to_user(autosaved_dval, self.conv.dir, self.pos.off);
-                if let Ok(rval) = coordinate::dial_to_raw(autosaved_dval, self.conv.mres) {
+            if let Some(dval) = loaded {
+                self.pos.dval = dval;
+                self.pos.val = coordinate::dial_to_user(dval, self.conv.dir, self.pos.off);
+                if let Ok(rval) = coordinate::dial_to_raw(dval, self.conv.mres) {
                     self.pos.rval = rval;
                 }
             } else {
@@ -468,7 +495,5 @@ impl MotorRecord {
         self.internal.lval = self.pos.val;
         self.internal.ldvl = self.pos.dval;
         self.internal.lrvl = self.pos.rval;
-
-        effects
     }
 }

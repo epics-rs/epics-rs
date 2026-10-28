@@ -17,7 +17,7 @@ use asyn_rs::interfaces::motor::{AsynMotor, MotorStatus};
 use crate::device_state::*;
 use crate::flags::MotorCommand;
 use crate::poll_loop::{
-    CommandBatch, MissingAxis, MotorCommandSender, Place, PlaceRef, PollCommand, PollerInbox,
+    CommandBatch, MissingAxis, MotorCommandSender, Place, PlaceRef, PollCommand, PollerInbox, Ran,
     SharedControllerPoll, ToAxis, Written,
 };
 use crate::trace::{MotorTrace, TraceUser};
@@ -625,6 +625,34 @@ impl CommandPort {
     /// `pact` is the record's while it sends: set in process, clear in
     /// init_record and special.
     pub(crate) fn send(&self, commands: Vec<MotorCommand>, pact: bool) {
+        self.queue(commands, pact, None);
+    }
+
+    /// C init_controller's pasynFloat64SyncIO writes (devMotorAsyn.c:190,
+    /// :223), sent from init_record as [`Self::send`] sends and returning
+    /// once the driver has run them and posted what they set, while a
+    /// poller's thread serves the axis: C's port thread runs them whatever
+    /// the poller does. motordevCom's are only queued (motordevCom.cc:
+    /// 327-343), as are the writes to a poller not yet started, which has
+    /// no thread to run them. Whether they ran.
+    pub(crate) fn send_init(&self, commands: Vec<MotorCommand>) -> bool {
+        let served = !self.trace.is_model1()
+            && !self.trace.is_motor_interface()
+            && match &self.link {
+                AxisLink::Bound { slot, .. } => slot.controller().is_some_and(|c| c.serving()),
+                AxisLink::Missing(_) => false,
+            };
+        if !served {
+            self.queue(commands, false, None);
+            return false;
+        }
+        let (ran, done) = Ran::new();
+        self.queue(commands, false, Some(ran));
+        done.recv().is_ok()
+    }
+
+    /// [`Self::send`], telling `ran` once the poller has run the batch.
+    fn queue(&self, commands: Vec<MotorCommand>, pact: bool, ran: Option<Ran>) {
         let moves = commands.iter().filter(|c| c.is_move()).count();
         if let Ok(mut ds) = self.device_state.lock() {
             let comm_alarm = ds.comm_alarm();
@@ -640,14 +668,15 @@ impl CommandPort {
             // Fails only once the poller has ended, a state C's port queue
             // cannot be in, so there is no C line to print.
             Ok((axis, record)) => {
-                let _ = axis.motor_cmd_tx.send(
-                    CommandBatch {
-                        trace: self.trace.clone(),
-                        record: Some(record),
-                        commands,
-                    }
-                    .into(),
-                );
+                let batch = CommandBatch {
+                    trace: self.trace.clone(),
+                    record: Some(record),
+                    commands,
+                };
+                let _ = axis.motor_cmd_tx.send(match ran {
+                    Some(ran) => ToAxis::Synced(batch, ran),
+                    None => batch.into(),
+                });
                 return;
             }
             Err(missing) => missing,
@@ -692,6 +721,13 @@ impl CommandPort {
             _ => None,
         };
         let _held = controller.as_ref().map(SharedControllerPoll::hold);
+        self.update_values()
+    }
+
+    /// init_record's `update_values` (motorRecord.cc:690): the status the
+    /// record's callbacks left in `pPvt->status`, read with no driver lock
+    /// (devMotorAsyn.c:438-452).
+    fn update_values(&self) -> CaResult<MotorStatus> {
         let mut ds = self.device_state.lock().map_err(|e| {
             epics_base_rs::error::CaError::InvalidValue(format!("device state lock: {e}"))
         })?;
@@ -753,8 +789,8 @@ impl DeviceSupport for MotorDeviceSupport {
         }
 
         // The RSTM/loadpos(#231)/MRES(#196) restore decision is owned
-        // entirely by `initial_readback` (status_update.rs), whose
-        // `InitPosition` is queued below.
+        // entirely by `init_controller` (status_update.rs), whose
+        // `InitPosition` is sent below.
         //
         // C `devMotorAsyn.c::init_controller` (166-239) reseeds only when
         // `initPos == 1`, decided by the RSTM switch testing the controller's
@@ -773,6 +809,27 @@ impl DeviceSupport for MotorDeviceSupport {
         // no hardware call, and no failure for a bound axis. An unfilled
         // cache reads as C's calloc-zeroed status.
         let status = self.port.init_status()?;
+
+        // C init_record: the dset's init_controller, each of its commands a
+        // transaction of its own (motordevCom.cc:327-343), then
+        // update_values (motorRecord.cc:690), which reads what the writes
+        // that ran posted, process_motor_info(initcall) and the drive sync,
+        // all before any process.
+        let mut rec = record
+            .as_any_mut()
+            .and_then(|a| a.downcast_mut::<crate::record::MotorRecord>());
+        let mut loaded = None;
+        if let Some(rec) = rec.as_deref_mut() {
+            let (commands, load) = rec.init_controller(&status);
+            loaded = load;
+            for command in commands {
+                let position = matches!(command, MotorCommand::InitPosition { .. });
+                if rec.send_init(command) && position {
+                    loaded = None;
+                }
+            }
+        }
+        let status = self.port.update_values()?;
         self.port.trace.print(
             asyn_rs::trace::TraceMask::IO_DEVICE,
             self.port.trace.update_status_reason(),
@@ -781,18 +838,8 @@ impl DeviceSupport for MotorDeviceSupport {
                 self.port.trace.record()
             ),
         );
-
-        // C init_record: the dset's init_controller, then
-        // process_motor_info(initcall) and the drive sync, all before any
-        // process. Each of its commands is a transaction of its own
-        // (motordevCom.cc:327-343).
-        if let Some(rec) = record
-            .as_any_mut()
-            .and_then(|a| a.downcast_mut::<crate::record::MotorRecord>())
-        {
-            for command in rec.initial_readback(&status).commands {
-                rec.send_special(vec![command]);
-            }
+        if let Some(rec) = rec {
+            rec.init_readback(&status, loaded);
         }
 
         // C init_record 717-718 ("Reset limits in case database values

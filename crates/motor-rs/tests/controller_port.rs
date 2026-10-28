@@ -331,10 +331,34 @@ fn a_driver_option_override_runs_in_place_of_the_base() {
     assert!(port.get_option_blocking(user(1), "other").is_err());
 }
 
+/// C `getAxis` returns NULL with no errorMessage, and the base function
+/// returns a bare asynError (asynMotorController.cpp:199-200, :281-282,
+/// :443-444, :477-478, :532-556).
+fn assert_bare_error<T: std::fmt::Debug>(result: AsynResult<T>) {
+    match result {
+        Err(AsynError::Status {
+            status: AsynStatus::Error,
+            message,
+        }) => assert_eq!(message, ""),
+        other => panic!("{other:?}"),
+    }
+}
+
 #[test]
-fn a_write_where_the_controller_has_no_axis_fails() {
+fn a_request_where_the_controller_has_no_axis_fails_with_no_message() {
     let port = register_controller_port(&open_owner(), "CPNOAXIS", 2, ()).unwrap();
-    assert!(port.write_int32_blocking(index::STOP, 1, 1).is_err());
+    assert_bare_error(port.write_int32_blocking(index::STOP, 1, 1));
+    assert_bare_error(port.write_float64_blocking(index::ACCEL, 1, 1.0));
+    assert_bare_error(write_array(&port, index::PROFILE_TIME_ARRAY, 1, vec![1.0]));
+    assert_bare_error(read_array(&port, index::PROFILE_READBACKS, 1, 1));
+}
+
+/// A driver's own call on an axis the controller lacks, C's subclass
+/// `getAxis` returning NULL.
+#[test]
+fn a_driver_call_where_the_controller_has_no_axis_fails_with_no_message() {
+    let port = register_controller_port(&open_owner(), "CPNOAXISRUN", 1, Servo::default()).unwrap();
+    assert_bare_error(port.write_int32_blocking(BASE_PARAMS.len(), 0, 1));
 }
 
 #[test]

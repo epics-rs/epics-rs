@@ -341,8 +341,7 @@ impl<'a> AxisUser<'a> {
     /// Run `command` on the axis's driver now and return its status, as a
     /// C subclass write calls its axis under the controller lock.
     pub fn run(&self, base: &mut PortDriverBase, command: MotorCommand) -> AsynResult<()> {
-        let axis = crate::devices::axis_at(&base.port_name, self.addr)
-            .ok_or_else(|| no_axis(&base.port_name, self.addr))?;
+        let axis = crate::devices::axis_at(&base.port_name, self.addr).ok_or_else(base_error)?;
         let c = crate::poll_loop::c_write(&command);
         run_on_axis(base, None, &axis, self.addr, &command, c)
     }
@@ -728,7 +727,7 @@ impl ControllerCtx<'_> {
     ) -> AsynResult<()> {
         let addr = user.addr;
         if !self.axes().any(|a| a == addr) {
-            return Err(no_axis(&self.base.port_name, addr));
+            return Err(base_error());
         }
         let value = &value[..value.len().min(self.profile.max_points)];
         match user.reason {
@@ -846,19 +845,13 @@ impl ControllerCtx<'_> {
     }
 }
 
-/// The bare `asynError` a C base function returns, with no errorMessage.
+/// The bare `asynError` a C base function returns, with no errorMessage,
+/// as each does where `getAxis` finds no axis
+/// (asynMotorController.cpp:199-200, :532-556).
 fn base_error() -> AsynError {
     AsynError::Status {
         status: AsynStatus::Error,
         message: String::new(),
-    }
-}
-
-/// C `getAxis`'s failure: the controller has no axis at `addr`.
-fn no_axis(port: &str, addr: i32) -> AsynError {
-    AsynError::Status {
-        status: AsynStatus::Error,
-        message: format!("{port} has no axis {addr}"),
     }
 }
 
@@ -945,7 +938,7 @@ impl<P: ControllerParams> ControllerPort<P> {
         if self.params.is_controller_axis(addr) {
             return Ok((addr, None));
         }
-        Err(no_axis(&self.base.port_name, addr))
+        Err(base_error())
     }
 
     /// A C subclass write at an address with no axis: its own code has run,

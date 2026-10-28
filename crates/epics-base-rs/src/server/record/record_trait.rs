@@ -5785,7 +5785,7 @@ pub trait Record: RecordAny + Send + Sync + 'static {
         None
     }
 
-    /// The [`Self::field_list`] fields a put can move a
+    /// The [`FieldDeclaration::field_list`] fields a put can move a
     /// [`Self::dbaddr_capacity`] answer by: any store of one (a `dbPut`, a
     /// device post, a restore) re-reads the record's lock-free channel
     /// counts, as C's `cvt_dbaddr` counts the record at each create.
@@ -6618,7 +6618,7 @@ pub trait Record: RecordAny + Send + Sync + 'static {
     /// state fields, which move `sdef` and so VAL's type. The put owner
     /// (`field_io`) then settles the record's address facts again
     /// (`RecordCell::settle_addr_facts`). Asked once per
-    /// [`Self::field_list`] field when the record's cell is built, so the
+    /// [`FieldDeclaration::field_list`] field when the record's cell is built, so the
     /// answer is the field's alone; a field off the list never retypes.
     /// Default: false.
     fn special_retypes(&self, _put_field: &str) -> bool {

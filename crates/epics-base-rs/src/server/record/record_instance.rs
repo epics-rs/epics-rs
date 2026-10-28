@@ -3892,7 +3892,7 @@ impl RecordCell {
     /// C `dbNameToAddr(name, &addr)` on this record succeeding, answered with
     /// `addr.no_elements` (1, or an array field's capacity), with no lock:
     /// the field is resolved against the type's declaration and the capacity
-    /// is the one the record's last `dbPut` left ([`Self::dbaddr_counts`]).
+    /// is the one the record's last `dbPut` left (`dbaddr_counts`).
     /// `None` is a field the type does not declare.
     pub fn no_elements(&self, field: &str) -> Option<u32> {
         let named = |f: &&FieldDesc| f.name.eq_ignore_ascii_case(field);

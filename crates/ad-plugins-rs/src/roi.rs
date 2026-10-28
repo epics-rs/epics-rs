@@ -694,8 +694,8 @@ pub fn create_roi_runtime(
             "_scratch_",
             1,
             asyn_rs::port::PortFlags::default(),
-            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+            asyn_rs::port::InterfaceMask::NONE,
+            asyn_rs::port::InterfaceMask::NONE,
         );
         let _ = ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base);
         let _ = ad_core_rs::plugin::params::PluginBaseParams::create(&mut base);
@@ -770,8 +770,8 @@ mod tests {
             "T",
             1,
             Default::default(),
-            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+            asyn_rs::port::InterfaceMask::NONE,
+            asyn_rs::port::InterfaceMask::NONE,
         );
         let threads = base
             .create_param("NUM_THREADS", asyn_rs::param::ParamType::Int32)
@@ -1295,8 +1295,8 @@ mod tests {
             "R9_67",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base).unwrap();
         proc.register_params(&mut base).unwrap();
@@ -1388,8 +1388,8 @@ mod tests {
             "ROI",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base).unwrap();
         proc.register_params(&mut base).unwrap();

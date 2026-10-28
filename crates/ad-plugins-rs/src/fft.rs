@@ -2354,8 +2354,8 @@ mod tests {
             "FFT_TEST",
             1,
             asyn_rs::port::PortFlags::default(),
-            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+            asyn_rs::port::InterfaceMask::NONE,
+            asyn_rs::port::InterfaceMask::NONE,
         );
         proc.register_params(&mut base).unwrap();
         proc

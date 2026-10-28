@@ -92,8 +92,13 @@ async fn drvinfo_put_resolves_on_a_blocking_port_under_the_exemption() {
             can_block: true,
             ..PortFlags::default()
         },
-        InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_INTERRUPTS,
+        InterfaceMask::OPTION
+            | InterfaceMask::INT32
+            | InterfaceMask::UINT32_DIGITAL
+            | InterfaceMask::FLOAT64
+            | InterfaceMask::OCTET
+            | InterfaceMask::DRV_USER,
+        InterfaceMask::NONE,
     );
     base.create_param("P0", ParamType::Int32).unwrap();
     base.create_param("P1", ParamType::Int32).unwrap();

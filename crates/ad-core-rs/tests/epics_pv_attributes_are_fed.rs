@@ -76,8 +76,8 @@ fn an_epics_pv_attribute_with_no_ca_client_stays_undefined_and_says_so() {
         1,
         1 << 20,
         ASYN_CANBLOCK,
-        InterfaceMask::UNMIGRATED_SUBCLASS,
-        InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+        InterfaceMask::NONE,
+        InterfaceMask::NONE,
     )
     .expect("driver");
 
@@ -119,8 +119,8 @@ async fn an_epics_pv_attribute_is_fed_from_the_installed_ca_client() {
         1,
         1 << 20,
         ASYN_CANBLOCK,
-        InterfaceMask::UNMIGRATED_SUBCLASS,
-        InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+        InterfaceMask::NONE,
+        InterfaceMask::NONE,
     )
     .expect("driver");
     drv.set_ca_client(client, tokio::runtime::Handle::current());

@@ -530,13 +530,8 @@ mod tests {
         }
 
         fn with_flags(name: &str, flags: PortFlags) -> Self {
-            let mut base = PortDriverBase::new(
-                name,
-                1,
-                flags,
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
-            );
+            let mut base =
+                PortDriverBase::new(name, 1, flags, InterfaceMask::INT32, InterfaceMask::NONE);
             base.create_param("VAL", ParamType::Int32).unwrap();
             base.create_param("F64", ParamType::Float64).unwrap();
             Self { base }

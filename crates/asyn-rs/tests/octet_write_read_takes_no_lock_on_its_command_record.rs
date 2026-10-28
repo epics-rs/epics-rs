@@ -52,8 +52,8 @@ fn sync_port(name: &str, db: &PvDatabase, writes: &Arc<Mutex<Vec<Vec<u8>>>>) -> 
         name,
         1,
         PortFlags::default(),
-        InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_INTERRUPTS,
+        InterfaceMask::OCTET,
+        InterfaceMask::NONE,
     );
     let driver = Echo {
         base,

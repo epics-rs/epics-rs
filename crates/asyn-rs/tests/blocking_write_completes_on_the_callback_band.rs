@@ -93,8 +93,8 @@ async fn a_blocking_write_completes_once_on_the_record_s_band() {
             can_block: true,
             ..PortFlags::default()
         },
-        InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_INTERRUPTS,
+        InterfaceMask::FLOAT64 | InterfaceMask::DRV_USER,
+        InterfaceMask::NONE,
     );
     base.create_param("VAL", ParamType::Float64).unwrap();
     let (runtime, _actor) = create_port_runtime_unclaimed(

@@ -66,8 +66,8 @@ fn quad_port(
             can_block: true,
             ..PortFlags::default()
         },
-        InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_INTERRUPTS,
+        InterfaceMask::INT32,
+        InterfaceMask::NONE,
     );
     let val = base.create_param("VAL", ParamType::Int32).unwrap();
     init(&mut base, val);

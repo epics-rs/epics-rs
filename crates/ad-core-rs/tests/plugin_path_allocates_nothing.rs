@@ -116,8 +116,8 @@ struct Forward;
 
 impl NDPluginProcess for Forward {
     const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
-    const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
-    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS;
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::NONE;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::NONE;
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         ProcessResult::forward(array, Vec::new())
     }
@@ -131,8 +131,8 @@ struct Sink(Arc<AtomicUsize>, Arc<AtomicUsize>);
 
 impl NDPluginProcess for Sink {
     const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
-    const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
-    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS;
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::NONE;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::NONE;
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         if array.attributes.get("Cnt").is_some() {
             self.1.fetch_add(1, Ordering::Relaxed);

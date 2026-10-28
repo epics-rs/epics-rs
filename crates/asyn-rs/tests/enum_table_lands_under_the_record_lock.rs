@@ -77,8 +77,8 @@ async fn enum_ioc(port: &str, record: &str) -> Ioc {
         port,
         1,
         PortFlags::default(),
-        InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_INTERRUPTS,
+        InterfaceMask::INT32 | InterfaceMask::ENUM | InterfaceMask::DRV_USER,
+        InterfaceMask::INT32 | InterfaceMask::UINT32_DIGITAL | InterfaceMask::ENUM,
     );
     base.create_param("MODE", ParamType::Enum).unwrap();
     base.set_enum_choices_param(0, 0, vec![entry("OFF", 0, 0), entry("ON", 1, 0)].into())

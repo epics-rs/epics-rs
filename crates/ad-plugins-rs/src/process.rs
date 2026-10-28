@@ -1319,8 +1319,8 @@ mod tests {
             "PROC_INIT",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         let mut proc = ProcessProcessor::new(ProcessConfig::default());
         proc.register_params(&mut base).unwrap();
@@ -1962,8 +1962,8 @@ mod tests {
             "R9_68",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         proc.register_params(&mut base).unwrap();
         let pool = NDArrayPool::new(1_000_000);
@@ -2012,8 +2012,8 @@ mod tests {
             "T",
             1,
             Default::default(),
-            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+            asyn_rs::port::InterfaceMask::NONE,
+            asyn_rs::port::InterfaceMask::NONE,
         );
         proc.register_params(&mut base).unwrap();
         let reason = proc.params.auto_offset_scale.unwrap();
@@ -2636,8 +2636,8 @@ mod tests {
             "R132",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         proc.register_params(&mut base).unwrap();
 

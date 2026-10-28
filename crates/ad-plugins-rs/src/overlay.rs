@@ -963,8 +963,8 @@ mod tests {
             "R6_72",
             9,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         proc.register_params(&mut base).unwrap();
 
@@ -1871,8 +1871,8 @@ mod tests {
             "OV_TEST",
             8,
             asyn_rs::port::PortFlags::default(),
-            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+            asyn_rs::port::InterfaceMask::NONE,
+            asyn_rs::port::InterfaceMask::NONE,
         );
         p.register_params(&mut base).unwrap();
         let params = OverlayParamIndices {
@@ -1946,8 +1946,8 @@ mod tests {
             "OV_MAX",
             3,
             asyn_rs::port::PortFlags::default(),
-            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+            asyn_rs::port::InterfaceMask::NONE,
+            asyn_rs::port::InterfaceMask::NONE,
         );
         p.register_params(&mut base).unwrap();
         let use_overlay = p.params.use_overlay.unwrap();

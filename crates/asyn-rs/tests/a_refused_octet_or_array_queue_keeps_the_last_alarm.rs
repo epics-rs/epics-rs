@@ -100,8 +100,8 @@ async fn failed_then_refused(case: Case) -> [(u16, AlarmSeverity); 2] {
             can_block,
             ..PortFlags::default()
         },
-        InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::OCTET | InterfaceMask::INT32_ARRAY | InterfaceMask::DRV_USER,
+        InterfaceMask::NONE,
     );
     base.create_param("P", param).unwrap();
     base.set_auto_connect(false);

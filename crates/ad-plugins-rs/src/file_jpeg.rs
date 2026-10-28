@@ -473,8 +473,8 @@ mod tests {
             "jpeg_param_test",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         let mut proc = JpegFileProcessor::new(50);
         proc.register_params(&mut base).unwrap();
@@ -494,8 +494,8 @@ mod tests {
             "jpeg_quality_write",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         let mut proc = JpegFileProcessor::new(50);
         proc.register_params(&mut base).unwrap();

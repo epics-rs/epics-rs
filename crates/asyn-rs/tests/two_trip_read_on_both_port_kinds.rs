@@ -57,13 +57,7 @@ fn port(name: &str, can_block: bool) -> PortRuntimeHandle {
         ..PortFlags::default()
     };
     let driver = Counter {
-        base: PortDriverBase::new(
-            name,
-            1,
-            flags,
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
-        ),
+        base: PortDriverBase::new(name, 1, flags, InterfaceMask::INT32, InterfaceMask::NONE),
         n: 0,
     };
     create_port_runtime_unclaimed(driver, RuntimeConfig::default())

@@ -362,8 +362,8 @@ mod tests {
             "ATTR_INIT",
             3,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         let mut proc = AttributeProcessor::new(3);
         proc.register_params(&mut base).unwrap();
@@ -421,8 +421,8 @@ mod tests {
             "T",
             2,
             Default::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         proc.register_params(&mut base).unwrap();
         let pool = NDArrayPool::new(1_000_000);

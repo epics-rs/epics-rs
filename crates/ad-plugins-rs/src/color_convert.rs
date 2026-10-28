@@ -1576,8 +1576,8 @@ mod tests {
                 "CC_INIT",
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::NONE,
+                InterfaceMask::NONE,
             );
             let mut proc = ColorConvertProcessor::new(ColorConvertConfig {
                 target_mode,

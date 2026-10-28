@@ -70,8 +70,8 @@ mod tests {
             "test",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         let params = PluginBaseParams::create(&mut base).unwrap();
         assert!(base.find_param("ENABLE_CALLBACKS").is_some());

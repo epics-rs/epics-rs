@@ -138,8 +138,8 @@ mod tests {
             "adonce",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         let (params, _) = ADDriverParams::create(&mut base).unwrap();
         assert_eq!(params.acquire, params.base.acquire);
@@ -153,8 +153,8 @@ mod tests {
             "test",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         let (params, _) = ADDriverParams::create(&mut base).unwrap();
         assert!(base.find_param("ACQUIRE").is_some());
@@ -171,8 +171,8 @@ mod tests {
             "test",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         let _ = ADDriverParams::create(&mut base).unwrap();
         // base params (~50) + ad-specific (~38) = ~88
@@ -185,8 +185,8 @@ mod tests {
             "test",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         let (params, _) = ADDriverParams::create(&mut base).unwrap();
         // Should be able to access base params through the base field
@@ -205,8 +205,8 @@ mod tests {
             "order",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         let (params, _) = ADDriverParams::create(&mut base).unwrap();
         let c = [

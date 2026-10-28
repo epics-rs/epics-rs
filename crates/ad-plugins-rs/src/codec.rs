@@ -2188,8 +2188,8 @@ mod tests {
             "CODEC_INIT",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         let mut proc = CodecProcessor::new(CodecMode::Decompress);
         proc.register_params(&mut base).unwrap();
@@ -3521,8 +3521,8 @@ mod tests {
             "CODECV",
             1,
             Default::default(),
-            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+            asyn_rs::port::InterfaceMask::NONE,
+            asyn_rs::port::InterfaceMask::NONE,
         );
         proc.register_params(&mut base).unwrap();
         let threads = base

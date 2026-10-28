@@ -593,8 +593,8 @@ mod tests {
             "T",
             1,
             Default::default(),
-            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+            asyn_rs::port::InterfaceMask::NONE,
+            asyn_rs::port::InterfaceMask::NONE,
         );
         let clamp = WriteVerdict::Refuse {
             keep: 1,
@@ -625,8 +625,8 @@ mod tests {
                 "TRANS_INIT",
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::NONE,
+                InterfaceMask::NONE,
             );
             let mut proc = TransformProcessor::new(t);
             ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base).unwrap();

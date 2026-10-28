@@ -48,8 +48,12 @@ impl TestScopeDriver {
             port_name,
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::INT32
+                | InterfaceMask::FLOAT64
+                | InterfaceMask::FLOAT64_ARRAY
+                | InterfaceMask::ENUM
+                | InterfaceMask::DRV_USER,
+            InterfaceMask::NONE,
         );
         let p_run = base.create_param("Run", ParamType::Int32).unwrap();
         let p_max_points = base.create_param("MaxPoints", ParamType::Int32).unwrap();
@@ -200,8 +204,8 @@ impl EchoDriver {
             port_name,
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OCTET | InterfaceMask::DRV_USER,
+            InterfaceMask::NONE,
         );
         let p_msg = base.create_param("MSG", ParamType::Octet).unwrap();
         Self { base, p_msg }
@@ -241,8 +245,8 @@ impl ErrorDriver {
             port_name,
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::INT32 | InterfaceMask::DRV_USER,
+            InterfaceMask::NONE,
         );
         let p_val = base.create_param("VAL", ParamType::Int32).unwrap();
         let p_status = base.create_param("STATUS", ParamType::Int32).unwrap();

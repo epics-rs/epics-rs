@@ -81,8 +81,8 @@ async fn ioc(
         port,
         1,
         PortFlags::default(),
-        InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::INT32 | InterfaceMask::OCTET | InterfaceMask::ENUM | InterfaceMask::DRV_USER,
+        InterfaceMask::INT32 | InterfaceMask::ENUM,
     );
     for (name, kind) in PARAMS {
         base.create_param(name, kind).unwrap();

@@ -300,10 +300,8 @@ pub(crate) struct Gated {
 
 impl ad_core_rs::plugin::runtime::NDPluginProcess for Gated {
     const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_CANBLOCK;
-    const INTERFACE_MASK: asyn_rs::port::InterfaceMask =
-        asyn_rs::port::InterfaceMask::UNMIGRATED_SUBCLASS;
-    const INTERRUPT_MASK: asyn_rs::port::InterfaceMask =
-        asyn_rs::port::InterfaceMask::UNMIGRATED_SUBCLASS;
+    const INTERFACE_MASK: asyn_rs::port::InterfaceMask = asyn_rs::port::InterfaceMask::NONE;
+    const INTERRUPT_MASK: asyn_rs::port::InterfaceMask = asyn_rs::port::InterfaceMask::NONE;
     fn process_array(
         &self,
         array: &std::sync::Arc<ad_core_rs::ndarray::NDArray>,
@@ -408,8 +406,8 @@ pub(crate) fn read_file<P: ad_core_rs::plugin::runtime::NDPluginProcess>(
         "FILEREAD",
         1,
         asyn_rs::port::PortFlags::default(),
-        asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-        asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+        asyn_rs::port::InterfaceMask::NONE,
+        asyn_rs::port::InterfaceMask::NONE,
     );
     ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base).unwrap();
     processor.register_params(&mut base).unwrap();

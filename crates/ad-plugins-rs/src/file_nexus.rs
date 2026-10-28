@@ -1388,8 +1388,8 @@ mod tests {
             "nexus_tmpl_test",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         let mut proc = NexusFileProcessor::new();
         proc.register_params(&mut base).unwrap();

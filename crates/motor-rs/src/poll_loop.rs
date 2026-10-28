@@ -3223,8 +3223,16 @@ pub(crate) mod drv_motor_asyn_stand_in {
                 port,
                 1,
                 PortFlags::default(),
-                asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-                asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+                asyn_rs::port::InterfaceMask::INT32
+                    | asyn_rs::port::InterfaceMask::UINT32_DIGITAL
+                    | asyn_rs::port::InterfaceMask::FLOAT64
+                    | asyn_rs::port::InterfaceMask::FLOAT64_ARRAY
+                    | asyn_rs::port::InterfaceMask::GENERIC_POINTER
+                    | asyn_rs::port::InterfaceMask::DRV_USER,
+                asyn_rs::port::InterfaceMask::INT32
+                    | asyn_rs::port::InterfaceMask::UINT32_DIGITAL
+                    | asyn_rs::port::InterfaceMask::FLOAT64
+                    | asyn_rs::port::InterfaceMask::GENERIC_POINTER,
             ),
             motor,
             axis,

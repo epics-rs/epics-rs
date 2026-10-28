@@ -7121,8 +7121,8 @@ mod tests {
                 "test",
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::INT32 | InterfaceMask::ENUM | InterfaceMask::DRV_USER,
+                InterfaceMask::NONE,
             );
             base.create_param("VAL", ParamType::Int32).unwrap();
             Self { base }
@@ -7150,8 +7150,8 @@ mod tests {
                 "test_bounds",
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::INT32 | InterfaceMask::DRV_USER,
+                InterfaceMask::NONE,
             );
             base.create_param("VAL", ParamType::Int32).unwrap();
             Self {
@@ -9110,8 +9110,8 @@ mod tests {
             "test_enum",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::ENUM | InterfaceMask::DRV_USER,
+            InterfaceMask::NONE,
         );
         base.create_param("MODE", ParamType::Enum).unwrap();
         base.set_enum_choices_param(0, 0, choices).unwrap();
@@ -10521,8 +10521,8 @@ mod tests {
                 "capport",
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::DRV_USER,
+                InterfaceMask::NONE,
             );
             base.create_param("VAL", ParamType::Int32).unwrap();
             let driver = CapPort { base, cap };
@@ -10629,8 +10629,8 @@ mod tests {
             "progport",
             1,
             PortFlags::default(),
-            crate::port::InterfaceMask::UNMIGRATED_ALL,
-            crate::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+            crate::port::InterfaceMask::INT32 | crate::port::InterfaceMask::DRV_USER,
+            crate::port::InterfaceMask::NONE,
         );
         base.create_param("START_", ParamType::Int32).unwrap();
         let driver = ProgPort {
@@ -10689,8 +10689,8 @@ mod tests {
             "tagport",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::INT32 | InterfaceMask::DRV_USER,
+            InterfaceMask::INT32,
         );
         base.create_param("DATA", ParamType::Int32).unwrap();
         let (rt, _jh) =
@@ -10761,8 +10761,8 @@ mod tests {
                 "r11_48_dev",
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             )),
             RuntimeConfig::default(),
         )
@@ -10825,8 +10825,8 @@ mod tests {
                     can_block: true,
                     ..PortFlags::default()
                 },
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::FLOAT64 | InterfaceMask::DRV_USER,
+                InterfaceMask::NONE,
             );
             base.create_param("VAL", ParamType::Float64).unwrap();
             let (rt, _jh) =
@@ -10907,8 +10907,8 @@ mod tests {
                     can_block: true,
                     ..PortFlags::default()
                 },
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::FLOAT64 | InterfaceMask::DRV_USER,
+                InterfaceMask::NONE,
             );
             base.create_param("VAL", ParamType::Float64).unwrap();
             let (rt, _jh) =
@@ -10993,8 +10993,8 @@ mod tests {
                     can_block,
                     ..PortFlags::default()
                 },
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::FLOAT64 | InterfaceMask::DRV_USER,
+                InterfaceMask::FLOAT64,
             );
             base.create_param("VAL", ParamType::Float64).unwrap();
             let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -11174,8 +11174,8 @@ mod tests {
                     can_block: true,
                     ..PortFlags::default()
                 },
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::FLOAT64 | InterfaceMask::OCTET | InterfaceMask::INT32_ARRAY,
+                InterfaceMask::NONE,
             );
             let msg = base.create_param("MSG", ParamType::Octet).unwrap();
             let arr = base.create_param("ARR", ParamType::Int32Array).unwrap();
@@ -11337,8 +11337,8 @@ mod tests {
                     "ondemand",
                     1,
                     PortFlags::default(),
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::DRV_USER,
+                    InterfaceMask::NONE,
                 ),
                 binds: Arc::clone(&binds),
             };
@@ -11808,8 +11808,8 @@ mod tests {
             "draw",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::INT8_ARRAY | InterfaceMask::INT32_ARRAY | InterfaceMask::DRV_USER,
+            InterfaceMask::NONE,
         );
         base.create_param("VAL", param).unwrap();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -11962,8 +11962,8 @@ mod tests {
             "octparam",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OCTET | InterfaceMask::DRV_USER,
+            InterfaceMask::NONE,
         );
         let fw = base.create_param("FW", ParamType::Octet).unwrap();
         base.params.set_string(fw, 0, text).unwrap();
@@ -12655,8 +12655,8 @@ mod tests {
                     "test_f64",
                     1,
                     PortFlags::default(),
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::DRV_USER,
+                    InterfaceMask::NONE,
                 );
                 base.create_param("VAL", ParamType::Float64).unwrap();
                 Self { base }
@@ -13129,8 +13129,8 @@ mod tests {
                 name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::INT32 | InterfaceMask::OCTET | InterfaceMask::DRV_USER,
+                InterfaceMask::NONE,
             ),
             writes: writes.clone(),
             fail,
@@ -13396,8 +13396,8 @@ mod tests {
                 name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::FLOAT32_ARRAY | InterfaceMask::DRV_USER,
+                InterfaceMask::NONE,
             ),
             writes: writes.clone(),
         };
@@ -13617,8 +13617,8 @@ mod tests {
                 name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             ),
             writes: writes.clone(),
             sequence: sequence.clone(),
@@ -13837,8 +13837,8 @@ mod tests {
                 "octet_partial",
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             ))),
             rx,
         );

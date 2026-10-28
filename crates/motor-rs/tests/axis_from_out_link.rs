@@ -32,7 +32,16 @@ static SIM: DevSup = motor_interface_device("devTestSim", "TestSim");
 
 /// A model-2 port with no axis open: a record on it never reaches a write.
 fn axisless_port(name: &str, num_axes: usize) -> asyn_rs::port_handle::PortHandle {
-    asyn_port(name, num_axes, asyn_rs::port::InterfaceMask::UNMIGRATED_ALL)
+    asyn_port(
+        name,
+        num_axes,
+        asyn_rs::port::InterfaceMask::INT32
+            | asyn_rs::port::InterfaceMask::UINT32_DIGITAL
+            | asyn_rs::port::InterfaceMask::FLOAT64
+            | asyn_rs::port::InterfaceMask::FLOAT64_ARRAY
+            | asyn_rs::port::InterfaceMask::GENERIC_POINTER
+            | asyn_rs::port::InterfaceMask::DRV_USER,
+    )
 }
 
 /// A bare asyn port with `interfaces` and no parameters, in asynManager.
@@ -58,7 +67,7 @@ fn asyn_port(
         num_axes,
         PortFlags::default(),
         interfaces,
-        asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+        asyn_rs::port::InterfaceMask::NONE,
     ));
     let (runtime, _actor) = asyn_rs::runtime::port::create_port_runtime(
         &claim,
@@ -645,7 +654,11 @@ async fn an_asyn_record_on_a_port_with_no_motor_axes_dies_where_c_s_init_stops()
             .map(|l| l.splitn(3, ' ').nth(2).unwrap().to_owned())
             .collect()
     };
-    asyn_port("NOTMOTOR", 1, InterfaceMask::UNMIGRATED_ALL);
+    asyn_port(
+        "NOTMOTOR",
+        1,
+        InterfaceMask::INT32 | InterfaceMask::FLOAT64 | InterfaceMask::DRV_USER,
+    );
     asyn_port(
         "OCTETONLY",
         1,

@@ -132,8 +132,8 @@ mod tests {
             "SVC_MULTI",
             4,
             flags,
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         services.bind(&mut base);
         let trace = services.trace();
@@ -151,8 +151,8 @@ mod tests {
             "SVC_UNBOUND",
             1,
             Default::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         assert!(Arc::ptr_eq(&base.trace, PortServices::global().trace()));
         assert!(

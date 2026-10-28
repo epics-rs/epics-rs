@@ -986,8 +986,8 @@ mod tests {
             "CB_INIT",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         let mut proc = CircularBuffProcessor::new(100, 100, TriggerCondition::default(), 10);
         proc.register_params(&mut base).unwrap();
@@ -1022,8 +1022,8 @@ mod tests {
             "CB_INIT2",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         let mut proc = CircularBuffProcessor::new(5, 7, TriggerCondition::default(), 10);
         proc.register_params(&mut base).unwrap();
@@ -1586,8 +1586,8 @@ mod tests {
             "T",
             1,
             Default::default(),
-            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+            asyn_rs::port::InterfaceMask::NONE,
+            asyn_rs::port::InterfaceMask::NONE,
         );
         proc.register_params(&mut base).unwrap();
         (proc, base)
@@ -2012,8 +2012,8 @@ mod tests {
                 "T",
                 1,
                 Default::default(),
-                asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-                asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+                asyn_rs::port::InterfaceMask::NONE,
+                asyn_rs::port::InterfaceMask::NONE,
             );
             p.validate_int32(
                 20,

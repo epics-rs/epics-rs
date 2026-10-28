@@ -47,8 +47,8 @@ async fn failed_write(port: &str, can_block: bool, record_type: &str) -> (u16, A
             can_block,
             ..PortFlags::default()
         },
-        InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::INT32_ARRAY | InterfaceMask::DRV_USER,
+        InterfaceMask::NONE,
     );
     base.create_param("ARR", ParamType::Int32Array).unwrap();
     let (runtime, _actor) =

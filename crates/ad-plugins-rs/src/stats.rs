@@ -3283,8 +3283,8 @@ mod tests {
             "_stats_scratch_",
             1,
             asyn_rs::port::PortFlags::default(),
-            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+            asyn_rs::port::InterfaceMask::NONE,
+            asyn_rs::port::InterfaceMask::NONE,
         );
         let _ = ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base);
         let _ = ad_core_rs::plugin::params::PluginBaseParams::create(&mut base);
@@ -3351,8 +3351,8 @@ mod tests {
             "_stats_adp13_",
             1,
             asyn_rs::port::PortFlags::default(),
-            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+            asyn_rs::port::InterfaceMask::NONE,
+            asyn_rs::port::InterfaceMask::NONE,
         );
         let _ = ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base);
         let _ = ad_core_rs::plugin::params::PluginBaseParams::create(&mut base);
@@ -3415,8 +3415,8 @@ mod tests {
             port,
             1,
             asyn_rs::port::PortFlags::default(),
-            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+            asyn_rs::port::InterfaceMask::NONE,
+            asyn_rs::port::InterfaceMask::NONE,
         );
         let _ = ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base);
         let _ = ad_core_rs::plugin::params::PluginBaseParams::create(&mut base);
@@ -3501,8 +3501,8 @@ mod tests {
             "_stats_drvinfo_",
             1,
             asyn_rs::port::PortFlags::default(),
-            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+            asyn_rs::port::InterfaceMask::NONE,
+            asyn_rs::port::InterfaceMask::NONE,
         );
         let _ = ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base);
         let _ = ad_core_rs::plugin::params::PluginBaseParams::create(&mut base);
@@ -3706,8 +3706,8 @@ mod tests {
             "_stats_histx_write_",
             1,
             asyn_rs::port::PortFlags::default(),
-            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+            asyn_rs::port::InterfaceMask::NONE,
+            asyn_rs::port::InterfaceMask::NONE,
         );
         let _ = ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base);
         let _ = ad_core_rs::plugin::params::PluginBaseParams::create(&mut base);
@@ -3769,8 +3769,8 @@ mod tests {
             "_stats_adp30_",
             1,
             asyn_rs::port::PortFlags::default(),
-            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+            asyn_rs::port::InterfaceMask::NONE,
+            asyn_rs::port::InterfaceMask::NONE,
         );
         let _ = ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base);
         let _ = ad_core_rs::plugin::params::PluginBaseParams::create(&mut base);
@@ -3834,8 +3834,8 @@ mod tests {
             "_stats_histx_",
             1,
             asyn_rs::port::PortFlags::default(),
-            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+            asyn_rs::port::InterfaceMask::NONE,
+            asyn_rs::port::InterfaceMask::NONE,
         );
         let _ = ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base);
         let _ = ad_core_rs::plugin::params::PluginBaseParams::create(&mut base);

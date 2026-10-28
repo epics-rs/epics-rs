@@ -3614,8 +3614,13 @@ mod tests {
                 "actor_test",
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::INT32
+                    | InterfaceMask::UINT32_DIGITAL
+                    | InterfaceMask::FLOAT64
+                    | InterfaceMask::OCTET
+                    | InterfaceMask::INT64
+                    | InterfaceMask::DRV_USER,
+                InterfaceMask::NONE,
             );
             base.create_param("VAL", ParamType::Int32).unwrap();
             base.create_param("F64", ParamType::Float64).unwrap();
@@ -3765,8 +3770,8 @@ mod tests {
             "addr_test",
             max_addr,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::INT32,
+            InterfaceMask::NONE,
         );
         base.own_interrupts(InterruptGate::opened());
         let val = base.create_param("VAL", ParamType::Int32).unwrap();
@@ -4070,8 +4075,8 @@ mod tests {
             "eos_test",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OCTET,
+            InterfaceMask::NONE,
         );
         eos_base.install_octet_interpose(Box::new(crate::interpose::eos::EosInterpose::default()));
         let tx = spawn_actor(EosObserver {
@@ -4198,8 +4203,8 @@ mod tests {
                 "flush_test",
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             ),
             flush_calls: flush_calls.clone(),
             write_calls: write_calls.clone(),
@@ -4265,8 +4270,8 @@ mod tests {
                 "eom_test",
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             ),
         };
         let tx = spawn_actor(drv);
@@ -4313,8 +4318,8 @@ mod tests {
                 "takeback_test",
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             ),
         };
         drv.base
@@ -4757,8 +4762,8 @@ mod tests {
             "throttle_test",
             1,
             flags,
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.create_param("VAL", ParamType::Int32).unwrap();
         base.init_connected(false);
@@ -4852,8 +4857,8 @@ mod tests {
             "waived_test",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OPTION | InterfaceMask::INT32,
+            InterfaceMask::NONE,
         );
         base.init_connected(false);
         base.init_auto_connect(true);
@@ -4947,8 +4952,8 @@ mod tests {
             "disconnect_test",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.init_connected(true);
         base.init_auto_connect(true);
@@ -5016,8 +5021,8 @@ mod tests {
             "addr_ac",
             1,
             flags,
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::INT32,
+            InterfaceMask::NONE,
         );
         base.create_param("VAL", ParamType::Int32).unwrap();
         base.params.set_int32(0, 0, 7).unwrap();
@@ -5089,8 +5094,8 @@ mod tests {
                     can_block: true,
                     ..PortFlags::default()
                 },
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::INT32,
+                InterfaceMask::NONE,
             );
             base.create_param("VAL", ParamType::Int32).unwrap();
             base.params.set_int32(0, 1, 7).unwrap();
@@ -5210,8 +5215,8 @@ mod tests {
             "retry_test",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.create_param("VAL", ParamType::Int32).unwrap();
         base.init_auto_connect(true);
@@ -5307,8 +5312,8 @@ mod tests {
                     multi_device: true,
                     ..PortFlags::default()
                 },
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::NONE,
+                InterfaceMask::NONE,
             );
             base.init_auto_connect(true);
             base.set_connected(false);
@@ -5417,8 +5422,8 @@ mod tests {
                 multi_device: true,
                 ..PortFlags::default()
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         services.bind(&mut base);
         let trace = services.trace();
@@ -5511,8 +5516,8 @@ mod tests {
             "no_auto",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.init_auto_connect(false);
         base.init_connected(true);
@@ -5527,8 +5532,8 @@ mod tests {
             "auto",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.init_auto_connect(true);
         base.init_connected(true);
@@ -5550,8 +5555,8 @@ mod tests {
                 can_block,
                 ..PortFlags::default()
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OPTION | InterfaceMask::INT32,
+            InterfaceMask::NONE,
         );
         base.create_param("VAL", ParamType::Int32).unwrap();
         base.params.set_int32(0, 0, 7).unwrap();
@@ -5832,8 +5837,8 @@ mod tests {
                 can_block: true,
                 ..PortFlags::default()
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OCTET,
+            InterfaceMask::NONE,
         );
         let tx = spawn_actor(InterposeDriver { base });
 
@@ -5919,8 +5924,8 @@ mod tests {
                 "enable_test",
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::NONE,
+                InterfaceMask::NONE,
             );
             base.create_param("VAL", ParamType::Int32).unwrap();
             base.init_connected(false);
@@ -6035,8 +6040,8 @@ mod tests {
             "status_test",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.create_param("VAL", ParamType::Int32).unwrap();
         // Down, enabled, auto-connect, and with no throttle window running
@@ -6340,8 +6345,8 @@ mod tests {
                 multi_device: true,
                 ..PortFlags::default()
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.own_interrupts(epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened());
         let val = base.create_param("VAL", ParamType::Int32).unwrap();
@@ -6403,8 +6408,8 @@ mod tests {
                 multi_device: true,
                 ..PortFlags::default()
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.own_interrupts(epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened());
         let val = base.create_param("VAL", ParamType::Int32).unwrap();
@@ -6464,8 +6469,8 @@ mod tests {
                 multi_device: true,
                 ..PortFlags::default()
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.own_interrupts(epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened());
         let val = base.create_param("VAL", ParamType::Int32).unwrap();
@@ -6509,8 +6514,8 @@ mod tests {
             "stamp_pub",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.own_interrupts(epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened());
         let val = base.create_param("VAL", ParamType::Int32).unwrap();
@@ -6562,8 +6567,8 @@ mod tests {
             "status_pub",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.own_interrupts(epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened());
         let val = base.create_param("VAL", ParamType::Int32).unwrap();
@@ -6641,8 +6646,8 @@ mod tests {
             "batch_array",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.own_interrupts(epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened());
         let val = base.create_param("VAL", ParamType::Int32).unwrap();
@@ -6689,8 +6694,8 @@ mod tests {
                 multi_device: true,
                 ..PortFlags::default()
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.own_interrupts(epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened());
         let val = base.create_param("VAL", ParamType::Int32).unwrap();
@@ -6736,8 +6741,8 @@ mod tests {
             "set_alone",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::INT32,
+            InterfaceMask::NONE,
         );
         base.own_interrupts(epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened());
         let val = base.create_param("VAL", ParamType::Int32).unwrap();
@@ -6897,8 +6902,8 @@ mod tests {
                     can_block: true,
                     ..PortFlags::default()
                 },
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::NONE,
+                InterfaceMask::NONE,
             );
             base.init_auto_connect(true);
             base.init_connected(false);
@@ -7036,8 +7041,8 @@ mod tests {
                 "rep",
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::NONE,
+                InterfaceMask::NONE,
             );
             base.init_auto_connect(false);
             base.set_connected(connected);
@@ -7076,8 +7081,8 @@ mod tests {
             "gone",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         shut_down(&mut base);
         let tx = spawn_actor(ReportSpy {
@@ -7119,8 +7124,8 @@ mod tests {
                     multi_device: true,
                     ..PortFlags::default()
                 },
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::NONE,
+                InterfaceMask::NONE,
             );
             base.init_auto_connect(port_auto_connect);
             base.device_state(0);
@@ -7182,8 +7187,8 @@ mod tests {
                 "drv_rep",
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::NONE,
+                InterfaceMask::INT32,
             );
             base.create_param("VAL", ParamType::Int32).unwrap();
             base.install_octet_interpose(Box::new(crate::interpose::eos::EosInterpose::default()));
@@ -7304,8 +7309,8 @@ mod tests {
             "disabled_port",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.init_auto_connect(false);
         base.set_connected(false);
@@ -7776,8 +7781,8 @@ mod tests {
             "serial_actor",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::INT32,
+            InterfaceMask::NONE,
         );
         base.create_param("VAL", ParamType::Int32).unwrap();
         let driver = CountingDriver {
@@ -7885,8 +7890,8 @@ mod tests {
                 "trace_link",
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             )),
             &crate::registry::open_owner(),
         )

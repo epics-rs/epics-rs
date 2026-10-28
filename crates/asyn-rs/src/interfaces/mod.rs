@@ -290,11 +290,6 @@ impl InterfaceMask {
         .or(Self::ENUM)
         .or(Self::INT64);
 
-    /// The interrupt mask of a port not yet given its C driver's: every
-    /// interface may interrupt, as every one could before masks existed. Each
-    /// use is a site still to migrate.
-    pub const UNMIGRATED_INTERRUPTS: Self = Self::ALL;
-
     /// Every bit: a mask that restricts nothing.
     pub const ALL: Self = Self(u32::MAX);
 
@@ -321,17 +316,6 @@ impl InterfaceMask {
             InterfaceType::UInt64 | InterfaceType::Motor => return None,
         })
     }
-
-    /// A C subclass (an areaDetector driver or plugin) whose own masks, ORed
-    /// into its base class's, are not yet carried over. Each use is a site
-    /// still to migrate.
-    pub const UNMIGRATED_SUBCLASS: Self = Self::NONE;
-
-    /// The interrupt mask of a C subclass not yet given its own: every
-    /// interface may interrupt, as with [`Self::UNMIGRATED_INTERRUPTS`], so
-    /// the port refuses none of the subclass's interrupt clients. Each use is
-    /// a site still to migrate.
-    pub const UNMIGRATED_SUBCLASS_INTERRUPTS: Self = Self::ALL;
 
     pub const fn or(self, other: Self) -> Self {
         Self(self.0 | other.0)

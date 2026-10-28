@@ -1250,8 +1250,8 @@ mod tests {
 
     impl NDPluginProcess for Downstream {
         const ASYN_FLAGS: PortFlags = ad_core_rs::plugin::runtime::ASYN_CANBLOCK;
-        const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
-        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+        const INTERFACE_MASK: InterfaceMask = InterfaceMask::NONE;
+        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::NONE;
         fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
             self.0.lock().push(Seen::Frame(array.unique_id));
             ProcessResult::sink(vec![])
@@ -1758,8 +1758,8 @@ mod tests {
             "TIFFBUSY",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         let _nd_params = NDArrayDriverParams::create(&mut base).unwrap();
         let mut proc = TiffFileProcessor::new();
@@ -1989,8 +1989,8 @@ mod tests {
             "TIFFTEST",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         let _nd_params = NDArrayDriverParams::create(&mut base).unwrap();
 

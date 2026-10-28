@@ -575,8 +575,8 @@ mod tests {
                     name,
                     1,
                     PortFlags::default(),
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::INT32 | InterfaceMask::FLOAT64 | InterfaceMask::OCTET,
+                    InterfaceMask::NONE,
                 ),
             }
         }
@@ -1053,8 +1053,8 @@ mod register_port_line_tests {
             name,
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.create_param("VAL", ParamType::Int32).unwrap();
         P(base)

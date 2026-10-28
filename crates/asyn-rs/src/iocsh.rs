@@ -2699,8 +2699,8 @@ mod tests {
                 name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OPTION,
+                InterfaceMask::NONE,
             );
             base.create_param("VAL", ParamType::Int32).unwrap();
             Self {
@@ -2756,8 +2756,8 @@ mod tests {
                     multi_device: true,
                     ..PortFlags::default()
                 },
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::NONE,
+                InterfaceMask::NONE,
             );
             base.create_param("VAL", ParamType::Int32).unwrap();
             Self {
@@ -2782,8 +2782,8 @@ mod tests {
                     name,
                     1,
                     PortFlags::default(),
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::OCTET,
+                    InterfaceMask::NONE,
                 ),
                 input: input.to_vec(),
                 pos: 0,
@@ -3768,8 +3768,8 @@ mod tests {
                     "eos_port",
                     1,
                     PortFlags::default(),
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::OCTET,
+                    InterfaceMask::NONE,
                 ),
                 rec: rec.clone(),
             },
@@ -3851,8 +3851,8 @@ mod tests {
             name,
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OPTION | InterfaceMask::OCTET,
+            InterfaceMask::NONE,
         )
     }
 
@@ -3978,8 +3978,8 @@ mod tests {
                     "eos_refusing",
                     1,
                     PortFlags::default(),
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::OCTET,
+                    InterfaceMask::NONE,
                 ),
             },
             &crate::registry::open_owner(),
@@ -4387,8 +4387,8 @@ mod tests {
                         multi_device: true,
                         ..PortFlags::default()
                     },
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::OCTET,
+                    InterfaceMask::NONE,
                 ),
             },
             &crate::registry::open_owner(),
@@ -4568,8 +4568,8 @@ mod tests {
                     "echo_port",
                     1,
                     PortFlags::default(),
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::OCTET,
+                    InterfaceMask::NONE,
                 ),
                 link: EchoingLink {
                     sizes: sizes.clone(),
@@ -4685,8 +4685,8 @@ mod tests {
                     "delay_port",
                     1,
                     PortFlags::default(),
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::OCTET,
+                    InterfaceMask::NONE,
                 ),
                 link: CountingLink {
                     sizes: sizes.clone(),
@@ -4844,8 +4844,8 @@ mod tests {
                     PORT,
                     1,
                     PortFlags::default(),
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::NONE,
+                    InterfaceMask::NONE,
                 ),
                 reports: reports.clone(),
             },
@@ -4899,8 +4899,8 @@ mod tests {
             name,
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OCTET,
+            InterfaceMask::OCTET,
         );
         base.octet_interrupt_process = true;
         base.install_octet_interpose(Box::new(crate::interpose::eos::EosInterpose::default()));
@@ -5036,8 +5036,8 @@ mod tests {
                         can_block: true,
                         ..PortFlags::default()
                     },
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::OCTET,
+                    InterfaceMask::NONE,
                 ),
             },
             &crate::registry::open_owner(),
@@ -5106,8 +5106,8 @@ mod tests {
                         multi_device: true,
                         ..PortFlags::default()
                     },
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::OCTET,
+                    InterfaceMask::NONE,
                 ),
                 eos: Vec::new(),
             },

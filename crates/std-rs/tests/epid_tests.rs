@@ -1127,8 +1127,8 @@ fn test_fast_set_output_port_wires_reader_from_asyn_port() {
         "EPID_OUT_PORT",
         1,
         PortFlags::default(),
-        InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_INTERRUPTS,
+        InterfaceMask::FLOAT64,
+        InterfaceMask::NONE,
     );
     let reason = base.create_param("OUTPUT", ParamType::Float64).unwrap();
     // Preload the output port's present value (the real DAC output).

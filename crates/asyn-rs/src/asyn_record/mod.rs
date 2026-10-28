@@ -6246,8 +6246,8 @@ mod tests {
                 name,
                 1,
                 flags,
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::NONE,
+                InterfaceMask::NONE,
             )),
             RuntimeConfig::default(),
         )
@@ -6366,8 +6366,13 @@ mod tests {
                 name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OPTION
+                    | InterfaceMask::INT32
+                    | InterfaceMask::UINT32_DIGITAL
+                    | InterfaceMask::FLOAT64
+                    | InterfaceMask::OCTET
+                    | InterfaceMask::DRV_USER,
+                InterfaceMask::NONE,
             );
             base.init_connected(connected);
             base.init_auto_connect(false);
@@ -6498,8 +6503,8 @@ mod tests {
             port_name,
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OPTION | InterfaceMask::OCTET | InterfaceMask::DRV_USER,
+            InterfaceMask::NONE,
         );
         // The port's first parameter — reason 0.
         assert_eq!(
@@ -6625,8 +6630,8 @@ mod tests {
             port_name,
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OPTION,
+            InterfaceMask::NONE,
         );
         // The port is down and nothing will bring it back: C's `autoConnectDevice`
         // is not consulted for a waived request, and must not be needed for one.
@@ -6823,8 +6828,8 @@ mod tests {
                     port_name,
                     1,
                     PortFlags::default(),
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::OPTION | InterfaceMask::OCTET,
+                    InterfaceMask::NONE,
                 ),
                 sets: sets.clone(),
             }),
@@ -6912,8 +6917,8 @@ mod tests {
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OPTION | InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             ))),
             rx,
         );
@@ -6970,8 +6975,8 @@ mod tests {
                     name,
                     1,
                     PortFlags::default(),
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::INT32 | InterfaceMask::OCTET | InterfaceMask::GPIB,
+                    InterfaceMask::NONE,
                 ),
                 calls,
                 poll_byte: None,
@@ -7172,8 +7177,8 @@ mod tests {
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OPTION | InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             )),
             RuntimeConfig::default(),
         )
@@ -7386,8 +7391,8 @@ mod tests {
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OPTION | InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             ))),
             rx,
         );
@@ -7462,8 +7467,8 @@ mod tests {
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OPTION | InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             ))),
             rx,
         );
@@ -7508,8 +7513,8 @@ mod tests {
                     "test_asyn_rec",
                     1,
                     PortFlags::default(),
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::NONE,
+                    InterfaceMask::NONE,
                 ))
             }
         }
@@ -7582,8 +7587,8 @@ mod tests {
                 port_name,
                 2,
                 flags,
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OPTION | InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             ))),
             rx,
         );
@@ -7654,8 +7659,8 @@ mod tests {
                 port_name,
                 4,
                 flags,
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OPTION | InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             ))),
             rx,
         );
@@ -7735,8 +7740,8 @@ mod tests {
                     port_name,
                     max_addr,
                     flags,
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::OPTION | InterfaceMask::OCTET,
+                    InterfaceMask::NONE,
                 ))),
                 rx,
             );
@@ -7953,8 +7958,8 @@ mod tests {
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OPTION | InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             ))),
             rx,
         );
@@ -8016,8 +8021,8 @@ mod tests {
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OPTION | InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             ))),
             rx,
         );
@@ -8106,8 +8111,8 @@ mod tests {
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OPTION | InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             ))),
             rx,
         );
@@ -8216,8 +8221,8 @@ mod tests {
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OPTION | InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             ))),
             rx,
         );
@@ -8318,8 +8323,8 @@ mod tests {
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OPTION | InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             ))),
             rx,
         );
@@ -8503,8 +8508,12 @@ mod tests {
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OPTION
+                    | InterfaceMask::INT32
+                    | InterfaceMask::UINT32_DIGITAL
+                    | InterfaceMask::FLOAT64
+                    | InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             ))),
             rx,
         );
@@ -8606,8 +8615,12 @@ mod tests {
             port_name,
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OPTION
+                | InterfaceMask::INT32
+                | InterfaceMask::UINT32_DIGITAL
+                | InterfaceMask::FLOAT64
+                | InterfaceMask::OCTET,
+            InterfaceMask::NONE,
         );
         let i32p = base.create_param("I32", ParamType::Int32).unwrap();
         let u32p = base.create_param("U32", ParamType::UInt32Digital).unwrap();
@@ -8757,8 +8770,8 @@ mod tests {
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OPTION | InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             ))),
             rx,
         );
@@ -8861,8 +8874,8 @@ mod tests {
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OPTION | InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             ))),
             rx,
         );
@@ -8969,8 +8982,8 @@ mod tests {
                     port_name,
                     1,
                     PortFlags::default(),
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::OPTION | InterfaceMask::OCTET,
+                    InterfaceMask::NONE,
                 ),
                 n: 0,
             }),
@@ -9068,8 +9081,8 @@ mod tests {
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OPTION | InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             ))),
             rx,
         );
@@ -9180,8 +9193,8 @@ mod tests {
                     port_name,
                     1,
                     PortFlags::default(),
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::OPTION | InterfaceMask::OCTET,
+                    InterfaceMask::NONE,
                 ),
                 connects: connects.clone(),
                 disconnects: disconnects.clone(),
@@ -9386,8 +9399,8 @@ mod tests {
                     port_name,
                     1,
                     PortFlags::default(),
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::OPTION | InterfaceMask::OCTET,
+                    InterfaceMask::NONE,
                 ),
                 log: log.clone(),
                 connects: connects.clone(),
@@ -9546,8 +9559,8 @@ mod tests {
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OPTION | InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             ))),
             rx,
         );
@@ -9629,8 +9642,8 @@ mod tests {
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OPTION | InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             )),
             RuntimeConfig::default(),
         )
@@ -9723,8 +9736,13 @@ mod tests {
             port_name,
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OPTION
+                | InterfaceMask::INT32
+                | InterfaceMask::UINT32_DIGITAL
+                | InterfaceMask::FLOAT64
+                | InterfaceMask::OCTET
+                | InterfaceMask::DRV_USER,
+            InterfaceMask::NONE,
         );
         base.set_connected(true);
         base.init_auto_connect(false);
@@ -9881,13 +9899,8 @@ mod tests {
                 can_block: true,
                 ..PortFlags::default()
             };
-            let mut base = PortDriverBase::new(
-                name,
-                1,
-                flags,
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
-            );
+            let mut base =
+                PortDriverBase::new(name, 1, flags, InterfaceMask::INT32, InterfaceMask::NONE);
             base.seconds_between_port_connect = Duration::from_millis(20);
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             let mut actor = PortActor::new(
@@ -10142,8 +10155,8 @@ mod tests {
                         port_name,
                         1,
                         PortFlags::default(),
-                        InterfaceMask::UNMIGRATED_ALL,
-                        InterfaceMask::UNMIGRATED_INTERRUPTS,
+                        InterfaceMask::OPTION | InterfaceMask::OCTET,
+                        InterfaceMask::NONE,
                     ),
                     accept,
                     fail,
@@ -10278,8 +10291,8 @@ mod tests {
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OPTION | InterfaceMask::INT32 | InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             ))),
             rx,
         );
@@ -10401,8 +10414,8 @@ mod tests {
                     port_name,
                     1,
                     PortFlags::default(),
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::OPTION | InterfaceMask::OCTET,
+                    InterfaceMask::NONE,
                 ),
                 fill,
                 eom,
@@ -10519,8 +10532,8 @@ mod tests {
                     port_name,
                     1,
                     PortFlags::default(),
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::OPTION | InterfaceMask::OCTET,
+                    InterfaceMask::NONE,
                 ),
                 seen: seen.clone(),
             }),
@@ -10592,8 +10605,8 @@ mod tests {
                     port_name,
                     1,
                     PortFlags::default(),
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::OPTION | InterfaceMask::OCTET,
+                    InterfaceMask::NONE,
                 ),
                 seen: seen.clone(),
             }),
@@ -10702,8 +10715,8 @@ mod tests {
                     port_name,
                     1,
                     PortFlags::default(),
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::OPTION | InterfaceMask::OCTET,
+                    InterfaceMask::NONE,
                 ),
                 log: log.clone(),
             }),
@@ -11402,8 +11415,8 @@ mod tests {
             "ASYNIO",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::INT32,
+            InterfaceMask::NONE,
         );
         let val = base.create_param("VAL", ParamType::Int32).unwrap();
         base.set_int32_param(val, 0, value).unwrap();
@@ -11559,8 +11572,8 @@ mod tests {
                     "ASYNSPQ",
                     1,
                     PortFlags::default(),
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::OPTION | InterfaceMask::INT32,
+                    InterfaceMask::NONE,
                 ),
                 entered: entered.clone(),
                 release: release.clone(),
@@ -11669,8 +11682,8 @@ mod tests {
             "ASYNAQR",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::INT32,
+            InterfaceMask::NONE,
         );
         base.create_param("VAL", ParamType::Int32).unwrap();
         let driver = BlockingReadDriver {
@@ -11790,8 +11803,8 @@ mod tests {
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OPTION | InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             ))),
             rx,
         );
@@ -11961,8 +11974,8 @@ A.TMSK 1
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OPTION | InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             ))),
             rx,
         );
@@ -12258,8 +12271,8 @@ A.OEOS
                     can_block: true,
                     ..PortFlags::default()
                 },
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             );
             base.install_octet_interpose(Box::new(EosInterpose::default()));
             base.set_connected(false);
@@ -12434,8 +12447,8 @@ A.OEOS
                 can_block: true,
                 ..PortFlags::default()
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OCTET,
+            InterfaceMask::NONE,
         );
         let driver = Gated {
             base,
@@ -12533,8 +12546,8 @@ A.OEOS
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OPTION | InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             ))),
             rx,
         );
@@ -12691,8 +12704,8 @@ A.OEOS
             port_name,
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OPTION,
+            InterfaceMask::NONE,
         );
         base.init_connected(false);
         base.init_auto_connect(false);
@@ -12814,8 +12827,8 @@ A.OEOS
             port_name,
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OPTION,
+            InterfaceMask::NONE,
         );
         base.init_connected(false);
         base.init_auto_connect(false);
@@ -12988,8 +13001,8 @@ A.OEOS
             port_name,
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OPTION | InterfaceMask::OCTET,
+            InterfaceMask::NONE,
         );
         // See `connect_device_reads_the_eos_back_from_the_driver`: an EOS is
         // only settable on a port carrying C's `asynInterposeEos` (R18-71).
@@ -13110,8 +13123,8 @@ A.OEOS
             port_name,
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OPTION | InterfaceMask::OCTET,
+            InterfaceMask::NONE,
         );
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(SteadyDevice(base)), rx);
@@ -13218,8 +13231,8 @@ A.OEOS
             port_name,
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OPTION | InterfaceMask::OCTET,
+            InterfaceMask::NONE,
         );
         base.bind_exception_sink(exceptions.clone());
         let (tx, rx) = mpsc::unbounded_channel();
@@ -13324,8 +13337,8 @@ A.OEOS
             port_name,
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OPTION | InterfaceMask::OCTET,
+            InterfaceMask::NONE,
         );
         base.bind_exception_sink(exceptions.clone());
         let (tx, rx) = mpsc::unbounded_channel();
@@ -13455,8 +13468,8 @@ A.OEOS
             port_name,
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OPTION | InterfaceMask::OCTET,
+            InterfaceMask::NONE,
         );
         base.bind_exception_sink(exceptions.clone());
         let (tx, rx) = mpsc::unbounded_channel();
@@ -13524,8 +13537,8 @@ A.OEOS
             port_name,
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OPTION | InterfaceMask::OCTET,
+            InterfaceMask::NONE,
         );
         base.bind_exception_sink(exceptions.clone());
         let (tx, rx) = mpsc::unbounded_channel();
@@ -13604,8 +13617,8 @@ A.OEOS
             port_name,
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OPTION | InterfaceMask::OCTET,
+            InterfaceMask::NONE,
         );
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(PlainDriver(base)), rx);
@@ -13677,8 +13690,8 @@ A.OEOS
             port_name,
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OPTION | InterfaceMask::OCTET,
+            InterfaceMask::NONE,
         );
         base.bind_exception_sink(exceptions.clone());
         let (tx, rx) = mpsc::unbounded_channel();
@@ -13815,8 +13828,8 @@ A.OEOS
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OPTION | InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             )),
             RuntimeConfig::default(),
         )
@@ -13909,8 +13922,8 @@ A.OEOS
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OPTION | InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             )),
             RuntimeConfig::default(),
         )
@@ -13970,8 +13983,8 @@ A.OEOS
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             )),
             RuntimeConfig::default(),
         )
@@ -14151,8 +14164,13 @@ A.OEOS
                     port_name,
                     1,
                     PortFlags::default(),
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::OPTION
+                        | InterfaceMask::INT32
+                        | InterfaceMask::UINT32_DIGITAL
+                        | InterfaceMask::FLOAT64
+                        | InterfaceMask::OCTET
+                        | InterfaceMask::DRV_USER,
+                    InterfaceMask::NONE,
                 ),
                 baud_text,
             ),
@@ -14247,8 +14265,8 @@ A.OEOS
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OPTION | InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             )),
             RuntimeConfig::default(),
         )
@@ -14285,8 +14303,13 @@ A.OEOS
             port_name,
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OPTION
+                | InterfaceMask::INT32
+                | InterfaceMask::UINT32_DIGITAL
+                | InterfaceMask::FLOAT64
+                | InterfaceMask::OCTET
+                | InterfaceMask::DRV_USER,
+            InterfaceMask::NONE,
         );
         // Reason 0 is taken by a filler param so the resolved reason is non-zero
         // and cannot be confused with the forced-zero case.
@@ -14379,8 +14402,8 @@ A.OEOS
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OPTION | InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             );
             base.init_auto_connect(false);
             base.init_connected(connected);
@@ -14512,8 +14535,8 @@ A.OEOS
             port_name,
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::INT32,
+            InterfaceMask::NONE,
         );
         let (rt, jh) =
             create_port_runtime_unclaimed(Int32Only(base), RuntimeConfig::default()).unwrap();
@@ -14577,8 +14600,13 @@ A.OEOS
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OPTION
+                    | InterfaceMask::INT32
+                    | InterfaceMask::UINT32_DIGITAL
+                    | InterfaceMask::FLOAT64
+                    | InterfaceMask::OCTET
+                    | InterfaceMask::DRV_USER,
+                InterfaceMask::NONE,
             );
             base.set_connected(connected);
             base.init_auto_connect(false);
@@ -14693,8 +14721,13 @@ A.OEOS
             port_name,
             1,
             PortFlags::default(),
-            crate::port::InterfaceMask::UNMIGRATED_ALL,
-            crate::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+            crate::port::InterfaceMask::OPTION
+                | crate::port::InterfaceMask::INT32
+                | crate::port::InterfaceMask::UINT32_DIGITAL
+                | crate::port::InterfaceMask::FLOAT64
+                | crate::port::InterfaceMask::OCTET
+                | crate::port::InterfaceMask::DRV_USER,
+            crate::port::InterfaceMask::OCTET,
         );
         base.params
             .create_param("START_", ParamType::Int32)
@@ -14867,8 +14900,16 @@ A.OEOS
                     name,
                     1,
                     PortFlags::default(),
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::OPTION
+                        | InterfaceMask::INT32
+                        | InterfaceMask::UINT32_DIGITAL
+                        | InterfaceMask::FLOAT64
+                        | InterfaceMask::OCTET
+                        | InterfaceMask::DRV_USER,
+                    InterfaceMask::INT32
+                        | InterfaceMask::UINT32_DIGITAL
+                        | InterfaceMask::FLOAT64
+                        | InterfaceMask::OCTET,
                 ),
                 reads: reads.clone(),
             },
@@ -15297,8 +15338,8 @@ A.OEOS
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OPTION | InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             )),
             RuntimeConfig::default(),
         )

@@ -631,8 +631,13 @@ mod tests {
                 name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::INT32
+                    | InterfaceMask::UINT32_DIGITAL
+                    | InterfaceMask::FLOAT64
+                    | InterfaceMask::OCTET
+                    | InterfaceMask::INT64
+                    | InterfaceMask::DRV_USER,
+                InterfaceMask::NONE,
             );
             base.create_param("INT_VAL", ParamType::Int32).unwrap();
             base.create_param("FLOAT_VAL", ParamType::Float64).unwrap();
@@ -750,8 +755,8 @@ mod tests {
                 "wr_seq",
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             ),
             seq: Arc::clone(&seq),
         };
@@ -809,8 +814,8 @@ mod tests {
                     can_block: true,
                     ..PortFlags::default()
                 },
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             ),
             seen: Arc::clone(&seen),
         };
@@ -932,8 +937,8 @@ mod tests {
             "sync_arrays",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::INT32_ARRAY,
+            InterfaceMask::NONE,
         );
         let port = ArrayPort {
             base,
@@ -1021,8 +1026,8 @@ mod tests {
                 "syncnodrvuser",
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::NONE,
+                InterfaceMask::NONE,
             )),
             RuntimeConfig::default(),
         )
@@ -1052,8 +1057,8 @@ mod tests {
                 multi_device: true,
                 ..PortFlags::default()
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::DRV_USER,
+            InterfaceMask::NONE,
         );
         base.create_param("V", ParamType::Int32).unwrap();
         let (rt, _jh) = create_port_runtime_unclaimed(TestPort { base }, RuntimeConfig::default())
@@ -1193,8 +1198,8 @@ mod tests {
             name,
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OCTET,
+            InterfaceMask::NONE,
         );
         base.create_param("V", ParamType::Int32).unwrap();
         PortManager::new()
@@ -1606,8 +1611,8 @@ mod tests {
                 "syncpartial",
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             )),
             RuntimeConfig::default(),
         )

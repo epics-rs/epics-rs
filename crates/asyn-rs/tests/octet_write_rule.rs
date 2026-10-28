@@ -54,8 +54,8 @@ fn base(name: &str, seen: Seen) -> (PortDriverBase, usize, usize) {
         name,
         1,
         PortFlags::default(),
-        InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_INTERRUPTS,
+        InterfaceMask::NONE,
+        InterfaceMask::NONE,
     );
     let file = base.create_param("FILE", ParamType::Octet).unwrap();
     let other = base.create_param("OTHER", ParamType::Octet).unwrap();

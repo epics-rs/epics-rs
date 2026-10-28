@@ -83,8 +83,8 @@ fn port(
             can_block: true,
             ..PortFlags::default()
         },
-        InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_INTERRUPTS,
+        InterfaceMask::INT32,
+        InterfaceMask::NONE,
     );
     base.own_interrupts(InterruptGate::opened());
     let reason = base.create_param("VAL", ParamType::Int32).unwrap();

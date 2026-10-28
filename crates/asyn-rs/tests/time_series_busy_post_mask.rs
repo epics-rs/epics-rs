@@ -57,8 +57,8 @@ impl TsPort {
             name,
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::DRV_USER,
+            InterfaceMask::INT32,
         );
         base.create_param("VAL", ParamType::Int32).unwrap();
         Self { base }

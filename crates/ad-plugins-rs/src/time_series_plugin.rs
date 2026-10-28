@@ -892,8 +892,8 @@ mod tests {
             "T",
             1,
             Default::default(),
-            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+            asyn_rs::port::InterfaceMask::NONE,
+            asyn_rs::port::InterfaceMask::NONE,
         );
         let clamp = WriteVerdict::Refuse {
             keep: 1,
@@ -994,8 +994,8 @@ mod tests {
             "TS_INIT",
             3,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         proc.register_params(&mut base).unwrap();
         let int = |name: &str| base.get_int32_param(base.find_param(name).unwrap(), 0);
@@ -1020,8 +1020,8 @@ mod tests {
             port,
             max_signals + 1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         proc.register_params(&mut base).unwrap();
         proc
@@ -1132,8 +1132,8 @@ mod tests {
             "TST_TS_REFUSED_B",
             3,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         let read = proc.state.lock().p.ts_read;
         let out = proc.validate_int32(
@@ -1168,8 +1168,8 @@ mod tests {
             "TST_TS_STOP_B",
             3,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         let (acquire, series) = {
             let st = proc.state.lock();
@@ -1199,8 +1199,8 @@ mod tests {
             "TST_TS_ADDR_B",
             3,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         let acquire = proc.state.lock().p.ts_acquire;
         let out = proc.validate_int32(
@@ -1231,8 +1231,8 @@ mod tests {
             "TST_TS_NPTS_B",
             2,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         let p = proc.state.lock().p.clone();
         proc.state.lock().averaging_time_actual = 1.0;
@@ -1285,8 +1285,8 @@ mod tests {
             "TST_TS_AVG_B",
             2,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         let p = proc.state.lock().p.clone();
         let out = proc.validate_float64(
@@ -1329,8 +1329,8 @@ mod tests {
             "TST_TS_BASE_B",
             2,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         // make_proc numbers the TS params from 0; this is none of them.
         const BASE: usize = 1000;
@@ -1644,8 +1644,8 @@ mod tests {
                 &format!("{port}_B"),
                 9,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::NONE,
+                InterfaceMask::NONE,
             );
             let p = proc.state.lock().p.clone();
             let mut rig = Self {

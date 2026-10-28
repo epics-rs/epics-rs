@@ -79,8 +79,8 @@ struct Unlocked {
 
 impl NDPluginProcess for Unlocked {
     const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_CANBLOCK;
-    const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
-    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS;
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::NONE;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::NONE;
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         let acc = burn(array);
         *self.sink.lock() = acc;
@@ -102,8 +102,8 @@ struct Locked {
 
 impl NDPluginProcess for Locked {
     const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_CANBLOCK;
-    const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
-    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS;
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::NONE;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::NONE;
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         let mut sink = self.sink.lock();
         *sink = burn(array);

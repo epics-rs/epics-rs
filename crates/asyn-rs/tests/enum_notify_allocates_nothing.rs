@@ -75,8 +75,8 @@ async fn enum_value_fires_with_a_ring_client_allocate_nothing_on_the_notify_thre
         "enumAlloc",
         1,
         PortFlags::default(),
-        InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_INTERRUPTS,
+        InterfaceMask::ENUM | InterfaceMask::DRV_USER,
+        InterfaceMask::ENUM,
     );
     base.create_param("MODE", ParamType::Enum).unwrap();
     base.set_enum_choices_param(0, 0, vec![entry("OFF", 0), entry("ON", 1)].into())

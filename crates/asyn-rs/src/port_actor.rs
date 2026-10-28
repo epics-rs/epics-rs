@@ -10,6 +10,7 @@
 use std::cell::Cell;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering as AtomicOrdering};
 use std::time::{Instant, SystemTime};
@@ -793,15 +794,39 @@ impl ActorMessage {
     }
 }
 
-/// Sleep until `deadline`, or never if there is none.
+/// Connect-retry timers the idle wait has armed, process-wide (nextest runs
+/// each test in its own process).
+#[cfg(test)]
+static RETRY_TIMERS_ARMED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Point the idle wait's held connect-retry timer at `deadline`. A timer is
+/// armed only when the deadline moved, and dropped when the retry is
+/// disarmed, so a pass woken by traffic arms none.
+fn retarget(mut timer: Pin<&mut Option<tokio::time::Sleep>>, deadline: Option<Instant>) {
+    let deadline = deadline.map(tokio::time::Instant::from_std);
+    let held = timer.as_ref().as_pin_ref().map(|sleep| sleep.deadline());
+    if held == deadline {
+        return;
+    }
+    match (timer.as_mut().as_pin_mut(), deadline) {
+        (Some(sleep), Some(at)) => sleep.reset(at),
+        (_, deadline) => timer.set(deadline.map(tokio::time::sleep_until)),
+    }
+    #[cfg(test)]
+    if deadline.is_some() {
+        RETRY_TIMERS_ARMED.fetch_add(1, AtomicOrdering::SeqCst);
+    }
+}
+
+/// Sleep on the held retry timer, or never if it is disarmed.
 ///
 /// A disarmed connect timer must not make the `select!` arm ready — otherwise
 /// the actor would spin. `pending()` is the "this arm never completes" form,
 /// leaving the other arms (request / shutdown) to drive the loop exactly as
 /// they did before the timer existed.
-async fn sleep_until_opt(deadline: Option<Instant>) {
-    match deadline {
-        Some(at) => tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await,
+async fn sleep_until_opt(timer: Pin<&mut Option<tokio::time::Sleep>>) {
+    match timer.as_pin_mut() {
+        Some(sleep) => sleep.await,
         None => std::future::pending().await,
     }
 }
@@ -1524,6 +1549,7 @@ impl PortActor {
             // The registration connect armed in `new`, ahead of every request.
             actor.registration_pass();
             let mut stop = Stop::Listening(shutdown_rx);
+            let mut retry = std::pin::pin!(None);
             loop {
                 // Drain all pending messages into the heap
                 actor.drain_channel();
@@ -1538,7 +1564,7 @@ impl PortActor {
                     // Connect-priority request to the port thread,
                     // asynManager.c:3283-3297); here the actor IS the port
                     // thread, so it wakes itself.
-                    let retry_at = actor.driver.base().connect_retry_at;
+                    retarget(retry.as_mut(), actor.driver.base().connect_retry_at);
                     let cells = Arc::clone(&actor.cells);
                     tokio::select! {
                         msg = actor.rx.recv() => {
@@ -1552,7 +1578,7 @@ impl PortActor {
                         // (asynManager.c:1628) for a queued cell.
                         _ = cells.pushed() => {}
                         () = stop.arrived() => {}
-                        _ = sleep_until_opt(retry_at) => {}
+                        () = sleep_until_opt(retry.as_mut()) => {}
                     }
                     // Drain any more that arrived
                     actor.drain_channel();
@@ -6111,6 +6137,69 @@ mod tests {
             calls.load(Ordering::SeqCst),
             1,
             "an exception is a port-thread wake and a woken pass does attempt one connect"
+        );
+    }
+
+    /// The idle wait holds the connect-retry timer across loop passes: a pass
+    /// woken by a message, with `connect_retry_at` where it was, arms none.
+    #[test]
+    fn a_pass_that_keeps_the_retry_deadline_arms_no_timer() {
+        use std::sync::atomic::Ordering;
+
+        struct DeadLink {
+            base: PortDriverBase,
+        }
+        impl PortDriver for DeadLink {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
+                Err(AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: "link down".into(),
+                })
+            }
+        }
+
+        let mut base = PortDriverBase::new(
+            "retry_hold",
+            1,
+            PortFlags::default(),
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
+        );
+        base.create_param("VAL", ParamType::Int32).unwrap();
+        base.init_auto_connect(true);
+        // Registration's failed attempt re-arms once, for the whole test.
+        base.seconds_between_port_connect = Duration::from_secs(3600);
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut actor = PortActor::new(Box::new(DeadLink { base }), rx);
+        actor.register();
+        let (_shutdown, shutdown_rx) = mpsc::channel(1);
+        std::thread::spawn(move || actor.run_with_shutdown(shutdown_rx));
+
+        let started = Instant::now();
+        while RETRY_TIMERS_ARMED.load(Ordering::SeqCst) == 0 {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the retry timer never armed"
+            );
+            std::thread::yield_now();
+        }
+        let before = RETRY_TIMERS_ARMED.load(Ordering::SeqCst);
+        // Plain reads: each wakes the actor and leaves the deadline alone. A
+        // reply leaves ahead of its pass's next idle wait, so the ninth one is
+        // what proves the eighth pass waited again.
+        for _ in 0..9 {
+            send_and_wait(&tx, RequestOp::GetConnected, AsynUser::default()).unwrap();
+        }
+        assert_eq!(
+            RETRY_TIMERS_ARMED.load(Ordering::SeqCst) - before,
+            0,
+            "timers armed by passes that kept the retry deadline"
         );
     }
 

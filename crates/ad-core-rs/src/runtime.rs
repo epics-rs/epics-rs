@@ -141,14 +141,14 @@ impl std::error::Error for Elapsed {}
 
 /// Await `fut`, returning `Err(Elapsed)` if it doesn't resolve within `duration`.
 pub async fn timeout<F: Future>(duration: Duration, fut: F) -> Result<F::Output, Elapsed> {
-    tokio::time::timeout(duration, fut)
+    epics_libcom_rs::runtime::task::timeout(duration, fut)
         .await
         .map_err(|_| Elapsed)
 }
 
 /// Async sleep for the given duration.
 pub async fn sleep(duration: Duration) {
-    tokio::time::sleep(duration).await;
+    epics_libcom_rs::runtime::task::sleep(duration).await;
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -185,4 +185,28 @@ where
         .name(name.to_string())
         .spawn(move || block_on_for_thread(make_fut()))
         .expect("failed to spawn driver thread")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A plain `std::thread` with no runtime entered still sleeps and bounds a
+    /// wait: the timer is the one the calling thread can reach.
+    #[test]
+    fn sleep_and_timeout_run_on_a_thread_with_no_runtime() {
+        std::thread::spawn(|| {
+            epics_libcom_rs::runtime::task::block_on_sync(async {
+                sleep(Duration::from_millis(5)).await;
+                let pending = std::future::pending::<()>();
+                assert_eq!(
+                    timeout(Duration::from_millis(5), pending).await,
+                    Err(Elapsed)
+                );
+            })
+            .expect("no runtime is entered on this thread")
+        })
+        .join()
+        .expect("sleep and timeout need no runtime");
+    }
 }

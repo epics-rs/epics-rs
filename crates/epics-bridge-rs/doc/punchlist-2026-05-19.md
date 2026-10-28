@@ -3,7 +3,7 @@
 Driver-managed punchlist. **Worker contract:**
 
 1. Take exactly the next unchecked `[ ]` item the driver hands you. Do NOT freelance to other items.
-2. Before editing the cited line, run the **Anchor / Sites / Same defect / Distinct** audit per the global rule (see ~/.claude/CLAUDE.md "Fixes from reported defects"). Mandatory report header before edits.
+2. Before editing the cited line, run the **Anchor / Sites / Same defect / Distinct** audit per the global rule. Mandatory report header before edits.
 3. NEVER emit: `TODO`, `FIXME`, `unimplemented!()`, `#[allow(...)]` (to silence), `// later`, "next session", "out of scope" (unless user-scoped this round), "scope이 크다", "위험합니다", "다음에", "defer".
 4. **Upstream parity is the bar — no inventing semantics.** Every design decision (values, edge cases, where behaviour applies, defaults) MUST be grounded in the upstream C++ reference:
    - pvxs:       `$PVXS_HOME`

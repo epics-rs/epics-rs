@@ -255,7 +255,13 @@ fn a_driver_write_octet_override_runs_in_place_of_the_base() {
     let params = Sends::default();
     let sent = params.sent.clone();
     let port = register_controller_port(&open_owner(), "CPOCTET", 1, params).unwrap();
-    let io = asyn_rs::sync_io::SyncIOHandle::from_handle(port, 0, Duration::from_secs(1));
+    let io = asyn_rs::sync_io::SyncIOHandle::from_handle(
+        port,
+        0,
+        Duration::from_secs(1),
+        asyn_rs::interfaces::InterfaceType::Octet,
+    )
+    .unwrap();
     let send = BASE_PARAMS.len();
     assert_eq!(io.write_octet(send, b"AX RP").unwrap(), 5);
     assert_eq!(*sent.lock().unwrap(), [b"AX RP".to_vec()]);
@@ -1568,7 +1574,13 @@ fn a_uint32_digital_write_reaches_the_driver_s_own_code() {
     let seen = regs.seen.clone();
     let port = register_controller_port(&open_owner(), "CPBINOUT", 1, regs).unwrap();
     let _ax = axis("CPBINOUT", 0);
-    let io = SyncIOHandle::from_handle(port.clone(), 0, Duration::from_secs(1));
+    let io = SyncIOHandle::from_handle(
+        port.clone(),
+        0,
+        Duration::from_secs(1),
+        asyn_rs::interfaces::InterfaceType::UInt32Digital,
+    )
+    .unwrap();
     let (out, stored) = (BASE_PARAMS.len(), BASE_PARAMS.len() + 1);
     io.write_uint32_digital(out, 1, 0x4).unwrap();
     assert_eq!(*seen.lock().unwrap(), [(1, 0x4)]);
@@ -1943,7 +1955,13 @@ fn every_subclass_entry_is_handed_getaddress_s_axis() {
         .unwrap();
     port.read_int32_blocking(index::STOP, -1).unwrap();
     port.read_float64_blocking(index::VELOCITY, -1).unwrap();
-    let io = asyn_rs::sync_io::SyncIOHandle::from_handle(port.clone(), -1, Duration::from_secs(1));
+    let io = asyn_rs::sync_io::SyncIOHandle::from_handle(
+        port.clone(),
+        -1,
+        Duration::from_secs(1),
+        asyn_rs::interfaces::InterfaceType::Common,
+    )
+    .unwrap();
     io.write_octet(index::PROFILE_BUILD_MESSAGE, b"x").unwrap();
     io.write_uint32_digital(index::STOP, 1, 1).unwrap();
     let user = || AsynUser::default().with_addr(-1);

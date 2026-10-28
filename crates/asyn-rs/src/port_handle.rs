@@ -4420,7 +4420,9 @@ mod tests {
             handle.clone(),
             0,
             std::time::Duration::from_secs(1),
-        );
+            InterfaceType::Common,
+        )
+        .unwrap();
         assert_eq!(
             refusal(syncio.read_enum(0)),
             "port does not implement interface asynEnum"
@@ -4788,9 +4790,15 @@ mod tests {
     #[test]
     fn a_syncio_call_that_never_ran_reports_as_queue_lock_port() {
         let sync = |handle: &PortHandle| {
-            crate::sync_io::SyncIOHandle::from_handle(handle.clone(), 0, Duration::from_millis(10))
-                .read_int32(0)
-                .expect_err("the call never ran")
+            crate::sync_io::SyncIOHandle::from_handle(
+                handle.clone(),
+                0,
+                Duration::from_millis(10),
+                InterfaceType::Int32,
+            )
+            .unwrap()
+            .read_int32(0)
+            .expect_err("the call never ran")
         };
 
         // Not connected, no autoconnect: queueRequest refuses.
@@ -4799,7 +4807,7 @@ mod tests {
             ..PortFlags::default()
         };
         let mut base =
-            PortDriverBase::new("qlp", 1, flags, InterfaceMask::NONE, InterfaceMask::NONE);
+            PortDriverBase::new("qlp", 1, flags, InterfaceMask::INT32, InterfaceMask::NONE);
         base.init_connected(false);
         base.init_auto_connect(false);
         let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -4871,8 +4879,13 @@ mod tests {
             delay: Duration::ZERO,
             reads: reads.clone(),
         });
-        let syncio =
-            crate::sync_io::SyncIOHandle::from_handle(handle.clone(), 0, Duration::from_millis(10));
+        let syncio = crate::sync_io::SyncIOHandle::from_handle(
+            handle.clone(),
+            0,
+            Duration::from_millis(10),
+            InterfaceType::Int32,
+        )
+        .unwrap();
         assert_eq!(syncio.read_int32(0).unwrap(), 7);
         assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
 
@@ -4892,8 +4905,13 @@ mod tests {
     fn a_syncio_call_on_a_synchronous_port_has_no_queue_deadline() {
         let (handle, _reads) = slow_port(Duration::from_millis(300));
         handle.set_queue_lock_port_timeout(Duration::from_millis(10));
-        let syncio =
-            crate::sync_io::SyncIOHandle::from_handle(handle.clone(), 0, Duration::from_millis(10));
+        let syncio = crate::sync_io::SyncIOHandle::from_handle(
+            handle.clone(),
+            0,
+            Duration::from_millis(10),
+            InterfaceType::Int32,
+        )
+        .unwrap();
         assert_eq!(syncio.user(0).queue_timeout(), None);
         let jammer = handle.clone();
         let jam = std::thread::spawn(move || {
@@ -5016,7 +5034,14 @@ mod tests {
         });
         std::thread::sleep(Duration::from_millis(50));
         let started = std::time::Instant::now();
-        let read = crate::sync_io::SyncIOHandle::from_handle(handle, 0, user_timeout).read_int32(0);
+        let read = crate::sync_io::SyncIOHandle::from_handle(
+            handle,
+            0,
+            user_timeout,
+            InterfaceType::Int32,
+        )
+        .unwrap()
+        .read_int32(0);
         let waited = started.elapsed();
         jam.join().unwrap();
         (read, waited)

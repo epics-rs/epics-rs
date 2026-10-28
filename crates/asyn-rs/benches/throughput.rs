@@ -48,7 +48,13 @@ fn make_sync_io(name: &str) -> SyncIOHandle {
     let (handle, _jh) =
         create_port_runtime_unclaimed(BenchPort::new(name), RuntimeConfig::default())
             .expect("the port runtime thread must start");
-    SyncIOHandle::from_handle(handle.port_handle().clone(), 0, Duration::from_secs(1))
+    SyncIOHandle::from_handle(
+        handle.port_handle().clone(),
+        0,
+        Duration::from_secs(1),
+        asyn_rs::interfaces::InterfaceType::Common,
+    )
+    .unwrap()
 }
 
 // -- Benchmarks --

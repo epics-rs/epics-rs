@@ -3036,9 +3036,15 @@ mod tests {
         .unwrap();
         let handle = mgr.find_port_handle("qlp_port").unwrap();
         let deadline = |timeout_ms| {
-            SyncIOHandle::from_handle(handle.clone(), 0, Duration::from_millis(timeout_ms))
-                .user(0)
-                .queue_timeout()
+            SyncIOHandle::from_handle(
+                handle.clone(),
+                0,
+                Duration::from_millis(timeout_ms),
+                InterfaceType::Common,
+            )
+            .unwrap()
+            .user(0)
+            .queue_timeout()
         };
         assert_eq!(deadline(200), Some(Duration::from_secs(2)), "C default");
 

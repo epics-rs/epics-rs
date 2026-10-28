@@ -2922,7 +2922,9 @@ mod tests {
                         runtime.port_handle().clone(),
                         0,
                         crate::driver::READ_TIMEOUT,
-                    ),
+                        InterfaceType::Octet,
+                    )
+                    .unwrap(),
                     LinkType::Rtu,
                 );
                 std::thread::spawn(move || {
@@ -3012,7 +3014,9 @@ mod tests {
             runtime.port_handle().clone(),
             0,
             crate::driver::READ_TIMEOUT,
-        );
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let mut driver = test_driver(
             "MB_SILENT",
             test_config(0, 4),
@@ -3041,7 +3045,9 @@ mod tests {
                     runtime.port_handle().clone(),
                     0,
                     crate::driver::READ_TIMEOUT,
-                ),
+                    InterfaceType::Octet,
+                )
+                .unwrap(),
                 LinkType::Rtu,
             )),
         )
@@ -3107,7 +3113,9 @@ mod tests {
             runtime.port_handle().clone(),
             0,
             crate::driver::READ_TIMEOUT,
-        );
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let mut transport = SyncIoTransport::new(sync, LinkType::Rtu);
         let mut engine = ModbusEngine::new(test_config(0, 1), LinkType::Rtu)
             .expect("an RTU read config must build");
@@ -3251,7 +3259,9 @@ mod tests {
                     runtime.port_handle().clone(),
                     0,
                     crate::driver::READ_TIMEOUT,
-                ),
+                    InterfaceType::Octet,
+                )
+                .unwrap(),
                 LinkType::Tcp,
             )),
         )
@@ -3323,7 +3333,9 @@ mod tests {
                         runtime.port_handle().clone(),
                         0,
                         crate::driver::READ_TIMEOUT,
-                    ),
+                        InterfaceType::Octet,
+                    )
+                    .unwrap(),
                     LinkType::Tcp,
                 )),
             )
@@ -3425,7 +3437,9 @@ mod tests {
                     runtime.port_handle().clone(),
                     0,
                     crate::driver::READ_TIMEOUT,
-                ),
+                    InterfaceType::Octet,
+                )
+                .unwrap(),
                 LinkType::Tcp,
             )),
         )

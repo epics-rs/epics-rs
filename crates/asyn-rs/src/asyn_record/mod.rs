@@ -10045,7 +10045,9 @@ mod tests {
             port.handle.clone(),
             0,
             Duration::from_millis(200),
-        );
+            crate::interfaces::InterfaceType::Int32,
+        )
+        .unwrap();
         let (got_tx, got) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let started = Instant::now();

@@ -27,7 +27,7 @@ The umbrella crate pulls in what you select by feature:
 
 ```toml
 [dependencies]
-epics-rs = { version = "0.32", features = ["ad"] }
+epics-rs = { version = "0.33", features = ["ad"] }
 ```
 
 ```rust
@@ -60,8 +60,8 @@ depend on them directly when needed.
 You can also depend on sub-crates directly:
 
 ```toml
-epics-base-rs = "0.32"  # just the IOC runtime
-epics-ca-rs   = "0.32"  # just Channel Access
+epics-base-rs = "0.33"  # just the IOC runtime
+epics-ca-rs   = "0.33"  # just Channel Access
 ```
 
 ## Workspace

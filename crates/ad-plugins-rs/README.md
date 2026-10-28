@@ -123,7 +123,7 @@ A pass is split only when it has at least two chunks and its estimated serial ti
 To disable parallelism entirely:
 
 ```toml
-ad-plugins-rs = { version = "0.32", default-features = false }
+ad-plugins-rs = { version = "0.33", default-features = false }
 ```
 
 ## Usage

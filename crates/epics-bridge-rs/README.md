@@ -221,14 +221,14 @@ epics-bridge-rs/src/
 
 ```toml
 [dependencies]
-epics-rs = { version = "0.32", features = ["bridge"] }
+epics-rs = { version = "0.33", features = ["bridge"] }
 ```
 
 Or directly:
 
 ```toml
 [dependencies]
-epics-bridge-rs = "0.32"
+epics-bridge-rs = "0.33"
 ```
 
 ### Example

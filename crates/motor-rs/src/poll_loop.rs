@@ -3254,8 +3254,8 @@ fn drive_model1(
         MotorCommand::SetAccel { acceleration } => motor.set_accel(&user, acceleration),
         MotorCommand::MoveAbsolute { position, .. } => motor.move_absolute(&user, position),
         MotorCommand::MoveRelative { distance, .. } => motor.move_relative(&user, distance),
-        MotorCommand::MoveVelocity { velocity, .. }
-        | MotorCommand::JogVelocity { velocity, .. } => motor.move_velocity(&user, velocity),
+        MotorCommand::MoveVelocity { velocity, .. } => motor.move_velocity(&user, velocity),
+        MotorCommand::JogVelocity { velocity, .. } => motor.jog_velocity(&user, velocity),
         MotorCommand::Home { forward, .. } => motor.home(&user, forward),
         MotorCommand::Stop { .. } => motor.stop(&user),
         MotorCommand::SetPosition { position } | MotorCommand::InitPosition { position } => {

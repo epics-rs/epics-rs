@@ -312,3 +312,27 @@ async fn a_home_after_a_stop_writes_velocity_base_and_accel_ahead_of_it() {
         ]
     );
 }
+
+// motorRecord.cc:3058-3071: a JVEL write on a running jog writes SET_ACCEL
+// and JOG_VELOCITY. Most model-1 `build_trans` have no JOG_VELOCITY case
+// (devMM3000.cc:333 `default:`) and append nothing for it, so the card sees
+// the SET_ACCEL and no second JOG.
+#[tokio::test]
+async fn a_jvel_retune_of_a_running_jog_does_not_jog_again() {
+    let (db, calls) = boot(6, false, "").await;
+    put(&db, 6, "JOGF", EpicsValue::Short(1)).await;
+    running(&calls, Call::Jog(3.0)).await;
+    put(&db, 6, "JVEL", EpicsValue::Double(2.0)).await;
+    for _ in 0..300 {
+        if calls.lock().unwrap().len() > 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    use Call::*;
+    assert_eq!(
+        *calls.lock().unwrap(),
+        [VelBase(1.0), Accel(5.0), Jog(3.0), Accel(5.0)]
+    );
+}

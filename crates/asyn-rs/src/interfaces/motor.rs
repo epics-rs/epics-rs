@@ -583,9 +583,19 @@ pub trait Model1Motor: Send + Sync {
     /// MOVE_REL.
     fn move_relative(&mut self, user: &AsynUser, distance: f64) -> AsynResult<()>;
 
-    /// JOG, and JOG_VELOCITY's change of a running jog: `velocity` is the
-    /// message's own value, signed by direction.
+    /// JOG: `velocity` is the message's own value, signed by direction.
     fn move_velocity(&mut self, user: &AsynUser, velocity: f64) -> AsynResult<()>;
+
+    /// JOG_VELOCITY, a JVEL write's change of a running jog
+    /// (motorRecord.cc:3058-3071). A C `build_trans` with no case for it
+    /// takes the `default:` that returns ERROR, which the record's
+    /// `WRITE_MSG` ignores, and appends nothing (devMM3000.cc:333), so this
+    /// sends nothing. A driver whose `build_trans` has the case overrides
+    /// it with what that case writes, which is not always what JOG writes
+    /// (devPmac.cc:249, devPIC862.cc:228).
+    fn jog_velocity(&mut self, _user: &AsynUser, _velocity: f64) -> AsynResult<()> {
+        Ok(())
+    }
 
     /// HOME_FOR, or HOME_REV when not `forward`.
     fn home(&mut self, user: &AsynUser, forward: bool) -> AsynResult<()>;

@@ -459,6 +459,43 @@ async fn an_rdly_write_posts_rdly_not_pdly() {
     );
 }
 
+/// `special()` rounds a delay put through C's `NINT`, whose `(long)` cast
+/// turns NaN or a tick count past `long` into `LONG_MIN`: C serves
+/// `LONG_MIN / ticsPerSecond`, a negative delay the scan treats as none.
+#[epics_base_rs::epics_test]
+async fn an_overflowing_delay_put_is_served_as_cs_long_cast() {
+    let db = ioc(ONE_D).await;
+    let tics = (1.0 / epics_base_rs::runtime::time::thread_sleep_quantum()).round();
+    let served = f64::from((i64::MIN as f64 / tics) as f32);
+    for (field, v) in [("DDLY", f32::INFINITY), ("PDLY", f32::NAN), ("RDLY", 1e30)] {
+        put(&db, &format!("S.{field}"), EpicsValue::Float(v)).await;
+        assert_eq!(f64_of(&db, &format!("S.{field}")), served, "{field}={v}");
+    }
+}
+
+/// C `fabs(p_si * NINT(r_dl))`: `NINT(-inf)` is `LONG_MIN`, so a zero step
+/// gives a zero limit and any readback error ends the scan. An inf limit
+/// would give `0 * inf`, NaN, and no error would ever exceed it.
+#[epics_base_rs::epics_test]
+async fn a_minus_inf_readback_delta_with_a_zero_step_aborts_on_any_error() {
+    let db = ioc(r#"record(sscan, "S") {
+  field(MPTS, "10")
+  field(NPTS, "3")
+  field(P1PV, "M")
+  field(P1SP, "1")
+  field(P1EP, "1")
+  field(R1PV, "M2")
+}"#)
+    .await;
+    connected(&db, "S", &["P1NV", "R1NV"]).await;
+    assert_eq!(f64_of(&db, "S.P1SI"), 0.0);
+    put(&db, "S.R1DL", EpicsValue::Double(f64::NEG_INFINITY)).await;
+    start(&db, "S").await;
+    finished(&db, "S").await;
+    assert_eq!(f64_of(&db, "S.ALRT"), 1.0, "scanErr");
+    assert_eq!(f64_of(&db, "S.CPT"), 0.0, "ended at the first point");
+}
+
 #[epics_base_rs::epics_test]
 async fn a_frozen_centre_start_change_posts_the_new_end() {
     let db = ioc(ONE_D).await;

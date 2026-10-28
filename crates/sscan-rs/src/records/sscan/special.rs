@@ -137,7 +137,7 @@ impl SscanRecord {
                 let tics = self.tics;
                 let round = |v: f32| {
                     let v = if v < 0.0 { 0.0 } else { v };
-                    (nint(f64::from(v) * tics) / tics) as f32
+                    (nint(f64::from(v) * tics) as f64 / tics) as f32
                 };
                 match o {
                     DDLY => self.ddly = round(self.ddly),

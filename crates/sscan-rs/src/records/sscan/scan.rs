@@ -378,7 +378,10 @@ impl SscanRecord {
                 let err = (q.dv - q.r_cv).abs();
                 let reason = if q.r_dl > 0.0 && err > q.r_dl {
                     "delta"
-                } else if q.r_dl < 0.0 && q.sm != SM_TABLE && err > (q.si * nint(q.r_dl)).abs() {
+                } else if q.r_dl < 0.0
+                    && q.sm != SM_TABLE
+                    && err > (q.si * nint(q.r_dl) as f64).abs()
+                {
                     "stepsize"
                 } else {
                     continue;

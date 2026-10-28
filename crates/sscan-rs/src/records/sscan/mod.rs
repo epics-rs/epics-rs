@@ -1530,11 +1530,8 @@ pub(crate) fn is_blank(s: &PvString) -> bool {
     !b.is_empty() && b.iter().all(|c| c.is_ascii_whitespace())
 }
 
-/// C `NINT`.
-pub(crate) fn nint(x: f64) -> f64 {
-    if x >= 0.0 {
-        (x + 0.5).trunc()
-    } else {
-        (x - 0.5).trunc()
-    }
+/// C `NINT(f) (long)((f)>0 ? (f)+0.5 : (f)-0.5)`. The `(long)` cast maps
+/// NaN and anything past `long` to `LONG_MIN`, which C then serves.
+pub(crate) fn nint(x: f64) -> i64 {
+    epics_base_rs::types::c_cast::f64_to_c_long(if x > 0.0 { x + 0.5 } else { x - 0.5 })
 }

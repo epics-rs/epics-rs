@@ -1125,14 +1125,10 @@ impl MotorRecord {
             return;
         }
         // C implicit GET_INFO (2546-2557): a put/scan pass that
-        // dispatched nothing refreshes the device status — STUP goes
-        // BUSY and GET_INFO is sent; a device that cannot deliver it
-        // returns STUP to OFF (here: never enters BUSY, like the
-        // explicit driverless STUP put). determine_event's stup==2
-        // clear + ack on the next fresh status closes the cycle.
-        if reason == ProcReason::NothingDone && self.stat.stup == 0 && self.can_get_info() {
-            self.stat.stup = 2;
-            self.mark(m::STUP);
+        // dispatched nothing refreshes the device status.
+        // determine_event's stup==2 clear + ack on the next fresh status
+        // closes the cycle.
+        if reason == ProcReason::NothingDone && self.stat.stup == 0 && self.request_get_info() {
             effects.commands.push(MotorCommand::Poll);
         }
     }
@@ -1841,18 +1837,8 @@ impl MotorRecord {
         // BUSY and fires GET_INFO, then *continues* the pass — it does not
         // early-return — so a user write or device update arriving in the
         // same cycle is not dropped. The data callback returns BUSY to OFF
-        // (process_exit 1498-1502, ported in determine_event). C 1824-1828:
-        // a device that cannot service GET_INFO (WRITE_MSG returns ERROR,
-        // e.g. Soft Channel) drops STUP back to OFF instead of holding
-        // BUSY — with no driver attached the refresh has no consumer and
-        // the BUSY->OFF callback never arrives, so a stuck BUSY would
-        // refuse every later STUP put (special before-write, 2615-2617).
-        let stup_requested = self.stat.stup == 1;
-        let stup_fired = stup_requested && self.can_get_info();
-        if stup_requested {
-            self.stat.stup = if stup_fired { 2 } else { 0 };
-            self.mark(m::STUP);
-        }
+        // (process_exit 1498-1502, ported in determine_event).
+        let stup_fired = self.stat.stup == 1 && self.request_get_info();
         let mut effects = self.do_process_inner();
         if stup_fired {
             // Sent before the rest of the pass, as C's do_work top does.
@@ -1868,6 +1854,17 @@ impl MotorRecord {
         self.device_state.as_ref().is_some_and(|state| {
             !self.internal.comm_alarm || state.lock().is_ok_and(|ds| !ds.refuses_in_comm_alarm())
         })
+    }
+
+    /// C's STUP GET_INFO, both sites (1819-1829, 2550-2558): STUP goes BUSY
+    /// and is marked; a `build_trans` refusal returns it to OFF under the
+    /// mark, so monitor() posts the OFF (3630), and no BUSY is left for a
+    /// callback that never comes to clear. Returns whether it was sent.
+    fn request_get_info(&mut self) -> bool {
+        let sent = self.can_get_info();
+        self.stat.stup = if sent { 2 } else { 0 };
+        self.mark(m::STUP);
+        sent
     }
 
     fn do_process_inner(&mut self) -> ProcessEffects {

@@ -2628,6 +2628,27 @@ fn test_stup_in_comm_alarm_returns_to_off() {
     assert_eq!(rec.stat.stup, 0);
 }
 
+/// C's implicit GET_INFO (motorRecord.cc:2546-2558) marks STUP BUSY before
+/// `build_trans` refuses it, so the OFF it returns to keeps the mark and
+/// monitor() posts it (3630-3631).
+#[test]
+fn test_refused_implicit_get_info_marks_stup_off() {
+    let stup_marked = |rec: &MotorRecord| match rec.get_field("NMAP") {
+        Some(EpicsValue::ULong(nmap)) => nmap & (1 << 6) != 0,
+        other => panic!("NMAP: {other:?}"),
+    };
+    let soft_channel = MotorRecord::new();
+    let mut comm_alarm = MotorRecord::new();
+    comm_alarm.set_device_state(motor_rs::device_state::new_shared_state());
+    comm_alarm.internal.comm_alarm = true;
+    for (case, mut rec) in [("no device", soft_channel), ("COMM_ALARM", comm_alarm)] {
+        let effects = rec.do_process();
+        assert!(!sends_get_info(&effects), "{case}");
+        assert_eq!(rec.stat.stup, 0, "{case}");
+        assert!(stup_marked(&rec), "{case}: C 2551 MARK_AUX(M_STUP)");
+    }
+}
+
 #[test]
 fn test_model1_stup_in_comm_alarm_still_sends_get_info() {
     // motordevCom's build_trans has no COMM_ALARM check.
@@ -11183,15 +11204,15 @@ fn test_alarm_cycle_fans_out_alarm_mask_to_monitored_fields() {
 
     // Raise a motor alarm without touching DMOV: MSTA RA_PROBLEM drives
     // STATE_ALARM/MAJOR in the alarm hook (C `alarm_sub`,
-    // motorRecord.cc:3400-3403).
-    instance
+    // motorRecord.cc:3400-3403). A STUP still BUSY fires no implicit
+    // GET_INFO (2546), so nothing below the short circuit is marked.
+    let rec = instance
         .record
         .as_any_mut()
         .and_then(|a| a.downcast_mut::<MotorRecord>())
-        .expect("motor record downcast")
-        .stat
-        .msta
-        .insert(MstaFlags::PROBLEM);
+        .expect("motor record downcast");
+    rec.stat.msta.insert(MstaFlags::PROBLEM);
+    rec.stat.stup = 2;
     let (snap, _) = instance.process_local().unwrap();
     let mask = |field: &str| snap.iter().find(|(k, _, _)| k == field).map(|(_, _, m)| *m);
     assert_eq!(
@@ -11202,6 +11223,20 @@ fn test_alarm_cycle_fans_out_alarm_mask_to_monitored_fields() {
     // The short circuit (3550-3551): with nothing below it marked, the
     // fields under it do not post on the alarm.
     assert_eq!(mask("DMOV"), None, "nothing marked below the short circuit");
+
+    // Clearing the alarm with STUP OFF: the implicit GET_INFO a driverless
+    // record refuses still marks STUP (2550-2557), so the group below the
+    // short circuit posts the alarm too.
+    let rec = instance
+        .record
+        .as_any_mut()
+        .and_then(|a| a.downcast_mut::<MotorRecord>())
+        .expect("motor record downcast");
+    rec.stat.msta.remove(MstaFlags::PROBLEM);
+    rec.stat.stup = 0;
+    let (snap, _) = instance.process_local().unwrap();
+    let mask = |field: &str| snap.iter().find(|(k, _, _)| k == field).map(|(_, _, m)| *m);
+    assert_eq!(mask("DMOV"), Some(EventMask::ALARM), "STUP marked");
 }
 
 #[test]

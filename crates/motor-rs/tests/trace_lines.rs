@@ -3,12 +3,12 @@
 use std::sync::{Arc, Mutex};
 
 use asyn_rs::error::{AsynError, AsynResult, AsynStatus};
-use asyn_rs::interfaces::motor::{AsynMotor, MotorStatus};
+use asyn_rs::interfaces::motor::{AsynMotor, Model1Motor, MotorStatus};
 use asyn_rs::manager::PortManager;
 use asyn_rs::trace::TraceFile;
 use asyn_rs::user::AsynUser;
 use motor_rs::flags::MotorCommand;
-use motor_rs::poll_loop::execute_commands;
+use motor_rs::poll_loop::{execute_commands, execute_model1_commands};
 use motor_rs::trace::{MotorTrace, TraceUser};
 
 /// An axis whose controller dropped the connection: every write fails the way
@@ -60,6 +60,48 @@ impl AsynMotor for Disconnected {
         refused()?;
         *status = MotorStatus::default();
         Ok(())
+    }
+}
+
+/// The same dropped line on a model-1 card.
+impl Model1Motor for Disconnected {
+    fn set_velocity(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        refused()
+    }
+    fn set_vel_base(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        refused()
+    }
+    fn set_accel(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        refused()
+    }
+    fn move_absolute(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        refused()
+    }
+    fn move_relative(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        refused()
+    }
+    fn move_velocity(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        refused()
+    }
+    fn home(&mut self, _: &AsynUser, _: bool) -> AsynResult<()> {
+        refused()
+    }
+    fn stop(&mut self, _: &AsynUser) -> AsynResult<()> {
+        refused()
+    }
+    fn set_position(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        refused()
+    }
+    fn poll_failure(&self) -> asyn_rs::interfaces::motor::PollFailure {
+        asyn_rs::interfaces::motor::PollFailure::PROBLEM_AND_COMMS_ERROR
+    }
+    fn poll(&mut self, _: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
+        refused()?;
+        *status = MotorStatus::default();
+        Ok(())
+    }
+    fn take_init_status(&mut self) -> MotorStatus {
+        MotorStatus::default()
     }
 }
 
@@ -362,12 +404,12 @@ fn stop_traced(user: TraceUser) -> Vec<String> {
     let mut lines = traced_by("traceLinesModel1", || {
         let trace = MotorTrace::with_user(user);
         trace.set_record("PIC844:m1");
-        execute_commands(
-            &mut Disconnected,
-            &trace,
-            &[MotorCommand::Stop { acceleration: 1.0 }],
-            &mut |_| {},
-        );
+        let stop = [MotorCommand::Stop { acceleration: 1.0 }];
+        if trace.is_model1() {
+            execute_model1_commands(&mut Disconnected, &trace, &stop, &mut |_| {});
+        } else {
+            execute_commands(&mut Disconnected, &trace, &stop, &mut |_| {});
+        }
     });
     lines.extend(
         std::fs::read_to_string(&path)

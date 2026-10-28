@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use asyn_rs::error::AsynResult;
-use asyn_rs::interfaces::motor::{AsynMotor, MotorStatus, PollFailure, PostMessage};
+use asyn_rs::interfaces::motor::{Model1Motor, MotorStatus, PollFailure, PostMessage};
 use asyn_rs::user::AsynUser;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -20,7 +20,7 @@ use motor_rs::devices::{
     device_support_factory, devices, model1_device, register_axis, register_model1_device,
 };
 use motor_rs::flags::MotorCommand;
-use motor_rs::poll_loop::{ToAxis, execute_commands};
+use motor_rs::poll_loop::{ToAxis, execute_model1_commands};
 use motor_rs::trace::{MotorTrace, TraceUser};
 use tokio::sync::mpsc;
 
@@ -373,18 +373,30 @@ struct Hooks {
     seen: Arc<Mutex<Vec<String>>>,
 }
 
-impl AsynMotor for Hooks {
-    fn move_absolute(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
+impl Model1Motor for Hooks {
+    fn set_velocity(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn set_vel_base(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn set_accel(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn move_absolute(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
         self.seen.lock().unwrap().push("move".into());
         Ok(())
     }
-    fn move_relative(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
+    fn move_relative(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
         Ok(())
     }
-    fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> AsynResult<()> {
+    fn move_velocity(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
         Ok(())
     }
-    fn stop(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+    fn home(&mut self, _: &AsynUser, _: bool) -> AsynResult<()> {
+        Ok(())
+    }
+    fn stop(&mut self, _: &AsynUser) -> AsynResult<()> {
         Ok(())
     }
     fn set_position(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
@@ -424,6 +436,9 @@ impl AsynMotor for Hooks {
     fn poll_failure(&self) -> PollFailure {
         PollFailure::NONE
     }
+    fn take_init_status(&mut self) -> MotorStatus {
+        MotorStatus::default()
+    }
 }
 
 /// Run `commands` on a model-1 axis; what its hooks received.
@@ -431,7 +446,7 @@ fn run(commands: &[MotorCommand]) -> Vec<String> {
     let mut motor = Hooks::default();
     let seen = motor.seen.clone();
     let trace = MotorTrace::with_user(user(0));
-    execute_commands(&mut motor, &trace, commands, &mut |_| {});
+    execute_model1_commands(&mut motor, &trace, commands, &mut |_| {});
     seen.lock().unwrap().clone()
 }
 

@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use asyn_rs::error::AsynResult;
-use asyn_rs::interfaces::motor::{AsynMotor, Model1Motor, MotorStatus, PollFailure};
+use asyn_rs::interfaces::motor::{Model1Motor, MotorStatus, PollFailure};
 use asyn_rs::user::AsynUser;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::record::DevSup;
@@ -24,31 +24,40 @@ struct Card {
     disables_ntm: bool,
 }
 
-/// `motor_init` reads the card with the status function the task queries.
 impl Model1Motor for Card {
+    fn set_velocity(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn set_vel_base(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn set_accel(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn move_absolute(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn move_relative(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn move_velocity(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn home(&mut self, _: &AsynUser, _: bool) -> AsynResult<()> {
+        Ok(())
+    }
+    fn stop(&mut self, _: &AsynUser) -> AsynResult<()> {
+        Ok(())
+    }
+    fn set_position(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    /// `motor_init` reads the card with the status function the task queries.
     fn take_init_status(&mut self) -> MotorStatus {
         let mut status = MotorStatus::default();
         self.poll(&AsynUser::default(), &mut status)
             .expect("the card answers");
         status
-    }
-}
-
-impl AsynMotor for Card {
-    fn move_absolute(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
-        Ok(())
-    }
-    fn move_relative(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
-        Ok(())
-    }
-    fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> AsynResult<()> {
-        Ok(())
-    }
-    fn stop(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
-        Ok(())
-    }
-    fn set_position(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
-        Ok(())
     }
     fn disables_ntm(&self) -> bool {
         self.disables_ntm

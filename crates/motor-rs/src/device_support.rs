@@ -194,8 +194,9 @@ impl AxisSlot {
 #[derive(Clone)]
 pub struct MotorAxis {
     user: TraceUser,
-    /// The driver, which a controller-port write calls on the port thread.
-    motor: Arc<Mutex<dyn AsynMotor>>,
+    /// The driver, which a controller-port write calls on the port thread;
+    /// a model-1 axis has no controller port.
+    motor: Option<Arc<Mutex<dyn AsynMotor>>>,
     controller_poll: SharedControllerPoll,
     timeout: Duration,
     poll_cmd_tx: mpsc::Sender<PollCommand>,
@@ -205,7 +206,7 @@ pub struct MotorAxis {
     params: Model2Params,
     report: Option<Arc<dyn AxisReport>>,
     build_trans: Option<Arc<dyn BuildTrans>>,
-    /// The driver's [`asyn_rs::interfaces::motor::AsynMotor::disables_ntm`].
+    /// The driver's [`asyn_rs::interfaces::motor::Model1Motor::disables_ntm`].
     disables_ntm: bool,
     /// C `asynMotorAxis::referencingModeMove_`, which
     /// `asynMotorEnableMoveToHome` sets.
@@ -227,7 +228,7 @@ impl MotorAxis {
             motor_cmd_tx,
         };
         let slot = AxisSlot::holding(subscribers, senders.clone());
-        Self::handle(user, motor, timeout, senders, Arc::new(slot))
+        Self::handle(user, Some(motor), timeout, senders, Arc::new(slot))
     }
 
     /// The axis of `poll`'s controller at `slot` from now on, posting to the
@@ -235,7 +236,7 @@ impl MotorAxis {
     /// while another controller's axis holds the slot.
     pub(crate) fn placed(
         user: TraceUser,
-        motor: Arc<Mutex<dyn AsynMotor>>,
+        motor: Option<Arc<Mutex<dyn AsynMotor>>>,
         timeout: Duration,
         slot: Arc<AxisSlot>,
         poll: &SharedControllerPoll,
@@ -266,7 +267,7 @@ impl MotorAxis {
 
     fn handle(
         user: TraceUser,
-        motor: Arc<Mutex<dyn AsynMotor>>,
+        motor: Option<Arc<Mutex<dyn AsynMotor>>>,
         timeout: Duration,
         AxisSenders {
             poll_cmd_tx,
@@ -368,8 +369,8 @@ impl MotorAxis {
     }
 
     /// The driver, for a controller-port write on the port thread.
-    pub(crate) fn motor(&self) -> &Arc<Mutex<dyn AsynMotor>> {
-        &self.motor
+    pub(crate) fn motor(&self) -> Option<&Arc<Mutex<dyn AsynMotor>>> {
+        self.motor.as_ref()
     }
 
     /// C `pC->poll()`, which UPDATE_STATUS runs before the axis's.

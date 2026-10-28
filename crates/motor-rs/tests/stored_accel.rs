@@ -3,9 +3,9 @@
 //! ahead of it (C skips it at `acc <= 0`) runs on the last stored one. A
 //! model-2 axis's are its drvMotorAsyn port's. On an asynMotorController axis
 //! they are the controller port's MOTOR_VELOCITY / MOTOR_VEL_BASE /
-//! MOTOR_ACCEL, which the speed writes set through the port. On a model-1
-//! card the velocities are the card's own registers, which a SET_* string
-//! sets; its acceleration is only the SET_ACCEL its message carries.
+//! MOTOR_ACCEL, which the speed writes set through the port. A model-1 card
+//! stores none here: each SET_* reaches its driver in the record's order
+//! (tests/model1_speed_writes.rs).
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -150,14 +150,6 @@ fn controller(port: &str) -> (TraceUser, PortHandle) {
     controller_with(port, ())
 }
 
-fn model1() -> TraceUser {
-    TraceUser::Model1 {
-        device: "devStoredAccel",
-        card: 0,
-        signal: 0,
-    }
-}
-
 #[test]
 fn a_skipped_acceleration_runs_on_the_last_stored_one() {
     let user = controller("storedAccel").0;
@@ -177,10 +169,9 @@ fn a_skipped_acceleration_runs_on_the_last_stored_one() {
 
 #[test]
 fn a_skipped_acceleration_before_any_is_stored_is_zero() {
-    for user in [controller("storedAccelNone").0, model1()] {
-        let seen = run(user, vec![home_with(-1.0), MotorCommand::stop_axis()]);
-        assert_eq!(seen, [0.0, 0.0]);
-    }
+    let user = controller("storedAccelNone").0;
+    let seen = run(user, vec![home_with(-1.0), MotorCommand::stop_axis()]);
+    assert_eq!(seen, [0.0, 0.0]);
 }
 
 #[test]
@@ -226,25 +217,6 @@ fn a_refused_set_accel_leaves_the_move_on_the_stored_one() {
     port.write_float64_blocking(index::ACCEL, 0, 3.0).unwrap();
     assert_eq!(run(user, vec![set_accel(9.0), move_with(9.0)]), [3.0]);
     assert_eq!(port.read_float64_blocking(index::ACCEL, 0).unwrap(), 3.0);
-}
-
-/// A model-1 message carries a SET_ACCEL only when the record wrote one
-/// ahead of its move; a home at acc 0 sends none (motorRecord.cc:874), and
-/// the driver then appends no acceleration.
-#[test]
-fn a_model1_move_gets_only_the_acceleration_written_ahead_of_it() {
-    let seen = run(
-        model1(),
-        vec![
-            set_accel(2.0),
-            move_with(2.0),
-            home_with(0.0),
-            MotorCommand::stop_axis(),
-            set_accel(3.0),
-            move_with(3.0),
-        ],
-    );
-    assert_eq!(seen, [2.0, 0.0, 0.0, 3.0]);
 }
 
 #[test]
@@ -305,10 +277,9 @@ fn move_then_backlash_leg() -> Vec<MotorCommand> {
 
 #[test]
 fn a_move_runs_on_the_stored_velocities() {
-    for user in [controller("storedSpeeds").0, model1()] {
-        let (_, speeds) = run_from(Some(0), user, move_then_backlash_leg());
-        assert_eq!(speeds, [(1.0, 4.0), (1.0, 6.0)]);
-    }
+    let user = controller("storedSpeeds").0;
+    let (_, speeds) = run_from(Some(0), user, move_then_backlash_leg());
+    assert_eq!(speeds, [(1.0, 4.0), (1.0, 6.0)]);
 }
 
 #[test]

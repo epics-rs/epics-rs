@@ -1401,7 +1401,10 @@ fn run_on_axis(
     }
     let driven = {
         let port = base.port_name.clone();
-        let Some(mut motor) = crate::poll_loop::lock_axis(axis.motor(), Some(&port), &held) else {
+        let Some(mut motor) = axis
+            .motor()
+            .and_then(|motor| crate::poll_loop::lock_axis(motor, Some(&port), &held))
+        else {
             return Err(base_error());
         };
         if let Some(delay) = on_delay {

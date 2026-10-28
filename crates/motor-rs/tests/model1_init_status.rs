@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use asyn_rs::error::{AsynError, AsynResult, AsynStatus};
-use asyn_rs::interfaces::motor::{AsynMotor, Model1Motor, MotorStatus, PidGainKind, PollFailure};
+use asyn_rs::interfaces::motor::{Model1Motor, MotorStatus, PidGainKind, PollFailure};
 use asyn_rs::user::AsynUser;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -52,17 +52,29 @@ impl Card {
     }
 }
 
-impl AsynMotor for Card {
-    fn move_absolute(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
+impl Model1Motor for Card {
+    fn set_velocity(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
         Ok(())
     }
-    fn move_relative(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
+    fn set_vel_base(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
         Ok(())
     }
-    fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> AsynResult<()> {
+    fn set_accel(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
         Ok(())
     }
-    fn stop(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+    fn move_absolute(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn move_relative(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn move_velocity(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn home(&mut self, _: &AsynUser, _: bool) -> AsynResult<()> {
+        Ok(())
+    }
+    fn stop(&mut self, _: &AsynUser) -> AsynResult<()> {
         Ok(())
     }
     fn set_position(&mut self, _: &AsynUser, position: f64) -> AsynResult<()> {
@@ -98,9 +110,6 @@ impl AsynMotor for Card {
         })?;
         Ok(())
     }
-}
-
-impl Model1Motor for Card {
     fn take_init_status(&mut self) -> MotorStatus {
         self.init.take().expect("taken once")
     }

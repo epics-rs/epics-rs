@@ -10,7 +10,7 @@ use std::time::Duration;
 use asyn_rs::error::{AsynError, AsynResult, AsynStatus};
 use asyn_rs::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, StatusWrite};
 use asyn_rs::user::AsynUser;
-use motor_rs::device_state::{AxisSubscribers, MotorDset, SharedDeviceState, new_shared_state};
+use motor_rs::device_state::{AxisSubscribers, SharedDeviceState, new_shared_state};
 use motor_rs::flags::MotorCommand;
 use motor_rs::poll_loop::{CommandBatch, MotorPollLoop, PollerInbox};
 use motor_rs::trace::{MotorTrace, TraceUser};
@@ -147,10 +147,6 @@ fn rig(user: TraceUser, encoder: f64) -> Rig {
         let state = new_shared_state();
         let own = Arc::<MotorTrace>::default();
         let reads = passes::bind(&state, &own);
-        // As MotorAxis::attach binds a model-1 record.
-        if trace.is_model1() {
-            state.lock().unwrap().set_dset(MotorDset::MotordevCom);
-        }
         subscribers.attach(state.clone(), io_intr_tx, own);
         Bound { reads, state }
     };
@@ -363,41 +359,6 @@ fn a_model2_driver_field_posts_like_a_controllers() {
     let ratio = MotorCommand::SetEncoderRatio { pulses: [2.0, 1.0] };
     assert_eq!(rig.write(ratio.clone()).unwrap().encoder_position, 2.0);
     assert_eq!(rig.write(ratio), None);
-}
-
-fn model1() -> TraceUser {
-    TraceUser::Model1 {
-        device: "devWritePosts",
-        card: 0,
-        signal: 0,
-    }
-}
-
-/// motordrvCom sends a MOTION or VELOCITY message with no callback: the
-/// record hears of the move only from the held move's next query.
-#[test]
-fn a_model1_move_or_jog_posts_nothing() {
-    let mut rig = rig(model1(), 1.0);
-    for command in [
-        move_to(5.0),
-        MotorCommand::MoveVelocity {
-            min_velocity: 0.1,
-            velocity: 1.0,
-            acceleration: 1.0,
-        },
-    ] {
-        assert_eq!(rig.write(command), None);
-        assert!(rig.record.passes().is_empty());
-        assert!(rig.observer.passes().is_empty());
-    }
-}
-
-#[test]
-fn a_failed_model1_move_posts_nothing() {
-    let mut rig = rig(model1(), 1.0);
-    rig.fail.store(true, Ordering::Relaxed);
-    assert_eq!(rig.write(move_to(5.0)), None);
-    assert!(rig.record.passes().is_empty());
 }
 
 #[test]

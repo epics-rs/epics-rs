@@ -5,9 +5,9 @@ use asyn_rs::interfaces::motor::{AsynMotor, Model1Motor, PortSets};
 use epics_base_rs::server::record::Record;
 use tokio::sync::mpsc;
 
-use crate::device_support::{AxisSlot, MotorAxis, MotorDeviceSupport};
+use crate::device_support::{MotorAxis, MotorDeviceSupport};
 use crate::poll_loop::{
-    Axis, FirstPollPending, Join, Joining, MotorPollLoop, Place, PollCommand, SharedControllerPoll,
+    Axis, FirstPollPending, Join, Joining, MotorPollLoop, PollCommand, SharedControllerPoll,
 };
 use crate::record::MotorRecord;
 use crate::trace::TraceUser;
@@ -193,22 +193,6 @@ impl MotorBuilder {
             poll_cmd_tx,
         }
     }
-}
-
-/// An axis's record half and the place its poller takes; the axis of
-/// `poll`'s controller at `slot` from now on, `None` while another
-/// controller's axis holds it.
-fn axis_parts(
-    motor: &Arc<Mutex<dyn AsynMotor>>,
-    user: TraceUser,
-    timeout: Duration,
-    capacity: usize,
-    slot: Arc<AxisSlot>,
-    poll: &SharedControllerPoll,
-) -> Option<(MotorAxis, Place)> {
-    let disables_ntm = motor.lock().is_ok_and(|m| m.disables_ntm());
-    let (axis, place) = MotorAxis::placed(user, motor.clone(), timeout, slot, poll, capacity)?;
-    Some((axis.disabling_ntm(disables_ntm), place))
 }
 
 /// An axis of a [`ControllerBuilder`], for a create command to register.
@@ -479,8 +463,15 @@ impl ControllerAxes {
             }
         } else {
             let slot = slot.unwrap_or_default();
-            let (axis, place) =
-                axis_parts(&motor, user, timeout, capacity, slot, &axes.poll).ok_or_else(held)?;
+            let (axis, place) = MotorAxis::placed(
+                user,
+                Some(motor.clone()),
+                timeout,
+                slot,
+                &axes.poll,
+                capacity,
+            )
+            .ok_or_else(held)?;
             let axis = axis.with_controller_poll(axes.poll.clone());
             axes.opened.push(Opened {
                 motor: motor.clone(),
@@ -657,12 +648,12 @@ impl MotorTaskBuilder {
         timeout: Duration,
         capacity: usize,
     ) -> ControllerAxis {
-        let polled: Arc<Mutex<dyn AsynMotor>> = motor.clone();
+        let disables_ntm = motor.lock().is_ok_and(|m| m.disables_ntm());
         let poll = SharedControllerPoll::default();
-        let (axis, place) = axis_parts(&polled, user, timeout, capacity, Arc::default(), &poll)
+        let (axis, place) = MotorAxis::placed(user, None, timeout, Arc::default(), &poll, capacity)
             .expect("a new slot is no controller's");
         self.axes.push(Axis::task(place, motor));
-        ControllerAxis::of(axis)
+        ControllerAxis::of(axis.disabling_ntm(disables_ntm))
     }
 
     /// The task over the axes.
@@ -706,6 +697,39 @@ mod tests {
     }
 
     impl Model1Motor for Card {
+        fn set_velocity(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+            Ok(())
+        }
+        fn set_vel_base(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+            Ok(())
+        }
+        fn set_accel(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+            Ok(())
+        }
+        fn move_absolute(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+            Ok(())
+        }
+        fn move_relative(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+            Ok(())
+        }
+        fn move_velocity(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+            Ok(())
+        }
+        fn home(&mut self, _: &AsynUser, _: bool) -> AsynResult<()> {
+            Ok(())
+        }
+        fn stop(&mut self, _: &AsynUser) -> AsynResult<()> {
+            Ok(())
+        }
+        fn set_position(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+            Ok(())
+        }
+        fn poll_failure(&self) -> PollFailure {
+            AsynMotor::poll_failure(self)
+        }
+        fn poll(&mut self, user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
+            AsynMotor::poll(self, user, status)
+        }
         fn take_init_status(&mut self) -> MotorStatus {
             MotorStatus::default()
         }

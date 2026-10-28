@@ -83,10 +83,10 @@ pub struct MotorDeviceState {
     stamps: Stamps,
     pub expired_delay_id: Option<u64>,
     /// The CDIR a model-1 driver left in `mr->cdir` while polling this
-    /// record's move ([`AsynMotor::poll_in_motion`]), for the record's next
+    /// record's move ([`Model1Motor::poll_in_motion`]), for the record's next
     /// pass to take.
     ///
-    /// [`AsynMotor::poll_in_motion`]: asyn_rs::interfaces::motor::AsynMotor::poll_in_motion
+    /// [`Model1Motor::poll_in_motion`]: asyn_rs::interfaces::motor::Model1Motor::poll_in_motion
     pub(crate) driver_cdir: Option<bool>,
 
     // Record → DeviceSupport

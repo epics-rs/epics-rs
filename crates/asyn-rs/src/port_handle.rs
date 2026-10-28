@@ -549,7 +549,7 @@ impl PortHandle {
     /// Does the port implement this interface? The port's `findInterface`
     /// (asynManager.c:1470-1514).
     pub fn has_interface(&self, iface: InterfaceType) -> bool {
-        InterfaceMask::of(iface).is_some_and(|bit| self.interfaces.contains(bit))
+        self.interfaces.has(iface)
     }
 
     /// Set whether this port can perform blocking I/O.
@@ -4388,6 +4388,48 @@ mod tests {
         assert!((handle.read_float64(1, 0).await.unwrap() - 1.23).abs() < 1e-10);
     }
 
+    /// The actor refuses an op on an interface outside the port's mask, so a
+    /// caller that never asked `has_interface` still cannot reach the driver.
+    #[test]
+    fn an_op_outside_the_interface_mask_is_refused() {
+        let handle = make_handle(TestDriver::new());
+        fn refusal<T: std::fmt::Debug>(r: AsynResult<T>) -> String {
+            r.unwrap_err().message().to_string()
+        }
+        let op = |op| handle.submit_blocking(op, AsynUser::new(0));
+        assert_eq!(
+            refusal(op(RequestOp::Int64Read)),
+            "port does not implement interface asynInt64"
+        );
+        assert_eq!(
+            refusal(op(RequestOp::UInt32DigitalWrite { value: 1, mask: 1 })),
+            "asynUInt32Digital interface not supported"
+        );
+        assert_eq!(
+            refusal(op(RequestOp::Float64ArrayRead {
+                buf: SharedArray::default(),
+                max_elements: 4,
+            })),
+            "interface asynFloat64Array is not supported by port"
+        );
+        assert_eq!(
+            refusal(handle.get_option_blocking(AsynUser::new(0), "baud")),
+            "port does not implement interface asynOption"
+        );
+        let syncio = crate::sync_io::SyncIOHandle::from_handle(
+            handle.clone(),
+            0,
+            std::time::Duration::from_secs(1),
+        );
+        assert_eq!(
+            refusal(syncio.read_enum(0)),
+            "port does not implement interface asynEnum"
+        );
+
+        handle.write_int32_blocking(0, 0, 5).unwrap();
+        assert_eq!(syncio.read_int32(0).unwrap(), 5, "an op in the mask runs");
+    }
+
     #[tokio::test]
     async fn handle_async_octet() {
         let handle = make_handle(TestDriver::new());
@@ -4624,7 +4666,7 @@ mod tests {
         let err = handle
             .gpib_universal_cmd_blocking(AsynUser::new(0), 0x14)
             .unwrap_err();
-        assert_eq!(err.message(), "port has no asynGpib interface");
+        assert_eq!(err.message(), "interface asynGpib is not supported by port");
         assert!(handle.gpib_ifc_blocking(AsynUser::new(0)).is_err());
     }
 

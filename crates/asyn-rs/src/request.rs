@@ -1472,6 +1472,72 @@ pub enum RequestOp {
     },
 }
 
+impl RequestOp {
+    /// The interface whose method this op calls, or `None` for a manager op.
+    /// `asynCommon`'s ops are `None` too: every port registers it.
+    pub(crate) fn interface(&self) -> Option<crate::interfaces::InterfaceType> {
+        use crate::interfaces::InterfaceType as I;
+        Some(match self {
+            Self::OctetWrite { .. }
+            | Self::OctetRead { .. }
+            | Self::OctetWriteRead { .. }
+            | Self::OctetWriteBinary { .. }
+            | Self::OctetReadBinary { .. }
+            | Self::Flush
+            | Self::SetInputEos { .. }
+            | Self::SetOutputEos { .. }
+            | Self::GetInputEos
+            | Self::GetOutputEos => I::Octet,
+            Self::Int32Write { .. } | Self::Int32Read | Self::GetBoundsInt32 => I::Int32,
+            Self::Int64Write { .. } | Self::Int64Read | Self::GetBoundsInt64 => I::Int64,
+            Self::Float64Write { .. } | Self::Float64Read => I::Float64,
+            Self::UInt32DigitalWrite { .. } | Self::UInt32DigitalRead { .. } => I::UInt32Digital,
+            Self::EnumRead | Self::EnumWrite { .. } => I::Enum,
+            Self::Int8ArrayRead { .. } | Self::Int8ArrayWrite { .. } => I::Int8Array,
+            Self::Int16ArrayRead { .. } | Self::Int16ArrayWrite { .. } => I::Int16Array,
+            Self::Int32ArrayRead { .. } | Self::Int32ArrayWrite { .. } => I::Int32Array,
+            Self::Int64ArrayRead { .. } | Self::Int64ArrayWrite { .. } => I::Int64Array,
+            Self::Float32ArrayRead { .. } | Self::Float32ArrayWrite { .. } => I::Float32Array,
+            Self::Float64ArrayRead { .. } | Self::Float64ArrayWrite { .. } => I::Float64Array,
+            Self::GetOption { .. } | Self::SetOption { .. } => I::Option,
+            Self::DrvUserCreate(_) => I::DrvUser,
+            Self::GpibUniversalCmd { .. }
+            | Self::GpibAddressedCmd { .. }
+            | Self::GpibIfc
+            | Self::GpibRen { .. } => I::Gpib,
+            Self::NoIo
+            | Self::Connect
+            | Self::Disconnect
+            | Self::ShutdownPort
+            | Self::ConnectAddr
+            | Self::DisconnectAddr
+            | Self::ConnectUser
+            | Self::SetEnable { .. }
+            | Self::ExceptionDisconnect
+            | Self::ExceptionConnect
+            | Self::SetAutoConnect { .. }
+            | Self::GetEnable
+            | Self::GetAutoConnect
+            | Self::BlockProcess { .. }
+            | Self::UnblockProcess { .. }
+            | Self::CallParamCallbacks { .. }
+            | Self::SetParams { .. }
+            | Self::Report { .. }
+            | Self::WithDriver(_)
+            | Self::WithDriverAfterQueue(_)
+            | Self::LockPort(_)
+            | Self::Cell(_)
+            | Self::CellInline(_)
+            | Self::GetConnected
+            | Self::PushEchoInterpose
+            | Self::PushDelayInterpose { .. }
+            | Self::PushEosInterpose { .. }
+            | Self::SetTimeStampSource { .. }
+            | Self::PushFlushInterpose { .. } => return None,
+        })
+    }
+}
+
 /// Result returned by the worker after executing a request.
 #[derive(Debug)]
 pub struct RequestResult {

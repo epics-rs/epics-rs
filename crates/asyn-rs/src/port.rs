@@ -3763,9 +3763,9 @@ pub trait PortDriver: Any + Send + Sync {
     // GPIBIV and refuses UCMD/ACMD when it is 0 (asynRecord.c:1232-1241,
     // :1647-1651).
     //
-    // The defaults refuse: a port that has not declared the capability can only
-    // be reached here by a caller that skipped the registry, and C has nothing
-    // to call in that case (the interface pointer is NULL).
+    // The defaults refuse. The actor refuses a port that has not declared the
+    // capability before it gets here, so they answer only a driver that
+    // declares GPIB without implementing it.
     //
     // Not ported: the `asynGpibPort` methods that exist solely to drive
     // asynGpib's SRQ poll thread — `srqStatus`, `srqEnable`, `serialPollBegin`,

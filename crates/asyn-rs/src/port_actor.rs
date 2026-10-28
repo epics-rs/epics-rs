@@ -2845,6 +2845,16 @@ impl PortActor {
     }
 
     fn dispatch_io(&mut self, user: &mut AsynUser, op: &RequestOp) -> AsynResult<RequestResult> {
+        // rs only: a C caller can hold an interface's methods only through
+        // findInterface, so no C path reaches one the port lacks.
+        if let Some(iface) = op.interface()
+            && !self.driver.base().interface_mask().has(iface)
+        {
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: crate::sync_io::no_interface(iface, iface),
+            });
+        }
         let is_read = matches!(
             op,
             RequestOp::Int32Read

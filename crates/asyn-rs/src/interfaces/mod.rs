@@ -210,6 +210,11 @@ impl InterfaceMask {
         self.0 & other.0 == other.0
     }
 
+    /// Does this mask register `iface`? Never for a Rust-only interface.
+    pub fn has(self, iface: InterfaceType) -> bool {
+        Self::of(iface).is_some_and(|bit| self.contains(bit))
+    }
+
     /// The interfaces this mask names.
     pub fn interfaces(self) -> impl Iterator<Item = InterfaceType> {
         use InterfaceType::*;
@@ -233,7 +238,7 @@ impl InterfaceMask {
             Gpib,
         ]
         .into_iter()
-        .filter(move |&iface| Self::of(iface).is_some_and(|bit| self.contains(bit)))
+        .filter(move |&iface| self.has(iface))
     }
 }
 

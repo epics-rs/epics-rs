@@ -43,28 +43,32 @@ enum Link {
 /// C SyncIO `connect`'s `findInterface` checks: `asynCommon`, then the
 /// interface the SyncIO transfers on, each refusal in its C file's words.
 fn missing_interface(handle: &PortHandle, iface: InterfaceType) -> Option<String> {
-    for needed in [InterfaceType::Common, iface] {
-        if handle.has_interface(needed) {
-            continue;
+    [InterfaceType::Common, iface]
+        .into_iter()
+        .find(|&needed| !handle.has_interface(needed))
+        .map(|needed| no_interface(iface, needed))
+}
+
+/// The SyncIO for `iface` refusing a port without `needed`, in its C file's
+/// words.
+pub(crate) fn no_interface(iface: InterfaceType, needed: InterfaceType) -> String {
+    match iface {
+        // asynOctetSyncIO.c:124-137, asynUInt32DigitalSyncIO.c.
+        InterfaceType::Octet | InterfaceType::UInt32Digital => {
+            format!("{needed} interface not supported")
         }
-        let message = match iface {
-            // asynOctetSyncIO.c:124-137, asynUInt32DigitalSyncIO.c.
-            InterfaceType::Octet | InterfaceType::UInt32Digital => {
-                format!("{needed} interface not supported")
-            }
-            // asynInt32SyncIO.c, asynInt64SyncIO.c, asynEnumSyncIO.c,
-            // asynOptionSyncIO.c.
-            InterfaceType::Int32
-            | InterfaceType::Int64
-            | InterfaceType::Enum
-            | InterfaceType::Option => format!("port does not implement interface {needed}"),
-            // asynCommonSyncIO.c:76-80, asynFloat64SyncIO.c, the array and
-            // genericPointer SyncIOs.
-            _ => format!("interface {needed} is not supported by port"),
-        };
-        return Some(message);
+        // asynInt32SyncIO.c, asynInt64SyncIO.c, asynEnumSyncIO.c,
+        // asynOptionSyncIO.c.
+        InterfaceType::Int32
+        | InterfaceType::Int64
+        | InterfaceType::Enum
+        | InterfaceType::Option => {
+            format!("port does not implement interface {needed}")
+        }
+        // asynCommonSyncIO.c:76-80, asynFloat64SyncIO.c, the array and
+        // genericPointer SyncIOs.
+        _ => format!("interface {needed} is not supported by port"),
     }
-    None
 }
 
 /// [`SyncIOHandle::print`] on a user connected to `port`.

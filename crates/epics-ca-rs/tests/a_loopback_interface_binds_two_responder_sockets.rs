@@ -2,7 +2,8 @@
 //! `osiSockDiscoverBroadcastAddresses` answers the loopback address with
 //! itself (`osdNetIfAddrs.c:41-52`, `caservertask.c:680-703`). The two share
 //! the address through datagram fanout, and a search sent to it is still
-//! answered once: compiled softIoc, three searches, one reply each.
+//! answered once: compiled softIoc, three searches, one reply each. rsrv's
+//! number is always configured; one the server picks binds no companion.
 #![cfg(all(tokio_backend, target_os = "linux"))]
 
 use std::collections::HashSet;
@@ -11,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use epics_base_rs::types::EpicsValue;
 use epics_ca_rs::server::CaServer;
+use named_port::HeldPort;
 use named_port::port_holders::{PortHolder, udp_holders};
 
 /// The UDP sockets on 127.0.0.1:`port` among `holders`, split into ours (an
@@ -116,8 +118,9 @@ async fn a_loopback_interface_has_two_responder_sockets_and_one_reply() {
     // holds before or after the measurement.
     let mut last = Vec::new();
     for _ in 0..5 {
+        let held = HeldPort::udp();
         let server = CaServer::builder()
-            .port(0)
+            .port(held.port)
             .tcp_port(0)
             .pv("LOOP:A", EpicsValue::Double(1.0))
             .build()

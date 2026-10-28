@@ -60,8 +60,13 @@ difference is either invisible to a client or is an improvement:
   every search responder bind (`caservertask.c:628`, `:698`). Linux then may
   hand `bind(0)` a number that another same-user fanout socket holds, and the
   two share unicasts at random. On a number it picks, epics-rs on unix binds
-  first and sets the options after, so a later fanout socket can still
-  co-bind but the pick is never a stranger's; a stranger on that number at a
+  a PVA collector first and sets the options after, so a pvxs client's
+  beacon receiver can still co-bind but the pick is never a stranger's. A CA
+  server responder on a number it picks, which rsrv never does (it refuses a
+  port at or below 5000), takes no options at all, so no stranger can join it
+  either; only its own sockets that overlap (the wildcard and a specific
+  address, one address twice) take them after the bind, and loopback's
+  127.0.0.1 broadcast companion is not bound. A stranger on that number at a
   later interface restarts the set, at most 16 times. A configured number is
   unchanged. Windows sets them first on every bind, as C: Winsock reads
   `SO_REUSEADDR` at bind time, so set after it no fanout socket can co-bind.

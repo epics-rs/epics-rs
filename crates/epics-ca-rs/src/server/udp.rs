@@ -11,7 +11,7 @@ use tokio::net::UdpSocket;
 
 use crate::protocol::*;
 use epics_base_rs::error::CaResult;
-use epics_base_rs::net::{PortOrigin, port_held};
+use epics_base_rs::net::{PortOrigin, PortUse, port_held};
 #[cfg(tokio_backend)]
 use epics_base_rs::net::{enable_so_rxq_ovfl_for_socket, recv_from_with_drop_count_socket};
 use epics_base_rs::server::database::PvDatabase;
@@ -90,7 +90,8 @@ pub struct BoundResponder {
     pub(crate) socket: Arc<std::net::UdpSocket>,
     /// Secondary socket bound to the interface's broadcast address —
     /// see the comment in [`bind_single_responder`]. `None` without
-    /// `ca_udp_bcast` (Windows, Cygwin) and for wildcard interfaces.
+    /// `ca_udp_bcast` (Windows, Cygwin), for wildcard interfaces, and for
+    /// loopback on a chosen number ([`companion`]).
     pub(crate) bcast: Option<Arc<std::net::UdpSocket>>,
 }
 
@@ -176,13 +177,14 @@ pub(crate) fn bind_udp_responders_with(
             SetBind::NumberHeld(..) => unreachable!("a configured number is never refused whole"),
         };
     }
-    // deliberate deviation, as for the PVA bundle (`docs/differences.md`):
-    // the number is ours, so a later socket that finds a fanout stranger on
-    // it restarts the set on a fresh one rather than joining the stranger or
-    // dropping the interface. Refused sets stay bound until the end, so
-    // `bind(0)` cannot hand the same number back. On Windows a stranger that
-    // set `SO_REUSEADDR` is joined, as rsrv joins it there (`bind_fanout`
-    // sets the option first); only a refusal, WSAEACCES, restarts the set.
+    // deliberate deviation (`docs/differences.md`): the number is ours. On
+    // unix no stranger can join it (`SetPlan::role_at`), and a later socket
+    // that finds a stranger on it restarts the set on a fresh one rather than
+    // joining the stranger or dropping the interface. Refused sets stay bound
+    // until the end, so `bind(0)` cannot hand the same number back. On
+    // Windows a stranger that set `SO_REUSEADDR` is joined, as rsrv joins it
+    // there (`bind_fanout` sets the option first); only a refusal, WSAEACCES,
+    // restarts the set.
     let mut refused = Vec::new();
     let mut last = None;
     for _ in 0..16 {
@@ -217,21 +219,42 @@ fn bind_responder_set(
     let mut actual_port = if port == 0 { None } else { Some(port) };
     let mut held: Option<epics_base_rs::error::CaError> = None;
     let mut own = Vec::new();
+    // What `osiSockDiscoverBroadcastAddresses` finds for each interface
+    // (`caservertask.c:680`), and every address the set binds.
+    let found: Vec<Option<Ipv4Addr>> = specs
+        .iter()
+        .map(|(ip, _)| {
+            if cfg!(ca_udp_bcast) {
+                broadcast_of(*ip)
+            } else {
+                None
+            }
+        })
+        .collect();
+    let set: Vec<Ipv4Addr> = specs
+        .iter()
+        .zip(&found)
+        .flat_map(|((ip, _), f)| std::iter::once(*ip).chain(companion(*ip, *f, origin)))
+        .collect();
     // Wildcards first: a clean bind there proves the number free on every
-    // address, so whatever follows is covered (`origin_at`). Bound in this
-    // order, reported in list order.
+    // address, so whatever follows is covered (`SetPlan::origin_at`). Bound
+    // in this order, reported in list order.
     let mut order: Vec<usize> = (0..specs.len()).collect();
     order.sort_by_key(|&i| !specs[i].0.is_unspecified());
     for i in order {
         let (bind_ip, mcast_groups) = &specs[i];
+        let plan = SetPlan {
+            origin,
+            own: &own,
+            set: &set,
+        };
         let responder = match bind_single_responder(
             *bind_ip,
             actual_port.unwrap_or(0),
-            origin,
-            &own,
+            plan,
             mcast_groups,
             tcp_port,
-            broadcast_of,
+            found[i],
         ) {
             Ok(r) => r,
             Err(epics_base_rs::error::CaError::Io(e))
@@ -368,16 +391,21 @@ fn try_bind_error_line(name: &str, e: &std::io::Error) -> String {
     )
 }
 
+/// `found` is what `osiSockDiscoverBroadcastAddresses` found for `bind_ip`.
 fn bind_single_responder(
     bind_ip: Ipv4Addr,
     port: u16,
-    origin: PortOrigin,
-    own: &[Ipv4Addr],
+    plan: SetPlan<'_>,
     mcast_groups: &[Ipv4Addr],
     tcp_port: u16,
-    broadcast_of: &dyn Fn(Ipv4Addr) -> Option<Ipv4Addr>,
+    found: Option<Ipv4Addr>,
 ) -> CaResult<BoundResponder> {
-    let socket = bind_responder_socket(bind_ip, port, origin_at(bind_ip, own, origin))?;
+    let socket = bind_responder_socket(
+        bind_ip,
+        port,
+        plan.origin_at(bind_ip),
+        plan.role_at(bind_ip),
+    )?;
     // The port the primary actually took — identical to `port`, except
     // for an ephemeral (0) request, where the kernel chose it. The only
     // consumer of the resolved port is the broadcast secondary responder
@@ -440,23 +468,27 @@ fn bind_single_responder(
     let bcast: Option<Arc<std::net::UdpSocket>> = {
         #[cfg(not(ca_udp_bcast))]
         {
-            let _ = (broadcast_of, tcp_port);
+            let _ = (found, tcp_port);
             None
         }
         #[cfg(ca_udp_bcast)]
         {
-            let found = broadcast_of(bind_ip);
             if let Some(w) = missing_broadcast_warning(bind_ip, tcp_port, found) {
                 epics_libcom_rs::stderr_print!("{w}");
             }
-            let with_primary = [own, &[bind_ip]].concat();
-            match found.map(|bcast_ip| {
+            let with_primary = [plan.own, &[bind_ip]].concat();
+            let plan = SetPlan {
+                own: &with_primary,
+                ..plan
+            };
+            match companion(bind_ip, found, plan.origin).map(|bcast_ip| {
                 (
                     bcast_ip,
                     bind_responder_socket(
                         bcast_ip,
                         port,
-                        origin_at(bcast_ip, &with_primary, origin),
+                        plan.origin_at(bcast_ip),
+                        plan.role_at(bcast_ip),
                     ),
                 )
             }) {
@@ -595,23 +627,66 @@ fn bind_was_held(e: &std::io::Error) -> bool {
     port_held(bind_source(e))
 }
 
-/// The origin of a bind on the set's number at `addr`. Only an address an
-/// earlier clean bind of the set covers — the same address, or the wildcard —
-/// co-binds, as loopback's companion does its primary; anywhere else the
-/// number must be free. An earlier specific address proves nothing about
-/// another, which is why `bind_responder_set` binds wildcards first.
-fn origin_at(addr: Ipv4Addr, own: &[Ipv4Addr], origin: PortOrigin) -> PortOrigin {
-    if own.iter().any(|h| *h == addr || h.is_unspecified()) {
-        PortOrigin::Configured
-    } else {
-        origin
+/// One pass of `bind_responder_set` on one number.
+struct SetPlan<'a> {
+    /// Whose number the pass binds.
+    origin: PortOrigin,
+    /// The addresses an earlier bind of this pass holds.
+    own: &'a [Ipv4Addr],
+    /// Every address this pass binds, companions included.
+    set: &'a [Ipv4Addr],
+}
+
+impl SetPlan<'_> {
+    /// The origin of a bind on the set's number at `addr`. Only an address an
+    /// earlier clean bind of the set covers — the same address, or the
+    /// wildcard — co-binds, as an interface listed twice, or the broadcast
+    /// address two interfaces share, does; anywhere else the number must be
+    /// free. An earlier specific address
+    /// proves nothing about another, which is why `bind_responder_set` binds
+    /// wildcards first.
+    fn origin_at(&self, addr: Ipv4Addr) -> PortOrigin {
+        if self.own.iter().any(|h| *h == addr || h.is_unspecified()) {
+            PortOrigin::Configured
+        } else {
+            self.origin
+        }
     }
+
+    /// The reuse role of the socket at `addr`. On unix a number this server
+    /// chose takes none, so no stranger can be handed it by `bind(0)` or
+    /// join it: nothing outside co-binds a CA server's chosen number, as C
+    /// never chooses one. Only a socket the set itself overlaps — the
+    /// wildcard and a specific address, the same address twice — needs the
+    /// options to co-bind its sibling.
+    fn role_at(&self, addr: Ipv4Addr) -> PortUse {
+        let overlaps = |b: &&Ipv4Addr| **b == addr || b.is_unspecified() || addr.is_unspecified();
+        if cfg!(unix)
+            && self.origin == PortOrigin::Chosen
+            && self.set.iter().filter(overlaps).count() < 2
+        {
+            PortUse::Exclusive
+        } else {
+            PortUse::Shared
+        }
+    }
+}
+
+/// The broadcast companion bound beside `bind_ip`, from what discovery
+/// `found` for it. On a chosen number a companion on the primary's own
+/// address — loopback's, which C binds at 127.0.0.1 twice
+/// (`osdNetIfAddrs.c:41-52`) — is not bound: it takes nothing its primary
+/// does not, and it would make the pair co-bind with the reuse options a
+/// chosen number goes without (`SetPlan::role_at`).
+fn companion(bind_ip: Ipv4Addr, found: Option<Ipv4Addr>, origin: PortOrigin) -> Option<Ipv4Addr> {
+    found.filter(|b| !(origin == PortOrigin::Chosen && *b == bind_ip))
 }
 
 fn bind_responder_socket(
     bind_ip: Ipv4Addr,
     port: u16,
     origin: PortOrigin,
+    role: PortUse,
 ) -> CaResult<std::net::UdpSocket> {
     use epics_base_rs::runtime::socket::{SocketOptions, udp_socket_on};
     // This is a *datagram fanout* socket: libcom's
@@ -623,15 +698,14 @@ fn bind_responder_socket(
     // CA port and never receives a broadcast SEARCH. Not to be confused with
     // the TCP time-wait helper, a Windows no-op.
     //
-    // Ephemeral ports included, as `rsrv_init` applies the helper whatever
-    // the port (`caservertask.c:628`, `:698`) — but on unix, on a number this
-    // server chooses, after the bind (`net::bind_fanout`): set before, Linux
-    // may hand `bind(0)` a number a same-user fanout socket holds, and that
-    // socket's SO_REUSEPORT group then takes every SEARCH from a given client
-    // port.
+    // `role` is `Exclusive` on unix on a number this server chooses, which C
+    // never does (`envGetInetPortConfigParam` refuses a port <= 5000): with
+    // the options, Linux may hand `bind(0)` a number a same-user fanout
+    // socket holds, or let one join ours, and that socket's SO_REUSEPORT group
+    // then takes every SEARCH from a given client port (`SetPlan::role_at`).
     let opts = SocketOptions {
         broadcast: true,
-        datagram_fanout: true,
+        datagram_fanout: role == PortUse::Shared,
         ..SocketOptions::default()
     };
     // Name the socket in the error: a CA server binds several, and
@@ -1588,22 +1662,48 @@ mod responder_bind_tests {
         );
     }
 
-    /// Boundary — port 0: `rsrv_init` enables datagram fanout on every
-    /// responder whatever the port (`caservertask.c:628`, `:698`), so a
-    /// reuse-enabled socket can co-bind an ephemeral responder's port, as it
-    /// can in C.
+    /// Boundary — port 0: on unix the number is the server's own, so a
+    /// same-user socket that sets the fanout options before its bind, as a
+    /// pvxs `Config::isolated()` server's does, can neither be handed it nor
+    /// join it and split the SEARCHes sent there. Windows joins it, as rsrv
+    /// does on every port (`caservertask.c:628`).
     #[test]
-    fn ephemeral_responder_port_can_be_co_bound() {
-        let bound = bind_udp_responders(0, vec![Ipv4Addr::LOCALHOST], &[]).expect("bind ephemeral");
-        assert_ne!(bound.port(), 0, "an ephemeral bind reports its real port");
+    fn a_chosen_responder_port_refuses_a_fanout_socket() {
+        let (any, lo) = (Ipv4Addr::UNSPECIFIED, Ipv4Addr::LOCALHOST);
+        for ip in [any, lo] {
+            let bound = bind_udp_responders(0, vec![ip], &[]).expect("bind ephemeral");
+            assert_ne!(bound.port(), 0, "an ephemeral bind reports its real port");
 
-        let peer = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).expect("socket");
-        peer.set_reuse_address(true).expect("reuse addr");
-        #[cfg(unix)]
-        peer.set_reuse_port(true).expect("reuse port");
-        let addr = std::net::SocketAddrV4::new(Ipv4Addr::LOCALHOST, bound.port());
-        peer.bind(&addr.into())
-            .expect("a fanout socket co-binds the responder's port, as in rsrv");
+            let peer = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).expect("socket");
+            peer.set_reuse_address(true).expect("reuse addr");
+            #[cfg(unix)]
+            peer.set_reuse_port(true).expect("reuse port");
+            let addr = std::net::SocketAddrV4::new(ip, bound.port());
+            let joined = peer.bind(&addr.into());
+            if cfg!(unix) {
+                let err = joined.expect_err("a fanout socket joined a chosen number");
+                assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse, "{ip}");
+            } else {
+                joined
+                    .unwrap_or_else(|e| panic!("{ip}: a fanout socket co-binds, as in rsrv: {e}"));
+            }
+        }
+    }
+
+    /// The companion C binds at 127.0.0.1 beside a loopback primary
+    /// (`osdNetIfAddrs.c:41-52`) takes nothing the primary does not; on a
+    /// chosen number it is left out rather than co-bound with the fanout
+    /// options. A configured number keeps it, as C.
+    #[cfg(ca_udp_bcast)]
+    #[test]
+    fn a_chosen_loopback_responder_binds_no_companion() {
+        let lo = Ipv4Addr::LOCALHOST;
+        let bound = bind_udp_responders(0, vec![lo], &[]).expect("bind ephemeral");
+        assert!(bound.into_responders()[0].bcast.is_none());
+
+        let held = named_port::HeldPort::udp();
+        let bound = bind_udp_responders(held.port, vec![lo], &[]).expect("bind configured");
+        assert!(bound.into_responders()[0].bcast.is_some());
     }
 
     /// An ephemeral responder's number is never one a same-user fanout socket

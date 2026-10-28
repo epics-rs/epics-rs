@@ -864,9 +864,11 @@ fn refuse_client(peer: SocketAddr, cause: &AcquireError, send: impl FnOnce(&[u8]
 
 /// Bind a blocking UDP name-search responder socket. Raw `libc` throughout
 /// (no `socket2`), so the socket-option path builds for RTEMS. SO_REUSEADDR +
-/// SO_REUSEPORT go on every port, as C
+/// SO_REUSEPORT go on a configured port, as C
 /// `epicsSocketEnableAddressUseForDatagramFanout` (`caservertask.c:629`), in
-/// the order `epics_base_rs::net::bind_fanout` gives against the bind.
+/// the order `epics_base_rs::net::bind_fanout` gives against the bind. On
+/// unix port 0 takes none: a number the server picks is its own, as for the
+/// async responder set (`udp::SetPlan::role_at`).
 pub fn bind_udp_search(addr: SocketAddrV4) -> std::io::Result<UdpSocket> {
     bind_udp_search_socket(addr)
 }
@@ -912,29 +914,34 @@ fn bind_udp_search_socket(addr: SocketAddrV4) -> std::io::Result<UdpSocket> {
     sin.sin_addr = libc::in_addr {
         s_addr: u32::from(*addr.ip()).to_be(),
     };
-    epics_base_rs::net::bind_fanout(
-        addr.port(),
-        epics_base_rs::net::PortOrigin::Configured,
-        || {
-            set_reuse_opt(fd, libc::SO_REUSEADDR)?;
-            set_reuse_opt(fd, libc::SO_REUSEPORT)
-        },
-        || {
-            // SAFETY: `sin` is a fully-initialized sockaddr_in; the length is
-            // exact.
-            let rc = unsafe {
-                libc::bind(
-                    fd,
-                    &sin as *const libc::sockaddr_in as *const libc::sockaddr,
-                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-                )
-            };
-            if rc != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        },
-    )?;
+    let bind = || {
+        // SAFETY: `sin` is a fully-initialized sockaddr_in; the length is
+        // exact.
+        let rc = unsafe {
+            libc::bind(
+                fd,
+                &sin as *const libc::sockaddr_in as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    };
+    if addr.port() == 0 {
+        bind()?;
+    } else {
+        epics_base_rs::net::bind_fanout(
+            addr.port(),
+            epics_base_rs::net::PortOrigin::Configured,
+            || {
+                set_reuse_opt(fd, libc::SO_REUSEADDR)?;
+                set_reuse_opt(fd, libc::SO_REUSEPORT)
+            },
+            bind,
+        )?;
+    }
     Ok(socket)
 }
 
@@ -2129,16 +2136,17 @@ mod tests {
         );
     }
 
-    /// C sets the fanout options on every port (`caservertask.c:628`), so a
-    /// responder on a number it chose still takes a co-binding responder.
+    /// A number the responder picked is its own: a same-user socket that sets
+    /// the fanout options before its bind, as rsrv and pvxs do, cannot join it.
     #[cfg(unix)]
     #[test]
-    fn a_responder_on_a_chosen_port_lets_a_fanout_socket_co_bind() {
+    fn a_responder_on_a_chosen_port_refuses_a_fanout_socket() {
         let first = bind_udp_search(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 0))
             .expect("first responder");
         let port = first.local_addr().expect("local addr").port();
-        bind_udp_search(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, port))
-            .expect("fanout co-bind");
+        let err = bind_udp_search(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, port))
+            .expect_err("a fanout socket joined a chosen number");
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
     }
 
     /// The CA server's threads are the ones that scale with client count, so

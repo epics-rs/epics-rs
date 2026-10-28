@@ -22,9 +22,10 @@ pub enum PortUse {
     /// On unix, on a number of its own choosing, they are set after the bind;
     /// Windows sets them before every bind. See [`bind_fanout`].
     Shared,
-    /// The PVA client search socket and the CA client sockets: no reuse
-    /// options, so a number somebody already holds is `EADDRINUSE` — a
-    /// failure the caller can retry — instead of a silent join.
+    /// The PVA client search socket, the CA client sockets, and on unix a CA
+    /// server responder on a number it chose: no reuse options, so a number
+    /// somebody already holds is `EADDRINUSE` — a failure the caller can
+    /// retry — instead of a silent join.
     Exclusive,
 }
 
@@ -108,7 +109,10 @@ pub enum PortOrigin {
 /// Linux treats a number that another same-user fanout socket holds as free,
 /// hands it to `bind(0)` and joins that socket's `SO_REUSEPORT` group, which
 /// then load-balances unicasts between the two. Set after the bind they still
-/// let a later fanout socket — a pvxs client's beacon receiver — co-bind.
+/// let a later fanout socket co-bind, which is why a chosen number takes them
+/// at all: a pvxs client told a PVA server's number binds its beacon receiver
+/// there. A chosen number nobody else is meant to join binds
+/// [`PortUse::Exclusive`] instead, as the CA server's does on unix.
 /// pvxs sets them first on every port (`udp_collector.cpp:136`); deliberate
 /// deviation on unix only, see `docs/differences.md`. Winsock reads
 /// `SO_REUSEADDR` at bind time, so set after it the socket refuses every

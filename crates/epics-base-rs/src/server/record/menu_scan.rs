@@ -271,7 +271,9 @@ fn period_of(choice: &str) -> Option<Duration> {
     };
     // C's `if (ppsl->period == 0)` guard, reached the same way: `1/number`
     // for an enormous frequency underflows to zero, and a zero period would
-    // be a scan thread in a spin loop. A NaN period has no wait C defines.
+    // be a scan thread in a spin loop. C keeps a list for a NaN period, but
+    // its scan thread's wait is then undefined behaviour (`epicsTimeAddSeconds`
+    // casts NaN to an integer), which is not copied.
     if seconds <= 0.0 || seconds.is_nan() {
         return None;
     }

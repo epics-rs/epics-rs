@@ -7449,6 +7449,127 @@ fn test_load_zero_accl_and_accs_floors_accl_at_init() {
 }
 
 #[test]
+fn test_load_zero_bacc_floors_bacc_at_init() {
+    // C:4048-4053 — a loaded BACC of 0 is floored to 0.1.
+    let mut rec = MotorRecord::new();
+    rec.put_field("BACC", EpicsValue::Double(0.0)).unwrap();
+    rec.init_record(0).unwrap();
+    rec.init_record(1).unwrap();
+
+    assert_eq!(rec.vel.bacc, 0.1);
+}
+
+#[test]
+fn test_negative_bacc_backlash_leg_skips_set_accel() {
+    // C 2278: the backlash rate is (bvel - vbase) / BACC with no floor of its
+    // own, and init floors only a BACC of 0, so a loaded negative BACC gives a
+    // negative rate and the in-range backlash leg skips SET_ACCEL (2528).
+    let mut rec = MotorRecord::new();
+    rec.internal.init_invariants_synced = true;
+    rec.conv.mres = 0.01;
+    rec.vel.velo = 2.0;
+    rec.vel.bvel = 1.0;
+    rec.vel.bacc = -0.5;
+    rec.retry.bdst = 1.0;
+    rec.stat.msta = MstaFlags::DONE;
+
+    rec.put_field("VAL", EpicsValue::Double(0.5)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Val);
+    assert_eq!(
+        effects.commands,
+        [
+            MotorCommand::SetVelocity { velocity: 100.0 },
+            MotorCommand::SetVelBase { velocity: 0.0 },
+            MotorCommand::MoveAbsolute {
+                position: 50.0,
+                min_velocity: 0.0,
+                velocity: 100.0,
+                acceleration: -200.0,
+            }
+        ]
+    );
+}
+
+#[test]
+fn test_negative_accl_move_skips_set_accel() {
+    // C accEGUfromVelo (motorRecord.cc:488-497) divides by the raw ACCL and
+    // init floors only an ACCL of 0 (4041), so a loaded negative ACCL gives a
+    // negative rate and the move skips SET_ACCEL (2528).
+    let mut rec = MotorRecord::new();
+    rec.internal.init_invariants_synced = true;
+    rec.conv.mres = 0.01;
+    rec.vel.velo = 2.0;
+    rec.vel.accl = -0.5;
+    rec.stat.msta = MstaFlags::DONE;
+
+    rec.put_field("VAL", EpicsValue::Double(0.5)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Val);
+    let accel = effects.commands.iter().find_map(|c| match c {
+        MotorCommand::MoveAbsolute { acceleration, .. } => Some(*acceleration),
+        _ => None,
+    });
+    assert_eq!(accel, Some(-400.0));
+}
+
+#[test]
+fn test_negative_accl_home_skips_set_accel() {
+    // C 2048: (hvel - vbase) / ACCL, raw, so a negative ACCL skips SET_ACCEL
+    // (2054) as the move does.
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
+    rec.stat.msta = MstaFlags::DONE;
+    rec.vel.vbas = 0.5;
+    rec.vel.hvel = 2.0;
+    rec.vel.accl = -0.5;
+
+    rec.ctrl.homf = 1;
+    let effects = rec.plan_motion(CommandSource::Homf);
+    let accel = effects.commands.iter().find_map(|c| match c {
+        MotorCommand::Home { acceleration, .. } => Some(*acceleration),
+        _ => None,
+    });
+    assert_eq!(accel, Some(-3.0));
+}
+
+#[test]
+fn test_load_negative_accl_derives_accs_at_init() {
+    // C 4041-4046: init floors only an ACCL of 0, and updateACCSfromACCL
+    // (515) divides by the negative one it keeps: accs = 10 / -0.5.
+    let mut rec = MotorRecord::new();
+    rec.put_field("VELO", EpicsValue::Double(10.0)).unwrap();
+    rec.put_field("ACCL", EpicsValue::Double(-0.5)).unwrap();
+    rec.init_record(0).unwrap();
+    rec.init_record(1).unwrap();
+
+    assert_eq!((rec.vel.accl, rec.vel.accs), (-0.5, -20.0));
+}
+
+#[test]
+fn test_accl_zero_from_accs_stands_in_for_the_divide_by_zero() {
+    // An ACCS put derives ACCL 0 from a VELO of 0 (C 503). C then divides
+    // by zero (539, 2048): rs keeps ACCS and homes at the 0.1 floor's rate.
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
+    rec.init_record(0).unwrap();
+    rec.init_record(1).unwrap();
+    rec.put_field("VELO", EpicsValue::Double(0.0)).unwrap();
+    rec.put_field("ACCS", EpicsValue::Double(5.0)).unwrap();
+    assert_eq!(rec.vel.accl, 0.0);
+    rec.put_field("VELO", EpicsValue::Double(4.0)).unwrap();
+    assert_eq!(rec.vel.accs, 5.0);
+
+    rec.stat.msta = MstaFlags::DONE;
+    rec.vel.hvel = 2.0;
+    rec.ctrl.homf = 1;
+    let effects = rec.plan_motion(CommandSource::Homf);
+    let accel = effects.commands.iter().find_map(|c| match c {
+        MotorCommand::Home { acceleration, .. } => Some(*acceleration),
+        _ => None,
+    });
+    assert_eq!(accel, Some(20.0));
+}
+
+#[test]
 fn test_runtime_accl_accs_puts_cross_calc_after_init() {
     // The load gate must not disarm C's special() cross-calc: after init an
     // ACCL put re-derives ACCS (motorRecord.cc:2735-2742) and an ACCS put

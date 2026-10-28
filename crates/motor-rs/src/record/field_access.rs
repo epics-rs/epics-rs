@@ -1749,12 +1749,11 @@ fn update_accl_from_accs(rec: &mut MotorRecord) {
 }
 
 /// C `updateACCSfromACCL` (motorRecord.cc:512-521): ACCL is the master, ACCS
-/// follows. The `accl > 0.0` guard is Rust-side: C divides unconditionally, and
-/// every C caller has already floored ACCL to 0.1 — the guard keeps a raw
-/// `field(ACCL,"0")` load from producing an infinite ACCS before the init floor
-/// runs, and is unreachable on the runtime paths.
+/// follows, divided by the raw ACCL (515, 539): a negative ACCL, which init
+/// keeps (4041), gives a negative ACCS. An ACCL of 0, derived from ACCS at a
+/// VELO of 0 (503), is C's divide by zero; leaving ACCS stands in for it.
 fn update_accs_from_accl(rec: &mut MotorRecord) {
-    if rec.vel.accl > 0.0 {
+    if rec.vel.accl != 0.0 {
         rec.vel.accs = accel_numerator(rec) / rec.vel.accl;
     }
 }
@@ -1956,8 +1955,8 @@ pub(crate) fn motor_sync_speed_at_init(rec: &mut MotorRecord) {
     // default is 0.0 (as is `VelocityFields::default`), the accel cross-calcs
     // are special()-only and so never fire during dbLoadRecords, and therefore
     // a nonzero ACCS here can only mean the .db wrote `field(ACCS,…)`. It then
-    // wins and ACCL is derived from it; otherwise ACCL is the master (floored
-    // to 0.1 first, C:4041-4045) and ACCS is derived. ACCU stays a pure
+    // wins and ACCL is derived from it; otherwise ACCL is the master (a 0
+    // floored to 0.1 first, C:4041-4045) and ACCS is derived. ACCU stays a pure
     // user/autosave control (63bfe5d0) — it selects the master only for the
     // *runtime* VELO/VBAS cascade (`apply_accu_cascade`), not at init.
     if rec.vel.accs > 0.0 {
@@ -1967,6 +1966,10 @@ pub(crate) fn motor_sync_speed_at_init(rec: &mut MotorRecord) {
             rec.vel.accl = 0.1;
         }
         update_accs_from_accl(rec);
+    }
+    // C 4048-4053: the backlash acceleration time's sanity check.
+    if rec.vel.bacc == 0.0 {
+        rec.vel.bacc = 0.1;
     }
 
     // C motorRecord.cc:4055-4067 — jog/home velocity sanity checks, after

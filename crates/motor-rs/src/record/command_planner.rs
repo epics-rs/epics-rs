@@ -1451,11 +1451,7 @@ impl MotorRecord {
     /// A result `<= 0` is C's skipped SET_ACCEL (motorRecord.cc:940, :2529);
     /// the poller turns it into the axis's stored acceleration.
     pub(crate) fn move_accel_egu(&self) -> f64 {
-        let accl = if self.vel.accl > 0.0 {
-            self.vel.accl
-        } else {
-            0.1
-        };
+        let accl = self.accl_divisor();
         let vmax = self.vel.velo.abs();
         let vmin = self.effective_vbas();
         if self.vel.accu == AccsUsed::Accs {
@@ -1468,18 +1464,14 @@ impl MotorRecord {
     }
 
     /// Acceleration for a backlash move, EGU/sec². Uses BVEL/BACC; `<= 0`
-    /// is C's skipped SET_ACCEL (:956, :1005), as in `move_accel_egu`.
+    /// is C's skipped SET_ACCEL (:956, :1005), as in `move_accel_egu`. BACC
+    /// is never 0 here: init and its special() floor it.
     pub(crate) fn backlash_accel_egu(&self) -> f64 {
-        let bacc = if self.vel.bacc > 0.0 {
-            self.vel.bacc
-        } else {
-            0.1
-        };
         let span = self.vel.bvel - self.effective_vbas();
         if span > 0.0 {
-            span / bacc
+            span / self.vel.bacc
         } else {
-            self.vel.bvel / bacc
+            self.vel.bvel / self.vel.bacc
         }
     }
 
@@ -1489,16 +1481,24 @@ impl MotorRecord {
     /// `(hvel - vbase) > 0 ? (hvel - vbase) / accl : hvel / accl`; `<= 0`
     /// is C's skipped SET_ACCEL (:874, :2054), as in `move_accel_egu`.
     pub(crate) fn home_accel_egu(&self) -> f64 {
-        let accl = if self.vel.accl > 0.0 {
-            self.vel.accl
-        } else {
-            0.1
-        };
+        let accl = self.accl_divisor();
         let span = self.vel.hvel - self.effective_vbas();
         if span > 0.0 {
             span / accl
         } else {
             self.vel.hvel / accl
+        }
+    }
+
+    /// The ACCL a move's or home's rate divides by. C divides by it raw
+    /// (motorRecord.cc:492-494, 862, 2048), so a negative ACCL gives the
+    /// negative rate that skips SET_ACCEL. An ACCL of 0, derived from ACCS
+    /// at a VELO of 0 (503), is C's divide by zero; 0.1 stands in for it.
+    fn accl_divisor(&self) -> f64 {
+        if self.vel.accl == 0.0 {
+            0.1
+        } else {
+            self.vel.accl
         }
     }
 

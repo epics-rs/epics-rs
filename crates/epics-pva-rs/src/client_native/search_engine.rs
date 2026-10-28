@@ -67,11 +67,11 @@ use tokio::sync::{mpsc, oneshot};
 // `cbMedium` worker with *"there is no reactor running"* the moment the engine
 // starts, and the pvalink monitor never connects.
 // Deadlines here are computed with `Instant::now() + window` and then waited
-// on with `sleep_until`, so they must be stamped in the clock the seam's timer
+// on with a held `Sleep`, so they must be stamped in the clock the seam's timer
 // actually runs on — hosted that is tokio's, which is virtual under
 // `start_paused`. Taking `Instant` from the seam alongside the timer is what
 // keeps the two from being different timelines.
-use epics_base_rs::runtime::task::{Instant, interval, sleep, sleep_until, timeout};
+use epics_base_rs::runtime::task::{Instant, Sleep, interval, sleep, timeout};
 use tracing::debug;
 use tracing::warn;
 
@@ -1499,6 +1499,12 @@ async fn run_engine(
     // Its first tick is one period after start, as pvxs arms `searchTimer`
     // (src/client.cpp:658).
     let mut next_tick = Instant::now() + BUCKET_INTERVAL;
+    // The loop's sleeps, held across passes so one that moves no deadline
+    // arms no timer. `hold_until` brings each to its deadline before the
+    // `select!`; with no deadline none is held and its arm parks.
+    let mut tick_sleep: Option<Sleep> = None;
+    let mut initial_sleep: Option<Sleep> = None;
+    let mut multi_sleep: Option<Sleep> = None;
     // Periodic beacon-tracker cleanup: every BEACON_CLEAN_INTERVAL we
     // walk the map and forget servers whose beacons have been silent
     // longer than BEACON_TIMEOUT. Each pruned entry fires a
@@ -1532,22 +1538,12 @@ async fn run_engine(
                 _ => None,
             })
             .min();
-        let deadline_arm = async {
-            match next_multi_deadline {
-                Some(d) => sleep_until(d).await,
-                None => std::future::pending::<()>().await,
-            }
-        };
-
+        hold_until(&mut multi_sleep, next_multi_deadline);
         // Fire when the coalescing window for buffered initial searches
         // elapses (pvxs `initialSearcher` timer). `None` ⟹ no window
         // armed, so this arm parks forever.
-        let initial_arm = async {
-            match initial_deadline {
-                Some(d) => sleep_until(d).await,
-                None => std::future::pending::<()>().await,
-            }
-        };
+        hold_until(&mut initial_sleep, initial_deadline);
+        hold_until(&mut tick_sleep, Some(next_tick));
 
         tokio::select! {
             cmd = cmd_rx.recv() => match cmd {
@@ -1865,7 +1861,7 @@ async fn run_engine(
                 }
             }
 
-            _ = deadline_arm => {
+            _ = held(&mut multi_sleep) => {
                 // The earliest unfired `Multi` deadline elapsed —
                 // flush it (and any others now past). Without this
                 // arm, deadlines were only checked at the 1 Hz tick,
@@ -1882,7 +1878,7 @@ async fn run_engine(
                 );
             }
 
-            _ = initial_arm => {
+            _ = held(&mut initial_sleep) => {
                 // The initial-search coalescing window elapsed: send the
                 // burst as one batched SEARCH (broadcast + name-server
                 // forward), then disarm until the next initial Find.
@@ -1903,12 +1899,12 @@ async fn run_engine(
                 initial_deadline = None;
             }
 
-            _ = sleep_until(next_tick) => {
+            _ = held(&mut tick_sleep) => {
                 let now = Instant::now();
 
                 // 1. Flush expired FindAll multi-window responders.
                 //    Same logic the deadline arm runs — covers the
-                //    case where deadline_arm was racing against a
+                //    case where the multi-deadline arm was racing against a
                 //    just-armed entry and missed it on this iteration.
                 //
                 //    Closed Single responders (caller dropped the
@@ -2040,6 +2036,25 @@ async fn run_engine(
                     + if poked { BUCKET_INTERVAL_FAST } else { BUCKET_INTERVAL };
             }
         }
+    }
+}
+
+/// Bring a held loop sleep to `deadline`. Only a moved deadline touches the
+/// timer; `None` drops the sleep, cancelling its entry.
+fn hold_until(held: &mut Option<Sleep>, deadline: Option<Instant>) {
+    match (held.as_mut(), deadline) {
+        (Some(s), Some(d)) if s.deadline() == d => {}
+        (Some(s), Some(d)) => s.reset(d),
+        (None, Some(d)) => *held = Some(Sleep::until(d)),
+        (_, None) => *held = None,
+    }
+}
+
+/// `select!` arm over a held sleep: its deadline, or never with none held.
+async fn held(sleep: &mut Option<Sleep>) {
+    match sleep {
+        Some(s) => s.await,
+        None => std::future::pending().await,
     }
 }
 
@@ -7166,5 +7181,136 @@ mod tests {
             SEARCHES as usize,
             "the server's own socket takes every broadcast: {copies:?}"
         );
+    }
+
+    /// `run_engine` with no transport and no name servers, driven on a plain
+    /// thread with no runtime, so every sleep lands on the background timer.
+    /// `on_thread` runs on that thread first.
+    // RTEMS-EXEC-MODEL-ALLOW(1): checked - runs and passes in the exec-backend
+    // suite (the runtime only mints the tokio Reactor and is cfg(tokio_backend)).
+    fn idle_engine(
+        on_thread: impl FnOnce() + Send + 'static,
+    ) -> (mpsc::Sender<SearchCommand>, std::thread::JoinHandle<()>) {
+        #[cfg(tokio_backend)]
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        #[cfg(tokio_backend)]
+        let reactor = {
+            let _entered = rt.enter();
+            crate::test_reactor()
+        };
+        #[cfg(exec_backend)]
+        let reactor = crate::test_reactor();
+        let (cmd_tx, cmd_rx) = mpsc::channel(256);
+        let engine = std::thread::spawn(move || {
+            #[cfg(tokio_backend)]
+            let _rt = rt;
+            on_thread();
+            epics_base_rs::runtime::task::block_on_sync(run_engine(
+                reactor,
+                cmd_rx,
+                SearchTransport::NameServersOnly,
+                BeaconTracker::new(),
+                Vec::new(),
+                Default::default(),
+                Default::default(),
+                heartbeat_timeout(),
+            ))
+            .expect("a plain thread parks")
+        });
+        (cmd_tx, engine)
+    }
+
+    /// A loop pass that moves no deadline arms no timer: each engine sleep is
+    /// held across passes and re-armed only when its deadline moves, and the
+    /// background timer counts the arms.
+    #[test]
+    fn a_pass_that_moves_no_deadline_arms_no_timer() {
+        let (cmd_tx, engine) = idle_engine(|| {});
+        let round_trip = || {
+            let (responder, rx) = oneshot::channel();
+            cmd_tx
+                .blocking_send(SearchCommand::Subscribe { responder })
+                .unwrap();
+            rx.blocking_recv().unwrap();
+        };
+        round_trip();
+        // The search tick and the beacon clean are armed by the first pass
+        // that polls them, which one answering a command first is not.
+        let armed = std::time::Instant::now();
+        while epics_base_rs::runtime::task::background_timer_scheduled_total() < 2 {
+            assert!(
+                armed.elapsed() < Duration::from_secs(5),
+                "standing timers never armed"
+            );
+            std::thread::yield_now();
+        }
+        let before = epics_base_rs::runtime::task::background_timer_scheduled_total();
+        for _ in 0..8 {
+            cmd_tx
+                .blocking_send(SearchCommand::Cancel {
+                    pv_name: "absent".into(),
+                })
+                .unwrap();
+        }
+        round_trip();
+        assert_eq!(
+            epics_base_rs::runtime::task::background_timer_scheduled_total() - before,
+            0,
+            "timers armed by nine passes that moved no deadline"
+        );
+        drop(cmd_tx);
+        engine.join().unwrap();
+    }
+
+    /// A deadline gone drops its held sleep. Kept, a fired sleep stays ready
+    /// and its `select!` arm wins every pass.
+    #[test]
+    fn a_gone_deadline_drops_the_held_sleep() {
+        let mut held = Some(Sleep::until(Instant::now() + Duration::from_secs(3600)));
+        hold_until(&mut held, None);
+        assert!(held.is_none());
+    }
+
+    /// Once the initial-search window has flushed, nothing is due before the
+    /// next search tick and the engine parks. Read from the engine thread's
+    /// CPU time in USER_HZ ticks, 10 ms on Linux.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_engine_parks_after_the_initial_window() {
+        let (stat_tx, stat_rx) = std::sync::mpsc::channel();
+        let (cmd_tx, engine) = idle_engine(move || {
+            let me = std::fs::read_link("/proc/thread-self").unwrap();
+            stat_tx
+                .send(format!("/proc/{}/stat", me.display()))
+                .unwrap();
+        });
+        let stat = stat_rx.recv().unwrap();
+        let cpu_ticks = || -> u64 {
+            let line = std::fs::read_to_string(&stat).unwrap();
+            // utime and stime, fields 14 and 15, after the parenthesised comm.
+            let after_comm = &line[line.rfind(')').unwrap() + 2..];
+            let f: Vec<&str> = after_comm.split_whitespace().collect();
+            f[11].parse::<u64>().unwrap() + f[12].parse::<u64>().unwrap()
+        };
+        let (responder, _unanswered) = oneshot::channel();
+        cmd_tx
+            .blocking_send(SearchCommand::Find {
+                pv_name: "absent".into(),
+                responder,
+                reason: SearchReason::Initial,
+            })
+            .unwrap();
+        std::thread::sleep(10 * INITIAL_SEARCH_DELAY);
+        let before = cpu_ticks();
+        std::thread::sleep(Duration::from_millis(500));
+        let spent = cpu_ticks() - before;
+        assert!(
+            spent < 15,
+            "the engine ran {spent} ticks of a 50-tick idle window"
+        );
+        drop(cmd_tx);
+        engine.join().unwrap();
     }
 }

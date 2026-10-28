@@ -611,6 +611,15 @@ pub fn background_callback_stats(
     )
 }
 
+/// How many entries the background timer has ever queued, 0 before it starts
+/// — see [`TimerHandle::scheduled_total`](crate::runtime::background::TimerHandle::scheduled_total).
+/// Reads `BACKGROUND` for the same reason [`background_callback_stats`] does.
+pub fn background_timer_scheduled_total() -> u64 {
+    BACKGROUND
+        .get()
+        .map_or(0, |exec| exec.timer().handle().scheduled_total())
+}
+
 /// Create the process-global `scanOnce` worker thread now — C `initOnce`
 /// (`dbScan.c:768-780`), called from the port's `scanInit` equivalent so the
 /// thread exists from IOC init rather than from the first one-shot. Idempotent.
@@ -1317,6 +1326,42 @@ fn std_instant(deadline: Instant) -> std::time::Instant {
 #[cfg(exec_backend)]
 fn std_instant(deadline: Instant) -> std::time::Instant {
     deadline
+}
+
+/// A re-armable sleep, `tokio::time::Sleep`'s shape on both backends. Held
+/// across a `select!` loop and polled through `&mut`, a losing arm drops no
+/// timer, and a pass that does not [`reset`](Self::reset) it arms none.
+pub struct Sleep {
+    deadline: Instant,
+    timer: TickTimer,
+}
+
+impl Sleep {
+    /// Complete at `deadline`, on the timer the calling thread can reach.
+    pub fn until(deadline: Instant) -> Self {
+        Self {
+            deadline,
+            timer: TickTimer::until(deadline),
+        }
+    }
+
+    pub fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
+    /// Re-arm for `deadline` in place.
+    pub fn reset(&mut self, deadline: Instant) {
+        self.deadline = deadline;
+        self.timer.reset(deadline);
+    }
+}
+
+impl Future for Sleep {
+    type Output = ();
+
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        self.get_mut().timer.poll(cx)
+    }
 }
 
 impl Interval {

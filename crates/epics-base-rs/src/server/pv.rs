@@ -181,9 +181,8 @@ pub type WriteForward = Box<dyn FnOnce(Option<WriteDone>) -> Result<(), CaError>
 const MAX_SIMUL_WRITE_IO: usize = 100;
 
 /// A put callback a [`WriteForward`] sent and upstream has not answered,
-/// one of ca-gateway's `pendWio`. It posts its status when it ends, which
-/// wakes the writes the PV postponed (`putCB` → `postIOCompletion`,
-/// gateVc.cc:1519-1533).
+/// one of ca-gateway's `pendWio`. It leaves the count and posts its status
+/// when it ends (`putCB` → `postIOCompletion`, gateVc.cc:1519-1533).
 pub struct WriteDone {
     done: Option<crate::runtime::sync::oneshot::Sender<DbResult>>,
     io: Arc<WriteIo>,
@@ -211,7 +210,9 @@ impl WriteDone {
 
     fn post(&mut self, status: DbResult) {
         if let Some(done) = self.done.take() {
-            let _ = done.send(status);
+            // Left before the post, so a write the post wakes finds the room.
+            self.io.in_flight.fetch_sub(1, Ordering::SeqCst);
+            self.io.post(done, status);
         }
     }
 }
@@ -219,8 +220,6 @@ impl WriteDone {
 impl Drop for WriteDone {
     fn drop(&mut self) {
         self.post(Err(DbStatus::FAILED));
-        self.io.in_flight.fetch_sub(1, Ordering::SeqCst);
-        self.io.signal();
     }
 }
 
@@ -254,7 +253,16 @@ pub enum PutStarted {
 /// `casAsyncIOI::postIOCompletion`. One the PV dropped un-sent, at a
 /// destroy, ends canceled as `~gateVcData` posts it (gateVc.cc:426-433).
 /// Cancel-safe.
-pub struct WriteEnd(WriteEndState);
+///
+/// Dropping it is pcas `uninstallIO`, which signals the writes postponed on
+/// the PV (casPVI.cc:422-433), so the holder drops it only after it answers
+/// the status: `cbFuncAsyncIO` queues the response first
+/// (casAsyncWriteIOI.cpp:50-63). One dropped before the status is posted
+/// leaves the signal to the post.
+pub struct WriteEnd {
+    state: WriteEndState,
+    io: Arc<WriteIo>,
+}
 
 enum WriteEndState {
     Pending(crate::runtime::sync::oneshot::Receiver<DbResult>),
@@ -262,24 +270,46 @@ enum WriteEndState {
 }
 
 impl WriteEnd {
-    fn pending(posted: crate::runtime::sync::oneshot::Receiver<DbResult>) -> Self {
-        Self(WriteEndState::Pending(posted))
+    fn pending(
+        posted: crate::runtime::sync::oneshot::Receiver<DbResult>,
+        io: &Arc<WriteIo>,
+    ) -> Self {
+        Self {
+            state: WriteEndState::Pending(posted),
+            io: io.clone(),
+        }
     }
 
     /// The posted status, once it is.
     pub fn try_end(&mut self) -> Option<DbResult> {
         use crate::runtime::sync::oneshot::error::TryRecvError;
-        if let WriteEndState::Pending(posted) = &mut self.0 {
+        if let WriteEndState::Pending(posted) = &mut self.state {
             let status = match posted.try_recv() {
                 Ok(status) => status,
                 Err(TryRecvError::Closed) => Err(DbStatus::CANCELED_ASYNC_IO),
                 Err(TryRecvError::Empty) => return None,
             };
-            self.0 = WriteEndState::Ended(status);
+            self.state = WriteEndState::Ended(status);
         }
-        match self.0 {
+        match self.state {
             WriteEndState::Ended(status) => Some(status),
             WriteEndState::Pending(_) => None,
+        }
+    }
+}
+
+impl Drop for WriteEnd {
+    fn drop(&mut self) {
+        let ended = match &mut self.state {
+            WriteEndState::Ended(_) => true,
+            WriteEndState::Pending(posted) => {
+                // A post after the close fails, and signals itself.
+                posted.close();
+                posted.try_recv().is_ok()
+            }
+        };
+        if ended {
+            self.io.signal();
         }
     }
 }
@@ -291,12 +321,12 @@ impl std::future::Future for WriteEnd {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<DbResult> {
-        if let WriteEndState::Pending(posted) = &mut self.0 {
+        if let WriteEndState::Pending(posted) = &mut self.state {
             let status = std::task::ready!(std::pin::Pin::new(posted).poll(cx))
                 .unwrap_or(Err(DbStatus::CANCELED_ASYNC_IO));
-            self.0 = WriteEndState::Ended(status);
+            self.state = WriteEndState::Ended(status);
         }
-        match self.0 {
+        match self.state {
             WriteEndState::Ended(status) => std::task::Poll::Ready(status),
             WriteEndState::Pending(_) => std::task::Poll::Pending,
         }
@@ -311,9 +341,11 @@ struct WriteIo {
     /// [`ProcessVariable::make_ready`] and [`ProcessVariable::destroy`] empty
     /// it, each under this lock.
     held: parking_lot::Mutex<Vec<DeferredWrite>>,
-    /// `pendWio`: one per live [`WriteDone`], added only under `held`.
+    /// `pendWio`: one per [`WriteDone`] not yet posted, added only under
+    /// `held`.
     in_flight: std::sync::atomic::AtomicUsize,
-    /// `ioBlockedList`.
+    /// `ioBlockedList`, signalled only by the last of an IO's post and its
+    /// [`WriteEnd`].
     unblocked: tokio::sync::watch::Sender<()>,
 }
 
@@ -321,6 +353,14 @@ impl WriteIo {
     /// `ioBlockedList::signal`.
     fn signal(&self) {
         self.unblocked.send_modify(|()| {});
+    }
+
+    /// Post a write IO's `status` to its [`WriteEnd`], which signals once
+    /// answered; one already dropped leaves it to this post.
+    fn post(&self, done: crate::runtime::sync::oneshot::Sender<DbResult>, status: DbResult) {
+        if done.send(status).is_err() {
+            self.signal();
+        }
     }
 }
 
@@ -1171,8 +1211,13 @@ impl DeferredWrite {
             let _ = (self.forward)(Some(WriteDone::start(io, self.done)));
         } else {
             let status = (self.forward)(None).map_err(|_| DbStatus::FAILED);
-            let _ = self.done.send(status);
+            io.post(self.done, status);
         }
+    }
+
+    /// `~gateVcData` posting a queued write canceled (gateVc.cc:426-429).
+    fn cancel(self, io: &WriteIo) {
+        io.post(self.done, Err(DbStatus::CANCELED_ASYNC_IO));
     }
 }
 
@@ -1247,7 +1292,6 @@ impl ProcessVariable {
         drop(value);
         drop(deferred);
         self.ready_wake.notify_waiters();
-        self.writes.signal();
     }
 
     /// Send `forward`, the write a [`WriteHook`] accepted, as a put callback
@@ -1278,7 +1322,7 @@ impl ProcessVariable {
                 notify,
                 done,
             });
-            return Ok(PutStarted::Posted(WriteEnd::pending(posted)));
+            return Ok(PutStarted::Posted(WriteEnd::pending(posted, &self.writes)));
         }
         if self.writes.in_flight.load(Ordering::SeqCst) >= MAX_SIMUL_WRITE_IO {
             // A put callback that ends after the subscribe wakes it; one that
@@ -1304,7 +1348,7 @@ impl ProcessVariable {
         let done = WriteDone::start(&self.writes, done);
         drop(held);
         let _ = forward(Some(done));
-        Ok(PutStarted::Posted(WriteEnd::pending(posted)))
+        Ok(PutStarted::Posted(WriteEnd::pending(posted, &self.writes)))
     }
 
     /// Park until [`Self::make_ready`]; `Err` if the PV is destroyed first, as
@@ -1862,8 +1906,13 @@ impl ProcessVariable {
         // it and refuses every later add; the monitors end after it.
         let destroyed = self.subscribers.close().map(RemovedMonitors).is_some();
         // C cancels the writes `delete vc` finds queued (gateVc.cc:426-429).
-        drop(std::mem::take(&mut *self.writes.held.lock()));
+        let held = std::mem::take(&mut *self.writes.held.lock());
+        for write in held {
+            write.cancel(&self.writes);
+        }
         self.ready_wake.notify_waiters();
+        // Stands in for the canceled `pendWio`'s `uninstallIO`: the put
+        // callbacks in flight are upstream's to end.
         self.writes.signal();
         destroyed
     }
@@ -3090,12 +3139,13 @@ mod pending_tests {
     }
 
     /// A pending PV holds `maxSimlWriteIO + 1` writes and postpones the
-    /// next until `make_ready` sends them (gateVc.cc:1467, `>`).
+    /// next until one `make_ready` sends is answered (gateVc.cc:1467, `>`):
+    /// an end dropped unread after its post signals.
     #[epics_macros_rs::epics_test]
     async fn a_pending_pv_postpones_past_max_simul_write_io_held() {
         let pv = pending();
         let sent = Sent::default();
-        let held: Vec<_> = (0..=MAX_SIMUL_WRITE_IO as u32)
+        let mut held: Vec<_> = (0..=MAX_SIMUL_WRITE_IO as u32)
             .map(|tag| started(pv.forward_write(forward(&sent, tag, true), tag % 2 == 0)))
             .collect();
         let mut blocked = postponed(pv.forward_write(forward(&sent, 999, true), false));
@@ -3103,14 +3153,50 @@ mod pending_tests {
         assert!(poll_once(woken.as_mut()).await.is_pending());
 
         pv.make_ready(first(1.0));
-        assert!(poll_once(woken.as_mut()).await.is_ready());
+        assert!(
+            poll_once(woken.as_mut()).await.is_pending(),
+            "posted, none answered"
+        );
         assert_eq!(sent.lock().len(), held.len(), "the postponed one was not");
+        drop(held.pop());
+        assert!(poll_once(woken.as_mut()).await.is_ready());
         started(pv.forward_write(forward(&sent, 1000, true), false));
     }
 
-    /// With only plain writes held no put callback ends to wake the
-    /// postponed one: `make_ready` does, as each held write's IO ends at
-    /// `vcNew` (gateVc.cc:984-1012).
+    /// A write IO ends a write postponed on it only once its status is
+    /// answered and its end dropped, as `cbFuncAsyncIO` answers before
+    /// `uninstallIO` (casAsyncWriteIOI.cpp:50-63).
+    #[epics_macros_rs::epics_test]
+    async fn a_postponed_write_waits_for_the_ended_io_to_be_answered() {
+        let pv = ProcessVariable::new("P:ready", EpicsValue::Double(0.0));
+        let (sent, open) = (Sent::default(), Open::default());
+        let mut ends: Vec<_> = (0..MAX_SIMUL_WRITE_IO as u32)
+            .map(|tag| {
+                started(pv.forward_write(held_open(&sent, tag, &open), true)).expect("posted")
+            })
+            .collect();
+        let mut blocked = postponed(pv.forward_write(forward(&sent, 100, true), true));
+        let mut woken = std::pin::pin!(blocked.signalled());
+
+        open.lock().remove(0).succeed();
+        assert!(
+            poll_once(woken.as_mut()).await.is_pending(),
+            "posted, not answered"
+        );
+        let mut end = ends.remove(0);
+        assert_eq!(end.try_end(), Some(Ok(())));
+        assert!(
+            poll_once(woken.as_mut()).await.is_pending(),
+            "answered, its end still held"
+        );
+        drop(end);
+        assert!(poll_once(woken.as_mut()).await.is_ready());
+        started(pv.forward_write(forward(&sent, 101, true), true));
+    }
+
+    /// With every held write's end already dropped, `make_ready`'s posts
+    /// wake the postponed one, as each held write's IO ends at `vcNew`
+    /// (gateVc.cc:984-1012).
     #[epics_macros_rs::epics_test]
     async fn make_ready_wakes_a_write_postponed_behind_plain_writes() {
         let pv = pending();

@@ -5875,10 +5875,10 @@ mod tests {
                 ));
             }
         }
-        answered.sort();
         assert_eq!(
             answered,
-            [(CA_PROTO_READ_NOTIFY, 500), (CA_PROTO_WRITE_NOTIFY, 1)]
+            [(CA_PROTO_WRITE_NOTIFY, 1), (CA_PROTO_READ_NOTIFY, 500)],
+            "the write that ended is answered before the request behind it"
         );
         assert_eq!(open.lock().unwrap().len(), 100, "the 101st went");
 

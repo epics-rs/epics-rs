@@ -4846,7 +4846,7 @@ pub(crate) async fn serve_write_head(
                     tail,
                     WriteTail::Now(
                         WriteEnded::Aborted | WriteEnded::Refused(_) | WriteEnded::Failed(_)
-                    )
+                    ) | WriteTail::Posted(WriteEnded::Failed(_), _)
                 );
             let tag = if failed { "fail" } else { "ok" };
             (tail, result, tag)
@@ -4934,6 +4934,11 @@ pub(crate) async fn serve_write_head(
         // The trap-write bracket closed above, with the audit status.
         WriteTail::Now(ended) => {
             reply.send(ended, &mut None, writer, state.client_minor_version())?;
+            return Ok(WriteHeadOutcome::Done);
+        }
+        WriteTail::Posted(ended, end) => {
+            reply.send(ended, &mut None, writer, state.client_minor_version())?;
+            drop(end);
             return Ok(WriteHeadOutcome::Done);
         }
         WriteTail::Later(rx) => rx,
@@ -5102,6 +5107,10 @@ impl PutEnd {
 /// that awaits it.
 enum WriteTail {
     Now(WriteEnded),
+    /// Write IO the PV posted before the head returned. Its end, which
+    /// signals the PV's postponed writes, goes after the answer
+    /// (`cbFuncAsyncIO`, casAsyncWriteIOI.cpp:50-63).
+    Posted(WriteEnded, WriteEnd),
     Later(PutEnd),
 }
 
@@ -5117,8 +5126,8 @@ impl WriteTail {
     /// pcas answers `S_casApp_success`.
     fn posted(mut end: WriteEnd) -> Self {
         match end.try_end() {
-            Some(Ok(())) => Self::Now(WriteEnded::Done),
-            Some(Err(status)) => Self::Now(WriteEnded::Failed(status)),
+            Some(Ok(())) => Self::Posted(WriteEnded::Done, end),
+            Some(Err(status)) => Self::Posted(WriteEnded::Failed(status), end),
             None => Self::Later(PutEnd::Posted(end)),
         }
     }

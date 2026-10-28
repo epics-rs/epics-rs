@@ -2327,8 +2327,14 @@ where
                     continue;
                 }
                 // The postponing PV ended an IO: serve the held request again
-                // (`casStreamIOWakeup::expire` → `processMsg`).
-                () = PostponedRequest::signalled(&mut postponed), if postponed.is_some() => None,
+                // (`casStreamIOWakeup::expire` → `processMsg`). A destroy's
+                // signal can beat its broadcast, so its channels retire
+                // first, as pcas drains the `channelDestroyEvent`s queued
+                // with the canceled IO before that timer fires.
+                () = PostponedRequest::signalled(&mut postponed), if postponed.is_some() => {
+                    sweep_destroyed_channels(&mut state, peer, conn_events.as_ref(), &outbox).await;
+                    None
+                }
                 read = read_with_optional_timeout(&mut reader, &mut buf[..room], inactivity), if room > 0 => {
                     match read {
                         Ok(Ok(n)) => Some(n),
@@ -14995,6 +15001,111 @@ mod destroyed_channel_teardown_tests {
                 (CA_PROTO_SERVER_DISCONN, 1, 0),
             ]
         );
+        drop(client);
+        handle.abort();
+    }
+
+    /// A write postponed on a PV that is destroyed runs again only after its
+    /// channel is retired, and is refused ECA_BADCHID: pcas sends the
+    /// `channelDestroyEvent` queued with the canceled IO before
+    /// `casStreamIOWakeup` re-runs it (casEventSys.cc:85-123). The destroy's
+    /// wake-up is held back until the re-run is answered, so the broadcast
+    /// arm cannot retire the channel first.
+    #[cfg(tokio_backend)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_write_postponed_on_a_destroyed_pv_runs_again_after_it_retires() {
+        use epics_base_rs::server::pv::WriteForward;
+        let (db, pending) = parked_read_db().await;
+        pending.make_ready(ready_snapshot());
+        let open = Arc::new(std::sync::Mutex::new(Vec::new()));
+        pending.set_write_hook(Arc::new({
+            let open = open.clone();
+            move |_value, _ctx| {
+                let open = open.clone();
+                Box::pin(async move {
+                    let forward: WriteForward = Box::new(move |done| {
+                        open.lock().unwrap().extend(done);
+                        Ok(())
+                    });
+                    Ok(forward)
+                })
+            }
+        }));
+        let peer: SocketAddr = "127.0.0.1:55311".parse().unwrap();
+        let (mut client, _conn_rx, _acf_tx, handle) = spawn_server(db.clone(), peer);
+        client.write_all(&version_frame()).await.expect("version");
+        client
+            .write_all(&create_chan_frame(1, "AR4:pending"))
+            .await
+            .expect("create_chan");
+        client.flush().await.expect("flush");
+        let sid = read_create_chan_sid(&mut client, Duration::from_secs(3)).await;
+        for ioid in 1..=101 {
+            client
+                .write_all(&put_frame(CA_PROTO_WRITE_NOTIFY, sid, ioid))
+                .await
+                .expect("write_notify");
+        }
+        client.flush().await.expect("flush");
+        let mut buf = [0u8; 64];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), client.read(&mut buf))
+                .await
+                .is_err(),
+            "the 101st is postponed"
+        );
+        assert_eq!(open.lock().unwrap().len(), 100);
+        let (go, held) = std::sync::mpsc::channel::<()>();
+        let remover = std::thread::spawn({
+            let db = db.clone();
+            move || {
+                let _armed = epics_base_rs::server::database::destroy_signal_hook::arm(move || {
+                    let _ = held.recv();
+                });
+                epics_base_rs::runtime::task::block_on_sync(db.remove_simple_pv("AR4:pending"))
+                    .expect("no async runtime on this thread")
+                    .expect("was there");
+            }
+        });
+
+        let mut seen = Vec::new();
+        loop {
+            let frames = frames_until(&mut client, CA_PROTO_WRITE_NOTIFY).await;
+            let rerun = frames.last().is_some_and(|&(.., ioid)| ioid == 101);
+            seen.extend(frames);
+            if rerun {
+                break;
+            }
+        }
+        assert!(
+            !remover.is_finished(),
+            "the re-run was answered while the destroy's wake-up was held back"
+        );
+        let retired = seen
+            .iter()
+            .position(|&(cmmd, ..)| cmmd == CA_PROTO_SERVER_DISCONN)
+            .unwrap_or_else(|| panic!("the channel is retired before the re-run, got {seen:?}"));
+        let canceled: Vec<_> = seen[..retired]
+            .iter()
+            .filter(|&&(cmmd, ..)| cmmd == CA_PROTO_WRITE_NOTIFY)
+            .map(|&(_, status, ioid)| (status, ioid))
+            .collect();
+        assert_eq!(
+            canceled,
+            (1..=100)
+                .map(|ioid| (ECA_PUTFAIL, ioid))
+                .collect::<Vec<_>>(),
+            "the put callbacks in flight, canceled, and not the postponed one"
+        );
+        assert_eq!(
+            seen[retired..],
+            [
+                (CA_PROTO_SERVER_DISCONN, 1, 0),
+                (CA_PROTO_WRITE_NOTIFY, ECA_BADCHID, 101)
+            ]
+        );
+        go.send(()).expect("the hook waits");
+        remover.join().expect("removed");
         drop(client);
         handle.abort();
     }

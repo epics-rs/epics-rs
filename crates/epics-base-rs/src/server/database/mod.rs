@@ -60,6 +60,47 @@ pub(crate) use processing::{
 };
 #[cfg(feature = "test-hooks")]
 pub use record_lock::fresh_hold_hook;
+
+/// Test-only: run a closure on this thread between a removal's destroy and
+/// its wake-up, where whatever the destroy woke runs before any server is
+/// told to sweep. A test holds that window open by blocking in the closure.
+#[cfg(feature = "test-hooks")]
+pub mod destroy_signal_hook {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Box<dyn FnMut()>>> = const { RefCell::new(None) };
+    }
+
+    /// Disarms the hook when dropped.
+    pub struct Armed(());
+
+    impl Drop for Armed {
+        fn drop(&mut self) {
+            HOOK.with(|h| h.borrow_mut().take());
+        }
+    }
+
+    /// Run `f` on this thread after each destroy, before its wake-up.
+    pub fn arm(f: impl FnMut() + 'static) -> Armed {
+        HOOK.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+        Armed(())
+    }
+
+    pub(super) fn fire() {
+        // Taken out for the call, so a removal inside `f` does not re-enter.
+        let Some(mut f) = HOOK.with(|h| h.borrow_mut().take()) else {
+            return;
+        };
+        f();
+        HOOK.with(|h| {
+            let mut h = h.borrow_mut();
+            if h.is_none() {
+                *h = Some(f);
+            }
+        });
+    }
+}
 pub(crate) use record_lock::{
     CycleHints, FrameGate, InFrame, InitPass, LockRecord, OwedRead, ReadWait, SetGuard,
     owe_callback, owe_cvt, owe_read,
@@ -2584,6 +2625,8 @@ impl PvDatabase {
     /// Fire the wake-up. A send error means no server is attached, which is
     /// the normal state for a bare in-process database.
     fn signal_destroyed(&self) {
+        #[cfg(feature = "test-hooks")]
+        destroy_signal_hook::fire();
         let _ = self.inner.pv_destroyed_tx.send(());
     }
 

@@ -53,6 +53,9 @@ impl Model1Motor for Card {
         Ok(())
     }
     /// `motor_init` reads the card with the status function the task queries.
+    fn update_delay(&self) -> Duration {
+        Duration::ZERO
+    }
     fn take_init_status(&mut self) -> MotorStatus {
         let mut status = MotorStatus::default();
         self.poll(&AsynUser::default(), &mut status)

@@ -100,6 +100,9 @@ impl Model1Motor for Disconnected {
         *status = MotorStatus::default();
         Ok(())
     }
+    fn update_delay(&self) -> std::time::Duration {
+        std::time::Duration::ZERO
+    }
     fn take_init_status(&mut self) -> MotorStatus {
         MotorStatus::default()
     }

@@ -436,6 +436,9 @@ impl Model1Motor for Hooks {
     fn poll_failure(&self) -> PollFailure {
         PollFailure::NONE
     }
+    fn update_delay(&self) -> Duration {
+        Duration::ZERO
+    }
     fn take_init_status(&mut self) -> MotorStatus {
         MotorStatus::default()
     }

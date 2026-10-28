@@ -1,6 +1,7 @@
 //! Motor interface definitions.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use parking_lot::Mutex;
 
@@ -704,6 +705,13 @@ pub trait Model1Motor: Send + Sync {
     /// `motor_init` prepared (EA_PRESENT, GAIN_SUPPORT) with that driver's
     /// RETRY or COMM_ERR bits (drvMCDC2805.cc:236-251, :368-369).
     fn take_init_status(&mut self) -> MotorStatus;
+
+    /// The driver's `update_delay` in its motor task's `thread_args`
+    /// (motordrvCom.h:214, e.g. drvSC800.cc:139): how long after a command
+    /// the motor task waits before reading the axis's status. Zero never
+    /// waits; a nonzero delay under two sleep quanta waits two quanta
+    /// (motordrvCom.cc:207-212).
+    fn update_delay(&self) -> Duration;
 }
 
 /// [`AsynMotor::move_to_home_task`]'s work. It applies sets on the

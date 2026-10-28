@@ -10,6 +10,7 @@ use asyn_rs::user::AsynUser;
 use epics_base_rs::runtime::task::{
     StackSizeClass, ThreadPriority, block_on_sync, sleep_background, spawn_dedicated_thread,
 };
+use epics_base_rs::runtime::time::thread_sleep_quantum;
 use epics_libcom_rs::cfmt::CFloat;
 use tokio::sync::{mpsc, oneshot};
 
@@ -764,6 +765,7 @@ enum Driver {
         held: Option<Held>,
         /// The driver's [`Model1Motor::no_motion_test`].
         no_motion_test: bool,
+        status_delay: StatusDelay,
     },
 }
 
@@ -799,6 +801,45 @@ struct Held {
     count: u32,
     sender: Option<(usize, RecordId)>,
     cdir: Option<bool>,
+}
+
+/// motor_task's `status_delay`, the wake that last sent the axis a command
+/// (motordrvCom.h:161), with the task's `stale_data_max_delay`: a status
+/// read sooner than that after the command waits out the rest.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct StatusDelay {
+    /// None until a command is sent: C's calloc'd `status_delay` lies so
+    /// far back that the first read never waits.
+    sent: Option<Instant>,
+    max: Duration,
+}
+
+impl StatusDelay {
+    fn new(update_delay: Duration) -> Self {
+        let quantum = Duration::from_secs_f64(thread_sleep_quantum());
+        Self {
+            sent: None,
+            max: stale_data_max_delay(update_delay, quantum),
+        }
+    }
+
+    /// What is left of the delay at the wake `tick` (motordrvCom.cc:288-300,
+    /// :440-447).
+    fn remaining(&self, tick: Instant) -> Duration {
+        self.sent.map_or(Duration::ZERO, |sent| {
+            self.max
+                .saturating_sub(tick.saturating_duration_since(sent))
+        })
+    }
+}
+
+/// motor_task's `stale_data_max_delay` (motordrvCom.cc:207-212).
+fn stale_data_max_delay(update_delay: Duration, quantum: Duration) -> Duration {
+    if update_delay.is_zero() {
+        Duration::ZERO
+    } else {
+        update_delay.max(quantum * 2)
+    }
 }
 
 /// The record's speed write `command` on an asynMotorController axis: the
@@ -936,14 +977,15 @@ impl Axis {
     /// A model-1 axis, whose held move a [`Schedule::MotorTask`] queries.
     pub(crate) fn task(place: Place, motor: Arc<Mutex<dyn Model1Motor>>) -> Self {
         let no_motion_test = motor.lock().map_or(true, |m| m.no_motion_test());
-        let status = motor
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take_init_status();
+        let (status, update_delay) = {
+            let mut motor = motor.lock().unwrap_or_else(|e| e.into_inner());
+            (motor.take_init_status(), motor.update_delay())
+        };
         let driver = Driver::Task {
             motor,
             held: None,
             no_motion_test,
+            status_delay: StatusDelay::new(update_delay),
         };
         let mut axis = Self::with_driver(
             place,
@@ -1088,11 +1130,11 @@ impl Axis {
         })
     }
 
-    fn run_queued_commands(&mut self, controller_poll: &SharedControllerPoll) {
+    fn run_queued_commands(&mut self, controller_poll: &SharedControllerPoll, tick: Instant) {
         // A batch's driver calls take the queue's posts, setting aside the
         // batches behind them.
         while let Some((place, message)) = self.next_message() {
-            self.receive(place, message, controller_poll);
+            self.receive(place, message, controller_poll, tick);
         }
         for io_intr in self.pulses.drain(..) {
             let _ = io_intr.try_send(());
@@ -1121,12 +1163,19 @@ impl Axis {
         }
     }
 
-    /// Take one message from the queue of place `place`.
-    fn receive(&mut self, place: usize, message: ToAxis, controller_poll: &SharedControllerPoll) {
+    /// Take one message from the queue of place `place`, on the wake at
+    /// `tick`.
+    fn receive(
+        &mut self,
+        place: usize,
+        message: ToAxis,
+        controller_poll: &SharedControllerPoll,
+        tick: Instant,
+    ) {
         match message {
-            ToAxis::Batch(batch) => self.execute(place, &batch, controller_poll),
+            ToAxis::Batch(batch) => self.execute(place, &batch, controller_poll, tick),
             ToAxis::Synced(batch, ran) => {
-                self.execute(place, &batch, controller_poll);
+                self.execute(place, &batch, controller_poll, tick);
                 ran.ran();
             }
             ToAxis::Written(written) => self.take_written(written),
@@ -1169,12 +1218,21 @@ impl Axis {
     /// move wakes the poller (asynMotorController.cpp:303, :320, :336,
     /// :355). The axis's lock is held only across each driver call: a port
     /// call made under it would wait on a port thread waiting on the lock.
+    /// `tick` is the wake that runs it, a model-1 message's send time.
     fn execute(
         &mut self,
         place: usize,
         batch: &CommandBatch,
         controller_poll: &SharedControllerPoll,
+        tick: Instant,
     ) {
+        // VELOCITY, MOTION and IMMEDIATE messages set `status_delay`;
+        // MOVE_TERM and INFO do not (motordrvCom.cc:421, :438, :488).
+        if let Driver::Task { status_delay, .. } = &mut self.driver
+            && message_type(&batch.commands).is_some_and(MessageType::sets_status_delay)
+        {
+            status_delay.sent = Some(tick);
+        }
         let motor = self.driver.motor();
         let records = self.places[place].records().clone();
         let drv_port = batch
@@ -1250,6 +1308,9 @@ impl Axis {
             .flatten();
             if on_delay.is_some() {
                 self.power = Power::Moving;
+            }
+            if matches!(command, MotorCommand::Poll) {
+                self.await_fresh_status(tick);
             }
             let trace = &batch.trace;
             let mut poisoned = false;
@@ -1665,6 +1726,15 @@ impl Axis {
         polled
     }
 
+    /// A model-1 INFO's wait before it reads the status: what is left of
+    /// the update delay since the axis's last command, from the wake at
+    /// `tick` (motordrvCom.cc:440-447).
+    fn await_fresh_status(&self, tick: Instant) {
+        if let Driver::Task { status_delay, .. } = &self.driver {
+            std::thread::sleep(status_delay.remaining(tick));
+        }
+    }
+
     /// A GET_INFO's post, made even for an unchanged status: C
     /// motorUpdateStatus_ forces statusChanged_ (asynMotorController.cpp:
     /// 217-222). motor_task's INFO reports RA_DONE as whether no move is
@@ -1682,22 +1752,30 @@ impl Axis {
         self.publish_to(sender, status);
     }
 
-    /// One wake of `motor_task`, before it processes the messages: query
-    /// the held move, if any (motordrvCom.cc:244-254).
-    fn query_task(&mut self, polled: &Polled) {
+    /// One wake of `motor_task` at `tick`, before it processes the
+    /// messages: query the held move, if any (motordrvCom.cc:244-254). One
+    /// whose last command is newer than the update delay is left for later;
+    /// returns what is left of its delay (:288-300).
+    fn query_task(&mut self, polled: &Polled, tick: Instant) -> Duration {
         let Driver::Task {
             ref motor,
             held: Some(held),
+            status_delay,
             ..
         } = self.driver
         else {
-            return;
+            return Duration::ZERO;
         };
+        let remaining = status_delay.remaining(tick);
+        if !remaining.is_zero() {
+            return remaining;
+        }
         let motor = motor.clone();
         let next = self.query_held(&motor, held, polled);
         if let Driver::Task { held, .. } = &mut self.driver {
             *held = next;
         }
+        Duration::ZERO
     }
 
     /// Poll and post; returns whether the axis is moving. On a failed poll
@@ -1896,17 +1974,18 @@ impl MotorPollLoop {
     /// standing in for the poller thread. The IOC path is [`Self::start`]'s
     /// thread.
     pub fn run_queued_commands(&mut self) {
+        let tick = Instant::now();
         for axis in &mut self.axes {
-            axis.run_queued_commands(&self.controller_poll);
+            axis.run_queued_commands(&self.controller_poll, tick);
         }
     }
 
-    /// Run a batch of axis `index`'s commands and send what they posted, as
-    /// C's write ends in `pAxis->callParamCallbacks()` before its
-    /// `wakeupPoller` (asynMotorController.cpp:317-320).
-    async fn execute(&mut self, index: usize, place: usize, message: ToAxis) {
+    /// Run a batch of axis `index`'s commands on the wake at `tick` and send
+    /// what they posted, as C's write ends in `pAxis->callParamCallbacks()`
+    /// before its `wakeupPoller` (asynMotorController.cpp:317-320).
+    async fn execute(&mut self, index: usize, place: usize, message: ToAxis, tick: Instant) {
         let axis = &mut self.axes[index];
-        axis.receive(place, message, &self.controller_poll);
+        axis.receive(place, message, &self.controller_poll, tick);
         axis.send_pulses().await;
     }
 
@@ -1914,17 +1993,22 @@ impl MotorPollLoop {
         matches!(self.schedule, Schedule::MotorTask { .. })
     }
 
-    /// One wake of `motor_task`, before it processes the messages: query
-    /// each held move (motordrvCom.cc:244-254), its callback queued as its
-    /// query returns (:280-318).
-    async fn query_task(&mut self) {
+    /// One wake of `motor_task` at `tick`, before it processes the
+    /// messages: query each held move (motordrvCom.cc:244-254), its callback
+    /// queued as its query returns (:280-318). Returns the longest delay
+    /// left on a move not queried yet, C's `stale_data_delay`.
+    async fn query_task(&mut self, tick: Instant) -> Duration {
         let polled = polled::after(&self.controller_poll);
+        // C keeps only the last card's delay (motordrvCom.cc:259-260), so an
+        // earlier card's later wake is lost; here the longest stands.
+        let mut stale = Duration::ZERO;
         for axis in &mut self.axes {
-            axis.query_task(&polled);
+            stale = stale.max(axis.query_task(&polled, tick));
             axis.offer_pulses();
         }
         drop(polled);
         self.send_pulses().await;
+        stale
     }
 
     /// The pulses a pass still owes, in axis order, once the controller's
@@ -1936,12 +2020,13 @@ impl MotorPollLoop {
         }
     }
 
-    /// `motor_task`'s next timed wake, a scan period after `tick` while a
-    /// move is held, and none while idle (motordrvCom.cc:216-238).
-    fn task_due(&self, tick: Instant) -> Option<Instant> {
+    /// `motor_task`'s next timed wake while a move is held, and none while
+    /// idle: once the `stale` delay a query left has passed, else a scan
+    /// period after `tick` (motordrvCom.cc:216-238).
+    fn task_due(&self, tick: Instant, stale: Duration) -> Option<Instant> {
         match self.schedule {
             Schedule::MotorTask { scan } if self.axes.iter().any(Axis::holds_move) => {
-                Some(tick + scan)
+                Some(tick + if stale.is_zero() { scan } else { stale })
             }
             _ => None,
         }
@@ -2012,8 +2097,8 @@ impl MotorPollLoop {
             return self.poller_pass(false).await;
         }
         let tick = Instant::now();
-        self.query_task().await;
-        self.task_due(tick)
+        let stale = self.query_task(tick).await;
+        self.task_due(tick, stale)
     }
 
     /// C's timeout choice (:686-694); a zero period waits on the event alone
@@ -2105,8 +2190,8 @@ impl MotorPollLoop {
     async fn wakeup_pass(&mut self) -> Option<Instant> {
         if self.is_motor_task() {
             let tick = Instant::now();
-            self.query_task().await;
-            self.task_due(tick)
+            let stale = self.query_task(tick).await;
+            self.task_due(tick, stale)
         } else {
             self.poller_pass(true).await
         }
@@ -2146,15 +2231,15 @@ impl MotorPollLoop {
                     // One wake drains the driver's whole queue after the
                     // query (motordrvCom.cc:255, :351).
                     let tick = Instant::now();
-                    self.query_task().await;
-                    self.execute(index, place, batch).await;
+                    let stale = self.query_task(tick).await;
+                    self.execute(index, place, batch, tick).await;
                     for axis in &mut self.axes {
-                        axis.run_queued_commands(&self.controller_poll);
+                        axis.run_queued_commands(&self.controller_poll, tick);
                     }
-                    due = self.task_due(tick);
+                    due = self.task_due(tick, stale);
                 }
                 Wake::Batch(index, place, batch) => {
-                    self.execute(index, place, batch).await;
+                    self.execute(index, place, batch, Instant::now()).await;
                     if std::mem::take(&mut self.axes[index].woken) {
                         due = self.poller_pass(true).await;
                     }
@@ -2162,12 +2247,13 @@ impl MotorPollLoop {
                 Wake::Command(index, place, cmd) => match cmd {
                     Some(PollCommand::ForcePoll(requester)) if self.is_motor_task() => {
                         let tick = Instant::now();
-                        self.query_task().await;
+                        let stale = self.query_task(tick).await;
+                        self.axes[index].await_fresh_status(tick);
                         let polled = polled::after(&self.controller_poll);
                         let axis = &mut self.axes[index];
                         let status = axis.poll_result(&polled);
                         axis.publish_info(status, requester.map(|record| (place, record)));
-                        due = self.task_due(tick);
+                        due = self.task_due(tick, stale);
                     }
                     // C motorUpdateStatus_ (asynMotorController.cpp:217-221).
                     Some(PollCommand::ForcePoll(_)) => {
@@ -3218,6 +3304,71 @@ fn drive_model1(
     }
 }
 
+/// A model-1 message's motordrvCom `msg_types` (motordrvCom.h:83-90), in
+/// C's order: a transaction's type is its commands' highest
+/// (devSC800.cc:187-188).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum MessageType {
+    Immediate,
+    MoveTerm,
+    Motion,
+    Velocity,
+    Info,
+}
+
+impl MessageType {
+    /// Every C device's `msg_types` table (devSC800.cc:78-102): moves and
+    /// homes MOTION, jogs VELOCITY, STOP_AXIS MOVE_TERM, GET_INFO INFO, the
+    /// rest IMMEDIATE. None for a command that is no C message.
+    fn of(command: &MotorCommand) -> Option<Self> {
+        match command {
+            MotorCommand::MoveAbsolute { .. }
+            | MotorCommand::MoveRelative { .. }
+            | MotorCommand::Home { .. } => Some(Self::Motion),
+            MotorCommand::MoveVelocity { .. } | MotorCommand::JogVelocity { .. } => {
+                Some(Self::Velocity)
+            }
+            MotorCommand::Stop { .. } => Some(Self::MoveTerm),
+            MotorCommand::Poll => Some(Self::Info),
+            MotorCommand::SetVelocity { .. }
+            | MotorCommand::SetVelBase { .. }
+            | MotorCommand::SetAccel { .. }
+            | MotorCommand::SetPosition { .. }
+            | MotorCommand::InitPosition { .. }
+            | MotorCommand::SetEncoderRatio { .. }
+            | MotorCommand::InitEncoderRatio { .. }
+            | MotorCommand::SetClosedLoop { .. }
+            | MotorCommand::SetPidGain { .. }
+            | MotorCommand::SetHighLimit { .. }
+            | MotorCommand::SetLowLimit { .. }
+            | MotorCommand::Primitive { .. } => Some(Self::Immediate),
+            MotorCommand::OutParm { .. }
+            | MotorCommand::MoveStrings { .. }
+            | MotorCommand::MoveDirection { .. }
+            | MotorCommand::RecordFields(_)
+            | MotorCommand::Driver(_)
+            | MotorCommand::DeferMoves { .. }
+            | MotorCommand::MoveToHome
+            | MotorCommand::SetEncoderPosition { .. }
+            | MotorCommand::ProfileInitialize { .. }
+            | MotorCommand::ProfileDefine { .. }
+            | MotorCommand::ProfileBuild
+            | MotorCommand::ProfileExecute
+            | MotorCommand::ProfileAbort
+            | MotorCommand::ProfileReadback => None,
+        }
+    }
+
+    fn sets_status_delay(self) -> bool {
+        matches!(self, Self::Immediate | Self::Motion | Self::Velocity)
+    }
+}
+
+/// The type of the message a model-1 batch is, if it is one.
+fn message_type(commands: &[MotorCommand]) -> Option<MessageType> {
+    commands.iter().filter_map(MessageType::of).max()
+}
+
 /// An axis the port answers for but never created.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MissingAxis {
@@ -3684,7 +3835,7 @@ mod tests {
             }],
         };
         let controller_poll = poll_loop.controller_poll.clone();
-        poll_loop.axes[0].execute(0, &batch, &controller_poll);
+        poll_loop.axes[0].execute(0, &batch, &controller_poll, Instant::now());
         assert_eq!(reads.take(), [Some(moving)]);
     }
 
@@ -3879,6 +4030,9 @@ mod tests {
                 }
                 fn poll(&mut self, user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
                     AsynMotor::poll(self, user, status)
+                }
+                fn update_delay(&self) -> Duration {
+                    Duration::ZERO
                 }
                 fn take_init_status(&mut self) -> MotorStatus {
                     MotorStatus::default()
@@ -4799,6 +4953,7 @@ mod tests {
                     record: None,
                     commands: vec![MotorCommand::Stop { acceleration: 1.0 }],
                 }),
+                Instant::now(),
             ));
             poll_loop.axes[0].places[0].records().stamp() - seq
         };
@@ -5013,10 +5168,15 @@ mod tests {
                 commands: vec![command],
             })
         };
-        now(poll_loop.execute(0, 0, write(MotorCommand::Poll)));
+        now(poll_loop.execute(0, 0, write(MotorCommand::Poll), Instant::now()));
         assert_eq!(read(), 5.0, "GET_INFO");
         *limit.lock().unwrap() = 6.0;
-        now(poll_loop.execute(0, 0, write(MotorCommand::Stop { acceleration: 1.0 })));
+        now(poll_loop.execute(
+            0,
+            0,
+            write(MotorCommand::Stop { acceleration: 1.0 }),
+            Instant::now(),
+        ));
         assert_eq!(read(), 6.0, "write leaving the status");
         *limit.lock().unwrap() = 7.0;
         let move_to = MotorCommand::MoveAbsolute {
@@ -5025,7 +5185,7 @@ mod tests {
             velocity: 1.0,
             acceleration: 1.0,
         };
-        now(poll_loop.execute(0, 0, write(move_to)));
+        now(poll_loop.execute(0, 0, write(move_to), Instant::now()));
         assert_eq!(read(), 7.0, "write changing the status");
     }
 
@@ -5160,6 +5320,7 @@ mod tests {
                         acceleration: 1.0,
                     }],
                 }),
+                Instant::now(),
             ));
         }
 
@@ -5256,6 +5417,7 @@ mod tests {
                 record: None,
                 commands: vec![MotorCommand::Stop { acceleration: 1.0 }],
             }),
+            Instant::now(),
         ));
     }
 
@@ -5572,6 +5734,7 @@ mod tests {
                     record: None,
                     commands: vec![command],
                 }),
+                Instant::now(),
             ));
         });
         entered.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -5778,6 +5941,7 @@ mod tests {
                 record: None,
                 commands: vec![MotorCommand::Stop { acceleration: 1.0 }],
             }),
+            Instant::now(),
         ));
         assert_eq!(poll_loop.axes[0].places[0].records().stamp(), seq + 1);
         assert_eq!(poll_loop.axes[0].last_status(), fresh);
@@ -6077,6 +6241,11 @@ mod tests {
     }
 
     fn send(poll_loop: &mut MotorPollLoop, command: MotorCommand) {
+        send_at(poll_loop, command, Instant::now());
+    }
+
+    /// `command` alone, as the message the wake at `tick` processes.
+    fn send_at(poll_loop: &mut MotorPollLoop, command: MotorCommand, tick: Instant) {
         let trace = Arc::new(MotorTrace::with_user(TraceUser::Model1 {
             device: "devHeld",
             card: 0,
@@ -6090,6 +6259,7 @@ mod tests {
                 record: None,
                 commands: vec![command],
             }),
+            tick,
         ));
     }
 
@@ -6158,6 +6328,9 @@ mod tests {
         fn poll(&mut self, _: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
             *status = MotorStatus::default();
             Ok(())
+        }
+        fn update_delay(&self) -> Duration {
+            Duration::ZERO
         }
         fn take_init_status(&mut self) -> MotorStatus {
             MotorStatus::default()
@@ -6245,6 +6418,9 @@ mod tests {
         fn poll(&mut self, user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
             AsynMotor::poll(&mut self.0, user, status)
         }
+        fn update_delay(&self) -> Duration {
+            Duration::ZERO
+        }
         fn take_init_status(&mut self) -> MotorStatus {
             MotorStatus::default()
         }
@@ -6324,9 +6500,9 @@ mod tests {
     fn a_new_move_is_first_queried_a_scan_period_later() {
         let (mut poll_loop, script) = model1_task(vec![Some(at(1.0))]);
         let tick = Instant::now();
-        now(poll_loop.query_task());
+        let stale = now(poll_loop.query_task(tick));
         send_move(&mut poll_loop);
-        assert_eq!(poll_loop.task_due(tick), Some(tick + SCAN));
+        assert_eq!(poll_loop.task_due(tick, stale), Some(tick + SCAN));
         assert_eq!(script.lock().unwrap().0.len(), 1);
         assert_eq!(held(&poll_loop).map(|held| held.count), Some(0));
     }
@@ -6366,7 +6542,7 @@ mod tests {
         let (_, state, reads) = bind_accepting(&poll_loop, &trace);
         state.lock().unwrap().set_dset(MotorDset::MotordevCom);
         send_move(&mut poll_loop);
-        now(poll_loop.query_task());
+        now(poll_loop.query_task(Instant::now()));
         assert!(poll_loop.axes[0].pulses.is_empty());
         let read: Vec<_> = reads
             .take()
@@ -6421,6 +6597,189 @@ mod tests {
         send_move(&mut poll_loop);
         assert!(now(poll_loop.timed_pass()).is_some());
         assert_eq!(held(&poll_loop).map(|held| held.count), Some(0));
+    }
+
+    /// A model-1 card with update delay `.1` whose polls answer from its
+    /// script.
+    struct Delayed(Script, Duration);
+
+    impl Model1Motor for Delayed {
+        fn set_velocity(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+            Ok(())
+        }
+        fn set_vel_base(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+            Ok(())
+        }
+        fn set_accel(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+            Ok(())
+        }
+        fn move_absolute(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+            Ok(())
+        }
+        fn move_relative(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+            Ok(())
+        }
+        fn move_velocity(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+            Ok(())
+        }
+        fn home(&mut self, _: &AsynUser, _: bool) -> AsynResult<()> {
+            Ok(())
+        }
+        fn stop(&mut self, _: &AsynUser) -> AsynResult<()> {
+            Ok(())
+        }
+        fn set_position(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+            Ok(())
+        }
+        fn poll_failure(&self) -> PollFailure {
+            PollFailure::NONE
+        }
+        fn poll(&mut self, user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
+            AsynMotor::poll(&mut self.0, user, status)
+        }
+        fn take_init_status(&mut self) -> MotorStatus {
+            MotorStatus::default()
+        }
+        fn update_delay(&self) -> Duration {
+            self.1
+        }
+    }
+
+    const UPDATE_DELAY: Duration = Duration::from_secs(2);
+
+    /// A model-1 task over a [`Delayed`] card with [`UPDATE_DELAY`].
+    fn delayed_task(script: Vec<Option<MotorStatus>>) -> (MotorPollLoop, Arc<Mutex<Delayed>>) {
+        let card = Arc::new(Mutex::new(Delayed(Script(script.into()), UPDATE_DELAY)));
+        (model1_task_on(card.clone()), card)
+    }
+
+    fn status_delay(poll_loop: &MotorPollLoop) -> StatusDelay {
+        let Driver::Task { status_delay, .. } = poll_loop.axes[0].driver else {
+            unreachable!()
+        };
+        status_delay
+    }
+
+    fn polls_left(card: &Mutex<Delayed>) -> usize {
+        card.lock().unwrap().0.0.len()
+    }
+
+    // motordrvCom.cc:421, :438, :488.
+    #[test]
+    fn an_immediate_motion_or_velocity_message_sets_the_status_delay() {
+        for command in [
+            MotorCommand::SetPosition { position: 1.0 },
+            MotorCommand::MoveAbsolute {
+                position: 5.0,
+                min_velocity: 0.0,
+                velocity: 1.0,
+                acceleration: 1.0,
+            },
+            MotorCommand::JogVelocity {
+                min_velocity: 0.0,
+                velocity: 1.0,
+                acceleration: 1.0,
+            },
+        ] {
+            let (mut poll_loop, _) = delayed_task(vec![]);
+            let tick = Instant::now();
+            send_at(&mut poll_loop, command.clone(), tick);
+            assert_eq!(status_delay(&poll_loop).sent, Some(tick), "{command:?}");
+        }
+    }
+
+    // MOVE_TERM sends and frees the message, leaving `status_delay`
+    // (motordrvCom.cc:474-481).
+    #[test]
+    fn a_stop_leaves_the_status_delay() {
+        let (mut poll_loop, _) = delayed_task(vec![]);
+        let sent = Instant::now();
+        send_at(
+            &mut poll_loop,
+            MotorCommand::SetPosition { position: 1.0 },
+            sent,
+        );
+        send_at(
+            &mut poll_loop,
+            MotorCommand::Stop { acceleration: 1.0 },
+            sent + UPDATE_DELAY / 2,
+        );
+        assert_eq!(status_delay(&poll_loop).sent, Some(sent));
+    }
+
+    // INFO sleeps `max_delay - delay`, the delay counted to its wake
+    // (motordrvCom.cc:440-447).
+    #[test]
+    fn an_info_waits_only_what_is_left_of_the_delay() {
+        let (mut poll_loop, card) = delayed_task(vec![Some(at(1.0))]);
+        let sent = Instant::now();
+        send_at(
+            &mut poll_loop,
+            MotorCommand::SetPosition { position: 1.0 },
+            sent,
+        );
+        let left = Duration::from_millis(100);
+        let started = Instant::now();
+        send_at(
+            &mut poll_loop,
+            MotorCommand::Poll,
+            sent + UPDATE_DELAY - left,
+        );
+        let waited = started.elapsed();
+        assert!(waited >= left, "{waited:?}");
+        assert!(waited < UPDATE_DELAY / 2, "{waited:?}");
+        assert_eq!(polls_left(&card), 0);
+        assert_eq!(status_delay(&poll_loop).sent, Some(sent), "INFO sets none");
+    }
+
+    // query_axis leaves a held move read too soon and returns the rest of
+    // the delay, motor_task's next wait (motordrvCom.cc:220-224, :288-300).
+    #[test]
+    fn a_held_move_is_queried_once_its_delay_has_passed() {
+        let (mut poll_loop, card) = delayed_task(vec![Some(at(1.0))]);
+        let sent = Instant::now();
+        send_at(
+            &mut poll_loop,
+            MotorCommand::MoveAbsolute {
+                position: 5.0,
+                min_velocity: 0.0,
+                velocity: 1.0,
+                acceleration: 1.0,
+            },
+            sent,
+        );
+        let early = sent + SCAN / 4;
+        let stale = now(poll_loop.query_task(early));
+        assert_eq!(stale, UPDATE_DELAY - SCAN / 4);
+        assert_eq!(poll_loop.task_due(early, stale), Some(sent + UPDATE_DELAY));
+        assert_eq!(polls_left(&card), 1);
+        let due = sent + UPDATE_DELAY;
+        assert_eq!(now(poll_loop.query_task(due)), Duration::ZERO);
+        assert_eq!(polls_left(&card), 0);
+        assert_eq!(poll_loop.axes[0].last_status(), at(1.0));
+    }
+
+    // stale_data_max_delay is 0 for an update_delay of 0
+    // (motordrvCom.cc:207-208): a held move is read on the wake that sent it.
+    #[test]
+    fn a_zero_update_delay_never_waits() {
+        let card = Delayed(Script(vec![Some(at(1.0))].into()), Duration::ZERO);
+        let mut poll_loop = model1_task_on(Arc::new(Mutex::new(card)));
+        let tick = Instant::now();
+        send_move(&mut poll_loop);
+        assert_eq!(status_delay(&poll_loop).max, Duration::ZERO);
+        assert_eq!(now(poll_loop.query_task(tick)), Duration::ZERO);
+        assert_eq!(poll_loop.axes[0].last_status(), at(1.0));
+    }
+
+    // motordrvCom.cc:209-212.
+    #[test]
+    fn an_update_delay_under_two_quanta_waits_two() {
+        let quantum = Duration::from_millis(10);
+        let max = |update_delay| stale_data_max_delay(update_delay, quantum);
+        assert_eq!(max(Duration::from_millis(5)), quantum * 2);
+        assert_eq!(max(quantum * 2), quantum * 2);
+        assert_eq!(max(Duration::from_millis(30)), Duration::from_millis(30));
     }
 
     /// A poller at rest whose polls answer from `script`, with distinct
@@ -6589,6 +6948,7 @@ mod tests {
                 velocity: 1.0,
                 acceleration: 1.0,
             }])),
+            Instant::now(),
         ));
         for (want, word) in [(hit, 1029), (back, 1028)] {
             assert!(now(poll_loop.timed_pass()).is_some());
@@ -6660,6 +7020,7 @@ mod tests {
                 velocity: 1.0,
                 acceleration: 1.0,
             }])),
+            Instant::now(),
         ));
         assert_eq!(poll_loop.axes[0].places[0].records().stamp(), seq + 1);
         assert_eq!(
@@ -6763,6 +7124,7 @@ mod tests {
             0,
             0,
             ToAxis::from(interface_batch(vec![MotorCommand::Poll])),
+            Instant::now(),
         ));
         assert_eq!(
             script.lock().unwrap().0.len(),

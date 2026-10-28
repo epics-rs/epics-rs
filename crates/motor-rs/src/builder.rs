@@ -730,6 +730,9 @@ mod tests {
         fn poll(&mut self, user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
             AsynMotor::poll(self, user, status)
         }
+        fn update_delay(&self) -> Duration {
+            Duration::ZERO
+        }
         fn take_init_status(&mut self) -> MotorStatus {
             MotorStatus::default()
         }

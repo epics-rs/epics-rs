@@ -110,6 +110,9 @@ impl Model1Motor for Card {
         })?;
         Ok(())
     }
+    fn update_delay(&self) -> Duration {
+        Duration::ZERO
+    }
     fn take_init_status(&mut self) -> MotorStatus {
         self.init.take().expect("taken once")
     }

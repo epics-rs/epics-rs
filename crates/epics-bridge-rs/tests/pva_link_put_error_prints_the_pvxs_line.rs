@@ -10,9 +10,9 @@ mod common;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use common::{CHILD, Shell, signal, spawn_ioc};
+use common::{CHILD, Shell, spawn_ioc, stop};
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
 use epics_pva_rs::server_native::{PvaServer, SharedPV, SharedSource};
 use named_port::HeldPort;
@@ -85,27 +85,16 @@ fn a_refused_pva_link_put_prints_the_pvxs_line() {
             .map(str::to_string)
             .collect()
     };
-    let mut sh = Shell {
-        stdin: ioc.stdin.take().unwrap(),
-        dir: dir.path(),
-        tag: "p",
-        n: 0,
-    };
-    let wait_for = |n: usize| {
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while put_lines().len() < n && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    };
+    let mut sh = Shell::new(&mut ioc, dir.path(), "local");
 
     sh.capture_until("dbjlr O 0", "conn=T");
     sh.line("dbpf O 5");
-    wait_for(1);
+    sh.wait_until(|| !put_lines().is_empty());
     sh.line("dbpf F.PROC 1");
-    wait_for(2);
+    sh.wait_until(|| put_lines().len() >= 2);
 
     sh.capture_until("dbjlr WR 0", "conn=T");
-    signal(&remote, "-STOP");
+    stop(&remote);
     sh.line("dbpf WR 5");
     sh.line("dbpf WRT 6");
     sh.capture_until("dbjlr WR 0", "conn=T Put");

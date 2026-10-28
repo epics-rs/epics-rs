@@ -6,11 +6,15 @@ use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use named_port::HeldPort;
 
 pub const CHILD: &str = "PVA_IOC_SHELL_CHILD_STCMD";
+
+/// The prompt a piped shell prints before each line it reads, pinned so
+/// their count in `{name}.out` is one more than the lines it has finished.
+const PROMPT: &str = "epics> ";
 
 /// The child half; a no-op unless the parent set [`CHILD`].
 pub fn ioc_child() {
@@ -54,6 +58,7 @@ pub fn spawn_ioc(dir: &Path, name: &str, db: &str, port: &HeldPort, servers: &st
         .env("EPICS_PVA_ADDR_LIST", "")
         .env("EPICS_PVA_AUTO_ADDR_LIST", "NO")
         .env("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1")
+        .env("IOCSH_PS1", PROMPT)
         .stdin(Stdio::piped())
         .stdout(log("out"))
         .stderr(log("err"))
@@ -69,45 +74,103 @@ pub fn signal(child: &Child, sig: &str) {
     assert!(status.success(), "kill {sig}");
 }
 
-/// An IOC's shell: types a line, and reads back a report.
-pub struct Shell<'a> {
-    pub stdin: ChildStdin,
-    pub dir: &'a Path,
-    pub tag: &'a str,
-    pub n: usize,
+/// SIGSTOPs `child` and returns once it has stopped. kill(2) returns with
+/// the signal only queued, and the threads it did not wake run on until the
+/// one it woke gets a CPU: under load, long enough to answer the next put.
+pub fn stop(child: &Child) {
+    signal(child, "-STOP");
+    let (pid, mut status) = (child.id() as libc::pid_t, 0);
+    // SAFETY: `child` is this process's child, and a stopped child is not
+    // reaped, so its `Child` still waits on it.
+    let got = unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) };
+    assert!(
+        got == pid && libc::WIFSTOPPED(status),
+        "stop {pid}: waitpid {got}, status {status:#x}"
+    );
 }
 
-impl Shell<'_> {
-    pub fn line(&mut self, line: &str) {
-        writeln!(self.stdin, "{line}").unwrap();
-        self.stdin.flush().unwrap();
+/// An IOC's shell: types a line, and reads back a report.
+///
+/// Every wait ends on what the child reports, or on its exit, and none on a
+/// clock: one started at the typing would also run through the child's
+/// boot, and under load a slow boot read as a command that never ran. A
+/// hang is nextest's to time out.
+pub struct Shell<'a> {
+    child: &'a mut Child,
+    stdin: ChildStdin,
+    dir: &'a Path,
+    name: &'a str,
+    typed: usize,
+    captures: usize,
+}
+
+impl<'a> Shell<'a> {
+    /// The shell of `child`, spawned by [`spawn_ioc`] as `name` in `dir`.
+    pub fn new(child: &'a mut Child, dir: &'a Path, name: &'a str) -> Self {
+        let stdin = child.stdin.take().unwrap();
+        Self {
+            child,
+            stdin,
+            dir,
+            name,
+            typed: 0,
+            captures: 0,
+        }
     }
 
-    /// `cmd > f`, then `f` once the shell has written it.
-    pub fn capture(&mut self, cmd: &str) -> String {
-        self.n += 1;
-        let f = self.dir.join(format!("{}{}.txt", self.tag, self.n));
-        // quoted: outside a quote iocsh takes a Windows path's `\` as an escape
-        self.line(&format!("{cmd} > \"{}\"", f.display()));
-        let deadline = Instant::now() + Duration::from_secs(20);
+    pub fn line(&mut self, line: &str) {
+        // A shell no longer reading has exited: report that, not the pipe.
+        if writeln!(self.stdin, "{line}")
+            .and_then(|()| self.stdin.flush())
+            .is_err()
+        {
+            self.wait_until(|| false);
+        }
+        self.typed += 1;
+    }
+
+    /// Polls `done` until it holds. A child that exits first fails the
+    /// test, as what it wrote before exiting is all there will be.
+    pub fn wait_until(&mut self, mut done: impl FnMut() -> bool) {
         loop {
-            if let Ok(text) = std::fs::read_to_string(&f)
-                && text.ends_with('\n')
-            {
-                return text;
+            let exited = self.child.try_wait().unwrap();
+            if done() {
+                return;
             }
-            assert!(Instant::now() < deadline, "{cmd} never ran");
+            if let Some(status) = exited {
+                panic!("the {} IOC exited, {status}\n{}", self.name, self.console());
+            }
             std::thread::sleep(Duration::from_millis(20));
         }
     }
 
-    /// [`Self::capture`] repeated until `done` holds for it.
+    /// `cmd > f`, then `f` once the shell has finished the line.
+    pub fn capture(&mut self, cmd: &str) -> String {
+        self.captures += 1;
+        let f = self.dir.join(format!("{}{}.txt", self.name, self.captures));
+        // quoted: outside a quote iocsh takes a Windows path's `\` as an escape
+        self.line(&format!("{cmd} > \"{}\"", f.display()));
+        let (out, prompts) = (self.dir.join(format!("{}.out", self.name)), self.typed + 1);
+        self.wait_until(|| {
+            let out = std::fs::read(&out).unwrap_or_default();
+            String::from_utf8_lossy(&out).matches(PROMPT).count() >= prompts
+        });
+        std::fs::read_to_string(&f).unwrap_or_else(|e| panic!("{cmd}: {e}\n{}", self.console()))
+    }
+
+    /// [`Self::capture`] repeated until `done` holds for it. Each report
+    /// that differs from the last goes to stderr, for a test nextest times
+    /// out on.
     pub fn capture_when(&mut self, cmd: &str, done: impl Fn(&str) -> bool) -> String {
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut last = String::new();
         loop {
             let text = self.capture(cmd);
-            if done(&text) || Instant::now() > deadline {
+            if done(&text) {
                 return text;
+            }
+            if text != last {
+                epics_base_rs::stderr_print!("{cmd}:\n{text}");
+                last = text;
             }
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -116,5 +179,14 @@ impl Shell<'_> {
     /// [`Self::capture`] repeated until it ends in `tail`.
     pub fn capture_until(&mut self, cmd: &str, tail: &str) -> String {
         self.capture_when(cmd, |text| text.ends_with(&format!("{tail}\n")))
+    }
+
+    /// The child's stderr, then its stdout, as written so far.
+    fn console(&self) -> String {
+        let read = |ext: &str| {
+            std::fs::read_to_string(self.dir.join(format!("{}.{ext}", self.name)))
+                .unwrap_or_default()
+        };
+        format!("stderr:\n{}\nstdout:\n{}", read("err"), read("out"))
     }
 }

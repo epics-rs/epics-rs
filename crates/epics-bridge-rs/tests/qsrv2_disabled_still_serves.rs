@@ -11,7 +11,6 @@
 
 use std::io::Write;
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
 
 const CHILD: &str = "QSRV2_OFF_CHILD_STCMD";
 
@@ -78,14 +77,7 @@ record(ai, "LNK") { field(INP, {pva:"XA"}) field(SCAN, "1 second") }
     let mut stdin = child.stdin.take().unwrap();
     let _ = stdin.write_all(input);
     drop(stdin);
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while child.try_wait().unwrap().is_none() {
-        if Instant::now() > deadline {
-            let _ = child.kill();
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    // The shell exits at `exit` or EOF; a clock would cut a slow one short.
     let out = child.wait_with_output().unwrap();
     let (stdout, stderr) = (
         String::from_utf8_lossy(&out.stdout).into_owned(),

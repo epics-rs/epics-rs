@@ -30,7 +30,7 @@
 
 mod common;
 
-use common::{CHILD, Shell, signal, spawn_ioc};
+use common::{CHILD, Shell, signal, spawn_ioc, stop};
 use named_port::HeldPort;
 
 /// The child half; a no-op unless the parent set [`CHILD`].
@@ -90,12 +90,7 @@ fn dbjlr_prints_the_pvxs_pva_report() {
             remote_port.port, local_port.port, late_port.port
         ),
     );
-    let mut sh = Shell {
-        stdin: local.stdin.take().unwrap(),
-        dir: dir.path(),
-        tag: "r",
-        n: 0,
-    };
+    let mut sh = Shell::new(&mut local, dir.path(), "local");
     let q4 = "Q=4 pipe=F defer=F time=F retry=F atomic=F morder=0";
 
     let wr = sh.report_until("WR", 1, "conn=T #disconn=0");
@@ -108,7 +103,7 @@ fn dbjlr_prints_the_pvxs_pva_report() {
     sh.line("dbpf O 3");
     let o1 = sh.report_until("O", 1, "conn=T #disconn=0");
 
-    signal(&remote, "-STOP");
+    stop(&remote);
     sh.line("dbpf WR 5");
     sh.line("dbpf WT 6");
     let wr_put = sh.report_until("WR", 1, "conn=T Put #disconn=0");
@@ -119,7 +114,7 @@ fn dbjlr_prints_the_pvxs_pva_report() {
     signal(&remote, "-CONT");
     let wr_done = sh.report_until("WR", 1, "conn=T #disconn=0");
 
-    signal(&remote, "-STOP");
+    stop(&remote);
     sh.line("dbpf WRT 8");
     let wrt_put = sh.report_until("WRT", 1, "conn=T Put #disconn=0");
     remote.kill().unwrap();
@@ -129,12 +124,7 @@ fn dbjlr_prints_the_pvxs_pva_report() {
     let wrt_gone = sh.report_until("WRT", 1, "conn=F #disconn=1");
 
     let mut late = spawn_ioc(dir.path(), "late", LATE, &late_port, "");
-    let mut late_sh = Shell {
-        stdin: late.stdin.take().unwrap(),
-        dir: dir.path(),
-        tag: "l",
-        n: 0,
-    };
+    let mut late_sh = Shell::new(&mut late, dir.path(), "late");
     let wt_back = sh.report_until("WT", 1, "conn=T #disconn=0");
     let nope_y = late_sh.capture_until("dbgf NOPE:Y", "DBF_DOUBLE:         6         ");
     late_sh.line("exit");

@@ -4959,20 +4959,37 @@ mod tests {
     }
 
     /// `MissedTickBehavior::Burst`: deadlines stay anchored at construction,
-    /// so after a stall every overdue tick is ready at once, not re-spaced a
-    /// period from now.
+    /// so after a stall every overdue tick is due at once, not re-spaced a
+    /// period from now. Due, not ready: a lapsed background `Sleep` yields its
+    /// first poll with a wake of its own, so no tick waits on the timer.
     #[test]
     fn an_interval_bursts_to_catch_up_after_a_stall() {
-        let mut cx = Context::from_waker(Waker::noop());
+        struct Wakes(std::sync::atomic::AtomicUsize);
+        impl Wake for Wakes {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let wakes = Arc::new(Wakes(std::sync::atomic::AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&wakes));
+        let mut cx = Context::from_waker(&waker);
         let period = Duration::from_millis(50);
         let mut every = interval(Period::new(period).unwrap());
         assert!(Box::pin(every.tick()).as_mut().poll(&mut cx).is_ready());
         std::thread::sleep(8 * period);
         for n in 1..=4 {
-            assert!(
-                Box::pin(every.tick()).as_mut().poll(&mut cx).is_ready(),
-                "overdue tick {n} waited"
-            );
+            let mut tick = Box::pin(every.tick());
+            if tick.as_mut().poll(&mut cx).is_pending() {
+                assert_eq!(
+                    wakes.0.swap(0, std::sync::atomic::Ordering::SeqCst),
+                    1,
+                    "overdue tick {n} waits on the timer"
+                );
+                assert!(
+                    tick.as_mut().poll(&mut cx).is_ready(),
+                    "overdue tick {n} waited"
+                );
+            }
         }
     }
 

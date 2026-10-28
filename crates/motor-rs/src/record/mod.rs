@@ -533,7 +533,35 @@ impl MotorRecord {
         {
             self.limits.lvio = 1;
         }
+        // The closing monitor() (747) moves MLST/ALST to the init readback.
+        let _ = self.rbv_deadband();
         let _ = self.take_monitor_marks();
+    }
+
+    /// C `monitor()`'s RBV block (motorRecord.cc:3468-3507): the value and
+    /// archive classes RBV posts with, consuming its mark and moving the
+    /// record's own MLST/ALST on a crossing.
+    fn rbv_deadband(&mut self) -> (bool, bool) {
+        let marked = self.internal.mmap & m::RBV as u32 != 0;
+        self.unmark(m::RBV);
+        let (mdel, adel, rbv) = (self.disp.mdel, self.disp.adel, self.pos.rbv);
+        let crossed = |del: f64, last: &mut f64| {
+            del == 0.0
+                || ((*last - rbv).abs() > del && {
+                    *last = rbv;
+                    true
+                })
+        };
+        if !marked {
+            (false, false)
+        } else if mdel == 0.0 && adel == 0.0 {
+            (true, true)
+        } else {
+            (
+                crossed(mdel, &mut self.disp.mlst),
+                crossed(adel, &mut self.disp.alst),
+            )
+        }
     }
 
     /// The marks `monitor()` posts from, cleared as its `UNMARK_ALL` does
@@ -910,27 +938,7 @@ impl Record for MotorRecord {
         _gate: MonitorValueGate,
         last_posted: &mut [f64; 2],
     ) -> MonitorValueClasses {
-        let marked = self.internal.mmap & m::RBV as u32 != 0;
-        self.unmark(m::RBV);
-        let (mdel, adel, rbv) = (self.disp.mdel, self.disp.adel, self.pos.rbv);
-        let crossed = |del: f64, last: &mut f64| {
-            del == 0.0
-                || ((*last - rbv).abs() > del && {
-                    *last = rbv;
-                    true
-                })
-        };
-        let (value, archive) = if !marked {
-            (false, false)
-        } else if mdel == 0.0 && adel == 0.0 {
-            (true, true)
-        } else {
-            // C reads and writes the record's own MLST/ALST.
-            (
-                crossed(mdel, &mut self.disp.mlst),
-                crossed(adel, &mut self.disp.alst),
-            )
-        };
+        let (value, archive) = self.rbv_deadband();
         *last_posted = [self.disp.mlst, self.disp.alst];
         MonitorValueClasses {
             value,
@@ -1468,6 +1476,39 @@ mod tests {
         rec.post_init_finalize_undef(&mut 1).unwrap();
         assert!(rec.ctrl.cnen, "CNEN follows EA_POSITION at init");
         assert_eq!(rec.internal.mmap, 0, "init monitor() drains the marks");
+    }
+
+    /// An idle record at dial 0 with OFF -0.49, through init's closing
+    /// monitor().
+    fn init_at_offset(mdel: f64, adel: f64) -> MotorRecord {
+        let mut rec = MotorRecord::new();
+        rec.pos.off = -0.49;
+        rec.disp.mdel = mdel;
+        rec.disp.adel = adel;
+        rec.init_record(1).unwrap();
+        rec.initial_readback(&asyn_rs::interfaces::motor::MotorStatus {
+            done: true,
+            ..Default::default()
+        });
+        rec.post_init_finalize_undef(&mut 1).unwrap();
+        rec
+    }
+
+    // C init_record's closing monitor() runs the RBV deadband (3482-3501):
+    // the init readback crossing MDEL or ADEL becomes MLST or ALST.
+    #[test]
+    fn init_monitor_moves_mlst_and_alst_to_the_readback() {
+        let rec = init_at_offset(0.001, 0.0);
+        assert_eq!((rec.disp.mlst, rec.disp.alst), (-0.49, 0.0));
+        let rec = init_at_offset(0.0, 0.001);
+        assert_eq!((rec.disp.mlst, rec.disp.alst), (0.0, -0.49));
+    }
+
+    // With both deadbands 0 C posts RBV without touching MLST/ALST (3468-3474).
+    #[test]
+    fn init_monitor_without_deadbands_leaves_mlst_and_alst() {
+        let rec = init_at_offset(0.0, 0.0);
+        assert_eq!((rec.disp.mlst, rec.disp.alst), (0.0, 0.0));
     }
 
     // C leaves udf TRUE for a non-CONSTANT .dol (init_record only clears for

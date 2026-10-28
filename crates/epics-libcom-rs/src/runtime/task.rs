@@ -724,6 +724,27 @@ pub async fn sleep_background(duration: Duration) {
     crate::runtime::background::timer_sleep::sleep(&background().timer().handle(), duration).await;
 }
 
+/// Resume the running [`spawn_background`] task from the tail of its band,
+/// `delay` from now — C `callbackRequestDelayed`, or `callbackRequest` for a
+/// zero delay, of the running callback from its own body
+/// (`seqRecord.c:211-215`). It runs again only after every request queued
+/// before it, through the band exactly once: a delay that lapses before its
+/// timer arms, which [`sleep_background`] completes inline, requeues instead.
+///
+/// Not [`yield_now`]: on the tokio backend that defers to tokio's scheduler,
+/// whereas this is the band's FIFO on either backend.
+pub async fn requeue_background(delay: Duration) {
+    if !delay.is_zero() {
+        let mut sleep = std::pin::pin!(sleep_background(delay));
+        let armed = std::future::poll_fn(|cx| Poll::Ready(sleep.as_mut().poll(cx).is_pending()));
+        if armed.await {
+            // The timer's wake is the band request.
+            return sleep.await;
+        }
+    }
+    YieldNow(false).await;
+}
+
 /// Periodic ticker on the process-global delayed-callback timer — the
 /// [`interval`] counterpart for work spawned by [`spawn_background`].
 pub fn interval_background(period: Duration) -> crate::runtime::background::TimerInterval {
@@ -913,20 +934,23 @@ pub async fn yield_now() {
 /// scheduling point, which is all `yield_now` promises.
 #[cfg(exec_backend)]
 pub async fn yield_now() {
-    struct YieldNow(bool);
-    impl Future for YieldNow {
-        type Output = ();
-        fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-            if self.0 {
-                Poll::Ready(())
-            } else {
-                self.0 = true;
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
+    YieldNow(false).await;
+}
+
+/// `Pending` once with the waker already woken.
+struct YieldNow(bool);
+
+impl Future for YieldNow {
+    type Output = ();
+    fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if self.0 {
+            Poll::Ready(())
+        } else {
+            self.0 = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
         }
     }
-    YieldNow(false).await;
 }
 
 /// Run a blocking closure on a worker thread.
@@ -4281,6 +4305,38 @@ mod tests {
             timeout(Duration::from_secs(3), ran).await.unwrap().unwrap(),
             5
         );
+    }
+
+    /// A requeued band task resumes behind what was queued meanwhile, for a
+    /// zero delay and for a positive one, lapsed before its timer arms or not.
+    #[epics_macros_rs::epics_test]
+    async fn requeue_background_resumes_behind_the_band() {
+        for delay in [
+            Duration::ZERO,
+            Duration::from_nanos(1),
+            Duration::from_millis(5),
+        ] {
+            let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let log = Arc::clone(&order);
+            let walk = spawn_background(CallbackPriority::Low, async move {
+                log.lock().unwrap().push("first");
+                let other = Arc::clone(&log);
+                drop(spawn_background(CallbackPriority::Low, async move {
+                    other.lock().unwrap().push("queued");
+                }));
+                requeue_background(delay).await;
+                log.lock().unwrap().push("second");
+            });
+            timeout(Duration::from_secs(3), walk)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                *order.lock().unwrap(),
+                ["first", "queued", "second"],
+                "{delay:?}"
+            );
+        }
     }
 
     /// A process that never started a runtime still gets a blocking pool.

@@ -5254,14 +5254,13 @@ impl PvDatabase {
                 // Ported one-for-one: PACT here, the group walk on a task that
                 // re-takes THIS record's L1 gate per group, and
                 // `complete_async_in` as `asyncFinish` inside the last
-                // group's gate. `spawn_background`
-                // is the callback pool (`callbackRequest`) and
-                // `sleep_background` its delayed timer
-                // (`callbackRequestDelayed`), so the DLY test belongs inside
-                // the walk — where it already is — and not on the decision to
-                // go async at all. Which of the three queues that walk runs on
-                // is C `seqRecord.c:145-146`, re-read at the top of every
-                // `process()` — "Set callback from PRIO",
+                // group's gate. The walk task is `pcb->callback`: its spawn
+                // is the first group's `callbackRequest`, and each later
+                // group's is a `requeue_background` to the band's tail after
+                // its DLY — so another record's groups queued meanwhile run
+                // between two of this one's, as on C. Which of the three
+                // queues that walk runs on is C `seqRecord.c:145-146`, re-read
+                // at the top of every `process()` — "Set callback from PRIO",
                 // `callbackSetPriority(prec->prio, &pcb->callback)` — so the
                 // band is taken here, under the same write lock that sets PACT.
                 if !active.is_empty() {
@@ -5276,12 +5275,14 @@ impl PvDatabase {
                     crate::runtime::task::spawn_background(prio, async move {
                         let last = active.len() - 1;
                         for (index, grp) in active.iter().enumerate() {
-                            let dly = grp.dly;
-                            if dly > 0.0 {
-                                crate::runtime::task::sleep_background(
-                                    crate::runtime::time::duration_from_secs(dly),
-                                )
-                                .await;
+                            let delay = if grp.dly > 0.0 {
+                                crate::runtime::time::duration_from_secs(grp.dly)
+                            } else {
+                                std::time::Duration::ZERO
+                            };
+                            // The spawn is the first group's request.
+                            if index > 0 || !delay.is_zero() {
+                                crate::runtime::task::requeue_background(delay).await;
                             }
                             // C `processCallback`'s `dbScanLock` /
                             // `dbScanUnlock` pair (`seqRecord.c:252`, `:274`)
@@ -5351,12 +5352,11 @@ impl PvDatabase {
     /// (`seqRecord.c:243-274`), minus the `dbScanLock`/`dbScanUnlock` pair the
     /// caller owns.
     ///
-    /// The two callers differ only in who holds the record's gate: the
-    /// zero-delay walk runs inside the processing cycle that already holds it,
-    /// the delayed chain re-takes it per group. Both read the record's PENDING
-    /// alarm HERE rather than once per dispatch, because C's `dbPutLink` reads
-    /// `psrce->nsta/nsev` at put time (`dbDbLink.c:382-383`) — so a group whose
-    /// LNKn put failed propagates that LINK_ALARM into the NEXT group's target.
+    /// The group walk re-takes the record's gate per group, and reads the
+    /// record's PENDING alarm HERE rather than once per dispatch, because C's
+    /// `dbPutLink` reads `psrce->nsta/nsev` at put time (`dbDbLink.c:382-383`)
+    /// — so a group whose LNKn put failed propagates that LINK_ALARM into the
+    /// NEXT group's target.
     fn seq_group_step(&self, rec: InFrame<'_>, grp: &SeqGroup, visited: &mut ProcStack) {
         let idx = grp.idx;
         let lnk_real = Self::seq_link_is_real(&grp.lnk);

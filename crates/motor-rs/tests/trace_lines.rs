@@ -855,6 +855,9 @@ impl motor_rs::controller_port::WriteHook for OwnGain {
 struct OwnGainParams;
 
 impl motor_rs::controller_port::ControllerParams for OwnGainParams {
+    const INTERFACE_MASK: asyn_rs::port::InterfaceMask = asyn_rs::port::InterfaceMask::NONE;
+    const INTERRUPT_MASK: asyn_rs::port::InterfaceMask = asyn_rs::port::InterfaceMask::NONE;
+
     fn write_hook(&self) -> Option<Arc<dyn motor_rs::controller_port::WriteHook>> {
         Some(Arc::new(OwnGain))
     }

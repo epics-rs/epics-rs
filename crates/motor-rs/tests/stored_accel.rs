@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use asyn_rs::error::{AsynError, AsynResult, AsynStatus};
 use asyn_rs::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
-use asyn_rs::port::PortDriverBase;
+use asyn_rs::port::{InterfaceMask, PortDriverBase};
 use asyn_rs::port_handle::PortHandle;
 use asyn_rs::registry::open_owner;
 use asyn_rs::user::AsynUser;
@@ -201,6 +201,9 @@ fn a_skipped_acceleration_runs_on_one_the_port_wrote() {
 struct SlowOnly;
 
 impl ControllerParams for SlowOnly {
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::NONE;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::NONE;
+
     fn write_float64(
         &mut self,
         _: &mut PortDriverBase,
@@ -263,6 +266,9 @@ fn a_record_stop_runs_on_the_last_stored_acceleration() {
 struct AccelWrites(Arc<Mutex<u32>>);
 
 impl ControllerParams for AccelWrites {
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::NONE;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::NONE;
+
     fn write_float64(&mut self, _: &mut PortDriverBase, user: AxisUser<'_>, _: f64) -> ParamWrite {
         if user.reason == index::ACCEL {
             *self.0.lock().unwrap() += 1;

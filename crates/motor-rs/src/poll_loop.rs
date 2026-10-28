@@ -3701,6 +3701,9 @@ mod tests {
     struct Hooked;
 
     impl crate::controller_port::ControllerParams for Hooked {
+        const INTERFACE_MASK: asyn_rs::port::InterfaceMask = asyn_rs::port::InterfaceMask::NONE;
+        const INTERRUPT_MASK: asyn_rs::port::InterfaceMask = asyn_rs::port::InterfaceMask::NONE;
+
         fn write_hook(&self) -> Option<Arc<dyn crate::controller_port::WriteHook>> {
             Some(Arc::new(CountingHook::default()))
         }
@@ -5264,6 +5267,9 @@ mod tests {
     struct Own;
 
     impl crate::controller_port::ControllerParams for Own {
+        const INTERFACE_MASK: asyn_rs::port::InterfaceMask = asyn_rs::port::InterfaceMask::NONE;
+        const INTERRUPT_MASK: asyn_rs::port::InterfaceMask = asyn_rs::port::InterfaceMask::NONE;
+
         fn create_params(&mut self, base: &mut asyn_rs::port::PortDriverBase) -> AsynResult<()> {
             base.create_param("OWN", asyn_rs::param::ParamType::Int32)?;
             Ok(())

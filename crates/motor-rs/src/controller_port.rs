@@ -375,8 +375,31 @@ pub trait WriteHook: Send + Sync + 'static {
     }
 }
 
+/// The interfaces `asynMotorController` ORs into its subclass's
+/// (asynMotorController.cpp:48).
+pub const CONTROLLER_INTERFACES: InterfaceMask = InterfaceMask::OCTET
+    .or(InterfaceMask::INT32)
+    .or(InterfaceMask::FLOAT64)
+    .or(InterfaceMask::FLOAT64_ARRAY)
+    .or(InterfaceMask::GENERIC_POINTER)
+    .or(InterfaceMask::DRV_USER);
+
+/// The interrupts `asynMotorController` ORs into its subclass's
+/// (asynMotorController.cpp:49).
+pub const CONTROLLER_INTERRUPTS: InterfaceMask = InterfaceMask::OCTET
+    .or(InterfaceMask::INT32)
+    .or(InterfaceMask::FLOAT64)
+    .or(InterfaceMask::FLOAT64_ARRAY)
+    .or(InterfaceMask::GENERIC_POINTER);
+
 /// What a C `asynMotorController` subclass adds to the base port.
 pub trait ControllerParams: Send + Sync + 'static {
+    /// The `interfaceMask` / `interruptMask` the C subclass hands its
+    /// `asynMotorController` constructor. No default, as C's constructor
+    /// argument has none.
+    const INTERFACE_MASK: InterfaceMask;
+    const INTERRUPT_MASK: InterfaceMask;
+
     /// The subclass constructor's `createParam` calls, after the base's.
     fn create_params(&mut self, _base: &mut PortDriverBase) -> AsynResult<()> {
         Ok(())
@@ -581,8 +604,12 @@ impl ControllerReport<'_> {
     }
 }
 
-/// A controller with no parameters of its own.
-impl ControllerParams for () {}
+/// A controller with no parameters of its own, whose C constructor passes
+/// masks of 0.
+impl ControllerParams for () {
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::NONE;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::NONE;
+}
 
 /// C's profile arrays: the controller's `profileTimes_` and, by address,
 /// each axis's `profilePositions_`, `profileReadbacks_` and
@@ -863,8 +890,8 @@ impl<P: ControllerParams> ControllerPort<P> {
             port,
             num_axes.max(1) as usize,
             flags,
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            P::INTERFACE_MASK | CONTROLLER_INTERFACES,
+            P::INTERRUPT_MASK | CONTROLLER_INTERRUPTS,
         );
         for &(name, param_type) in BASE_PARAMS {
             base.create_param(name, param_type)?;

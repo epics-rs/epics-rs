@@ -16,9 +16,11 @@ use epics_base_rs::error::eca::ECA_TIMEOUT;
 use epics_base_rs::runtime::log::errlog_vprintf;
 use epics_base_rs::runtime::sync::mpsc;
 use epics_base_rs::runtime::task::{
-    BlockingBridge, StackSizeClass, ThreadPriority, spawn_dedicated_thread, timeout,
+    BlockingBridge, StackSizeClass, ThreadPriority, block_on_sync, spawn_dedicated_thread, timeout,
 };
-use epics_base_rs::server::database::{CaClientContext, ClientChannel, Connection, PvDatabase};
+use epics_base_rs::server::database::{
+    CaClientContext, ClientChannel, ClientSubscription, Connection, PvDatabase,
+};
 use epics_base_rs::server::iocsh::registry::*;
 use epics_base_rs::server::snapshot::Snapshot;
 use epics_base_rs::types::{DBR_SHORT, DBR_STRING, EpicsValue};
@@ -114,20 +116,24 @@ impl Ca {
 
     /// `pvMonitor`: `ca_add_event` of one `dbr_type` element, each value
     /// queued as `f` makes it.
-    fn monitor(&self, ch: &Chan, dbr_type: u16, f: impl Fn(Snapshot) -> Msg + Send + 'static) {
-        // C answers a failed ca_add_event with ca_task_exit and then goes on
-        // searching on the context it destroyed; only this monitor is lost.
-        let Ok(mut m) = self.run(ch.subscribe(dbr_type, 1, DBE_DEFAULT)) else {
-            return;
-        };
+    fn monitor(
+        &self,
+        ch: &Chan,
+        dbr_type: u16,
+        f: impl Fn(Snapshot) -> Msg + Send + Sync + 'static,
+    ) -> Option<ClientSubscription> {
         let tx = self.tx.clone();
-        let _ = self.ctx.spawn(async move {
-            while let Some(s) = m.next().await {
-                if tx.send(f(s)).await.is_err() {
-                    return;
-                }
+        let callback = Box::new(move |s| {
+            // The wait for room holds the delivering thread; a reactor
+            // worker that may not block drops the value.
+            if let Err(mpsc::error::TrySendError::Full(msg)) = tx.try_send(f(s)) {
+                let _ = block_on_sync(tx.send(msg));
             }
         });
+        // C answers a failed ca_add_event with ca_task_exit and then goes on
+        // searching on the context it destroyed; only this monitor is lost.
+        self.run(ch.subscribe(dbr_type, 1, DBE_DEFAULT, callback))
+            .ok()
     }
 
     /// `ca_put`, issued and not waited on.
@@ -208,6 +214,8 @@ fn motor_util_task(ca: &Ca, db: &PvDatabase, vme: &str, mut rx: mpsc::Receiver<M
         ));
         return;
     }
+    // The task's for its life, as C's are its context's.
+    let mut subs = Vec::new();
     for (i, name) in motorlist.iter().enumerate() {
         {
             let mut st = STATE.lock();
@@ -218,9 +226,9 @@ fn motor_util_task(ca: &Ca, db: &PvDatabase, vme: &str, mut rx: mpsc::Receiver<M
         // C hands the null chid of a .DMOV that did not connect to
         // ca_add_event; a motor's own field always connects here.
         if let Some(ch) = &dmov {
-            ca.monitor(ch, DBR_SHORT, move |s| {
+            subs.extend(ca.monitor(ch, DBR_SHORT, move |s| {
                 Msg::Dmov(i, s.value.to_f64().unwrap_or(0.0) as i16)
-            });
+            }));
         }
         let stop = ca.get_ch_id(&format!("{name}.STOP"));
         let mut st = STATE.lock();
@@ -229,12 +237,12 @@ fn motor_util_task(ca: &Ca, db: &PvDatabase, vme: &str, mut rx: mpsc::Receiver<M
     let allstop = ca.get_ch_id(&format!("{vme}allstop.VAL"));
     match &allstop {
         None => errlog_vprintf(format_args!("Failed to connect to {vme}allstop\n")),
-        Some(ch) => ca.monitor(ch, DBR_STRING, |s| {
+        Some(ch) => subs.extend(ca.monitor(ch, DBR_STRING, |s| {
             Msg::Allstop(match s.value {
                 EpicsValue::String(v) => v.as_str_lossy().into_owned(),
                 _ => String::new(),
             })
-        }),
+        })),
     }
     STATE.lock().allstop = allstop;
     while let Some(msg) = rx.blocking_recv() {

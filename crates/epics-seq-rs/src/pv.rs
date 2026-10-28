@@ -45,8 +45,8 @@ use epics_base_rs::runtime::log::{ErrlogSevEnum, errlog_sev_printf};
 use epics_base_rs::runtime::sync::mpsc;
 use epics_base_rs::runtime::task::TaskHandle;
 use epics_base_rs::server::database::{
-    CaClientContext, ClientChannel, ClientMonitor, Connection, InProcessChannel, InProcessEvents,
-    InProcessSubscription, PutCompletion, PvDatabase,
+    CaClientContext, ClientChannel, ClientSubscription, Connection, InProcessChannel,
+    InProcessEvents, InProcessSubscription, PutCompletion, PvDatabase,
 };
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::snapshot::Snapshot;
@@ -90,7 +90,6 @@ pub struct PvEvent<'a> {
 #[derive(Clone)]
 pub struct PvSystem {
     ctx: CaClientContext,
-    events: InProcessEvents,
     /// The network channels' request queue, its [`Dispatcher`] started
     /// with the first network channel.
     requests: Arc<Mutex<Option<mpsc::UnboundedSender<Request>>>>,
@@ -101,7 +100,6 @@ impl PvSystem {
     pub fn create(db: &PvDatabase) -> PvSystem {
         PvSystem {
             ctx: db.ca_client(),
-            events: InProcessEvents::default(),
             requests: Arc::default(),
         }
     }
@@ -143,13 +141,13 @@ impl PvSystem {
     /// The in-process monitor events queued now, delivered on the calling
     /// thread, which holds no lock a monitor callback takes.
     pub fn deliver(&self) {
-        self.events.deliver();
+        self.ctx.events().deliver();
     }
 
     /// A new [`EventGate`] over this system's queue.
     pub fn gate(&self) -> Arc<EventGate> {
         Arc::new(EventGate {
-            events: self.events.clone(),
+            events: self.ctx.events().clone(),
         })
     }
 }
@@ -570,7 +568,6 @@ impl Network {
 struct InProcess {
     chan: InProcessChannel,
     ctx: CaClientContext,
-    events: InProcessEvents,
     monitor: Mutex<Option<InProcessSubscription>>,
 }
 
@@ -584,7 +581,7 @@ impl InProcess {
         let handler = shared.clone();
         let sub = self
             .chan
-            .subscribe(&self.events, type_to_ca(ty), count, mask, move |snapshot| {
+            .subscribe(type_to_ca(ty), count, mask, move |snapshot| {
                 m.deliver(&handler, &snapshot)
             });
         match sub {
@@ -633,7 +630,6 @@ impl PvVar {
             let link = Link::InProcess(InProcess {
                 chan,
                 ctx: sys.ctx.clone(),
-                events: sys.events.clone(),
                 monitor: Mutex::new(None),
             });
             return Ok(PvVar { name, shared, link });
@@ -823,7 +819,7 @@ impl PvVar {
             // `dbChannelIO::write` throws a refused `dbChannel_put`, which
             // `ca_array_put` answers with ECA_PUTFAIL.
             Link::InProcess(l) => {
-                if l.chan.put(&l.events, value).is_err() {
+                if l.chan.put(value).is_err() {
                     return self.shared.refuse(Eca::PutFail, PUT_EXPR);
                 }
             }
@@ -850,9 +846,10 @@ impl PvVar {
         };
         let value = put_value(value, ty, count);
         match &self.link {
-            Link::InProcess(l) => match l.chan.put_callback(&l.events, value, |done| {
-                l.complete_put(&self.shared, id, done)
-            }) {
+            Link::InProcess(l) => match l
+                .chan
+                .put_callback(value, |done| l.complete_put(&self.shared, id, done))
+            {
                 Ok(()) => {}
                 // `ca_array_put_callback` answers a throw at once and never
                 // calls the callback.
@@ -981,12 +978,13 @@ struct Dispatcher {
     chans: HashMap<u64, Served>,
 }
 
-/// A created network channel and the tasks delivering its events.
+/// A created network channel, the task delivering its connection changes
+/// and its subscription.
 struct Served {
     chan: Arc<dyn ClientChannel>,
     shared: Arc<Shared>,
     _connection: AbortOnDrop,
-    monitor: Option<AbortOnDrop>,
+    monitor: Option<ClientSubscription>,
 }
 
 impl Dispatcher {
@@ -1088,12 +1086,12 @@ impl Served {
                     return;
                 }
                 let mask = (EventMask::VALUE | EventMask::ALARM).bits();
-                match chan.subscribe(type_to_ca(m.ty), m.count, mask).await {
-                    Ok(sub) => {
-                        let task = monitor_task(sub, shared.clone(), m);
-                        drop(self.monitor.replace(AbortOnDrop(ctx.spawn(task))));
-                    }
-                    Err(e) => subscribe_refused(shared, m.monid, &e),
+                let (monid, ty, count) = (m.monid, m.ty, m.count);
+                let handler = shared.clone();
+                let callback = Box::new(move |snapshot: Snapshot| m.deliver(&handler, &snapshot));
+                match chan.subscribe(type_to_ca(ty), count, mask, callback).await {
+                    Ok(sub) => drop(self.monitor.replace(sub)),
+                    Err(e) => subscribe_refused(shared, monid, &e),
                 }
             }
             ChanCmd::MonitorOff => drop(self.monitor.take()),
@@ -1105,14 +1103,6 @@ impl Served {
 async fn connection_task(chan: Arc<dyn ClientChannel>, shared: Arc<Shared>, conn: ConnFn) {
     while let Some(state) = chan.next_connection().await {
         shared.connection_change(state == Connection::Connected, &*conn);
-    }
-}
-
-/// `pvCaMonitorHandler`, for each event of monitor `m` while it is the
-/// channel's monitor.
-async fn monitor_task(mut sub: Box<dyn ClientMonitor>, shared: Arc<Shared>, m: Monitor) {
-    while let Some(snapshot) = sub.next().await {
-        m.deliver(&shared, &snapshot);
     }
 }
 
@@ -1322,7 +1312,6 @@ mod tests {
             .create_in_process(name)
             .unwrap()
             .subscribe(
-                &sys.events,
                 type_to_ca(PvType::Double),
                 1,
                 EventMask::VALUE.bits(),
@@ -1492,7 +1481,6 @@ mod tests {
             .create_in_process("g:a")
             .unwrap()
             .subscribe(
-                &sys.events,
                 type_to_ca(PvType::Double),
                 1,
                 EventMask::VALUE.bits(),
@@ -1551,7 +1539,8 @@ mod tests {
             _: u16,
             _: u32,
             _: u16,
-        ) -> Result<Box<dyn ClientMonitor>, String> {
+            _: Box<dyn Fn(Snapshot) + Send + Sync>,
+        ) -> Result<ClientSubscription, String> {
             Err("refused".into())
         }
 
@@ -1679,7 +1668,8 @@ mod tests {
             _: u16,
             _: u32,
             _: u16,
-        ) -> Result<Box<dyn ClientMonitor>, String> {
+            _: Box<dyn Fn(Snapshot) + Send + Sync>,
+        ) -> Result<ClientSubscription, String> {
             unreachable!()
         }
 

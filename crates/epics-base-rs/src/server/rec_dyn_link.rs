@@ -7,9 +7,9 @@
 //! the database serves is `dbContext`'s channel, whose search connects at
 //! once, so the owner thread itself runs the connect, the metadata read, the
 //! search callback and the monitor add, and every link's monitor events
-//! come from the owners' one event context ([`InProcessEvents`]) in post
-//! order. A name served elsewhere goes to one network dispatcher, which
-//! issues the owners' requests in their order.
+//! come from the owners' one event context ([`CaClientContext::events`])
+//! in post order. A name served elsewhere goes to one network dispatcher,
+//! which issues the owners' requests in their order.
 //!
 //! What a link learns reaches the record as a [`LinkEvent`] through the
 //! record's [`Deliver`], which takes the record's lock
@@ -36,8 +36,8 @@ use epics_base_rs::runtime::task::{
     StackSizeClass, TaskHandle, ThreadPriority, spawn_dedicated_thread,
 };
 use epics_base_rs::server::database::{
-    AsyncDbHandle, CaClientContext, ClientChannel, ClientMonitor, Connection, InProcessChannel,
-    InProcessEvents, InProcessSubscription, PutCompletion,
+    AsyncDbHandle, CaClientContext, ClientChannel, ClientSubscription, Connection,
+    InProcessChannel, InProcessSubscription, PutCompletion,
 };
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::snapshot::Snapshot;
@@ -229,7 +229,6 @@ impl RecDynLinks {
             idle: Mutex::new(Some([inp_rx, out_rx])),
             dispatcher: Arc::new(Dispatcher {
                 ctx,
-                events: InProcessEvents::default(),
                 network: OnceLock::new(),
             }),
         }
@@ -282,7 +281,6 @@ impl RecDynLinks {
 /// which `recDynOut` attaches to — and its network half.
 struct Dispatcher {
     ctx: CaClientContext,
-    events: InProcessEvents,
     network: OnceLock<tokio::sync::mpsc::UnboundedSender<(Arc<LinkChan>, Cmd)>>,
 }
 
@@ -786,7 +784,7 @@ impl Dispatcher {
             let count = if link.scalar { 1 } else { nelem };
             let mask = (EventMask::VALUE | EventMask::ALARM).bits();
             let (ca_type, deliver) = (link.ca_type, link.deliver.clone());
-            let sub = chan.subscribe(&self.events, ca_type.time_dbr(), count, mask, move |s| {
+            let sub = chan.subscribe(ca_type.time_dbr(), count, mask, move |s| {
                 deliver(LinkEvent::Monitor(values_of(ca_type, s)))
             });
             match sub {
@@ -802,13 +800,12 @@ impl Dispatcher {
         let deliver = &link.deliver;
         match request {
             Request::Put(value) => {
-                if let Err(e) = chan.put(&self.events, value) {
+                if let Err(e) = chan.put(value) {
                     tracing::error!("recDynLinkTask pv={} CA Error {e}", link.pvname);
                 }
             }
             Request::PutCallback(value) => {
-                let issued =
-                    chan.put_callback(&self.events, value, |done| self.complete_put(deliver, done));
+                let issued = chan.put_callback(value, |done| self.complete_put(deliver, done));
                 if let Err(e) = issued {
                     tracing::error!("recDynLinkTask pv={} CA Error {e}", link.pvname);
                     deliver(LinkEvent::PutDone(Err(e.to_string())));
@@ -872,7 +869,6 @@ async fn network(
                 };
                 let monitor = MonitorSlot::default();
                 let connection = connection_task(
-                    ctx.clone(),
                     channel.clone(),
                     link.io,
                     link.ca_type,
@@ -947,13 +943,12 @@ async fn poll_once<F: Future + Unpin>(fut: &mut F) -> Option<F::Output> {
     .await
 }
 
-type MonitorSlot = Arc<std::sync::Mutex<Option<AbortOnDrop>>>;
+type MonitorSlot = Arc<std::sync::Mutex<Option<ClientSubscription>>>;
 
 /// `connectCallback` → `getCallback` → `ca_add_array_event`, for every
 /// connection change. The monitor is added once per link: C adds another on
 /// every reconnect, each delivering the same value.
 async fn connection_task(
-    ctx: CaClientContext,
     channel: Arc<dyn ClientChannel>,
     io: Io,
     ca_type: CaType,
@@ -984,28 +979,19 @@ async fn connection_task(
                 if io == Io::Input && monitor.lock().unwrap().is_none() {
                     let count = if scalar { 1 } else { nelem };
                     let mask = (EventMask::VALUE | EventMask::ALARM).bits();
-                    match channel.subscribe(ca_type.time_dbr(), count, mask).await {
-                        Ok(sub) => {
-                            *monitor.lock().unwrap() = Some(AbortOnDrop(ctx.spawn(monitor_task(
-                                sub,
-                                ca_type,
-                                deliver.clone(),
-                            ))))
-                        }
+                    let deliver = deliver.clone();
+                    let callback = Box::new(move |snapshot| {
+                        deliver(LinkEvent::Monitor(values_of(ca_type, snapshot)))
+                    });
+                    match channel
+                        .subscribe(ca_type.time_dbr(), count, mask, callback)
+                        .await
+                    {
+                        Ok(sub) => *monitor.lock().unwrap() = Some(sub),
                         Err(e) => tracing::error!("ca_add_array_event: {e}"),
                     }
                 }
             }
         }
-    }
-}
-
-async fn monitor_task(
-    mut sub: Box<dyn ClientMonitor>,
-    ca_type: CaType,
-    deliver: Arc<dyn Fn(LinkEvent) + Send + Sync>,
-) {
-    while let Some(snapshot) = sub.next().await {
-        deliver(LinkEvent::Monitor(values_of(ca_type, snapshot)));
     }
 }

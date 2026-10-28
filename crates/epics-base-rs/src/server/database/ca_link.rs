@@ -29,9 +29,7 @@ use super::link_set::{
 use super::{CaLinkInit, ExternalCpProcess, LinkHolder, PvDatabase, PvDatabaseInner};
 use crate::runtime::sync::oneshot;
 use crate::runtime::task::TaskHandle;
-use crate::server::event_queue::{
-    CircuitEvent, DeliveryContext, EventReader, EventUser, no_context,
-};
+use crate::server::event_queue::{CircuitEvent, DeliveryContext, EventReader, EventUser};
 use crate::server::pv::{MonitorEvent, PutStarted, SubscribeRefused, WriteContext, WriteEnd};
 use crate::server::record::{ProcessCompletion, RecordCell};
 use crate::server::snapshot::{AlarmInfo, Snapshot};
@@ -1362,25 +1360,6 @@ impl LocalChannel {
         decode_counted(dbr_type, buf, snapshot.value.count(), count)
     }
 
-    /// `dbSubscriptionIO` (`dbSubscriptionIO.cpp:38-56`): `db_add_event`
-    /// with `mask`, then `db_post_single_event`. Each caller owns its event
-    /// context.
-    pub(super) fn subscribe(
-        &self,
-        db: &PvDatabase,
-        dbr_type: u16,
-        mask: u16,
-    ) -> Result<LocalMonitor, SubscribeRefused> {
-        let (pre_chain, notify) = self.state_notify(dbr_type);
-        let user = EventUser::new();
-        let reader = self.add_event(db, &user, mask, no_context(), pre_chain)?;
-        Ok(LocalMonitor {
-            _user: user,
-            reader,
-            notify,
-        })
-    }
-
     /// A `dbr_type` subscription's `callStateNotify`, and the pre chain its
     /// `db_add_event` runs.
     pub(super) fn state_notify(&self, dbr_type: u16) -> (FilterChain, StateNotify) {
@@ -1574,23 +1553,6 @@ impl Issued {
                 .await
                 .map_err(|status| format!("put notify unsuccessful: {status}")),
         }
-    }
-}
-
-/// C `dbSubscriptionIO`: one installed event plus what `callStateNotify`
-/// needs to hand each one over as a DBR value. Dropping it cancels the
-/// event (`db_cancel_event`).
-pub(super) struct LocalMonitor {
-    /// The event context the reader's queue belongs to.
-    _user: EventUser,
-    pub(super) reader: EventReader,
-    notify: StateNotify,
-}
-
-impl LocalMonitor {
-    /// [`StateNotify::state_notify`].
-    pub(super) fn state_notify(&self, event: MonitorEvent, count: u32) -> Option<Snapshot> {
-        self.notify.state_notify(event, count)
     }
 }
 

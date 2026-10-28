@@ -9,9 +9,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use epics_base_rs::server::database::{Connection, PvDatabase};
+use epics_base_rs::server::database::{ClientChannel, ClientSubscription, Connection, PvDatabase};
 use epics_base_rs::server::ioc_app::{IocApplication, RunOutcome};
 use epics_base_rs::server::records::ai::AiRecord;
+use epics_base_rs::server::snapshot::Snapshot;
 use epics_base_rs::types::{DBR_CTRL_DOUBLE, DBR_TIME_DOUBLE, EpicsValue};
 use epics_ca_rs::calink::{install_calink_resolver, register_calink_commands};
 use epics_ca_rs::protocol::{CA_PROTO_READ_NOTIFY, CA_PROTO_SEARCH, CaHeader};
@@ -64,6 +65,24 @@ async fn within<T>(what: &str, fut: impl std::future::Future<Output = T>) -> T {
         .unwrap_or_else(|_| panic!("{what}"))
 }
 
+/// A `DBR_TIME_DOUBLE` subscription of `ch` and the values it delivers.
+async fn subscribe(
+    ch: &dyn ClientChannel,
+) -> (
+    ClientSubscription,
+    tokio::sync::mpsc::UnboundedReceiver<Snapshot>,
+) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let callback = Box::new(move |s| {
+        let _ = tx.send(s);
+    });
+    let sub = ch
+        .subscribe(DBR_TIME_DOUBLE, 1, 5, callback)
+        .await
+        .expect("monitor");
+    (sub, rx)
+}
+
 /// A served name connects at once, and a put callback completes only when
 /// the target's processing does — here after the calcout's ODLY.
 #[epics_macros_rs::epics_test]
@@ -82,8 +101,8 @@ async fn a_served_name_is_an_in_process_channel() {
             let ctrl = ao.get(DBR_CTRL_DOUBLE, 1).await.expect("ctrl get");
             assert_eq!(ctrl.value.to_f64(), Some(2.0));
 
-            let mut monitor = ao.subscribe(DBR_TIME_DOUBLE, 1, 5).await.expect("monitor");
-            let first = within("no first event", monitor.next()).await.unwrap();
+            let (_sub, mut monitor) = subscribe(&*ao).await;
+            let first = within("no first event", monitor.recv()).await.unwrap();
             assert_eq!(
                 first.value.to_f64(),
                 Some(2.0),
@@ -96,7 +115,7 @@ async fn a_served_name_is_an_in_process_channel() {
                     .unwrap()
                     .is_none()
             );
-            let next = within("the put was not seen", monitor.next())
+            let next = within("the put was not seen", monitor.recv())
                 .await
                 .unwrap();
             assert_eq!(next.value.to_f64(), Some(4.0));
@@ -168,8 +187,8 @@ async fn an_unserved_name_goes_to_the_network_context() {
             );
             let ctrl = ai.get(DBR_CTRL_DOUBLE, 1).await.expect("ctrl get");
             assert_eq!(ctrl.value.to_f64(), Some(3.0));
-            let mut monitor = ai.subscribe(DBR_TIME_DOUBLE, 1, 5).await.expect("monitor");
-            let first = within("no first event", monitor.next()).await.unwrap();
+            let (_sub, mut monitor) = subscribe(&*ai).await;
+            let first = within("no first event", monitor.recv()).await.unwrap();
             assert_eq!(first.value.to_f64(), Some(3.0));
 
             let done = ai
@@ -178,7 +197,7 @@ async fn an_unserved_name_goes_to_the_network_context() {
                 .expect("issued")
                 .expect("a completion");
             within("never completed", done).await.expect("completed");
-            let next = within("the put was not seen", monitor.next())
+            let next = within("the put was not seen", monitor.recv())
                 .await
                 .unwrap();
             assert_eq!(next.value.to_f64(), Some(6.0));

@@ -18,10 +18,12 @@ use std::time::{Duration, Instant};
 
 use epics_base_rs::runtime::sync::mpsc;
 use epics_base_rs::runtime::task::{
-    BlockingBridge, TaskHandle, ThreadPriority, apply_to_current_thread, timeout,
+    BlockingBridge, ThreadPriority, apply_to_current_thread, block_on_sync, timeout,
 };
 use epics_base_rs::server::builtin_devices::timestamp::epics_time_to_strftime;
-use epics_base_rs::server::database::{CaClientContext, ClientChannel, Connection};
+use epics_base_rs::server::database::{
+    CaClientContext, ClientChannel, ClientSubscription, Connection,
+};
 use epics_base_rs::server::iocsh::register_command;
 use epics_base_rs::server::iocsh::registry::{
     ArgDesc, ArgType, ArgValue, CommandContext, CommandDef, CommandOutcome, CommandResult,
@@ -189,21 +191,11 @@ fn extra_value(dbr_type: u16, s: &Snapshot) -> ExtraValue {
 
 type Chan = Arc<dyn ClientChannel>;
 
-/// One `evid`: the task forwarding a subscription's values, cancelled on
-/// drop (`ca_clear_subscription`, or the `ca_clear_channel` that ends it).
-struct Sub(TaskHandle<()>);
-
-impl Drop for Sub {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-
 /// A channel and the subscription on it (C's `cpxds`/`crxds`/`cdxds` with
 /// their `descMonitor`).
 struct Watched {
     _ch: Chan,
-    _sub: Option<Sub>,
+    _sub: Option<ClientSubscription>,
 }
 
 /// Where a `descMonitor` string lands (C's `pdest`).
@@ -354,26 +346,23 @@ impl Ca {
         dbr_type: u16,
         count: u32,
         mask: u16,
-        mut f: impl FnMut(Snapshot) -> Option<(Msg, bool)> + Send + 'static,
-    ) -> Option<Sub> {
-        let mut m = self.run(ch.subscribe(dbr_type, count, mask)).ok()?;
+        f: impl Fn(Snapshot) -> Option<(Msg, bool)> + Send + Sync + 'static,
+    ) -> Option<ClientSubscription> {
         let tx = self.tx.clone();
-        let task = self.ctx.spawn(async move {
-            while let Some(s) = m.next().await {
-                match f(s) {
-                    Some((msg, true)) => {
-                        if tx.send(msg).await.is_err() {
-                            return;
-                        }
-                    }
-                    Some((msg, false)) => {
-                        let _ = tx.try_send(msg);
-                    }
-                    None => {}
+        let callback = Box::new(move |s: Snapshot| match f(s) {
+            Some((msg, true)) => {
+                // The wait for room holds the delivering thread, as C's
+                // does; a reactor worker that may not block drops it.
+                if let Err(mpsc::error::TrySendError::Full(msg)) = tx.try_send(msg) {
+                    let _ = block_on_sync(tx.send(msg));
                 }
             }
-        })?;
-        Some(Sub(task))
+            Some((msg, false)) => {
+                let _ = tx.try_send(msg);
+            }
+            None => {}
+        });
+        self.run(ch.subscribe(dbr_type, count, mask, callback)).ok()
     }
 }
 
@@ -407,10 +396,10 @@ struct ScanChans {
     txpv: [Option<Chan>; SCAN_NBT],
     txcd: [Option<Chan>; SCAN_NBT],
     /// `cpt_evid` (`cpt_monitored` is its presence).
-    cpt_sub: Option<Sub>,
+    cpt_sub: Option<ClientSubscription>,
     /// `cpt_time`, read by the `.CPT` forwarder.
     cpt_time: Arc<Mutex<Instant>>,
-    subs: Vec<Sub>,
+    subs: Vec<ClientSubscription>,
 }
 
 impl ScanChans {
@@ -521,7 +510,7 @@ struct Task {
     curr_retries: i64,
     total_retries: i64,
     abandoned_writes: i64,
-    subs: Vec<Sub>,
+    subs: Vec<ClientSubscription>,
 }
 
 /// `msg_queue` and `threadId` once `saveData_Init` ran.
@@ -1303,7 +1292,7 @@ impl Task {
         let c = &mut self.chans[scan];
         let mut sub = |ch: &Option<Chan>,
                        t: u16,
-                       f: Box<dyn FnMut(Snapshot) -> Option<(Msg, bool)> + Send>|
+                       f: Box<dyn Fn(Snapshot) -> Option<(Msg, bool)> + Send + Sync>|
          -> bool {
             let Some(ch) = ch else { return false };
             match ca.monitor(ch, t, 1, DBE_DEFAULT, f) {

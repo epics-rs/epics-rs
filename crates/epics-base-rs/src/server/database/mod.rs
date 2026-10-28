@@ -26,7 +26,7 @@ mod subroutine_context;
 
 pub use crate::server::record::OwnRecord;
 pub use ca_client::{
-    CaClientContext, CaClientService, ClientChannel, ClientFuture, ClientMonitor, Connection,
+    CaClientContext, CaClientService, ClientChannel, ClientFuture, ClientSubscription, Connection,
     InProcessChannel, InProcessEvents, InProcessSubscription, PutCompletion,
 };
 pub use ca_link::CA_LINK_EVENT_MASK;

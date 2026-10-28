@@ -11,7 +11,8 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use epics_base_rs::server::database::{ClientChannel, ClientMonitor, PvDatabase};
+use epics_base_rs::runtime::sync::mpsc;
+use epics_base_rs::server::database::{ClientChannel, ClientSubscription, PvDatabase};
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::types::{DBR_TIME_DOUBLE, EpicsValue};
@@ -35,15 +36,29 @@ async fn get(ch: &dyn ClientChannel, count: u32) -> Result<EpicsValue, String> {
     ch.get(DBR_TIME_DOUBLE, count).await.map(|s| s.value)
 }
 
+/// A subscription of `count` elements, and the values it delivers.
+async fn subscribe(
+    ch: &dyn ClientChannel,
+    count: u32,
+) -> (ClientSubscription, mpsc::UnboundedReceiver<EpicsValue>) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let mask = (EventMask::VALUE | EventMask::ALARM).bits();
+    let callback = Box::new(move |s: epics_base_rs::server::snapshot::Snapshot| {
+        let _ = tx.send(s.value);
+    });
+    let sub = ch
+        .subscribe(DBR_TIME_DOUBLE, count, mask, callback)
+        .await
+        .unwrap();
+    (sub, rx)
+}
+
 /// The next event of the count 1 and the count 4 subscription.
 async fn next(
-    one: &mut Box<dyn ClientMonitor>,
-    four: &mut Box<dyn ClientMonitor>,
+    one: &mut mpsc::UnboundedReceiver<EpicsValue>,
+    four: &mut mpsc::UnboundedReceiver<EpicsValue>,
 ) -> (EpicsValue, EpicsValue) {
-    (
-        one.next().await.unwrap().value,
-        four.next().await.unwrap().value,
-    )
+    (one.recv().await.unwrap(), four.recv().await.unwrap())
 }
 
 #[epics_macros_rs::epics_test]
@@ -57,9 +72,8 @@ async fn a_counted_request_is_truncated_or_zero_padded() {
     let db = std::sync::Arc::clone(ioc.database());
     assert!(ioc.run().await);
     let ch = db.ca_client().create_channel("WE").await.expect("WE");
-    let mask = (EventMask::VALUE | EventMask::ALARM).bits();
-    let mut one = ch.subscribe(DBR_TIME_DOUBLE, 1, mask).await.unwrap();
-    let mut four = ch.subscribe(DBR_TIME_DOUBLE, 4, mask).await.unwrap();
+    let (_one, mut one) = subscribe(&*ch, 1).await;
+    let (_four, mut four) = subscribe(&*ch, 4).await;
 
     let born_empty = (next(&mut one, &mut four).await, get(&*ch, 1).await);
     put(&db, &[5.0, 6.0]).await;

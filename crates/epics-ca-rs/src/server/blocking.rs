@@ -161,7 +161,7 @@ use crate::server::tcp::{
     RegisteredSubscription, SubscriptionDelivery, SubscriptionOutcome, WriteHeadOutcome,
     cancel_subscription_reply, dispatch_message, is_peer_disconnect, log_circuit,
     print_forcing_disconnect, refuse_bad_tcp_command, register_subscription, report_gate_error,
-    run_event_task, serve_write_head,
+    retire_destroyed_channels, run_event_task, serve_write_head,
 };
 use crate::server::udp::{self, SearchReplyBatch};
 
@@ -1327,6 +1327,57 @@ pub(crate) fn hand_off_subscription(
     })));
 }
 
+/// Finish the monitors a channel retirement in the shared handlers cancelled
+/// (`ClientState::take_retired_subscriptions`): their gates are revoked, but
+/// the producers are this driver's.
+fn finish_retired_subscriptions(
+    state: &mut ClientState,
+    blk_subs: &mut HashMap<epics_base_rs::server::event_queue::AttachId, BlockingSub>,
+    ev_tx: &mpsc::UnboundedSender<EventTaskControl>,
+) {
+    for id in state.take_retired_subscriptions() {
+        if let Some(sub) = blk_subs.remove(&id) {
+            let _ = ev_tx.send(EventTaskControl::Cancel(id));
+            match &sub.target {
+                ChannelTarget::SimplePv(pv) => {
+                    pv.remove_subscriber(id);
+                }
+                ChannelTarget::RecordField { record, .. } => {
+                    record.write().remove_subscriber(id);
+                }
+            }
+        }
+    }
+}
+
+/// Before a postponed request runs again, retire the channels a destroy left
+/// behind, as the async server's postponed arm does: a destroy signals the
+/// postponing PV before anything retires them. Returns once the event thread
+/// has staged each `CA_PROTO_SERVER_DISCONN` behind the writes it owes that
+/// channel, so the re-run's reply follows them.
+fn retire_destroyed_before_rerun(
+    state: &mut ClientState,
+    blk_subs: &mut HashMap<epics_base_rs::server::event_queue::AttachId, BlockingSub>,
+    ev_tx: &mpsc::UnboundedSender<EventTaskControl>,
+    peer: SocketAddr,
+) {
+    // Not blockable here, the re-run refuses the same.
+    let Ok(cids) = block_on_sync(retire_destroyed_channels(state, peer, None)) else {
+        return;
+    };
+    if cids.is_empty() {
+        return;
+    }
+    finish_retired_subscriptions(state, blk_subs, ev_tx);
+    for cid in cids {
+        let _ = ev_tx.send(EventTaskControl::Retire(cid));
+    }
+    let (ack, staged) = tokio::sync::oneshot::channel();
+    if ev_tx.send(EventTaskControl::Staged(ack)).is_ok() {
+        let _ = block_on_sync(staged);
+    }
+}
+
 /// Serve one CA client over a blocking `TcpStream`. C `camsgtask`
 /// (`camsgtask.c:41`).
 ///
@@ -1702,6 +1753,7 @@ fn handle_client_blocking(
                         // Not blockable here, the head below refuses the same.
                         if let Some(mut blocked) = postponed.take() {
                             let _ = block_on_sync(blocked.signalled());
+                            retire_destroyed_before_rerun(&mut state, &mut blk_subs, &ev_tx, peer);
                         }
                         match block_on_sync(serve_write_head(&hdr, &payload, &state, &db, &outbox))
                         {
@@ -1756,6 +1808,7 @@ fn handle_client_blocking(
                     loop {
                         if let Some(mut blocked) = postponed.take() {
                             let _ = block_on_sync(blocked.signalled());
+                            retire_destroyed_before_rerun(&mut state, &mut blk_subs, &ev_tx, peer);
                         }
                         match block_on_sync(dispatch_message(
                             &hdr,
@@ -1781,19 +1834,7 @@ fn handle_client_blocking(
                                 // whole `db_cancel_event`-then-confirm order of C
                                 // `clear_channel_reply` (`camessage.c:1890-1912`)
                                 // holds on this driver too.
-                                for id in state.take_retired_subscriptions() {
-                                    if let Some(sub) = blk_subs.remove(&id) {
-                                        let _ = ev_tx.send(EventTaskControl::Cancel(id));
-                                        match &sub.target {
-                                            ChannelTarget::SimplePv(pv) => {
-                                                pv.remove_subscriber(id);
-                                            }
-                                            ChannelTarget::RecordField { record, .. } => {
-                                                record.write().remove_subscriber(id);
-                                            }
-                                        }
-                                    }
-                                }
+                                finish_retired_subscriptions(&mut state, &mut blk_subs, &ev_tx);
                             }
                             Ok(Err(e)) => {
                                 // Ship anything an earlier handler in this burst (or
@@ -5881,6 +5922,113 @@ mod tests {
             "the write that ended is answered before the request behind it"
         );
         assert_eq!(open.lock().unwrap().len(), 100, "the 101st went");
+
+        drop(c);
+        server.shutdown();
+        accept.join().unwrap();
+    }
+
+    /// A write postponed on a PV that is destroyed runs again only after its
+    /// channel is retired, and is refused ECA_BADCHID, as on the async server:
+    /// pcas sends the `channelDestroyEvent` queued with the canceled IO before
+    /// `casStreamIOWakeup` re-runs it (casEventSys.cc:85-123). The destroy's
+    /// wake-up is held back until the re-run is answered, so nothing else
+    /// can retire the channel first.
+    #[test]
+    fn a_write_postponed_on_a_destroyed_pv_runs_again_after_it_retires() {
+        use epics_base_rs::server::pv::WriteForward;
+        let db = seed_db(&[("BLK:PPD", EpicsValue::Double(0.0))]);
+        let open = Arc::new(Mutex::new(Vec::new()));
+        simple_pv(&db, "BLK:PPD").set_write_hook(Arc::new({
+            let open = open.clone();
+            move |_value, _ctx| {
+                let open = open.clone();
+                Box::pin(async move {
+                    let forward: WriteForward = Box::new(move |done| {
+                        open.lock().unwrap().extend(done);
+                        Ok(())
+                    });
+                    Ok(forward)
+                })
+            }
+        }));
+        let server =
+            Arc::new(BlockingCaServer::bind("127.0.0.1:0", db.clone(), new_acf()).unwrap());
+        let addr = server.local_addr().unwrap();
+        let srv = server.clone();
+        let accept = thread::spawn(move || srv.serve());
+
+        let (mut c, sid) = connected_client(addr, "BLK:PPD");
+        for ioid in 1..=101 {
+            c.write_all(&write_notify_frame(sid, ioid, DBR_DOUBLE_MON, 3.0))
+                .unwrap();
+        }
+        c.set_read_timeout(Some(Duration::from_millis(400)))
+            .unwrap();
+        let mut probe = [0u8; 1];
+        let peeked = c.peek(&mut probe);
+        assert!(
+            peeked.as_ref().is_err_and(|e| is_read_timeout(e.kind())),
+            "the 101st is postponed, got {peeked:?}"
+        );
+        assert_eq!(open.lock().unwrap().len(), 100);
+        let (go, held) = std::sync::mpsc::channel::<()>();
+        let remover = thread::spawn({
+            let db = db.clone();
+            move || {
+                let _armed = epics_base_rs::server::database::destroy_signal_hook::arm(move || {
+                    let _ = held.recv();
+                });
+                block_on_sync(db.remove_simple_pv("BLK:PPD"))
+                    .expect("no async runtime on this thread")
+                    .expect("was registered");
+            }
+        });
+
+        c.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        let mut seen: Vec<(u16, u32, u32)> = Vec::new();
+        loop {
+            let frame = read_one_frame(&mut c);
+            let cmmd = u16::from_be_bytes([frame[0], frame[1]]);
+            let ioid = u32::from_be_bytes([frame[12], frame[13], frame[14], frame[15]]);
+            seen.push((
+                cmmd,
+                u32::from_be_bytes([frame[8], frame[9], frame[10], frame[11]]),
+                ioid,
+            ));
+            if (cmmd, ioid) == (CA_PROTO_WRITE_NOTIFY, 101) {
+                break;
+            }
+        }
+        assert!(
+            !remover.is_finished(),
+            "the re-run was answered while the destroy's wake-up was held back"
+        );
+        let retired = seen
+            .iter()
+            .position(|&(cmmd, ..)| cmmd == crate::protocol::CA_PROTO_SERVER_DISCONN)
+            .unwrap_or_else(|| panic!("the channel is retired before the re-run, got {seen:?}"));
+        let canceled: Vec<_> = seen[..retired]
+            .iter()
+            .filter(|&&(cmmd, ..)| cmmd == CA_PROTO_WRITE_NOTIFY)
+            .map(|&(_, status, ioid)| (status, ioid))
+            .collect();
+        assert_eq!(
+            canceled,
+            (1..=100)
+                .map(|ioid| (crate::protocol::ECA_PUTFAIL, ioid))
+                .collect::<Vec<_>>(),
+            "the put callbacks in flight, canceled, and not the postponed one"
+        );
+        assert_eq!(
+            seen[retired..],
+            [
+                (crate::protocol::CA_PROTO_SERVER_DISCONN, 0x1234, 0),
+                (CA_PROTO_WRITE_NOTIFY, crate::protocol::ECA_BADCHID, 101),
+            ]
+        );
+        go.send(()).expect("the hook waits");
+        remover.join().expect("removed");
 
         drop(c);
         server.shutdown();

@@ -806,7 +806,7 @@ pub(crate) struct ClientState {
     /// [`ClientState::take_retired_subscriptions`]. Empty for the async
     /// server, which owns `subscriptions` and finishes in place.
     retired_subscriptions: Vec<epics_base_rs::server::event_queue::AttachId>,
-    /// Each sid `sweep_destroyed_channels` retired with
+    /// Each sid [`retire_destroyed_channels`] retired with
     /// `CA_PROTO_SERVER_DISCONN`, and its channel's element count. A request
     /// still naming one crossed that frame, and gets [`answer_pcas_refusal`];
     /// every other unknown sid keeps rsrv's answer. Freed with the circuit.
@@ -2726,9 +2726,6 @@ fn destroy_channel(
 /// a channel it keeps alive, so the client's monitor STOPS and `camonitor`
 /// reports the disconnect instead of latching the last value at NO_ALARM.
 ///
-/// The writes still owed on them are answered first, by the circuit's
-/// write-completion owner ([`take_owed_writes`]).
-///
 /// Returns the number of channels retired.
 ///
 /// `tokio_backend`-only, so the docs that mention it — `server_disconn_frame`'s
@@ -2741,26 +2738,50 @@ async fn sweep_destroyed_channels(
     conn_events: Option<&broadcast::Sender<ServerConnectionEvent>>,
     writer: &Outbox,
 ) -> usize {
+    let cids = retire_destroyed_channels(state, peer, conn_events).await;
+    for &cid in &cids {
+        writer.push(server_disconn_frame(cid));
+    }
+    cids.len()
+}
+
+/// Both drivers' half of retiring the channels whose target the database has
+/// destroyed: the writes still owed on them are answered by the circuit's
+/// write-completion owner ([`take_owed_writes`]), then each channel is torn
+/// down and its sid kept for [`pcas_verify_request`]. Returns the client cids,
+/// each owed a [`server_disconn_frame`] by the driver that stages its frames.
+///
+/// A postponed request runs again only after this, on either driver: pcas
+/// drains the `channelDestroyEvent`s queued with the canceled IO before the
+/// IO's wakeup fires, so the re-run finds the channel gone.
+pub(crate) async fn retire_destroyed_channels(
+    state: &mut ClientState,
+    peer: SocketAddr,
+    conn_events: Option<&broadcast::Sender<ServerConnectionEvent>>,
+) -> Vec<u32> {
     let gone: Vec<u32> = state
         .channels
         .iter()
         .filter(|(_, entry)| entry.target.is_destroyed())
         .map(|(&sid, _)| sid)
         .collect();
+    // Before `destroy_channel`, whose `free_channel` drops them unanswered.
+    // The blocking driver has no queue here: its event thread holds the
+    // writes and answers them as it stages each retirement.
+    #[cfg(tokio_backend)]
     if let Some(queue) = &state.write_notify_queue {
         if !gone.is_empty() {
             queue.retire(gone.clone()).await;
         }
     }
-    let mut retired = 0;
+    let mut cids = Vec::with_capacity(gone.len());
     for sid in gone {
         if let Some(entry) = destroy_channel(state, sid, peer, conn_events) {
-            writer.push(server_disconn_frame(entry.cid));
             state.retired.insert(sid, entry.final_element_count);
-            retired += 1;
+            cids.push(entry.cid);
         }
     }
-    retired
+    cids
 }
 
 /// The wire bytes retiring one channel.
@@ -5820,6 +5841,10 @@ pub(crate) enum EventTaskControl {
     /// ([`SubscriptionOutcome::ChannelGone`]), owed its
     /// `CA_PROTO_SERVER_DISCONN` if no end of stream has sent it.
     Retire(u32),
+    /// Answered once every message sent ahead of it has been acted on and its
+    /// frames staged, so a reply the dispatch thread stages after the answer
+    /// follows them on the wire. Dropped unanswered if the peer is gone.
+    Staged(tokio::sync::oneshot::Sender<()>),
 }
 
 /// What one `select` cycle of [`run_event_task`] resolved to.
@@ -6166,6 +6191,9 @@ pub(crate) async fn run_event_task(
                 {
                     break;
                 }
+            }
+            EventStep::Control(Some(EventTaskControl::Staged(ack))) => {
+                let _ = ack.send(());
             }
             // End of stream, which has two causes needing opposite answers.
             //

@@ -254,7 +254,9 @@ impl From<&PortCommand> for RequestOp {
                 process_out: *process_out,
             },
             PortCommand::PushFlushInterpose { flush_timeout_secs } => Self::PushFlushInterpose {
-                flush_timeout: std::time::Duration::from_secs_f64(*flush_timeout_secs),
+                flush_timeout: crate::interpose::flush::flush_timeout_from_secs(
+                    *flush_timeout_secs,
+                ),
             },
             PortCommand::BlockProcess { all_devices } => Self::BlockProcess {
                 all_devices: *all_devices,
@@ -421,6 +423,28 @@ mod tests {
     use super::*;
     use crate::interpose::EomReason;
     use crate::request::OctetRead;
+
+    /// A wire flush timeout lands in C's range: `asynInterposeFlushConfig`
+    /// keeps an `int` of milliseconds, at least 1 (asynInterposeFlush.c:78-79).
+    #[test]
+    fn wire_flush_timeout_lands_in_c_range() {
+        let decode = |secs: f64| match RequestOp::from(&PortCommand::PushFlushInterpose {
+            flush_timeout_secs: secs,
+        }) {
+            RequestOp::PushFlushInterpose { flush_timeout } => flush_timeout,
+            other => panic!("decoded to {other:?}"),
+        };
+        let longest = std::time::Duration::from_millis(i32::MAX as u64);
+        let shortest = std::time::Duration::from_millis(1);
+        assert_eq!(decode(1e300), longest);
+        // Representable as a `Duration`, but past C's `int` of milliseconds.
+        assert_eq!(decode(1e9), longest);
+        assert_eq!(decode(f64::INFINITY), longest);
+        assert_eq!(decode(-1.0), shortest);
+        assert_eq!(decode(0.0), shortest);
+        assert_eq!(decode(f64::NAN), shortest);
+        assert_eq!(decode(0.05), std::time::Duration::from_millis(50));
+    }
 
     #[test]
     fn request_op_to_command_roundtrip() {

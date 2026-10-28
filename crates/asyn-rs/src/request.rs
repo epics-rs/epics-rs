@@ -246,7 +246,8 @@ impl RequestCell {
         // C starts the timer before it signals the port thread
         // (asynManager.c:1619-1628).
         if let Some(timeout) = user.queue_timeout {
-            queue_timer().arm(self, seq, std::time::Instant::now() + timeout.get());
+            let at = epics_libcom_rs::runtime::time::deadline_from_now(timeout.get());
+            queue_timer().arm(self, seq, at);
         }
         if self.queue.push(self, seq) {
             Ok(())
@@ -2300,6 +2301,17 @@ mod tests {
         cell.queue(&user).unwrap();
         assert_eq!(cell.lock().state, ACTIVE_QUEUED);
         assert_eq!(cell.queue(&user), Err(QueueRefusal::AlreadyQueued));
+    }
+
+    /// A queue deadline past `Instant`'s range never fires; arming it must
+    /// not overflow `Instant::now() + timeout`.
+    #[test]
+    fn an_unrepresentable_queue_deadline_arms_without_panicking() {
+        let (queue, _body, cell) = probe(false);
+        let user = crate::user::AsynUser::new(0).with_queue_timeout(std::time::Duration::MAX);
+        cell.queue(&user).unwrap();
+        assert!(cell.cancel());
+        assert!(queue.pop().is_none());
     }
 
     /// asynManager.c:1592-1597: a queue timeout needs a timeout callback.

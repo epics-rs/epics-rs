@@ -725,21 +725,6 @@ fn octet_device_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
     ]
 }
 
-/// `asynReport` body — walks every registered port (or the named one
-/// only) and calls `PortDriver::report(level)`. C asyn's `asynReport`
-/// loops through `pasynManager`'s port list and calls each driver's
-/// `report` interface (`asynManager.c::asynReport`).
-/// A shell `double` seconds argument as a `Duration`. C hands the value to
-/// `epicsEventWaitWithTimeout`, which treats a non-positive timeout as "do not
-/// wait"; NaN cannot be represented at all. Both collapse to zero here.
-fn duration_from_secs(secs: f64) -> Duration {
-    if secs.is_finite() && secs > 0.0 {
-        Duration::from_secs_f64(secs)
-    } else {
-        Duration::ZERO
-    }
-}
-
 /// `portName addr yesNo` — the argument list C gives both `asynEnable` and
 /// `asynAutoConnect` (asynShellCommands.c:944-948, 976-982).
 fn enable_style_args() -> Vec<ArgDesc> {
@@ -1356,10 +1341,14 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
             "asynSetQueueLockPortTimeout portName timeout - least seconds a SyncIO call \
              waits in the port's queue (C default 2.0)",
             move |args: &[ArgValue], ctx: &CommandContext| {
+                // A timer delay, not an event wait: C arms `queueRequest`'s
+                // timer only for a positive value (asynManager.c:1619-1626).
                 match shell_connect_device(&mgr_r, arg_str(args, 0)?.as_deref()) {
-                    Ok(handle) => handle.set_queue_lock_port_timeout(duration_from_secs(
-                        arg_f64(args, 1).unwrap_or(0.0),
-                    )),
+                    Ok(handle) => handle.set_queue_lock_port_timeout(
+                        epics_libcom_rs::runtime::time::duration_from_secs(
+                            arg_f64(args, 1).unwrap_or(0.0),
+                        ),
+                    ),
                     Err(msg) => ctx.println(&msg),
                 }
                 Ok(CommandOutcome::Continue)
@@ -1414,7 +1403,8 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
             "asynWaitConnect portName timeout - block until the port is connected",
             move |args: &[ArgValue], _ctx: &CommandContext| {
                 let port = arg_str(args, 0)?;
-                let timeout = duration_from_secs(arg_f64(args, 1).unwrap_or(0.0));
+                let timeout =
+                    crate::runtime::config::event_wait_timeout(arg_f64(args, 1).unwrap_or(0.0));
                 let Ok(handle) = shell_connect_device(&mgr_r, port.as_deref()) else {
                     // An unbound user's asynPrint goes to the global trace;
                     // printf's "%s" of NULL is glibc's "(null)".
@@ -3064,6 +3054,26 @@ mod tests {
             .unwrap();
         assert_eq!(deadline(200), Some(Duration::from_millis(500)));
         assert_eq!(deadline(1000), Some(Duration::from_millis(1000)));
+
+        let set = |secs: f64| {
+            cmds.iter()
+                .find(|c| c.name == "asynSetQueueLockPortTimeout")
+                .unwrap()
+                .handler
+                .call(
+                    &[ArgValue::String("qlp_port".into()), ArgValue::Double(secs)],
+                    &make_ctx(),
+                )
+                .unwrap();
+        };
+        // C arms no timer for a non-positive floor (asynManager.c:1619-1620),
+        // so the user's own timeout is the deadline.
+        set(-1.0);
+        assert_eq!(deadline(200), Some(Duration::from_millis(200)));
+        // A floor past `Duration` is a deadline that never fires, held in the
+        // port's u64 of nanoseconds.
+        set(1e300);
+        assert_eq!(deadline(200), Some(Duration::from_nanos(u64::MAX)));
     }
 
     /// R19-120: `asynShowOption` prints `key=value` for a driver option
@@ -3248,6 +3258,11 @@ mod tests {
             elapsed < Duration::from_secs(1),
             "an already-connected port must not wait ({elapsed:?})"
         );
+
+        // C's event wait caps a timeout at ten years and waits not at all on a
+        // negative one; neither may panic converting the shell's double.
+        assert!(wait("wc_late", 1e300) < Duration::from_secs(1));
+        assert!(wait("wc_never", -1.0) < Duration::from_secs(1));
     }
 
     /// asynWaitConnect prints nothing on the console: a port it cannot connect

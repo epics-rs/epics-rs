@@ -18,12 +18,20 @@ fn auto_connect_timeout_secs() -> f64 {
 }
 
 /// The registration connect-wait every new port gets — C's
-/// `waitConnect(..., pasynBase->autoConnectTimeout)` at :2137, whose
-/// `epicsEventWaitWithTimeout` does not wait on a negative or NaN value.
+/// `waitConnect(..., pasynBase->autoConnectTimeout)` at :2137, an
+/// `event_wait_timeout`.
 pub fn auto_connect_timeout() -> Duration {
-    let secs = auto_connect_timeout_secs();
-    if secs.is_finite() && secs > 0.0 {
-        Duration::from_secs_f64(secs)
+    event_wait_timeout(auto_connect_timeout_secs())
+}
+
+/// A C `epicsEventWaitWithTimeout` timeout as posix `convertDoubleToWakeTime`
+/// (libcom osdTime.cpp:92-127) clamps it: a negative one is 0 and anything past
+/// ten years is ten years. NaN slips past both of C's tests into an undefined
+/// `time_t` cast; it is 0 here.
+pub(crate) fn event_wait_timeout(secs: f64) -> Duration {
+    const TEN_YEARS: f64 = 60.0 * 60.0 * 24.0 * 3652.5;
+    if secs > 0.0 {
+        Duration::from_secs_f64(secs.min(TEN_YEARS))
     } else {
         Duration::ZERO
     }
@@ -147,6 +155,8 @@ mod auto_connect_timeout_tests {
     #[test]
     fn the_auto_connect_timeout_readers_part_on_the_sign() {
         let longest = Duration::from_millis(i32::MAX as u64);
+        // posix `convertDoubleToWakeTime`'s cap (osdTime.cpp:97-98).
+        let ten_years = Duration::from_secs(60 * 60 * 24 * 36525 / 10);
         for (secs, wait, poll) in [
             (0.5, Duration::from_millis(500), Duration::from_millis(500)),
             (
@@ -156,7 +166,9 @@ mod auto_connect_timeout_tests {
             ),
             (0.0, Duration::ZERO, Duration::ZERO),
             (f64::NAN, Duration::ZERO, Duration::ZERO),
-            (f64::INFINITY, Duration::ZERO, longest),
+            (f64::INFINITY, ten_years, longest),
+            (1e300, ten_years, longest),
+            (f64::NEG_INFINITY, Duration::ZERO, longest),
             // C's `(int)` makes this a 0 ms poll, not a wait-forever.
             (-0.0004, Duration::ZERO, Duration::ZERO),
             (-1.0, Duration::ZERO, longest),

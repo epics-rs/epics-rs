@@ -11,6 +11,19 @@ use crate::user::AsynUser;
 
 use super::{OctetInterpose, OctetNext, OctetReadResult};
 
+/// A flush timeout in seconds, brought into C's range: `asynInterposeFlushConfig`
+/// keeps an `int` of milliseconds and makes a non-positive one 1
+/// (asynInterposeFlush.c:66-79).
+pub fn flush_timeout_from_secs(secs: f64) -> Duration {
+    let shortest = Duration::from_millis(1);
+    let longest = Duration::from_millis(i32::MAX as u64);
+    if secs > 0.0 {
+        Duration::try_from_secs_f64(secs).map_or(longest, |t| t.min(longest))
+    } else {
+        shortest
+    }
+}
+
 /// Flush interpose layer.
 ///
 /// On `flush()`, temporarily sets a short timeout and reads in a loop to

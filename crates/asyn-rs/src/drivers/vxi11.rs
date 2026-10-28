@@ -172,9 +172,11 @@ impl Vxi11Config {
         //   if (defTimeoutString) defTimeout = epicsStrtod(...)
         //   pvxiPort->defTimeout = (defTimeout > .0001)
         //       ? defTimeout : (double)DEFAULT_RPC_TIMEOUT;
+        // Its users saturate an oversized value (`getIoTimeout`, :223-230;
+        // `clientIoCall`, :571-577), as `duration_from_secs` does.
         let parsed: f64 = def_timeout_string.trim().parse().unwrap_or(0.0);
         let default_timeout = if parsed > 0.0001 {
-            Duration::from_secs_f64(parsed)
+            epics_libcom_rs::runtime::time::duration_from_secs(parsed)
         } else {
             Duration::from_secs(DEFAULT_RPC_TIMEOUT_SECS)
         };
@@ -533,6 +535,16 @@ mod tests {
 
         let cfg = Vxi11Config::from_positional("h", 0, "10", "inst0", 0);
         assert_eq!(cfg.default_timeout, Duration::from_secs(10));
+    }
+
+    /// C saturates an oversized timeout where it uses it (`getIoTimeout`,
+    /// drvVxi11.c:223-230; `clientIoCall`, :571-577).
+    #[test]
+    fn default_timeout_saturates_past_duration() {
+        for huge in ["1e300", "inf"] {
+            let cfg = Vxi11Config::from_positional("h", 0, huge, "inst0", 0);
+            assert_eq!(cfg.default_timeout, Duration::MAX, "{huge}");
+        }
     }
 
     #[test]

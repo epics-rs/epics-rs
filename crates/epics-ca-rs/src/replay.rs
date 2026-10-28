@@ -232,7 +232,7 @@ pub async fn replay(
             let target = epics_base_rs::runtime::time::duration_from_secs(ev.ts() - st);
             let elapsed = start.elapsed();
             if target > elapsed {
-                tokio::time::sleep(target - elapsed).await;
+                epics_base_rs::runtime::task::sleep(target - elapsed).await;
             }
             prior_ts = Some(ev.ts());
         } else {
@@ -307,25 +307,41 @@ mod tests {
         assert!(RecordedEvent::from_json(line).is_none());
     }
 
-    /// A timestamp gap past `Duration`'s range paces to a wait that never
-    /// ends.
-    // RTEMS-EXEC-MODEL-ALLOW(1): paced replay sleeps on tokio's timer, so the
-    // test brings its own runtime; measured passing under
-    // `EPICS_RS_BUILD_EXEC_BACKEND=thread`.
-    #[tokio::test]
-    async fn a_gap_past_duration_range_paces_forever() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("rec.jsonl");
-        let far = format!("1{}.000", "0".repeat(20));
-        let lines: String = ["0.000", far.as_str()]
+    /// A recording of `client_connect` events at the given timestamps.
+    fn write_connects(path: &Path, stamps: &[&str]) {
+        let lines: String = stamps
             .iter()
             .map(|ts| {
                 format!("{{\"ts\":{ts},\"ev\":\"client_connect\",\"peer\":\"10.0.0.6:54311\"}}\n")
             })
             .collect();
-        std::fs::write(&path, lines).unwrap();
+        std::fs::write(path, lines).unwrap();
+    }
+
+    /// Paced replay waits out the recorded gap on the runtime seam's timer, so
+    /// it runs on the exec backend's executor, which has no tokio runtime.
+    #[epics_macros_rs::epics_test]
+    async fn paced_replay_waits_out_the_recorded_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rec.jsonl");
+        write_connects(&path, &["0.000", "0.050"]);
+        let start = std::time::Instant::now();
         let mut seen = 0;
-        let paced = tokio::time::timeout(
+        assert_eq!(replay(&path, true, |_| seen += 1).await.unwrap(), 2);
+        assert_eq!(seen, 2);
+        assert!(start.elapsed() >= std::time::Duration::from_millis(50));
+    }
+
+    /// A timestamp gap past `Duration`'s range paces to a wait that never
+    /// ends.
+    #[epics_macros_rs::epics_test]
+    async fn a_gap_past_duration_range_paces_forever() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rec.jsonl");
+        let far = format!("1{}.000", "0".repeat(20));
+        write_connects(&path, &["0.000", &far]);
+        let mut seen = 0;
+        let paced = epics_base_rs::runtime::task::timeout(
             std::time::Duration::from_millis(200),
             replay(&path, true, |_| seen += 1),
         )

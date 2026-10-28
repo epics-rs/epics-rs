@@ -132,9 +132,12 @@ fn roll(pct: u8) -> bool {
 /// caller proceeds. Awaitable so it integrates naturally into async
 /// I/O paths.
 pub async fn maybe_stall() {
-    let cfg = config();
+    stall(config()).await;
+}
+
+async fn stall(cfg: &ChaosConfig) {
     if cfg.enabled && cfg.stall > Duration::ZERO {
-        tokio::time::sleep(cfg.stall).await;
+        epics_base_rs::runtime::task::sleep(cfg.stall).await;
     }
 }
 
@@ -191,6 +194,17 @@ mod tests {
     fn unknown_keys_are_ignored() {
         let c = ChaosConfig::from_env_str("totally_made_up:1,drop:1%");
         assert_eq!(c.drop_pct, 1);
+    }
+
+    /// The stall waits on the runtime seam's timer, so it runs on the exec
+    /// backend's executor, which has no tokio runtime. Bypasses the global
+    /// config as `roll_extremes_are_honoured` does.
+    #[epics_macros_rs::epics_test]
+    async fn a_configured_stall_waits_it_out() {
+        let cfg = ChaosConfig::from_env_str("stall:20ms");
+        let start = std::time::Instant::now();
+        stall(&cfg).await;
+        assert!(start.elapsed() >= Duration::from_millis(20));
     }
 
     #[test]

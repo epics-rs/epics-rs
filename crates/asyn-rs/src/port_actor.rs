@@ -794,10 +794,12 @@ impl ActorMessage {
     }
 }
 
-/// Connect-retry timers the idle wait has armed, process-wide (nextest runs
-/// each test in its own process).
+/// Connect-retry timers the idle wait has armed, and the waits they ended;
+/// process-wide (nextest runs each test in its own process).
 #[cfg(test)]
 static RETRY_TIMERS_ARMED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static RETRY_TIMER_FIRES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Point the idle wait's held connect-retry timer at `deadline`. A timer is
 /// armed only when the deadline moved, and dropped when the retry is
@@ -826,7 +828,11 @@ fn retarget(mut timer: Pin<&mut Option<tokio::time::Sleep>>, deadline: Option<In
 /// they did before the timer existed.
 async fn sleep_until_opt(timer: Pin<&mut Option<tokio::time::Sleep>>) {
     match timer.as_pin_mut() {
-        Some(sleep) => sleep.await,
+        Some(sleep) => {
+            sleep.await;
+            #[cfg(test)]
+            RETRY_TIMER_FIRES.fetch_add(1, AtomicOrdering::SeqCst);
+        }
         None => std::future::pending().await,
     }
 }
@@ -6140,16 +6146,26 @@ mod tests {
         );
     }
 
-    /// The idle wait holds the connect-retry timer across loop passes: a pass
-    /// woken by a message, with `connect_retry_at` where it was, arms none.
-    #[test]
-    fn a_pass_that_keeps_the_retry_deadline_arms_no_timer() {
-        use std::sync::atomic::Ordering;
+    /// An auto-connect port whose connect fails `fail_first` times and then
+    /// holds, on the production loop (the one with the connect-retry timer).
+    /// Returns the request sender, the connect attempts and the link state.
+    fn spawn_retrying_port(
+        fail_first: usize,
+        between: Duration,
+    ) -> (
+        mpsc::UnboundedSender<ActorMessage>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-        struct DeadLink {
+        struct Retrying {
             base: PortDriverBase,
+            calls: Arc<AtomicUsize>,
+            up: Arc<AtomicBool>,
+            fail_first: usize,
         }
-        impl PortDriver for DeadLink {
+        impl PortDriver for Retrying {
             fn base(&self) -> &PortDriverBase {
                 &self.base
             }
@@ -6157,15 +6173,20 @@ mod tests {
                 &mut self.base
             }
             fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
-                Err(AsynError::Status {
-                    status: AsynStatus::Error,
-                    message: "link down".into(),
-                })
+                if self.calls.fetch_add(1, Ordering::SeqCst) < self.fail_first {
+                    return Err(AsynError::Status {
+                        status: AsynStatus::Error,
+                        message: "link down".into(),
+                    });
+                }
+                self.base.set_connected(true);
+                self.up.store(true, Ordering::SeqCst);
+                Ok(())
             }
         }
 
         let mut base = PortDriverBase::new(
-            "retry_hold",
+            "retry_timer",
             1,
             PortFlags::default(),
             InterfaceMask::NONE,
@@ -6173,13 +6194,31 @@ mod tests {
         );
         base.create_param("VAL", ParamType::Int32).unwrap();
         base.init_auto_connect(true);
-        // Registration's failed attempt re-arms once, for the whole test.
-        base.seconds_between_port_connect = Duration::from_secs(3600);
+        base.seconds_between_port_connect = between;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let up = Arc::new(AtomicBool::new(false));
+        let driver = Retrying {
+            base,
+            calls: calls.clone(),
+            up: up.clone(),
+            fail_first,
+        };
         let (tx, rx) = mpsc::unbounded_channel();
-        let mut actor = PortActor::new(Box::new(DeadLink { base }), rx);
+        let mut actor = PortActor::new(Box::new(driver), rx);
         actor.register();
         let (_shutdown, shutdown_rx) = mpsc::channel(1);
         std::thread::spawn(move || actor.run_with_shutdown(shutdown_rx));
+        (tx, calls, up)
+    }
+
+    /// The idle wait holds the connect-retry timer across loop passes: a pass
+    /// woken by a message, with `connect_retry_at` where it was, arms none.
+    #[test]
+    fn a_pass_that_keeps_the_retry_deadline_arms_no_timer() {
+        use std::sync::atomic::Ordering;
+
+        // Registration's failed attempt re-arms once, for the whole test.
+        let (tx, _calls, _up) = spawn_retrying_port(usize::MAX, Duration::from_secs(3600));
 
         let started = Instant::now();
         while RETRY_TIMERS_ARMED.load(Ordering::SeqCst) == 0 {
@@ -6200,6 +6239,63 @@ mod tests {
             RETRY_TIMERS_ARMED.load(Ordering::SeqCst) - before,
             0,
             "timers armed by passes that kept the retry deadline"
+        );
+    }
+
+    /// A retry that fires and fails moves the deadline, and the spent timer
+    /// is re-armed at it: a wait ends once per due retry, each a connect
+    /// attempt, not on every pass until the next one is due.
+    #[test]
+    fn a_spent_retry_timer_follows_the_moved_deadline() {
+        use std::sync::atomic::Ordering;
+
+        let (_tx, calls, _up) = spawn_retrying_port(usize::MAX, Duration::from_millis(20));
+        // From the second timer retry on, each waited on a deadline the one
+        // before it moved.
+        let started = Instant::now();
+        while calls.load(Ordering::SeqCst) < 4 {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the retry timer stopped"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // Fires first: registration's attempt ended no wait, which covers a
+        // fire whose attempt is still running.
+        let fires = RETRY_TIMER_FIRES.load(Ordering::SeqCst);
+        let attempts = calls.load(Ordering::SeqCst);
+        assert!(
+            fires <= attempts,
+            "{fires} retry-timer wakes for {attempts} connect attempts"
+        );
+    }
+
+    /// A retry that brings the port up disarms the timer, and the spent
+    /// `Sleep` goes with it: a connected idle port's wait never ends on its
+    /// own.
+    #[test]
+    fn a_disarmed_retry_timer_is_dropped() {
+        use std::sync::atomic::Ordering;
+
+        // Registration's attempts fail, so a timer retry brings the link up.
+        let (tx, _calls, up) = spawn_retrying_port(2, Duration::from_millis(20));
+        let started = Instant::now();
+        while !up.load(Ordering::SeqCst) {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the retry never connected"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let fires = RETRY_TIMER_FIRES.load(Ordering::SeqCst);
+        assert!(fires > 0, "the link came up on a timer retry");
+        // Idle, then woken: neither may end a wait on the spent timer.
+        std::thread::sleep(Duration::from_millis(20));
+        send_and_wait(&tx, RequestOp::GetConnected, AsynUser::default()).unwrap();
+        assert_eq!(
+            RETRY_TIMER_FIRES.load(Ordering::SeqCst) - fires,
+            0,
+            "waits ended by a disarmed retry timer"
         );
     }
 

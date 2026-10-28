@@ -63,7 +63,10 @@ impl EnumPort {
             name,
             1,
             PortFlags::default(),
-            InterfaceMask::ENUM | InterfaceMask::DRV_USER,
+            InterfaceMask::INT32
+                | InterfaceMask::UINT32_DIGITAL
+                | InterfaceMask::ENUM
+                | InterfaceMask::DRV_USER,
             InterfaceMask::ENUM,
         );
         base.create_param("MODE", ParamType::Enum).unwrap();

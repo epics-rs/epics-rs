@@ -1115,6 +1115,21 @@ impl AsynDeviceSupport {
         }
     }
 
+    /// C `initCommon`'s `findInterface` for the record's interface: a port
+    /// that never registered it refuses the record (devAsynInt32.c:279-284).
+    fn find_interface(&self) -> Result<(), DeviceInitOutcome> {
+        match self.iface {
+            Some(iface) if !self.handle.has_interface(iface) => {
+                self.dset.report(
+                    &self.record_name,
+                    &LinkRefusal::Interface(iface.asyn_name()),
+                );
+                Err(self.dset.bad())
+            }
+            _ => Ok(()),
+        }
+    }
+
     fn request_user(&self, priority: QueuePriority) -> AsynUser {
         AsynUser::new(self.reason)
             .with_addr(self.addr)
@@ -4333,6 +4348,13 @@ impl DeviceSupport for AsynDeviceSupport {
         // moment a record binds to it. C's failures (:255-259) are a port it
         // cannot find, and this handle is that port.
         self.handle.connect_device(self.addr);
+        // devAsynOctet finds asynOctet before its drvUser (devAsynOctet.c:291);
+        // the other dsets after it.
+        if self.dset == Dset::Octet {
+            if let Err(dead) = self.find_interface() {
+                return Ok(dead);
+            }
+        }
         if self.handle.can_block() {
             self.request_cell();
         }
@@ -4380,6 +4402,11 @@ impl DeviceSupport for AsynDeviceSupport {
                 }
             }
             self.reason_set = true;
+        }
+        if self.dset != Dset::Octet {
+            if let Err(dead) = self.find_interface() {
+                return Ok(dead);
+            }
         }
         if let Some(sync_io) = self.dset.sync_io() {
             if let Err(dead) = self.sync_io_connect(drv_user, sync_io) {
@@ -5379,6 +5406,26 @@ impl Dset {
                 format!("{record} {driver}::initCommon {sync_io}->connect failed {message}"),
                 false,
             ),
+            // A port without the interface leaves `errorMessage` empty, and C
+            // prints it after the space.
+            LinkRefusal::Interface(iface) => match self {
+                Self::Octet => (
+                    format!("{record} {driver}::initCommon interface {iface} not found"),
+                    false,
+                ),
+                Self::Array => (
+                    format!("{driver}::devAsynXXXArray, {record} find {iface} interface failed "),
+                    true,
+                ),
+                Self::TimeSeries(_) => (
+                    format!("{driver}::initCommon, {record} find {iface} interface failed "),
+                    true,
+                ),
+                _ => (
+                    format!("{record} {driver}::initCommon findInterface {iface}Type "),
+                    false,
+                ),
+            },
         }
     }
 
@@ -5410,6 +5457,8 @@ enum LinkRefusal {
     DrvUser(String),
     /// This SyncIO's `connect` failed with this `errorMessage`.
     SyncIo(&'static str, String),
+    /// `findInterface` found no such interface on the port.
+    Interface(&'static str),
 }
 
 /// What `pasynUser->errorMessage` holds after a failed `drvUserCreate`.
@@ -6517,6 +6566,170 @@ mod tests {
         }
     }
 
+    /// A port that never registered the record's interface: each dset
+    /// prints C's `findInterface` line and takes its `bad:` arm —
+    /// devAsynOctet before its drvUser (devAsynOctet.c:291-295), the others
+    /// after it (devAsynInt32.c:279-284, devBusyAsyn.c:199-204,
+    /// devAsynUInt32Digital.c:234-239, devAsynFloat64.c:193-198,
+    /// devAsynInt64.c:235-240, devAsynXXXArray.cpp:159-164,
+    /// devAsynXXXTimeSeries.h:108-114). A child, to read its stdout.
+    #[test]
+    fn a_port_without_the_records_interface_refuses_it_at_init() {
+        use epics_base_rs::runtime::log::{errlog_add_listener, errlog_flush};
+        use epics_base_rs::server::ioc_app::DeviceSupportContext;
+        use epics_base_rs::server::records::ai::AiRecord;
+        use epics_base_rs::server::records::busy::BusyRecord;
+        use epics_base_rs::server::records::waveform::WaveformRecord;
+        use epics_base_rs::types::DbFieldType;
+
+        const CHILD: &str = "ASYN_FIND_INTERFACE_LINE_CHILD";
+        const TEST: &str =
+            "adapter::tests::a_port_without_the_records_interface_refuses_it_at_init";
+        let link_alarm = DeviceInitOutcome::dead_with_alarm(
+            epics_base_rs::server::recgbl::alarm_status::LINK_ALARM,
+            epics_base_rs::server::record::AlarmSeverity::Invalid,
+        );
+        // (record type, DTYP, link, printed line, errlog)
+        let cases = [
+            (
+                "ai",
+                "asynInt32",
+                "@asyn(fi_port,0)VAL",
+                "FI:I32 devAsynInt32::initCommon findInterface asynInt32Type ",
+                false,
+            ),
+            (
+                "busy",
+                "asynInt32",
+                "@asyn(fi_port,0)VAL",
+                "FI:BUSY devBusyAsyn::initCommon findInterface asynInt32Type ",
+                false,
+            ),
+            (
+                "bi",
+                "asynUInt32Digital",
+                "@asynMask(fi_port,0,1)VAL",
+                "FI:U32 devAsynUInt32Digital::initCommon findInterface asynUInt32DigitalType ",
+                false,
+            ),
+            (
+                "ai",
+                "asynFloat64",
+                "@asyn(fi_port,0)VAL",
+                "FI:F64 devAsynFloat64::initCommon findInterface asynFloat64Type ",
+                false,
+            ),
+            (
+                "int64in",
+                "asynInt64",
+                "@asyn(fi_port,0)VAL",
+                "FI:I64 devAsynInt64::initCommon findInterface asynInt64Type ",
+                false,
+            ),
+            // drvUser runs first, and refuses a parameter the port lacks.
+            (
+                "int64in",
+                "asynInt64",
+                "@asyn(fi_port,0)NOPE",
+                "FI:I64N devAsynInt64::initCommon drvUserCreate ",
+                false,
+            ),
+            // findInterface runs first: the missing parameter is never asked.
+            (
+                "stringin",
+                "asynOctetRead",
+                "@asyn(fi_port,0)NOPE",
+                "FI:OCT devAsynOctet::initCommon interface asynOctet not found",
+                false,
+            ),
+            (
+                "waveform",
+                "asynInt32ArrayIn",
+                "@asyn(fi_port,0)VAL",
+                "devAsynXXXArray::devAsynXXXArray, FI:ARR find asynInt32Array interface failed ",
+                true,
+            ),
+            (
+                "waveform",
+                "asynInt32TimeSeries",
+                "@asyn(fi_port,0)VAL",
+                "devAsynInt32TimeSeries::initCommon, FI:TS find asynInt32 interface failed ",
+                true,
+            ),
+        ];
+        let name = |line: &'static str| {
+            line.split([' ', ','])
+                .find(|w| w.starts_with("FI:"))
+                .unwrap()
+        };
+        if std::env::var_os(CHILD).is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "{stdout}{stderr}");
+            for (.., line, errlog) in cases {
+                let ours: Vec<_> = stdout
+                    .lines()
+                    .filter(|l| l.contains(&format!("{} ", name(line))))
+                    .collect();
+                let want = if errlog {
+                    format!("errlog: {line}")
+                } else {
+                    line.to_string()
+                };
+                assert_eq!(ours, [want.as_str()], "{stdout}");
+            }
+            return;
+        }
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let actor = PortActor::new(Box::new(TestPort::registering(InterfaceMask::DRV_USER)), rx);
+        let actor_link = actor.link();
+        std::thread::spawn(actor.registered());
+        let handle = PortHandle::new(
+            tx,
+            "fi_port".into(),
+            Arc::new(InterruptManager::new()),
+            actor_link,
+            Arc::new(crate::trace::TraceManager::new()),
+        );
+        crate::asyn_record::register_port("fi_port", handle, &crate::registry::open_owner())
+            .unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = seen.clone();
+        errlog_add_listener(move |m: &str| sink.lock().unwrap().push(m.to_string()));
+        for (record_type, dtyp, inp, line, _) in cases {
+            let ctx = DeviceSupportContext {
+                record_type,
+                dtyp,
+                inp,
+                out: "",
+            };
+            let mut dev = universal_asyn_factory(&ctx).expect("the dset binds");
+            dev.set_record_info(name(line), ScanType::Passive);
+            let (mut rec, want): (Box<dyn Record>, _) = match record_type {
+                "busy" => (Box::new(BusyRecord::new()), link_alarm),
+                "waveform" if dtyp.ends_with("TimeSeries") => (
+                    Box::new(WaveformRecord::new(4, DbFieldType::Long)),
+                    DeviceInitOutcome::dead(),
+                ),
+                "waveform" => (
+                    Box::new(WaveformRecord::new(4, DbFieldType::Long)),
+                    link_alarm,
+                ),
+                _ => (Box::new(AiRecord::default()), link_alarm),
+            };
+            assert_eq!(dev.init(rec.as_mut()).unwrap(), want, "{dtyp}");
+        }
+        errlog_flush();
+        for m in seen.lock().unwrap().iter() {
+            println!("errlog: {}", m.trim_end_matches('\n'));
+        }
+    }
+
     /// Each dset's `drvUserCreate` refusal: devAsynInt32.c:273,
     /// devBusyAsyn.c:193, devAsynUInt32Digital.c:228, devAsynFloat64.c:187,
     /// devAsynInt64.c:229 and devAsynOctet.c:616 printf it;
@@ -7117,7 +7330,15 @@ mod tests {
     }
     impl TestPort {
         fn new() -> Self {
-            Self::registering(InterfaceMask::INT32 | InterfaceMask::ENUM | InterfaceMask::DRV_USER)
+            Self::registering(
+                InterfaceMask::INT32
+                    | InterfaceMask::INT64
+                    | InterfaceMask::UINT32_DIGITAL
+                    | InterfaceMask::FLOAT64
+                    | InterfaceMask::OCTET
+                    | InterfaceMask::ENUM
+                    | InterfaceMask::DRV_USER,
+            )
         }
 
         fn registering(interfaces: InterfaceMask) -> Self {
@@ -10531,7 +10752,7 @@ mod tests {
                 "capport",
                 1,
                 PortFlags::default(),
-                InterfaceMask::DRV_USER,
+                InterfaceMask::OCTET | InterfaceMask::DRV_USER,
                 InterfaceMask::NONE,
             );
             base.create_param("VAL", ParamType::Int32).unwrap();
@@ -11344,7 +11565,7 @@ mod tests {
                     "ondemand",
                     1,
                     PortFlags::default(),
-                    InterfaceMask::DRV_USER,
+                    InterfaceMask::INT32 | InterfaceMask::FLOAT64 | InterfaceMask::DRV_USER,
                     InterfaceMask::NONE,
                 ),
                 binds: Arc::clone(&binds),

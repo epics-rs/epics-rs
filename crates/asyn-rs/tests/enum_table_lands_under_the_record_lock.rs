@@ -77,7 +77,10 @@ async fn enum_ioc(port: &str, record: &str) -> Ioc {
         port,
         1,
         PortFlags::default(),
-        InterfaceMask::INT32 | InterfaceMask::ENUM | InterfaceMask::DRV_USER,
+        InterfaceMask::INT32
+            | InterfaceMask::UINT32_DIGITAL
+            | InterfaceMask::ENUM
+            | InterfaceMask::DRV_USER,
         InterfaceMask::INT32 | InterfaceMask::UINT32_DIGITAL | InterfaceMask::ENUM,
     );
     base.create_param("MODE", ParamType::Enum).unwrap();

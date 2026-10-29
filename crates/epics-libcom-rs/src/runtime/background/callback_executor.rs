@@ -2836,17 +2836,36 @@ mod rv_stop_race {
     /// returns (callback.c:237-260).
     #[test]
     fn rv_nothing_runs_after_stop_returns() {
+        // Like C's, `stop` returns once the band is found drained
+        // (callback.c:217-226), which a requester outpacing the worker puts
+        // off for as long as it keeps going: the hammer requests this many
+        // times inside `stop`, then waits for it to return.
+        const BUDGET_IN_STOP: usize = 4096;
         let mut late_total = 0;
         for _ in 0..300 {
             let pool = Arc::new(CallbackPool::with_config(1024, 1));
+            let stopping = Arc::new(AtomicBool::new(false));
             let stopped = Arc::new(AtomicBool::new(false));
             let late = Arc::new(AtomicUsize::new(0));
             let quit = Arc::new(AtomicBool::new(false));
             let hammer = {
-                let (pool, stopped, late, quit) =
-                    (pool.clone(), stopped.clone(), late.clone(), quit.clone());
+                let (pool, stopping, stopped, late, quit) = (
+                    pool.clone(),
+                    stopping.clone(),
+                    stopped.clone(),
+                    late.clone(),
+                    quit.clone(),
+                );
                 std::thread::spawn(move || {
+                    let mut budget = BUDGET_IN_STOP;
                     while !quit.load(Ordering::SeqCst) {
+                        if stopping.load(Ordering::SeqCst) && !stopped.load(Ordering::SeqCst) {
+                            if budget == 0 {
+                                std::thread::yield_now();
+                                continue;
+                            }
+                            budget -= 1;
+                        }
                         let (s, l) = (stopped.clone(), late.clone());
                         let _ = pool.request(
                             CallbackPriority::Low,
@@ -2860,6 +2879,7 @@ mod rv_stop_race {
                 })
             };
             std::thread::sleep(Duration::from_micros(200));
+            stopping.store(true, Ordering::SeqCst);
             pool.stop();
             stopped.store(true, Ordering::SeqCst);
             std::thread::sleep(Duration::from_millis(2));

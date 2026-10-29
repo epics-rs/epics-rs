@@ -761,11 +761,16 @@ mod tests {
         assert_eq!(scanf_long("0b1", 2), Some((1, 3)));
         // `%lx`, `%lo` and `%lb` are unsigned conversions: `strtoul`'s value
         // stored into the `long`.
-        assert_eq!(scanf_long("8000000000000000", 16), Some((c_long::MIN, 16)));
+        // Past `unsigned long`'s range `strtoul` saturates at `ULONG_MAX`.
+        let min = |digits_64: c_long| if c_long::BITS == 64 { digits_64 } else { -1 };
+        assert_eq!(
+            scanf_long("8000000000000000", 16),
+            Some((min(c_long::MIN), 16))
+        );
         assert_eq!(scanf_long("1ffffffffffffffffff", 16), Some((-1, 19)));
         assert_eq!(
             scanf_long("1000000000000000000000", 8),
-            Some((c_long::MIN, 22))
+            Some((min(c_long::MIN), 22))
         );
     }
 

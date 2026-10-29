@@ -239,10 +239,15 @@ fn test_sscanf_narrows_through_the_output_object() {
         eval_str(r#"SSCANF("70000", "%hd")"#),
         StackValue::Double(4464.0)
     );
-    // `%lx` still parses HEX digits: 0x4294967295.
+    // `%lx` still parses HEX digits: 0x4294967295, which `strtoul` saturates
+    // at `ULONG_MAX` where `long` is 32 bits.
     assert_eq!(
         eval_str(r#"SSCANF("4294967295", "%lx")"#),
-        StackValue::Double(285960729237.0)
+        StackValue::Double(if std::ffi::c_ulong::BITS == 64 {
+            285960729237.0
+        } else {
+            4294967295.0
+        })
     );
 }
 

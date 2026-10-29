@@ -9865,13 +9865,17 @@ record(lso, "SOD") { field(SIZV, "128") }
         );
     }
 
-    /// `pft`'s `%ld` stores into a `long`, so a value past 2^53 keeps the low
-    /// bits C puts as `dbr_long_t`.
+    /// `pft`'s `%ld` stores into a `long`: a value past 2^53 is exact where
+    /// `long` is 64 bits and saturates at `LONG_MAX` where it is 32.
     #[test]
     fn pft_scans_into_c_short_and_long() {
         assert_eq!(
             c_scan::<c_long>(b"9007199254740993", b"%ld"),
-            Some(9007199254740993i64 as c_long)
+            Some(if c_long::BITS == 64 {
+                9007199254740993
+            } else {
+                c_long::MAX
+            })
         );
         assert_eq!(c_scan::<c_short>(b"70000", b"%hd"), Some(4464));
         assert_eq!(c_scan::<c_short>(b"-1", b"%hd"), Some(-1));

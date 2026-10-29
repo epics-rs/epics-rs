@@ -769,8 +769,8 @@ pub fn sscanf(input: impl AsRef<[u8]>, fmt: impl AsRef<[u8]>, out: &[&dyn ScanTa
 mod tests {
     use super::*;
 
-    fn long(input: &str, fmt: &str) -> (c_int, i64, c_int) {
-        let (v, n) = (Cell::new(0i64), Cell::new(-1));
+    fn long(input: &str, fmt: &str) -> (c_int, c_long, c_int) {
+        let (v, n) = (Cell::new(0 as c_long), Cell::new(-1));
         (sscanf(input, fmt, &[&v, &n]), v.get(), n.get())
     }
 
@@ -783,7 +783,7 @@ mod tests {
     /// format, return, value, `%n`).
     #[test]
     fn integers_take_c23_binary_like_glibc_with_gnu_source() {
-        const ROWS: &[(&str, &str, c_int, i64, c_int)] = &[
+        const ROWS: &[(&str, &str, c_int, c_long, c_int)] = &[
             ("0b11", "%li%n", 1, 3, 4),
             ("-0b11", "%li%n", 1, -3, 5),
             ("0b", "%li%n", 0, 0, -1),
@@ -814,7 +814,14 @@ mod tests {
             ("0b1", "%lo%n", 1, 0, 1),
             ("0b1", "%lu%n", 1, 0, 1),
             ("0b1", "%lx%n", 1, 0xb1, 3),
-            ("-8000000000000000", "%lx%n", 1, i64::MIN, 17),
+            // `strtoul` saturates at `ULONG_MAX` where `long` is 32 bits.
+            (
+                "-8000000000000000",
+                "%lx%n",
+                1,
+                if c_long::BITS == 64 { c_long::MIN } else { -1 },
+                17,
+            ),
             ("10000000000000000", "%lx%n", 1, -1, 17),
             ("99999999999", "%d%n", 1, 1215752191, 11),
             ("(nil)", "%p%n", 1, 0, 5),
@@ -830,11 +837,11 @@ mod tests {
     /// prefix even when the width cuts it off.
     #[test]
     fn hex_width_two_matches_glibc() {
-        const ROWS: &[(&str, c_int, i64, c_int)] = &[
+        const ROWS: &[(&str, c_int, c_long, c_int)] = &[
             ("41\"", 1, 0x41, 2),
             ("4g", 1, 4, 1),
             (" 5", 1, 5, 2),
-            ("-1", 1, 0xffff_ffff, 2),
+            ("-1", 1, 0xffff_ffff_u32 as c_long, 2),
             ("+5", 1, 5, 2),
             ("0x5", 0, 0, -1),
             ("0x", 0, 0, -1),

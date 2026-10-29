@@ -9871,11 +9871,7 @@ record(lso, "SOD") { field(SIZV, "128") }
     fn pft_scans_into_c_short_and_long() {
         assert_eq!(
             c_scan::<c_long>(b"9007199254740993", b"%ld"),
-            Some(if c_long::BITS == 64 {
-                9007199254740993
-            } else {
-                c_long::MAX
-            })
+            Some(c_long::try_from(9007199254740993i64).unwrap_or(c_long::MAX))
         );
         assert_eq!(c_scan::<c_short>(b"70000", b"%hd"), Some(4464));
         assert_eq!(c_scan::<c_short>(b"-1", b"%hd"), Some(-1));

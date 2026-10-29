@@ -1,0 +1,12 @@
+1..10
+# This test will run for 10 seconds...
+ok  1 - 9 seconds left
+ok  2 - 8 seconds left
+ok  3 - 7 seconds left
+ok  4 - 6 seconds left
+ok  5 - 5 seconds left
+ok  6 - 4 seconds left
+ok  7 - 3 seconds left
+ok  8 - 2 seconds left
+ok  9 - 1 seconds left
+ok 10 - 0 seconds left

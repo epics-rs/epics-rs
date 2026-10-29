@@ -1,0 +1,37 @@
+1..30
+# start
+ok  1 - seq_pvChannelCount(seqg_env) == 3
+ok  2 - seq_pvAssignCount(seqg_env) == 2
+ok  3 - seq_pvConnectCount(seqg_env) == 2
+ok  4 - seq_pvAssign(seqg_env, 0 , "") == pvStatOK
+# wait_x_nil
+ok  5 - seq_pvChannelCount(seqg_env) == 3
+ok  6 - seq_pvAssignCount(seqg_env) == 1
+ok  7 - seq_pvAssign(seqg_env, 0 , "pv1") == pvStatOK
+ok  8 - seq_pvAssignCount(seqg_env) == 2
+# wait_x_pv1
+ok  9 - seq_pvGetTmo(seqg_env, 0 , DEFAULT, DEFAULT_TIMEOUT) == pvStatOK
+ok 10 - seq_pvChannelCount(seqg_env) == 3
+ok 11 - seq_pvConnectCount(seqg_env) == 2
+ok 12 - seq_pvAssignCount(seqg_env) == 2
+ok 13 - seq_pvAssign(seqg_env, 0 , "pv2") == pvStatOK
+# wait_x_pv2
+ok 14 - seq_pvGetTmo(seqg_env, 0 , DEFAULT, DEFAULT_TIMEOUT) == pvStatOK
+ok 15 - seq_pvChannelCount(seqg_env) == 3
+ok 16 - seq_pvConnectCount(seqg_env) == 2
+ok 17 - seq_pvAssignCount(seqg_env) == 2
+ok 18 - seq_pvAssign(seqg_env, 1 , "") == pvStatOK
+ok 19 - seq_pvConnectCount(seqg_env) == 2
+ok 20 - seq_pvAssignCount(seqg_env) == 2
+ok 21 - seq_pvAssign(seqg_env, 1 , "pv1") == pvStatOK
+ok 22 - seq_pvAssignCount(seqg_env) == 3
+# wait_y_pv1
+ok 23 - seq_pvGetTmo(seqg_env, 1 , DEFAULT, DEFAULT_TIMEOUT) == pvStatOK
+ok 24 - seq_pvChannelCount(seqg_env) == 3
+ok 25 - seq_pvConnectCount(seqg_env) == 3
+ok 26 - seq_pvAssign(seqg_env, 2 , "pv2") == pvStatOK
+# wait_z_pv2
+ok 27 - seq_pvChannelCount(seqg_env) == 3
+ok 28 - seq_pvConnectCount(seqg_env) == 3
+ok 29 - seq_pvAssignCount(seqg_env) == 3
+ok 30 - ok

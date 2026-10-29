@@ -1,7 +1,7 @@
 use crate::error::{CaError, CaResult};
 use crate::server::event_queue::PostBurst;
 use crate::server::recgbl::PutReport;
-use crate::server::record::record_instance::{LinkScanMove, ScanMove};
+use crate::server::record::record_instance::{FieldMetaSource, LinkScanMove, ScanMove};
 use crate::server::record::{
     AfterGate, PreparedCommonLink, PreparedLink, PutRefused, RecordCell, RecordInstance,
 };
@@ -896,7 +896,7 @@ fn special_after_put(
         let name = instance.name.clone();
         db.link_check_held(name.as_bytes(), instance);
     }
-    let mut status = instance.record.special(field, true, &instance.common);
+    let mut status = instance.special(field, true);
     collect_after_gate(instance, tail);
     collect_put_report(instance, status.is_err(), tail);
     // The record's half above and the registry half here are ONE C function,
@@ -935,32 +935,32 @@ fn special_after_put(
     // `sCalcoutRecord.c:513-518`, `aCalcoutRecord.c:533-538`,
     // `transformRecord.c:715-723` — the four records whose C `special()` calls
     // `recGblInitConstantLink`): a put that leaves an input link constant
-    // re-runs the load into that input's value field and posts it. Without it a
+    // re-runs the load into that input's value field and posts it. C's own load
+    // is dead: `dbPutFieldLink` clears the lset (`dbAccess.c:1170`) and calls
+    // `special(1)` (`:1181`) before `dbAddLink` sets the new one (`:1206-1208`),
+    // so `dbLoadLink` returns `S_db_noLSET` (`dbLink.c:238-241`) and only the
+    // post runs. That C defect is not copied: without the load a
     // constant link is load-once dead state — the link layer delivers nothing
     // for a constant at process time, so `caput CO.INPB 7` would store the text
-    // and leave `B` at its `.db` value forever. The post does not depend on the
-    // load: C posts `pvalue` for an empty link too, which loads nothing.
+    // and leave `B` at its `.db` value forever.
     //
     // The record only DECLARES the pairs (`special_reseed_input_links`); the
-    // load itself is the shared `rec_gbl_init_constant_link` owner, the same one
-    // the init seed uses. Records whose C `special()` does not re-seed (calc,
-    // sub, sel, aSub, swait, …) declare nothing and are untouched.
-    let reseed = instance
+    // load and C's guard on it are the shared `reseed_constant_input_link`
+    // owner, over the init seed's load. Records whose C `special()` does not
+    // re-seed (calc, sub, sel, aSub, swait, …) declare nothing and are
+    // untouched.
+    if instance
         .record
         .special_reseed_input_links()
         .iter()
-        .find(|(link, _)| *link == field)
-        .map(|(_, value_field)| *value_field);
-    if let Some(value_field) = reseed {
+        .any(|(link, _)| *link == field)
+    {
         // The put funnel has already installed the link parsed before the
         // hold; a refcount, not a parse.
         let link = std::sync::Arc::clone(instance.record_link(field));
-        crate::server::record::reseed_constant_input_link(&mut *instance.record, field, &link);
-        let constant = matches!(
-            link.link_type(),
-            crate::server::record::LinkType::Empty | crate::server::record::LinkType::Constant
-        );
-        if constant {
+        if let Some(value_field) =
+            crate::server::record::reseed_constant_input_link(&mut *instance.record, field, &link)
+        {
             // The mask is the C call site's, and they disagree — calcout posts
             // a literal DBE_VALUE, transform DBE_VALUE|DBE_LOG. The record
             // carries it.
@@ -3082,6 +3082,7 @@ impl PvDatabase {
             if let Some(element) = src.element() {
                 let old_nord = array_nord_before_put(&instance, field);
                 if instance.record.put_primary_element0(element) {
+                    rec.settle_after_put(&instance, at.settle());
                     finish_put(&mut instance, field, at, &old_nord, origin, &mut burst);
                     return Ok(None);
                 }
@@ -3106,10 +3107,7 @@ impl PvDatabase {
                     gate_link(&mut instance, field, common, at, tail)
                 }
             })
-            .and_then(|()| {
-                let inst = &mut *instance;
-                inst.record.special(field, false, &inst.common)
-            })
+            .and_then(|()| instance.special(field, false))
             .and_then(|()| linconv_special(&mut instance, field, false, &mut burst));
         if let Err(e) = pass0 {
             self.remove_put_link(&instance, field, before);
@@ -3187,6 +3185,8 @@ impl PvDatabase {
                 Err(e) => status = Err(e),
             }
         }
+        // C's `cvt_dbaddr` answers from the record as each create finds it.
+        rec.settle_after_put(&instance, at.settle());
         self.remove_put_link(&instance, field, before);
         if status.is_ok() && link_put {
             self.open_put_link(&mut instance, field);
@@ -3493,7 +3493,7 @@ impl PvDatabase {
     /// `LinkSet::put_value` from this thread. It stages the write on the
     /// database's link-put queue and returns, exactly as C `dbCaPutLink`
     /// stages into `pca->pputNative`, calls `addAction` and returns
-    /// (`dbCa.c:515-602`); the `ca://` / `pva://` round trip runs on the
+    /// (`dbCa.c:515-602`); the CA / pva round trip runs on the
     /// queue's owner task, C's `dbCaTask` (`dbCa.c:1161-1183`). See
     /// [`super::link_put_queue`]. What is left inside the window is the
     /// re-entrant database work C also does under `dbScanLock`:
@@ -4925,12 +4925,17 @@ impl PvDatabase {
     /// `None` for a name that is no record's field.
     pub fn restore_target(&self, name: impl AsRef<[u8]>) -> Option<RestoreTarget> {
         let parts = super::DbNameParts::of(name.as_ref());
-        let target = self.field_target(parts.record, parts.field)?;
+        let target = self
+            .field_target(parts.record, parts.field)
+            .or_else(|| self.attribute_target(parts.record, parts.field))?;
+        let rec = self.get_record(parts.record)?;
+        let (field, _) = rec.put_name(field_or_val(parts.field));
+        // `dbEntryToAddr` runs the field's `cvt_dbaddr`; dbStatic's
+        // `dbFindRecord` ([`Self::static_restore_target`]) does not.
+        self.resolve_addr(&rec, &field);
         if !parts.tail.starts_with(b"$") {
             return Some(target);
         }
-        let rec = self.get_record(parts.record)?;
-        let (field, _) = rec.put_name(field_or_val(parts.field));
         let view = super::char_view::char_view(&rec.read(), &field)?;
         Some(RestoreTarget {
             dbf: crate::types::DbfCode::Char,
@@ -4949,6 +4954,21 @@ impl PvDatabase {
             return None;
         }
         self.field_target(parts.record, parts.field)
+    }
+
+    /// `dbNameToAddr`'s record attribute: `dbPutRecordAttribute`'s
+    /// `DBF_STRING` of `MAX_STRING_SIZE`, `SPC_ATTRIBUTE` (`dbStaticLib.c:1268-1271`).
+    fn attribute_target(&self, base: &[u8], field: &str) -> Option<RestoreTarget> {
+        use crate::types::DbfCode;
+        self.attribute_field_type(&*self.get_record(base)?, field)?;
+        Some(RestoreTarget {
+            dbf: DbfCode::String,
+            calc: false,
+            no_mod: false,
+            elements: 1,
+            addr_type: DbfCode::String,
+            field_size: super::char_view::MAX_STRING_SIZE as u16,
+        })
     }
 
     fn field_target(&self, base: &[u8], field: &str) -> Option<RestoreTarget> {
@@ -5102,7 +5122,12 @@ impl PvDatabase {
         let _gate = self.acquire_put_gate(base, &field, Some(&value));
         let owned = crate::server::db_loader::record_owns_field(&*rec.read().record, &field);
         match owned {
-            true => rec.write().put_declared_field(&field, value),
+            true => {
+                let mut inst = rec.write();
+                let put = inst.put_declared_field(&field, value);
+                inst.recount_after_store(&field);
+                put
+            }
             false => self.put_common_static(base, &rec, &field, value),
         }
     }
@@ -5758,7 +5783,7 @@ mod tests {
             .await
             .expect("CA put to CALC1.VAL must succeed");
 
-        let got = crate::runtime::task::timeout(std::time::Duration::from_secs(1), sub.recv_f64())
+        let got = crate::runtime::task::timeout(fact_budget::FACT_BUDGET, sub.recv_f64())
             .await
             .expect("a DBE_VALUE monitor must fire for a direct VAL put to a non-pp record");
         assert_eq!(got, Some(5.0));

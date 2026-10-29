@@ -69,7 +69,7 @@ fn console_of(name: &str) -> Vec<String> {
         .collect()
 }
 
-/// Process `R1` (OUT `ca://R2.PROC`) once, drain the put queue and the
+/// Process `R1` (OUT `R2.PROC CA`) once, drain the put queue and the
 /// errlog, and return the record's alarm.
 async fn put_once(lset: Lset) -> (u16, AlarmSeverity) {
     let db = PvDatabase::new();
@@ -81,7 +81,7 @@ async fn put_once(lset: Lset) -> (u16, AlarmSeverity) {
         .await
         .unwrap();
     {
-        db.put_pv_no_process("R1.OUT", EpicsValue::String("ca://R2.PROC".into()))
+        db.put_pv_no_process("R1.OUT", EpicsValue::String("R2.PROC CA".into()))
             .await
             .unwrap();
         let rec = db.get_record("R1").unwrap();
@@ -144,14 +144,22 @@ fn a_link_that_drops_after_staging_says_nothing() {
 }
 
 /// Process `R1` (OUT `R2.CALC CA`, a local calc) with VAL `1+`, which R2
-/// refuses: as a plain put, or in a put callback chain when `notify`.
-async fn put_local_refused(notify: bool) {
+/// refuses: as a plain put, or as `Async Soft Channel`'s put callback
+/// (`dbPutLinkAsync`) when `callback`. A put-notify chain alone puts plain.
+async fn put_local_refused(callback: bool) {
+    let dtyp = if callback {
+        r#"field(DTYP, "Async Soft Channel") "#
+    } else {
+        ""
+    };
     let (db, _h) = IocBuilder::new()
         .db_string(
-            r#"
-record(calc, "R2") { }
-record(stringout, "R1") { field(OUT, "R2.CALC CA") }
-"#,
+            &format!(
+                r#"
+record(calc, "R2") {{ }}
+record(stringout, "R1") {{ {dtyp}field(OUT, "R2.CALC CA") }}
+"#
+            ),
             &HashMap::new(),
         )
         .unwrap()
@@ -168,23 +176,17 @@ record(stringout, "R1") { field(OUT, "R2.CALC CA") }
         .find(|(field, _, _)| *field == "OUT")
         .unwrap();
     let out = out.external().unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
     while db.external_link_metadata(out).is_none() {
         assert!(std::time::Instant::now() < deadline, "R1.OUT connects");
         epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(5)).await;
     }
-    if notify {
-        db.put_record_field_from_ca("R1", "VAL", EpicsValue::String("1+".into()))
-            .await
-            .unwrap();
-    } else {
-        db.put_pv_no_process("R1", EpicsValue::String("1+".into()))
-            .await
-            .unwrap();
-        db.process_record_with_links("R1", &mut ProcStack::new())
-            .await
-            .unwrap();
-    }
+    db.put_pv_no_process("R1", EpicsValue::String("1+".into()))
+        .await
+        .unwrap();
+    db.process_record_with_links("R1", &mut ProcStack::new())
+        .await
+        .unwrap();
     db.sync_external_link_puts().await;
     errlog_flush();
 }

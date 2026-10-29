@@ -8,7 +8,8 @@
 
 mod common;
 
-use common::{CHILD, Shell, free_port, signal, spawn_ioc};
+use common::{CHILD, Shell, spawn_ioc, stop};
+use named_port::HeldPort;
 
 /// The child half; a no-op unless the parent set [`CHILD`].
 #[test]
@@ -188,21 +189,19 @@ fn dbpvar_prints_the_pvxs_channel_report() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let (remote_port, local_port, late_port) = (free_port(), free_port(), free_port());
-    let mut remote = spawn_ioc(dir.path(), "remote", REMOTE, remote_port, "");
+    let (remote_port, local_port, late_port) = (HeldPort::tcp(), HeldPort::tcp(), HeldPort::tcp());
+    let mut remote = spawn_ioc(dir.path(), "remote", REMOTE, &remote_port, "");
     let mut local = spawn_ioc(
         dir.path(),
         "local",
         LOCAL,
-        local_port,
-        &format!("127.0.0.1:{remote_port} 127.0.0.1:{local_port} 127.0.0.1:{late_port}"),
+        &local_port,
+        &format!(
+            "127.0.0.1:{} 127.0.0.1:{} 127.0.0.1:{}",
+            remote_port.port, local_port.port, late_port.port
+        ),
     );
-    let mut sh = Shell {
-        stdin: local.stdin.take().unwrap(),
-        dir: dir.path(),
-        tag: "p",
-        n: 0,
-    };
+    let mut sh = Shell::new(&mut local, dir.path(), "local");
 
     let p0 = sh.capture_until(&all(0), "  4/8 channels connected used by 10 links");
     let p1 = sh.capture(&all(1));
@@ -213,7 +212,7 @@ fn dbpvar_prints_the_pvxs_channel_report() {
     let pzz = sh.capture("dbpvar \"ZZ\" 2");
     let p1star = sh.capture("dbpvar \"*\" 1");
 
-    signal(&remote, "-STOP");
+    stop(&remote);
     sh.line("dbpf WR 5");
     sh.line("dbpf WT 6");
     sh.line("dbpf WRT 8");
@@ -224,16 +223,11 @@ fn dbpvar_prints_the_pvxs_channel_report() {
         t.contains("REM conn=F 1 disconnects, 1 type changes\n")
     });
 
-    let mut late = spawn_ioc(dir.path(), "late", LATE, late_port, "");
+    let mut late = spawn_ioc(dir.path(), "late", LATE, &late_port, "");
     let p5_end = sh.capture_when(&all(5), |t| {
         t.contains("NOPE:Y conn=T 0 disconnects, 1 type changes\n")
     });
-    let mut late_sh = Shell {
-        stdin: late.stdin.take().unwrap(),
-        dir: dir.path(),
-        tag: "l",
-        n: 0,
-    };
+    let mut late_sh = Shell::new(&mut late, dir.path(), "late");
     late_sh.line("exit");
     drop(late_sh);
     let _ = late.wait();

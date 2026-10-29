@@ -67,9 +67,12 @@ fn create_monitor_set_after_ioc_init_starts_a_saving_set() {
     // The set's task ticks on its own; C's `create_data_set` starts the
     // save task the same way.
     let sav = dir.path().join("settings.sav");
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
     while !sav.exists() {
-        assert!(Instant::now() < deadline, "no settings.sav after 10 s");
+        assert!(
+            Instant::now() < deadline,
+            "no settings.sav within the fact budget"
+        );
         std::thread::sleep(Duration::from_millis(100));
     }
     let text = std::fs::read_to_string(&sav).unwrap();

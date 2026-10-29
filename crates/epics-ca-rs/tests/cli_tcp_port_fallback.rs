@@ -28,20 +28,12 @@
 
 use std::io::{BufRead, BufReader};
 use std::net::TcpListener;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 use std::time::Instant;
 
-/// A spawned child that is killed and reaped on every exit path.
-struct Reaped(Child);
-
-impl Drop for Reaped {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
+use c_ca_tools::Reaped;
 
 /// How long the server is given to print a line after the one the test is
 /// waiting for. C prints nothing past the block, so there is no later line to

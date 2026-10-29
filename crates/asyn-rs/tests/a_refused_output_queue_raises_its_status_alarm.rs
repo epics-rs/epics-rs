@@ -38,8 +38,8 @@ async fn a_disconnected_blocking_port_raises_comm_on_a_write() {
             can_block: true,
             ..PortFlags::default()
         },
-        InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::DRV_USER,
+        InterfaceMask::NONE,
     );
     base.create_param("VAL", ParamType::Int32).unwrap();
     base.set_auto_connect(false);

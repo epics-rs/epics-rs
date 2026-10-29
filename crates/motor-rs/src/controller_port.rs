@@ -18,7 +18,7 @@
 use std::sync::Arc;
 
 use asyn_rs::error::{AsynError, AsynResult, AsynStatus};
-use asyn_rs::interfaces::motor::PortSet;
+use asyn_rs::interfaces::motor::{PortSet, StatusWrite};
 use asyn_rs::manager::PortManager;
 use asyn_rs::param::{ParamType, ParamValue};
 use asyn_rs::port::InterfaceMask;
@@ -341,8 +341,7 @@ impl<'a> AxisUser<'a> {
     /// Run `command` on the axis's driver now and return its status, as a
     /// C subclass write calls its axis under the controller lock.
     pub fn run(&self, base: &mut PortDriverBase, command: MotorCommand) -> AsynResult<()> {
-        let axis = crate::devices::axis_at(&base.port_name, self.addr)
-            .ok_or_else(|| no_axis(&base.port_name, self.addr))?;
+        let axis = crate::devices::axis_at(&base.port_name, self.addr).ok_or_else(base_error)?;
         let c = crate::poll_loop::c_write(&command);
         run_on_axis(base, None, &axis, self.addr, &command, c)
     }
@@ -375,8 +374,31 @@ pub trait WriteHook: Send + Sync + 'static {
     }
 }
 
+/// The interfaces `asynMotorController` ORs into its subclass's
+/// (asynMotorController.cpp:48).
+pub const CONTROLLER_INTERFACES: InterfaceMask = InterfaceMask::OCTET
+    .or(InterfaceMask::INT32)
+    .or(InterfaceMask::FLOAT64)
+    .or(InterfaceMask::FLOAT64_ARRAY)
+    .or(InterfaceMask::GENERIC_POINTER)
+    .or(InterfaceMask::DRV_USER);
+
+/// The interrupts `asynMotorController` ORs into its subclass's
+/// (asynMotorController.cpp:49).
+pub const CONTROLLER_INTERRUPTS: InterfaceMask = InterfaceMask::OCTET
+    .or(InterfaceMask::INT32)
+    .or(InterfaceMask::FLOAT64)
+    .or(InterfaceMask::FLOAT64_ARRAY)
+    .or(InterfaceMask::GENERIC_POINTER);
+
 /// What a C `asynMotorController` subclass adds to the base port.
 pub trait ControllerParams: Send + Sync + 'static {
+    /// The `interfaceMask` / `interruptMask` the C subclass hands its
+    /// `asynMotorController` constructor. No default, as C's constructor
+    /// argument has none.
+    const INTERFACE_MASK: InterfaceMask;
+    const INTERRUPT_MASK: InterfaceMask;
+
     /// The subclass constructor's `createParam` calls, after the base's.
     fn create_params(&mut self, _base: &mut PortDriverBase) -> AsynResult<()> {
         Ok(())
@@ -581,8 +603,12 @@ impl ControllerReport<'_> {
     }
 }
 
-/// A controller with no parameters of its own.
-impl ControllerParams for () {}
+/// A controller with no parameters of its own, whose C constructor passes
+/// masks of 0.
+impl ControllerParams for () {
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::NONE;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::NONE;
+}
 
 /// C's profile arrays: the controller's `profileTimes_` and, by address,
 /// each axis's `profilePositions_`, `profileReadbacks_` and
@@ -701,7 +727,7 @@ impl ControllerCtx<'_> {
     ) -> AsynResult<()> {
         let addr = user.addr;
         if !self.axes().any(|a| a == addr) {
-            return Err(no_axis(&self.base.port_name, addr));
+            return Err(base_error());
         }
         let value = &value[..value.len().min(self.profile.max_points)];
         match user.reason {
@@ -819,19 +845,13 @@ impl ControllerCtx<'_> {
     }
 }
 
-/// The bare `asynError` a C base function returns, with no errorMessage.
+/// The bare `asynError` a C base function returns, with no errorMessage,
+/// as each does where `getAxis` finds no axis
+/// (asynMotorController.cpp:199-200, :532-556).
 fn base_error() -> AsynError {
     AsynError::Status {
         status: AsynStatus::Error,
         message: String::new(),
-    }
-}
-
-/// C `getAxis`'s failure: the controller has no axis at `addr`.
-fn no_axis(port: &str, addr: i32) -> AsynError {
-    AsynError::Status {
-        status: AsynStatus::Error,
-        message: format!("{port} has no axis {addr}"),
     }
 }
 
@@ -863,8 +883,8 @@ impl<P: ControllerParams> ControllerPort<P> {
             port,
             num_axes.max(1) as usize,
             flags,
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            P::INTERFACE_MASK | CONTROLLER_INTERFACES,
+            P::INTERRUPT_MASK | CONTROLLER_INTERRUPTS,
         );
         for &(name, param_type) in BASE_PARAMS {
             base.create_param(name, param_type)?;
@@ -918,7 +938,7 @@ impl<P: ControllerParams> ControllerPort<P> {
         if self.params.is_controller_axis(addr) {
             return Ok((addr, None));
         }
-        Err(no_axis(&self.base.port_name, addr))
+        Err(base_error())
     }
 
     /// A C subclass write at an address with no axis: its own code has run,
@@ -1135,6 +1155,15 @@ impl<P: ControllerParams> ControllerPort<P> {
                 let c = Some((user.reason as i32, WriteValue::Float64(value)));
                 run_on_axis(&mut self.base, self.hook.as_ref(), axis, addr, &command, c)
             }
+            (Some(_), None) if user.reason == index::ACT_VELOCITY => {
+                // C's pAxis->setDoubleParam sets status_ too (:289).
+                let field = StatusWrite::Velocity(value);
+                crate::poll_loop::apply_axis_set(
+                    &self.base.port_name,
+                    PortSet::Status { addr, field },
+                );
+                Ok(())
+            }
             (axis, _) => {
                 call_back_axis(axis);
                 Ok(())
@@ -1185,7 +1214,12 @@ impl<P: ControllerParams> ControllerPort<P> {
     /// them, the port's or the axis poller's.
     fn store(&mut self, addr: i32, delta: ParamDelta) {
         for (function, value) in delta.into_values() {
-            let _ = self.base.set_param_value(function, addr, value);
+            let set = PortSet::Set {
+                addr,
+                reason: function,
+                value,
+            };
+            apply_port_sets(&mut self.base, Some(addr), [set]);
         }
     }
 
@@ -1374,7 +1408,10 @@ fn run_on_axis(
     }
     let driven = {
         let port = base.port_name.clone();
-        let Some(mut motor) = crate::poll_loop::lock_axis(axis.motor(), Some(&port), &held) else {
+        let Some(mut motor) = axis
+            .motor()
+            .and_then(|motor| crate::poll_loop::lock_axis(motor, Some(&port), &held))
+        else {
             return Err(base_error());
         };
         if let Some(delay) = on_delay {
@@ -1411,9 +1448,46 @@ fn call_back_axis(axis: Option<&MotorAxis>) {
 }
 
 /// A driver's own-port steps on the port's thread, as C makes them: on the
-/// parameter library itself. `axis` is the address a [`PortSet::Axis`]
-/// lands on, None for a controller poll's.
+/// parameter library itself, but for a readback ([`route_readback`]).
+/// `axis` is the address a [`PortSet::Axis`] lands on, None for a
+/// controller poll's.
 pub(crate) fn apply_port_sets(
+    base: &mut PortDriverBase,
+    axis: Option<i32>,
+    sets: impl IntoIterator<Item = PortSet>,
+) {
+    let sets = sets.into_iter().map(|set| route_readback(axis, set));
+    apply_routed_sets(base, axis, sets);
+}
+
+/// A driver's set of a readback as the axis's poll loop takes it, the one
+/// setter of MOTOR_POSITION, MOTOR_ENCODER_POSITION and MOTOR_ACT_VELOCITY:
+/// its status written, as C's `pAxis->setDoubleParam` writes `status_`.
+pub(crate) fn route_readback(axis: Option<i32>, set: PortSet) -> PortSet {
+    let (addr, reason, value) = match &set {
+        PortSet::Set {
+            addr,
+            reason,
+            value,
+        } => (Some(*addr), *reason, value),
+        PortSet::Axis { reason, value } => (axis, *reason, value),
+        _ => return set,
+    };
+    let (Some(addr), &ParamValue::Float64(v)) = (addr, value) else {
+        return set;
+    };
+    let field = match reason {
+        index::POSITION => StatusWrite::Position(v),
+        index::ENCODER_POSITION => StatusWrite::EncoderPosition(v),
+        index::ACT_VELOCITY => StatusWrite::Velocity(v),
+        _ => return set,
+    };
+    PortSet::Status { addr, field }
+}
+
+/// [`apply_port_sets`] of sets [`route_readback`] has routed, or the poll
+/// loop's own.
+pub(crate) fn apply_routed_sets(
     base: &mut PortDriverBase,
     axis: Option<i32>,
     sets: impl IntoIterator<Item = PortSet>,

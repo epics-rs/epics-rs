@@ -1,6 +1,7 @@
 //! Motor interface definitions.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use parking_lot::Mutex;
 
@@ -36,6 +37,10 @@ pub enum PortSet {
 pub struct PortSets(Vec<PortSet>);
 
 impl PortSets {
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self(Vec::with_capacity(capacity))
+    }
+
     pub fn set(&mut self, addr: i32, reason: usize, value: crate::param::ParamValue) {
         self.0.push(PortSet::Set {
             addr,
@@ -134,12 +139,10 @@ impl PartialEq for PostMessage {
 /// case.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MotorStatus {
-    /// Motor position, steps.
-    pub position: f64,
-    /// Encoder position, counts.
-    pub encoder_position: f64,
-    /// Actual velocity, steps/s.
-    pub velocity: f64,
+    /// Motor position (steps), encoder position (counts) and actual
+    /// velocity (steps/s), written through [`Self::set_position`],
+    /// [`Self::set_encoder_position`] and [`Self::set_velocity`].
+    pub readbacks: Readbacks,
     /// True if the last move has completed.
     pub done: bool,
     /// True if the motor is currently moving: the poller's pace (C
@@ -191,9 +194,7 @@ pub struct MotorStatus {
 impl Default for MotorStatus {
     fn default() -> Self {
         Self {
-            position: 0.0,
-            encoder_position: 0.0,
-            velocity: 0.0,
+            readbacks: Readbacks::default(),
             done: false,
             moving: false,
             msta_moving: false,
@@ -212,6 +213,106 @@ impl Default for MotorStatus {
             has_encoder: false,
             vbas_supported: true,
         }
+    }
+}
+
+impl MotorStatus {
+    pub fn position(&self) -> f64 {
+        self.readbacks.get(Readback::Position)
+    }
+
+    pub fn encoder_position(&self) -> f64 {
+        self.readbacks.get(Readback::EncoderPosition)
+    }
+
+    pub fn velocity(&self) -> f64 {
+        self.readbacks.get(Readback::Velocity)
+    }
+
+    /// C `asynMotorAxis::setDoubleParam(motorPosition_, …)`.
+    pub fn set_position(&mut self, value: f64) {
+        self.readbacks.set(Readback::Position, value);
+    }
+
+    /// C `asynMotorAxis::setDoubleParam(motorEncoderPosition_, …)`.
+    pub fn set_encoder_position(&mut self, value: f64) {
+        self.readbacks.set(Readback::EncoderPosition, value);
+    }
+
+    /// C `asynMotorAxis::setDoubleParam(motorActVelocity_, …)`.
+    pub fn set_velocity(&mut self, value: f64) {
+        self.readbacks.set(Readback::Velocity, value);
+    }
+
+    /// [`Self::set_position`] on a status being built.
+    #[must_use]
+    pub fn with_position(mut self, value: f64) -> Self {
+        self.set_position(value);
+        self
+    }
+
+    /// [`Self::set_encoder_position`] on a status being built.
+    #[must_use]
+    pub fn with_encoder_position(mut self, value: f64) -> Self {
+        self.set_encoder_position(value);
+        self
+    }
+
+    /// [`Self::set_velocity`] on a status being built.
+    #[must_use]
+    pub fn with_velocity(mut self, value: f64) -> Self {
+        self.set_velocity(value);
+        self
+    }
+}
+
+/// A [`MotorStatus`] readback: C's `motorPosition_`,
+/// `motorEncoderPosition_` and `motorActVelocity_`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Readback {
+    Position,
+    EncoderPosition,
+    Velocity,
+}
+
+impl Readback {
+    pub const ALL: [Self; 3] = [Self::Position, Self::EncoderPosition, Self::Velocity];
+}
+
+/// A status's readbacks, and which of them the driver set since the poll
+/// loop last took them. C's paramLib holds each undefined until the
+/// driver's `setDoubleParam`, which a poll bailing to its error label may
+/// make before it bails (XPSAxis.cpp:706, :716), so only a set defines one.
+/// Two compare by their values alone, as C's `statusChanged_` does
+/// (asynMotorAxis.cpp:283-297).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Readbacks {
+    values: [f64; 3],
+    set: [bool; 3],
+}
+
+impl Readbacks {
+    pub fn get(&self, readback: Readback) -> f64 {
+        self.values[readback as usize]
+    }
+
+    /// Write `readback` and mark it set.
+    pub fn set(&mut self, readback: Readback, value: f64) {
+        self.values[readback as usize] = value;
+        self.set[readback as usize] = true;
+    }
+
+    /// The readbacks set since the last take, indexed by [`Readback`], with
+    /// the marks lowered: the poll loop's, which sets them on the port.
+    pub fn take_sets(&mut self) -> [Option<f64>; 3] {
+        let set = std::mem::take(&mut self.set);
+        std::array::from_fn(|at| set[at].then_some(self.values[at]))
+    }
+}
+
+impl PartialEq for Readbacks {
+    fn eq(&self, other: &Self) -> bool {
+        self.values == other.values
     }
 }
 
@@ -284,6 +385,9 @@ pub enum PidGainKind {
 pub enum StatusWrite {
     Position(f64),
     EncoderPosition(f64),
+    /// `motorActVelocity_`, which a write of MOTOR_ACT_VELOCITY sets
+    /// (asynMotorController.cpp:289).
+    Velocity(f64),
     Done(bool),
     PowerOn(bool),
     Problem(bool),
@@ -321,8 +425,9 @@ impl StatusWrite {
     /// Write the field into `status`.
     pub fn apply(self, status: &mut MotorStatus) {
         match self {
-            StatusWrite::Position(v) => status.position = v,
-            StatusWrite::EncoderPosition(v) => status.encoder_position = v,
+            StatusWrite::Position(v) => status.set_position(v),
+            StatusWrite::EncoderPosition(v) => status.set_encoder_position(v),
+            StatusWrite::Velocity(v) => status.set_velocity(v),
             StatusWrite::Done(v) => status.done = v,
             StatusWrite::PowerOn(v) => status.powered = v,
             StatusWrite::Problem(v) => status.problem = v,
@@ -472,77 +577,11 @@ pub trait AsynMotor: std::any::Any + Send + Sync {
         Ok(())
     }
 
-    /// A model-1 record's OUT parm, the text after `@` in `#C card S signal
-    /// @parm`, given once when the record binds the axis: C devices read it
-    /// from the record (devMVP2001.cc:262, :361). Not given when empty.
-    fn set_out_parm(&mut self, _user: &AsynUser, _parm: &[u8]) -> AsynResult<()> {
-        Ok(())
-    }
-
-    /// A model-1 device's `PRIMITIVE`: the record's INIT text, sent once at
-    /// record init before anything else (motordevCom.cc:309-327). Each C
-    /// device formats it its own way (`"? "` + INIT on an IM483PL).
-    fn primitive(&mut self, _user: &AsynUser, _init: &[u8]) -> AsynResult<()> {
-        Ok(())
-    }
-
-    /// A model-1 record's PREM and POST for the move called next, which C
-    /// `build_trans` reads at every MOVE_ABS, MOVE_REL, HOME and JOG
-    /// (devIM483PL.cc:191-205): the device puts PREM ahead of that move its
-    /// own way. `post` is given when POST was set at that build, and the
-    /// device sends what it holds once the move is done
-    /// (drvIM483PL.cc:361-366). Called only when either is set, so they
-    /// belong to that one move.
-    fn set_move_strings(
-        &mut self,
-        _user: &AsynUser,
-        _prem: &[u8],
-        _post: Option<PostMessage>,
-    ) -> AsynResult<()> {
-        Ok(())
-    }
-
-    /// A model-1 record's [`RecordFields`], given ahead of each transaction
-    /// that moves.
-    fn set_record_fields(&mut self, _user: &AsynUser, _fields: &RecordFields) -> AsynResult<()> {
-        Ok(())
-    }
-
     /// Poll the motor into `status`: the axis's status parameters as the
     /// poller last set them, which a C poll sets in place. What it wrote
     /// before an `Err` stays set, as a C poll's sets before it bails, with
     /// [`AsynMotor::poll_failure`]'s bits raised over them.
     fn poll(&mut self, user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()>;
-
-    /// A model-1 `set_status` with a move in motion (`nodeptr != 0`):
-    /// `cdir` is the moving record's CDIR, which the C driver reads and may
-    /// overwrite through `nodeptr->mrecord` (drvSC800.cc:279-282,
-    /// drvOms58.cc:642-649); the record reads what is left. The motor task
-    /// calls it in place of [`AsynMotor::poll`] while it holds the move.
-    fn poll_in_motion(
-        &mut self,
-        user: &AsynUser,
-        cdir: &mut bool,
-        status: &mut MotorStatus,
-    ) -> AsynResult<()> {
-        let _ = cdir;
-        self.poll(user, status)
-    }
-
-    /// Whether the model-1 device support forces the record's NTM to NO at
-    /// init_record because the device does its own backlash
-    /// (devEMC18011.cc:127-129, devPIE816.cc:130, devMDT695.cc:129).
-    fn disables_ntm(&self) -> bool {
-        false
-    }
-
-    /// Whether a model-1 `set_status` counts a pass whose position did not
-    /// change as no motion (`no_motion_count++`), which motor_task does not
-    /// call back. drvEMC18011.cc:356-358 disables it, so every pass of a
-    /// held move is called back.
-    fn no_motion_test(&self) -> bool {
-        true
-    }
 
     /// What the C driver's `poll()` posts when it fails, i.e. when
     /// [`AsynMotor::poll`] returns `Err`. No default: drivers differ (an
@@ -624,7 +663,147 @@ pub trait AsynMotor: std::any::Any + Send + Sync {
 }
 
 /// A model-1 driver's axis (motordrvCom.cc), which only a motor task runs.
-pub trait Model1Motor: AsynMotor {
+///
+/// Each record command is one C `WRITE_MSG`, in motorRecord.cc's order, and
+/// the driver builds its message from them as its C `build_trans` appends
+/// each: a move's speeds arrive as the [`set_velocity`](Self::set_velocity),
+/// [`set_vel_base`](Self::set_vel_base) and [`set_accel`](Self::set_accel)
+/// the record wrote ahead of it, and only those. A backlash leg writes no
+/// SET_VEL_BASE (motorRecord.cc:1004-1006), and a move's SET_ACCEL of 0 is
+/// not written (:2529-2530).
+pub trait Model1Motor: Send + Sync {
+    /// SET_VELOCITY: the speed of the moves that follow, in steps/s.
+    fn set_velocity(&mut self, user: &AsynUser, velocity: f64) -> AsynResult<()>;
+
+    /// SET_VEL_BASE: the base velocity (VBAS), in steps/s.
+    fn set_vel_base(&mut self, user: &AsynUser, velocity: f64) -> AsynResult<()>;
+
+    /// SET_ACCEL, in steps/s².
+    fn set_accel(&mut self, user: &AsynUser, acceleration: f64) -> AsynResult<()>;
+
+    /// MOVE_ABS.
+    fn move_absolute(&mut self, user: &AsynUser, position: f64) -> AsynResult<()>;
+
+    /// MOVE_REL.
+    fn move_relative(&mut self, user: &AsynUser, distance: f64) -> AsynResult<()>;
+
+    /// JOG: `velocity` is the message's own value, signed by direction.
+    fn move_velocity(&mut self, user: &AsynUser, velocity: f64) -> AsynResult<()>;
+
+    /// JOG_VELOCITY, a JVEL write's change of a running jog
+    /// (motorRecord.cc:3058-3071). A C `build_trans` with no case for it
+    /// takes the `default:` that returns ERROR, which the record's
+    /// `WRITE_MSG` ignores, and appends nothing (devMM3000.cc:333), so this
+    /// sends nothing. A driver whose `build_trans` has the case overrides
+    /// it with what that case writes, which is not always what JOG writes
+    /// (devPmac.cc:249, devPIC862.cc:228).
+    fn jog_velocity(&mut self, _user: &AsynUser, _velocity: f64) -> AsynResult<()> {
+        Ok(())
+    }
+
+    /// HOME_FOR, or HOME_REV when not `forward`.
+    fn home(&mut self, user: &AsynUser, forward: bool) -> AsynResult<()>;
+
+    /// STOP_AXIS, which carries no acceleration.
+    fn stop(&mut self, user: &AsynUser) -> AsynResult<()>;
+
+    /// LOAD_POS: set the current position without moving.
+    fn set_position(&mut self, user: &AsynUser, position: f64) -> AsynResult<()>;
+
+    /// SET_ENC_RATIO, motor steps per encoder count.
+    fn set_encoder_ratio(&mut self, _user: &AsynUser, _ratio: f64) -> AsynResult<()> {
+        Ok(())
+    }
+
+    /// ENABLE_TORQUE or DISABL_TORQUE.
+    fn set_closed_loop(&mut self, _user: &AsynUser, _enable: bool) -> AsynResult<()> {
+        Ok(())
+    }
+
+    /// SET_PGAIN, SET_IGAIN or SET_DGAIN, clamped to 0.0 ..= 1.0 by the
+    /// record (motorRecord.cc 3003-3026).
+    fn set_pid_gain(&mut self, _user: &AsynUser, _kind: PidGainKind, _gain: f64) -> AsynResult<()> {
+        Ok(())
+    }
+
+    /// SET_HIGH_LIMIT (motorRecord.cc 4236-4328).
+    fn set_high_limit(&mut self, _user: &AsynUser, _position: f64) -> AsynResult<()> {
+        Ok(())
+    }
+
+    /// SET_LOW_LIMIT.
+    fn set_low_limit(&mut self, _user: &AsynUser, _position: f64) -> AsynResult<()> {
+        Ok(())
+    }
+
+    /// A model-1 record's OUT parm, the text after `@` in `#C card S signal
+    /// @parm`, given once when the record binds the axis: C devices read it
+    /// from the record (devMVP2001.cc:262, :361). Not given when empty.
+    fn set_out_parm(&mut self, _user: &AsynUser, _parm: &[u8]) -> AsynResult<()> {
+        Ok(())
+    }
+
+    /// A model-1 device's `PRIMITIVE`: the record's INIT text, sent once at
+    /// record init before anything else (motordevCom.cc:309-327). Each C
+    /// device formats it its own way (`"? "` + INIT on an IM483PL).
+    fn primitive(&mut self, _user: &AsynUser, _init: &[u8]) -> AsynResult<()> {
+        Ok(())
+    }
+
+    /// A model-1 record's PREM and POST for the move called next, which C
+    /// `build_trans` reads at every MOVE_ABS, MOVE_REL, HOME and JOG
+    /// (devIM483PL.cc:191-205): the device puts PREM ahead of that move its
+    /// own way. `post` is given when POST was set at that build, and the
+    /// device sends what it holds once the move is done
+    /// (drvIM483PL.cc:361-366). Called only when either is set, so they
+    /// belong to that one move.
+    fn set_move_strings(
+        &mut self,
+        _user: &AsynUser,
+        _prem: &[u8],
+        _post: Option<PostMessage>,
+    ) -> AsynResult<()> {
+        Ok(())
+    }
+
+    /// A model-1 record's [`RecordFields`], given ahead of each transaction
+    /// that moves.
+    fn set_record_fields(&mut self, _user: &AsynUser, _fields: &RecordFields) -> AsynResult<()> {
+        Ok(())
+    }
+
+    /// GET_INFO: poll the motor into `status`, the status the task last
+    /// read. What it wrote before an `Err` stays set, with
+    /// [`Model1Motor::poll_failure`]'s bits raised over them.
+    fn poll(&mut self, user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()>;
+
+    /// A model-1 `set_status` with a move in motion (`nodeptr != 0`):
+    /// `cdir` is the moving record's CDIR, which the C driver reads and may
+    /// overwrite through `nodeptr->mrecord` (drvSC800.cc:279-282,
+    /// drvOms58.cc:642-649); the record reads what is left. The motor task
+    /// calls it in place of [`Model1Motor::poll`] while it holds the move.
+    fn poll_in_motion(
+        &mut self,
+        user: &AsynUser,
+        cdir: &mut bool,
+        status: &mut MotorStatus,
+    ) -> AsynResult<()> {
+        let _ = cdir;
+        self.poll(user, status)
+    }
+
+    /// Whether a model-1 `set_status` counts a pass whose position did not
+    /// change as no motion (`no_motion_count++`), which motor_task does not
+    /// call back. drvEMC18011.cc:356-358 disables it, so every pass of a
+    /// held move is called back.
+    fn no_motion_test(&self) -> bool {
+        true
+    }
+
+    /// What the driver's `set_status` raises when it fails, i.e. when
+    /// [`Model1Motor::poll`] returns `Err`.
+    fn poll_failure(&self) -> PollFailure;
+
     /// What the driver's `motor_init` read with `set_status`, at the point
     /// it reads it among the axis's init queries (drvSoloist.cc:734,
     /// drvMVP2001.cc:720). C motor_task makes no read of its own before the
@@ -633,6 +812,13 @@ pub trait Model1Motor: AsynMotor {
     /// `motor_init` prepared (EA_PRESENT, GAIN_SUPPORT) with that driver's
     /// RETRY or COMM_ERR bits (drvMCDC2805.cc:236-251, :368-369).
     fn take_init_status(&mut self) -> MotorStatus;
+
+    /// The driver's `update_delay` in its motor task's `thread_args`
+    /// (motordrvCom.h:214, e.g. drvSC800.cc:139): how long after a command
+    /// the motor task waits before reading the axis's status. Zero never
+    /// waits; a nonzero delay under two sleep quanta waits two quanta
+    /// (motordrvCom.cc:207-212).
+    fn update_delay(&self) -> Duration;
 }
 
 /// [`AsynMotor::move_to_home_task`]'s work. It applies sets on the

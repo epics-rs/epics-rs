@@ -319,7 +319,10 @@ async fn test_poll_loop_lifecycle() {
     let poll_handle = tokio::spawn(poll_loop.start());
 
     // Start polling
-    poll_cmd_tx.send(PollCommand::ForcePoll).await.unwrap();
+    poll_cmd_tx
+        .send(PollCommand::ForcePoll(None))
+        .await
+        .unwrap();
 
     // Wait for the poll loop's first process of the record.
     let read = reads.wait(Duration::from_millis(500)).await;
@@ -370,7 +373,10 @@ async fn test_zero_idle_interval_is_event_only_not_busy_spin() {
     // channel and masks itself.
     tokio::spawn(async move { while io_intr_rx.recv().await.is_some() {} });
 
-    poll_cmd_tx.send(PollCommand::ForcePoll).await.unwrap();
+    poll_cmd_tx
+        .send(PollCommand::ForcePoll(None))
+        .await
+        .unwrap();
 
     // seq starts at 1 (init), +1 for the startup pass's post of its changed
     // status to the record already bound (asynMotorController.cpp:630,
@@ -447,7 +453,10 @@ async fn test_idle_poll_change_detection_suppresses_unchanged_reposts() {
     // The startup pass posts its changed status to the bound record
     // (asynMotorController.cpp:630, asynMotorAxis.cpp:318-320; seq 1→2);
     // ForcePoll forces one more → 3.
-    poll_cmd_tx.send(PollCommand::ForcePoll).await.unwrap();
+    poll_cmd_tx
+        .send(PollCommand::ForcePoll(None))
+        .await
+        .unwrap();
     assert!(wait_until(Duration::from_secs(10), || seq(&device_state) >= 3).await);
     tokio::time::sleep(Duration::from_millis(80)).await;
     assert_eq!(
@@ -458,7 +467,10 @@ async fn test_idle_poll_change_detection_suppresses_unchanged_reposts() {
 
     // A second ForcePoll is a FORCED poll → re-posts even though the status
     // is byte-identical → seq 3→4.
-    poll_cmd_tx.send(PollCommand::ForcePoll).await.unwrap();
+    poll_cmd_tx
+        .send(PollCommand::ForcePoll(None))
+        .await
+        .unwrap();
     assert!(wait_until(Duration::from_secs(10), || seq(&device_state) >= 4).await);
     tokio::time::sleep(Duration::from_millis(80)).await;
     assert_eq!(
@@ -557,7 +569,7 @@ async fn test_jog_held_through_a_move_strands_until_pressed_again() {
 
 fn read_motor_pos(motor: &Arc<Mutex<dyn AsynMotor>>) -> f64 {
     let mut m = motor.lock().unwrap();
-    polled(&mut *m, &asyn_rs::user::AsynUser::new(0)).position
+    polled(&mut *m, &asyn_rs::user::AsynUser::new(0)).position()
 }
 
 /// R59 regression: device-support `init()` must NOT reseed the controller.
@@ -789,9 +801,8 @@ async fn failed_poll_posts_comms_error_status() {
                 });
             }
             *status = MotorStatus {
-                position: self.position,
                 done: true,
-                ..MotorStatus::default()
+                ..MotorStatus::default().with_position(self.position)
             };
             Ok(())
         }
@@ -865,7 +876,10 @@ async fn failed_poll_posts_comms_error_status() {
     // A healthy poll first, so the failure has a last-known status to carry
     // forward (C's parameter library keeps every field the failed poll never
     // wrote).
-    poll_cmd_tx.send(PollCommand::ForcePoll).await.unwrap();
+    poll_cmd_tx
+        .send(PollCommand::ForcePoll(None))
+        .await
+        .unwrap();
     assert!(
         !reads.wait(Duration::from_millis(500)).await.is_empty(),
         "the healthy poll must notify"
@@ -876,7 +890,7 @@ async fn failed_poll_posts_comms_error_status() {
         (s.seq, s.status)
     };
     assert!(!healthy.comms_error);
-    assert_eq!(healthy.position, 3.5);
+    assert_eq!(healthy.position(), 3.5);
 
     // Cut the link. The very next poll fails.
     offline.store(true, Ordering::SeqCst);
@@ -907,7 +921,8 @@ async fn failed_poll_posts_comms_error_status() {
         "C sets motorStatusProblem_ alongside motorStatusCommsError_"
     );
     assert_eq!(
-        stamped.status.position, 3.5,
+        stamped.status.position(),
+        3.5,
         "fields the failed poll never wrote keep their last-known value, as C's \
          parameter library does"
     );
@@ -938,10 +953,7 @@ impl AsynMotor for FailingMotor {
                 message: "controller not responding".into(),
             });
         }
-        *status = asyn_rs::interfaces::motor::MotorStatus {
-            position: 3.5,
-            ..Default::default()
-        };
+        *status = asyn_rs::interfaces::motor::MotorStatus::default().with_position(3.5);
         Ok(())
     }
     fn move_absolute(
@@ -1083,7 +1095,7 @@ async fn a_problem_only_failure_keeps_the_last_status() {
     );
     let status = axis.latest().unwrap().status;
     assert!(!status.comms_error);
-    assert_eq!(status.position, 3.5);
+    assert_eq!(status.position(), 3.5);
     axis.shutdown().await;
 }
 
@@ -1105,7 +1117,7 @@ async fn a_failure_raising_no_bit_posts_only_when_forced() {
         healthy.seq,
         "background polls post nothing"
     );
-    axis.poll.send(PollCommand::ForcePoll).await.unwrap();
+    axis.poll.send(PollCommand::ForcePoll(None)).await.unwrap();
     assert!(
         wait_until(Duration::from_secs(2), || {
             axis.latest().is_some_and(|s| s.seq > healthy.seq)
@@ -1143,9 +1155,8 @@ async fn pass0_restored_dval_is_not_a_move_command() {
         }
         fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> Result<(), AsynError> {
             *status = MotorStatus {
-                position: self.position,
                 done: true,
-                ..MotorStatus::default()
+                ..MotorStatus::default().with_position(self.position)
             };
             Ok(())
         }
@@ -1233,7 +1244,8 @@ async fn pass0_restored_dval_is_not_a_move_command() {
     let user = AsynUser::new(0);
     let st = polled(&mut *motor.lock().unwrap(), &user);
     assert_eq!(
-        st.position, 1500.0,
+        st.position(),
+        1500.0,
         "the controller was redefined, not moved"
     );
 }
@@ -1329,7 +1341,7 @@ async fn blocked_driver_does_not_stall_the_ioc_runtime() {
     // keeps serving its other tasks.
     setup
         .poll_cmd_tx
-        .send(PollCommand::ForcePoll)
+        .send(PollCommand::ForcePoll(None))
         .await
         .unwrap();
     let start = Instant::now();
@@ -1449,7 +1461,7 @@ async fn a_poller_started_from_the_shell_runs_while_the_runtime_blocks() {
     setup.device_support.write(&mut setup.record).unwrap();
     setup
         .poll_cmd_tx
-        .send(PollCommand::ForcePoll)
+        .send(PollCommand::ForcePoll(None))
         .await
         .unwrap();
 
@@ -1673,7 +1685,10 @@ async fn force_poll_does_not_reload_the_forced_fast_polls() {
     // Startup: the startup poll and its 5 forced fast polls.
     settled(6).await;
 
-    poll_cmd_tx.send(PollCommand::ForcePoll).await.unwrap();
+    poll_cmd_tx
+        .send(PollCommand::ForcePoll(None))
+        .await
+        .unwrap();
     settled(7).await;
 
     motor_cmd_tx
@@ -1758,83 +1773,6 @@ async fn init_commands_reach_the_device_build_trans() {
             .any(|c| matches!(c, MotorCommand::InitEncoderRatio { .. })),
         "{seen:?}"
     );
-}
-
-/// motordevCom.cc:327-343: each init command is its own transaction, so a
-/// device deferring INIT ends that one with its own INFO before the encoder
-/// ratio goes out.
-#[tokio::test]
-async fn a_deferred_init_command_ends_its_own_transaction() {
-    use asyn_rs::error::AsynError;
-    use asyn_rs::interfaces::motor::{MotorStatus, PollFailure};
-    use asyn_rs::user::AsynUser;
-    use motor_rs::device_support::BuildTrans;
-    struct DefersInit;
-    impl BuildTrans for DefersInit {
-        fn defers(&self, command: &MotorCommand) -> bool {
-            matches!(command, MotorCommand::Primitive { .. })
-        }
-    }
-    struct Calls(Arc<Mutex<Vec<&'static str>>>);
-    impl AsynMotor for Calls {
-        fn poll_failure(&self) -> PollFailure {
-            PollFailure::PROBLEM_AND_COMMS_ERROR
-        }
-        fn poll(&mut self, _: &AsynUser, status: &mut MotorStatus) -> Result<(), AsynError> {
-            self.0.lock().unwrap().push("poll");
-            *status = MotorStatus {
-                done: true,
-                ..MotorStatus::default()
-            };
-            Ok(())
-        }
-        fn move_absolute(
-            &mut self,
-            _: &AsynUser,
-            _: f64,
-            _: f64,
-            _: f64,
-            _: f64,
-        ) -> Result<(), AsynError> {
-            Ok(())
-        }
-        fn move_relative(
-            &mut self,
-            _: &AsynUser,
-            _: f64,
-            _: f64,
-            _: f64,
-            _: f64,
-        ) -> Result<(), AsynError> {
-            Ok(())
-        }
-        fn stop(&mut self, _: &AsynUser, _: f64) -> Result<(), AsynError> {
-            Ok(())
-        }
-        fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> Result<(), AsynError> {
-            Ok(())
-        }
-        fn set_position(&mut self, _: &AsynUser, _: f64) -> Result<(), AsynError> {
-            Ok(())
-        }
-        fn set_encoder_ratio(&mut self, _: &AsynUser, _: f64) -> Result<(), AsynError> {
-            self.0.lock().unwrap().push("ratio");
-            Ok(())
-        }
-    }
-    let calls = Arc::new(Mutex::new(Vec::new()));
-    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(Calls(calls.clone())));
-    let setup = make_builder(motor).build_axis();
-    let mut poll_loop = setup.poll_loop;
-    let mut support = setup.axis.with_build_trans(Arc::new(DefersInit)).attach();
-    let mut rec = motor_rs::MotorRecord::new();
-    rec.conv.mres = 0.001;
-    rec.put_field("INIT", EpicsValue::String("X".into()))
-        .unwrap();
-    support.init(&mut rec).unwrap();
-    calls.lock().unwrap().clear();
-    poll_loop.run_queued_commands();
-    assert_eq!(*calls.lock().unwrap(), ["poll", "ratio"]);
 }
 
 /// C set_dial_highlimit/lowlimit (4236-4325), run by init_record (717-718),

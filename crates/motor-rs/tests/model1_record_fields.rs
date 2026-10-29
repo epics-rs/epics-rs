@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use asyn_rs::error::AsynResult;
-use asyn_rs::interfaces::motor::{AsynMotor, Model1Motor, MotorStatus, PollFailure, RecordFields};
+use asyn_rs::interfaces::motor::{Model1Motor, MotorStatus, PollFailure, RecordFields};
 use asyn_rs::user::AsynUser;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -24,7 +24,8 @@ static MODEL1: DevSup = model1_device("devTestFields", "TestFields");
 #[derive(Debug, PartialEq)]
 enum Call {
     Fields(RecordFields),
-    Home(f64),
+    Velocity(f64),
+    Home,
     SetPosition,
 }
 
@@ -34,28 +35,31 @@ struct Card {
     calls: Arc<Mutex<Vec<Call>>>,
 }
 
-/// `motor_init` reads the card with the status function the task queries.
 impl Model1Motor for Card {
-    fn take_init_status(&mut self) -> MotorStatus {
-        let mut status = MotorStatus::default();
-        self.poll(&AsynUser::default(), &mut status)
-            .expect("the card answers");
-        status
-    }
-}
-
-impl AsynMotor for Card {
-    fn move_absolute(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
+    fn set_velocity(&mut self, _: &AsynUser, velocity: f64) -> AsynResult<()> {
+        self.calls.lock().unwrap().push(Call::Velocity(velocity));
         Ok(())
     }
-    fn move_relative(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
+    fn set_vel_base(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
         Ok(())
     }
-    fn home(&mut self, _: &AsynUser, _: f64, velocity: f64, _: f64, _: bool) -> AsynResult<()> {
-        self.calls.lock().unwrap().push(Call::Home(velocity));
+    fn set_accel(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
         Ok(())
     }
-    fn stop(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+    fn move_absolute(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn move_relative(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn move_velocity(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn home(&mut self, _: &AsynUser, _: bool) -> AsynResult<()> {
+        self.calls.lock().unwrap().push(Call::Home);
+        Ok(())
+    }
+    fn stop(&mut self, _: &AsynUser) -> AsynResult<()> {
         Ok(())
     }
     fn set_position(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
@@ -75,6 +79,16 @@ impl AsynMotor for Card {
             ..MotorStatus::default()
         };
         Ok(())
+    }
+    /// `motor_init` reads the card with the status function the task queries.
+    fn update_delay(&self) -> Duration {
+        Duration::ZERO
+    }
+    fn take_init_status(&mut self) -> MotorStatus {
+        let mut status = MotorStatus::default();
+        self.poll(&AsynUser::default(), &mut status)
+            .expect("the card answers");
+        status
     }
 }
 
@@ -129,15 +143,16 @@ async fn a_home_is_given_the_records_fields_ahead_of_it() {
     db.put_record_field_from_ca("V:m0", "HOMF", EpicsValue::Short(1))
         .await
         .unwrap();
-    wait_for(&calls, |c| c.iter().any(|c| matches!(c, Call::Home(_)))).await;
-    // VELO 3 / MRES 0.5; the home itself runs at HVEL 1 / 0.5.
+    wait_for(&calls, |c| c.contains(&Call::Home)).await;
+    // VELO 3 / MRES 0.5; the home itself runs at HVEL 1 / 0.5
+    // (motorRecord.cc:2052).
     let fields = RecordFields {
         velocity: 6.0,
         srev: 400,
     };
     assert_eq!(
         *calls.lock().unwrap(),
-        [Call::Fields(fields), Call::Home(2.0)]
+        [Call::Fields(fields), Call::Velocity(2.0), Call::Home]
     );
 }
 

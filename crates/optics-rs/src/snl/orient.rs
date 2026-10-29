@@ -7,8 +7,6 @@
 //! are not ported: `orientDebug` and `matrix3Debug` in those files are C
 //! globals no shell command sets.
 
-use std::sync::Arc;
-
 use epics_seq_rs::c::*;
 use epics_seq_rs::{CharPtr, Place};
 
@@ -147,13 +145,17 @@ mod orient_h {
 /// and `cp`, which pointed there, is the empty string; null when `s` has
 /// no `c`.
 fn cut_at_last<B: CBuf>(s: &impl Place<B>, c: u8) -> CharPtr {
-    s.modify(|b| {
+    let cut = s.modify(|b| {
         let b = b.bytes_mut();
         let len = b.iter().position(|&x| x == 0).unwrap_or(b.len());
-        let at = b[..len].iter().rposition(|&x| x == c)?;
-        b[at] = 0;
-        Some(Arc::from(&b""[..]))
-    })
+        let at = b[..len].iter().rposition(|&x| x == c);
+        at.map(|at| b[at] = 0).is_some()
+    });
+    if cut {
+        CharPtr::from_bytes(b"")
+    } else {
+        CharPtr::default()
+    }
 }
 
 macro_rules! seqg_escaped {
@@ -537,12 +539,12 @@ mod tests {
     fn the_strrchr_cut_ends_tmpstr_at_its_last_dot() {
         let tmpstr = SeqVar::<[c_char; 100]>::new([0; 100]);
         strcpy(&tmpstr, "X:m:tth.VAL");
-        assert_eq!(cut_at_last(&tmpstr, b'.').as_deref(), Some(&b""[..]));
+        assert_eq!(cut_at_last(&tmpstr, b'.').to_c_vec(), b"");
         strcat(&tmpstr, ".STOP");
         assert_eq!(tmpstr.to_c_vec(), b"X:m:tth.STOP");
 
         strcpy(&tmpstr, "nodot");
-        assert_eq!(cut_at_last(&tmpstr, b'.'), None);
+        assert!(cut_at_last(&tmpstr, b'.').is_null());
         assert_eq!(tmpstr.to_c_vec(), b"nodot");
     }
 }

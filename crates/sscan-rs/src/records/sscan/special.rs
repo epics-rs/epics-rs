@@ -28,14 +28,14 @@ fn special_code(s: Special) -> i16 {
 
 impl SscanRecord {
     /// C `special()`. `false` is C's `return(-1)`: the put is refused.
-    pub(crate) fn special_field(&mut self, o: usize, after: bool) -> bool {
+    pub(crate) fn special_field(&mut self, own: OwnFrame<'_>, o: usize, after: bool) -> bool {
         self.clamp_npts();
         if !after {
-            return self.special_before(o);
+            return self.special_before(own, o);
         }
         let spc = SSCAN_FIELDS[o].special;
         match spc {
-            Special::Mod => return self.special_mod(o),
+            Special::Mod => return self.special_mod(own, o),
             Special::Record(n @ SPC_SC_S..=SPC_SC_W) => {
                 let prev = self.alrt;
                 self.alrt = 0;
@@ -94,7 +94,7 @@ impl SscanRecord {
     }
 
     /// `special(.., after = 0)`.
-    fn special_before(&mut self, o: usize) -> bool {
+    fn special_before(&mut self, own: OwnFrame<'_>, o: usize) -> bool {
         self.pffo = self.ffo;
         let pv_field = (PV0..PV0 + NUM_PVS).contains(&o);
         if self.busy != 0 {
@@ -120,24 +120,24 @@ impl SscanRecord {
         }
         if pv_field {
             let li = o - PV0;
-            self.wait_for_connect(li);
+            self.wait_for_connect(own, li);
             // Positioners have a second link, POSITIONER_OUT.
             if li < NUM_POS {
-                self.wait_for_connect(li + NUM_PVS);
+                self.wait_for_connect(own, li + NUM_PVS);
             }
         }
         true
     }
 
     /// `special(.., after = 1)` for `SPC_MOD`.
-    fn special_mod(&mut self, o: usize) -> bool {
+    fn special_mod(&mut self, own: OwnFrame<'_>, o: usize) -> bool {
         match o {
-            EXSC => return self.exsc_written(),
+            EXSC => return self.exsc_written(own),
             DDLY | PDLY | RDLY => {
                 let tics = self.tics;
                 let round = |v: f32| {
                     let v = if v < 0.0 { 0.0 } else { v };
-                    (nint(f64::from(v) * tics) / tics) as f32
+                    (nint(f64::from(v) * tics) as f64 / tics) as f32
                 };
                 match o {
                     DDLY => self.ddly = round(self.ddly),
@@ -219,14 +219,14 @@ impl SscanRecord {
                     self.post(REFD);
                 }
             }
-            _ if (PV0..PV0 + NUM_PVS).contains(&o) => self.pv_written(o - PV0),
+            _ if (PV0..PV0 + NUM_PVS).contains(&o) => self.pv_written(own, o - PV0),
             _ => {}
         }
         true
     }
 
     /// The `EXSC` case of `special`.
-    fn exsc_written(&mut self) -> bool {
+    fn exsc_written(&mut self, own: OwnFrame<'_>) -> bool {
         if self.exsc == 0 {
             if self.xsc != 0 {
                 self.xsc = 0;
@@ -294,7 +294,7 @@ impl SscanRecord {
                     // C then waits for the clear to take; the port's clear
                     // has taken when it returns.
                     self.lpvt[i].lookup_time = Some(now);
-                    self.lookup_pv(i);
+                    self.lookup_pv(own, i);
                 }
             }
         }
@@ -398,7 +398,7 @@ impl SscanRecord {
     }
 
     /// The PV-name case of `special`.
-    pub(super) fn pv_written(&mut self, i: usize) {
+    pub(super) fn pv_written(&mut self, own: OwnFrame<'_>, i: usize) {
         let old = self.nv[i];
         if is_blank(&self.pvn[i]) {
             self.pvn[i] = PvString::default();
@@ -422,7 +422,7 @@ impl SscanRecord {
             self.post(NV0 + i);
         }
         self.lpvt[i].lookup_time = Some(Instant::now());
-        self.lookup_pv(i);
+        self.lookup_pv(own, i);
     }
 
     /// `SPC_SC_MO`: a positioner entering or leaving table mode.
@@ -929,7 +929,7 @@ impl SscanRecord {
                     det[j] = det[j - 1];
                 }
             }
-            self.post(pf(i, p::RA));
+            self.post_pos_buffers(i, EventMask::VALUE);
             self.post(df(i, d::DA));
             self.post(df(i, d::CA));
             self.post_null_served(EventMask::VALUE);

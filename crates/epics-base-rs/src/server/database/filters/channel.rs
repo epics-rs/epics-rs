@@ -26,7 +26,7 @@ impl DbChannel {
     /// they hold. `None` where the read fails. Takes the record's lock; a
     /// caller must hold none.
     pub fn get(&self, db: &PvDatabase) -> Option<EpicsValue> {
-        let value = match db.get_record(&self.name.record) {
+        let read = match db.get_record(&self.name.record) {
             Some(rec) => {
                 let field = rec.canonical_field(&self.name.field);
                 crate::server::database::channel_io::record_field_snapshot_scan_locked(
@@ -35,14 +35,14 @@ impl DbChannel {
                     &field,
                     self.name.string_view,
                 )?
-                .value
             }
-            None => db.get_pv(&self.name.record_path).ok()?,
+            None => db.simple_pv_bytes(&self.name.record_path)?.snapshot(),
         };
+        let value = read.value.clone();
         Some(
             self.chain
-                .apply_to_read_value(value.clone())
-                .unwrap_or(value),
+                .apply_to_read_snapshot(read)
+                .map_or(value, |read| read.value),
         )
     }
 }
@@ -117,7 +117,7 @@ pub(crate) fn db_channel_create_unreported(
     } else {
         raw
     };
-    if !db.channel_create_found(probe) {
+    if !db.resolve_channel_create(probe) {
         return Err(ChannelCreateError::NotFound);
     }
     let chain = match name.json_suffix.as_deref() {

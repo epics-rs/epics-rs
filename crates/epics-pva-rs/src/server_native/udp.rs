@@ -4,7 +4,7 @@
 //! SEARCH_RESPONSE messages naming our TCP endpoint. Beacons are emitted
 //! periodically to advertise our presence.
 
-// RTEMS-EXEC-MODEL-ALLOW(11): this file does not build on the exec backend -
+// RTEMS-EXEC-MODEL-ALLOW(12): this file does not build on the exec backend -
 // server_native/mod.rs declares it under #[cfg(tokio_backend)] pub mod udp;.
 use std::io::Cursor;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -43,8 +43,8 @@ use super::search::{SearchRequest, parse_search_request};
 // resolving, including this module's own tests.
 pub use super::search_engine::random_guid;
 pub(crate) use super::search_engine::{
-    Origin, SearchListeners, SearchOutput, ServerInterfaces, V6Listen, filter_inbound,
-    local_v4_addrs, process_search_datagram,
+    Origin, SearchListeners, SearchOutput, SearchReplier, ServerInterfaces, V6Listen,
+    filter_inbound, local_v4_addrs, process_search_datagram,
 };
 
 /// pvxs `beaconSender4` (`server.cpp:389,399`): beacons leave from their own
@@ -340,15 +340,16 @@ pub async fn run_udp_responder_with_config(
     );
     let (_, v4_alive) = Liveness::guarded();
     let (_, v6_alive) = Liveness::guarded();
+    let (_, started) = tokio::sync::watch::channel(Some(SearchReplier {
+        source,
+        tcp_port,
+        guid,
+        protocol,
+    }));
     serve_udp(
         bound,
-        UdpServe {
-            source,
-            tcp_port,
-            guid,
-            protocol,
-            ignore_addrs,
-        },
+        ignore_addrs,
+        started,
         beacons,
         super::beacon::BeaconCycle::new(beacon_period, beacon_period_long, beacon_burst_count),
         v4_alive,
@@ -357,20 +358,15 @@ pub async fn run_udp_responder_with_config(
     .await
 }
 
-/// What every search responder answers with and filters by.
-#[derive(Clone)]
-pub(crate) struct UdpServe {
-    pub source: DynSource,
-    /// Advertised in SEARCH_RESPONSE and beacons.
-    pub tcp_port: u16,
-    pub guid: [u8; 12],
-    pub protocol: &'static str,
-    pub ignore_addrs: Vec<(IpAddr, u16)>,
-}
+/// A server's started state as its search responders read it: `None` from
+/// the bind, the replier from `start` on.
+pub(crate) type SearchStarted = tokio::sync::watch::Receiver<Option<SearchReplier>>;
 
-/// Serve an already-bound [`UdpBind`]: the responder of each bound family
-/// and the beacons, until one of them ends. Each responder holds its
-/// family's guard, so a family never bound reads down at once.
+/// Serve an already-bound [`UdpBind`] from the bind on: the responder of
+/// each bound family, which answers only once `started` holds the replier,
+/// and from then the beacons, until one of them ends — or, never started,
+/// until `started`'s sender is dropped. Each responder holds its family's
+/// guard, so a family never bound reads down at once.
 ///
 /// Splitting the bind out is what lets [`crate::server_native::runtime`]
 /// support `udp_port = 0`: the responders are spawned as a task, so a bind
@@ -381,7 +377,8 @@ pub(crate) struct UdpServe {
 /// origin-tag group, none of which tolerate a placeholder.
 pub(crate) async fn serve_udp(
     bound: UdpBind,
-    serve: UdpServe,
+    ignore_addrs: Vec<(IpAddr, u16)>,
+    mut started: SearchStarted,
     beacons: Vec<Endpoint>,
     cycle: super::beacon::BeaconCycle,
     v4_alive: LivenessGuard,
@@ -392,37 +389,47 @@ pub(crate) async fn serve_udp(
         ?port,
         v4 = v4.is_some(),
         v6 = v6.is_some(),
-        "UDP search responders started"
+        "UDP search responders reading"
     );
     let mut set: tokio::task::JoinSet<PvaResult<()>> = tokio::task::JoinSet::new();
-    set.spawn(run_beacons(serve.clone(), beacons, cycle));
     if let Some(v4) = v4 {
-        let serve = serve.clone();
+        let (ignore_addrs, started) = (ignore_addrs.clone(), started.clone());
         set.spawn(async move {
             let _alive = v4_alive;
-            run_udp_responder_v4(v4, port, serve).await
+            run_udp_responder_v4(v4, port, ignore_addrs, started).await
         });
     }
     if let Some(v6) = v6 {
+        let started = started.clone();
         set.spawn(async move {
             let _alive = v6_alive;
-            run_udp_responder_v6(v6, port, serve).await
+            run_udp_responder_v6(v6, port, ignore_addrs, started).await
         });
     }
     // Dropping the set, on a return or an abort of this future, aborts
     // every responder and the beacons together.
-    match set.join_next().await {
+    let joined = |res: Option<Result<PvaResult<()>, tokio::task::JoinError>>| match res {
         Some(Ok(res)) => res,
         Some(Err(e)) => Err(PvaError::Protocol(format!("udp task panic: {e}"))),
         None => Ok(()),
-    }
+    };
+    // pvxs arms the beacon timer in `Server::Pvt::start` (`server.cpp:590`).
+    let replier = tokio::select! {
+        replier = started.wait_for(Option::is_some) => replier.ok().and_then(|r| (*r).clone()),
+        res = set.join_next() => return joined(res),
+    };
+    let Some(replier) = replier else {
+        return Ok(());
+    };
+    set.spawn(run_beacons(replier, beacons, cycle));
+    joined(set.join_next().await)
 }
 
 /// The beacon stream, first beacon at once (pvxs cc5071cd22c4:
 /// `server.cpp:590-592` arms the timer `immediate`). pvxs `beaconSender4`
 /// and `beaconSender6`; the v6 one is opened only for a v6 destination.
 async fn run_beacons(
-    serve: UdpServe,
+    serve: SearchReplier,
     dests: Vec<Endpoint>,
     mut cycle: super::beacon::BeaconCycle,
 ) -> PvaResult<()> {
@@ -463,15 +470,13 @@ async fn run_beacons(
 
 /// The v4 responder on the collector, routed by [`SearchListeners::route`]
 /// as the blocking responder's collector is.
-async fn run_udp_responder_v4(bind: V4Bind, udp_port: u16, serve: UdpServe) -> PvaResult<()> {
+async fn run_udp_responder_v4(
+    bind: V4Bind,
+    udp_port: u16,
+    ignore_addrs: Vec<(IpAddr, u16)>,
+    started: SearchStarted,
+) -> PvaResult<()> {
     let V4Bind { collector } = bind;
-    let UdpServe {
-        source,
-        tcp_port,
-        guid,
-        protocol,
-        ignore_addrs,
-    } = serve;
     let mut prev_drops: u32 = 0;
     // 64 KB receive buffer — IPv4 maximum: pvxs clients pack many SEARCH
     // messages into one datagram, and a 1500-byte buffer truncated them.
@@ -507,17 +512,15 @@ async fn run_udp_responder_v4(bind: V4Bind, udp_port: u16, serve: UdpServe) -> P
         else {
             continue;
         };
+        let replier = started.borrow().clone();
         let outputs = process_search_datagram(
-            &source,
+            replier.as_ref(),
             forward,
             udp_port,
             frame,
             src,
             reply_iface_ip,
             origin,
-            tcp_port,
-            guid,
-            protocol,
         )
         .await;
         dispatch_search_outputs(&collector.sock, outputs).await;
@@ -565,7 +568,12 @@ async fn dispatch_search_outputs(sock: &tokio::net::UdpSocket, outputs: Vec<Sear
 /// listeners take ([`V6Listen::takes`]) is answered from the socket, and
 /// nothing is forwarded — pvxs forwards only a v4 destination
 /// (`udp_collector.cpp:385`).
-async fn run_udp_responder_v6(bind: V6Bind, udp_port: u16, serve: UdpServe) -> PvaResult<()> {
+async fn run_udp_responder_v6(
+    bind: V6Bind,
+    udp_port: u16,
+    ignore_addrs: Vec<(IpAddr, u16)>,
+    started: SearchStarted,
+) -> PvaResult<()> {
     let V6Bind { sock, listen } = bind;
     let socket = tokio::net::UdpSocket::from_std(sock).map_err(PvaError::Io)?;
     if let Err(e) = enable_so_rxq_ovfl_for_socket(&socket) {
@@ -588,22 +596,19 @@ async fn run_udp_responder_v6(bind: V6Bind, udp_port: u16, serve: UdpServe) -> P
             );
         }
         prev_drops_v6 = drops;
-        if !filter_inbound(src, &serve.ignore_addrs)
-            || !listen.takes(src, pktinfo.map(|(dest, _)| dest))
+        if !filter_inbound(src, &ignore_addrs) || !listen.takes(src, pktinfo.map(|(dest, _)| dest))
         {
             continue;
         }
+        let replier = started.borrow().clone();
         let outputs = process_search_datagram(
-            &serve.source,
+            replier.as_ref(),
             false,
             udp_port,
             &buf[..n],
             src,
             Ipv4Addr::UNSPECIFIED,
             Origin::Direct,
-            serve.tcp_port,
-            serve.guid,
-            serve.protocol,
         )
         .await;
         for out in outputs {
@@ -955,6 +960,101 @@ mod tests {
         assert_eq!(hdr.command, Command::SearchResponse.code());
     }
 
+    /// pvxs's collector reads from its bind (`udp_collector.cpp:169`) and
+    /// forwards a local unicast SEARCH at once (`forwardM`, `:385-397`), while
+    /// its search listeners start only in `Server::Pvt::start`
+    /// (`server.cpp:555-599`): a SEARCH that reaches the bound sockets before
+    /// `start` is never answered, and a unicast one is forwarded then.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_search_before_start_is_dropped_and_a_unicast_one_forwarded() {
+        use crate::nt::typed::TypedNT;
+        use crate::server_native::blocking::tests::origin_tag_member;
+        use crate::server_native::{PvaServer, SharedPV, SharedSource};
+        /// Whether a group datagram carrying `needle` arrives, each within 2 s.
+        async fn saw(member: &tokio::net::UdpSocket, needle: &[u8]) -> bool {
+            let mut buf = [0u8; 1500];
+            while let Ok(Ok(n)) =
+                tokio::time::timeout(Duration::from_secs(2), member.recv(&mut buf)).await
+            {
+                if buf[..n].windows(needle.len()).any(|w| w == needle) {
+                    return true;
+                }
+            }
+            false
+        }
+        let bound = PvaServer::bind(lo_mcast_server()).expect("bind");
+        let port = bound.report_handle().report().udp_port;
+        let group = SocketAddr::from((epics_base_rs::net::ORIGIN_TAG_MCAST_GROUP, port));
+        let member = origin_tag_member(port);
+        member.set_nonblocking(true).unwrap();
+        let member = tokio::net::UdpSocket::from_std(member).unwrap();
+        let client = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        socket2::SockRef::from(&client)
+            .set_multicast_if_v4(&Ipv4Addr::LOCALHOST)
+            .unwrap();
+        let reply_port = client.local_addr().unwrap().port();
+        client.set_nonblocking(true).unwrap();
+        let client = tokio::net::UdpSocket::from_std(client).unwrap();
+        let codec = PvaCodec { big_endian: false };
+        let tagged = |seq| {
+            let mut frame = PvaCodec::build_origin_tag_prefix(Ipv4Addr::LOCALHOST).to_vec();
+            frame.extend(codec.build_search(
+                seq,
+                0x1234,
+                "LO:MCAST:PV",
+                [127, 0, 0, 1],
+                reply_port,
+                false,
+            ));
+            frame
+        };
+        // Answered once started; seen by the member when the collector has it.
+        client.send_to(&tagged(1), group).await.unwrap();
+        assert!(
+            saw(&member, b"LO:MCAST:PV").await,
+            "the group SEARCH reached the group"
+        );
+        // Queued behind it on the collector, so its forward is proof the
+        // collector read the group SEARCH before `start`.
+        let sink = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let unicast = codec.build_search(
+            2,
+            0x1235,
+            "pre.start.forward",
+            [127, 0, 0, 1],
+            sink.local_addr().unwrap().port(),
+            true,
+        );
+        client
+            .send_to(&unicast, (Ipv4Addr::LOCALHOST, port))
+            .await
+            .unwrap();
+        let forwarded = saw(&member, b"pre.start.forward").await;
+
+        let pv = SharedPV::new();
+        pv.open(f64::descriptor(), f64::to_pv_field(&1.0)).unwrap();
+        let source = Arc::new(SharedSource::new());
+        source.add("LO:MCAST:PV", pv);
+        let _server = bound.start(source).expect("start");
+        let mut buf = [0u8; 1500];
+        let answered = tokio::time::timeout(Duration::from_secs(1), client.recv(&mut buf))
+            .await
+            .is_ok();
+        assert_eq!(
+            (forwarded, answered),
+            (true, false),
+            "(unicast forwarded before start, group SEARCH answered after)"
+        );
+        client.send_to(&tagged(3), group).await.unwrap();
+        let n = tokio::time::timeout(Duration::from_secs(2), client.recv(&mut buf))
+            .await
+            .expect("a SEARCH_RESPONSE once started")
+            .unwrap();
+        let hdr = PvaHeader::decode(&mut Cursor::new(&buf[..n])).unwrap();
+        assert_eq!(hdr.command, Command::SearchResponse.code());
+    }
+
     /// pvxs throws out of the `Server` constructor when the collector cannot
     /// bind (`udp_collector.cpp:151`, `evhelper.cpp:498-505`). A stranger on
     /// 127.0.0.2:P without reuse flags leaves the 127.0.0.1:P search bind free
@@ -1283,17 +1383,20 @@ mod tests {
         guid: [u8; 12],
         protocol: &'static str,
     ) {
+        let replier = SearchReplier {
+            source: source.clone(),
+            tcp_port,
+            guid,
+            protocol,
+        };
         let outputs = process_search_datagram(
-            source,
+            Some(&replier),
             lo_mcast.is_some(),
             udp_port,
             frame,
             udp_src,
             reply_iface_ip,
             origin,
-            tcp_port,
-            guid,
-            protocol,
         )
         .await;
         dispatch_search_outputs(lo_mcast.map_or(socket, |lo| &**lo), outputs).await;
@@ -1392,18 +1495,21 @@ mod tests {
         let frame = codec.build_search(7, 42, "MY:PV", [127, 0, 0, 1], 9999, false);
         let udp_src = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 9, 5), 30000));
         let guid = [3u8; 12];
+        let replier = SearchReplier {
+            source,
+            tcp_port: 5075,
+            guid,
+            protocol: "tcp",
+        };
 
         let outputs = process_search_datagram(
-            &source,
+            Some(&replier),
             false, // no ORIGIN_TAG forwarding
             5076,
             &frame,
             udp_src,
             Ipv4Addr::new(192, 168, 9, 10), // NIC the SEARCH arrived on
             Origin::Direct,
-            5075,
-            guid,
-            "tcp",
         )
         .await;
 
@@ -1423,16 +1529,13 @@ mod tests {
         // packets whose peeled origDest was `isAny()` — must resolve to
         // "no NIC pin" rather than travel on as an address.
         let outputs = process_search_datagram(
-            &source,
+            Some(&replier),
             false,
             5076,
             &frame,
             udp_src,
             Ipv4Addr::UNSPECIFIED,
             Origin::Direct,
-            5075,
-            guid,
-            "tcp",
         )
         .await;
         assert!(

@@ -242,7 +242,8 @@ async fn seq_delay_runs_outside_the_gate_and_fires_after_release() {
         .expect("the gate must be free while the seq DLYn delay is pending");
 
     // After the delay the group runs and the chain completes the cycle.
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if db
             .get_record("H6:SEQTGT")
             .unwrap()
@@ -265,7 +266,8 @@ async fn seq_delay_runs_outside_the_gate_and_fires_after_release() {
         "LNK0 must be driven once DLY0 elapsed"
     );
     // `asyncFinish` cleared PACT (`seqRecord.c:238`).
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if !db.get_record("H6:SEQ").unwrap().read().is_processing() {
             break;
         }
@@ -313,7 +315,7 @@ async fn seq_process_returns_without_waiting_out_dly0() {
         ));
     });
     done_rx
-        .recv_timeout(Duration::from_secs(30))
+        .recv_timeout(fact_budget::FACT_BUDGET)
         .expect("process must return without waiting out DLY0")
         .unwrap();
 
@@ -402,7 +404,8 @@ async fn seq_with_every_delay_zero_still_runs_on_the_callback_task() {
         .expect("the seq gate must be free while the group chain runs");
 
     // The chain finishes on its own and `asyncFinish` clears PACT (`:238`).
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if !db.get_record("UI81:SEQ").unwrap().read().is_processing() {
             break;
         }
@@ -478,7 +481,7 @@ async fn the_async_completion_waits_for_the_gate() {
 
     drop(release_tx);
     holder.join().expect("epoch holder thread");
-    epics_base_rs::runtime::task::timeout(Duration::from_secs(5), h)
+    epics_base_rs::runtime::task::timeout(fact_budget::FACT_BUDGET, h)
         .await
         .expect("the completion must run once the gate is released")
         .unwrap();

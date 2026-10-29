@@ -454,9 +454,9 @@ impl NDPluginProcess for PosPluginProcessor {
         self.attributes = Some(attributes);
     }
 
-    /// C `NDPosPlugin::writeInt32` drops the base class status
-    /// (`status = (asynStatus)callParamCallbacks();`, NDPosPlugin.cpp:260): a refused NDPluginDriver write keeps
-    /// its clamp and succeeds. Running/Mode/Restart/Delete set their side
+    /// C `NDPosPlugin::writeInt32` drops the base refusal (NDPosPlugin.cpp:260);
+    /// not copied. A kept refusal carries the errorMessage C's `if (status)`
+    /// sets (:262-265). Running/Mode/Restart/Delete set their side
     /// params inside the write (:230-250); every NDPos param C reads per
     /// frame is mirrored here, before the next write can read it.
     fn validate_int32(
@@ -467,8 +467,16 @@ impl NDPluginProcess for PosPluginProcessor {
         verdict: ad_core_rs::plugin::runtime::WriteVerdict<i32>,
         _params: &mut ad_core_rs::plugin::runtime::WritePort<'_>,
     ) -> ad_core_rs::plugin::runtime::WriteOutcome<i32> {
-        use ad_core_rs::plugin::runtime::WriteOutcome;
-        let out = WriteOutcome::from(verdict.succeed());
+        use ad_core_rs::plugin::runtime::{WriteOutcome, WriteVerdict};
+        let out = WriteOutcome::from(match verdict {
+            WriteVerdict::Refuse { keep, .. } => WriteVerdict::Refuse {
+                keep,
+                message: format!(
+                    "NDPosPlugin::writeInt32: status=3, function={reason}, value={value}"
+                ),
+            },
+            accepted => accepted,
+        });
         let mut state = self.state.lock();
         let s = &mut *state;
         let p = s.params;
@@ -526,6 +534,7 @@ impl NDPluginProcess for PosPluginProcessor {
 
     /// C `NDPosPlugin::writeOctet(NDPos_Filename)` loads the positions inside
     /// the write and fails it on invalid XML (NDPosPlugin.cpp:295-315).
+    /// NDPluginDriver's failure carries the same errorMessage (:326).
     fn validate_octet(
         &self,
         reason: usize,
@@ -535,9 +544,18 @@ impl NDPluginProcess for PosPluginProcessor {
         _params: &asyn_rs::port::PortDriverBase,
     ) -> ad_core_rs::plugin::runtime::WriteOutcome<String> {
         use ad_core_rs::plugin::runtime::{WriteOutcome, WriteVerdict};
+        let refused =
+            || format!("NDPosPlugin:writeOctet: status=3, function={reason}, value={value}");
         let mut state = self.state.lock();
         if Some(reason) != state.params.filename {
-            return verdict.into();
+            return match verdict {
+                WriteVerdict::Refuse { keep, .. } => WriteVerdict::Refuse {
+                    keep,
+                    message: refused(),
+                },
+                accepted => accepted,
+            }
+            .into();
         }
         let set = |out: WriteOutcome<String>, i: Option<usize>, v: i32| match i {
             Some(i) => out.set_int32(i, 0, v),
@@ -556,9 +574,7 @@ impl NDPluginProcess for PosPluginProcessor {
             Err(_) => set(
                 WriteVerdict::Refuse {
                     keep: value.to_string(),
-                    message: format!(
-                        "NDPosPlugin:writeOctet: status=3, function={reason}, value={value}"
-                    ),
+                    message: refused(),
                 }
                 .into(),
                 valid,
@@ -712,7 +728,7 @@ impl NDPluginProcess for PosPluginProcessor {
         push_str(&mut updates, state.params.current_pos, current_pos);
 
         ProcessResult {
-            output_arrays: vec![Arc::new(out)],
+            output_arrays: [Arc::new(out)].into(),
             param_updates: updates,
             scatter: false,
             addressed: vec![],
@@ -815,32 +831,30 @@ impl NDPluginProcess for PosPluginProcessor {
 mod tests {
     use super::*;
 
-    /// `status = (asynStatus)callParamCallbacks();` (NDPosPlugin.cpp:260).
+    /// NDPluginDriver's FilePath refusal fails the write under this
+    /// plugin's errorMessage.
     #[test]
-    fn a_refused_base_write_succeeds_as_c_write_int32_does() {
-        use ad_core_rs::plugin::runtime::WriteVerdict;
-        let proc = PosPluginProcessor::new(PosMode::Discard);
-        let mut base = asyn_rs::port::PortDriverBase::new(
-            "T",
-            1,
-            Default::default(),
-            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+    fn a_refused_file_path_write_fails() {
+        let (message, function, value) = crate::test_util::refused_file_path_write(
+            "POS_PATH",
+            PosPluginProcessor::new(PosMode::Discard),
         );
-        let clamp = WriteVerdict::Refuse {
-            keep: 1,
-            message: String::new(),
-        };
         assert_eq!(
-            proc.validate_int32(
-                0,
-                0,
-                98,
-                clamp,
-                &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base)
-            )
-            .verdict,
-            WriteVerdict::Accept(1)
+            message,
+            format!("NDPosPlugin:writeOctet: status=3, function={function}, value={value}")
+        );
+    }
+
+    /// NDPosPlugin.cpp:260 drops the base refusal; a Pos port returns it.
+    #[test]
+    fn a_refused_base_write_fails() {
+        let (message, function, value) = crate::test_util::refused_base_write(
+            "POS_REFUSED",
+            PosPluginProcessor::new(PosMode::Discard),
+        );
+        assert_eq!(
+            message,
+            format!("NDPosPlugin::writeInt32: status=3, function={function}, value={value}")
         );
     }
     use ad_core_rs::ndarray::{NDDataType, NDDimension};
@@ -1217,8 +1231,8 @@ mod tests {
             "T",
             1,
             Default::default(),
-            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+            asyn_rs::port::InterfaceMask::NONE,
+            asyn_rs::port::InterfaceMask::NONE,
         );
         proc.register_params(&mut base).unwrap();
         let (file, valid, qty) = {
@@ -1301,8 +1315,8 @@ mod tests {
             "T",
             1,
             Default::default(),
-            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+            asyn_rs::port::InterfaceMask::NONE,
+            asyn_rs::port::InterfaceMask::NONE,
         );
         proc.register_params(&mut base).unwrap();
         (proc, base)
@@ -1487,7 +1501,7 @@ mod tests {
             .remove(0);
         assert_eq!(first.pool_id(), pool.id());
         assert!(first.attributes.get("X").is_some());
-        let ptr = first.data.as_u8_slice().as_ptr();
+        let ptr = first.data().as_u8_slice().as_ptr();
         drop(first);
 
         let second = proc
@@ -1495,7 +1509,7 @@ mod tests {
             .output_arrays
             .remove(0);
         assert_eq!(
-            second.data.as_u8_slice().as_ptr(),
+            second.data().as_u8_slice().as_ptr(),
             ptr,
             "the second frame reuses the freed buffer"
         );

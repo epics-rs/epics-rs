@@ -36,6 +36,18 @@ async fn proc(db: &PvDatabase, rec: &str) {
         .unwrap();
 }
 
+/// Until `rec` leaves PACT: an SDLY pass completes from its callback.
+async fn idle(db: &PvDatabase, rec: &str) {
+    let cell = db.get_record(rec).unwrap();
+    epics_base_rs::runtime::task::timeout(fact_budget::FACT_BUDGET, async {
+        while cell.read().is_processing() {
+            epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{rec} never left PACT"));
+}
+
 /// `(VAL, SIMM, STAT, SEVR, PACT)` as text.
 async fn state(db: &PvDatabase, rec: &str) -> String {
     let val = match db.get_pv(format!("{rec}.VAL")).unwrap() {
@@ -88,7 +100,7 @@ async fn run(db: &PvDatabase, r: &str, want: &[(&str, &str)]) {
     put(db, &format!("{r}.SDLY"), EpicsValue::Double(0.4)).await;
     proc(db, r).await;
     check("sdly fresh", state(db, r).await);
-    epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(900)).await;
+    idle(db, r).await;
     check("sdly done", state(db, r).await);
     let want: Vec<(String, String)> = want
         .iter()

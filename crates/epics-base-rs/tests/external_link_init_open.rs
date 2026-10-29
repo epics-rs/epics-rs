@@ -161,7 +161,7 @@ async fn non_cp_external_inp_link_is_opened_at_init_not_on_first_scan() {
     db.process_cp_links_on_connect().await;
 
     // No `CP` / `CPP` modifier — `setup_cp_links` ignores this link entirely.
-    add_ai(&db, "AI_PLAIN", "ca://REMOTE:IN").await;
+    add_ai(&db, "AI_PLAIN", "REMOTE:IN CA").await;
 
     let staged = db.setup_external_link_opens().await;
     assert_eq!(staged, 1, "the plain external INP link must be staged");
@@ -201,7 +201,7 @@ async fn out_only_external_link_is_opened_at_init() {
     db.ca_link_init();
     db.register_link_set("ca", lset.clone()).await;
 
-    add_ao(&db, "AO_PLAIN", "ca://REMOTE:OUT").await;
+    add_ao(&db, "AO_PLAIN", "REMOTE:OUT CA").await;
 
     let staged = db.setup_external_link_opens().await;
     assert_eq!(staged, 1, "an OUT-only external link must be staged");
@@ -233,10 +233,10 @@ async fn record_specific_input_link_fields_are_opened_at_init() {
         let rec = db.get_record("CALC1").expect("just added");
         let mut inst = rec.write();
         inst.record
-            .put_field("INPA", EpicsValue::String("ca://REMOTE:A".into()))
+            .put_field("INPA", EpicsValue::String("REMOTE:A CA".into()))
             .unwrap();
         inst.record
-            .put_field("INPB", EpicsValue::String("ca://REMOTE:B".into()))
+            .put_field("INPB", EpicsValue::String("REMOTE:B CA".into()))
             .unwrap();
     }
 
@@ -321,7 +321,7 @@ async fn plain_non_local_db_link_converts_and_opens_at_init() {
     db.sync_external_link_puts().await;
     assert_eq!(lset.opened_names(), vec!["OTHER:PV".to_string()]);
 
-    // The parity payoff, same as the explicit `ca://` case: no cold cycle.
+    // The parity payoff, same as the explicit CA case: no cold cycle.
     process(&db, "AI_NONLOCAL").await;
     assert_eq!(val_of(&db, "AI_NONLOCAL").await, Some(12.5));
     assert_eq!(
@@ -502,7 +502,7 @@ async fn external_forward_link_is_opened_at_init() {
         .unwrap();
     db.put_pv_no_process(
         "AI_FWD.FLNK",
-        EpicsValue::String("ca://REMOTE:FWD.PROC".into()),
+        EpicsValue::String("REMOTE:FWD.PROC CA".into()),
     )
     .await
     .unwrap();
@@ -597,7 +597,7 @@ async fn external_cp_link_already_warmed_is_not_staged_again() {
     db.ca_link_init();
     db.register_link_set("ca", lset.clone()).await;
 
-    add_ai(&db, "AI_CP", "ca://REMOTE:CP CP").await;
+    add_ai(&db, "AI_CP", "REMOTE:CP CP").await;
 
     db.setup_cp_links().await; // warms it through resolve_external_pv
     let staged = db.setup_external_link_opens().await;
@@ -631,7 +631,7 @@ async fn no_link_set_registered_stages_nothing_and_leaves_the_link_openable() {
     let db = PvDatabase::new();
     // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
     db.ca_link_init();
-    add_ai(&db, "AI_NOLSET", "ca://REMOTE:IN").await;
+    add_ai(&db, "AI_NOLSET", "REMOTE:IN CA").await;
 
     assert_eq!(
         db.setup_external_link_opens().await,

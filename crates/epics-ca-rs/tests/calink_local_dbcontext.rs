@@ -8,7 +8,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use epics_base_rs::server::database::{LinkPutOp, LinkRef, PvDatabase};
-use epics_base_rs::server::ioc_app::IocApplication;
+use epics_base_rs::server::ioc_app::{IocApplication, RunOutcome};
 use epics_base_rs::server::record::{OpenLatch, ParsedLink};
 use epics_base_rs::types::EpicsValue;
 use epics_ca_rs::calink::{CaLinkResolver, install_calink_resolver, register_calink_commands};
@@ -31,29 +31,32 @@ where
     let db_path = dir.path().join("local.db");
     std::fs::write(&db_path, db_text).expect("write db");
     let stcmd_path = dir.path().join("st.cmd");
+    // Without the `iocInit` the script is a custom `main`'s and the body
+    // never runs.
     std::fs::write(
         &stcmd_path,
-        format!("dbLoadRecords(\"{}\")\n", db_path.display()),
+        format!("dbLoadRecords(\"{}\")\niocInit\n", db_path.display()),
     )
     .expect("write st.cmd");
 
     let slot = Arc::new(OnceLock::new());
     let installed = slot.clone();
     let reactor = epics_base_rs::runtime::task::Reactor::current().expect("test runtime");
-    IocApplication::new()
+    let outcome = IocApplication::new()
         .startup_script(stcmd_path.to_str().unwrap())
         .register_link_type("ca", move |db| async move {
             let resolver = install_calink_resolver(&db, reactor).await;
             let _ = installed.set(resolver.clone());
             register_calink_commands(resolver)
         })
-        .run(move |config| async move {
+        .run_outcome(move |config| async move {
             let resolver = slot.get().expect("ca link set installed").clone();
             body(config.db.clone(), resolver).await;
             Ok(())
         })
         .await
         .expect("IOC run");
+    assert_eq!(outcome, RunOutcome::Served);
 }
 
 fn val(db: &PvDatabase, name: &str) -> Option<f64> {
@@ -182,14 +185,14 @@ async fn a_local_ca_put_writes_the_target_plain_and_with_callback() {
 async fn a_cp_link_added_to_a_served_name_processes_its_holder_once() {
     with_ioc(
         "record(ao, \"RL:X\") {}\n\
-         record(calc, \"RL:HP\") { field(INPA, \"ca://RL:X CP\") field(CALC, \"VAL+1\") }\n\
+         record(calc, \"RL:HP\") { field(INPA, \"RL:X CP\") field(CALC, \"VAL+1\") }\n\
          record(calc, \"RL:H\") { field(CALC, \"VAL+1\") }\n",
         |db, _resolver| async move {
             until("RL:HP never processed on connect", || {
                 val(&db, "RL:HP") == Some(1.0)
             })
             .await;
-            db.put_record_field_from_ca("RL:H", "INPA", EpicsValue::String("ca://RL:X CP".into()))
+            db.put_record_field_from_ca("RL:H", "INPA", EpicsValue::String("RL:X CP".into()))
                 .await
                 .expect("put RL:H.INPA");
             until("RL:H never processed on its link's add", || {
@@ -213,7 +216,7 @@ async fn a_cp_link_added_to_a_served_name_processes_its_holder_once() {
 /// `dbCaRun` returns for links that never become local channels or that
 /// join one already open: `RI:R.VAL$x` names a local record but
 /// `dbChannel_create` refuses it, so its link takes the network path, and
-/// `RI:X` is opened by two links, `RI:X CP` and `ca://RI:X CP`.
+/// `RI:X` is opened by two `RI:X CP` links.
 #[epics_macros_rs::epics_test]
 #[serial(epics_env)]
 async fn iocinit_completes_over_refused_and_shared_local_names() {
@@ -222,7 +225,7 @@ async fn iocinit_completes_over_refused_and_shared_local_names() {
          record(ao, \"RI:X\") { field(VAL, \"4\") }\n\
          record(calc, \"RI:HR\") { field(INPA, \"RI:R.VAL$x CP\") field(CALC, \"A\") }\n\
          record(calc, \"RI:H1\") { field(INPA, \"RI:X CP\") field(CALC, \"A\") }\n\
-         record(calc, \"RI:H2\") { field(INPA, \"ca://RI:X CP\") field(CALC, \"A\") }\n",
+         record(calc, \"RI:H2\") { field(INPA, \"RI:X CP\") field(CALC, \"A\") }\n",
         |db, resolver| async move {
             assert!(
                 resolver.client_connection_count().await.is_some(),

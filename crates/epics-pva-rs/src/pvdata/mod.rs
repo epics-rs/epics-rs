@@ -27,4 +27,5 @@ pub use shared_array::SharedArray;
 pub use structure::{PvField, PvStructure, UnionItem, VariantValue};
 pub use typed_array::TypedScalarArray;
 pub use value::{FromScalarValue, IntoScalarValue, Value, ValueError};
+pub(crate) use value::{ScalarCopy, coerce_scalar};
 pub use value_check::{ValueDescMismatch, apply_marked_delta, value_matches_descriptor};

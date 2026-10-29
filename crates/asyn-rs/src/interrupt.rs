@@ -862,6 +862,9 @@ pub struct InterruptSharedState {
     /// The edge sweeps queued and not yet run — see
     /// [`InterruptManager::edge_sweeps`].
     edge_sweeps: Arc<epics_libcom_rs::runtime::interrupt_accept::Outstanding>,
+    /// The interfaces the port registers: C's `interfaceList`, which
+    /// `getInterruptPvt` searches before the interrupt source.
+    registered: InterfaceMask,
     /// The interfaces a client may register on: C's `interruptMask`, which
     /// asynPortDriver turns into one `registerInterruptSource` per interface
     /// (asynPortDriver.cpp:4074-4086).
@@ -894,12 +897,13 @@ impl Default for InterruptManager {
 impl InterruptManager {
     /// A manager no port's mask restricts: every interface is a source.
     pub fn new() -> Self {
-        Self::with_sources(InterfaceMask::ALL)
+        Self::with_masks(InterfaceMask::ALL, InterfaceMask::ALL)
     }
 
     /// A port's manager: clients register only on the interfaces in
-    /// `sources`, its C `interruptMask`.
-    pub fn with_sources(sources: InterfaceMask) -> Self {
+    /// `sources`, its C `interruptMask`, that are among `interfaces`, the
+    /// ones it registers.
+    pub fn with_masks(interfaces: InterfaceMask, sources: InterfaceMask) -> Self {
         Self {
             state: Arc::new(InterruptSharedState {
                 async_rings: parking_lot::Mutex::new(Vec::new()),
@@ -910,6 +914,7 @@ impl InterruptManager {
                 next_client: AtomicU64::new(0),
                 owner: std::sync::OnceLock::new(),
                 edge_sweeps: Arc::default(),
+                registered: interfaces,
                 sources,
             }),
         }
@@ -928,9 +933,10 @@ impl InterruptManager {
     /// `register_port` refuses its handle ([`crate::error::AsynError::PortAlreadyOwned`]).
     pub fn owned_by(
         gate: Arc<epics_libcom_rs::runtime::interrupt_accept::InterruptGate>,
+        interfaces: InterfaceMask,
         sources: InterfaceMask,
     ) -> Self {
-        let this = Self::with_sources(sources);
+        let this = Self::with_masks(interfaces, sources);
         let _ = this.state.owner.set(gate);
         this
     }
@@ -966,22 +972,26 @@ impl InterruptManager {
     }
 
     /// C `getInterruptPvt` (asynManager.c:2460-2500): a client registering on
-    /// an interface that is not an interrupt source is refused. A filter that
-    /// names no interface, or a Rust-only one with no C mask bit, is not.
+    /// an interface the port does not register, or on one that is not an
+    /// interrupt source, is refused. A filter that names no interface, or a
+    /// Rust-only one with no C mask bit, is not.
     fn interrupt_pvt(&self, filter: &InterruptFilter) -> AsynResult<()> {
-        let Some(iface) = filter.iface else {
+        let Some(iface) = filter.iface.filter(|&i| InterfaceMask::of(i).is_some()) else {
             return Ok(());
         };
-        match InterfaceMask::of(iface) {
-            Some(bit) if !self.state.sources.contains(bit) => Err(AsynError::Status {
-                status: AsynStatus::Error,
-                message: format!(
-                    "asynManager:getInterruptPvt Driver does not support interrupts on interface {}",
-                    iface.asyn_name()
-                ),
-            }),
-            _ => Ok(()),
-        }
+        let message = if !self.state.registered.has(iface) {
+            format!("asynManager:getInterruptPvt interface {iface} is not registered")
+        } else if !self.state.sources.has(iface) {
+            format!(
+                "asynManager:getInterruptPvt Driver does not support interrupts on interface {iface}"
+            )
+        } else {
+            return Ok(());
+        };
+        Err(AsynError::Status {
+            status: AsynStatus::Error,
+            message,
+        })
     }
 
     /// Get the shared state for cross-manager sharing.
@@ -1381,13 +1391,51 @@ impl InterruptManager {
 mod tests {
     use crate::param::EnumEntry;
 
+    /// C `getInterruptPvt` looks the interface up before its interrupt
+    /// source (asynManager.c:2482-2500): an interrupt bit on an interface the
+    /// port never registered is refused as unregistered.
+    #[test]
+    fn a_client_on_an_unregistered_interface_is_refused() {
+        use super::InterruptFilter;
+        use crate::interfaces::{InterfaceMask, InterfaceType};
+        use crate::port::{PortDriverBase, PortFlags};
+        let base = PortDriverBase::new(
+            "unregistered_iface",
+            1,
+            PortFlags::default(),
+            InterfaceMask::INT32,
+            InterfaceMask::INT32 | InterfaceMask::FLOAT64,
+        );
+        let on = |iface| InterruptFilter {
+            iface: Some(iface),
+            ..InterruptFilter::default()
+        };
+        assert!(
+            base.interrupts
+                .register_interrupt_user(on(InterfaceType::Int32), 0)
+                .is_ok()
+        );
+        let refused = base
+            .interrupts
+            .register_interrupt_user(on(InterfaceType::Float64), 0)
+            .err()
+            .unwrap();
+        assert_eq!(
+            (refused.status(), refused.message_display().to_string()),
+            (
+                crate::error::AsynStatus::Error,
+                "asynManager:getInterruptPvt interface asynFloat64 is not registered".to_string()
+            )
+        );
+    }
+
     /// C `getInterruptPvt` (asynManager.c:2492-2497): only an interface the
     /// port's `interruptMask` names takes a client.
     #[test]
     fn a_client_registers_only_on_an_interrupt_source() {
         use super::{InterruptFilter, InterruptManager};
         use crate::interfaces::{InterfaceMask, InterfaceType};
-        let im = InterruptManager::with_sources(InterfaceMask::OCTET);
+        let im = InterruptManager::with_masks(InterfaceMask::ALL, InterfaceMask::OCTET);
         let on = |iface| InterruptFilter {
             iface,
             ..InterruptFilter::default()

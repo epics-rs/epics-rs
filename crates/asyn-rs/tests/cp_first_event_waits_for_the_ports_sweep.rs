@@ -92,8 +92,8 @@ impl Port {
                 can_block: true,
                 ..PortFlags::default()
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::INT32 | InterfaceMask::DRV_USER,
+            InterfaceMask::INT32,
         );
         let param = base.create_param("VAL", ParamType::Int32).unwrap();
         base.set_int32_param(param, 0, val).unwrap();

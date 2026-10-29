@@ -2679,6 +2679,7 @@ mod tests {
     #[tokio::test]
     async fn r17_33_layered_stack_forwards_set_channel_invalidator() {
         use crate::pva_gateway::{ChannelCache, GatewayChannelSource};
+        use epics_base_rs::runtime::task::Period;
         use epics_pva_rs::client::PvaClient;
         use epics_pva_rs::server_native::source::ChannelInvalidator;
         use std::time::Duration;
@@ -2687,7 +2688,11 @@ mod tests {
         // so the handle has to survive three wrappers in the longest one.
         for read_only in [false, true] {
             let client = Arc::new(PvaClient::builder().build());
-            let cache = ChannelCache::new(crate::test_reactor(), client, Duration::from_secs(60));
+            let cache = ChannelCache::new(
+                crate::test_reactor(),
+                client,
+                Period::new(Duration::from_secs(60)).unwrap(),
+            );
             let gw = GatewayChannelSource::new(cache.clone());
             let layered: DynSource = layer_access_control(
                 gw.clone(),

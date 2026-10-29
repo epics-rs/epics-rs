@@ -73,11 +73,11 @@ does not want one does not compile it:
 - **Server hardening** — a structured audit log, per-client rate limiting with
   strikes, signed beacons, an introspection HTTP endpoint, and a drain grace
   period for shutdown.
-- **`calink`** — the network half of CA record links (`ca://<pv>` or a
-  ` CA` modifier) to a PV the IOC's own database does not serve; a local
-  name is answered in process by `epics-base-rs`, as C dbCa does. This is
-  what the `client-core` feature exists for: an RTEMS build takes the client
-  a record link needs without the UDP discovery stack.
+- **`calink`** — the network half of CA record links, to a PV the IOC's
+  own database does not serve; a local name is answered in process by
+  `epics-base-rs`, as C dbCa does. This is what the `client-core` feature
+  exists for: an RTEMS build takes the client a record link needs without
+  the UDP discovery stack.
 
 ### CLI Tools
 - **caget-rs** — read PV value (single shot)
@@ -98,7 +98,7 @@ does not want one does not compile it:
 | feature | what it adds |
 |---|---|
 | `client` (default) | the full client: `client-core` plus the host-only UDP discovery stack — beacon monitor, repeater registration, `discovery`, reverse-DNS peer names |
-| `client-core` | the client a record link needs and nothing else — search, virtual circuit, subscriptions, the `ca://` resolver. The configuration an RTEMS target builds |
+| `client-core` | the client a record link needs and nothing else — search, virtual circuit, subscriptions, the CA link resolver. The configuration an RTEMS target builds |
 | `discovery` | mDNS + DNS-SD announcement and lookup |
 | `discovery-dns-update` | RFC 2136 dynamic DNS registration, TSIG-signed |
 | `experimental-rust-tls` | CA over TLS (not an EPICS protocol feature) |

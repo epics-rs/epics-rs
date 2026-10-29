@@ -2821,7 +2821,7 @@ variable(seqDLYprecision,int)
     fn a_hardware_links_type_word_is_its_bus() {
         let word = |text: &str| {
             crate::server::record::parse_link_field(text, crate::server::record::LinkFieldType::In)
-                .link_type_after_init(text, crate::server::record::LinkFieldType::In)
+                .link_type_after_init()
                 .c_name()
         };
 

@@ -1301,15 +1301,15 @@ impl CaServer {
         // available, but the inner Arc-shared state already implements
         // the necessary handle semantics.
         let _hag_refresh_handle = {
-            let secs = epics_base_rs::runtime::env::get_lossy("EPICS_RS_HAG_DNS_REFRESH_SECS")
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(0);
+            let period = epics_base_rs::runtime::env::get_lossy("EPICS_RS_HAG_DNS_REFRESH_SECS")
+                .and_then(|s| s.parse().ok())
+                .map(epics_base_rs::runtime::task::Period::from_secs);
             let path = self.acf_source_path();
-            if let (true, Some(path)) = (secs > 0, path) {
+            if let (Some(period), Some(path)) = (period, path) {
                 let acf = self.acf.clone();
                 let reload_tx = self.acf_reload_tx.clone();
                 Some(reactor.spawn(async move {
-                    let mut tick = tokio::time::interval(std::time::Duration::from_secs(secs));
+                    let mut tick = epics_base_rs::runtime::task::interval(period);
                     tick.tick().await; // skip immediate fire
                     loop {
                         tick.tick().await;

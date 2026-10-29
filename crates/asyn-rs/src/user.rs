@@ -1,13 +1,13 @@
 use std::any::Any;
 use std::time::{Duration, SystemTime};
 
+use epics_libcom_rs::runtime::sync::event_wait_timeout;
+
 use crate::port::QueuePriority;
 
 /// The timeout every C asyn entry point supplies when the operator gives none:
 /// `parseLink` writes `pasynUser->timeout = 1.0` for an `@asyn(port)` or
-/// `@asyn(port,addr)` link (asynEpicsUtils.c:109,121), and it is also the
-/// bounded value [`timeout_from_secs`] substitutes for a timeout that
-/// [`AsynUser::timeout`] cannot represent.
+/// `@asyn(port,addr)` link (asynEpicsUtils.c:109,121).
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// The single owner of every `f64 seconds` → [`AsynUser::timeout`] conversion.
@@ -22,18 +22,18 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(1);
 /// record told to wait forever timed out after a second and raised an alarm C
 /// never raises.
 ///
-/// The values that remain unrepresentable are the ones C has no defined
-/// behaviour for either — NaN, infinity, and a magnitude beyond `Duration` —
-/// and those still take the bounded [`DEFAULT_TIMEOUT`]. Callers must not
-/// construct a `Duration` from an operator-supplied `f64` themselves:
-/// `Duration::from_secs_f64` *panics* on exactly the inputs C accepts, so
-/// routing the conversion through this function is what makes the panic
-/// structurally impossible rather than merely unobserved.
+/// A positive value is clamped as C's `epicsEventWaitWithTimeout` clamps it
+/// ([`event_wait_timeout`]): past ten years, infinity included, it is ten
+/// years, so every deadline built from it is a representable `Instant`. NaN
+/// fails the serial driver's `> 0` and `== 0` tests alike and so waits forever
+/// (drvAsynSerialPort.c:812, :895-909, :946); so does any other value below 0.
+///
+/// Callers must not construct a `Duration` from an operator-supplied `f64`
+/// themselves: `Duration::from_secs_f64` *panics* on exactly the inputs C
+/// accepts, so routing the conversion through this function is what makes the
+/// panic structurally impossible rather than merely unobserved.
 pub fn timeout_from_secs(secs: f64) -> Option<Duration> {
-    if secs.is_finite() && secs < 0.0 {
-        return None;
-    }
-    Some(Duration::try_from_secs_f64(secs).unwrap_or(DEFAULT_TIMEOUT))
+    (secs >= 0.0).then(|| event_wait_timeout(secs))
 }
 
 /// C `ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED` (asynDriver.h:105, aliasing
@@ -460,6 +460,27 @@ mod tests {
         // whenever `pdevice` is NULL (:2006-2010).
         assert_eq!(u.addr, -1);
         assert_eq!(u.timeout, Some(Duration::from_secs(1)));
+    }
+
+    /// C's event wait caps a timeout at ten years, so the one it yields is a
+    /// deadline `Instant` can hold; anything not `>= 0`, NaN included, waits
+    /// forever.
+    #[test]
+    fn timeout_from_secs_clamps_as_cs_event_wait() {
+        let ten_years = Duration::from_secs(60 * 60 * 24 * 36525 / 10);
+        for (secs, want) in [
+            (1.5, Some(Duration::from_millis(1500))),
+            (0.0, Some(Duration::ZERO)),
+            (-1.0, None),
+            (f64::NEG_INFINITY, None),
+            (-0.0, Some(Duration::ZERO)),
+            (f64::NAN, None),
+            (f64::INFINITY, Some(ten_years)),
+            (1e19, Some(ten_years)),
+            (1e300, Some(ten_years)),
+        ] {
+            assert_eq!(timeout_from_secs(secs), want, "{secs}");
+        }
     }
 
     #[test]

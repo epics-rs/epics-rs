@@ -19,7 +19,7 @@
 //!     the simulated output back to 0.
 
 use epics_base_rs::server::database::PvDatabase;
-use epics_base_rs::server::record::DelayedCallbackOutcome;
+use epics_base_rs::server::record::{DelayedCallback, DelayedCallbackOutcome};
 use epics_base_rs::server::records::ao::AoRecord;
 use epics_base_rs::server::records::bo::BoRecord;
 use epics_base_rs::types::EpicsValue;
@@ -119,7 +119,8 @@ async fn sim_output_runs_bo_high_momentary_reset_in_sim_mode() {
         let rec = db.get_record("BOHI").unwrap();
         let mut inst = rec.write();
         assert_eq!(
-            inst.record.delayed_callback_fire(false),
+            inst.record
+                .delayed_callback_fire(DelayedCallback::ONLY, false),
             DelayedCallbackOutcome::Reprocess,
             "the arming cycle left a HIGH one-shot for the timer to release"
         );

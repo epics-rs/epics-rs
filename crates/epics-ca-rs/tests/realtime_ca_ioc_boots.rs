@@ -389,13 +389,13 @@ mod exec_model {
         let dir = tempfile::tempdir().expect("temp dir");
         let db = dir.path().join("calink.db");
         // Both link spellings the resolver owns: the ` CA` modifier and the
-        // `ca://` scheme. Each one makes the record a client of a server this
+        // CA scheme. Each one makes the record a client of a server this
         // IOC has to search for, which is what drives the search engine and
         // the dial.
         std::fs::write(
             &db,
             "record(ai, \"LOCAL:AI\") { field(INP, \"UPSTREAM:AI CP\") }\n\
-             record(ai, \"LOCAL:AI2\") { field(INP, \"ca://UPSTREAM:AI CP\") }\n",
+             record(ai, \"LOCAL:AI2\") { field(INP, \"UPSTREAM:AI CP\") }\n",
         )
         .expect("write the db");
 

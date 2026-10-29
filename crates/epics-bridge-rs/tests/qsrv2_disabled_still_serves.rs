@@ -11,7 +11,6 @@
 
 use std::io::Write;
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
 
 const CHILD: &str = "QSRV2_OFF_CHILD_STCMD";
 
@@ -54,13 +53,9 @@ record(ai, "LNK") { field(INP, {pva:"XA"}) field(SCAN, "1 second") }
     )
     .unwrap();
     // The link reaches the IOC's own server by name server, so its TCP port
-    // is fixed.
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-        .to_string();
+    // is fixed, and held until the IOC is gone.
+    let held = named_port::HeldPort::tcp();
+    let port = held.port.to_string();
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args(["ioc_child", "--exact", "--nocapture"])
         .env(CHILD, &stcmd)
@@ -82,19 +77,19 @@ record(ai, "LNK") { field(INP, {pva:"XA"}) field(SCAN, "1 second") }
     let mut stdin = child.stdin.take().unwrap();
     let _ = stdin.write_all(input);
     drop(stdin);
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while child.try_wait().unwrap().is_none() {
-        if Instant::now() > deadline {
-            let _ = child.kill();
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    // The shell exits at `exit` or EOF; a clock would cut a slow one short.
     let out = child.wait_with_output().unwrap();
-    (
+    let (stdout, stderr) = (
         String::from_utf8_lossy(&out.stdout).into_owned(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
-    )
+    );
+    // The gated commands register at iocInit's link-set install and in the
+    // protocol runner, so their absence means nothing unless both ran.
+    assert!(
+        out.status.success() && stderr.contains("iocRun: All initialization complete\n"),
+        "the IOC never served\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    (stdout, stderr)
 }
 
 /// softIocPVX 1.5.3 with `PVXS_QSRV_ENABLE=NO` on the same db, `pvxsr 1`.

@@ -25,7 +25,7 @@ use parking_lot::Mutex;
 use tokio::sync::RwLock;
 use tokio::sync::mpsc;
 
-use epics_base_rs::runtime::task::Reactor;
+use epics_base_rs::runtime::task::{Period, Reactor};
 use epics_base_rs::server::access_security::AccessSecurityConfig;
 // `AccessLevel` is referenced only by the `#[cfg(test)]` `acl_level`
 // introspection helper, so the import is gated to match.
@@ -301,7 +301,7 @@ pub struct GatewayChannelSource {
     /// configured bound (`p2pApp/server.h:9-16`), so `max_cache_entries`
     /// is a per-cache cap here too — matching that one-cache-per-client
     /// model rather than a single global ceiling.
-    pub cleanup_interval: Duration,
+    pub cleanup_interval: Period,
     /// Per-credential-cache entry ceiling — see [`Self::cleanup_interval`].
     pub per_credential_max_entries: usize,
     /// Bridge subscriber-side mpsc capacity. Each downstream subscriber
@@ -1747,7 +1747,11 @@ mod tests {
 
     fn make_source() -> GatewayChannelSource {
         let client = Arc::new(PvaClient::builder().build());
-        let cache = ChannelCache::new(crate::test_reactor(), client, Duration::from_secs(60));
+        let cache = ChannelCache::new(
+            crate::test_reactor(),
+            client,
+            Period::new(Duration::from_secs(60)).unwrap(),
+        );
         GatewayChannelSource::new(cache)
     }
 

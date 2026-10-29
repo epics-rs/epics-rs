@@ -140,6 +140,10 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ),
     (
         "epics-bridge-rs",
+        "tests/a_compress_pva_inp_of_an_empty_array_keeps_its_ring.rs",
+    ),
+    (
+        "epics-bridge-rs",
         "tests/connected_pva_link_lset_calls_allocate_nothing.rs",
     ),
     (
@@ -184,13 +188,26 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ("epics-bridge-rs", "tests/qsrv_rs_resolves_a_ca_link.rs"),
     ("epics-bridge-rs", "tests/qsrv_ts_filter_probe.rs"),
     ("epics-bridge-rs", "tests/tpro_names_the_pva_client.rs"),
+    ("epics-ca-rs", "src/client/mod.rs"),
     ("epics-ca-rs", "src/client/sync_group.rs"),
     ("epics-ca-rs", "src/client/transport.rs"),
     ("epics-ca-rs", "src/server/ca_server.rs"),
     ("epics-ca-rs", "src/server/tcp.rs"),
     (
         "epics-ca-rs",
+        "tests/a_ca_link_waits_on_its_put_callback.rs",
+    ),
+    (
+        "epics-ca-rs",
         "tests/a_loopback_interface_binds_two_responder_sockets.rs",
+    ),
+    (
+        "epics-ca-rs",
+        "tests/a_network_ca_inp_count_allocates_nothing.rs",
+    ),
+    (
+        "epics-ca-rs",
+        "tests/a_network_ca_link_shape_is_set_at_connect.rs",
     ),
     (
         "epics-ca-rs",
@@ -219,9 +236,11 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ("epics-ca-rs", "tests/ca_client_context_channels.rs"),
     ("epics-ca-rs", "tests/ca_filter_pre_post.rs"),
     ("epics-ca-rs", "tests/ca_out_link_write_access_gate.rs"),
+    ("epics-ca-rs", "tests/ca_ts_filter_get_time.rs"),
     ("epics-ca-rs", "tests/ca_ts_filter_probe.rs"),
     ("epics-ca-rs", "tests/caget_dbr_type.rs"),
     ("epics-ca-rs", "tests/calink_enum_ctrl_attributes.rs"),
+    ("epics-ca-rs", "tests/calink_enum_string_monitor.rs"),
     (
         "epics-ca-rs",
         "tests/calink_out_put_clamps_to_element_count.rs",
@@ -367,8 +386,10 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ("regression-ioc", "tests/smoke.rs"),
     ("scaler-rs", "tests/cnt_abort_cancels_delayed_start.rs"),
     ("scaler-rs", "tests/integration_tests.rs"),
+    ("seq-validate", "tests/validate.rs"),
     ("std-rs", "tests/e2e_tests.rs"),
     ("std-rs", "tests/epid_dtyp_put_keeps_the_init_dset.rs"),
+    ("std-rs", "tests/epid_empty_inp_is_constant.rs"),
     ("std-rs", "tests/integration_tests.rs"),
     ("std-rs", "tests/snl_runners_drive_the_db.rs"),
     ("std-rs", "tests/timestamp_monitor_gate.rs"),

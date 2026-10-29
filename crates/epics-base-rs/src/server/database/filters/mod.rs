@@ -116,11 +116,12 @@ pub trait SubscriptionFilter: Send + Sync + 'static {
         input
     }
 
-    /// The field type this filter emits for an `input`-typed log, as its
-    /// `channelRegisterPost` sets `probe->field_type` (C
-    /// `dbChannelFinalFieldType`). Only `ts`'s value modes change it.
-    fn final_field_type(&self, input: crate::types::DbFieldType) -> crate::types::DbFieldType {
-        input
+    /// The field type of the log this filter puts in place of its input's,
+    /// as its `channelRegisterPost` sets `probe->field_type` (C
+    /// `dbChannelFinalFieldType`); `None` where the log keeps its input's
+    /// type. Only `ts`'s value modes replace it.
+    fn log_type(&self) -> Option<crate::types::DbFieldType> {
+        None
     }
 
     /// C's `channelRegisterPost` stage: the filter runs on the log the
@@ -208,12 +209,16 @@ impl FilterChain {
     }
 
     /// Final field type this chain produces for a `native`-typed field (C
-    /// `dbChannelFinalFieldType`), folded like
-    /// [`final_element_count`](Self::final_element_count).
+    /// `dbChannelFinalFieldType`).
     pub fn final_field_type(&self, native: crate::types::DbFieldType) -> crate::types::DbFieldType {
-        self.filters
-            .iter()
-            .fold(native, |t, f| f.final_field_type(t))
+        self.log_type().unwrap_or(native)
+    }
+
+    /// The type of the log the last replacing filter left, `None` where
+    /// every filter keeps the field's own
+    /// ([`SubscriptionFilter::log_type`]).
+    pub fn log_type(&self) -> Option<crate::types::DbFieldType> {
+        self.filters.iter().rev().find_map(|f| f.log_type())
     }
 
     /// The chain as C's `dbChannel` runs it, whatever the JSON order: the
@@ -229,126 +234,51 @@ impl FilterChain {
         self.filters.iter().map(|f| &**f)
     }
 
-    /// Apply the chain to a single value wrapped in a synthetic
-    /// [`FilteredMonitorEvent`], then return the (possibly transformed)
-    /// value. `None` means a filter dropped the synthetic event.
-    /// `read_context` selects the C field-log context: `true` =>
-    /// `dbfl_context_read` (one-shot DB read — `dec`/`sync`
-    /// short-circuit), `false` => `dbfl_context_event` (monitor
-    /// single-event post — `dec`/`sync` state machines run). This is the
-    /// single owner shared by [`apply_to_read_value`](Self::apply_to_read_value)
-    /// and [`apply_to_event_value`](Self::apply_to_event_value).
-    ///
-    /// `mask` is the log's `pLog->mask`, which the two contexts fill
-    /// differently and which three filters branch on: `sync.c:98`,
-    /// `decimate.c:64` and `utag.c:53` pass an event carrying
-    /// `DBE_PROPERTY` straight through, and `dbnd.c:83-85` seeds `send`
-    /// from `mask & ~(DBE_VALUE|DBE_LOG)` and hands
-    /// `mask & (DBE_VALUE|DBE_LOG)` to `recGblCheckDeadband` as the bits
-    /// to add. Both were previously handed a hardcoded `DBE_VALUE`.
-    fn apply_single_value(
+    /// The chain run on `log`, made by C `db_create_read_log`
+    /// (`dbEvent.c:760-770`): read context (`dbfl_context_read`), so
+    /// `dec`/`sync` short-circuit, and the log's alarm, time and tag are
+    /// the record's (`db_create_field_log`, `:704-713`), which is what a
+    /// `ts` value mode reads. The log is the `freeListCalloc`'d one with
+    /// only `ctx` set (`:702`), so a filter sees a mask of ZERO — which is
+    /// why `dbnd` drops every read it is given (`send` starts at
+    /// `0 & ~(DBE_VALUE|DBE_LOG)` and `recGblCheckDeadband` adds no bits).
+    /// `None` is a dropped read, which a caller answers with the unfiltered
+    /// field (`dbDbLink.c:206-219`).
+    fn run_read(&self, log: MonitorEvent) -> Option<MonitorEvent> {
+        self.apply(FilteredMonitorEvent::new_read(log))
+            .map(|filtered| filtered.event)
+    }
+
+    /// The chain run on `snap`, a read of the field: the read log `dbGet`
+    /// takes value, time and options from (`dbChannelGet`), written back
+    /// over `snap` with its options narrowed to the log's type.
+    pub fn apply_to_read_snapshot(
         &self,
+        mut snap: crate::server::snapshot::Snapshot,
+    ) -> Option<crate::server::snapshot::Snapshot> {
+        if self.filters.is_empty() {
+            return Some(snap);
+        }
+        self.run_read(MonitorEvent::read_log(&mut snap, EventMask::NONE))?
+            .write_log_over(&mut snap);
+        Some(snap)
+    }
+
+    /// The chain run on `value`, read from a record whose log head is
+    /// `head`, for a reader that takes only the value off the log: a DB
+    /// link's `dbDbGetValue` (`dbDbLink.c:206-219`), a group member's plain
+    /// read.
+    pub fn apply_to_read_log(
+        &self,
+        head: crate::server::pv::LogHead,
         value: crate::types::EpicsValue,
-        read_context: bool,
-        mask: EventMask,
     ) -> Option<crate::types::EpicsValue> {
         if self.filters.is_empty() {
             return Some(value);
         }
-        let snap =
-            crate::server::snapshot::Snapshot::new(value, 0, 0, crate::types::WallTime::now());
-        self.apply_single(snap, read_context, mask)
-            .map(|snap| snap.value)
-    }
-
-    /// [`Self::apply_single_value`] on a whole snapshot, whose timestamp a
-    /// `ts` value mode reads: the chain runs on a log of the read and is
-    /// written back over it, narrowing its options to the log's type.
-    fn apply_single(
-        &self,
-        mut snap: crate::server::snapshot::Snapshot,
-        read_context: bool,
-        mask: EventMask,
-    ) -> Option<crate::server::snapshot::Snapshot> {
-        use crate::server::pv::MonitorEvent;
-        if self.filters.is_empty() {
-            return Some(snap);
-        }
-        let log = MonitorEvent::read_log(&mut snap, mask);
-        let wrapped = if read_context {
-            FilteredMonitorEvent::new_read(log)
-        } else {
-            FilteredMonitorEvent::new(log)
-        };
-        self.apply(wrapped)?.event.write_log_over(&mut snap);
-        Some(snap)
-    }
-
-    /// [`Self::apply_to_read_value`] on the field's snapshot, the read log
-    /// `dbGet` takes its value, time and options from.
-    pub fn apply_to_read_snapshot(
-        &self,
-        snap: crate::server::snapshot::Snapshot,
-    ) -> Option<crate::server::snapshot::Snapshot> {
-        self.apply_single(snap, true, EventMask::NONE)
-    }
-
-    /// epics-base PR `17a8dbc` parity: apply the filter chain to a
-    /// single one-shot read (DB link `dbDbGetValue` path / CA
-    /// `READ`/`READ_NOTIFY`). Read context (C `dbfl_context_read`).
-    ///
-    /// Stream-only filters (`dbnd`, `dec`, `sync`) do NOT make sense
-    /// in a single-read context — `dbnd` would always pass on the
-    /// first call (no prior value), `dec` would emit every Nth call
-    /// from a continuous counter, and `sync` would be governed by a
-    /// state never observed in single-read flow. Only `arr` (array
-    /// slicing) and `ts` (timestamp tagging) have meaningful single-
-    /// read semantics. Operators are responsible for using filters
-    /// that match their intent — the framework executes whatever
-    /// chain is configured.
-    ///
-    /// `db_create_read_log` sets only `ctx` on the `freeListCalloc`'d log
-    /// (`dbEvent.c:760-770`, `:702`), so a read-context filter sees a mask
-    /// of ZERO — which is why `dbnd` drops every read it is given
-    /// (`send` starts at `0 & ~(DBE_VALUE|DBE_LOG)` and
-    /// `recGblCheckDeadband` adds no bits) and the caller falls back to
-    /// the unfiltered field.
-    pub fn apply_to_read_value(
-        &self,
-        value: crate::types::EpicsValue,
-    ) -> Option<crate::types::EpicsValue> {
-        self.apply_single_value(value, true, EventMask::NONE)
-    }
-
-    /// epics-base parity for a CA monitor single-event post
-    /// (`db_post_single_event`, `rsrv/camessage.c:1117-1122`,
-    /// `1851-1853`): the initial monitor event and access-rights
-    /// transition events are queued via `db_create_event_log`
-    /// (`dbEvent.c:746-754`, `dbfl_context_event`) then run through
-    /// `dbChannelRunPreChain`, and `db_queue_event_log` fires only when
-    /// the filtered log is non-null (`dbEvent.c:922-924`).
-    ///
-    /// Event context (the opposite of [`apply_to_read_value`](Self::apply_to_read_value)):
-    /// `dec`/`sync` state machines DO run, so an initial or
-    /// access-transition post is decimated or gated exactly like a
-    /// natural update. `None` means the chain dropped the post — the
-    /// caller MUST send no frame (matching `if(pLog)` in C), never fall
-    /// back to the unfiltered value.
-    ///
-    /// `select` is the SUBSCRIBER's own `DBE_*` mask, not `DBE_VALUE`:
-    /// `db_create_event_log` seeds `pLog->mask = pevent->select`
-    /// (`dbEvent.c:750`) and `db_post_single_event` runs the pre-chain
-    /// over that log without narrowing it (`:914-927`) — unlike
-    /// `db_post_events`, which overwrites the mask with
-    /// `caEventMask & pevent->select` (`:900`). So a `camonitor -m p`
-    /// subscriber's initial post carries `DBE_PROPERTY` and passes the
-    /// `sync` / `dec` / `utag` gates that a `DBE_VALUE` post does not.
-    pub fn apply_to_event_value(
-        &self,
-        value: crate::types::EpicsValue,
-        select: EventMask,
-    ) -> Option<crate::types::EpicsValue> {
-        self.apply_single_value(value, false, select)
+        // A read log holds its value, so `None` here is only a drop.
+        self.run_read(MonitorEvent::read_of(head, value, EventMask::NONE))?
+            .into_value()
     }
 }
 
@@ -405,6 +335,29 @@ mod tests {
         fn apply(&self, _e: FilteredMonitorEvent) -> Option<FilteredMonitorEvent> {
             None
         }
+    }
+
+    /// The chain run on a read log of `value`, whose head is a read's.
+    fn read_value(chain: &FilterChain, value: EpicsValue) -> Option<EpicsValue> {
+        chain
+            .apply_to_read_snapshot(Snapshot::new(value, 0, 0, SystemTime::UNIX_EPOCH))
+            .map(|read| read.value)
+    }
+
+    /// The chain run on `value` posted as a single event to a subscriber
+    /// selecting `select` (`db_create_event_log`, `dbEvent.c:746-754`).
+    fn event_value(
+        chain: &FilterChain,
+        value: EpicsValue,
+        select: EventMask,
+    ) -> Option<EpicsValue> {
+        let mut post = Snapshot::new(value, 0, 0, SystemTime::UNIX_EPOCH);
+        chain
+            .apply(FilteredMonitorEvent::new(MonitorEvent::read_log(
+                &mut post, select,
+            )))?
+            .event
+            .into_value()
     }
 
     fn make_event(v: f64) -> FilteredMonitorEvent {
@@ -489,9 +442,9 @@ mod tests {
     /// EVENT-context single-event post (C `db_post_single_event` runs
     /// the pre-chain in `dbfl_context_event`) but is bypassed by the
     /// READ context (C `dbfl_context_read`). Same chain, opposite
-    /// outcome — proving `apply_to_event_value` uses event context.
+    /// outcome — proving the event log runs in event context.
     #[test]
-    fn apply_to_event_value_decimates_while_read_value_bypasses() {
+    fn event_value_decimates_while_read_value_bypasses() {
         use super::parse_filter_chain;
         let value = EpicsValue::Double(7.0);
         // Read context: `dec` short-circuits → value passes unchanged, and
@@ -500,7 +453,7 @@ mod tests {
         for _ in 0..3 {
             assert!(
                 matches!(
-                    read_chain.apply_to_read_value(value.clone()),
+                    read_value(&read_chain, value.clone()),
                     Some(EpicsValue::Double(v)) if v == 7.0
                 ),
                 "read context bypasses the decimator"
@@ -510,15 +463,11 @@ mod tests {
         // 2-window is dropped.
         let event_chain = parse_filter_chain(r#"{"dec":{"n":2}}"#);
         assert!(
-            event_chain
-                .apply_to_event_value(value.clone(), EventMask::VALUE)
-                .is_some(),
+            event_value(&event_chain, value.clone(), EventMask::VALUE).is_some(),
             "first single-event post is the head of the window"
         );
         assert!(
-            event_chain
-                .apply_to_event_value(value, EventMask::VALUE)
-                .is_none(),
+            event_value(&event_chain, value, EventMask::VALUE).is_none(),
             "event context decimates the second single-event post"
         );
     }
@@ -528,7 +477,7 @@ mod tests {
     /// false`), so the initial monitor snapshot is suppressed — while
     /// the same chain passes a one-shot READ unchanged.
     #[test]
-    fn apply_to_event_value_suppresses_sync_while_read_value_passes() {
+    fn event_value_suppresses_sync_while_read_value_passes() {
         use super::parse_filter_chain;
         let value = EpicsValue::Double(1.0);
         // `sync.c`'s `parse_ok` resolves the state with `dbStateFind`, so it
@@ -536,14 +485,12 @@ mod tests {
         super::db_state_registry().get_or_create("BFR7:GATE");
         let read_chain = parse_filter_chain(r#"{"sync":{"while":"BFR7:GATE"}}"#);
         assert!(
-            read_chain.apply_to_read_value(value.clone()).is_some(),
+            read_value(&read_chain, value.clone()).is_some(),
             "read context bypasses the sync gate"
         );
         let event_chain = parse_filter_chain(r#"{"sync":{"while":"BFR7:GATE"}}"#);
         assert!(
-            event_chain
-                .apply_to_event_value(value, EventMask::VALUE)
-                .is_none(),
+            event_value(&event_chain, value, EventMask::VALUE).is_none(),
             "event context gates the initial post on a cleared state"
         );
     }
@@ -563,9 +510,12 @@ mod tests {
         let cfg = r#"{"sync":{"while":"BFR7:MASK"}}"#;
         // The state is clear, so a VALUE-only subscriber is gated …
         assert!(
-            parse_filter_chain(cfg)
-                .apply_to_event_value(EpicsValue::Double(1.0), EventMask::VALUE)
-                .is_none(),
+            event_value(
+                &parse_filter_chain(cfg),
+                EpicsValue::Double(1.0),
+                EventMask::VALUE
+            )
+            .is_none(),
             "a DBE_VALUE post is gated by `while` on a cleared state"
         );
         // … while a subscriber that selected DBE_PROPERTY is not.
@@ -575,9 +525,7 @@ mod tests {
             EventMask::VALUE | EventMask::LOG | EventMask::ALARM | EventMask::PROPERTY,
         ] {
             assert!(
-                parse_filter_chain(cfg)
-                    .apply_to_event_value(EpicsValue::Double(1.0), select)
-                    .is_some(),
+                event_value(&parse_filter_chain(cfg), EpicsValue::Double(1.0), select).is_some(),
                 "a select carrying DBE_PROPERTY bypasses the sync gate"
             );
         }
@@ -585,24 +533,25 @@ mod tests {
         // post is not consumed by the decimator either.
         let dec = r#"{"dec":{"n":3}}"#;
         assert!(
-            parse_filter_chain(dec)
-                .apply_to_event_value(EpicsValue::Double(1.0), EventMask::PROPERTY)
-                .is_some()
+            event_value(
+                &parse_filter_chain(dec),
+                EpicsValue::Double(1.0),
+                EventMask::PROPERTY
+            )
+            .is_some()
         );
     }
 
     /// Doc test #2: when a filter drops the single-event post,
-    /// `apply_to_event_value` returns `None` — there is NO fallback to
+    /// the chain returns `None` — there is NO fallback to
     /// the unfiltered value (the CA call sites translate `None` into
     /// "send no frame").
     #[test]
-    fn apply_to_event_value_drop_yields_none_no_fallback() {
+    fn event_value_drop_yields_none_no_fallback() {
         let mut chain = FilterChain::new();
         chain.push(Arc::new(DropAll));
         assert!(
-            chain
-                .apply_to_event_value(EpicsValue::Double(42.0), EventMask::VALUE)
-                .is_none(),
+            event_value(&chain, EpicsValue::Double(42.0), EventMask::VALUE).is_none(),
             "a dropped post yields None, not the unfiltered value"
         );
     }
@@ -611,14 +560,14 @@ mod tests {
     /// initial post is sent with the unmodified value (matching a CA
     /// channel that carried no `.{...}` filter suffix).
     #[test]
-    fn apply_to_event_and_read_value_empty_chain_identity() {
+    fn event_and_read_value_empty_chain_identity() {
         let chain = FilterChain::new();
         assert!(matches!(
-            chain.apply_to_event_value(EpicsValue::Double(3.0), EventMask::VALUE),
+            event_value(&chain, EpicsValue::Double(3.0), EventMask::VALUE),
             Some(EpicsValue::Double(v)) if v == 3.0
         ));
         assert!(matches!(
-            chain.apply_to_read_value(EpicsValue::Double(3.0)),
+            read_value(&chain, EpicsValue::Double(3.0)),
             Some(EpicsValue::Double(v)) if v == 3.0
         ));
     }
@@ -627,15 +576,15 @@ mod tests {
     /// EVENT-context initial post still applies the array transform
     /// (only `dec`/`sync` distinguish read vs event context).
     #[test]
-    fn apply_to_event_value_arr_slice_still_applies() {
+    fn event_value_arr_slice_still_applies() {
         use super::parse_filter_chain;
         let chain = parse_filter_chain(r#"{"arr":{"s":1,"e":2}}"#);
-        let out = chain
-            .apply_to_event_value(
-                EpicsValue::DoubleArray(vec![10.0, 20.0, 30.0, 40.0].into()),
-                EventMask::VALUE,
-            )
-            .expect("arr passes the event through");
+        let out = event_value(
+            &chain,
+            EpicsValue::DoubleArray(vec![10.0, 20.0, 30.0, 40.0].into()),
+            EventMask::VALUE,
+        )
+        .expect("arr passes the event through");
         assert!(
             matches!(out, EpicsValue::DoubleArray(v) if v == vec![20.0, 30.0]),
             "arr slices [s=1,e=2] in event context too"

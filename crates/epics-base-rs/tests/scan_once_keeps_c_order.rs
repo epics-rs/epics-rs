@@ -32,7 +32,8 @@ async fn back_to_back_scan_once_of_async_records_keeps_request_order() {
             .map(|i| db.get_pv(format!("R{i}")).unwrap().to_f64().unwrap())
             .collect()
     };
-    for _ in 0..500 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if db.get_pv("SEQ").unwrap().to_f64().unwrap() == N as f64 {
             break;
         }

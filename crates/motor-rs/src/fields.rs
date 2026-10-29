@@ -1,4 +1,7 @@
+use std::collections::VecDeque;
+
 use asyn_rs::interfaces::motor::PostMessage;
+use epics_base_rs::server::device_support::DevicePost;
 use epics_base_rs::types::PvString;
 
 use crate::flags::*;
@@ -514,6 +517,10 @@ pub struct InternalFields {
     /// The literal `DBE_VAL_LOG` posts `special()` makes itself, drained
     /// by the put that ran it ([`m`]'s `PUT_*` bits).
     pub put_posted: u64,
+    /// The posts a put's `special()` made with the value C's call copied:
+    /// `motor_end_trans_com`'s DMOV, one per transaction, drained by the
+    /// put after its marks.
+    pub put_post_values: VecDeque<DevicePost>,
     pub lspg: SpmgMode,
     /// C `pmr->sync` — latched SYNC request. Set by a nonzero SYNC put,
     /// consumed by `apply_latent_sync` only when the record is idle under

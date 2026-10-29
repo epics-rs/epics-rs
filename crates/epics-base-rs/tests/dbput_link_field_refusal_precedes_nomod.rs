@@ -131,7 +131,8 @@ record(seq, "SQ") {
             .unwrap();
         // seq writes its links from a callback, after the put returns.
         let mut said = heard();
-        for _ in 0..100 {
+        let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+        while std::time::Instant::now() < deadline {
             if said.len() >= 2 {
                 break;
             }

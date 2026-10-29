@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use epics_base_rs::runtime::task::sleep;
 
 use epics_base_rs::server::autosave::AutosaveStartupConfig;
-use epics_base_rs::server::ioc_app::IocApplication;
+use epics_base_rs::server::ioc_app::{IocApplication, RunOutcome};
 use epics_base_rs::types::EpicsValue;
 
 const RESTORE_CHILD: &str = "AUTOSAVE_LONG_STRING_RESTORE_SCRIPT";
@@ -55,15 +55,15 @@ async fn child_restore() {
     let Some(script) = std::env::var_os(RESTORE_CHILD) else {
         return;
     };
-    IocApplication::new()
+    let outcome = IocApplication::new()
         .port(0)
         .autosave_startup(Arc::new(Mutex::new(AutosaveStartupConfig::new())))
         .startup_script(script.to_str().unwrap())
-        .run(|config| async move {
+        .run_outcome(|config| async move {
             let db = config.db.clone();
             // iocInit returns, and a manual script reaches fdbrestore.
             epics_base_rs::server::db_server::announce_serving("probe");
-            let deadline = Instant::now() + Duration::from_secs(30);
+            let deadline = Instant::now() + fact_budget::FACT_BUDGET;
             while db.get_pv("LS2.LEN").unwrap().to_f64() != Some(200.0) {
                 assert!(Instant::now() < deadline, "LS2 never restored");
                 sleep(Duration::from_millis(20)).await;
@@ -94,6 +94,7 @@ async fn child_restore() {
         })
         .await
         .unwrap();
+    assert_eq!(outcome, RunOutcome::Served);
 }
 
 fn restore(before_init: &str, after_init: &str) -> std::process::Output {

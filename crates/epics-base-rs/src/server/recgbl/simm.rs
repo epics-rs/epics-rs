@@ -262,10 +262,7 @@ mod tests {
         assert!(is_constant(&removed));
         assert!(!has_const_lset(&removed));
         assert_eq!(removed.db_link_type(), DbLinkType::PvLink);
-        assert_eq!(
-            removed.link_type_after_init("MX NPP NMS", crate::server::record::LinkFieldType::In),
-            DbLinkType::PvLink
-        );
+        assert_eq!(removed.link_type_after_init(), DbLinkType::PvLink);
         for live in [ParsedLink::None, crate::server::record::parse_link_v2("5")] {
             assert!(is_constant(&live) && has_const_lset(&live), "{live:?}");
         }

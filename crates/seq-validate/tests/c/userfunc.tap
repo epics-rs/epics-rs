@@ -1,0 +1,21 @@
+1..20
+ok  1 - seqg_var->seqg_vars_myss.seqg_vars_doit.i_saved == seqg_var->i - 1
+ok  2 - seqg_var->i == 1
+ok  3 - seqg_var->seqg_vars_myss.seqg_vars_doit.i_saved == seqg_var->i - 1
+ok  4 - seqg_var->i == 1
+ok  5 - seqg_var->seqg_vars_myss.seqg_vars_doit.i_saved == seqg_var->i - 1
+ok  6 - seqg_var->i == 1
+ok  7 - seqg_var->seqg_vars_myss.seqg_vars_doit.i_saved == seqg_var->i - 1
+ok  8 - seqg_var->i == 1
+ok  9 - seqg_var->seqg_vars_myss.seqg_vars_doit.i_saved == seqg_var->i - 1
+ok 10 - seqg_var->i == 1
+ok 11 - seqg_var->seqg_vars_myss.seqg_vars_doit.i_saved == seqg_var->i - 1
+ok 12 - seqg_var->i == 1
+ok 13 - seqg_var->seqg_vars_myss.seqg_vars_doit.i_saved == seqg_var->i - 1
+ok 14 - seqg_var->i == 1
+ok 15 - seqg_var->seqg_vars_myss.seqg_vars_doit.i_saved == seqg_var->i - 1
+ok 16 - seqg_var->i == 1
+ok 17 - seqg_var->seqg_vars_myss.seqg_vars_doit.i_saved == seqg_var->i - 1
+ok 18 - seqg_var->i == 1
+ok 19 - seqg_var->seqg_vars_myss.seqg_vars_doit.i_saved == seqg_var->i - 1
+ok 20 - seqg_var->i == 1

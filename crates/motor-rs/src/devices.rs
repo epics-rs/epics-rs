@@ -67,8 +67,20 @@ pub const fn model1_device(dset: &'static str, choice: &'static str) -> DevSup {
 /// [`device_support_factory`] serve its DTYP. Called where the driver
 /// registers, not where a card is configured: the row is the dbd's.
 pub fn register_model1_device(row: &'static DevSup) {
+    register_model1(row, false);
+}
+
+/// [`register_model1_device`] for a dset whose init_record sets the
+/// record's NTM to NO before `motor_init_record_com`, so whether or not its
+/// card or signal exists (devPIE816.cc:126-131, devEMC18011.cc:127-129,
+/// devMDT695.cc:129).
+pub fn register_model1_device_disabling_ntm(row: &'static DevSup) {
+    register_model1(row, true);
+}
+
+fn register_model1(row: &'static DevSup, disables_ntm: bool) {
     epics_base_rs::server::record::register_device_row("motor", row);
-    lock(model1_choices()).insert(row.choice);
+    lock(model1_choices()).insert(row.choice, disables_ntm);
 }
 
 /// devMotorSim's `device(motor,VME_IO,devMotorSim,"Motor Simulation")`
@@ -347,8 +359,9 @@ fn interface_drivers() -> &'static Mutex<HashMap<&'static str, Open>> {
     DRIVERS.get_or_init(Default::default)
 }
 
-fn model1_choices() -> &'static Mutex<HashSet<&'static str>> {
-    static CHOICES: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+/// Each model-1 DTYP and whether its init_record disables NTM.
+fn model1_choices() -> &'static Mutex<HashMap<&'static str, bool>> {
+    static CHOICES: OnceLock<Mutex<HashMap<&'static str, bool>>> = OnceLock::new();
     CHOICES.get_or_init(Default::default)
 }
 
@@ -455,18 +468,21 @@ pub fn device_support_factory()
             return None;
         }
         let interface = lock(interface_choices()).get(ctx.dtyp).copied();
-        let (dtyp, bound) = if ctx.dtyp == DEV_MOTOR_ASYN.choice {
-            (DEV_MOTOR_ASYN.choice, bind_asyn(ctx.out))
+        let (dtyp, disables_ntm, bound) = if ctx.dtyp == DEV_MOTOR_ASYN.choice {
+            (DEV_MOTOR_ASYN.choice, false, bind_asyn(ctx.out))
         } else if let Some(device) = interface {
-            (device, bind_motor_interface(ctx.out))
+            (device, false, bind_motor_interface(ctx.out))
         } else {
-            let device = lock(model1_choices()).get(ctx.dtyp).copied()?;
-            (device, bind_model1(device, ctx.out))
+            let (device, disables_ntm) = lock(model1_choices())
+                .get_key_value(ctx.dtyp)
+                .map(|(&device, &disables_ntm)| (device, disables_ntm))?;
+            (device, disables_ntm, bind_model1(device, ctx.out))
         };
         Some(match bound {
-            Ok(axis) => Box::new(axis) as Box<dyn DeviceSupport>,
+            Ok(axis) => Box::new(axis.disabling_ntm(disables_ntm)) as Box<dyn DeviceSupport>,
             Err(failure) => Box::new(Unbound {
                 dtyp,
+                disables_ntm,
                 failure,
                 record: String::new(),
             }),
@@ -494,11 +510,9 @@ enum Failure {
         addr: i32,
         num_axes: i32,
     },
-    /// `motor_init_record_com`'s four refusals.
+    /// `motor_init_record_com`'s refusal of a non-VME_IO OUT; it keeps
+    /// the record of every other refusal.
     BadBus,
-    NoCard,
-    NoSignal,
-    InUse,
     /// devMotorSim's three refusals: OUT not VME_IO, no drvet by the parm's
     /// name, and the driver's `open` returning NULL.
     IllegalInp,
@@ -507,7 +521,8 @@ enum Failure {
 }
 
 /// Bind a record to the axis. An asyn axis serves every record that names
-/// it; a model-1 signal serves one (motordevCom.cc:244-247).
+/// it; a model-1 signal serves the first, and each later record on it is
+/// bound refused as in use (motordevCom.cc:244-247).
 fn take(controller: Controller, addr: i32) -> Result<MotorDeviceSupport, Taken> {
     let mut controllers = lock(controllers());
     let axes = controllers
@@ -515,7 +530,7 @@ fn take(controller: Controller, addr: i32) -> Result<MotorDeviceSupport, Taken> 
         .ok_or(Taken::NoController)?;
     let (axis, bound) = axes.get_mut(&addr).ok_or(Taken::NoAxis)?;
     if *bound && matches!(controller, Controller::Card { .. }) {
-        return Err(Taken::InUse);
+        return Ok(axis.attach_in_use());
     }
     *bound = true;
     Ok(axis.attach())
@@ -524,7 +539,6 @@ fn take(controller: Controller, addr: i32) -> Result<MotorDeviceSupport, Taken> 
 enum Taken {
     NoController,
     NoAxis,
-    InUse,
 }
 
 /// devMotorAsyn's binding: a live port reached at an axis it lacks still
@@ -560,7 +574,7 @@ fn bind_asyn(out: &str) -> Result<MotorDeviceSupport, Failure> {
                 addr,
             };
             take(Controller::Port(port), addr)
-                .or_else(|_| Ok(slot.attach(user, std::time::Duration::ZERO)))
+                .or_else(|_| Ok(slot.attach(user, std::time::Duration::ZERO, None)))
         }
         (PortDriver::DrvMotorAsyn, _) => {
             let user = TraceUser::Model2 {
@@ -582,15 +596,12 @@ fn bind_model1(device: &'static str, out: &str) -> Result<MotorDeviceSupport, Fa
     let ParsedLink::Hw(HwLink::VmeIo { card, signal, parm }) = parse_link_v2(out) else {
         return Err(Failure::BadBus);
     };
-    let card = i32::from(card);
-    let support =
-        take(Controller::Card { device, card }, i32::from(signal)).map_err(
-            |taken| match taken {
-                Taken::NoController => Failure::NoCard,
-                Taken::NoAxis => Failure::NoSignal,
-                Taken::InUse => Failure::InUse,
-            },
-        )?;
+    let (card, signal) = (i32::from(card), i32::from(signal));
+    let support = match take(Controller::Card { device, card }, signal) {
+        Ok(support) => support,
+        Err(Taken::NoController) => return Ok(MotorDeviceSupport::no_card(device, card, signal)),
+        Err(Taken::NoAxis) => return Ok(MotorDeviceSupport::no_signal(device, card, signal)),
+    };
     support.send_out_parm(parm);
     Ok(support)
 }
@@ -659,6 +670,7 @@ fn parse_link(out: &str) -> Result<(String, i32, Option<String>), &'static str> 
 /// and fails the same way.
 struct Unbound {
     dtyp: &'static str,
+    disables_ntm: bool,
     failure: Failure,
     record: String,
 }
@@ -669,14 +681,22 @@ impl DeviceSupport for Unbound {
         use asyn_rs::trace::TraceMask;
         use epics_base_rs::server::recgbl::rec_gbl_record_error;
 
+        // The dset sets NTM before motor_init_record_com refuses the bus.
+        if self.disables_ntm
+            && let Some(motor) = record
+                .as_any_mut()
+                .and_then(|a| a.downcast_mut::<crate::record::MotorRecord>())
+        {
+            motor.timing.ntm = false;
+        }
         let name = &self.record;
-        let message = match &self.failure {
+        match &self.failure {
             Failure::BadLink(why) => {
                 epics_base_rs::runtime::log::errlog_vprintf(format_args!(
                     "devMotorAsyn::init_record {name} bad link {why}\n"
                 ));
                 unqueued_dial_limits(name);
-                return Ok(bad(record));
+                Ok(bad(record))
             }
             Failure::NoPort(port) => {
                 // An unconnected asynUser prints on the global trace.
@@ -690,7 +710,7 @@ impl DeviceSupport for Unbound {
                     ),
                 );
                 unqueued_dial_limits(name);
-                return Ok(bad(record));
+                Ok(bad(record))
             }
             Failure::NotMotor {
                 port,
@@ -698,7 +718,7 @@ impl DeviceSupport for Unbound {
                 user_param,
             } => {
                 refuse_foreign_port(name, port, *addr, user_param.as_deref());
-                return Ok(bad(record));
+                Ok(bad(record))
             }
             Failure::BadAddress {
                 port,
@@ -742,7 +762,7 @@ impl DeviceSupport for Unbound {
                         "devMotorAsyn::asynCallback: {name} pasyn{{Float64,Int32}}->write returned \n"
                     ));
                 }
-                return Ok(bad(record));
+                Ok(bad(record))
             }
             Failure::BadBus => {
                 // S_dev_badBus: M_devSup has no symbol table.
@@ -752,7 +772,7 @@ impl DeviceSupport for Unbound {
                     "motor_init_record_com(): Illegal OUT Bus Type",
                 );
                 failed_init(record, false);
-                return Err(CaError::InvalidValue("Illegal OUT Bus Type".into()));
+                Err(CaError::InvalidValue("Illegal OUT Bus Type".into()))
             }
             Failure::IllegalInp | Failure::NoDrvet | Failure::NoOpen => {
                 // M_drvSup has no symbol table either.
@@ -772,15 +792,9 @@ impl DeviceSupport for Unbound {
                 };
                 rec_gbl_record_error(status, name, message);
                 failed_init(record, false);
-                return Err(CaError::InvalidValue(message.into()));
+                Err(CaError::InvalidValue(message.into()))
             }
-            Failure::NoCard => "motor_init_record_com(): card does not exist!",
-            Failure::NoSignal => "motor_init_record_com(): signal does not exist!",
-            Failure::InUse => "motor_init_record_com(): motor already in use!",
-        };
-        rec_gbl_record_error("Illegal field value", name, message);
-        failed_init(record, true);
-        Err(CaError::InvalidValue(message.into()))
+        }
     }
 
     fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {

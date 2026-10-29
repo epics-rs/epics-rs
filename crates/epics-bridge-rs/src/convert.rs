@@ -1,6 +1,8 @@
 use epics_base_rs::types::{DbFieldType, EpicsValue};
-use epics_pva_rs::pvdata::convert::{parse_to_i64, parse_to_u64};
-use epics_pva_rs::pvdata::{PvArray, PvField, ScalarType, ScalarValue, TypedScalarArray};
+use epics_pva_rs::pvdata::convert::{parse_to_f64, parse_to_i64, parse_to_u64};
+use epics_pva_rs::pvdata::{PvField, ScalarType, ScalarValue, TypedScalarArray};
+
+pub use epics_pva_rs::epics_convert::{epics_to_pv_field, epics_to_scalar};
 
 /// Convert EPICS DBF type to PVA ScalarType.
 ///
@@ -26,46 +28,6 @@ pub fn dbf_to_scalar_type(dbf: DbFieldType) -> ScalarType {
         // C `DBF_UCHAR` → PVA `ubyte` (UInt8), the unsigned twin of the
         // signed `Char → Byte` above (pvxs `ioc/typeutils.cpp:34-35`).
         DbFieldType::UChar => ScalarType::UByte,
-    }
-}
-
-/// Convert EpicsValue to PVA ScalarValue.
-pub fn epics_to_scalar(val: &EpicsValue) -> ScalarValue {
-    match val {
-        EpicsValue::String(s) => ScalarValue::String(s.clone()),
-        EpicsValue::Short(v) => ScalarValue::Short(*v),
-        EpicsValue::Float(v) => ScalarValue::Float(*v),
-        EpicsValue::Enum(v) => ScalarValue::UShort(*v), // C++: pvUShort
-        // Transient NTEnum carrier never reaches qsrv serving (coerced in
-        // base at the link-write boundary); convert its index like a DBF_ENUM.
-        EpicsValue::EnumWithChoices { index, .. } => ScalarValue::UShort(*index),
-        // C qsrv: DBF_CHAR → pvByte (signed). Bit-preserving cast keeps
-        // the on-the-wire byte identical; only the typed interpretation
-        // changes from unsigned to signed.
-        EpicsValue::Char(v) => ScalarValue::Byte(*v as i8),
-        EpicsValue::Long(v) => ScalarValue::Int(*v),
-        EpicsValue::Double(v) => ScalarValue::Double(*v),
-        EpicsValue::Int64(v) => ScalarValue::Long(*v),
-        EpicsValue::UInt64(v) => ScalarValue::ULong(*v),
-        // C `DBF_USHORT` → PVA `ushort` / `DBF_ULONG` → PVA `uint`
-        // (pvxs `ioc/typeutils.cpp:38-44`).
-        EpicsValue::UShort(v) => ScalarValue::UShort(*v),
-        EpicsValue::ULong(v) => ScalarValue::UInt(*v),
-        // C `DBF_UCHAR` → PVA `ubyte`, the unsigned twin of `Char → Byte`.
-        EpicsValue::UChar(v) => ScalarValue::UByte(*v),
-        // Arrays: take first element or default
-        EpicsValue::ShortArray(a) => ScalarValue::Short(a.first().copied().unwrap_or(0)),
-        EpicsValue::FloatArray(a) => ScalarValue::Float(a.first().copied().unwrap_or(0.0)),
-        EpicsValue::EnumArray(a) => ScalarValue::UShort(a.first().copied().unwrap_or(0)),
-        EpicsValue::DoubleArray(a) => ScalarValue::Double(a.first().copied().unwrap_or(0.0)),
-        EpicsValue::LongArray(a) => ScalarValue::Int(a.first().copied().unwrap_or(0)),
-        EpicsValue::CharArray(a) => ScalarValue::Byte(a.first().copied().unwrap_or(0) as i8),
-        EpicsValue::StringArray(a) => ScalarValue::String(a.first().cloned().unwrap_or_default()),
-        EpicsValue::Int64Array(a) => ScalarValue::Long(a.first().copied().unwrap_or(0)),
-        EpicsValue::UInt64Array(a) => ScalarValue::ULong(a.first().copied().unwrap_or(0)),
-        EpicsValue::UShortArray(a) => ScalarValue::UShort(a.first().copied().unwrap_or(0)),
-        EpicsValue::ULongArray(a) => ScalarValue::UInt(a.first().copied().unwrap_or(0)),
-        EpicsValue::UCharArray(a) => ScalarValue::UByte(a.first().copied().unwrap_or(0)),
     }
 }
 
@@ -164,12 +126,12 @@ pub fn scalar_to_epics_typed(
         DbFieldType::UInt64 => EpicsValue::UInt64(scalar_to_u64(val)?),
         DbFieldType::Short => EpicsValue::Short(scalar_to_i64(val)? as i16),
         DbFieldType::Char => EpicsValue::Char(scalar_to_i64(val)? as u8),
-        DbFieldType::UChar => EpicsValue::UChar(scalar_to_i64(val)? as u8),
+        DbFieldType::UChar => EpicsValue::UChar(scalar_to_uinteger(val)? as u8),
         DbFieldType::Enum => EpicsValue::Enum(scalar_to_i64(val)? as u16),
         // DBF_USHORT/DBF_ULONG narrow off the integer view (C static_cast
         // truncation, low 16/32 bits), mirroring the Short/Enum targets.
-        DbFieldType::UShort => EpicsValue::UShort(scalar_to_i64(val)? as u16),
-        DbFieldType::ULong => EpicsValue::ULong(scalar_to_i64(val)? as u32),
+        DbFieldType::UShort => EpicsValue::UShort(scalar_to_uinteger(val)? as u16),
+        DbFieldType::ULong => EpicsValue::ULong(scalar_to_uinteger(val)? as u32),
         DbFieldType::String => match val {
             ScalarValue::String(s) => EpicsValue::String(s.clone()),
             other => EpicsValue::String(other.to_string().into()),
@@ -179,11 +141,8 @@ pub fn scalar_to_epics_typed(
 
 /// Extract f64 from any ScalarValue.
 ///
-/// A `String` source is parsed strictly (leading/trailing whitespace
-/// tolerated to match `std::stod`); a non-numeric / out-of-range /
-/// trailing-garbage string returns [`ScalarConvertError`] instead of
-/// silently coercing to 0.0 — see pvxs `parseTo<double>`
-/// (`util.cpp:769`).
+/// A `String` source is pvxs `parseTo<double>` (`util.cpp:769`); a string
+/// it refuses returns [`ScalarConvertError`] instead of coercing to 0.0.
 fn scalar_to_f64(val: &ScalarValue) -> Result<f64, ScalarConvertError> {
     Ok(match val {
         ScalarValue::Double(v) => *v,
@@ -204,13 +163,10 @@ fn scalar_to_f64(val: &ScalarValue) -> Result<f64, ScalarConvertError> {
             }
         }
         ScalarValue::String(s) => {
-            s.as_str_lossy()
-                .trim()
-                .parse()
-                .map_err(|_| ScalarConvertError {
-                    value: s.as_str_lossy().into_owned(),
-                    target: "f64",
-                })?
+            parse_to_f64(&s.as_str_lossy()).map_err(|_| ScalarConvertError {
+                value: s.as_str_lossy().into_owned(),
+                target: "f64",
+            })?
         }
     })
 }
@@ -247,6 +203,16 @@ fn scalar_to_i64(val: &ScalarValue) -> Result<i64, ScalarConvertError> {
             })?
         }
     })
+}
+
+/// The unsigned narrow targets, pvxs `as<uint8/16/32_t>`
+/// (`iocsource.cpp:484-487`): a string is `parseTo<uint64_t>`, so `u64::MAX`
+/// spelled out is in range; every other source keeps the integer view.
+fn scalar_to_uinteger(val: &ScalarValue) -> Result<u64, ScalarConvertError> {
+    match val {
+        ScalarValue::String(_) => scalar_to_u64(val),
+        other => scalar_to_i64(other).map(|v| v as u64),
+    }
 }
 
 /// Extract u64 from any ScalarValue, preserving the full unsigned range
@@ -295,39 +261,6 @@ pub fn enum_index_to_string(choices: &[String], index: u16) -> String {
         .get(index as usize)
         .cloned()
         .unwrap_or_else(|| format!("{index}"))
-}
-
-/// Convert EpicsValue to PvField (scalar or array).
-///
-/// An array becomes a [`PvField::ScalarArrayTyped`] reading the
-/// `EpicsValue`'s own buffer: the record, its snapshot and the wire
-/// encoder share one `SharedArray`, the way pvxs hands a monitor the
-/// record's `shared_array` (`iocsource.cpp` `getValue`). Only `CharArray`
-/// copies, since u8 storage cannot alias the signed `byte[]` it serves.
-pub fn epics_to_pv_field(val: &EpicsValue) -> PvField {
-    let typed = match val {
-        EpicsValue::ShortArray(a) => TypedScalarArray::Short(PvArray::from(a)),
-        EpicsValue::FloatArray(a) => TypedScalarArray::Float(PvArray::from(a)),
-        EpicsValue::EnumArray(a) => TypedScalarArray::UShort(PvArray::from(a)),
-        EpicsValue::DoubleArray(a) => TypedScalarArray::Double(PvArray::from(a)),
-        EpicsValue::LongArray(a) => TypedScalarArray::Int(PvArray::from(a)),
-        // DBF_CHAR ↔ pvByte (signed): the storage byte reinterpreted.
-        EpicsValue::CharArray(a) => TypedScalarArray::Byte(a.iter().map(|&v| v as i8).collect()),
-        EpicsValue::StringArray(a) => TypedScalarArray::String(PvArray::from(a)),
-        EpicsValue::Int64Array(a) => TypedScalarArray::Long(PvArray::from(a)),
-        EpicsValue::UInt64Array(a) => TypedScalarArray::ULong(PvArray::from(a)),
-        // DBF_USHORT[]/DBF_ULONG[] serve as PVA ushort[]/uint[]. These MUST be
-        // explicit: the `other =>` scalar fallback below would collapse the
-        // array to its first element (pvxs `ioc/typeutils.cpp:38-44`).
-        EpicsValue::UShortArray(a) => TypedScalarArray::UShort(PvArray::from(a)),
-        EpicsValue::ULongArray(a) => TypedScalarArray::UInt(PvArray::from(a)),
-        // DBF_UCHAR[] serves as PVA ubyte[] (unsigned), unlike CHAR[]'s signed
-        // byte[] above (pvxs `ioc/typeutils.cpp:34-35` DBR_UCHAR→UInt8). MUST
-        // be explicit: the `other =>` scalar fallback would collapse it.
-        EpicsValue::UCharArray(a) => TypedScalarArray::UByte(PvArray::from(a)),
-        other => return PvField::Scalar(epics_to_scalar(other)),
-    };
-    PvField::ScalarArrayTyped(typed)
 }
 
 /// The `EpicsValue` carrier for a typed PVA array, one variant per wire
@@ -724,6 +657,28 @@ mod tests {
         assert!(
             scalar_to_epics_typed(&ScalarValue::String("\u{a0}5".into()), DbFieldType::Int64)
                 .is_err()
+        );
+    }
+
+    /// A real string PUT is `parseTo<double>` (glibc `stod`): hex floats,
+    /// ERANGE refused, C `isspace` only; an unsigned field parses unsigned.
+    #[test]
+    fn string_to_real_put_is_pvxs_parse_to_double() {
+        let put = |s: &str, t| scalar_to_epics_typed(&ScalarValue::String(s.into()), t);
+        assert_eq!(
+            put("0x1p4", DbFieldType::Double),
+            Ok(EpicsValue::Double(16.0))
+        );
+        assert_eq!(
+            put(" 2.5\t", DbFieldType::Float),
+            Ok(EpicsValue::Float(2.5))
+        );
+        for s in ["1e400", "1e-310", "\u{a0}5"] {
+            assert!(put(s, DbFieldType::Double).is_err(), "{s:?}");
+        }
+        assert_eq!(
+            put("18446744073709551615", DbFieldType::ULong),
+            Ok(EpicsValue::ULong(u32::MAX))
         );
     }
 

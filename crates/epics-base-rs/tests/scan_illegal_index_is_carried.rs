@@ -20,7 +20,7 @@
 //!
 //! # Ground truth
 //!
-//! Measured on the compiled softIoc (`/home/stevek/work/epics-base`), record
+//! Measured on the compiled softIoc (`$EPICS_BASE`), record
 //! `record(ai,"T:A"){ field(SCAN,"1 second") }`:
 //!
 //! ```text

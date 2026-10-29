@@ -8,7 +8,7 @@ use rand::rngs::StdRng;
 use asyn_rs::port_handle::PortHandle;
 
 use ad_core_rs::driver::{ADStatus, ImageMode};
-use ad_core_rs::ndarray::{NDDataBuffer, NDDataType, NDDimension};
+use ad_core_rs::ndarray::{NDDataType, NDDataViewMut, NDDimension};
 use ad_core_rs::ndarray_pool::DriverPool;
 use ad_core_rs::params::ADBaseParams;
 use ad_core_rs::plugin::channel::ArrayPublisher;
@@ -226,7 +226,8 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             // printed the pool's limit line.
             let Some(frame) = ctx.pool.owner().replace_array(0, || {
                 let mut frame = ctx.pool.alloc(dims, NDDataType::UInt16).ok()?;
-                let NDDataBuffer::U16(out) = &mut frame.data else {
+                let mut fill = frame.fill();
+                let NDDataViewMut::U16(out) = fill.data_mut().view_mut() else {
                     unreachable!("the frame was allocated as UInt16")
                 };
                 bin_into_u16(&img_data, width, bx, by, out_w, out);
@@ -319,7 +320,7 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
 
             // Stamped in place in pArrays[0] (simDetector.cpp:824-825).
             let Ok(frame) = ctx.pool.owner().refill(0, frame, |frame| {
-                frame.unique_id = array_counter;
+                frame.set_unique_id(array_counter);
                 frame.update_time_stamps(stamp);
             }) else {
                 continue;

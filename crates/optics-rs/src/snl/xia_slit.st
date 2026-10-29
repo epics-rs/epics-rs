@@ -140,6 +140,7 @@ option -w;  /* Suppress SNC warnings */
 #define ERROR_UNKNOWN       (16)
 #define ERROR_BAD_ID        (17)
 #define ERROR_COMM_ERROR    (18)
+#define COMM_ERROR_LOCATES  (3)     /* locates in a row without a reply */
 #define TIMEOUT_TICKS       (30)    /*15*/   /* wait up to 0.5 (was 0.25) seconds */
 
 /* HSC memory write commands (WR) */
@@ -277,60 +278,64 @@ PV(int,    vStText,     "{P}{HSC}vStatTextBI",  Monitor);
  * is constructed so we can write to, e.g., load_l, which will disable l_event,
  * write to l, and then re-enable l_event. 
  */ 
+/* C defect: the *_RB readbacks were monitored, so update_positions and
+ * new_H_RB (new_V_RB) could read back a late echo of an earlier locate's
+ * put in place of the reading they had just put. They are only put now:
+ * a client's *_RB write inside a locate, which C took too, is dropped. */
 PV(double, t,            "{P}{HSC}t",        Monitor);
 PV(double, t_event,      "{P}{HSC}t_event",  EvFlag);
 PV(double, t_hi,         "{P}{HSC}t.HOPR",   Monitor);
 PV(double, t_lo,         "{P}{HSC}t.LOPR",   Monitor);
-PV(double, t_RB,         "{P}{HSC}tRB",      Monitor);
+PV(double, t_RB,         "{P}{HSC}tRB",      NoMon);
 PV(double, load_t,       "{P}{HSC}load_t.B", NoMon);
 
 PV(double, l,            "{P}{HSC}l",        Monitor);
 PV(double, l_event,      "{P}{HSC}l_event",  EvFlag);
 PV(double, l_hi,         "{P}{HSC}l.HOPR",   Monitor);
 PV(double, l_lo,         "{P}{HSC}l.LOPR",   Monitor);
-PV(double, l_RB,         "{P}{HSC}lRB",      Monitor);
+PV(double, l_RB,         "{P}{HSC}lRB",      NoMon);
 PV(double, load_l,       "{P}{HSC}load_l.B", NoMon);
 
 PV(double, b,            "{P}{HSC}b",        Monitor);
 PV(double, b_event,      "{P}{HSC}b_event",  EvFlag);
 PV(double, b_hi,         "{P}{HSC}b.HOPR",   Monitor);
 PV(double, b_lo,         "{P}{HSC}b.LOPR",   Monitor);
-PV(double, b_RB,         "{P}{HSC}bRB",      Monitor);
+PV(double, b_RB,         "{P}{HSC}bRB",      NoMon);
 PV(double, load_b,       "{P}{HSC}load_b.B", NoMon);
 
 PV(double, r,            "{P}{HSC}r",        Monitor);
 PV(double, r_event,      "{P}{HSC}r_event",  EvFlag);
 PV(double, r_hi,         "{P}{HSC}r.HOPR",   Monitor);
 PV(double, r_lo,         "{P}{HSC}r.LOPR",   Monitor);
-PV(double, r_RB,         "{P}{HSC}rRB",      Monitor);
+PV(double, r_RB,         "{P}{HSC}rRB",      NoMon);
 PV(double, load_r,       "{P}{HSC}load_r.B", NoMon);
 
 PV(double, h0,           "{P}{HSC}h0",        Monitor);
 PV(double, h0_event,     "{P}{HSC}h0_event",  EvFlag);
 PV(double, h0_hi,        "{P}{HSC}h0.HOPR",   Monitor);
 PV(double, h0_lo,        "{P}{HSC}h0.LOPR",   Monitor);
-PV(double, h0_RB,        "{P}{HSC}h0RB",      Monitor);
+PV(double, h0_RB,        "{P}{HSC}h0RB",      NoMon);
 PV(double, load_h0,      "{P}{HSC}load_h0.B", NoMon);
 
 PV(double, v0,           "{P}{HSC}v0",        Monitor);
 PV(double, v0_event,     "{P}{HSC}v0_event",  EvFlag);
 PV(double, v0_hi,        "{P}{HSC}v0.HOPR",   Monitor);
 PV(double, v0_lo,        "{P}{HSC}v0.LOPR",   Monitor);
-PV(double, v0_RB,        "{P}{HSC}v0RB",      Monitor);
+PV(double, v0_RB,        "{P}{HSC}v0RB",      NoMon);
 PV(double, load_v0,      "{P}{HSC}load_v0.B", NoMon);
 
 PV(double, width,        "{P}{HSC}width",        Monitor);
 PV(double, width_event,  "{P}{HSC}width_event",  EvFlag);
 PV(double, width_hi,     "{P}{HSC}width.HOPR",   Monitor);
 PV(double, width_lo,     "{P}{HSC}width.LOPR",   Monitor);
-PV(double, width_RB,     "{P}{HSC}widthRB",      Monitor);
+PV(double, width_RB,     "{P}{HSC}widthRB",      NoMon);
 PV(double, load_width,   "{P}{HSC}load_width.B", NoMon);
 
 PV(double, height,       "{P}{HSC}height",        Monitor);
 PV(double, height_event, "{P}{HSC}height_event",  EvFlag);
 PV(double, height_hi,    "{P}{HSC}height.HOPR",   Monitor);
 PV(double, height_lo,    "{P}{HSC}height.LOPR",   Monitor);
-PV(double, height_RB,    "{P}{HSC}heightRB",      Monitor);
+PV(double, height_RB,    "{P}{HSC}heightRB",      NoMon);
 PV(double, load_height,  "{P}{HSC}load_height.B", NoMon);
 
 PV(int,    error,  "{P}{HSC}error",  NoMon);
@@ -395,6 +400,9 @@ int     delta;
 int     init_delay;
 int     ainp_fifo_write;
 int     ainp_fifo_read;
+int     ainp_replies;       /* replies put into the FIFO */
+int     silent_locates;     /* locates in a row without a reply */
+int     hsc_silent_reads;   /* WRITE_READ_HSC reads without a reply */
 string  ainp_fifo[FIFO_SIZE];
 string  scratch;
 
@@ -452,6 +460,8 @@ string  hsc_response;
         strcpy(hsc_response, s_ainp);                                           \
         DEBUG_PRINT3(10,"\nWAIT_HSC_RESPONSE: <%s> -> NORD=%d  TINP=%s",hsc_command,s_nord,s_tinp); \
     }                                                                           \
+    /* a read timeout posts an emptied AINP, so hsc_timeout misses it */       \
+    if (!hsc_response[0]) ++hsc_silent_reads;                                   \
 }
 #define WRITE_READ_HSC(HSC_ID, HSC_COMMAND)                             \
 {                                                                       \
@@ -483,6 +493,7 @@ string  hsc_response;
 {                                                                           \
     if (efTest(s_ainp_mon))                                                 \
     {                                                                       \
+        ++ainp_replies;                                                     \
         strcpy(ainp_fifo[ainp_fifo_read++], s_ainp);                        \
         FIFO_PTR_CHECK(ainp_fifo_read);                                     \
         delta = ainp_fifo_read-ainp_fifo_write;                             \
@@ -497,6 +508,27 @@ string  hsc_response;
     strcpy(OUTPUT, ainp_fifo[ainp_fifo_write++]);                       \
     DEBUG_PRINT2(10,"FIFO_OUT: got message %d:\n ->'%s'",delta,OUTPUT); \
     FIFO_PTR_CHECK(ainp_fifo_write);                                    \
+}
+/* C defect fixed: C never reported a silent controller (comm_error is
+** unreachable), so error stayed 0 and a move stayed busy. The next reply
+** clears the error through its "if (error)" path. */
+#define REPORT_COMM_ERROR()                             \
+{                                                       \
+    if (hBusy || h_Busy)                                \
+    {                                                   \
+        PVPUT(hBusy, MOTOR_IDLE);                       \
+        PVPUT(h_BusyOff, 0);                            \
+    }                                                   \
+    if (vBusy || v_Busy)                                \
+    {                                                   \
+        PVPUT(vBusy, MOTOR_IDLE);                       \
+        PVPUT(v_BusyOff, 0);                            \
+    }                                                   \
+    if (error != ERROR_COMM_ERROR)                      \
+    {                                                   \
+        PVPUT(error, ERROR_COMM_ERROR);                 \
+        PVPUTSTR(errMsg, "communications error");       \
+    }                                                   \
 }
 #define S_PORT_CONFIG(BAUD,DBIT,SBIT,PRTY,FCTL) \
 {                                               \
@@ -640,6 +672,9 @@ ss xiahsc {
   /*
    * _any_ communications errors will land us here
    */
+  /* C defect: nothing enters comm_error (dead since optics b414555), so C
+  ** left communication faults silent. Every read here ends in a timeout, so
+  ** rs reports faults from idle with REPORT_COMM_ERROR(); this stays dead. */
   state comm_error {
     when (init || !s_sevr || delay(ERROR_RECONNECT_INTERVAL)) { 
       DEBUG_PRINT2 (20, "comm_error: init=%d  s_sevr=%d", init, s_sevr)
@@ -790,6 +825,7 @@ ss xiahsc {
          	proper response length
          What to do when each of these fails?
        */
+      hsc_silent_reads = 0;
       error = 0;
       READ_HSC_STEPDELAY(hID,hStepDelay);
       READ_HSC_BACKLASH(hID,hGearBacklash);
@@ -879,6 +915,7 @@ ss xiahsc {
         PVPUT(v0_hi, (t_hi - b_lo)/2);
         PVPUT(v0_lo, (t_lo - b_hi)/2);
       }
+      if (hsc_silent_reads) REPORT_COMM_ERROR();
       PVPUT(locate, 1);  /* update the positions from the controller */
 
     } state idle
@@ -1005,12 +1042,20 @@ ss xiahsc {
       PVPUT(locate, 0);
       WRITE_HSC (TMOD_WRITE, "ALL", HSC1_POSITION_INQUIRY);
       epicsThreadSleep(.1);
+      ainp_replies = 0;
       while (!s_sevr) {		/* read until no more input data */
         DEBUG_PRINT(10,"locate: calling READ_HSC");
         READ_HSC();		/* process generic serial port */
         if (!s_sevr) INPUT_TO_FIFO();	/* put input string into FIFO */
       }
       DEBUG_PRINT(10,"locate: s_sevr = TRUE");
+      /* Every read ends in a timeout, so only a locate with no reply at all
+      ** counts; one alone can be a read loop skipped on a stale SEVR. */
+      if (ainp_replies) {
+        silent_locates = 0;
+      } else if (++silent_locates >= COMM_ERROR_LOCATES) {
+        REPORT_COMM_ERROR();
+      }
     } state idle
 
     when (calibrate) {

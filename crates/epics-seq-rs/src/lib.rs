@@ -1,5 +1,7 @@
-//! Rust port of the EPICS sequencer run-time (sequencer R2-2-9 `src/seq`,
-//! `src/pv`) that programs compiled by snc-rs run on.
+//! Rust port of the EPICS sequencer R2-2-9: the run-time (`src/seq`,
+//! `src/pv`, feature `runtime`, the default) and the SNL compiler snc-rs
+//! (`src/snc`, module `snc` under feature `snc`), one crate as C's seq
+//! module is one module.
 //!
 //! An upstream `.st` file is unchanged. A crate's `build.rs` runs the Rust
 //! cpp and snc-rs on it and writes `$OUT_DIR/<stem>.rs`, named after the
@@ -55,7 +57,9 @@
 //!   `u8`, `short` and `int16_t` `i16`, `unsigned short` and `uint16_t`
 //!   `u16`, `int` and `int32_t` `i32`, `unsigned int` and `uint32_t` `u32`,
 //!   `long` `i64`, `unsigned long` `u64`, `float` `f32`, `double` `f64`,
-//!   `string` [`SeqString`], `char *` [`CharPtr`]. `char` is written
+//!   `string` [`SeqString`], `char *` [`CharPtr`], `void *`
+//!   `Ptr<c_void>`, another `T *` [`Ptr<T>`], `typename pvStat` [`PvStat`]
+//!   and `typename pvSevr` [`PvSevr`]. `char` is written
 //!   `std::ffi::c_char` in full and the run-time types `seqg_rt::...`, so
 //!   a companion imports neither. The outer dimension of a multi-PV
 //!   array is split: `[SeqVar<T>; N]`. A block-local variable is a `let`
@@ -67,8 +71,28 @@
 //!   `x.modify(|v| *v += e)`. Every operand is evaluated before a lock is
 //!   taken, so `x = x + 1` is a `get` followed by a `set`, and `x += y`
 //!   reads `y` first. No code holds two variable locks at once.
+//! - Pointers. A [`Ptr`] points into a variable's cell, as C's points into
+//!   its memory, so it sees later writes and keeps the cell alive. Where C
+//!   converts a value to a pointer type (an assignment, an initializer, a
+//!   `return`, an SNL function's argument), `&x` is `x.ptr()`
+//!   (`a.at(i).ptr()`) and an array or a `string` decays with
+//!   `Ptr::from(&a)`; a call without a prototype passes them as places
+//!   (see Calls). `*p` and `p[i]` are places: `p.get()`, `p.set(e)`,
+//!   `p.offset(i).get()`. `p + n` is `p.offset(n)`, `p - q` is
+//!   `p.diff(&q)`, and `==` compares addresses, an array's or a `string`'s
+//!   too, as C's decay makes it. A read or write through null, outside the
+//!   variable, or into a literal panics where C's is undefined. A
+//!   `void *` is a `Ptr<c_void>`: C's conversion to it is `p.erase()` and
+//!   from it `v.cast::<T>()`, which panics unless `T` is the type it was
+//!   made from. snc-rs refuses `*v` and arithmetic on it, as ISO C does,
+//!   and a cast of an integer to a pointer, which has no cell to point to.
 //! - C semantics. A value assigned to, or passed as, a numeric of another
-//!   type is emitted `as _`. A C truth value is spelled out as `!= 0` or
+//!   type is emitted `as _`. An operator on a foreign value or member,
+//!   whose C type snc-rs does not know, is an [`arith`] call
+//!   (`seqg_rt::arith::mul(a, b)`), whose usual arithmetic conversions
+//!   rustc resolves from the operands' Rust types; `?:` and comparisons
+//!   take two of one type as they are, structs and pointers too. With a
+//!   `double` the foreign operand is cast `as f64`. A C truth value is spelled out as `!= 0` or
 //!   `== 0`. Source parentheses and empty statements are dropped.
 //! - Literals. A string literal is a `&str`, or `&b"..."[..]` when it is
 //!   not UTF-8.
@@ -78,7 +102,11 @@
 //!   is the place (`&seqg_var.x`); anything else is its value. A variadic
 //!   argument is `seqg_rt::c::CArg::from(e)` in a `&[...]` slice. See [`c`].
 //!   A run-time call's string parameter (`pvAssign`, `macValueGet`) is a
-//!   [`c::CSrc`] and takes its argument by the same rule. A foreign call's
+//!   [`c::CSrc`] and takes its argument by the same rule. A destination is
+//!   a [`c::CDst`]. A [`c`] function's `char *` parameter that it returns
+//!   or keeps a pointer into (`strchr`, `strstr`, `epicsStrtok_r`) is
+//!   passed a [`CharPtr`] value by the Pointers rule, so C's null constant
+//!   is `CharPtr::default()`. A foreign call's
 //!   result is cast `as _` where it is used (an assignment or `pvPut`
 //!   target, an initializer, a typed `seqg_env` parameter), which makes
 //!   C's implicit conversion explicit, so a companion function returns its
@@ -164,17 +192,42 @@
 //! that only a callee writes, through C's decay of an array
 //! (Keithley2kDMM.st:216's `%%char pvname[...]` passed to `sprintf`), is
 //! such a static holding a reference to a companion type that implements
-//! [`Place`] and [`c::CSrc`]. snc-rs refuses SNL code that assigns a
-//! global.
+//! [`c::CDst`] and [`c::CSrc`]. A global that SNL code assigns
+//! (`x = e`, `x += e`, `x++`, pvGet.st:26's `mutex`) is a cell instead,
+//! `static x: LazyLock<SeqVar<T>>`, read with `x.get()` and written with
+//! `x.set(e)` as a variable is; a number stored into one whose type its
+//! escaped declaration does not spell in keywords is cast `as _`. snc-rs
+//! refuses SNL code that assigns an element of a global.
+//!
+//! A foreign `struct`, `union`, `enum` or `typename` is the companion type
+//! of C's name, its tag dropped (`struct struct_t` is `struct_t`), and is
+//! `Clone` and [`Zeroed`] as every variable's type is; a struct or union
+//! that `?:` selects is also [`arith::AsIs`]. A struct has a
+//! `pub` field per C member: `s.a` is the place `s.field(|v| &mut v.a)`, a
+//! [`Field`], which `&s.a` points into and whose array decays to a pointer
+//! along the member, and `p->a` is the same place through the [`Ptr`]. A
+//! union keeps C's shared storage in a [`UnionBytes`] with a pair of
+//! accessors per member, `a()` and `set_a(x)`, so `u.a` is
+//! `u.view(|v| v.a(), |v, x| v.set_a(x))`, a [`View`], and one member
+//! reads back the bytes another wrote. A pointer member read over another
+//! member's write panics, where C's is undefined. A union member has no
+//! address, so snc-rs refuses `&u.a`. snc-rs knows a union only by an SNL
+//! declaration that names one; any other foreign aggregate is taken to be
+//! a struct. An enum is its integer type and a constant per enumerator. A
+//! brace initializer is `T::from` a tuple of its shape (`{1, {0.1}}` is
+//! `(1, (0.1,))`), which converts each member as C's initialization does.
 //!
 //! When a fragment has no arm, the build fails with that text, so a
 //! changed upstream `.st` cannot compile against a stale companion. A
 //! companion holds one program, because each program defines its own
 //! `mod seqg`.
 //!
-//! None of the 16 `.st` programs that run on this crate uses an SNL
-//! `struct`, a function definition, or escaped C inside a struct, so
-//! snc-rs refuses those with an error naming the line.
+//! An SNL function definition is a Rust `fn` that takes the calling state
+//! set first, C's implicit `SS_ID`, then its parameters by value, each
+//! held in a [`SeqVar`] as a local is; a call converts every argument to
+//! its parameter's type as C's prototype does. snc-rs refuses an SNL
+//! `struct`, escaped C inside one, and a function's array or `string`
+//! parameter, with an error naming the line.
 //!
 //! # Options: `+r`, `+s` and the rest
 //!
@@ -253,36 +306,69 @@
 //! `seq_cmd.c`, `qry.rs` `seq_qry.c`, `pv.rs` `pvCa.c`. [`ChanCell`]
 //! carries the value transfer and [`c`] the `printf` family, where a null
 //! `%s` prints `(null)`, as glibc does. What one module calls in another
-//! is public and reached through [`pvt`].
+//! is public and reached through [`pvt`]. `snc` is C `src/snc` and the cpp
+//! before it; a build script takes this crate with `default-features =
+//! false, features = ["snc"]` and compiles none of the run time.
 
+#[cfg(feature = "runtime")]
+pub mod arith;
+#[cfg(feature = "runtime")]
 pub mod c;
+#[cfg(feature = "runtime")]
 mod ca;
+#[cfg(feature = "runtime")]
 mod cmd;
+#[cfg(feature = "runtime")]
 mod mac;
+#[cfg(feature = "runtime")]
 mod prog;
+#[cfg(feature = "runtime")]
 mod program;
+#[cfg(feature = "runtime")]
 pub mod pv;
+#[cfg(feature = "runtime")]
 #[doc(hidden)]
 pub mod pvt;
+#[cfg(feature = "runtime")]
 mod qry;
+#[cfg(feature = "runtime")]
 mod queue;
+#[cfg(feature = "runtime")]
 mod seq;
+#[cfg(feature = "snc")]
+pub mod snc;
+#[cfg(feature = "runtime")]
 mod state_set;
+#[cfg(feature = "runtime")]
 mod task;
+#[cfg(feature = "runtime")]
 pub mod types;
+#[cfg(feature = "runtime")]
 pub mod var;
 
+#[cfg(feature = "runtime")]
 pub use cmd::{RegisteredProgram, seq_register_sequencer_commands, seq_register_sequencer_program};
+#[cfg(feature = "runtime")]
 pub use program::*;
+#[cfg(feature = "runtime")]
 pub use qry::{SeqStats, seq_chan_show, seq_gather_stats, seq_queue_show, seq_show, seqcar};
+#[cfg(feature = "runtime")]
 pub use seq::{SeqThreadId, seq};
+#[cfg(feature = "runtime")]
 pub use state_set::{CompleteFlags, StateSet};
+#[cfg(feature = "runtime")]
 pub use task::seq_stop;
+#[cfg(feature = "runtime")]
 pub use types::*;
-pub use var::{At, ChanCell, ElemKind, Indexed, Place, Prim, ProgramVars, SeqVar, Zeroed};
+#[cfg(feature = "runtime")]
+pub use var::{
+    Addr, At, ChanCell, ElemKind, Field, Indexed, Place, Prim, ProgramVars, Ptr, SeqVar,
+    UnionBytes, UnionMember, View, Zeroed,
+};
 
 /// Include the program snc-rs wrote for `<name>.st` to `$OUT_DIR/<name>.rs`.
 /// The companion's `seqg_escaped!` must be defined before this call.
+#[cfg(feature = "runtime")]
 #[macro_export]
 macro_rules! include_program {
     ($name:literal) => {

@@ -730,6 +730,10 @@ impl Record for ASubRecord {
         }
     }
 
+    fn dbaddr_capacity_inputs(&self) -> Option<&'static [&'static str]> {
+        Some(&[])
+    }
+
     fn dbaddr_stored_as_scalar(&self, field: &str) -> bool {
         match parse_channel(field) {
             Some((Chan::Value, idx)) => !self.a[idx].is_array(),
@@ -1115,6 +1119,19 @@ impl Record for ASubRecord {
         })
     }
 
+    /// `INPx` lands in its value field.
+    fn array_read_destination(&self, link_field: &str) -> Option<EpicsValue> {
+        let (chan, idx) = parse_channel(link_field)?;
+        (chan == Chan::Inp).then(|| self.a[idx].clone())
+    }
+
+    /// NEA moves only on success (`aSubRecord.c:283-287`).
+    fn land_failed_array_read(&mut self, link_field: &str, left: EpicsValue) {
+        if let Some((Chan::Inp, idx)) = parse_channel(link_field) {
+            self.a[idx].write_head(left);
+        }
+    }
+
     /// `FTA..FTU` are fields, so the request above is the instance's.
     fn input_link_answers_fixed_at_type(&self) -> bool {
         false
@@ -1273,7 +1290,6 @@ mod tests {
                     (
                         rec.link_text_ref(link).map(<[u8]>::to_vec),
                         rec.input_link_request(link),
-                        rec.input_link_failure_is_inert(link),
                     )
                 })
                 .collect::<Vec<_>>()

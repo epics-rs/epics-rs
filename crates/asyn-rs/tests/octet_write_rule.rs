@@ -6,7 +6,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use asyn_rs::error::AsynResult;
+use asyn_rs::error::{AsynError, AsynResult, AsynStatus};
 use asyn_rs::param::ParamType;
 use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
@@ -54,8 +54,8 @@ fn base(name: &str, seen: Seen) -> (PortDriverBase, usize, usize) {
         name,
         1,
         PortFlags::default(),
-        InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_INTERRUPTS,
+        InterfaceMask::NONE,
+        InterfaceMask::NONE,
     );
     let file = base.create_param("FILE", ParamType::Octet).unwrap();
     let other = base.create_param("OTHER", ParamType::Octet).unwrap();
@@ -65,6 +65,7 @@ fn base(name: &str, seen: Seen) -> (PortDriverBase, usize, usize) {
             seen.lock()
                 .unwrap()
                 .push(base.get_string_param(file, addr).unwrap().to_vec());
+            Ok(())
         }),
     );
     (base, file, other)
@@ -97,4 +98,30 @@ fn an_override_chains_to_the_rule() {
     det.write_octet(&mut AsynUser::new(file), b"attrs.xml")
         .unwrap();
     assert_eq!(*seen.lock().unwrap(), vec![b"attrs.xml".to_vec()]);
+}
+
+#[test]
+fn a_refusing_rule_fails_the_write_it_ran_on() {
+    let (mut base, file, _) = base("OCTRULEREFUSE", Seen::default());
+    base.set_write_octet_rule(
+        file,
+        Arc::new(|_: &mut PortDriverBase, _, _: &[u8]| {
+            Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: "missing".into(),
+            })
+        }),
+    );
+    let mut det = Det { base };
+
+    let Err(AsynError::Status { message, .. }) =
+        det.write_octet(&mut AsynUser::new(file), b"bad\0tail")
+    else {
+        panic!("a refusing rule must fail the write");
+    };
+    assert_eq!(
+        message,
+        format!("asynPortDriver:writeOctet: status=3, function={file}, name=FILE, value=bad")
+    );
+    assert_eq!(det.base.get_string_param(file, 0).unwrap(), b"bad");
 }

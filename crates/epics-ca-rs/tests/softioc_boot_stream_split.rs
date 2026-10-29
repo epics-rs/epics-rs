@@ -14,7 +14,7 @@
 #![cfg(all(unix, tokio_backend))]
 
 use std::io::Write;
-use std::net::{TcpListener, UdpSocket};
+use std::net::TcpListener;
 use std::process::{Command, Stdio};
 
 use named_port::verdict as softioc_verdict;
@@ -110,17 +110,22 @@ const CLEAN_STDERR: &str = "Starting iocInit\n\
                             iocRun: All initialization complete\n\
                             iocBuild: ERROR IOC can only be initialized from uninitialized or stopped state\n";
 
-/// [`boot`] under `on_a_named_port` with the first candidate taken by `hold`
-/// before softioc-rs starts: the ports tried and the winning stderr.
-/// named_port has no hook for its first number, so the closure takes it on
-/// its first call.
-fn boot_past_a_held_port<H>(hold: impl Fn(u16) -> H) -> (Vec<u16>, String) {
+/// [`boot`] under `on_a_named_port_from` with the first candidate the number
+/// `hold` keeps from before softioc-rs starts: the ports tried and the
+/// winning stderr.
+fn boot_past_a_held_port<H>(hold: impl FnOnce() -> (H, u16)) -> (Vec<u16>, String) {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = dir.path().join("a.db");
     std::fs::write(&db, "record(ai, \"R1\") {\n}\n").expect("write the .db");
+    let (_held, port) = hold();
+    let mut first = Some(port);
+    let pick = || {
+        first
+            .take()
+            .unwrap_or_else(named_port::free_for_tcp_and_udp)
+    };
     let mut tried = Vec::new();
-    let (_, stderr) = named_port::on_a_named_port(|port| {
-        let _held = tried.is_empty().then(|| hold(port));
+    let (_, stderr) = named_port::on_a_named_port_from(pick, |port| {
         tried.push(port);
         boot(&db, port)
     });
@@ -129,8 +134,10 @@ fn boot_past_a_held_port<H>(hold: impl Fn(u16) -> H) -> (Vec<u16>, String) {
 
 #[test]
 fn a_held_tcp_port_is_retried_on_a_new_one() {
-    let (tried, stderr) = boot_past_a_held_port(|port| {
-        TcpListener::bind(("127.0.0.1", port)).expect("hold the TCP port")
+    let (tried, stderr) = boot_past_a_held_port(|| {
+        let held = TcpListener::bind("127.0.0.1:0").expect("hold a TCP port");
+        let port = held.local_addr().expect("read the held port").port();
+        (held, port)
     });
     // Another process on the box may take a later candidate too.
     assert!(
@@ -143,8 +150,10 @@ fn a_held_tcp_port_is_retried_on_a_new_one() {
 
 #[test]
 fn a_held_udp_port_is_retried_on_a_new_one() {
-    let (tried, stderr) = boot_past_a_held_port(|port| {
-        UdpSocket::bind(("127.0.0.1", port)).expect("hold the UDP port")
+    let (tried, stderr) = boot_past_a_held_port(|| {
+        let held = named_port::HeldPort::closed_udp();
+        let port = held.port;
+        (held, port)
     });
     // Another process on the box may take a later candidate too.
     assert!(

@@ -397,21 +397,6 @@ impl TransformRecord {
         None
     }
 
-    /// C's link classification, `plink->type == CONSTANT` — the ONE test every
-    /// one of this record's three link decisions is written in:
-    /// `no_inlink` (`transformRecord.c:571`), "has an input link" (`:535`),
-    /// "has an output link" (`:606`).
-    ///
-    /// A link field is CONSTANT when it is EMPTY *or* holds a literal number:
-    /// dbStatic gives `field(INPA,"5")` the type CONSTANT, not PV_LINK. Reading
-    /// the stored text's EMPTINESS instead (what the port did at all three
-    /// sites) makes a constant-seeded channel look link-driven — and in the
-    /// default Conditional mode its CLCx was then never evaluated at all:
-    /// `field(INPA,"2")` + `field(CLCA,"A+1")` sat at 2 forever.
-    fn link_is_constant(parsed: &ParsedLink) -> bool {
-        matches!(parsed, ParsedLink::None | ParsedLink::Constant(_))
-    }
-
     /// C's `no_inlink` (`transformRecord.c:571`).
     fn no_inlink(&self, i: usize) -> bool {
         self.inp_linked & 1 << i == 0
@@ -423,9 +408,21 @@ impl TransformRecord {
         self.out_linked & 1 << i == 0
     }
 
-    /// The bit `i` of `mask` [`Self::no_inlink`]/[`Self::no_outlink`] read.
+    /// The bit `i` of `mask` [`Self::no_inlink`]/[`Self::no_outlink`] read:
+    /// C's `plink->type == CONSTANT`, the one test every one of this record's
+    /// three link decisions is written in: `no_inlink`
+    /// (`transformRecord.c:571`), "has an input link" (`:535`), "has an
+    /// output link" (`:606`).
+    ///
+    /// A link field is CONSTANT when it is EMPTY *or* holds a literal number:
+    /// dbStatic gives `field(INPA,"5")` the type CONSTANT, not PV_LINK. Reading
+    /// the stored text's EMPTINESS instead (what the port did at all three
+    /// sites) makes a constant-seeded channel look link-driven — and in the
+    /// default Conditional mode its CLCx was then never evaluated at all:
+    /// `field(INPA,"2")` + `field(CLCA,"A+1")` sat at 2 forever. A
+    /// `{const:…}` link is a `JSON_LINK`, so it counts as a link.
     fn set_linked(mask: &mut u16, i: usize, parsed: &ParsedLink) {
-        if Self::link_is_constant(parsed) {
+        if parsed.is_constant_type() {
             *mask &= !(1 << i);
         } else {
             *mask |= 1 << i;
@@ -494,7 +491,7 @@ impl TransformRecord {
     /// Classify all 32 links and publish `IAV..IPV` / `OAV..OPV`, mirroring C
     /// `transformRecord.c::init_record` (444-473) and the `special()`
     /// re-classification (709-742). No-op without an async context.
-    fn refresh_link_status(&self, posts: LinkStatusPosts) {
+    fn refresh_link_status(&mut self, posts: LinkStatusPosts) {
         let mut links: Vec<(&'static str, PvString, LinkRole)> =
             Vec::with_capacity(2 * NUM_CHANNELS);
         for i in 0..NUM_CHANNELS {
@@ -509,7 +506,7 @@ impl TransformRecord {
                 LinkRole::Output,
             ));
         }
-        post_link_status(
+        let stored = post_link_status(
             self.async_ctx.as_ref(),
             &self.link_gen,
             links,
@@ -517,6 +514,11 @@ impl TransformRecord {
             TRANSFORM_LINK_CHECK.mask,
             posts,
         );
+        if let (LinkStatusPosts::Put(field), Some(status)) = (posts, stored)
+            && let Some(slot) = Self::link_status_slot(field)
+        {
+            self.link_status[slot] = status;
+        }
     }
 
     /// LA..LP — "Prev Value of A".."Prev Value of P"
@@ -1320,7 +1322,10 @@ impl Record for TransformRecord {
     /// DBF_DOUBLE, pvalue)`); `dbGetLink` then delivers nothing for it on
     /// every later process, so a client's `caput REC.A 99` stands.
     fn constant_init_links(&self) -> Vec<crate::server::record::ConstantInitLink> {
-        crate::server::record::seed_input_links(self.multi_input_links())
+        crate::server::record::seed_input_links(
+            self.multi_input_links(),
+            crate::server::record::SeedGuard::TypeConstant,
+        )
     }
 
     /// C `transformRecord.c::special` (715-723) — a runtime put to an INPn that

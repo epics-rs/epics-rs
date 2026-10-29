@@ -253,6 +253,13 @@ impl TimerHandle {
     pub fn scheduled_count(&self) -> usize {
         self.inner.state.lock().queue.len()
     }
+
+    /// How many entries have ever been queued. A loop that arms a timer per
+    /// pass and cancels the last one keeps [`scheduled_count`](Self::scheduled_count)
+    /// flat; this is where that churn shows.
+    pub fn scheduled_total(&self) -> u64 {
+        self.inner.state.lock().next_seq
+    }
 }
 
 /// The delayed-callback timer: one thread draining a deadline-ordered queue

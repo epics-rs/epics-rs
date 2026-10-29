@@ -1,8 +1,6 @@
 //! The value types of the snc→seq contract: `pvAlarm.h`, `pvType.h`,
 //! `seq_prim_types.h`, `seq_mask.h` and the scalar definitions of `seqCom.h`.
 
-use std::sync::Arc;
-
 /// `MAX_STRING_SIZE`: the bytes of an SNL `string`, terminating NUL included.
 pub const MAX_STRING_SIZE: usize = 40;
 
@@ -240,7 +238,11 @@ pub const NOEVFLAG: EfId = EfId(0);
 /// An SNL `string` (`typedef char string[MAX_STRING_SIZE]`): NUL-terminated
 /// bytes, not UTF-8. A copy longer than the buffer stops one byte short of
 /// it, where C's `strcpy` would write past the variable.
+///
+/// Transparent, so its address is its first `char`'s, as a pointer into it
+/// counts.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
 pub struct SeqString([u8; MAX_STRING_SIZE]);
 
 impl SeqString {
@@ -290,9 +292,10 @@ impl std::fmt::Debug for SeqString {
 }
 
 /// A C `char *` an SNL program holds: what `macValueGet`, `pvName` and
-/// `pvMessage` return, and the type of a `char *` program variable. `None`
-/// is the null pointer.
-pub type CharPtr = Option<Arc<[u8]>>;
+/// `pvMessage` return, and the type of a `char *` program variable. It
+/// points into a variable as C's does (`p = stringIn` sees later writes to
+/// `stringIn`), or into a read-only string ([`crate::Ptr::from_bytes`]).
+pub type CharPtr = crate::var::Ptr<std::ffi::c_char>;
 
 #[cfg(test)]
 mod tests {

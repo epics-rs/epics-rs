@@ -96,8 +96,8 @@
 use crate::error::{CaError, CaResult};
 use crate::server::record::{CycleCell, CycleRead, CycleValue};
 use crate::server::record::{
-    CycleMarks, CyclePostMask, InputFetchPolicy, OutTarget, ProcessAction, ProcessOutcome, Record,
-    RecordProcessResult,
+    CycleMarks, CyclePostMask, InputFetchPolicy, InputLinkRequest, LinkReadAs, OutTarget,
+    ProcessAction, ProcessOutcome, Record, RecordProcessResult,
 };
 use crate::types::{EpicsValue, PvString};
 
@@ -106,8 +106,8 @@ use crate::calc::{ArrayInputs, Rpcl, acalc_eval};
 // `LINK_CON` (= 3, the `Constant` link-status index) is the value C
 // `init_record` writes for an unconfigured link; shared with `calcout`.
 use super::link_status::{
-    LINK_CON, LinkCheck, LinkCheckSpec, LinkCheckState, LinkRole, LinkRule, LinkStatusGen,
-    LinkStatusPosts, post_link_status,
+    LINK_CON, LINK_EXT_OK, LINK_LOC, LinkCheck, LinkCheckSpec, LinkCheckState, LinkRole, LinkRule,
+    LinkStatusGen, LinkStatusPosts, post_link_status,
 };
 use crate::server::database::AsyncDbHandle;
 use crate::server::recgbl::PutReport;
@@ -265,7 +265,9 @@ const PA_NAMES: [&str; 12] = [
 /// a concurrency feature: it is what lets the charge sit at C's OWN seam.
 /// `cvt_dbaddr` runs when a client resolves a channel on an `SPC_DBADDR` field,
 /// which reaches this port as [`Record::cvt_dbaddr`] — a `&self` hook,
-/// because resolving a channel is a read. A charge is idempotent per [`ArrayBuf`] and the test-and-set is one
+/// because resolving a channel is a read. `fetch_values`' charge sits in
+/// `input_link_request`, the `&self` answer the fetch loop asks right before
+/// each read, for the same reason. A charge is idempotent per [`ArrayBuf`] and the test-and-set is one
 /// `fetch_or`, so the ledger stays a pure function of which buffers have been
 /// demanded, whoever asks and however often.
 mod array_mem {
@@ -1131,7 +1133,7 @@ impl AcalcoutRecord {
     /// Classify all 25 links and publish INAV..INLV / IAAV..ILLV / OUTV,
     /// mirroring C `aCalcoutRecord.c::init_record` (209-243) and the
     /// `special()` re-classification (528-569). No-op without an async context.
-    fn refresh_link_status(&self, posts: LinkStatusPosts) {
+    fn refresh_link_status(&mut self, posts: LinkStatusPosts) {
         let mut links: Vec<(&'static str, PvString, LinkRole)> = Vec::with_capacity(25);
         for i in 0..12 {
             links.push((INAV_NAMES[i], self.inp_links[i].clone(), LinkRole::Input));
@@ -1139,7 +1141,7 @@ impl AcalcoutRecord {
         }
         links.push(("OUTV", self.out.clone(), LinkRole::Output));
         // C `aCalcoutRecord.c:242`, `:569`, `:1157`.
-        post_link_status(
+        let stored = post_link_status(
             self.async_ctx.as_ref(),
             &self.link_gen,
             links,
@@ -1147,6 +1149,11 @@ impl AcalcoutRecord {
             ACALCOUT_LINK_CHECK.mask,
             posts,
         );
+        if let (LinkStatusPosts::Put(field), Some(status)) = (posts, stored)
+            && let Some(idx) = Self::status_index(field)
+        {
+            self.link_status[idx] = status;
+        }
     }
 
     /// The `link_status` slot of a status field.
@@ -1753,6 +1760,11 @@ impl Record for AcalcoutRecord {
         Some(self.dbaddr_no_elements() as u32)
     }
 
+    /// `NELM` is `SPC_NOMOD`; a client moves the window.
+    fn dbaddr_capacity_inputs(&self) -> Option<&'static [&'static str]> {
+        Some(&["SIZE", "NUSE"])
+    }
+
     /// `cvt_dbaddr`'s first act is the allocation (`aCalcoutRecord.c:589-617`):
     /// the record cannot hand out a `pfield` for a buffer it has not
     /// `calloc`'d, so a channel resolving on AVAL, AA..LL or OAV charges it.
@@ -1919,13 +1931,8 @@ impl Record for AcalcoutRecord {
         let Some(i) = Self::arr_index(name) else {
             return crate::server::record::put_field_internal_default(self, name, value);
         };
-        // C `fetch_values` (`:1082-1094`) allocates the array field and, on the
-        // first array link it ever serves, the shared PAA compare buffer —
-        // ahead of the save/fetch/compare below, because it is about to write
-        // through both. Neither charge posts or advances PMEM here: this runs
-        // inside the process cycle, and `complete_cycle` closes it.
-        self.mem.allocate(ArrayBuf::Arr(i), self.nelm);
-        self.mem.allocate(ArrayBuf::Paa, self.nelm);
+        // AA..LL and PAA were charged when the fetch loop asked
+        // `input_link_request`, before the read that delivers this value.
         let before = self.array_field_value(&self.arr_vals[i]);
         // The LINK's bound, and it is this path's alone: C asks the link for exactly
         // `nRequest = acalcGetNumElements(pcalc)` elements — the NUSE window
@@ -2386,7 +2393,10 @@ impl Record for AcalcoutRecord {
     /// its `fieldIndex <= acalcoutRecordINPL` — so it is the same slice, and
     /// the two cannot drift apart.
     fn constant_init_links(&self) -> Vec<crate::server::record::ConstantInitLink> {
-        crate::server::record::seed_input_links(self.special_reseed_input_links())
+        crate::server::record::seed_input_links(
+            self.special_reseed_input_links(),
+            crate::server::record::SeedGuard::TypeConstant,
+        )
     }
 
     /// The `INPA..INPL` then `INAA..INLL` texts read straight off the record's
@@ -2426,17 +2436,57 @@ impl Record for AcalcoutRecord {
         InputFetchPolicy::AbortOnFirstFailure
     }
 
-    /// ...but only the SCALAR loop reaches its `dbGetLink` unconditionally. The
-    /// ARRAY loop is wrapped in `if ((*plinkValid==acalcoutINAV_EXT) ||
-    /// (*plinkValid==acalcoutINAV_LOC))` (`aCalcoutRecord.c:1078`), so an array
-    /// link C believes cannot deliver is never read and never gates the cycle —
-    /// which is why a typo'd or not-yet-loaded INAA leaves the record computing
-    /// in C and killed it here. See [`Record::input_link_failure_is_inert`] for
-    /// why this port answers the status question at read time.
-    fn input_link_failure_is_inert(&self, link_field: &str) -> bool {
-        ACALCOUT_INPUT_LINKS[ACALCOUT_NUMERIC_INPUTS..]
-            .iter()
-            .any(|(lf, _)| *lf == link_field)
+    /// C's array loop reads a link only while its IAAV..ILLV is `EXT` or `LOC`
+    /// (`aCalcoutRecord.c:1078`). Any other status is no read at all: no
+    /// value, no LINK alarm, no gate. A link it does read fails as a scalar
+    /// one does (`:1098-1099`).
+    ///
+    /// Inside that gate and ahead of `dbGetLink`, C allocates the array field
+    /// and the shared PAA compare buffer (`:1082-1094`), so a read that then
+    /// fails has still paid for both. This answer is that seam: the fetch
+    /// loop asks it once per link, in C's order, right before the read. The
+    /// read is `dbGetLink(plink, DBR_DOUBLE, *pavalue, 0, &nRequest)` with
+    /// `nRequest = acalcGetNumElements(pcalc)` (`:1097-1098`).
+    fn input_link_request(&self, link_field: &str) -> InputLinkRequest {
+        let Some(i) = Self::ina_index(link_field) else {
+            return InputLinkRequest::As(LinkReadAs::Native);
+        };
+        match self.link_status[ACALCOUT_NUMERIC_INPUTS + i] {
+            LINK_EXT_OK | LINK_LOC => {
+                // No post or PMEM here: `monitor()`'s tail closes the cycle.
+                self.mem.allocate(ArrayBuf::Arr(i), self.nelm);
+                self.mem.allocate(ArrayBuf::Paa, self.nelm);
+                InputLinkRequest::As(LinkReadAs::Array {
+                    dbr: crate::types::DbFieldType::Double,
+                    n_request: self.num_elements(),
+                })
+            }
+            _ => InputLinkRequest::NotRead,
+        }
+    }
+
+    /// The request above reads IAAV..ILLV and NUSE.
+    fn input_link_answers_fixed_at_type(&self) -> bool {
+        false
+    }
+
+    /// `INAA..INLL` land in `*pavalue`, the array field itself.
+    fn array_read_destination(&self, link_field: &str) -> Option<EpicsValue> {
+        let i = Self::ina_index(link_field)?;
+        Some(EpicsValue::DoubleArray(self.arr_vals[i].as_slice().into()))
+    }
+
+    /// The array loop returns the status (`aCalcoutRecord.c:1099`) before
+    /// its zero-fill and NEWM compare.
+    fn land_failed_array_read(&mut self, link_field: &str, left: EpicsValue) {
+        let (Some(i), EpicsValue::DoubleArray(left)) = (Self::ina_index(link_field), left) else {
+            return;
+        };
+        let nelm = (self.nelm as usize).max(1);
+        let buf = &mut self.arr_vals[i];
+        buf.resize(nelm.max(buf.len()), 0.0);
+        let n = left.len().min(buf.len());
+        buf[..n].copy_from_slice(&left[..n]);
     }
 
     fn set_fetch_gate_failed(&mut self, failed: bool) {
@@ -2472,7 +2522,10 @@ impl Record for AcalcoutRecord {
     /// `dbCaGetNelements` (resolved by the framework into `target`), clamped
     /// by the source count `i = (nuse > 0) ? nuse : nelm` (:82-83) — the
     /// staged array's served length here, so a 1-element source picks the
-    /// scalar whatever the target is.
+    /// scalar whatever the target is. C sizes only a `CA_LINK` or a `DB_LINK`
+    /// (:75-80): for a JSON link it reads the inactive `pv_link.pvname`, NULL
+    /// after `dbStaticLib.c:135`'s memset, so it writes one element and drops
+    /// the array. That C defect is not copied; every link uses its own count.
     fn multi_output_buffer(
         &self,
         link_field: &str,

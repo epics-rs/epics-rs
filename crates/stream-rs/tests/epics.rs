@@ -398,8 +398,7 @@ struct Logged {
     line: String,
 }
 
-/// The C log, made comparable: the protocol path is the oracle directory.
-/// The dbgf lines after the run have no thread.
+/// The C log, made comparable. The dbgf lines after the run have no thread.
 fn expected(name: &str) -> Vec<Logged> {
     // C keeps the spaces before the bus name in the protocol name
     // (StreamEpics.cc initRecord) and finds no protocol "p   ": the port
@@ -411,11 +410,6 @@ fn expected(name: &str) -> Vec<Logged> {
         name
     };
     let log = std::fs::read_to_string(oracle_dir().join(format!("{file}.log"))).unwrap();
-    let dir = log
-        .lines()
-        .find_map(|l| l.strip_prefix("-\tStreamProtocolParser::path = "))
-        .unwrap()
-        .to_string();
     log.lines()
         .map(|l| match l.split_once('\t') {
             Some((thread, line)) => (thread, line),
@@ -429,7 +423,7 @@ fn expected(name: &str) -> Vec<Logged> {
                 let line = "OVAL \"two\"".to_string();
                 return Logged { thread, line };
             }
-            let line = masked(&fixed_convert_text(&line.replace(&dir, "<dir>")));
+            let line = masked(&fixed_convert_text(&line));
             let line = if name == "link_spaces" {
                 line.replace(
                     "parse link string \"l.proto p P\"",

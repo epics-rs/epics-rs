@@ -7,7 +7,7 @@
 //! was printed.
 //!
 //! The expected byte string is the one the compiled tools write. Captured from
-//! `/home/stevek/work/epics-base/bin/linux-x86_64`:
+//! `$EPICS_BASE/bin/linux-x86_64`:
 //!
 //! ```text
 //! $ EPICS_CA_ADDR_LIST="127.0.0.1:15099 127.0.0.1:15099" caget TST:X

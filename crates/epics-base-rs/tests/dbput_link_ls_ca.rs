@@ -3,7 +3,7 @@
 //! `DBF_DOUBLE` channel sends one `DBR_STRING` and into a `DBF_CHAR` one the
 //! characters. While the channel is down the type is -1 (`pcaGetCheck`,
 //! `dbCa.c:621-631`): nothing is put and no LINK alarm is raised. Both the
-//! `ca://` form and a DB-spelled name this IOC does not hold.
+//! ` CA` form and a DB-spelled name this IOC does not hold.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -70,9 +70,9 @@ impl LinkSet for Remote {
 }
 
 const DB: &str = r#"
-record(lso,"LA"){field(SIZV,"64") field(OUT,"ca://AO")}
-record(lso,"LW"){field(SIZV,"64") field(OUT,"ca://WF")}
-record(lso,"LD"){field(SIZV,"64") field(OUT,"ca://DOWN")}
+record(lso,"LA"){field(SIZV,"64") field(OUT,"AO CA")}
+record(lso,"LW"){field(SIZV,"64") field(OUT,"WF CA")}
+record(lso,"LD"){field(SIZV,"64") field(OUT,"DOWN CA")}
 record(lso,"NA"){field(SIZV,"64") field(OUT,"AO")}
 record(lso,"NW"){field(SIZV,"64") field(OUT,"WF")}
 record(lso,"ND"){field(SIZV,"64") field(OUT,"DOWN")}

@@ -46,8 +46,8 @@ fn seeded_port(
         name,
         1,
         flags,
-        InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_INTERRUPTS,
+        InterfaceMask::FLOAT64,
+        InterfaceMask::FLOAT64,
     );
     let val = base.create_param("VAL", ParamType::Float64).unwrap();
     base.set_float64_param(val, 0, 4.0).unwrap();

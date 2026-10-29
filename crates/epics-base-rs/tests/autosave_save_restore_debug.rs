@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use epics_base_rs::runtime::task::sleep;
 use epics_base_rs::server::autosave::AutosaveStartupConfig;
-use epics_base_rs::server::ioc_app::IocApplication;
+use epics_base_rs::server::ioc_app::{IocApplication, RunOutcome};
 
 const CHILD: &str = "AUTOSAVE_SR_DEBUG_SCRIPT";
 
@@ -26,11 +26,11 @@ async fn child_debug() {
     let Some(script) = std::env::var_os(CHILD) else {
         return;
     };
-    IocApplication::new()
+    let outcome = IocApplication::new()
         .port(0)
         .autosave_startup(Arc::new(Mutex::new(AutosaveStartupConfig::new())))
         .startup_script(script.to_str().unwrap())
-        .run(|config| async move {
+        .run_outcome(|config| async move {
             let mgr = config.autosave_manager.unwrap();
             // The script's lines after iocInit run, and queue their ops.
             epics_base_rs::server::db_server::announce_serving("probe");
@@ -40,6 +40,8 @@ async fn child_debug() {
         })
         .await
         .unwrap();
+    // A task this runner never shut down shows nothing either.
+    assert_eq!(outcome, RunOutcome::Served);
 }
 
 /// The child's stdout lines that start `save_restore` or `manual_save`.

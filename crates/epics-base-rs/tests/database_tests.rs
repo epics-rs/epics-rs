@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use epics_base_rs::error::CaError;
 use epics_base_rs::server::database::{PvDatabase, RecordLoad};
+use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::record::*;
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::server::records::ao::AoRecord;
@@ -25,6 +26,17 @@ fn sub_with_snam(snam: &str) -> epics_base_rs::server::records::sub_record::SubR
     rec.put_field("SNAM", EpicsValue::String(snam.into()))
         .expect("SNAM is writable");
     rec
+}
+
+/// A database that declares the `pva` link type, as softIocPVX's does; a
+/// `{pva:…}` link text is refused by a database that does not.
+async fn pva_database() -> Arc<PvDatabase> {
+    IocBuilder::new()
+        .register_link_type("pva", |_db| async { Vec::new() })
+        .build()
+        .await
+        .unwrap()
+        .0
 }
 
 #[epics_macros_rs::epics_test]
@@ -361,7 +373,7 @@ async fn test_out_link_nms_does_not_propagate_alarm_to_dest() {
 }
 
 /// B2 regression: a soft-channel record whose INP is an external
-/// `pva://` link must fold the lset's gated alarm severity into its
+/// pva link must fold the lset's gated alarm severity into its
 /// own `LINK_ALARM`. Previously `read_link_with_alarm` returned
 /// `(None, None)` for any non-Db link, so a connected pva link
 /// carrying a remote MAJOR severity left the owning record at
@@ -393,14 +405,17 @@ async fn test_pva_link_propagates_alarm_severity_into_link_alarm() {
         }
     }
 
-    let db = PvDatabase::new();
+    let db = pva_database().await;
     db.register_link_set("pva", Arc::new(AlarmingLset)).await;
     db.add_record("PVADST", Box::new(AiRecord::new(0.0)))
         .await
         .unwrap();
-    db.put_pv_no_process("PVADST.INP", EpicsValue::String("pva://REMOTE:PV".into()))
-        .await
-        .unwrap();
+    db.put_pv_no_process(
+        "PVADST.INP",
+        EpicsValue::String(r#"{pva:"REMOTE:PV"}"#.into()),
+    )
+    .await
+    .unwrap();
     if let Some(rec) = db.get_record("PVADST") {
         let mut inst = rec.write();
         inst.common.udf = 0;
@@ -455,14 +470,17 @@ async fn test_pva_link_no_alarm_when_lset_reports_none() {
         // alarm_severity defaults to None.
     }
 
-    let db = PvDatabase::new();
+    let db = pva_database().await;
     db.register_link_set("pva", Arc::new(QuietLset)).await;
     db.add_record("PVAQUIET", Box::new(AiRecord::new(0.0)))
         .await
         .unwrap();
-    db.put_pv_no_process("PVAQUIET.INP", EpicsValue::String("pva://REMOTE:OK".into()))
-        .await
-        .unwrap();
+    db.put_pv_no_process(
+        "PVAQUIET.INP",
+        EpicsValue::String(r#"{pva:"REMOTE:OK"}"#.into()),
+    )
+    .await
+    .unwrap();
     if let Some(rec) = db.get_record("PVAQUIET") {
         let mut inst = rec.write();
         inst.common.udf = 0;
@@ -534,7 +552,7 @@ impl epics_base_rs::server::database::LinkSet for CapturingLset {
     }
 }
 
-/// A record whose OUT link is an external `pva://` link must drive
+/// A record whose OUT link is an external pva link must drive
 /// the processed value through the registered link set's `put_value`.
 ///
 /// Before this fix the OUT-link write stage in `processing.rs` only
@@ -551,9 +569,7 @@ async fn test_pva_out_link_writes_value_through_link_set() {
     use epics_base_rs::server::database::LinkPutOp;
 
     let writes = Arc::new(Mutex::new(Vec::new()));
-    let db = PvDatabase::new();
-    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
-    db.ca_link_init();
+    let db = pva_database().await;
     db.register_link_set(
         "pva",
         Arc::new(CapturingLset {
@@ -569,7 +585,7 @@ async fn test_pva_out_link_writes_value_through_link_set() {
         .unwrap();
     db.put_pv_no_process(
         "AO_PVAOUT.OUT",
-        EpicsValue::String("pva://REMOTE:OUT".into()),
+        EpicsValue::String(r#"{pva:"REMOTE:OUT"}"#.into()),
     )
     .await
     .unwrap();
@@ -600,7 +616,7 @@ async fn test_pva_out_link_writes_value_through_link_set() {
     );
     assert_eq!(
         captured[0].0, "REMOTE:OUT",
-        "put_value must receive the bare PV name (scheme stripped)"
+        "put_value must receive the bare PV name"
     );
     assert_eq!(
         captured[0].1.to_f64(),
@@ -615,19 +631,19 @@ async fn test_pva_out_link_writes_value_through_link_set() {
     );
 }
 
-/// A record with a `pva://` OUT link and NO registered link set must
+/// A record with a pva OUT link and NO registered link set must
 /// fail gracefully — process() completes without panic, the value is
 /// simply not delivered (C `dbPutLink` returns `S_db_noLSET`).
 #[epics_macros_rs::epics_test]
 async fn test_pva_out_link_no_link_set_fails_gracefully() {
-    let db = PvDatabase::new();
-    // No register_link_set call — the "pva" scheme is unregistered.
+    let db = pva_database().await;
+    // The `pva` link type is declared, but no link set is registered.
     db.add_record("AO_NOLSET", Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();
     db.put_pv_no_process(
         "AO_NOLSET.OUT",
-        EpicsValue::String("pva://NOWHERE:PV".into()),
+        EpicsValue::String(r#"{pva:"NOWHERE:PV"}"#.into()),
     )
     .await
     .unwrap();
@@ -656,23 +672,18 @@ async fn test_pva_out_link_no_link_set_fails_gracefully() {
 }
 
 /// Boundary twin of `test_pva_out_link_writes_value_through_link_set`:
-/// when the originating record is part of a put-notify / blocking-put
-/// chain (it carries a completion wait-set), its external OUT-link
-/// write must be delivered as [`LinkPutOp::Async`] — the C
-/// `dbPutLinkAsync` / pvxs `pvaPutValueAsync` path. The plain-process
-/// twin asserts the `Plain` boundary; this asserts `Async`, so the
-/// notify→op mapping (`PvDatabase::external_put_op`) is pinned on both
-/// sides of its single branch.
+/// a record in a put-notify chain (it carries a completion wait-set) still
+/// writes its pva OUT link with [`LinkPutOp::Plain`]: a Soft Channel ao
+/// calls `dbPutLink`, which is pvxs `pvaPutValue` (`wait=false`); only
+/// `dbPutLinkAsync` reaches `pvaPutValueAsync`.
 #[epics_macros_rs::epics_test]
-async fn test_pva_out_link_put_notify_chain_uses_async_op() {
+async fn test_pva_out_link_put_notify_chain_puts_plain() {
     use std::sync::Mutex;
 
     use epics_base_rs::server::database::LinkPutOp;
 
     let writes = Arc::new(Mutex::new(Vec::new()));
-    let db = PvDatabase::new();
-    // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
-    db.ca_link_init();
+    let db = pva_database().await;
     db.register_link_set(
         "pva",
         Arc::new(CapturingLset {
@@ -690,7 +701,7 @@ async fn test_pva_out_link_put_notify_chain_uses_async_op() {
     let (tx, _rx) = epics_base_rs::runtime::sync::oneshot::channel();
     db.put_pv_no_process(
         "AO_PVAOUT_NOTIFY.OUT",
-        EpicsValue::String("pva://REMOTE:OUT".into()),
+        EpicsValue::String(r#"{pva:"REMOTE:OUT"}"#.into()),
     )
     .await
     .unwrap();
@@ -701,7 +712,7 @@ async fn test_pva_out_link_put_notify_chain_uses_async_op() {
             .put_field("VAL", EpicsValue::Double(7.0))
             .unwrap();
         // Arm a put-notify wait-set: the source record is now in a
-        // blocking-put chain, so its OUT-link write must use Async.
+        // blocking-put chain.
         inst.install_or_queue_notify(tx)
             .expect("the record is free, so the wait-set installs");
     }
@@ -710,11 +721,8 @@ async fn test_pva_out_link_put_notify_chain_uses_async_op() {
     db.process_record_with_links("AO_PVAOUT_NOTIFY", &mut visited)
         .await
         .unwrap();
-    // The completion flavour stages and returns like the plain one (C
-    // `dbCaPutLinkCallback`, `dbCa.c:585-595`), so the wire write is observed
-    // through the `dbCaSync` barrier. This test asserts the OP FLAVOUR, not
-    // the timing — the timing boundary is
-    // `external_link_put_enqueue::async_put_completion_is_reported_through_the_notify_chain`.
+    // The put is staged, so the wire write is observed through the
+    // `dbCaSync` barrier.
     db.sync_external_link_puts().await;
 
     let captured = writes.lock().unwrap();
@@ -726,10 +734,8 @@ async fn test_pva_out_link_put_notify_chain_uses_async_op() {
     assert_eq!(captured[0].0, "REMOTE:OUT");
     assert_eq!(
         captured[0].2,
-        LinkPutOp::Async,
-        "an OUT-link write from a put-notify chain must be a \
-         completion-aware Async put (C dbPutLinkAsync / pvxs \
-         pvaPutValueAsync)"
+        LinkPutOp::Plain,
+        "a put-notify chain's dbPutLink is pvxs pvaPutValue"
     );
 }
 
@@ -3217,7 +3223,8 @@ async fn test_put_to_pact_record_sets_rpro_and_second_value_reaches_device() {
     // Device callback completes cycle 1. recGblFwdLink consumes RPRO and
     // queues the reprocess (a detached task, C's scanOnce ring).
     db.complete_async_record("ASYNC_OUT").await.unwrap();
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if writes.lock().unwrap().len() >= 2 {
             break;
         }
@@ -3824,7 +3831,7 @@ async fn test_reprocess_after_continuation_bypasses_pact_guard() {
     // loaded machine puts that construction plus a 20 ms timer well past
     // any interval short enough to be worth writing. The deadline is a
     // failure bound, not the expected latency (20.7 ms, idle Linux).
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
     while process_count.load(Ordering::SeqCst) < 2 && std::time::Instant::now() < deadline {
         epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(1)).await;
     }
@@ -4343,7 +4350,8 @@ async fn test_fire_and_forget_put_parks_no_notify_write_notify_stays_legal() {
     // makes the record PACT again — and the callback belongs to THAT cycle, the
     // first one that actually saw 2.0.
     db.complete_async_record("PN_FF").await.unwrap();
-    for _ in 0..2000 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         let rec = db.get_record("PN_FF").unwrap();
         let inst = rec.read();
         if inst.is_processing() && inst.record.get_field("VAL") == Some(EpicsValue::Double(2.0)) {
@@ -4485,7 +4493,7 @@ async fn scan_once_is_not_joined_to_put_notify_completion() {
     // continuation is: the scanOnce is a spawned cycle, so how long it takes
     // to land is the machine's business, and a fixed settle only encodes the
     // load the test was written under.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
     while count.load(Ordering::SeqCst) < 2 && std::time::Instant::now() < deadline {
         epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(1)).await;
     }
@@ -6010,7 +6018,8 @@ async fn test_dfanout_out_link_write_success_no_link_alarm() {
 /// recursion", `seqRecord.c:210-215`), so the group work and `asyncFinish`
 /// (`:219-241`) run after `process_record_with_links` returns.
 async fn settle_seq(db: &PvDatabase, rec: &str) {
-    for _ in 0..400 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if !db.get_record(rec).unwrap().read().is_processing() {
             return;
         }
@@ -6317,7 +6326,8 @@ async fn test_write_db_link_runs_before_flnk_target_reads_fresh() {
 /// completes via spawned per-step re-entries, so the kicking call returns
 /// before the later steps' `LNKn` writes happen.
 async fn poll_atomic_reaches(label: &str, counter: &Arc<AtomicU32>, want: u32) {
-    for _ in 0..400 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if counter.load(Ordering::SeqCst) >= want {
             epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(30)).await;
             return;
@@ -6333,7 +6343,8 @@ async fn poll_atomic_reaches(label: &str, counter: &Arc<AtomicU32>, want: u32) {
 /// Poll a PV until it equals `want`, with a timeout. Used to wait out the
 /// sseq machine's per-step `DLYn` delays + async re-entries.
 async fn poll_pv_double(db: &PvDatabase, pv: &str, want: f64) {
-    for _ in 0..400 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if let Ok(EpicsValue::Double(v)) = db.get_pv(pv) {
             if (v - want).abs() < 1e-10 {
                 return;
@@ -7089,7 +7100,7 @@ async fn test_tsel_ca_time_link_copies_source_time() {
     {
         let rec = db.get_record("TS_CADST").unwrap();
         let mut inst = rec.write();
-        inst.common.text.tsel = "ca://TSE_SRC.TIME".into();
+        inst.common.text.tsel = "TSE_SRC.TIME CA".into();
         let tsel = parse_link_v2(&inst.common.text.tsel);
         inst.install_link_cache("TSEL", std::sync::Arc::new(tsel))
             .expect("a common link");
@@ -7117,7 +7128,7 @@ async fn test_tsel_ca_time_link_copies_source_time() {
 
 #[epics_macros_rs::epics_test]
 async fn test_tsel_nonlocal_db_time_link_copies_remote_time() {
-    // A bare TSEL `.TIME` link (no `ca://`, no CP/CPP/CA modifier) whose
+    // A bare TSEL `.TIME` link (no CP/CPP/CA modifier) whose
     // target record is NOT local. C `dbInitLink` (dbLink.c:115-130) sets
     // `TSELisTIME` and strips `.TIME` BEFORE the DB-vs-CA decision, then
     // `dbDbInitLink` fails for the non-local target so the link becomes a
@@ -7144,7 +7155,7 @@ async fn test_tsel_nonlocal_db_time_link_copies_remote_time() {
             let name = link.name;
             // The bare Db record name (`.TIME` already split into the link
             // field by the parser) reaches the CA lset via the non-local
-            // fallback `external_link_time("ca://TSE_SRC")`.
+            // fallback CA `external_link_time` for `TSE_SRC`.
             assert_eq!(
                 name, b"TSE_SRC",
                 "non-local TSEL .TIME must address the bare record"
@@ -8392,11 +8403,10 @@ async fn test_histogram_sdel_watchdog_posts_val() {
         .unwrap();
 
     // The tick must post VAL and zero MCNT.
-    let event =
-        epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(2), val_rx.recv())
-            .await
-            .expect("SDEL watchdog must post VAL within one period")
-            .expect("subscription alive");
+    let event = epics_base_rs::runtime::task::timeout(fact_budget::FACT_BUDGET, val_rx.recv())
+        .await
+        .expect("SDEL watchdog must post VAL")
+        .expect("subscription alive");
     match &event.delivered_value(&rec.read(), "VAL").unwrap() {
         EpicsValue::ULongArray(v) => assert_eq!(
             v,
@@ -8415,11 +8425,10 @@ async fn test_histogram_sdel_watchdog_posts_val() {
     db.put_record_field_from_ca("HI_WDOG", "SGNL", EpicsValue::Double(6.0))
         .await
         .unwrap();
-    let event =
-        epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(2), val_rx.recv())
-            .await
-            .expect("the watchdog re-arms itself (C: callbackRequestDelayed at the tail)")
-            .expect("subscription alive");
+    let event = epics_base_rs::runtime::task::timeout(fact_budget::FACT_BUDGET, val_rx.recv())
+        .await
+        .expect("the watchdog re-arms itself (C: callbackRequestDelayed at the tail)")
+        .expect("subscription alive");
     match &event.delivered_value(&rec.read(), "VAL").unwrap() {
         EpicsValue::ULongArray(v) => assert_eq!(v, &vec![1, 1]),
         other => panic!("VAL must be ULongArray (C DBF_ULONG), got {other:?}"),
@@ -8585,43 +8594,43 @@ async fn test_lnk_calc_parses_and_evaluates() {
     use epics_base_rs::server::record::{CalcLink, ParsedLink, parse_link_v2};
     use epics_base_rs::server::records::ai::AiRecord;
 
-    // The port's string-arg shorthand: one `args` slot holding a link to
-    // the named record. C refuses a bare string here (`lnkCalc.c:187-190`);
-    // see the DEVIATION note on `json_calc_arg`.
-    fn name_arg(pv: &str) -> CalcArg {
-        CalcArg::Link(Box::new(parse_link_v2(pv)))
+    fn pva_arg(pv: &str) -> CalcArg {
+        CalcArg::Link(Box::new(ParsedLink::Pva(PvaChannelLink::new(pv))))
     }
 
     // Parser: full lnkCalc form.
-    let parsed = parse_link_v2(r#"{calc:{"expr":"A+B*2","args":["pv_a","pv_b"],"time":"A"}}"#);
+    let parsed =
+        parse_link_v2(r#"{calc:{"expr":"A+B*2","args":[{pva:"pv_a"},{pva:"pv_b"}],"time":"A"}}"#);
     let calc = match parsed {
         ParsedLink::Calc(c) => c,
         other => panic!("expected ParsedLink::Calc, got {other:?}"),
     };
     assert_eq!(calc.expr.as_deref(), Some("A+B*2"));
-    assert_eq!(calc.args, vec![name_arg("pv_a"), name_arg("pv_b")]);
+    assert_eq!(calc.args, vec![pva_arg("pv_a"), pva_arg("pv_b")]);
     assert_eq!(calc.time_source, Some('A'));
 
     // Parser without `time` field — time_source must be None.
-    let no_time = parse_link_v2(r#"{calc:{"expr":"A","args":["pv_a"]}}"#);
+    let no_time = parse_link_v2(r#"{calc:{"expr":"A","args":[1]}}"#);
     assert!(matches!(no_time, ParsedLink::Calc(c) if c.time_source.is_none()));
 
     // Parser refuses more than CALC_NARGS args — C `lnkCalc.c:135-139`
     // returns `jlif_stop`, it does not truncate. The 21/22 boundary itself
     // is pinned in `tests/calc_json_link_body.rs`.
-    let names: Vec<String> = (0..=epics_base_rs::calc::CALC_NARGS)
-        .map(|i| format!("\"pv{i}\""))
+    let args: Vec<String> = (0..=epics_base_rs::calc::CALC_NARGS)
+        .map(|i| i.to_string())
         .collect();
     let too_many = parse_link_v2(&format!(
         r#"{{calc:{{"expr":"A","args":[{}]}}}}"#,
-        names.join(",")
+        args.join(",")
     ));
     assert!(
         !matches!(too_many, ParsedLink::Calc(_)),
         "more than CALC_NARGS args must NOT parse as Calc"
     );
 
-    // Read-path: feed real PVs, evaluate A+B*2.
+    // Read-path: feed real PVs, evaluate A+B*2. A DB link child is built
+    // here, as no link text yields one: `lnkCalc_string` refuses a string
+    // arg (`lnkCalc.c:188-191`).
     let db = PvDatabase::new();
     db.add_record("pv_a", Box::new(AiRecord::new(3.0)))
         .await
@@ -8635,7 +8644,10 @@ async fn test_lnk_calc_parses_and_evaluates() {
         major: None,
         minor: None,
         out: None,
-        args: vec![name_arg("pv_a"), name_arg("pv_b")],
+        args: vec![
+            CalcArg::Link(Box::new(parse_link_v2("pv_a"))),
+            CalcArg::Link(Box::new(parse_link_v2("pv_b"))),
+        ],
         time_source: Some('A'),
         val: Default::default(),
         prec: 15,
@@ -8648,91 +8660,6 @@ async fn test_lnk_calc_parses_and_evaluates() {
         .expect("calc link evaluates");
     match value {
         EpicsValue::Double(v) => assert!((v - 13.0).abs() < 1e-9, "expected 3+5*2=13, got {v}"),
-        other => panic!("expected Double, got {other:?}"),
-    }
-}
-
-/// A `lnkCalc` `{calc:...}` link whose input record is NON-LOCAL must
-/// read that input through the external CA path — each `A..` input is its
-/// own `dbInitLink` link (`lnkCalc.c:353`), so a non-local input is a CA
-/// link. The pre-fix loop read every input with a local-only `get_pv`, so
-/// a single non-local input made the whole evaluation return `None`.
-/// Sibling of the non-local Db read / OUT-write / TSEL `.TIME` fixes —
-/// same `dbInitLink` locality cause, the lnkCalc inputs. The matching
-/// non-local TIMESTAMP boundary is in
-/// `calc_link_adopts_its_time_inputs_stamp.rs`, which owns that half.
-#[epics_macros_rs::epics_test]
-async fn test_lnk_calc_nonlocal_input_resolves_externally() {
-    use epics_base_rs::server::database::{LinkRef, LinkSet};
-    use epics_base_rs::server::record::CalcLink;
-    use epics_base_rs::server::records::ai::AiRecord;
-
-    struct CalcCaLset {
-        secs: i64,
-        nsec: i32,
-    }
-    #[epics_base_rs::async_trait]
-    impl LinkSet for CalcCaLset {
-        fn is_connected(&self, _: LinkRef<'_>) -> bool {
-            true
-        }
-        fn get_cached_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
-            let name = link.name;
-            (name == b"REMOTE:A").then_some(EpicsValue::Double(10.0))
-        }
-        async fn get_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
-            self.get_cached_value(link)
-        }
-        fn time_stamp(&self, link: LinkRef<'_>) -> Option<(i64, i32, u64)> {
-            let name = link.name;
-            (name == b"REMOTE:A").then_some((self.secs, self.nsec, 0))
-        }
-    }
-
-    let db = PvDatabase::new();
-    db.register_link_set(
-        "ca",
-        Arc::new(CalcCaLset {
-            secs: 1_700_000_456,
-            nsec: 321,
-        }),
-    )
-    .await;
-    db.process_cp_links_on_connect().await;
-    // pv_b is local; REMOTE:A is never added → non-local CA input.
-    db.add_record("pv_b", Box::new(AiRecord::new(5.0)))
-        .await
-        .unwrap();
-
-    let calc = CalcLink {
-        expr: Some("A+B*2".into()),
-        major: None,
-        minor: None,
-        out: None,
-        args: vec![
-            CalcArg::Link(Box::new(parse_link_v2("REMOTE:A"))),
-            CalcArg::Link(Box::new(parse_link_v2("pv_b"))),
-        ],
-        time_source: Some('A'),
-        val: Default::default(),
-        prec: 15,
-        units: None,
-    };
-
-    let mut visited = epics_base_rs::server::database::ProcStack::new();
-    let value = db
-        .read_link_value_soft(
-            &epics_base_rs::server::record::ParsedLink::Calc(Box::new(calc)),
-            true,
-            &mut visited,
-        )
-        .expect("calc with a non-local input must still evaluate");
-    match value {
-        // 10 (remote A) + 5 (local B) * 2 = 20.
-        EpicsValue::Double(v) => assert!(
-            (v - 20.0).abs() < 1e-9,
-            "non-local calc input must resolve via CA: expected 20, got {v}"
-        ),
         other => panic!("expected Double, got {other:?}"),
     }
 }
@@ -9533,7 +9460,7 @@ async fn br_fr3_ca_link_applies_maximize_switch_at_processing() {
     const REMOTE_STAT: i32 = alarm_status::COMM_ALARM as i32;
 
     // NMS — no propagation despite a connected MAJOR remote.
-    let (sevr, _stat) = run("ca://REMOTE NMS", 2, REMOTE_STAT).await;
+    let (sevr, _stat) = run("REMOTE CA NMS", 2, REMOTE_STAT).await;
     assert_eq!(
         sevr,
         AlarmSeverity::NoAlarm,
@@ -9541,7 +9468,7 @@ async fn br_fr3_ca_link_applies_maximize_switch_at_processing() {
     );
 
     // MS — lift to remote MAJOR, but surface as the generic LINK_ALARM.
-    let (sevr, stat) = run("ca://REMOTE MS", 2, REMOTE_STAT).await;
+    let (sevr, stat) = run("REMOTE CA MS", 2, REMOTE_STAT).await;
     assert_eq!(sevr, AlarmSeverity::Major, "MS lifts SEVR to remote MAJOR");
     assert_eq!(
         stat,
@@ -9550,7 +9477,7 @@ async fn br_fr3_ca_link_applies_maximize_switch_at_processing() {
     );
 
     // MSS — lift severity AND adopt the remote STAT (the cited gap).
-    let (sevr, stat) = run("ca://REMOTE MSS", 2, REMOTE_STAT).await;
+    let (sevr, stat) = run("REMOTE CA MSS", 2, REMOTE_STAT).await;
     assert_eq!(sevr, AlarmSeverity::Major, "MSS lifts SEVR to remote MAJOR");
     assert_eq!(
         stat,
@@ -9559,7 +9486,7 @@ async fn br_fr3_ca_link_applies_maximize_switch_at_processing() {
     );
 
     // MSI with a non-INVALID (MAJOR) remote — must NOT propagate.
-    let (sevr, _stat) = run("ca://REMOTE MSI", 2, REMOTE_STAT).await;
+    let (sevr, _stat) = run("REMOTE CA MSI", 2, REMOTE_STAT).await;
     assert_eq!(
         sevr,
         AlarmSeverity::NoAlarm,
@@ -9567,7 +9494,7 @@ async fn br_fr3_ca_link_applies_maximize_switch_at_processing() {
     );
 
     // MSI with an INVALID remote — inherits as LINK_ALARM + INVALID.
-    let (sevr, stat) = run("ca://REMOTE MSI", 3, REMOTE_STAT).await;
+    let (sevr, stat) = run("REMOTE CA MSI", 3, REMOTE_STAT).await;
     assert_eq!(
         sevr,
         AlarmSeverity::Invalid,

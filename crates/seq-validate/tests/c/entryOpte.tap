@@ -1,0 +1,6 @@
+1..5
+ok  1 - seqg_vars_opt_e.entry1cnt == 0
+ok  2 - seqg_vars_opt_e.entry2cnt == seqg_vars_opt_e.delayed2 + 1
+ok  3 - seqg_vars_opt_e.entry2cnt == seqg_vars_opt_e.delayed2 + 1
+ok  4 - seqg_vars_opt_e.entry2cnt == seqg_vars_opt_e.delayed2 + 1
+ok  5 - seqg_vars_opt_e.entry2cnt == seqg_vars_opt_e.delayed2 + 1

@@ -8,7 +8,7 @@
 //! `caput SA.NELM 2` EMPTIED VAL instead of narrowing the slice.
 //!
 //! Expectations are from a built softIoc
-//! (`/home/stevek/work/epics-base/bin/linux-x86_64/softIoc`) driving these exact
+//! (`$EPICS_BASE/bin/linux-x86_64/softIoc`) driving these exact
 //! records over CA.
 
 use epics_base_rs::server::ioc_builder::IocBuilder;

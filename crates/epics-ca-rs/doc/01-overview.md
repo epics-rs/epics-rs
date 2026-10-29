@@ -101,7 +101,7 @@ let client = CaClient::new().await?;
 let ch = client.create_channel("MY:PV");
 ch.wait_connected(Duration::from_secs(5)).await?;
 let (_, val) = ch.get_with_timeout(Duration::from_secs(3)).await?;
-ch.put(&EpicsValue::Long(42)).await?;
+ch.put_with_timeout(&EpicsValue::Long(42), Duration::from_secs(3)).await?;
 let mut monitor = ch.subscribe().await?;
 while let Some(snap) = monitor.recv().await { ... }
 ```

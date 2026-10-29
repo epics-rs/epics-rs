@@ -377,7 +377,6 @@ async fn main() -> CaResult<()> {
     // + configuration in st.cmd (simMotorCreate + dbLoadRecords per motor).
     // ========================================================================
 
-    epics_base_rs::runtime::env::set_default_path("MOTOR", motor_rs::MOTOR_IOC_DIR);
     let motor_holder = SimMotorHolder::new();
     app = app.register_startup_command(motor_holder.sim_motor_create_command());
     app = app.register_dynamic_device_support(

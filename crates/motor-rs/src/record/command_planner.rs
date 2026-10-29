@@ -370,13 +370,20 @@ impl MotorRecord {
                     } else {
                         self.dispatch_latent_collection(&mut effects, reason);
                     }
+                } else if self.retry_armed() {
+                    self.dispatch_latent_collection(&mut effects, reason);
                 }
             }
             CommandSource::Sync => {
                 // C 2540-2544: the latched SYNC applies only when idle
                 // (`mip == MIP_DONE`); written during a motion it stays
                 // latched and finalize_motion consumes it at completion.
-                self.apply_latent_sync();
+                // An armed retry takes the move block ahead of it (2455).
+                if self.retry_armed() {
+                    self.dispatch_latent_collection(&mut effects, reason);
+                } else {
+                    self.apply_latent_sync();
+                }
             }
             CommandSource::Set => {
                 // C: the SET-mode redefinition dispatches through the
@@ -401,6 +408,19 @@ impl MotorRecord {
     /// Plan an absolute move to current DVAL: C do_work's move block,
     /// dispatching only at `mip == MIP_DONE || mip == MIP_RETRY`.
     pub(crate) fn plan_absolute_move(&mut self, effects: &mut ProcessEffects) {
+        // A target with no i64 step count (NaN, ±Inf, or DVAL/MRES past
+        // 2^63) is a C defect not copied: NINT (motor.h:88) casts it to long
+        // unchecked, which is undefined, and C dispatches it to sit moving
+        // (the oracle on motorSim, for NaN, ±Inf and -1e300). Here NaN read
+        // as 0 steps and re-armed the sub-step poll without end, -Inf and
+        // -1e300 overflowed the step difference, +Inf reached the driver. It
+        // is refused like a refused move (2434-2452), before the SET test.
+        let npos = (self.pos.dval / self.conv.mres).round();
+        let countable = (i64::MIN as f64..i64::MAX as f64).contains(&npos);
+        if !self.pos.dval.is_finite() || (self.conv.mres != 0.0 && !countable) {
+            self.refuse_move_restore_lasts();
+            return;
+        }
         // C move-block entry (2248-2255): DIFF and RDIF are recomputed
         // from the requested target before anything else — they post
         // even when the pass is then suppressed (too_small) or refused
@@ -446,11 +466,12 @@ impl MotorRecord {
         // dispatch when under one motor step or inside the open SPDB
         // window around DRBV (2313-2326).
         if self.conv.mres != 0.0 {
-            let npos = (self.pos.dval / self.conv.mres).round() as i64;
+            let npos = npos as i64;
             let rpos = (self.pos.drbv / self.conv.mres).round() as i64;
-            let steps = (npos - rpos).abs();
+            // Both counts fit i64, their distance may not.
+            let steps = npos.abs_diff(rpos);
             let too_small = if self.stat.mip.contains(MipFlags::RETRY) {
-                let rdbd_steps = (self.retry.rdbd / self.conv.mres.abs()).round() as i64;
+                let rdbd_steps = (self.retry.rdbd / self.conv.mres.abs()).round() as u64;
                 steps < rdbd_steps
             } else {
                 steps < 1
@@ -1066,7 +1087,9 @@ impl MotorRecord {
         effects: &mut ProcessEffects,
         reason: ProcReason,
     ) {
-        if self.stat.dmov == 0 || !self.can_accept_command() {
+        // `!dmov` enters the move block (2241), whose dispatch gate (2455)
+        // passes only maybeRetry's armed retry among the `!dmov` states.
+        if (self.stat.dmov == 0 && !self.retry_armed()) || !self.can_accept_command() {
             return;
         }
         // C closed-loop bypass (1994-2008): its else covers only the
@@ -1087,13 +1110,13 @@ impl MotorRecord {
         if self.collect_drive_fields() {
             return;
         }
-        // C move block entry (2241): `dval != ldvl || !dmov` — dmov is
-        // true past the gate above, so only a diverged DVAL enters: a
-        // drive field the collection just propagated, or a SET
-        // redefinition parked while a LOAD_POS was in flight (the set
+        // C move block entry (2241): `dval != ldvl || !dmov` — past the
+        // gate above `!dmov` is the armed retry, otherwise only a diverged
+        // DVAL enters: a drive field the collection just propagated, or a
+        // SET redefinition parked while a LOAD_POS was in flight (the set
         // test, 2257-2263, routes it to load_pos, which skips while
         // MIP_LOAD_P is set).
-        if self.pos.dval != self.internal.ldvl {
+        if self.stat.dmov == 0 || self.pos.dval != self.internal.ldvl {
             self.plan_absolute_move(effects);
             return;
         }
@@ -1102,14 +1125,10 @@ impl MotorRecord {
             return;
         }
         // C implicit GET_INFO (2546-2557): a put/scan pass that
-        // dispatched nothing refreshes the device status — STUP goes
-        // BUSY and GET_INFO is sent; a device that cannot deliver it
-        // returns STUP to OFF (here: never enters BUSY, like the
-        // explicit driverless STUP put). determine_event's stup==2
-        // clear + ack on the next fresh status closes the cycle.
-        if reason == ProcReason::NothingDone && self.stat.stup == 0 && self.can_get_info() {
-            self.stat.stup = 2;
-            self.mark(m::STUP);
+        // dispatched nothing refreshes the device status.
+        // determine_event's stup==2 clear + ack on the next fresh status
+        // closes the cycle.
+        if reason == ProcReason::NothingDone && self.stat.stup == 0 && self.request_get_info() {
             effects.commands.push(MotorCommand::Poll);
         }
     }
@@ -1428,11 +1447,7 @@ impl MotorRecord {
     /// A result `<= 0` is C's skipped SET_ACCEL (motorRecord.cc:940, :2529);
     /// the poller turns it into the axis's stored acceleration.
     pub(crate) fn move_accel_egu(&self) -> f64 {
-        let accl = if self.vel.accl > 0.0 {
-            self.vel.accl
-        } else {
-            0.1
-        };
+        let accl = self.accl_divisor();
         let vmax = self.vel.velo.abs();
         let vmin = self.effective_vbas();
         if self.vel.accu == AccsUsed::Accs {
@@ -1445,18 +1460,14 @@ impl MotorRecord {
     }
 
     /// Acceleration for a backlash move, EGU/sec². Uses BVEL/BACC; `<= 0`
-    /// is C's skipped SET_ACCEL (:956, :1005), as in `move_accel_egu`.
+    /// is C's skipped SET_ACCEL (:956, :1005), as in `move_accel_egu`. BACC
+    /// is never 0 here: init and its special() floor it.
     pub(crate) fn backlash_accel_egu(&self) -> f64 {
-        let bacc = if self.vel.bacc > 0.0 {
-            self.vel.bacc
-        } else {
-            0.1
-        };
         let span = self.vel.bvel - self.effective_vbas();
         if span > 0.0 {
-            span / bacc
+            span / self.vel.bacc
         } else {
-            self.vel.bvel / bacc
+            self.vel.bvel / self.vel.bacc
         }
     }
 
@@ -1466,16 +1477,24 @@ impl MotorRecord {
     /// `(hvel - vbase) > 0 ? (hvel - vbase) / accl : hvel / accl`; `<= 0`
     /// is C's skipped SET_ACCEL (:874, :2054), as in `move_accel_egu`.
     pub(crate) fn home_accel_egu(&self) -> f64 {
-        let accl = if self.vel.accl > 0.0 {
-            self.vel.accl
-        } else {
-            0.1
-        };
+        let accl = self.accl_divisor();
         let span = self.vel.hvel - self.effective_vbas();
         if span > 0.0 {
             span / accl
         } else {
             self.vel.hvel / accl
+        }
+    }
+
+    /// The ACCL a move's or home's rate divides by. C divides by it raw
+    /// (motorRecord.cc:492-494, 862, 2048), so a negative ACCL gives the
+    /// negative rate that skips SET_ACCEL. An ACCL of 0, derived from ACCS
+    /// at a VELO of 0 (503), is C's divide by zero; 0.1 stands in for it.
+    fn accl_divisor(&self) -> f64 {
+        if self.vel.accl == 0.0 {
+            0.1
+        } else {
+            self.vel.accl
         }
     }
 
@@ -1818,18 +1837,8 @@ impl MotorRecord {
         // BUSY and fires GET_INFO, then *continues* the pass — it does not
         // early-return — so a user write or device update arriving in the
         // same cycle is not dropped. The data callback returns BUSY to OFF
-        // (process_exit 1498-1502, ported in determine_event). C 1824-1828:
-        // a device that cannot service GET_INFO (WRITE_MSG returns ERROR,
-        // e.g. Soft Channel) drops STUP back to OFF instead of holding
-        // BUSY — with no driver attached the refresh has no consumer and
-        // the BUSY->OFF callback never arrives, so a stuck BUSY would
-        // refuse every later STUP put (special before-write, 2615-2617).
-        let stup_requested = self.stat.stup == 1;
-        let stup_fired = stup_requested && self.can_get_info();
-        if stup_requested {
-            self.stat.stup = if stup_fired { 2 } else { 0 };
-            self.mark(m::STUP);
-        }
+        // (process_exit 1498-1502, ported in determine_event).
+        let stup_fired = self.stat.stup == 1 && self.request_get_info();
         let mut effects = self.do_process_inner();
         if stup_fired {
             // Sent before the rest of the pass, as C's do_work top does.
@@ -1839,12 +1848,25 @@ impl MotorRecord {
     }
 
     /// Whether `build_trans` would queue a GET_INFO: it returns ERROR with
-    /// no device, or, devMotorAsyn's, with the record in COMM_ALARM
-    /// (devMotorAsyn.c:530-532).
+    /// no device or no card (devESP300.cc:182-184), or, devMotorAsyn's, with
+    /// the record in COMM_ALARM (devMotorAsyn.c:530-532).
     fn can_get_info(&self) -> bool {
-        self.device_state.as_ref().is_some_and(|state| {
-            !self.internal.comm_alarm || state.lock().is_ok_and(|ds| !ds.refuses_in_comm_alarm())
-        })
+        self.port.as_ref().is_none_or(|port| port.builds())
+            && self.device_state.as_ref().is_some_and(|state| {
+                !self.internal.comm_alarm
+                    || state.lock().is_ok_and(|ds| !ds.refuses_in_comm_alarm())
+            })
+    }
+
+    /// C's STUP GET_INFO, both sites (1819-1829, 2550-2558): STUP goes BUSY
+    /// and is marked; a `build_trans` refusal returns it to OFF under the
+    /// mark, so monitor() posts the OFF (3630), and no BUSY is left for a
+    /// callback that never comes to clear. Returns whether it was sent.
+    fn request_get_info(&mut self) -> bool {
+        let sent = self.can_get_info();
+        self.stat.stup = if sent { 2 } else { 0 };
+        self.mark(m::STUP);
+        sent
     }
 
     fn do_process_inner(&mut self) -> ProcessEffects {
@@ -1961,6 +1983,12 @@ impl MotorRecord {
             }
             None => self.do_work(ProcReason::NothingDone),
         }
+    }
+
+    /// C `mip == MIP_RETRY`: maybeRetry (1077-1082) armed a retry that this
+    /// pass's move block owes.
+    pub(super) fn retry_armed(&self) -> bool {
+        self.stat.mip == MipFlags::RETRY
     }
 
     /// Whether a put left do_work to this pass: the src a field put

@@ -643,6 +643,11 @@ impl Record for McaRecord {
         "mca"
     }
 
+    /// `if (pmca->siml.type == CONSTANT)` (`mcaRecord.c:442-444`).
+    fn sim_seed_guard(&self) -> epics_base_rs::server::record::SeedGuard {
+        epics_base_rs::server::record::SeedGuard::TypeConstant
+    }
+
     /// `readValue` reads SIML at `DBR_ENUM` (`mcaRecord.c:1106`) and SIOL at
     /// `(FTVL, NMAX)` (`:1117-1118`), so a source either request cannot
     /// convert is a failed read.
@@ -655,6 +660,23 @@ impl Record for McaRecord {
             },
             _ => LinkReadAs::Native,
         })
+    }
+
+    /// SIOL lands in `bptr` (`mcaRecord.c:1118`).
+    fn array_read_destination(&self, link_field: &str) -> Option<EpicsValue> {
+        (link_field == "SIOL").then(|| self.val.clone())
+    }
+
+    /// Only a DB link's read writes part of `bptr`, and NORD takes its
+    /// clamped count whatever the status (`mcaRecord.c:1118-1120`).
+    fn land_failed_array_read(&mut self, link_field: &str, left: EpicsValue) {
+        if link_field != "SIOL" {
+            return;
+        }
+        if let Ok((read, n)) = self.land_buffer(left) {
+            copy_channels(&mut self.val, &read, n);
+            self.nord = n as i32;
+        }
     }
 
     /// The `mca` declaration: the table generated from the vendored
@@ -702,6 +724,10 @@ impl Record for McaRecord {
     /// capacity cannot drift from the allocation behind it.
     fn dbaddr_capacity(&self, _field: &str) -> Option<u32> {
         Some(self.capacity() as u32)
+    }
+
+    fn dbaddr_capacity_inputs(&self) -> Option<&'static [&'static str]> {
+        Some(&[])
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {

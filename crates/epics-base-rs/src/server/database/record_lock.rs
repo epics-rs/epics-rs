@@ -351,13 +351,16 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{
+    AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+};
 
 use crate::server::record::RecordCell;
 use crate::server::record::record_instance::{HeldMut, RecordRef};
 
 use crate::runtime::sync::{
-    CMutex, MutexInfo, PriorityInheritanceMutex, PriorityInheritanceMutexGuard, mutex_report,
+    CMutex, MutexInfo, PriorityInheritanceMutex, PriorityInheritanceMutexGuard,
+    UnlistedPriorityInheritanceMutex, mutex_report,
 };
 
 use super::PvDatabase;
@@ -401,9 +404,10 @@ struct LockSet {
     /// [`Self::owed`] is not empty. Read by every fresh hold, so it shares
     /// `many_holds`' word: the fields before [`Self::trace`] stay one line.
     has_owed: AtomicBool,
-    /// [`Self::callbacks`] is not empty. Read by every outermost release,
-    /// in `has_owed`'s padding.
-    callbacks_owed: AtomicBool,
+    /// [`OWED_CALLBACKS`]: [`Self::callbacks`] is not empty; [`OWED_READS`]:
+    /// [`Self::reads`] is not. One byte, so every outermost release reads
+    /// both with the one load, in `has_owed`'s padding.
+    release_owed: AtomicU8,
     /// The mutex guard of the current outermost hold, kept here rather than
     /// in that hold's [`SetGuard`] so that a frame which does not own the
     /// guard can still give the set up and take it back — [`Self::unheld`],
@@ -425,10 +429,32 @@ struct LockSet {
     /// when the dset call returns ([`InFrame::run_owed_callbacks`]), and the
     /// outermost release runs whatever is left before the mutex goes.
     callbacks: std::sync::Mutex<std::collections::VecDeque<(Arc<RecordCell>, OwedCallback)>>,
+    /// Reads of member records that found the set held ([`owe_read`]),
+    /// served by the outermost release, or by the holder from where it waits
+    /// for a read of its own ([`ReadWait`]).
+    reads: std::sync::Mutex<Vec<Arc<dyn OwedRead>>>,
 }
+
+/// [`LockSet::release_owed`]'s bits.
+const OWED_CALLBACKS: u8 = 1;
+const OWED_READS: u8 = 2;
 
 /// A driver callback [`owe_callback`] deferred: run once its record is free.
 pub(crate) type OwedCallback = Box<dyn FnOnce() + Send>;
+
+/// A read of a member record that found its set held — C's lock-free
+/// `dbGet` (`dbAccess.c:909`) — run by a thread that holds the set.
+pub(crate) trait OwedRead: Send + Sync {
+    /// The record read.
+    fn cell(&self) -> &RecordCell;
+    /// Read now. `own` is the serving thread's own record, borrowed by its
+    /// processing, when it serves from a [`ReadWait`].
+    fn serve(&self, own: Option<(&RecordCell, crate::server::record::OwnRecord<'_>)>);
+    /// Whether the read has its answer.
+    fn answered(&self) -> bool;
+    /// Answer the read with nothing, unless it has its answer already.
+    fn claim(&self) -> bool;
+}
 
 // SAFETY: `held` is the one non-`Sync` field, and it is read or written only
 // by the thread that holds `lock` (`acquire`'s fresh arm, `SetGuard::drop`'s
@@ -647,7 +673,231 @@ pub(crate) fn owe_callback(cell: &Arc<RecordCell>, job: OwedCallback) {
     debug_assert_eq!(set.owner.load(Ordering::Acquire), thread_key());
     let mut callbacks = set.callbacks.lock().unwrap_or_else(|e| e.into_inner());
     callbacks.push_back((Arc::clone(cell), job));
-    set.callbacks_owed.store(true, Ordering::Relaxed);
+    set.release_owed.fetch_or(OWED_CALLBACKS, Ordering::Relaxed);
+}
+
+/// Owe `read` to the set its record is in, held by another thread: its
+/// outermost release serves it, and a holder waiting in a [`ReadWait`] is
+/// handed the set to serve it from there. A record a merge moves meanwhile
+/// is left to the reader's own retry.
+pub(crate) fn owe_read(read: Arc<dyn OwedRead>) {
+    let set = read.cell().lock_record().set();
+    set.reads
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(read);
+    set.release_owed.fetch_or(OWED_READS, Ordering::Release);
+    let owner = set.owner.load(Ordering::Acquire);
+    let waits = WAITS.lock();
+    if let Some(wait) = waits.reading.iter().find(|w| w.key == owner) {
+        wait.owed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(set);
+        wait.thread.unpark();
+    }
+}
+
+/// A thread in a [`ReadWait`], and the sets it holds that were owed reads
+/// since it last served them.
+struct Waiter {
+    key: u64,
+    thread: std::thread::Thread,
+    read: Arc<dyn OwedRead>,
+    owed: std::sync::Mutex<Vec<Set>>,
+}
+
+/// A thread waiting in [`LockSet::lock_taking`] for the set `taking`, null
+/// once it has it. It lives on that thread's stack, linked into
+/// [`Waits::taking`] for the wait only, so a wait allocates nothing.
+struct Taker {
+    key: u64,
+    taking: AtomicPtr<LockSet>,
+    /// The next linked taker, under [`WAITS`].
+    next: AtomicPtr<Taker>,
+}
+
+/// A [`Taker`] linked into [`Waits::taking`] while this lives.
+struct Linked<'a>(&'a Taker);
+
+impl<'a> Linked<'a> {
+    fn new(taker: &'a Taker) -> Self {
+        let waits = WAITS.lock();
+        taker
+            .next
+            .store(waits.taking.load(Ordering::Relaxed), Ordering::Relaxed);
+        waits
+            .taking
+            .store(std::ptr::from_ref(taker).cast_mut(), Ordering::Relaxed);
+        Self(taker)
+    }
+}
+
+impl Drop for Linked<'_> {
+    fn drop(&mut self) {
+        let waits = WAITS.lock();
+        let me = std::ptr::from_ref(self.0).cast_mut();
+        let mut link = &waits.taking;
+        while link.load(Ordering::Relaxed) != me {
+            // SAFETY: as in `Waits::takers`; this taker is linked, so the
+            // walk meets it before the end.
+            link = unsafe { &(*link.load(Ordering::Relaxed)).next };
+        }
+        link.store(self.0.next.load(Ordering::Relaxed), Ordering::Relaxed);
+    }
+}
+
+/// The threads that wait while they may hold sets.
+struct Waits {
+    reading: Vec<Arc<Waiter>>,
+    /// The first linked [`Taker`].
+    taking: AtomicPtr<Taker>,
+}
+
+impl Waits {
+    fn takers(&self) -> impl Iterator<Item = &Taker> {
+        let mut next = self.taking.load(Ordering::Relaxed);
+        std::iter::from_fn(move || {
+            // SAFETY: a taker unlinks under `WAITS` before its frame ends, and
+            // `self` is reached only through that lock.
+            let taker = unsafe { next.as_ref() }?;
+            next = taker.next.load(Ordering::Relaxed);
+            Some(taker)
+        })
+    }
+}
+
+/// Priority-inheriting, since a contended [`LockSet::lock_fresh`] takes it;
+/// built by [`new_set`], so no wait builds it.
+static WAITS: std::sync::LazyLock<UnlistedPriorityInheritanceMutex<Waits>> =
+    std::sync::LazyLock::new(|| {
+        UnlistedPriorityInheritanceMutex::new(Waits {
+            reading: Vec::new(),
+            taking: AtomicPtr::new(std::ptr::null_mut()),
+        })
+    });
+
+/// One link of the chain [`ReadWait::stuck`] follows.
+enum Hop<'a> {
+    /// A holder waiting for this set.
+    Takes(&'a Taker, Set),
+    /// A holder waiting for this read.
+    Reads(&'a Waiter),
+}
+
+/// This thread waiting for `read`, which it owed: a read owed to any set it
+/// holds is served from here ([`Self::serve`]), its own record's or not, and
+/// whether owed before the wait began or after. Two holders reading each
+/// other's records would otherwise wait for good. Taken before `read` is
+/// owed; given up when dropped.
+pub(crate) struct ReadWait(Arc<Waiter>);
+
+impl ReadWait {
+    pub(crate) fn new(read: Arc<dyn OwedRead>) -> Self {
+        let key = thread_key();
+        let mut waits = WAITS.lock();
+        // Every owed read's reader waits in a `ReadWait`, so the reads owed
+        // to this thread's sets before now are among theirs.
+        let owed = waits
+            .reading
+            .iter()
+            .map(|w| w.read.cell().lock_record().set())
+            .filter(|set| set.owner.load(Ordering::Acquire) == key)
+            .collect();
+        let wait = Arc::new(Waiter {
+            key,
+            thread: std::thread::current(),
+            read,
+            owed: std::sync::Mutex::new(owed),
+        });
+        waits.reading.push(Arc::clone(&wait));
+        Self(wait)
+    }
+
+    /// Serve the reads owed to the sets this thread holds. `own` is the
+    /// record the thread is inside, read through the view it lends.
+    pub(crate) fn serve(&self, own: Option<(&RecordCell, crate::server::record::OwnRecord<'_>)>) {
+        let sets = std::mem::take(&mut *self.0.owed.lock().unwrap_or_else(|e| e.into_inner()));
+        for set in sets {
+            // Released since it was owed: its next holder's release serves it.
+            if set.owner.load(Ordering::Acquire) != self.0.key {
+                continue;
+            }
+            for read in set.take_reads() {
+                read.serve(own);
+            }
+        }
+    }
+
+    /// Whether the holder of the record read waits in
+    /// [`LockSet::lock_fresh`] for a set this thread holds, directly or
+    /// through holders that wait in turn: it can neither serve the read nor
+    /// let go, and the read is claimed, unanswered, for the caller to fail.
+    /// A holder waiting on a read of its own serves this one, so a chain
+    /// ends free at one, or at a read this thread serves.
+    pub(crate) fn stuck(&self) -> bool {
+        let me = self.0.key;
+        let waits = WAITS.lock();
+        let owner = |set: Set| set.owner.load(Ordering::Acquire);
+        let read_owner = |w: &Waiter| owner(w.read.cell().lock_record().set());
+        let mut chain = Vec::new();
+        let mut holder = read_owner(&self.0);
+        for _ in 0..waits.takers().count() {
+            let Some(taker) = waits.takers().find(|t| t.key == holder) else {
+                return false;
+            };
+            let set = taker.taking.load(Ordering::Acquire);
+            if set.is_null() {
+                return false;
+            }
+            // SAFETY: `lock_fresh` publishes its `&'static self`.
+            let set: Set = unsafe { &*set };
+            chain.push(Hop::Takes(taker, set));
+            holder = owner(set);
+            if holder == me {
+                break;
+            }
+            if let Some(reader) = waits.reading.iter().find(|w| w.key == holder) {
+                holder = read_owner(reader);
+                if reader.read.answered() || holder == me {
+                    return false;
+                }
+                chain.push(Hop::Reads(reader));
+            }
+        }
+        if holder != me {
+            return false;
+        }
+        // Read again from the last hop back: the last taker waits for a set
+        // this thread keeps, so it stays put, and so then does each holder
+        // it waits behind.
+        let mut next = me;
+        for hop in chain.iter().rev() {
+            next = match *hop {
+                Hop::Takes(taker, set) => {
+                    if !std::ptr::eq(taker.taking.load(Ordering::Acquire), set)
+                        || owner(set) != next
+                    {
+                        return false;
+                    }
+                    taker.key
+                }
+                Hop::Reads(reader) => {
+                    if read_owner(reader) != next || reader.read.answered() {
+                        return false;
+                    }
+                    reader.key
+                }
+            };
+        }
+        read_owner(&self.0) == next && self.0.read.claim()
+    }
+}
+
+impl Drop for ReadWait {
+    fn drop(&mut self) {
+        WAITS.lock().reading.retain(|w| !Arc::ptr_eq(w, &self.0));
+    }
 }
 
 /// Owe `cell`'s pending `cvt_dbaddr` to the set it is in, for that set's next
@@ -725,6 +975,7 @@ const FIRST_SET_ID: u64 = 2;
 
 /// Mint one set. Every `LockSet` in the process comes from here.
 fn new_set(id: u64) -> Set {
+    std::sync::LazyLock::force(&WAITS);
     let lock = PriorityInheritanceMutex::new((), CMutex::LockSet);
     // The mutex names its own row, so no two sets can be confused for each
     // other and nothing has to be serialised against the process mutex list.
@@ -737,11 +988,12 @@ fn new_set(id: u64) -> Set {
         depth: AtomicUsize::new(0),
         many_holds: AtomicU32::new(0),
         has_owed: AtomicBool::new(false),
-        callbacks_owed: AtomicBool::new(false),
+        release_owed: AtomicU8::new(0),
         held: std::cell::UnsafeCell::new(None),
         trace: AtomicUsize::new(0),
         owed: std::sync::Mutex::new(Vec::new()),
         callbacks: std::sync::Mutex::new(std::collections::VecDeque::new()),
+        reads: std::sync::Mutex::new(Vec::new()),
     }))
 }
 
@@ -948,7 +1200,10 @@ impl LockSet {
     /// Take the mutex on a thread that does not hold it and publish the hold.
     fn lock_fresh(&'static self, me: u64) {
         Self::debug_check_fresh();
-        let guard = self.lock.lock();
+        let guard = match self.lock.try_lock() {
+            Some(guard) => guard,
+            None => self.lock_taking(me),
+        };
         // SAFETY: this thread holds `lock`, so it is the only one allowed at
         // `held` (see the `Sync` impl).
         // `held` is `None` whenever the mutex is free (`unlock_outermost` takes it
@@ -959,6 +1214,22 @@ impl LockSet {
         #[cfg(debug_assertions)]
         SETS_HELD.with(|n| n.set(n.get() + 1));
         self.admit_owed();
+    }
+
+    /// Wait for the mutex linked as a [`Taker`] of this set, for
+    /// [`ReadWait::stuck`].
+    #[cold]
+    #[inline(never)]
+    fn lock_taking(&'static self, me: u64) -> PriorityInheritanceMutexGuard<'static, ()> {
+        let taker = Taker {
+            key: me,
+            taking: AtomicPtr::new(std::ptr::from_ref(self).cast_mut()),
+            next: AtomicPtr::new(std::ptr::null_mut()),
+        };
+        let _linked = Linked::new(&taker);
+        let guard = self.lock.lock();
+        taker.taking.store(std::ptr::null_mut(), Ordering::Release);
+        guard
     }
 
     /// Run what [`owe_cvt`] left on this set. Called wherever a hold is taken
@@ -1036,9 +1307,22 @@ impl LockSet {
                 taken
             }
         };
-        self.callbacks_owed
-            .store(!callbacks.is_empty(), Ordering::Relaxed);
+        if callbacks.is_empty() {
+            self.release_owed
+                .fetch_and(!OWED_CALLBACKS, Ordering::Relaxed);
+        }
         taken
+    }
+
+    /// The owed reads, in arrival order.
+    fn take_reads(&self) -> Vec<Arc<dyn OwedRead>> {
+        // A read owed after this look is the reader's own retry's.
+        if self.release_owed.load(Ordering::Acquire) & OWED_READS == 0 {
+            return Vec::new();
+        }
+        let mut reads = self.reads.lock().unwrap_or_else(|e| e.into_inner());
+        self.release_owed.fetch_and(!OWED_READS, Ordering::Relaxed);
+        std::mem::take(&mut *reads)
     }
 
     /// The outermost release: what the set was owed runs first, still under
@@ -1046,7 +1330,7 @@ impl LockSet {
     /// the next holder's release.
     #[inline(always)]
     fn release_outermost(&'static self) {
-        if self.callbacks_owed.load(Ordering::Relaxed) {
+        if self.release_owed.load(Ordering::Relaxed) != 0 {
             self.run_owed_then_unlock();
         } else {
             self.unlock_outermost();
@@ -1068,11 +1352,15 @@ impl LockSet {
         let _unlock = Unlock(self);
         while !std::thread::panicking() {
             let jobs = self.take_callbacks(None);
-            if jobs.is_empty() {
+            let reads = self.take_reads();
+            if jobs.is_empty() && reads.is_empty() {
                 break;
             }
             for job in jobs {
                 job();
+            }
+            for read in reads {
+                read.serve(None);
             }
         }
     }
@@ -2043,7 +2331,7 @@ impl PvDatabase {
     /// `dbLockSetMerge` from `dbDbInitLink`, and a target this IOC does not
     /// have falls through to `dbCaAddLink` instead (`dbLink.c:118-130`), which
     /// merges nothing. `record_link_fields` has already applied that same
-    /// locality rule, so a `ca://` link to a local record is a `Ca` link here
+    /// locality rule, so a CA link to a local record is a `Ca` link here
     /// and does not widen the set.
     fn db_link_targets(&self, record: &[u8]) -> Vec<RecordName> {
         self.db_links(record)
@@ -2639,7 +2927,7 @@ impl<'a> InFrame<'a> {
     /// Whether a member of the frame's set is owed a driver callback.
     #[inline(always)]
     pub(crate) fn callbacks_owed(&self) -> bool {
-        self.set.set.callbacks_owed.load(Ordering::Relaxed)
+        self.set.set.release_owed.load(Ordering::Relaxed) & OWED_CALLBACKS != 0
     }
 
     /// The driver callbacks this record was owed inside its dset call
@@ -2922,7 +3210,7 @@ mod tests {
             })
             .collect();
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
         while done.load(Ordering::SeqCst) < 2 {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -3181,6 +3469,298 @@ mod tests {
             "the record moved to the surviving set"
         );
         assert_eq!(amem(&cell), Some(EpicsValue::Long(8)));
+    }
+
+    /// Per-operation PVA creates on a busy set owe its record one
+    /// `cvt_dbaddr`, not one each (`RecordCell::cvt_resolved`).
+    #[epics_macros_rs::epics_test]
+    async fn repeated_creates_on_a_busy_set_owe_once() {
+        use crate::server::database::filters::db_channel_create;
+        use crate::server::ioc_builder::IocBuilder;
+        use crate::server::records::acalcout::AcalcoutRecord;
+        use crate::types::EpicsValue;
+        let db = IocBuilder::new()
+            .register_record_type("acalcout", || Box::new(AcalcoutRecord::new()))
+            .db_string(
+                r#"record(acalcout, "M") {}"#,
+                &std::collections::HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap()
+            .0;
+        let cell = db.get_record("M").unwrap();
+        let busy = cell.write();
+        for _ in 0..50 {
+            db_channel_create(&db, b"M.AA").unwrap();
+        }
+        let owed = cell.lock_record().set().owed.lock().unwrap().len();
+        drop(busy);
+        assert_eq!(owed, 1);
+        assert_eq!(db.get_pv("M.AMEM").unwrap(), EpicsValue::Long(8));
+    }
+
+    /// C `cvt_dbaddr` recomputes `no_elements` per create when `SIZE=NUSE`
+    /// (`aCalcoutRecord.c:627-631`), so a create after a `NUSE` put sees it.
+    #[epics_macros_rs::epics_test]
+    async fn size_nuse_count_follows_a_runtime_nuse() {
+        use crate::server::database::filters::db_channel_create;
+        use crate::server::ioc_builder::IocBuilder;
+        use crate::server::records::acalcout::AcalcoutRecord;
+        use crate::types::EpicsValue;
+        let db = IocBuilder::new()
+            .register_record_type("acalcout", || Box::new(AcalcoutRecord::new()))
+            .db_string(
+                r#"record(acalcout, "M") { field(NELM, "10") field(NUSE, "4") field(SIZE, "NUSE") }"#,
+                &std::collections::HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap()
+            .0;
+        let cell = db.get_record("M").unwrap();
+        assert_eq!(cell.no_elements("AA"), Some(4));
+        db.put_pv("M.NUSE", EpicsValue::Long(7)).await.unwrap();
+        db_channel_create(&db, b"M.AA").unwrap();
+        assert_eq!(cell.no_elements("AA"), Some(7));
+    }
+
+    /// Boundary: a create that finds the record busy, which cannot run
+    /// `cvt_dbaddr`'s count, still counts the window the last `dbPut` of
+    /// `SIZE` or `NUSE` left — on a field already resolved and on a fresh one.
+    #[epics_macros_rs::epics_test]
+    async fn a_busy_create_counts_the_last_put_window() {
+        use crate::server::ioc_builder::IocBuilder;
+        use crate::server::records::acalcout::AcalcoutRecord;
+        use crate::types::EpicsValue;
+        let db = IocBuilder::new()
+            .register_record_type("acalcout", || Box::new(AcalcoutRecord::new()))
+            .db_string(
+                r#"record(acalcout, "M") { field(NELM, "10") field(NUSE, "4") }"#,
+                &std::collections::HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap()
+            .0;
+        let cell = db.get_record("M").unwrap();
+        assert_eq!(cell.resolve_addr("AA"), Some(10));
+        db.put_pv("M.SIZE", EpicsValue::String("NUSE".into()))
+            .await
+            .unwrap();
+        let busy = cell.write();
+        assert_eq!(cell.resolve_addr("AA"), Some(4));
+        assert_eq!(cell.resolve_addr("BB"), Some(4));
+        drop(busy);
+        db.put_pv("M.NUSE", EpicsValue::Long(6)).await.unwrap();
+        let busy = cell.write();
+        assert_eq!(cell.resolve_addr("AA"), Some(6));
+        drop(busy);
+    }
+
+    /// Boundary: a type off the `.dbd` tables that names no
+    /// `Record::dbaddr_capacity_inputs` has a busy create count what a put to
+    /// any field left, here a plain one; one that names its input settles
+    /// after a put there, as a declared type does.
+    #[epics_macros_rs::epics_test]
+    async fn an_off_table_type_recounts_after_a_counted_put() {
+        use crate::error::{CaError, CaResult};
+        use crate::server::ioc_builder::IocBuilder;
+        use crate::server::record::{FieldDesc, Record};
+        use crate::types::{DbFieldType, EpicsValue};
+        static FIELDS: [FieldDesc; 2] = [
+            FieldDesc::new("BUF", DbFieldType::Double, false),
+            FieldDesc::new("N", DbFieldType::Long, false),
+        ];
+        /// `BUF` counts `N`; the type is `.1` and names `.2` its inputs.
+        struct Window(i32, &'static str, Option<&'static [&'static str]>);
+        impl Record for Window {
+            fn record_type(&self) -> &'static str {
+                self.1
+            }
+            fn get_field(&self, name: &str) -> Option<EpicsValue> {
+                match name {
+                    "BUF" => Some(EpicsValue::DoubleArray(vec![0.0].into())),
+                    "N" => Some(EpicsValue::Long(self.0)),
+                    _ => None,
+                }
+            }
+            fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
+                let ("N", EpicsValue::Long(n)) = (name, value) else {
+                    return Err(CaError::FieldNotFound(name.into()));
+                };
+                self.0 = n;
+                Ok(())
+            }
+            fn dbaddr_capacity_inputs(&self) -> Option<&'static [&'static str]> {
+                self.2
+            }
+            fn declared_fields(&self) -> &'static [FieldDesc] {
+                &FIELDS
+            }
+            fn declared_dbaddr_fields(&self) -> Option<&'static [&'static str]> {
+                Some(&["BUF"])
+            }
+            fn dbaddr_capacity(&self, field: &str) -> Option<u32> {
+                (field == "BUF").then_some(self.0 as u32)
+            }
+        }
+        let db = IocBuilder::new()
+            .register_record_type("window", || Box::new(Window(2, "window", None)))
+            .register_record_type("windown", || Box::new(Window(2, "windown", Some(&["N"]))))
+            .db_string(
+                r#"record(window, "W") {} record(windown, "V") {}"#,
+                &std::collections::HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap()
+            .0;
+        for name in ["W", "V"] {
+            let cell = db.get_record(name).unwrap();
+            assert_eq!(cell.resolve_addr("BUF"), Some(2), "{name}");
+            db.put_pv_no_process(&format!("{name}.N"), EpicsValue::Long(5))
+                .await
+                .unwrap();
+            let busy = cell.write();
+            assert_eq!(cell.resolve_addr("BUF"), Some(5), "{name}");
+            drop(busy);
+        }
+    }
+
+    /// Boundary: a named input the lean store could write — a plain
+    /// `DBF_DOUBLE` slot of a declared field — takes the general arm, which
+    /// re-reads the counts; the unnamed sibling keeps the lean arm. A static
+    /// restore stores the input raw through its slot, and recounts too.
+    #[epics_macros_rs::epics_test]
+    async fn a_slotted_capacity_input_takes_the_general_put() {
+        use crate::error::{CaError, CaResult};
+        use crate::server::ioc_builder::IocBuilder;
+        use crate::server::record::dbd_generated::slots::waveform;
+        use crate::server::record::record_instance::{PutAddr, PutFn};
+        use crate::server::record::{DeclaredStore, FieldSlot, Record, SlotMut, SlotRef};
+        use crate::types::EpicsValue;
+        /// A waveform whose VAL counts SDLY, with SDLY and HASH slotted:
+        /// both are plain fields of the base `.dbd`.
+        struct Sized {
+            sdly: f64,
+            hash: u32,
+        }
+        impl Record for Sized {
+            fn record_type(&self) -> &'static str {
+                "waveform"
+            }
+            fn get_field(&self, name: &str) -> Option<EpicsValue> {
+                match name {
+                    "VAL" => Some(EpicsValue::DoubleArray(vec![0.0].into())),
+                    "SDLY" => Some(EpicsValue::Double(self.sdly)),
+                    "HASH" => Some(EpicsValue::ULong(self.hash)),
+                    _ => None,
+                }
+            }
+            fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
+                match (name, value) {
+                    ("SDLY", EpicsValue::Double(v)) => self.sdly = v,
+                    ("HASH", EpicsValue::ULong(v)) => self.hash = v,
+                    _ => return Err(CaError::FieldNotFound(name.into())),
+                }
+                Ok(())
+            }
+            fn dbaddr_capacity(&self, field: &str) -> Option<u32> {
+                (field == "VAL").then_some(self.sdly as u32)
+            }
+            fn dbaddr_capacity_inputs(&self) -> Option<&'static [&'static str]> {
+                Some(&["SDLY"])
+            }
+            fn slot_ref(&self, slot: FieldSlot) -> Option<SlotRef<'_>> {
+                match slot {
+                    waveform::SDLY => Some(SlotRef::F64(&self.sdly)),
+                    waveform::HASH => Some(SlotRef::U32(&self.hash)),
+                    _ => None,
+                }
+            }
+            fn slot_mut(&mut self, slot: FieldSlot) -> Option<SlotMut<'_>> {
+                match slot {
+                    waveform::SDLY => Some(SlotMut::F64(&mut self.sdly)),
+                    waveform::HASH => Some(SlotMut::U32(&mut self.hash)),
+                    _ => None,
+                }
+            }
+            fn declared_store(&self, slot: FieldSlot) -> Option<DeclaredStore> {
+                self.slot_ref(slot).map(|_| DeclaredStore::Member)
+            }
+        }
+        let db = IocBuilder::new()
+            .register_record_type("waveform", || Box::new(Sized { sdly: 0.0, hash: 0 }))
+            .db_string(
+                r#"record(waveform, "S") { field(SDLY, "2") }"#,
+                &std::collections::HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap()
+            .0;
+        let cell = db.get_record("S").unwrap();
+        assert!(matches!(
+            PutAddr::resolve_in(&cell, "HASH").put(),
+            PutFn::U32(_)
+        ));
+        assert_eq!(PutAddr::resolve_in(&cell, "SDLY").put(), PutFn::General);
+        assert_eq!(cell.resolve_addr("VAL"), Some(2));
+        db.put_pv_no_process("S.HASH", EpicsValue::ULong(9))
+            .await
+            .unwrap();
+        db.put_pv_no_process("S.SDLY", EpicsValue::Double(5.0))
+            .await
+            .unwrap();
+        let busy = cell.write();
+        assert_eq!(cell.resolve_addr("VAL"), Some(5));
+        drop(busy);
+        db.put_pv_static("S.SDLY", "7").await.unwrap();
+        let busy = cell.write();
+        assert_eq!(cell.resolve_addr("VAL"), Some(7));
+        drop(busy);
+    }
+
+    /// Boundary: a store no `special()` follows — a device post, a static
+    /// restore — re-reads the counts as a `dbPut` does, for each input.
+    #[epics_macros_rs::epics_test]
+    async fn a_post_or_restore_of_a_capacity_input_recounts() {
+        use crate::server::ioc_builder::IocBuilder;
+        use crate::server::records::acalcout::AcalcoutRecord;
+        use crate::types::EpicsValue;
+        let db = IocBuilder::new()
+            .register_record_type("acalcout", || Box::new(AcalcoutRecord::new()))
+            .db_string(
+                r#"record(acalcout, "M") { field(NELM, "10") field(NUSE, "4") }"#,
+                &std::collections::HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap()
+            .0;
+        let cell = db.get_record("M").unwrap();
+        let counted = || {
+            let _busy = cell.write();
+            cell.resolve_addr("AA")
+        };
+        assert_eq!(counted(), Some(10));
+        db.put_pv_menu_index("M.SIZE", 1).await.unwrap();
+        assert_eq!(counted(), Some(4), "SIZE restore");
+        db.post_fields("M", vec![("NUSE".into(), EpicsValue::Long(6))])
+            .unwrap();
+        assert_eq!(counted(), Some(6), "NUSE post");
+        db.put_pv_static("M.NUSE", "7").await.unwrap();
+        assert_eq!(counted(), Some(7), "NUSE restore");
+        db.put_pv_array_static("M.NUSE", EpicsValue::Long(3))
+            .unwrap();
+        assert_eq!(counted(), Some(3), "NUSE array restore");
     }
 
     /// Boundary `built == false`: a record adopted before `iocInit` waits on
@@ -3759,7 +4339,7 @@ mod tests {
             EpicsValue::String("LF:NEXT".into()),
             super::super::links::OutLinkSrc {
                 putf: false,
-                notify: None,
+                notify: super::super::links::OutNotify::None,
                 field: "OUT",
             },
             &mut visited,

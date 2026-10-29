@@ -243,6 +243,10 @@ impl Record for HistogramRecord {
         false
     }
 
+    fn dbaddr_capacity_inputs(&self) -> Option<&'static [&'static str]> {
+        Some(&[])
+    }
+
     /// `monitor()` posts VAL alone (`histogramRecord.c:282-297`).
     fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
         Some(

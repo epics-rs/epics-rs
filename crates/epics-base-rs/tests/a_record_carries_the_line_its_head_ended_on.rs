@@ -3,7 +3,7 @@
 //! C decides a record exists in the `record_head` action — `dbCreateRecord`
 //! runs from it (`dbYacc.y:227-235`, `dbLexRoutines.c:1128`) — so every
 //! refusal of the head is reported with the closing `)` still the last token
-//! the lexer matched. Measured on `softIoc` built from `~/work/epics-base`
+//! the lexer matched. Measured on `softIoc` built from `$EPICS_BASE`
 //! (`R7.0.10`), an unknown record type prints:
 //!
 //! ```text

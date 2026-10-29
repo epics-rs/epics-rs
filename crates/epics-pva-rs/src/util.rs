@@ -161,26 +161,20 @@ impl Drop for SigInt {
     }
 }
 
-/// Periodic timer — a thin wrapper over [`tokio::time::Interval`].
+/// Periodic timer — a thin wrapper over the seam's
+/// [`Interval`](epics_base_rs::runtime::task::Interval).
 /// Unlike pvxs `Timer` it offers only the periodic role: there is no
 /// one-shot constructor and no `cancel()` (drop the `Timer` to stop
-/// ticking). Prefer `tokio::time::interval` / `sleep` directly in new
+/// ticking). Prefer `runtime::task::interval` / `sleep` directly in new
 /// code; this exists to give the public surface a named type.
-///
-/// `tokio_backend` for the same reason [`SigInt`] is: `tokio::time::interval`
-/// arms a `TimerEntry` against the runtime's time driver and panics with no
-/// runtime entered, which is every reactor-free build and not just the two
-/// embedded targets.
-#[cfg(tokio_backend)]
 pub struct Timer {
-    interval: tokio::time::Interval,
+    interval: epics_base_rs::runtime::task::Interval,
 }
 
-#[cfg(tokio_backend)]
 impl Timer {
-    pub fn periodic(period: std::time::Duration) -> Self {
+    pub fn periodic(period: epics_base_rs::runtime::task::Period) -> Self {
         Self {
-            interval: tokio::time::interval(period),
+            interval: epics_base_rs::runtime::task::interval(period),
         }
     }
 
@@ -201,6 +195,23 @@ pub use tokio::sync::mpsc::{
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A plain `std::thread` with no runtime entered still ticks.
+    #[test]
+    fn a_timer_on_a_thread_with_no_runtime_ticks() {
+        std::thread::spawn(|| {
+            epics_base_rs::runtime::task::block_on_sync(async {
+                let mut timer = Timer::periodic(epics_base_rs::runtime::task::Period::from_millis(
+                    std::num::NonZeroU64::new(5).unwrap(),
+                ));
+                timer.tick().await;
+                timer.tick().await;
+            })
+            .expect("no runtime is entered on this thread")
+        })
+        .join()
+        .expect("a Timer needs no runtime");
+    }
 
     #[test]
     fn escaper_roundtrips_printable() {

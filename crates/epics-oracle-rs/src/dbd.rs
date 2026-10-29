@@ -2,7 +2,7 @@
 //!
 //! The denominator must come from the spec, not from a hand-written list, so
 //! every enumerated case traces back to a `field(...)` declaration in
-//! `/home/stevek/work/epics-base/dbd/softIoc.dbd`. That file is the built,
+//! `$EPICS_BASE/dbd/softIoc.dbd`. That file is the built,
 //! macro-expanded form: `dbCommon` is already inlined into each `recordtype`
 //! and every `menu(...)` it references is defined in the same file. The
 //! unexpanded per-record `.dbd`s (`aiRecord.dbd` etc.) still carry

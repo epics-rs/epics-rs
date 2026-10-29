@@ -271,11 +271,15 @@ fn period_of(choice: &str) -> Option<Duration> {
     };
     // C's `if (ppsl->period == 0)` guard, reached the same way: `1/number`
     // for an enormous frequency underflows to zero, and a zero period would
-    // be a scan thread in a spin loop.
-    if seconds <= 0.0 || !seconds.is_finite() {
+    // be a scan thread in a spin loop. C keeps a list for a NaN period, but
+    // its scan thread's wait is then undefined behaviour (`epicsTimeAddSeconds`
+    // casts NaN to an integer), which is not copied.
+    if seconds <= 0.0 || seconds.is_nan() {
         return None;
     }
-    Some(Duration::from_secs_f64(seconds))
+    // `periodicTask` waits at most ten years a tick (`convertDoubleToWakeTime`),
+    // so a longer period, inf included, scans every ten years.
+    Some(crate::runtime::sync::event_wait_timeout(seconds))
 }
 
 /// C's achievability warning (`dbScan.c:909-914`): a period below two clock
@@ -390,6 +394,17 @@ mod tests {
         assert_eq!(install(&bad), Err(InstallError::FixedChoicesRenamed));
         let short: Vec<String> = ["Passive", "Event"].iter().map(|s| s.to_string()).collect();
         assert_eq!(install(&short), Err(InstallError::FixedChoicesRenamed));
+    }
+
+    /// A period past C's ten-year wait cap scans every ten years; NaN has no
+    /// period at all.
+    #[test]
+    fn a_period_past_the_ten_year_wait_cap_is_the_cap() {
+        let cap = crate::runtime::sync::event_wait_timeout(f64::INFINITY);
+        for choice in ["1e300 second", "1e-300 Hz", "inf second", "1e9 hours"] {
+            assert_eq!(period_of(choice), Some(cap), "choice {choice:?}");
+        }
+        assert_eq!(period_of("nan second"), None);
     }
 
     /// `Hz` is `1/number`, so a frequency big enough to underflow the period

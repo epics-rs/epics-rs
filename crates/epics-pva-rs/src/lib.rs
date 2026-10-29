@@ -78,6 +78,7 @@ pub mod client_native;
 pub mod codec;
 pub mod config;
 pub mod decode;
+pub mod epics_convert;
 pub mod error;
 pub mod format;
 pub(crate) mod leaf_convert;
@@ -88,6 +89,9 @@ pub mod peer_buf;
 pub mod proto;
 pub mod pv_request;
 pub mod pvdata;
+// PVA links (pvxs `ioc/pvalink*.cpp`) are a client, so the client feature gates them.
+#[cfg(feature = "client")]
+pub mod pvalink;
 pub mod pvxs_log;
 pub mod server;
 pub mod server_native;
@@ -170,3 +174,6 @@ pub(crate) fn test_reactor() -> epics_base_rs::runtime::task::Reactor {
     epics_base_rs::runtime::task::Reactor::current()
         .expect("this test body runs inside an executor")
 }
+
+#[cfg(test)]
+mod test_alloc;

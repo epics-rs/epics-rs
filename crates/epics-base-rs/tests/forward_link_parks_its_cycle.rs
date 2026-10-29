@@ -9,7 +9,6 @@
 mod hop_rule;
 
 use std::collections::HashMap;
-use std::time::Duration;
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -71,7 +70,7 @@ async fn a_parked_cycle_holds_its_pact_through_its_target() {
 async fn a_parked_cycle_stays_on_the_process_stack() {
     hop_rule::sweep(|rule| async move {
         let db = ioc().await;
-        epics_base_rs::runtime::task::timeout(Duration::from_secs(5), db.process_record("Q"))
+        epics_base_rs::runtime::task::timeout(fact_budget::FACT_BUDGET, db.process_record("Q"))
             .await
             .expect("the loop through a waiting L1 terminates")
             .unwrap();

@@ -160,8 +160,7 @@ pub struct Strtod {
     /// Bytes consumed: C's `endptr - str`. 0 is "no conversion performed".
     pub len: usize,
     /// C `errno == ERANGE`: the text named a nonzero number that does not fit —
-    /// overflow (the value is infinite) or underflow (subnormal, or zero); or
-    /// a `nan(...)` payload too big for `strtoull`.
+    /// overflow (the value is infinite) or underflow (subnormal, or zero).
     pub erange: bool,
 }
 
@@ -212,8 +211,7 @@ fn magnitude(s: &[u8]) -> Option<(f64, usize, bool)> {
     if starts_ci(s, b"nan") {
         let n = nan_char_sequence(&s[3..]);
         let payload = if n == 0 { &[][..] } else { &s[4..2 + n] };
-        let (nan, erange) = nan_payload(payload);
-        return Some((nan, 3 + n, erange));
+        return Some((nan_payload(payload), 3 + n, false));
     }
     let hex_digit_at = |k: usize| s.get(k).is_some_and(u8::is_ascii_hexdigit);
     if s.len() > 2
@@ -257,34 +255,29 @@ fn nan_char_sequence(s: &[u8]) -> usize {
 
 /// glibc's `SET_NAN_PAYLOAD`: the sequence, when `strtoull(seq, &end, 0)`
 /// reads all of it, goes in the mantissa below the quiet bit; a zero
-/// payload leaves the default NaN. strtoull's ERANGE stays in errno.
-fn nan_payload(seq: &[u8]) -> (f64, bool) {
+/// payload leaves the default NaN. A payload that overflows `strtoull` is
+/// not an ERANGE of `strtod` (C11 7.22.1.3p10 is about the value); glibc
+/// before 2.41 leaked strtoull's errno (BZ #32045), which is not copied.
+fn nan_payload(seq: &[u8]) -> f64 {
     let (digits, radix) = match seq {
         [b'0', x, d, ..] if *x | 0x20 == b'x' && d.is_ascii_hexdigit() => (&seq[2..], 16),
         [b'0', ..] => (seq, 8),
         _ => (seq, 10),
     };
-    let mut mant = 0u64;
-    let mut erange = false;
+    let mut mant = Some(0u64);
     let mut read = 0;
     for d in digits.iter().map_while(|&b| (b as char).to_digit(radix)) {
-        match mant
-            .checked_mul(radix as u64)
-            .and_then(|m| m.checked_add(d as u64))
-        {
-            Some(m) => mant = m,
-            None => erange = true,
-        }
+        mant = mant
+            .and_then(|m| m.checked_mul(radix as u64))
+            .and_then(|m| m.checked_add(d as u64));
         read += 1;
     }
-    if erange {
-        mant = u64::MAX;
-    }
-    let mant = mant & ((1 << 51) - 1);
+    // strtoull saturates.
+    let mant = mant.unwrap_or(u64::MAX) & ((1 << 51) - 1);
     if read != digits.len() || mant == 0 {
-        return (f64::NAN, erange);
+        return f64::NAN;
     }
-    (f64::from_bits(f64::NAN.to_bits() | mant), erange)
+    f64::from_bits(f64::NAN.to_bits() | mant)
 }
 
 /// `0x` significand and optional `p` exponent; the caller checked a hex digit
@@ -589,37 +582,47 @@ pub fn strtol(s: impl AsRef<[u8]>, base: u32) -> (c_long, usize) {
     strto(s.as_ref(), base)
 }
 
-/// One glibc `scanf` integer conversion into a `long` — `%i` is base 0, `%d`
-/// base 10, `%x` 16, `%o` 8 — with the end offset. vfscanf hands its digits
-/// to [`strtol`], so an out-of-range value is `strtol`'s and a `%d`/`%hd`
-/// narrows it as [`long_to_int`] does; but it takes a `0x` (base 0 or 16) or
-/// `0b` (base 0) prefix before it sees that no digit follows, so a bare one
-/// is consumed with its `0`. `None` is a matching failure.
+/// glibc's `sscanf(s, "%l<conv>%n")` into a `long` through
+/// [`super::scanf::sscanf`] — base 0 is `%li`, 10 `%ld`, 16 `%lx`, 8 `%lo`,
+/// 2 `%lb` — with the end offset. `None` is a matching failure. `%lx`,
+/// `%lo` and `%lb` are unsigned conversions, so their `strtoul` value wraps
+/// into the `long`.
+///
+/// # Panics
+///
+/// On a base no conversion reads.
 pub fn scanf_long(s: impl AsRef<[u8]>, base: u32) -> Option<(c_long, usize)> {
-    scanf(s.as_ref(), base)
+    let fmt: &[u8] = match base {
+        0 => b"%li%n",
+        10 => b"%ld%n",
+        _ => unsigned_conversion(base),
+    };
+    scanf(s.as_ref(), fmt)
 }
 
-/// [`scanf_long`] for `%u`/`%lu`, through [`strtoul`]: a leading `-` negates
-/// modulo `unsigned long`, and `%u` narrows as [`ulong_to_uint`] does.
+/// [`scanf_long`] for `%lu` and the other unsigned conversions into an
+/// `unsigned long`: a leading `-` negates modulo `unsigned long`.
+///
+/// # Panics
+///
+/// On base 0, which only the signed `%i` reads, or one no conversion reads.
 pub fn scanf_ulong(s: impl AsRef<[u8]>, base: u32) -> Option<(c_ulong, usize)> {
-    scanf(s.as_ref(), base)
+    scanf(s.as_ref(), unsigned_conversion(base))
 }
 
-fn scanf<T: CInt>(s: &[u8], base: u32) -> Option<(T, usize)> {
-    let (v, end) = strto(s, base);
-    if end == 0 {
-        return None;
+fn unsigned_conversion(base: u32) -> &'static [u8] {
+    match base {
+        10 => b"%lu%n",
+        16 => b"%lx%n",
+        8 => b"%lo%n",
+        2 => b"%lb%n",
+        _ => panic!("no unsigned scanf conversion reads base {base}"),
     }
-    let mut start = s.iter().take_while(|&&c| c_isspace(c as char)).count();
-    start += usize::from(matches!(s.get(start), Some(b'+' | b'-')));
-    let bare_prefix = end == start + 1
-        && s[start] == b'0'
-        && match s.get(end) {
-            Some(b'x' | b'X') => base == 0 || base == 16,
-            Some(b'b' | b'B') => base == 0,
-            _ => false,
-        };
-    Some((v, end + usize::from(bare_prefix)))
+}
+
+fn scanf<T: super::scanf::ScanNum + Default>(s: &[u8], fmt: &[u8]) -> Option<(T, usize)> {
+    let (v, end) = (std::cell::Cell::new(T::default()), std::cell::Cell::new(0));
+    (super::scanf::sscanf(s, fmt, &[&v, &end]) == 1).then(|| (v.get(), end.get() as usize))
 }
 
 /// C `strtoul(s, &end, base)`, likewise at `unsigned long`'s width; `ERANGE`
@@ -730,13 +733,15 @@ pub fn epics_str_hash(s: impl AsRef<[u8]>, seed: u32) -> u32 {
 mod tests {
     use super::*;
 
-    /// Measured with glibc 2.39, `-D_GNU_SOURCE`, `sscanf(s, "%i%n")`.
+    /// Measured with glibc 2.43, `-D_GNU_SOURCE`, `sscanf(s, "%li%n")`.
     #[test]
     fn scanf_i_matches_glibc_with_gnu_source() {
         let i = |s| scanf_long(s, 0);
-        assert_eq!(i("0xS"), Some((0, 2)));
-        assert_eq!(i("0bS"), Some((0, 2)));
-        assert_eq!(i(" -0x S"), Some((0, 4)));
+        assert_eq!(i("0xS"), None);
+        assert_eq!(i("0bS"), None);
+        assert_eq!(i(" -0x S"), None);
+        assert_eq!(i("0X"), None);
+        assert_eq!(i("-0b"), None);
         assert_eq!(i("0b11 "), Some((3, 4)));
         assert_eq!(i("0x1g"), Some((1, 3)));
         assert_eq!(i("00x"), Some((0, 2)));
@@ -744,10 +749,29 @@ mod tests {
         assert_eq!(i("\u{0b}1"), Some((1, 2)));
         assert_eq!(i("\u{a0}1"), None);
         assert_eq!(i("-"), None);
-        // `%d` takes no prefix; `%x` takes `0x` but `b` is its digit.
+        // `%d`/`%o`/`%u` take no prefix; `%x` takes `0x` but `b` is its
+        // digit; `%b` takes `0b`.
         assert_eq!(scanf_long("0x", 10), Some((0, 1)));
-        assert_eq!(scanf_long("0xS", 16), Some((0, 2)));
+        assert_eq!(scanf_long("0x", 8), Some((0, 1)));
+        assert_eq!(scanf_ulong("0b", 10), Some((0, 1)));
+        assert_eq!(scanf_long("0xS", 16), None);
+        assert_eq!(scanf_long("0X", 16), None);
         assert_eq!(scanf_long("0bS", 16), Some((11, 2)));
+        assert_eq!(scanf_long("0b", 2), None);
+        assert_eq!(scanf_long("0b1", 2), Some((1, 3)));
+        // `%lx`, `%lo` and `%lb` are unsigned conversions: `strtoul`'s value
+        // stored into the `long`.
+        // Past `unsigned long`'s range `strtoul` saturates at `ULONG_MAX`.
+        let min = |digits_64: c_long| if c_long::BITS == 64 { digits_64 } else { -1 };
+        assert_eq!(
+            scanf_long("8000000000000000", 16),
+            Some((min(c_long::MIN), 16))
+        );
+        assert_eq!(scanf_long("1ffffffffffffffffff", 16), Some((-1, 19)));
+        assert_eq!(
+            scanf_long("1000000000000000000000", 8),
+            Some((min(c_long::MIN), 22))
+        );
     }
 
     #[test]
@@ -950,7 +974,9 @@ mod tests {
     /// `strtod` against the C library's on every edge the ports disagreed on:
     /// hex floats (`0x.8`, a bare `0x`, `p` with no digit), the `inf`/`nan`
     /// words and `nan(...)`'s character set, leading C whitespace (`\v`
-    /// included), an exponent with no digits, and both ERANGE sides.
+    /// included), an exponent with no digits, and both ERANGE sides. Only
+    /// rows every glibc agrees on; the rest are pinned in
+    /// `nan_payload_overflow_is_not_erange`.
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     #[test]
     fn strtod_matches_c_strtod() {
@@ -987,8 +1013,6 @@ mod tests {
             b"nan(0xg)",
             b"nan(2251799813685248)",
             b"nan(2251799813685249)",
-            b"nan(99999999999999999999999)",
-            b"nan(99999999999999999999999z)",
             b"nan(a-b)",
             b"nan(",
             b"nan()",
@@ -1030,6 +1054,21 @@ mod tests {
             assert_eq!(r.len, len, "length of {shown:?}");
             assert_eq!(r.erange, erange, "ERANGE of {shown:?}");
             assert_eq!(r.value.to_bits(), v.to_bits(), "value of {shown:?}");
+        }
+    }
+
+    /// glibc 2.43 `strtod`: `(text, length, bits)`, never ERANGE. glibc 2.39
+    /// sets ERANGE on both (BZ #32045).
+    #[test]
+    fn nan_payload_overflow_is_not_erange() {
+        let rows: &[(&str, usize, u64)] = &[
+            ("nan(99999999999999999999999)", 28, 0x7fff_ffff_ffff_ffff),
+            ("nan(99999999999999999999999z)", 29, 0x7ff8_0000_0000_0000),
+        ];
+        for &(text, len, bits) in rows {
+            let r = strtod(text.as_bytes());
+            assert_eq!((r.len, r.value.to_bits()), (len, bits), "{text}");
+            assert!(!r.erange, "ERANGE of {text}");
         }
     }
 

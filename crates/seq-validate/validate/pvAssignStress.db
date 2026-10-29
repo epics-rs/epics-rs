@@ -1,0 +1,3 @@
+record(longin,"pvAssignStress0") {field(VAL,0)}
+record(longin,"pvAssignStress1") {field(VAL,1)}
+record(longin,"pvAssignStress2") {field(VAL,2)}

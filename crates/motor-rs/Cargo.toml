@@ -14,6 +14,7 @@ epics-libcom-rs = { workspace = true }
 asyn-rs = { workspace = true }
 tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
 bitflags = "2"
+parking_lot = "0.12"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -21,6 +22,7 @@ libc = "0.2"
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3"
 
 [[bench]]
 name = "motor"

@@ -80,15 +80,15 @@ fn unconnected_calls(lset: &dyn LinkSet, name: LinkRef<'_>, forward: &dyn LinkFo
 // build (EPICS_RS_BUILD_EXEC_BACKEND=thread); the runtime only drives setup.
 #[test]
 fn unconnected_pva_link_lset_calls_allocate_nothing() {
-    let port = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let closed = named_port::HeldPort::closed_tcp();
     // SAFETY: the one test in this binary, before any runtime exists, so no
-    // other thread reads the environment. Nothing listens on `port`.
+    // other thread reads the environment. Nothing listens on `closed.port`,
+    // and the hold keeps a stranger from binding it until the test ends.
     unsafe {
-        std::env::set_var("EPICS_PVA_NAME_SERVERS", format!("127.0.0.1:{port}"));
+        std::env::set_var(
+            "EPICS_PVA_NAME_SERVERS",
+            format!("127.0.0.1:{}", closed.port),
+        );
         std::env::set_var("EPICS_PVA_ADDR_LIST", "");
         std::env::set_var("EPICS_PVA_AUTO_ADDR_LIST", "NO");
     }
@@ -105,14 +105,11 @@ fn unconnected_pva_link_lset_calls_allocate_nothing() {
                 // One name per config route: the defaults, a convenience URI
                 // (one naming a `field`, so a clone of it would allocate) and a
                 // structured key.
-                let json = format!(
-                    "pva://{}",
-                    pvajson_identity_key("T:NONE", &[("Q".to_string(), JlinkValue::Int(7))])
-                );
+                let json = pvajson_identity_key("T:NONE", &[("Q".to_string(), JlinkValue::Int(7))]);
                 for name in [
-                    "pva://T:NONE",
-                    "pva://T:NONE?sevr=MS&field=value",
-                    "pva://T:NONE?time=true",
+                    "T:NONE",
+                    "T:NONE?sevr=MS&field=value",
+                    "T:NONE?time=true",
                     json.as_str(),
                 ] {
                     let open = OpenLatch::default();

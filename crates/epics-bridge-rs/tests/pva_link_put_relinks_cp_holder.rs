@@ -19,7 +19,7 @@ use epics_pva_rs::server::PvDatabaseSource;
 use epics_pva_rs::server_native::{PvaServer, PvaServerConfig};
 
 const HOLDER: &str = r#"
-record(calc, "H") { field(INPA, "pva://T:OLD?proc=CP") field(CALC, "A") field(FLNK, "CNT") }
+record(calc, "H") { field(INPA, {pva:{pv:"T:OLD", proc:"CP"}}) field(CALC, "A") field(FLNK, "CNT") }
 record(calc, "CNT") { field(INPA, "CNT NPP") field(CALC, "A+1") }
 "#;
 
@@ -90,7 +90,7 @@ async fn a_cp_pvalink_put_scans_on_the_new_channel_only() {
     db.put_record_field_from_ca_no_notify(
         "H",
         "INPA",
-        EpicsValue::String("pva://T:NEW?proc=CP".into()),
+        EpicsValue::String(r#"{pva:{pv:"T:NEW", proc:"CP"}}"#.into()),
     )
     .await
     .unwrap();

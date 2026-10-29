@@ -44,8 +44,8 @@ impl TeardownDriver {
             name,
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.create_param("VAL", ParamType::Int32).unwrap();
         Self { base, torn_down }

@@ -169,26 +169,102 @@ pub(crate) fn bind_pvxs_server(
     crate::server_native::serving::PvaSockets::bind_ioc(config)
 }
 
-/// pvxs `pvxsBaseRegistrar` (`ioc/iochooks.cpp:461-511`): the commands, then
-/// `initialisePvxsServer`, which binds the server from the environment and
-/// publishes its TCP port before the startup script runs. pvxs starts it at
-/// `initHookAfterIocRunning` (`:374-379`), which here is the runner. A bind
-/// that fails prints pvxs's catch line and leaves the IOC without pvAccess.
+/// The pvxs `enable2()` decision: whether QSRV2's iocsh commands register, plus
+/// the startup diagnostics pvxs prints synchronously (iochooks.cpp:401-448).
+struct Qsrv2Decision {
+    enabled: bool,
+    /// Invalid `PVXS_QSRV_ENABLE` value — pvxs prints this to stderr
+    /// immediately (iochooks.cpp:421-426).
+    error: Option<String>,
+    /// The `INFO: PVXS QSRV2 ...` status line pvxs prints to stdout
+    /// (iochooks.cpp:441-443). `None` when the operator explicitly
+    /// disabled QSRV2 (`quiet` — the "shut up, I know what I'm doing" path).
+    info: Option<String>,
+}
+
+/// Pure core of pvxs `enable2()` (iochooks.cpp:401-448), parameterized on
+/// the two environment strings so it is testable without mutating the
+/// process environment.
+///
+/// pvxs gates on `permit && request`. `permit` is false only when QSRV1
+/// (`qsrv.dbd`) is co-linked; the Rust IOC has no QSRV1 coexistence, so
+/// `permit` is always true and only `request` varies. `EPICS_IOC_IGNORE_
+/// SERVERS=qsrv2` and `PVXS_QSRV_ENABLE=NO` disable quietly; `=YES`
+/// enables; any other value keeps the default (enabled) and emits the
+/// error diagnostic. The ignore-servers check takes precedence over
+/// `PVXS_QSRV_ENABLE` (pvxs evaluates it first).
+fn resolve_qsrv2_enable(ignore_servers: Option<&str>, qsrv_enable: Option<&str>) -> Qsrv2Decision {
+    let mut request = true;
+    let mut quiet = false;
+    let mut error = None;
+
+    if ignore_servers.is_some_and(|s| s.contains("qsrv2")) {
+        request = false;
+        quiet = true;
+    } else if qsrv_enable.is_some_and(|s| s.eq_ignore_ascii_case("YES")) {
+        request = true;
+    } else if qsrv_enable.is_some_and(|s| s.eq_ignore_ascii_case("NO")) {
+        request = false;
+        quiet = true;
+    } else if let Some(v) = qsrv_enable {
+        // Unknown value: keep the default (`request` unchanged) and report.
+        error = Some(format!(
+            "ERROR: PVXS_QSRV_ENABLE={v} not YES/NO.  Defaulting to {}.",
+            if request { "YES" } else { "NO" }
+        ));
+    }
+
+    // permit == true, so enable == request.
+    let enabled = request;
+    let info = if quiet {
+        None
+    } else {
+        Some(format!(
+            "INFO: PVXS QSRV2 is loaded, permitted, and {}.",
+            if enabled { "ENABLED" } else { "disabled" }
+        ))
+    };
+    Qsrv2Decision {
+        enabled,
+        error,
+        info,
+    }
+}
+
+/// pvxs `enableQ`: `pvxsBaseRegistrar` computes it once, and it gates
+/// `single_enable`, `group_enable` and `pvalink_enable` together
+/// (`ioc/iochooks.cpp:476,503-507`). The first call reads the environment and
+/// prints `enable2()`'s lines.
+pub fn qsrv2_enabled() -> bool {
+    static DECISION: OnceLock<Qsrv2Decision> = OnceLock::new();
+    DECISION
+        .get_or_init(|| {
+            let decision = resolve_qsrv2_enable(
+                epics_base_rs::runtime::env::get_lossy("EPICS_IOC_IGNORE_SERVERS").as_deref(),
+                epics_base_rs::runtime::env::get_lossy("PVXS_QSRV_ENABLE").as_deref(),
+            );
+            if let Some(e) = &decision.error {
+                epics_libcom_rs::stderr_println!("{e}");
+            }
+            if let Some(i) = &decision.info {
+                println!("{i}");
+            }
+            decision
+        })
+        .enabled
+}
+
+/// pvxs `pvxsBaseRegistrar` (`ioc/iochooks.cpp:461-511`): `enable2()`, the
+/// commands, then `initialisePvxsServer`, which binds the server from the
+/// environment and publishes its TCP port before the startup script runs.
+/// pvxs starts it at `initHookAfterIocRunning` (`:374-379`), which here is
+/// the runner. A bind that fails prints pvxs's catch line and leaves the IOC
+/// without pvAccess.
 ///
 /// Must be called on the IOC's runtime, which the bound sockets register with.
 pub fn pvxs_base_registrar(app: IocApplication) -> IocApplication {
-    pvxs_base_registrar_with_enable2(app, || ())
-}
-
-/// [`pvxs_base_registrar`] with QSRV's `enable2()` decision run where pvxs
-/// runs it: after `logger_config_env()`, before the commands and the bind
-/// (`ioc/iochooks.cpp:461-476`).
-pub fn pvxs_base_registrar_with_enable2(
-    app: IocApplication,
-    enable2: impl FnOnce(),
-) -> IocApplication {
     crate::pvxs_log::logger_config_env();
-    enable2();
+    qsrv2_enabled();
     let app = register_pvxs_commands(app);
     let config = PvaServerConfig::default().with_env();
     let bound = match config.map_err(Into::into).and_then(bind_pvxs_server) {
@@ -374,6 +450,50 @@ fn report_server(detail: i64, out: &dyn Fn(&[u8])) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── pvxs enable2() decision (resolve_qsrv2_enable) ──
+
+    #[test]
+    fn qsrv2_enable_default_is_on() {
+        let d = resolve_qsrv2_enable(None, None);
+        assert!(d.enabled, "QSRV2 defaults to enabled when no env set");
+        assert!(d.error.is_none());
+        assert!(d.info.as_deref().unwrap().contains("ENABLED"));
+    }
+
+    #[test]
+    fn qsrv2_enable_yes_case_insensitive() {
+        assert!(resolve_qsrv2_enable(None, Some("YES")).enabled);
+        assert!(resolve_qsrv2_enable(None, Some("yes")).enabled);
+    }
+
+    #[test]
+    fn qsrv2_enable_no_disables_quietly() {
+        let d = resolve_qsrv2_enable(None, Some("NO"));
+        assert!(!d.enabled, "PVXS_QSRV_ENABLE=NO disables QSRV2");
+        assert!(d.error.is_none());
+        assert!(d.info.is_none(), "explicit NO is the quiet path");
+    }
+
+    #[test]
+    fn qsrv2_enable_ignore_servers_qsrv2_overrides_yes() {
+        // EPICS_IOC_IGNORE_SERVERS=qsrv2 takes precedence over an explicit
+        // PVXS_QSRV_ENABLE=YES (pvxs checks ignore-servers first).
+        let d = resolve_qsrv2_enable(Some("qsrv1 qsrv2"), Some("YES"));
+        assert!(!d.enabled, "qsrv2 in EPICS_IOC_IGNORE_SERVERS disables");
+        assert!(d.info.is_none(), "ignore-servers disable is quiet");
+    }
+
+    #[test]
+    fn qsrv2_enable_invalid_value_defaults_on_with_error() {
+        let d = resolve_qsrv2_enable(None, Some("maybe"));
+        assert!(d.enabled, "invalid PVXS_QSRV_ENABLE keeps the default (on)");
+        let err = d.error.expect("invalid value must report an error");
+        assert!(err.contains("not YES/NO"));
+        assert!(err.contains("Defaulting to YES"));
+        // pvxs still prints the INFO status line after the inline error.
+        assert!(d.info.as_deref().unwrap().contains("ENABLED"));
+    }
 
     #[test]
     fn pvxsr_command_is_named_with_optional_detail() {

@@ -140,7 +140,9 @@ linux-rt = ["epics-libcom-rs/linux-rt"]
 # only compiles when the 12-arg signature is in effect.
 ca-server-tls-test = ["epics-ca-rs/experimental-rust-tls", "epics-ca-rs/cap-tokens"]
 # Test-only: `server::database::fresh_hold_hook`, a closure run at each
-# fresh lock-set hold, for tests that must act between two holds.
+# fresh lock-set hold, for tests that must act between two holds; and
+# `server::database::destroy_signal_hook`, one run between a removal's
+# destroy and its wake-up.
 test-hooks = []
 
 [[bench]]

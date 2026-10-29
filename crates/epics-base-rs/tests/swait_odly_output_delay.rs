@@ -83,7 +83,8 @@ async fn link_out(db: &PvDatabase, rec: &str, target: &str) {
 /// Wait until `pv` reads `want` — the OUT write is a CA put — and fail naming
 /// it if it never does.
 async fn settle(db: &PvDatabase, pv: &str, want: f64) {
-    for _ in 0..400 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if db.get_pv(pv).unwrap().to_f64() == Some(want) {
             return;
         }
@@ -142,7 +143,8 @@ async fn swait_odly_defers_out_write_and_oevt_to_continuation() {
         .await
         .unwrap();
     // OEVT post is spawned (like dispatch_event_record) — poll then settle.
-    for _ in 0..400 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if count.load(Ordering::SeqCst) >= 1 {
             break;
         }
@@ -221,7 +223,8 @@ async fn swait_odly_holds_pact_foreign_process_does_not_fire_early() {
     db.process_record_continuation("W3_ODLY", &mut v3)
         .await
         .unwrap();
-    for _ in 0..400 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if count.load(Ordering::SeqCst) >= 1 {
             break;
         }
@@ -409,7 +412,8 @@ async fn swait_no_odly_writes_out_and_posts_oevt_synchronously() {
     db.process_record_with_links("W2_ODLY", &mut v)
         .await
         .unwrap();
-    for _ in 0..400 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if count.load(Ordering::SeqCst) >= 1 {
             break;
         }

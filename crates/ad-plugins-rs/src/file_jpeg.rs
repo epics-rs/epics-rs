@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use ad_core_rs::color::{NDColorMode, convert_rgb_layout};
 use ad_core_rs::error::{ADError, ADResult};
-use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType};
+use ad_core_rs::ndarray::{NDArray, NDDataType, NDDataView};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::file_base::{NDFileOpenMode, NDFileWriter};
 use ad_core_rs::plugin::file_controller::{
@@ -15,7 +15,7 @@ use ad_core_rs::plugin::runtime::{NDPluginProcess, ProcessResult};
 use jpeg_encoder::{ColorType as JpegColorType, Encoder as JpegEncoder};
 use parking_lot::Mutex;
 
-/// JPEG file writer using `jpeg-encoder` for encoding and `jpeg-decoder` for decoding.
+/// JPEG file writer using `jpeg-encoder`.
 pub struct JpegWriter {
     current_path: Option<PathBuf>,
     pub(crate) quality: WriterSettings<u8>,
@@ -38,7 +38,7 @@ impl NDFileWriter for JpegWriter {
     fn open_file(&mut self, path: &Path, mode: NDFileOpenMode, array: &NDArray) -> ADResult<()> {
         // NDFileJPEG.cpp:34-37
         mode.refuse_read_or_append("NDFileJPEG")?;
-        let dt = array.data.data_type();
+        let dt = array.data().data_type();
         if dt != NDDataType::UInt8 && dt != NDDataType::Int8 {
             return Err(ADError::UnsupportedConversion(
                 "JPEG only supports UInt8/Int8 data".into(),
@@ -100,9 +100,9 @@ impl NDFileWriter for JpegWriter {
         let width = info.x_size;
         let height = info.y_size;
 
-        let data: Vec<u8> = match &src.data {
-            NDDataBuffer::U8(v) => v.clone(),
-            NDDataBuffer::I8(v) => v.iter().map(|&b| b as u8).collect(),
+        let data: Vec<u8> = match src.data().view() {
+            NDDataView::U8(v) => v.to_vec(),
+            NDDataView::I8(v) => v.iter().map(|&b| b as u8).collect(),
             _ => {
                 return Err(ADError::UnsupportedConversion(
                     "JPEG only supports UInt8/Int8".into(),
@@ -127,7 +127,7 @@ impl NDFileWriter for JpegWriter {
     }
 
     /// C `readFile` returns asynError (NDFileJPEG.cpp:194-198).
-    fn read_file(&mut self) -> ADResult<NDArray> {
+    fn read_file(&mut self, _pool: &NDArrayPool) -> ADResult<NDArray> {
         Err(ADError::UnsupportedConversion(
             "NDFileJPEG cannot read".into(),
         ))
@@ -226,6 +226,10 @@ impl NDPluginProcess for JpegFileProcessor {
         self.attributes = Some(attributes);
     }
 
+    fn bind_pool(&mut self, pool: ad_core_rs::plugin::runtime::PluginPool) {
+        self.ctrl.get_mut().bind_pool(pool);
+    }
+
     fn plugin_type(&self) -> &str {
         "NDFileJPEG"
     }
@@ -255,7 +259,7 @@ impl NDPluginProcess for JpegFileProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ad_core_rs::ndarray::{NDDataBuffer, NDDimension};
+    use ad_core_rs::ndarray::{NDDataViewMut, NDDimension};
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -287,7 +291,10 @@ mod tests {
         writer.close_file().unwrap();
         let mut proc = JpegFileProcessor::new(90);
         let (out, _base) = crate::test_util::read_file(&mut proc, &path);
-        assert_eq!(out.trace, crate::test_util::read_refused_lines(&path));
+        assert_eq!(
+            out.trace,
+            crate::test_util::read_refused_lines(&path, &_base)
+        );
         assert_eq!(out.publish, ad_core_rs::plugin::runtime::Published::Nothing);
         std::fs::remove_file(&path).ok();
     }
@@ -374,7 +381,7 @@ mod tests {
             vec![NDDimension::new(8), NDDimension::new(8)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             for i in 0..64 {
                 v[i] = (i * 4) as u8;
             }
@@ -418,7 +425,7 @@ mod tests {
             vec![NDDimension::new(32), NDDimension::new(32)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             for i in 0..v.len() {
                 v[i] = (i % 256) as u8;
             }
@@ -466,8 +473,8 @@ mod tests {
             "jpeg_param_test",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         let mut proc = JpegFileProcessor::new(50);
         proc.register_params(&mut base).unwrap();
@@ -487,8 +494,8 @@ mod tests {
             "jpeg_quality_write",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         let mut proc = JpegFileProcessor::new(50);
         proc.register_params(&mut base).unwrap();
@@ -521,7 +528,7 @@ mod tests {
             vec![NDDimension::new(8), NDDimension::new(8)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             // Use uniform value so JPEG compression is lossless at quality 100
             for i in 0..64 {
                 v[i] = 128;
@@ -534,8 +541,8 @@ mod tests {
         writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
-        let (info, pixels) = decode(&path);
-        assert_eq!(info.pixel_format, jpeg_decoder::PixelFormat::L8);
+        let (dims, pixels) = decode(&path);
+        assert_eq!(dims, [1, 8, 8]);
         // With uniform input at max quality, decoded values should be close
         for &px in pixels.iter() {
             assert!(
@@ -547,12 +554,26 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    /// The file as an independent decoder reads it.
-    fn decode(path: &Path) -> (jpeg_decoder::ImageInfo, Vec<u8>) {
+    /// The file as an independent decoder reads it: `[components, width,
+    /// height]` and the pixels, gray for a 1-component image.
+    fn decode(path: &Path) -> (Vec<usize>, Vec<u8>) {
+        use zune_jpeg::zune_core::bytestream::ZCursor;
+        use zune_jpeg::zune_core::colorspace::ColorSpace;
+
         let bytes = std::fs::read(path).unwrap();
-        let mut decoder = jpeg_decoder::Decoder::new(&bytes[..]);
+        let mut decoder = zune_jpeg::JpegDecoder::new(ZCursor::new(&bytes[..]));
+        decoder.decode_headers().unwrap();
+        let info = decoder.info().unwrap();
+        if info.components == 1 {
+            decoder.set_options(decoder.options().jpeg_set_out_colorspace(ColorSpace::Luma));
+        }
         let pixels = decoder.decode().unwrap();
-        (decoder.info().unwrap(), pixels)
+        let dims = vec![
+            info.components as usize,
+            info.width as usize,
+            info.height as usize,
+        ];
+        (dims, pixels)
     }
 
     /// Write an RGB-mode array to JPEG and return the decoded
@@ -572,7 +593,7 @@ mod tests {
             NDAttrSource::Driver,
             NDAttrValue::Int32(mode as i32),
         ));
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             for (i, x) in v.iter_mut().enumerate() {
                 *x = (i % 256) as u8;
             }
@@ -583,14 +604,9 @@ mod tests {
             .unwrap();
         writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
-        let (info, _) = decode(&path);
+        let (dims, _) = decode(&path);
         std::fs::remove_file(&path).ok();
-        let components = match info.pixel_format {
-            jpeg_decoder::PixelFormat::L8 => 1,
-            jpeg_decoder::PixelFormat::RGB24 => 3,
-            other => panic!("unexpected {other:?}"),
-        };
-        vec![components, info.width as usize, info.height as usize]
+        dims
     }
 
     #[test]

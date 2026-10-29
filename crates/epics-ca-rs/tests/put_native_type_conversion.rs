@@ -67,7 +67,10 @@ async fn server_with_bi(pv: &'static str) -> (CaClient, epics_ca_rs::client::CaC
 
 /// Native readback as a plain integer, whatever ENUM carrier comes back.
 async fn read_index(ch: &epics_ca_rs::client::CaChannel) -> i64 {
-    let (_t, v) = ch.get().await.expect("readback");
+    let (_t, v) = ch
+        .get_with_timeout(fact_budget::FACT_BUDGET)
+        .await
+        .expect("readback");
     match v {
         EpicsValue::Enum(i) => i as i64,
         EpicsValue::EnumWithChoices { index, .. } => index as i64,
@@ -81,7 +84,9 @@ async fn read_index(ch: &epics_ca_rs::client::CaChannel) -> i64 {
 #[serial]
 async fn matching_enum_put_lands_index() {
     let (_client, ch) = server_with_bi("PNC:BI:ENUM").await;
-    ch.put(&EpicsValue::Enum(1)).await.expect("put");
+    ch.put_with_timeout(&EpicsValue::Enum(1), fact_budget::FACT_BUDGET)
+        .await
+        .expect("put");
     assert_eq!(read_index(&ch).await, 1);
 }
 
@@ -104,7 +109,9 @@ async fn long_put_on_enum_native_converts() {
 #[serial]
 async fn double_put_on_enum_native_converts() {
     let (_client, ch) = server_with_bi("PNC:BI:DBL").await;
-    ch.put(&EpicsValue::Double(1.0)).await.expect("put");
+    ch.put_with_timeout(&EpicsValue::Double(1.0), fact_budget::FACT_BUDGET)
+        .await
+        .expect("put");
     assert_eq!(read_index(&ch).await, 1);
 }
 

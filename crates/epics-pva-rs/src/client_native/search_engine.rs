@@ -11,7 +11,7 @@
 //!
 //! - Per-PV search retry using a 30-bucket ring at 1 s/tick (pvxs
 //!   `client.cpp` `searchBuckets`/`tickSearch`). Each retry advances the
-//!   channel by `min(attempt, 30)` buckets, giving 1 s, 2 s, 3 s, …,
+//!   channel by `min(nSearch, 30)` buckets, giving 1 s, 2 s, 3 s, …,
 //!   ~29 s cap (pvxs `nBuckets = 30`). See `cascade_smoothed_next`.
 //! - Beacon-driven fast reconnect: when a beacon arrives for a server we
 //!   have a disconnected channel against, the engine re-issues SEARCH for
@@ -67,11 +67,11 @@ use tokio::sync::{mpsc, oneshot};
 // `cbMedium` worker with *"there is no reactor running"* the moment the engine
 // starts, and the pvalink monitor never connects.
 // Deadlines here are computed with `Instant::now() + window` and then waited
-// on with `sleep_until`, so they must be stamped in the clock the seam's timer
+// on with a held `Sleep`, so they must be stamped in the clock the seam's timer
 // actually runs on — hosted that is tokio's, which is virtual under
 // `start_paused`. Taking `Instant` from the seam alongside the timer is what
 // keeps the two from being different timelines.
-use epics_base_rs::runtime::task::{Instant, Interval, interval, sleep, sleep_until, timeout};
+use epics_base_rs::runtime::task::{Instant, Period, Sleep, interval, sleep, timeout};
 use tracing::debug;
 use tracing::warn;
 
@@ -131,10 +131,10 @@ const INITIAL_SEARCH_DELAY: Duration = Duration::from_millis(10);
 ///
 /// Mirrors pvxs `client.cpp` (Channel::disconnect / tickSearch):
 ///
-/// - `Initial` is a fresh resolve: the engine fires an immediate
-///   broadcast AND places the search at `current_bucket+1` so the
-///   first scheduled retransmit lands one tick after the
-///   immediate fire.
+/// - `Initial` is a fresh resolve: the first broadcast leaves with the
+///   coalesced initial-search burst, which then places the search in
+///   `current_bucket` (pvxs `tickSearch(SearchKind::initial)`), so the
+///   next tick retransmits it.
 ///
 /// - `Reconnect` follows pvxs `Channel::disconnect` (src/client.cpp:213)
 ///   semantics: the search is placed at `current_bucket` with no
@@ -288,7 +288,8 @@ pub const BEACON_TIMEOUT: Duration = Duration::from_secs(360);
 
 /// Period of the beacon-cleanup tick. pvxs runs `tickBeaconClean` every
 /// 180s; we match.
-pub const BEACON_CLEAN_INTERVAL: Duration = Duration::from_secs(180);
+pub const BEACON_CLEAN_INTERVAL: Period =
+    Period::from_secs(std::num::NonZeroU64::new(180).unwrap());
 
 /// How long the engine collects extra SEARCH_RESPONSE entries after the
 /// first one for a given pv name (used by [`SearchCommand::FindAll`]).
@@ -1219,23 +1220,22 @@ enum Responder {
     Multi {
         responder: oneshot::Sender<Vec<SearchHit>>,
         accumulated: Vec<SearchHit>,
-        deadline: Instant,
+        /// End of the reply window; `None` until the first broadcast,
+        /// which opens it.
+        deadline: Option<Instant>,
     },
 }
 
 struct Pending {
     pv_name: String,
     responder: Responder,
-    last_attempt: Instant,
-    /// Number of times this search has been broadcast. 0 before the
-    /// first transmit; bumped to 1 after the bucket-fire (or
-    /// immediate-fire for `Initial`). Doubles as the pvxs `nSearch`
-    /// counter that controls retry-bucket escalation: each retry
-    /// pushes the search forward by `min(attempt, nBuckets)` buckets,
+    /// pvxs `Channel::nSearch`: bumped only by an unpoked bucket tick, so
+    /// each retry pushes the search `min(n_search, nBuckets)` buckets on,
     /// giving the 1 s, 2 s, 3 s, ..., 30 s pattern.
-    attempt: u32,
-    /// Which search bucket this pending currently occupies.
-    bucket: usize,
+    n_search: u32,
+    /// The ring bucket this search waits in; `None` while it waits in the
+    /// initial-search window (pvxs `initialSearchBucket`).
+    bucket: Option<usize>,
 }
 
 /// pvxs `client.cpp::nBuckets`. 30 buckets at 1 s normal interval gives
@@ -1243,6 +1243,11 @@ struct Pending {
 /// caps UDP search traffic at roughly `pending.len() / 30` packets per
 /// second instead of letting every channel fire on its own backoff.
 const N_SEARCH_BUCKETS: usize = 30;
+
+/// pvxs `bucketInterval` and `bucketIntervalFast` (src/client.cpp:40-41):
+/// the search tick period, and the period during a poke revolution.
+const BUCKET_INTERVAL: Duration = Duration::from_secs(1);
+const BUCKET_INTERVAL_FAST: Duration = Duration::from_millis(200);
 
 /// pvxs `pokeHoldoff` (src/client.cpp:60): global minimum interval between two
 /// fast-search pokes. A beacon-driven poke is ignored unless at least this
@@ -1267,11 +1272,11 @@ const SEARCH_SEQ: u32 = 0x6669_6e64;
 /// caller's intent. Pure function so the production handlers and
 /// the unit tests share the formula and can't drift apart.
 ///
-/// - `Initial`: `current_bucket + 1`. The Find handler ALSO fires an
-///   immediate broadcast for `Initial`; the +1 placement is so the
-///   first scheduled retry lands one tick after the immediate fire
-///   instead of being eaten by the same tick the immediate broadcast
-///   already covered.
+/// - `Initial`: `current_bucket`, applied when the initial-search window
+///   flushes, not at Find time. pvxs `tickSearch(SearchKind::initial)`
+///   (src/client.cpp:1053-1063, 1146-1148) leaves `currentBucket` and
+///   `nSearch` alone and splices the channel into the bucket the next
+///   tick takes.
 /// - `Reconnect`: `current_bucket`. Mirrors pvxs `Channel::disconnect`
 ///   (src/client.cpp:213) which pushes the channel into
 ///   `searchBuckets[currentBucket + holdoff]` with `holdoff = 0` for
@@ -1284,8 +1289,7 @@ const SEARCH_SEQ: u32 = 0x6669_6e64;
 /// per-channel sid hashing needed.
 fn placement_bucket(current_bucket: usize, reason: SearchReason) -> usize {
     match reason {
-        SearchReason::Initial => (current_bucket + 1) % N_SEARCH_BUCKETS,
-        SearchReason::Reconnect => current_bucket,
+        SearchReason::Initial | SearchReason::Reconnect => current_bucket,
         // pvxs 084336bb: `laterBucket = currentBucket ? currentBucket - 1
         // : nBuckets - 1` — the furthest future bucket, so a refusal that
         // will recur is retried once per ring revolution (~30 s), not
@@ -1334,7 +1338,7 @@ fn cascade_smoothed_next(
 }
 
 /// Single owner of a search's post-send retry decision: returns the
-/// `(next_bucket, next_attempt)` to requeue it with.
+/// `(next_bucket, next_n_search)` to requeue it with.
 ///
 /// pvxs `tickSearch(..., poked)` (src/client.cpp:1141-1160): on a poked tick (during
 /// the fast poke revolution) `ninc = 0`, so the channel keeps its accumulated
@@ -1346,16 +1350,16 @@ fn cascade_smoothed_next(
 fn rearm_after_send(
     poked: bool,
     current_bucket: usize,
-    attempt: u32,
+    n_search: u32,
     bucket_sizes: impl Fn(usize) -> usize,
 ) -> (usize, u32) {
     if poked {
-        (current_bucket, attempt)
+        (current_bucket, n_search)
     } else {
-        let next_attempt = attempt.saturating_add(1);
+        let next_n_search = n_search.saturating_add(1);
         (
-            cascade_smoothed_next(current_bucket, next_attempt, bucket_sizes),
-            next_attempt,
+            cascade_smoothed_next(current_bucket, next_n_search, bucket_sizes),
+            next_n_search,
         )
     }
 }
@@ -1424,8 +1428,8 @@ async fn run_engine(
     // channels accrue here for INITIAL_SEARCH_DELAY, then their first
     // SEARCH goes out as one batched datagram instead of one per PV.
     // `initial_deadline` is the instant the window flushes; `None` means
-    // no window is armed. The sids are also placed in their retry
-    // buckets at command time, so this affects only the first broadcast.
+    // no window is armed. A sid here is in no ring bucket until the flush
+    // places it.
     let mut initial_pending: Vec<u32> = Vec::new();
     let mut initial_deadline: Option<Instant> = None;
     // Server-GUID blocklist (pvxs `ignoreServerGUIDs`). Only SEARCH_RESPONSE
@@ -1492,7 +1496,16 @@ async fn run_engine(
         ));
     }
 
-    let mut tick = interval(Duration::from_secs(1));
+    // One-shot search timer, re-armed by each tick and pulled in by a poke.
+    // Its first tick is one period after start, as pvxs arms `searchTimer`
+    // (src/client.cpp:658).
+    let mut next_tick = Instant::now() + BUCKET_INTERVAL;
+    // The loop's sleeps, held across passes so one that moves no deadline
+    // arms no timer. `hold_until` brings each to its deadline before the
+    // `select!`; with no deadline none is held and its arm parks.
+    let mut tick_sleep: Option<Sleep> = None;
+    let mut initial_sleep: Option<Sleep> = None;
+    let mut multi_sleep: Option<Sleep> = None;
     // Periodic beacon-tracker cleanup: every BEACON_CLEAN_INTERVAL we
     // walk the map and forget servers whose beacons have been silent
     // longer than BEACON_TIMEOUT. Each pruned entry fires a
@@ -1522,26 +1535,16 @@ async fn run_engine(
         let next_multi_deadline: Option<Instant> = pending
             .values()
             .filter_map(|p| match &p.responder {
-                Responder::Multi { deadline, .. } if p.attempt > 0 => Some(*deadline),
+                Responder::Multi { deadline, .. } => *deadline,
                 _ => None,
             })
             .min();
-        let deadline_arm = async {
-            match next_multi_deadline {
-                Some(d) => sleep_until(d).await,
-                None => std::future::pending::<()>().await,
-            }
-        };
-
+        hold_until(&mut multi_sleep, next_multi_deadline);
         // Fire when the coalescing window for buffered initial searches
         // elapses (pvxs `initialSearcher` timer). `None` ⟹ no window
         // armed, so this arm parks forever.
-        let initial_arm = async {
-            match initial_deadline {
-                Some(d) => sleep_until(d).await,
-                None => std::future::pending::<()>().await,
-            }
-        };
+        hold_until(&mut initial_sleep, initial_deadline);
+        hold_until(&mut tick_sleep, Some(next_tick));
 
         tokio::select! {
             cmd = cmd_rx.recv() => match cmd {
@@ -1553,32 +1556,13 @@ async fn run_engine(
                     // → caller's find() future returns Cancelled).
                     if let Some(old_sid) = by_name.remove(&pv_name) {
                         if let Some(old) = pending.remove(&old_sid) {
-                            search_buckets[old.bucket].retain(|x| *x != old_sid);
+                            if let Some(b) = old.bucket {
+                                search_buckets[b].retain(|x| *x != old_sid);
+                            }
                         }
                     }
                     let sid = NEXT_SEARCH_ID.fetch_add(1, Ordering::Relaxed);
-                    let bucket = placement_bucket(current_bucket, reason);
-                    search_buckets[bucket].push(sid);
-                    let p = Pending {
-                        pv_name: pv_name.clone(),
-                        responder: Responder::Single(responder),
-                        last_attempt: Instant::now(),
-                        attempt: 0,
-                        bucket,
-                    };
-                    by_name.insert(pv_name, sid);
-                    pending.insert(sid, p);
-                    if reason == SearchReason::Initial {
-                        if let Some(p) = pending.get_mut(&sid) {
-                            // Mark this as an attempt so the bucket-fire
-                            // path doesn't later re-anchor the Multi
-                            // responder's deadline (it would only do that
-                            // when `attempt == 0`, i.e. the bucket is
-                            // firing the FIRST broadcast — true for
-                            // Reconnect, false for Initial).
-                            p.attempt = 1;
-                            p.last_attempt = Instant::now();
-                        }
+                    let bucket = if reason == SearchReason::Initial {
                         // Defer the first broadcast into the coalescing
                         // window instead of sending one datagram now — a
                         // burst of channel creation is packed into one
@@ -1587,49 +1571,64 @@ async fn run_engine(
                         if initial_deadline.is_none() {
                             initial_deadline = Some(Instant::now() + INITIAL_SEARCH_DELAY);
                         }
-                    }
+                        None
+                    } else {
+                        let b = placement_bucket(current_bucket, reason);
+                        search_buckets[b].push(sid);
+                        Some(b)
+                    };
+                    let p = Pending {
+                        pv_name: pv_name.clone(),
+                        responder: Responder::Single(responder),
+                        n_search: 0,
+                        bucket,
+                    };
+                    by_name.insert(pv_name, sid);
+                    pending.insert(sid, p);
                 }
                 Some(SearchCommand::FindAll { pv_name, responder, reason }) => {
                     // same dedup as Find — drop any prior
                     // pending search for the same name.
                     if let Some(old_sid) = by_name.remove(&pv_name) {
                         if let Some(old) = pending.remove(&old_sid) {
-                            search_buckets[old.bucket].retain(|x| *x != old_sid);
+                            if let Some(b) = old.bucket {
+                                search_buckets[b].retain(|x| *x != old_sid);
+                            }
                         }
                     }
                     let sid = NEXT_SEARCH_ID.fetch_add(1, Ordering::Relaxed);
-                    let bucket = placement_bucket(current_bucket, reason);
-                    search_buckets[bucket].push(sid);
-                    let p = Pending {
-                        pv_name: pv_name.clone(),
-                        responder: Responder::Multi {
-                            responder,
-                            accumulated: Vec::new(),
-                            deadline: Instant::now() + MULTI_SERVER_WINDOW,
-                        },
-                        last_attempt: Instant::now(),
-                        attempt: 0,
-                        bucket,
-                    };
-                    by_name.insert(pv_name, sid);
-                    pending.insert(sid, p);
-                    if reason == SearchReason::Initial {
-                        if let Some(p) = pending.get_mut(&sid) {
-                            p.attempt = 1;
-                            p.last_attempt = Instant::now();
-                        }
+                    let bucket = if reason == SearchReason::Initial {
                         // Coalesce with any other initial searches in the
                         // window (see the Find branch above).
                         initial_pending.push(sid);
                         if initial_deadline.is_none() {
                             initial_deadline = Some(Instant::now() + INITIAL_SEARCH_DELAY);
                         }
-                    }
+                        None
+                    } else {
+                        let b = placement_bucket(current_bucket, reason);
+                        search_buckets[b].push(sid);
+                        Some(b)
+                    };
+                    let p = Pending {
+                        pv_name: pv_name.clone(),
+                        responder: Responder::Multi {
+                            responder,
+                            accumulated: Vec::new(),
+                            deadline: None,
+                        },
+                        n_search: 0,
+                        bucket,
+                    };
+                    by_name.insert(pv_name, sid);
+                    pending.insert(sid, p);
                 }
                 Some(SearchCommand::Cancel { pv_name }) => {
                     if let Some(sid) = by_name.remove(&pv_name) {
                         if let Some(p) = pending.remove(&sid) {
-                            search_buckets[p.bucket].retain(|x| *x != sid);
+                            if let Some(b) = p.bucket {
+                                search_buckets[b].retain(|x| *x != sid);
+                            }
                         }
                     }
                 }
@@ -1667,7 +1666,7 @@ async fn run_engine(
                         // one revolution while keeping its accumulated backoff.
                         // `maybe_poke` enforces the 30 s holdoff + one-active
                         // -revolution guard.
-                        maybe_poke(&mut tick, &mut fast_ticks_remaining, &mut last_poke);
+                        maybe_poke(&mut next_tick, &mut fast_ticks_remaining, &mut last_poke);
                     }
                 }
                 Some(SearchCommand::Subscribe { responder }) => {
@@ -1685,7 +1684,7 @@ async fn run_engine(
                     // the increment and requeues into the same bucket). The prior
                     // `attempt = 0` reset was more aggressive than pvxs's poked
                     // semantic.
-                    maybe_poke(&mut tick, &mut fast_ticks_remaining, &mut last_poke);
+                    maybe_poke(&mut next_tick, &mut fast_ticks_remaining, &mut last_poke);
                 }
                 Some(SearchCommand::CacheClear { pv_name }) => {
                     // Same drop-the-name path as Cancel, but the name
@@ -1701,7 +1700,9 @@ async fn run_engine(
                         }
                     } else if let Some(sid) = by_name.remove(&pv_name) {
                         if let Some(p) = pending.remove(&sid) {
-                            search_buckets[p.bucket].retain(|x| *x != sid);
+                            if let Some(b) = p.bucket {
+                                search_buckets[b].retain(|x| *x != sid);
+                            }
                         }
                     }
                 }
@@ -1751,7 +1752,7 @@ async fn run_engine(
                     if poke {
                         // pvxs `poke()` (src/client.cpp:736-759): rate-limited.
                         // Never extends a revolution already in flight.
-                        maybe_poke(&mut tick, &mut fast_ticks_remaining, &mut last_poke);
+                        maybe_poke(&mut next_tick, &mut fast_ticks_remaining, &mut last_poke);
                     }
                 }
             }
@@ -1777,7 +1778,7 @@ async fn run_engine(
                     if poke {
                         // pvxs `poke()` (src/client.cpp:736-759): rate-limited.
                         // Never extends a revolution already in flight.
-                        maybe_poke(&mut tick, &mut fast_ticks_remaining, &mut last_poke);
+                        maybe_poke(&mut next_tick, &mut fast_ticks_remaining, &mut last_poke);
                     }
                 }
             }
@@ -1803,7 +1804,7 @@ async fn run_engine(
                     if poke {
                         // pvxs `poke()` (src/client.cpp:736-759): rate-limited.
                         // Never extends a revolution already in flight.
-                        maybe_poke(&mut tick, &mut fast_ticks_remaining, &mut last_poke);
+                        maybe_poke(&mut next_tick, &mut fast_ticks_remaining, &mut last_poke);
                     }
                 }
             }
@@ -1830,7 +1831,7 @@ async fn run_engine(
                     if poke {
                         // pvxs `poke()` (src/client.cpp:736-759): rate-limited.
                         // Never extends a revolution already in flight.
-                        maybe_poke(&mut tick, &mut fast_ticks_remaining, &mut last_poke);
+                        maybe_poke(&mut next_tick, &mut fast_ticks_remaining, &mut last_poke);
                     }
                 }
             }
@@ -1845,7 +1846,7 @@ async fn run_engine(
             Some(()) = ns_ready_rx.recv() => {
                 // A search skipped while the name server was not ready is
                 // sent now, not at its next bucket.
-                maybe_poke(&mut tick, &mut fast_ticks_remaining, &mut last_poke);
+                maybe_poke(&mut next_tick, &mut fast_ticks_remaining, &mut last_poke);
             }
 
             ns_rsp = ns_response_rx.recv() => {
@@ -1861,7 +1862,7 @@ async fn run_engine(
                 }
             }
 
-            _ = deadline_arm => {
+            _ = held(&mut multi_sleep) => {
                 // The earliest unfired `Multi` deadline elapsed —
                 // flush it (and any others now past). Without this
                 // arm, deadlines were only checked at the 1 Hz tick,
@@ -1878,28 +1879,33 @@ async fn run_engine(
                 );
             }
 
-            _ = initial_arm => {
+            _ = held(&mut initial_sleep) => {
                 // The initial-search coalescing window elapsed: send the
                 // burst as one batched SEARCH (broadcast + name-server
                 // forward), then disarm until the next initial Find.
-                flush_initial_searches(
+                let entries = flush_initial_searches(
                     &mut initial_pending,
-                    &pending,
-                    &codec,
-                    &transport,
-                    &mut search_send_errs,
-                    &ns_senders,
-                )
-                .await;
+                    &mut pending,
+                    &mut search_buckets,
+                    current_bucket,
+                );
+                if !entries.is_empty() {
+                    // UDP broadcast and TCP name-server forward are
+                    // independent: a name-servers-only engine packs no UDP
+                    // frame at all but still forwards the burst to every
+                    // name server.
+                    transport.broadcast_search(&codec, &entries, &mut search_send_errs).await;
+                    ns_forward_frames(&ns_senders, &pack_search_frames(&codec, &entries, 0, true));
+                }
                 initial_deadline = None;
             }
 
-            _ = tick.tick() => {
+            _ = held(&mut tick_sleep) => {
                 let now = Instant::now();
 
                 // 1. Flush expired FindAll multi-window responders.
                 //    Same logic the deadline arm runs — covers the
-                //    case where deadline_arm was racing against a
+                //    case where the multi-deadline arm was racing against a
                 //    just-armed entry and missed it on this iteration.
                 //
                 //    Closed Single responders (caller dropped the
@@ -1918,9 +1924,9 @@ async fn run_engine(
                 //    pvxs's `nSearch+1` escalation (`tickSearch`,
                 //    src/client.cpp:1141-1143):
                 //
-                //      next = (idx + min(attempt, nBuckets)) % nBuckets
+                //      next = (idx + min(nSearch, nBuckets)) % nBuckets
                 //
-                //    `attempt` is bumped immediately after the send
+                //    `n_search` is bumped immediately after the send
                 //    so the first retry lands at idx+1 (1 s later),
                 //    the second at idx+2 (2 s after that), the
                 //    third at idx+3 (4 s total), …, capping at
@@ -1941,12 +1947,12 @@ async fn run_engine(
                 // increment and requeues each channel into the SAME bucket. Since
                 // `current_bucket` has already advanced, the channel waits for the
                 // fast revolution to wrap rather than becoming a fresh 1-bucket
-                // retry. Preserving `attempt` keeps each search's accumulated
+                // retry. Preserving `n_search` keeps each search's accumulated
                 // backoff across the poke.
                 let poked = fast_ticks_remaining > 0;
                 let bucket_ids = std::mem::take(&mut search_buckets[current_bucket]);
-                // Phase 1: prune dead responders, re-anchor first-attempt
-                // FindAll deadlines, and collect the live (sid, name)
+                // Phase 1: prune dead responders, open the FindAll reply
+                // window on a first broadcast, and collect the live (sid, name)
                 // entries so the whole bucket goes out as ONE batched
                 // SEARCH rather than one datagram per channel per
                 // destination.
@@ -1976,24 +1982,9 @@ async fn run_engine(
                     }
 
                     if let Some(p) = pending.get_mut(&sid) {
-                        // First-broadcast bookkeeping for FindAll
-                        // callers: the deadline was set to
-                        // `call_time + MULTI_SERVER_WINDOW` assuming
-                        // an immediate broadcast. With Reconnect
-                        // placement going through the bucket
-                        // scheduler, the actual first broadcast can
-                        // land up to one tick later. Without re-
-                        // anchoring, the accumulation window may
-                        // already have expired by the time SEARCH
-                        // actually goes out and post-first responses
-                        // get dropped. Re-arm relative to NOW on
-                        // the first attempt only.
-                        if p.attempt == 0 {
-                            if let Responder::Multi { ref mut deadline, .. } = p.responder {
-                                *deadline = now + MULTI_SERVER_WINDOW;
-                            }
+                        if let Responder::Multi { ref mut deadline, .. } = p.responder {
+                            deadline.get_or_insert(now + MULTI_SERVER_WINDOW);
                         }
-                        p.last_attempt = now;
                         to_send.push((sid, p.pv_name.clone()));
                         rearm_ids.push(sid);
                     }
@@ -2020,35 +2011,51 @@ async fn run_engine(
                 // the re-arm past the sends is size-equivalent).
                 for sid in rearm_ids {
                     if let Some(p) = pending.get(&sid) {
-                        let attempt = p.attempt;
-                        let (next, next_attempt) = {
+                        let n_search = p.n_search;
+                        let (next, next_n_search) = {
                             let bucket_sizes = |idx: usize| search_buckets[idx].len();
-                            rearm_after_send(poked, current_bucket, attempt, bucket_sizes)
+                            rearm_after_send(poked, current_bucket, n_search, bucket_sizes)
                         };
-                        // Update the pending's bucket/attempt BEFORE the
+                        // Update the pending's bucket/n_search BEFORE the
                         // push so the in-place state and the buckets agree.
                         if let Some(p) = pending.get_mut(&sid) {
-                            p.attempt = next_attempt;
-                            p.bucket = next;
+                            p.n_search = next_n_search;
+                            p.bucket = Some(next);
                         }
                         search_buckets[next].push(sid);
                     }
                 }
                 current_bucket = (current_bucket + 1) % N_SEARCH_BUCKETS;
 
-                // 3. Drop fast-tick mode after one full revolution so we
-                //    don't permanently spam the network at 200 ms.
-                if fast_ticks_remaining > 0 {
+                // 3. pvxs `tickSearchS` (src/client.cpp:1248-1268): re-arm
+                //    from the end of this tick, at the fast period if it was
+                //    poked, the revolution's last poked tick included.
+                if poked {
                     fast_ticks_remaining -= 1;
-                    if fast_ticks_remaining == 0 {
-                        tick = interval(Duration::from_secs(1));
-                        // Skip the immediate fire so the new cadence
-                        // doesn't double-tick in the same instant.
-                        tick.tick().await;
-                    }
                 }
+                next_tick = Instant::now()
+                    + if poked { BUCKET_INTERVAL_FAST } else { BUCKET_INTERVAL };
             }
         }
+    }
+}
+
+/// Bring a held loop sleep to `deadline`. Only a moved deadline touches the
+/// timer; `None` drops the sleep, cancelling its entry.
+fn hold_until(held: &mut Option<Sleep>, deadline: Option<Instant>) {
+    match (held.as_mut(), deadline) {
+        (Some(s), Some(d)) if s.deadline() == d => {}
+        (Some(s), Some(d)) => s.reset(d),
+        (None, Some(d)) => *held = Some(Sleep::until(d)),
+        (_, None) => *held = None,
+    }
+}
+
+/// `select!` arm over a held sleep: its deadline, or never with none held.
+async fn held(sleep: &mut Option<Sleep>) {
+    match sleep {
+        Some(s) => s.await,
+        None => std::future::pending().await,
     }
 }
 
@@ -2064,13 +2071,13 @@ async fn run_engine(
 ///   least [`POKE_HOLDOFF`] has elapsed since the last GRANTED poke.
 ///
 /// Returns `true` iff the poke was granted, in which case it has already
-/// recorded the poke time, switched `tick` to the 200 ms fast cadence, and
+/// recorded the poke time, pulled `next_tick` in to now, and
 /// armed one full revolution; the caller may then bring pending searches
 /// forward. Returns `false` (no side effects) when either guard declines —
 /// this is what stops a site-wide IOC reboot from amplifying into a sustained
 /// UDP search-broadcast storm.
 fn maybe_poke(
-    tick: &mut Interval,
+    next_tick: &mut Instant,
     fast_ticks_remaining: &mut u32,
     last_poke: &mut Option<Instant>,
 ) -> bool {
@@ -2086,9 +2093,9 @@ fn maybe_poke(
         }
     }
     *last_poke = Some(now);
-    // The interval's first tick is immediate: pvxs schedules the poked
-    // search timer with `immediate{0,0}` (src/client.cpp:757-758).
-    *tick = interval(Duration::from_millis(200));
+    // pvxs schedules the poked search timer with `immediate{0,0}`
+    // (src/client.cpp:757-758).
+    *next_tick = now;
     *fast_ticks_remaining = N_SEARCH_BUCKETS as u32;
     true
 }
@@ -2240,46 +2247,43 @@ impl UdpTransport {
     }
 }
 
-/// Send the coalesced initial-search burst as one batched SEARCH.
+/// Move the coalesced initial-search burst into the ring and return the
+/// `(sid, name)` entries to send as its one batched SEARCH.
 ///
-/// pvxs `tickSearch(SearchKind::initial)` (`src/client.cpp:1063-1170`): the
+/// pvxs `tickSearch(SearchKind::initial)` (`src/client.cpp:1053-1170`): the
 /// channels that accrued during the [`INITIAL_SEARCH_DELAY`] window are
-/// packed into as few datagrams as fit under [`MAX_SEARCH_PAYLOAD`] and
-/// broadcast once, then forwarded to the name servers (port zeroed).
-/// Each sid is already placed in its retry bucket at command time, so
-/// retry scheduling and Cancel are unaffected — this only sends the
-/// *first* broadcast. A sid that was deduped/cancelled, or whose caller
-/// dropped the responder during the window, is filtered out here (its
-/// `pending` entry is gone or its responder closed), so no SEARCH leaks
-/// for a channel that no longer exists.
-async fn flush_initial_searches(
+/// broadcast once and spliced into `searchBuckets[currentBucket]` with
+/// `nSearch` still 0, so the next tick retransmits them. A sid that was
+/// deduped/cancelled, or whose caller dropped the responder during the
+/// window, is neither returned nor placed (its `pending` entry is gone, or
+/// its closed responder is left for `flush_expired_pending`), so no SEARCH
+/// leaks for a channel that no longer exists.
+fn flush_initial_searches(
     initial_pending: &mut Vec<u32>,
-    pending: &HashMap<u32, Pending>,
-    codec: &PvaCodec,
-    transport: &SearchTransport,
-    send_errs: &mut HashSet<SocketAddr>,
-    ns_senders: &[NsHandle],
-) {
-    let entries: Vec<(u32, String)> = initial_pending
-        .drain(..)
-        .filter_map(|sid| {
-            pending.get(&sid).and_then(|p| {
-                let alive = match &p.responder {
-                    Responder::Single(tx) => !tx.is_closed(),
-                    Responder::Multi { responder, .. } => !responder.is_closed(),
-                };
-                alive.then(|| (sid, p.pv_name.clone()))
-            })
-        })
-        .collect();
-    if entries.is_empty() {
-        return;
+    pending: &mut HashMap<u32, Pending>,
+    search_buckets: &mut [Vec<u32>],
+    current_bucket: usize,
+) -> Vec<(u32, String)> {
+    let now = Instant::now();
+    let bucket = placement_bucket(current_bucket, SearchReason::Initial);
+    let mut entries: Vec<(u32, String)> = Vec::with_capacity(initial_pending.len());
+    for sid in initial_pending.drain(..) {
+        let Some(p) = pending.get_mut(&sid) else {
+            continue;
+        };
+        match &mut p.responder {
+            Responder::Single(tx) if tx.is_closed() => continue,
+            Responder::Multi { responder, .. } if responder.is_closed() => continue,
+            Responder::Single(_) => {}
+            Responder::Multi { deadline, .. } => {
+                deadline.get_or_insert(now + MULTI_SERVER_WINDOW);
+            }
+        }
+        p.bucket = Some(bucket);
+        search_buckets[bucket].push(sid);
+        entries.push((sid, p.pv_name.clone()));
     }
-    // UDP broadcast and TCP name-server forward are independent: a
-    // name-servers-only engine packs no UDP frame at all but still forwards
-    // the burst to every name server.
-    transport.broadcast_search(codec, &entries, send_errs).await;
-    ns_forward_frames(ns_senders, &pack_search_frames(codec, &entries, 0, true));
+    entries
 }
 
 /// Flush any pending entries whose Multi deadline has elapsed (deliver
@@ -2304,11 +2308,10 @@ fn flush_expired_pending(
             } => {
                 if responder.is_closed() {
                     to_drop_single.push(*sid);
-                } else if now >= *deadline && p.attempt > 0 {
-                    // `attempt > 0` ensures the first broadcast went
-                    // out — Reconnect entries waiting on a bucket fire
-                    // would otherwise flush prematurely with empty
-                    // results.
+                } else if deadline.is_some_and(|d| now >= d) {
+                    // No deadline until the first broadcast went out — a
+                    // search still waiting for it would otherwise flush
+                    // prematurely with empty results.
                     to_flush_multi.push(*sid);
                 }
             }
@@ -2322,7 +2325,9 @@ fn flush_expired_pending(
     for sid in to_flush_multi {
         if let Some(p) = pending.remove(&sid) {
             by_name.remove(&p.pv_name);
-            search_buckets[p.bucket].retain(|x| *x != sid);
+            if let Some(b) = p.bucket {
+                search_buckets[b].retain(|x| *x != sid);
+            }
             if let Responder::Multi {
                 responder,
                 accumulated,
@@ -2336,7 +2341,9 @@ fn flush_expired_pending(
     for sid in to_drop_single {
         if let Some(p) = pending.remove(&sid) {
             by_name.remove(&p.pv_name);
-            search_buckets[p.bucket].retain(|x| *x != sid);
+            if let Some(b) = p.bucket {
+                search_buckets[b].retain(|x| *x != sid);
+            }
             // Sender drops at end of scope; that's the signal to the
             // caller (already-cancelled).
         }
@@ -3069,10 +3076,7 @@ async fn ns_run_once(
     // bookkeeping — and leaves a ≥10 s window in which no PV can be resolved
     // at all. The host never showed it: a tokio-side NS circuit is just as
     // silent, but the churn only costs a reconnect there.
-    let echo_interval = Duration::from_secs_f64(crate::config::env::echo_period_secs(
-        tcp_timeout.as_secs_f64(),
-    ));
-    let mut echo_tick = interval(echo_interval);
+    let mut echo_tick = interval(crate::config::env::echo_period(tcp_timeout));
     echo_tick.tick().await; // `interval` fires immediately; skip that one
     let mut last_rx = Instant::now();
     let mut reassembly = SegmentAssembler::default();
@@ -3239,25 +3243,21 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn maybe_poke_first_poke_granted_arms_revolution() {
         // last_poke == None, no active revolution → granted.
-        let mut tick = interval(Duration::from_secs(1));
+        let mut next_tick = Instant::now() + BUCKET_INTERVAL;
         let mut ftr = 0u32;
         let mut last = None;
-        assert!(maybe_poke(&mut tick, &mut ftr, &mut last));
+        assert!(maybe_poke(&mut next_tick, &mut ftr, &mut last));
         assert_eq!(ftr, N_SEARCH_BUCKETS as u32);
         assert!(last.is_some(), "granted poke must record a poke time");
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn a_granted_poke_ticks_at_once() {
-        let mut tick = interval(Duration::from_secs(1));
-        tick.tick().await;
+        let mut next_tick = Instant::now() + BUCKET_INTERVAL;
         let (mut ftr, mut last) = (0u32, None);
-        assert!(maybe_poke(&mut tick, &mut ftr, &mut last));
-        // The fast period is 200 ms; a skipped first tick waits all of it.
+        assert!(maybe_poke(&mut next_tick, &mut ftr, &mut last));
         assert!(
-            timeout(Duration::from_millis(100), tick.tick())
-                .await
-                .is_ok(),
+            next_tick <= Instant::now(),
             "the first poked tick waited a period"
         );
     }
@@ -3265,10 +3265,10 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn maybe_poke_declines_while_revolution_active() {
         // fast_ticks_remaining > 0 → skip-while-active, no re-arm/extend.
-        let mut tick = interval(Duration::from_secs(1));
+        let mut next_tick = Instant::now() + BUCKET_INTERVAL;
         let mut ftr = 5u32;
         let mut last = None;
-        assert!(!maybe_poke(&mut tick, &mut ftr, &mut last));
+        assert!(!maybe_poke(&mut next_tick, &mut ftr, &mut last));
         assert_eq!(ftr, 5, "active revolution must not be re-armed or extended");
         assert!(last.is_none(), "declined poke must not record a poke time");
     }
@@ -3276,10 +3276,10 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn maybe_poke_declines_within_holdoff_window() {
         // last_poke just now, no active revolution → inside 30 s holdoff.
-        let mut tick = interval(Duration::from_secs(1));
+        let mut next_tick = Instant::now() + BUCKET_INTERVAL;
         let mut ftr = 0u32;
         let mut last = Some(Instant::now());
-        assert!(!maybe_poke(&mut tick, &mut ftr, &mut last));
+        assert!(!maybe_poke(&mut next_tick, &mut ftr, &mut last));
         assert_eq!(
             ftr, 0,
             "poke inside the holdoff window must not arm a revolution"
@@ -3289,11 +3289,11 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn maybe_poke_granted_once_holdoff_elapsed() {
         // last_poke older than POKE_HOLDOFF, no active revolution → granted.
-        let mut tick = interval(Duration::from_secs(1));
+        let mut next_tick = Instant::now() + BUCKET_INTERVAL;
         let mut ftr = 0u32;
         let prev = Instant::now() - (POKE_HOLDOFF + Duration::from_secs(1));
         let mut last = Some(prev);
-        assert!(maybe_poke(&mut tick, &mut ftr, &mut last));
+        assert!(maybe_poke(&mut next_tick, &mut ftr, &mut last));
         assert_eq!(ftr, N_SEARCH_BUCKETS as u32);
         assert!(last.unwrap() > prev, "granted poke must advance last_poke");
     }
@@ -3716,9 +3716,8 @@ mod tests {
             Pending {
                 pv_name: "dut".into(),
                 responder: Responder::Single(tx),
-                last_attempt: Instant::now(),
-                attempt: 1,
-                bucket: 0,
+                n_search: 1,
+                bucket: Some(0),
             },
         );
         let mut by_name: HashMap<String, u32> = std::iter::once(("dut".to_string(), 1)).collect();
@@ -3850,9 +3849,8 @@ mod tests {
                 Pending {
                     pv_name: "dut".into(),
                     responder: Responder::Single(tx),
-                    last_attempt: Instant::now(),
-                    attempt: 1,
-                    bucket: 0,
+                    n_search: 1,
+                    bucket: Some(0),
                 },
             );
             let mut by_name: HashMap<String, u32> =
@@ -3887,9 +3885,8 @@ mod tests {
             Pending {
                 pv_name: "dut".into(),
                 responder: Responder::Single(tx),
-                last_attempt: Instant::now(),
-                attempt: 1,
-                bucket: 0,
+                n_search: 1,
+                bucket: Some(0),
             },
         );
         let mut by_name: HashMap<String, u32> = std::iter::once(("dut".to_string(), 1)).collect();
@@ -3946,9 +3943,8 @@ mod tests {
             Pending {
                 pv_name: "dut".into(),
                 responder: Responder::Single(tx),
-                last_attempt: Instant::now(),
-                attempt: 1,
-                bucket: 0,
+                n_search: 1,
+                bucket: Some(0),
             },
         );
         let mut by_name: HashMap<String, u32> = std::iter::once(("dut".to_string(), 1)).collect();
@@ -4032,9 +4028,8 @@ mod tests {
             Pending {
                 pv_name: "dut".into(),
                 responder: Responder::Single(tx),
-                last_attempt: Instant::now(),
-                attempt: 1,
-                bucket: 0,
+                n_search: 1,
+                bucket: Some(0),
             },
         );
         let mut by_name: HashMap<String, u32> = std::iter::once(("dut".to_string(), 1)).collect();
@@ -4115,11 +4110,10 @@ mod tests {
                     responder: Responder::Multi {
                         responder: tx,
                         accumulated: vec![seed],
-                        deadline: Instant::now(),
+                        deadline: Some(Instant::now()),
                     },
-                    last_attempt: Instant::now(),
-                    attempt: 1,
-                    bucket: 0,
+                    n_search: 1,
+                    bucket: Some(0),
                 },
             );
             let mut by_name: HashMap<String, u32> =
@@ -4356,9 +4350,8 @@ mod tests {
                 Pending {
                     pv_name: "dut".into(),
                     responder: Responder::Single(tx),
-                    last_attempt: Instant::now(),
-                    attempt: 1,
-                    bucket: 0,
+                    n_search: 1,
+                    bucket: Some(0),
                 },
             );
             let mut by_name: HashMap<String, u32> = HashMap::new();
@@ -4531,20 +4524,14 @@ mod tests {
         }
     }
 
-    /// `Initial` is paired with an immediate broadcast in the Find /
-    /// FindAll handlers, so its bucket placement is one tick ahead
-    /// — that's where the FIRST scheduled retransmit (after the
-    /// immediate fire) lands. Wrap-around at the ring boundary is
-    /// part of the contract and exercised here.
+    /// pvxs `tickSearch` re-buckets an initial search at `idx + nSearch`
+    /// with nSearch still 0 (src/client.cpp:1146-1149), so the next
+    /// tick retries a search the initial burst sent.
     #[test]
-    fn placement_initial_is_one_bucket_ahead_with_wraparound() {
-        assert_eq!(placement_bucket(0, SearchReason::Initial), 1);
-        assert_eq!(placement_bucket(13, SearchReason::Initial), 14);
-        assert_eq!(
-            placement_bucket(N_SEARCH_BUCKETS - 1, SearchReason::Initial),
-            0,
-            "wrap-around at ring boundary"
-        );
+    fn placement_initial_uses_current_bucket() {
+        for current in 0..N_SEARCH_BUCKETS {
+            assert_eq!(placement_bucket(current, SearchReason::Initial), current);
+        }
     }
 
     /// pvxs 084336bb: a refused CREATE_CHANNEL parks the re-search in
@@ -4702,7 +4689,7 @@ mod tests {
     /// ticks then preserve each search's accumulated backoff
     /// (`tickSearch(..., poked=true)` skips the `nSearch++` increment,
     /// src/client.cpp:1141-1143). A real discovery pong must therefore leave a
-    /// pending search's `attempt`/`bucket` untouched and only signal the
+    /// pending search's `n_search`/`bucket` untouched and only signal the
     /// poke. Before, the UDP discovery-pong handler reset every pending
     /// search to `attempt = 0` / `last_attempt = now-60s`, converting an
     /// escalated backoff into a fresh 1-bucket retry on each beacon — a
@@ -4718,9 +4705,8 @@ mod tests {
             Pending {
                 pv_name: "dut".into(),
                 responder: Responder::Single(tx),
-                last_attempt: Instant::now(),
-                attempt: 3,
-                bucket: 2,
+                n_search: 3,
+                bucket: Some(2),
             },
         );
         let mut by_name: HashMap<String, u32> = std::iter::once(("dut".to_string(), 1)).collect();
@@ -4755,11 +4741,12 @@ mod tests {
         assert!(poke, "a New discovery-pong identity must signal a poke");
         let p = pending.get(&1).expect("pending search must survive a poke");
         assert_eq!(
-            p.attempt, 3,
+            p.n_search, 3,
             "discovery pong must NOT reset the pending search's accumulated backoff"
         );
         assert_eq!(
-            p.bucket, 2,
+            p.bucket,
+            Some(2),
             "discovery pong must NOT move the pending search to a fresh bucket"
         );
     }
@@ -5190,6 +5177,169 @@ mod tests {
             (1500..=2700).contains(&(gap_23.as_millis() as u64)),
             "gap #2→#3 should be ~2 s (nSearch=2); got {gap_23:?}. \
              Production retry escalation may have regressed."
+        );
+    }
+
+    /// pvxs `tickSearch(SearchKind::initial)` (src/client.cpp:1053-1063,
+    /// 1146-1148) moves a new channel into `searchBuckets[currentBucket]`
+    /// with `nSearch` still 0, and the search timer first fires one
+    /// `bucketInterval` after start (src/client.cpp:658). So the retries
+    /// after the initial SEARCH come at that first tick, then 1 s and 2 s
+    /// apart.
+    // `tokio_backend` for the `AsyncUdpV4` sniffer, as above.
+    #[cfg(tokio_backend)]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial(epics_env)]
+    async fn initial_search_retries_pvxs_pattern() {
+        #[cfg(tokio_backend)]
+        use epics_base_rs::net::AsyncUdpV4;
+        use std::net::Ipv4Addr;
+
+        let beacon_port = quiet_beacon_port().to_string();
+        let _env = EnvVarGuard::set(&[
+            ("EPICS_PVA_AUTO_ADDR_LIST", "NO"),
+            ("EPICS_PVA_ADDR_LIST", ""),
+            ("EPICS_PVA_BROADCAST_PORT", &beacon_port),
+        ]);
+        let sniffer = AsyncUdpV4::bind_single(
+            Ipv4Addr::LOCALHOST,
+            0,
+            epics_base_rs::net::PortUse::Exclusive,
+            false,
+        )
+        .expect("bind sniffer");
+        let sniffer_addr = sniffer
+            .local_addrs()
+            .first()
+            .copied()
+            .expect("sniffer addr");
+        let engine = SearchEngine::spawn(&crate::test_reactor(), vec![sniffer_addr], Vec::new())
+            .await
+            .expect("spawn");
+
+        let pv = "INITIAL:ESCALATION:PVA";
+        let started = std::time::Instant::now();
+        let _find_handle = tokio::spawn({
+            let engine = engine.clone();
+            let pv = pv.to_string();
+            async move { engine.find(&pv, SearchReason::Initial).await }
+        });
+
+        let mut buf = vec![0u8; 4096];
+        let mut t = Vec::new();
+        for i in 0..4 {
+            let at = tokio::time::timeout(Duration::from_secs(8), async {
+                loop {
+                    let (n, _) = sniffer.recv_from(&mut buf).await.expect("recv");
+                    if buf[..n].windows(pv.len()).any(|w| w == pv.as_bytes()) {
+                        return started.elapsed();
+                    }
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("SEARCH #{} did not arrive within 8 s", i + 1));
+            t.push(at);
+        }
+
+        assert!(
+            t[0] < Duration::from_millis(300),
+            "initial SEARCH should leave after the 10 ms window; got {:?}",
+            t[0]
+        );
+        assert!(
+            t[1] < Duration::from_millis(1500),
+            "first retry should come at the engine's first tick, 1 s after start; got {:?}",
+            t[1]
+        );
+        let gap_23 = t[2].saturating_sub(t[1]);
+        let gap_34 = t[3].saturating_sub(t[2]);
+        assert!(
+            (700..=1500).contains(&(gap_23.as_millis() as u64)),
+            "gap #2→#3 should be ~1 s (nSearch=1); got {gap_23:?}"
+        );
+        assert!(
+            (1500..=2700).contains(&(gap_34.as_millis() as u64)),
+            "gap #3→#4 should be ~2 s (nSearch=2); got {gap_34:?}"
+        );
+    }
+
+    /// pvxs `tickSearchS` (src/client.cpp:1248-1268) re-arms every poked tick
+    /// at `bucketIntervalFast`, the revolution's last one included, so a
+    /// search the poke requeued comes round again on the first unpoked tick,
+    /// 30 × 200 ms = 6 s after the poke.
+    // `tokio_backend` for the `AsyncUdpV4` sniffer, as above.
+    #[cfg(tokio_backend)]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial(epics_env)]
+    async fn poked_search_comes_round_one_revolution_after_the_poke() {
+        #[cfg(tokio_backend)]
+        use epics_base_rs::net::AsyncUdpV4;
+        use std::net::Ipv4Addr;
+
+        let beacon_port = quiet_beacon_port().to_string();
+        let _env = EnvVarGuard::set(&[
+            ("EPICS_PVA_AUTO_ADDR_LIST", "NO"),
+            ("EPICS_PVA_ADDR_LIST", ""),
+            ("EPICS_PVA_BROADCAST_PORT", &beacon_port),
+        ]);
+        let sniffer = AsyncUdpV4::bind_single(
+            Ipv4Addr::LOCALHOST,
+            0,
+            epics_base_rs::net::PortUse::Exclusive,
+            false,
+        )
+        .expect("bind sniffer");
+        let sniffer_addr = sniffer
+            .local_addrs()
+            .first()
+            .copied()
+            .expect("sniffer addr");
+        let engine = SearchEngine::spawn(&crate::test_reactor(), vec![sniffer_addr], Vec::new())
+            .await
+            .expect("spawn");
+
+        let pv = "POKED:REVOLUTION:PVA";
+        let _find_handle = tokio::spawn({
+            let engine = engine.clone();
+            let pv = pv.to_string();
+            async move { engine.find(&pv, SearchReason::Initial).await }
+        });
+
+        let mut buf = vec![0u8; 4096];
+        let mut next_search = async |within: Duration| {
+            tokio::time::timeout(within, async {
+                loop {
+                    let (n, _) = sniffer.recv_from(&mut buf).await.expect("recv");
+                    if buf[..n].windows(pv.len()).any(|w| w == pv.as_bytes()) {
+                        return std::time::Instant::now();
+                    }
+                }
+            })
+            .await
+        };
+        next_search(Duration::from_secs(1))
+            .await
+            .expect("initial SEARCH must arrive");
+
+        // The initial flush left the search in the current bucket, which the
+        // granted poke's immediate tick sends and requeues in place.
+        engine.hurry_up().await;
+        let poked_at = std::time::Instant::now();
+        let second = next_search(Duration::from_secs(1))
+            .await
+            .expect("the poked tick must send the search");
+        assert!(
+            second - poked_at < Duration::from_millis(150),
+            "the poke's immediate tick should send the search; took {:?}",
+            second - poked_at
+        );
+        let third = next_search(Duration::from_secs(8))
+            .await
+            .expect("the search must come round after the revolution");
+        assert!(
+            (5600..=6400).contains(&((third - poked_at).as_millis() as u64)),
+            "the search should come round 30 fast ticks (~6 s) after the poke; took {:?}",
+            third - poked_at
         );
     }
 
@@ -7029,5 +7179,136 @@ mod tests {
             SEARCHES as usize,
             "the server's own socket takes every broadcast: {copies:?}"
         );
+    }
+
+    /// `run_engine` with no transport and no name servers, driven on a plain
+    /// thread with no runtime, so every sleep lands on the background timer.
+    /// `on_thread` runs on that thread first.
+    // RTEMS-EXEC-MODEL-ALLOW(1): checked - runs and passes in the exec-backend
+    // suite (the runtime only mints the tokio Reactor and is cfg(tokio_backend)).
+    fn idle_engine(
+        on_thread: impl FnOnce() + Send + 'static,
+    ) -> (mpsc::Sender<SearchCommand>, std::thread::JoinHandle<()>) {
+        #[cfg(tokio_backend)]
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        #[cfg(tokio_backend)]
+        let reactor = {
+            let _entered = rt.enter();
+            crate::test_reactor()
+        };
+        #[cfg(exec_backend)]
+        let reactor = crate::test_reactor();
+        let (cmd_tx, cmd_rx) = mpsc::channel(256);
+        let engine = std::thread::spawn(move || {
+            #[cfg(tokio_backend)]
+            let _rt = rt;
+            on_thread();
+            epics_base_rs::runtime::task::block_on_sync(run_engine(
+                reactor,
+                cmd_rx,
+                SearchTransport::NameServersOnly,
+                BeaconTracker::new(),
+                Vec::new(),
+                Default::default(),
+                Default::default(),
+                heartbeat_timeout(),
+            ))
+            .expect("a plain thread parks")
+        });
+        (cmd_tx, engine)
+    }
+
+    /// A loop pass that moves no deadline arms no timer: each engine sleep is
+    /// held across passes and re-armed only when its deadline moves, and the
+    /// background timer counts the arms.
+    #[test]
+    fn a_pass_that_moves_no_deadline_arms_no_timer() {
+        let (cmd_tx, engine) = idle_engine(|| {});
+        let round_trip = || {
+            let (responder, rx) = oneshot::channel();
+            cmd_tx
+                .blocking_send(SearchCommand::Subscribe { responder })
+                .unwrap();
+            rx.blocking_recv().unwrap();
+        };
+        round_trip();
+        // The search tick and the beacon clean are armed by the first pass
+        // that polls them, which one answering a command first is not.
+        let armed = std::time::Instant::now();
+        while epics_base_rs::runtime::task::background_timer_scheduled_total() < 2 {
+            assert!(
+                armed.elapsed() < Duration::from_secs(5),
+                "standing timers never armed"
+            );
+            std::thread::yield_now();
+        }
+        let before = epics_base_rs::runtime::task::background_timer_scheduled_total();
+        for _ in 0..8 {
+            cmd_tx
+                .blocking_send(SearchCommand::Cancel {
+                    pv_name: "absent".into(),
+                })
+                .unwrap();
+        }
+        round_trip();
+        assert_eq!(
+            epics_base_rs::runtime::task::background_timer_scheduled_total() - before,
+            0,
+            "timers armed by nine passes that moved no deadline"
+        );
+        drop(cmd_tx);
+        engine.join().unwrap();
+    }
+
+    /// A deadline gone drops its held sleep. Kept, a fired sleep stays ready
+    /// and its `select!` arm wins every pass.
+    #[test]
+    fn a_gone_deadline_drops_the_held_sleep() {
+        let mut held = Some(Sleep::until(Instant::now() + Duration::from_secs(3600)));
+        hold_until(&mut held, None);
+        assert!(held.is_none());
+    }
+
+    /// Once the initial-search window has flushed, nothing is due before the
+    /// next search tick and the engine parks. Read from the engine thread's
+    /// CPU time in USER_HZ ticks, 10 ms on Linux.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_engine_parks_after_the_initial_window() {
+        let (stat_tx, stat_rx) = std::sync::mpsc::channel();
+        let (cmd_tx, engine) = idle_engine(move || {
+            let me = std::fs::read_link("/proc/thread-self").unwrap();
+            stat_tx
+                .send(format!("/proc/{}/stat", me.display()))
+                .unwrap();
+        });
+        let stat = stat_rx.recv().unwrap();
+        let cpu_ticks = || -> u64 {
+            let line = std::fs::read_to_string(&stat).unwrap();
+            // utime and stime, fields 14 and 15, after the parenthesised comm.
+            let after_comm = &line[line.rfind(')').unwrap() + 2..];
+            let f: Vec<&str> = after_comm.split_whitespace().collect();
+            f[11].parse::<u64>().unwrap() + f[12].parse::<u64>().unwrap()
+        };
+        let (responder, _unanswered) = oneshot::channel();
+        cmd_tx
+            .blocking_send(SearchCommand::Find {
+                pv_name: "absent".into(),
+                responder,
+                reason: SearchReason::Initial,
+            })
+            .unwrap();
+        std::thread::sleep(10 * INITIAL_SEARCH_DELAY);
+        let before = cpu_ticks();
+        std::thread::sleep(Duration::from_millis(500));
+        let spent = cpu_ticks() - before;
+        assert!(
+            spent < 15,
+            "the engine ran {spent} ticks of a 50-tick idle window"
+        );
+        drop(cmd_tx);
+        engine.join().unwrap();
     }
 }

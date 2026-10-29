@@ -20,13 +20,20 @@
 //! it swallows, so every `ca_array_get` runs out its `-w` window.
 
 #![cfg(tokio_backend)]
+#![cfg(feature = "client-core")]
 
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use epics_base_rs::server::records::ai::AiRecord;
+use epics_base_rs::server::records::bo::BoRecord;
+use epics_ca_rs::client::CaClient;
 use epics_ca_rs::protocol::{CA_PROTO_READ_NOTIFY, CA_PROTO_SEARCH, CaHeader};
 use epics_ca_rs::server::CaServer;
+use epics_ca_rs::{CaError, CaResult};
+use serial_test::serial;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::process::Command;
@@ -56,10 +63,14 @@ async fn bind_proxy_sockets() -> (UdpSocket, TcpListener, u16, u16) {
     (udp, tcp, search_port, circuit_port)
 }
 
-/// Relay one direction of a CA circuit, frame by frame, dropping every
-/// `CA_PROTO_READ_NOTIFY`. Frames are 16-byte header + payload; the PV under
-/// test is a scalar, so no extended (0xffff) header can appear.
-async fn relay(mut from: tokio::net::tcp::OwnedReadHalf, mut to: tokio::net::tcp::OwnedWriteHalf) {
+/// Relay one direction of a CA circuit, frame by frame, dropping and counting
+/// every `CA_PROTO_READ_NOTIFY`. Frames are 16-byte header + payload; the PV
+/// under test is a scalar, so no extended (0xffff) header can appear.
+async fn relay(
+    mut from: tokio::net::tcp::OwnedReadHalf,
+    mut to: tokio::net::tcp::OwnedWriteHalf,
+    swallowed: Arc<AtomicUsize>,
+) {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
@@ -81,6 +92,7 @@ async fn relay(mut from: tokio::net::tcp::OwnedReadHalf, mut to: tokio::net::tcp
             // relay carries. The peer never sees it, so the client's
             // `ca_array_get` times out on a fully connected channel.
             if cmmd == CA_PROTO_READ_NOTIFY {
+                swallowed.fetch_add(1, Ordering::SeqCst);
                 continue;
             }
             if to.write_all(&frame).await.is_err() {
@@ -94,12 +106,13 @@ async fn relay(mut from: tokio::net::tcp::OwnedReadHalf, mut to: tokio::net::tcp
 /// name search to `server_udp` and rewrites the TCP port the server
 /// advertises in its SEARCH reply (header `data_type`) to the proxy's own,
 /// so the client's data circuit lands here and is relayed to `server_tcp`.
-/// Returns the proxy's UDP search port, the one the client is pointed at.
+/// Returns the proxy's UDP search port, the one the client is pointed at,
+/// and the count of reads it has swallowed.
 ///
 /// The two server ports are distinct: the server bound them itself from
 /// `.port(0)`, so the UDP search port and the TCP data port are separate
 /// ephemerals.
-async fn read_dropping_proxy(server_udp: u16, server_tcp: u16) -> u16 {
+async fn read_dropping_proxy(server_udp: u16, server_tcp: u16) -> (u16, Arc<AtomicUsize>) {
     let (udp, tcp, search_port, circuit_port) = bind_proxy_sockets().await;
     let search: SocketAddr = format!("127.0.0.1:{server_udp}").parse().unwrap();
     let circuit: SocketAddr = format!("127.0.0.1:{server_tcp}").parse().unwrap();
@@ -137,6 +150,8 @@ async fn read_dropping_proxy(server_udp: u16, server_tcp: u16) -> u16 {
         }
     });
 
+    let swallowed = Arc::new(AtomicUsize::new(0));
+    let count = swallowed.clone();
     tokio::spawn(async move {
         loop {
             let Ok((client, _)) = tcp.accept().await else {
@@ -147,12 +162,12 @@ async fn read_dropping_proxy(server_udp: u16, server_tcp: u16) -> u16 {
             };
             let (cr, cw) = client.into_split();
             let (sr, sw) = upstream.into_split();
-            tokio::spawn(relay(cr, sw));
-            tokio::spawn(relay(sr, cw));
+            tokio::spawn(relay(cr, sw, count.clone()));
+            tokio::spawn(relay(sr, cw, count.clone()));
         }
     });
 
-    search_port
+    (search_port, swallowed)
 }
 
 /// `caput` against a PV whose get never answers: C warns on stderr, prints
@@ -168,7 +183,7 @@ async fn caput_readback_timeout_prints_the_new_line_and_exits_zero() {
     let (server_udp, server_tcp) = (server.udp_port(), server.tcp_port());
     tokio::spawn(async move { server.run().await });
 
-    let search_port = read_dropping_proxy(server_udp, server_tcp).await;
+    let (search_port, _) = read_dropping_proxy(server_udp, server_tcp).await;
 
     // `-w` is the single pend_io window covering BOTH the connect (search +
     // data circuit, relayed through this test's UDP+TCP proxy) and the readback
@@ -215,4 +230,144 @@ async fn caput_readback_timeout_prints_the_new_line_and_exits_zero() {
         "a readback timeout does NOT change caput's exit status (caput.c:239); \
          stderr: {stderr:?}"
     );
+}
+
+/// Serve `record` as `name` behind the read-dropping proxy; the proxy's
+/// search port.
+async fn served_without_reads(
+    name: &str,
+    record: impl epics_base_rs::server::record::Record,
+) -> u16 {
+    let server = CaServer::builder()
+        .port(0)
+        .record(name, record)
+        .build()
+        .await
+        .expect("build CA server");
+    let (server_udp, server_tcp) = (server.udp_port(), server.tcp_port());
+    tokio::spawn(async move { server.run().await });
+    read_dropping_proxy(server_udp, server_tcp).await.0
+}
+
+/// Run `caput-rs args` against the proxy: its output and how long it took.
+async fn caput(search_port: u16, args: &[&str]) -> (std::process::Output, Duration) {
+    let started = std::time::Instant::now();
+    let out = Command::new(env!("CARGO_BIN_EXE_caput-rs"))
+        .args(args)
+        .env("EPICS_CA_ADDR_LIST", format!("127.0.0.1:{search_port}"))
+        .env("EPICS_CA_AUTO_ADDR_LIST", "NO")
+        .env("EPICS_CA_SERVER_PORT", search_port.to_string())
+        .output()
+        .await
+        .expect("run caput-rs");
+    (out, started.elapsed())
+}
+
+/// `-l`'s TIME-class readbacks are gets under the same
+/// `ca_pend_io(caTimeout)` as the plain one (caput.c:172, 186): unanswered,
+/// each ends at the `-w` window, not at a deadline of the client's own.
+#[tokio::test(flavor = "multi_thread")]
+async fn caput_long_readback_times_out_at_its_w() {
+    let search_port = served_without_reads("R918:LONG", AiRecord::new(1.0)).await;
+    let (out, took) = caput(search_port, &["-l", "-w", "2", "R918:LONG", "42"]).await;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Read operation timed out: PV data was not read."),
+        "got stderr: {stderr:?}"
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr:?}");
+    assert!(
+        took < Duration::from_secs(20),
+        "two 2 s readbacks took {took:?}"
+    );
+}
+
+/// An ENUM field's menu read is `ca_array_get(DBR_GR_ENUM)` +
+/// `ca_pend_io(caTimeout)` (caput.c:459-465): unanswered, it aborts the put
+/// at the `-w` window.
+#[tokio::test(flavor = "multi_thread")]
+async fn caput_enum_menu_read_times_out_at_its_w() {
+    let search_port = served_without_reads("R918:ENUM", BoRecord::new(0)).await;
+    let (out, took) = caput(search_port, &["-w", "2", "R918:ENUM", "1"]).await;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Read operation timed out: ENUM data was not read."),
+        "got stderr: {stderr:?}"
+    );
+    assert_eq!(out.status.code(), Some(1), "stderr: {stderr:?}");
+    assert!(
+        took < Duration::from_secs(20),
+        "a 2 s menu read took {took:?}"
+    );
+}
+
+/// `op` ends `Timeout` after the proxy swallowed its read, and well before
+/// the 30 s the client once gave every get.
+async fn read_ends_at_its_bound<T: std::fmt::Debug>(
+    what: &str,
+    swallowed: &AtomicUsize,
+    op: impl std::future::Future<Output = CaResult<T>>,
+) {
+    let before = swallowed.load(Ordering::SeqCst);
+    let started = Instant::now();
+    let got = tokio::time::timeout(fact_budget::FACT_BUDGET, op)
+        .await
+        .unwrap_or_else(|_| panic!("{what} still waits on its unanswered read"));
+    let took = started.elapsed();
+    assert!(matches!(got, Err(CaError::Timeout)), "{what}: {got:?}");
+    assert!(
+        swallowed.load(Ordering::SeqCst) > before,
+        "{what} timed out before it read"
+    );
+    assert!(took < Duration::from_secs(20), "{what} took {took:?}");
+}
+
+/// `CaClient`'s by-name one-shots give each read the bound C's tools give it,
+/// their one `ca_pend_io(caTimeout)` (`caget.c:234`, `caput.c:460`): the
+/// `caget` read, and the ENUM menu read of `caput` and `caput_callback`.
+#[tokio::test(flavor = "multi_thread")]
+#[serial(epics_env)]
+async fn ca_client_one_shot_reads_end_at_their_bound() {
+    let server = CaServer::builder()
+        .port(0)
+        .record("R918:CLI:AI", AiRecord::new(1.0))
+        .record("R918:CLI:BO", BoRecord::new(0))
+        .build()
+        .await
+        .expect("build CA server");
+    let (server_udp, server_tcp) = (server.udp_port(), server.tcp_port());
+    tokio::spawn(async move { server.run().await });
+    let (search_port, swallowed) = read_dropping_proxy(server_udp, server_tcp).await;
+    // SAFETY: `#[serial(epics_env)]` keeps every env-touching test apart, and
+    // `CaClient::new` snapshots its resolver configuration.
+    unsafe {
+        std::env::set_var("EPICS_CA_ADDR_LIST", format!("127.0.0.1:{search_port}"));
+        std::env::set_var("EPICS_CA_AUTO_ADDR_LIST", "NO");
+        std::env::set_var("EPICS_CA_SERVER_PORT", search_port.to_string());
+    }
+    let client = CaClient::new().await.expect("CA client");
+    // Held open so each one-shot connects over a circuit already up.
+    let mut warm = Vec::new();
+    for name in ["R918:CLI:AI", "R918:CLI:BO"] {
+        let ch = client.create_channel(name);
+        ch.wait_connected(fact_budget::FACT_BUDGET)
+            .await
+            .unwrap_or_else(|e| panic!("{name} connects through the proxy: {e:?}"));
+        warm.push(ch);
+    }
+
+    read_ends_at_its_bound("caget", &swallowed, client.caget("R918:CLI:AI")).await;
+    read_ends_at_its_bound("caput", &swallowed, client.caput("R918:CLI:BO", "1")).await;
+    read_ends_at_its_bound(
+        "caput_callback",
+        &swallowed,
+        client.caput_callback("R918:CLI:BO", "1", 2.0),
+    )
+    .await;
+    // SAFETY: `#[serial(epics_env)]`.
+    unsafe {
+        std::env::remove_var("EPICS_CA_ADDR_LIST");
+        std::env::remove_var("EPICS_CA_AUTO_ADDR_LIST");
+        std::env::remove_var("EPICS_CA_SERVER_PORT");
+    }
 }

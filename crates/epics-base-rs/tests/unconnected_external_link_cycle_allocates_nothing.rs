@@ -63,13 +63,12 @@ impl LinkSet for Down {
 
 const DB: &str = r#"
 record(ai, "U:AI") { field(INP, {pva:"U:NOPE"}) }
-record(ai, "U:AIURL") { field(INP, "pva://U:NOPE") }
 record(ai, "U:AIJSON") { field(INP, {pva:{pv:"U:NOPE", Q:4}}) }
-record(ai, "U:AICA") { field(INP, "ca://U:NOPE") }
+record(ai, "U:AICA") { field(INP, "U:NOPE CA") }
 record(ai, "U:AIDB") { field(INP, "U:NOT:HERE") }
 record(ao, "U:AO") { field(OUT, {pva:"U:NOPE"}) }
 record(ao, "U:AOJSON") { field(OUT, {pva:{pv:"U:NOPE", Q:4}}) }
-record(ao, "U:AOCA") { field(OUT, "ca://U:NOPE") }
+record(ao, "U:AOCA") { field(OUT, "U:NOPE CA") }
 record(ao, "U:AODB") { field(OUT, "U:NOT:HERE") }
 "#;
 
@@ -115,7 +114,7 @@ fn allocs(db: Arc<PvDatabase>, rec: &'static str) -> usize {
 #[epics_macros_rs::epics_test]
 async fn an_unconnected_external_inp_cycle_allocates_nothing() {
     let db = ioc().await;
-    for rec in ["U:AI", "U:AIURL", "U:AIJSON", "U:AICA", "U:AIDB"] {
+    for rec in ["U:AI", "U:AIJSON", "U:AICA", "U:AIDB"] {
         assert_eq!(allocs(db.clone(), rec), 0, "{rec}");
     }
 }

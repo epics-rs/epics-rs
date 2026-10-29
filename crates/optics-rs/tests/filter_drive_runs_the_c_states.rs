@@ -260,7 +260,7 @@ async fn no_pattern_below_one_keeps_the_current_one() {
 }
 
 /// With `MAX_FILTERS` blades, 16 of them disabled, a mask in range takes
-/// its blades (`filterDrive.st:740-767`).
+/// its blades (`filterDrive.st:750-797`).
 ///
 /// C defect fixed: C bounded the mask by `(1 << 32) - 1`, which x86 makes
 /// `0`, and refused every mask but 0.

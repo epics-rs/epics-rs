@@ -54,41 +54,42 @@ impl PixelCast for f64 {
     }
 }
 
-/// Dispatch on NDDataBuffer variant, binding the inner Vec to `$v`.
-/// The body `$body` is monomorphized for each type.
+/// Dispatch on an [`NDDataBuffer`](crate::ndarray::NDDataBuffer)'s element
+/// type, binding its elements as a slice to `$v`. The body `$body` is
+/// monomorphized for each type.
 #[macro_export]
 macro_rules! with_buffer {
     ($buffer:expr, |$v:ident| $body:expr) => {
-        match $buffer {
-            $crate::ndarray::NDDataBuffer::I8($v) => $body,
-            $crate::ndarray::NDDataBuffer::U8($v) => $body,
-            $crate::ndarray::NDDataBuffer::I16($v) => $body,
-            $crate::ndarray::NDDataBuffer::U16($v) => $body,
-            $crate::ndarray::NDDataBuffer::I32($v) => $body,
-            $crate::ndarray::NDDataBuffer::U32($v) => $body,
-            $crate::ndarray::NDDataBuffer::I64($v) => $body,
-            $crate::ndarray::NDDataBuffer::U64($v) => $body,
-            $crate::ndarray::NDDataBuffer::F32($v) => $body,
-            $crate::ndarray::NDDataBuffer::F64($v) => $body,
+        match ($buffer).view() {
+            $crate::ndarray::NDDataView::I8($v) => $body,
+            $crate::ndarray::NDDataView::U8($v) => $body,
+            $crate::ndarray::NDDataView::I16($v) => $body,
+            $crate::ndarray::NDDataView::U16($v) => $body,
+            $crate::ndarray::NDDataView::I32($v) => $body,
+            $crate::ndarray::NDDataView::U32($v) => $body,
+            $crate::ndarray::NDDataView::I64($v) => $body,
+            $crate::ndarray::NDDataView::U64($v) => $body,
+            $crate::ndarray::NDDataView::F32($v) => $body,
+            $crate::ndarray::NDDataView::F64($v) => $body,
         }
     };
 }
 
-/// Same as with_buffer! but gives mutable access.
+/// Same as with_buffer! but binds a mutable slice.
 #[macro_export]
 macro_rules! with_buffer_mut {
     ($buffer:expr, |$v:ident| $body:expr) => {
-        match $buffer {
-            $crate::ndarray::NDDataBuffer::I8($v) => $body,
-            $crate::ndarray::NDDataBuffer::U8($v) => $body,
-            $crate::ndarray::NDDataBuffer::I16($v) => $body,
-            $crate::ndarray::NDDataBuffer::U16($v) => $body,
-            $crate::ndarray::NDDataBuffer::I32($v) => $body,
-            $crate::ndarray::NDDataBuffer::U32($v) => $body,
-            $crate::ndarray::NDDataBuffer::I64($v) => $body,
-            $crate::ndarray::NDDataBuffer::U64($v) => $body,
-            $crate::ndarray::NDDataBuffer::F32($v) => $body,
-            $crate::ndarray::NDDataBuffer::F64($v) => $body,
+        match ($buffer).view_mut() {
+            $crate::ndarray::NDDataViewMut::I8($v) => $body,
+            $crate::ndarray::NDDataViewMut::U8($v) => $body,
+            $crate::ndarray::NDDataViewMut::I16($v) => $body,
+            $crate::ndarray::NDDataViewMut::U16($v) => $body,
+            $crate::ndarray::NDDataViewMut::I32($v) => $body,
+            $crate::ndarray::NDDataViewMut::U32($v) => $body,
+            $crate::ndarray::NDDataViewMut::I64($v) => $body,
+            $crate::ndarray::NDDataViewMut::U64($v) => $body,
+            $crate::ndarray::NDDataViewMut::F32($v) => $body,
+            $crate::ndarray::NDDataViewMut::F64($v) => $body,
         }
     };
 }
@@ -99,44 +100,44 @@ macro_rules! with_buffer_mut {
 #[macro_export]
 macro_rules! with_buffer_mut_typed {
     ($buffer:expr, |$v:ident : $t:ident| $body:expr) => {
-        match $buffer {
-            $crate::ndarray::NDDataBuffer::I8($v) => {
+        match ($buffer).view_mut() {
+            $crate::ndarray::NDDataViewMut::I8($v) => {
                 type $t = i8;
                 $body
             }
-            $crate::ndarray::NDDataBuffer::U8($v) => {
+            $crate::ndarray::NDDataViewMut::U8($v) => {
                 type $t = u8;
                 $body
             }
-            $crate::ndarray::NDDataBuffer::I16($v) => {
+            $crate::ndarray::NDDataViewMut::I16($v) => {
                 type $t = i16;
                 $body
             }
-            $crate::ndarray::NDDataBuffer::U16($v) => {
+            $crate::ndarray::NDDataViewMut::U16($v) => {
                 type $t = u16;
                 $body
             }
-            $crate::ndarray::NDDataBuffer::I32($v) => {
+            $crate::ndarray::NDDataViewMut::I32($v) => {
                 type $t = i32;
                 $body
             }
-            $crate::ndarray::NDDataBuffer::U32($v) => {
+            $crate::ndarray::NDDataViewMut::U32($v) => {
                 type $t = u32;
                 $body
             }
-            $crate::ndarray::NDDataBuffer::I64($v) => {
+            $crate::ndarray::NDDataViewMut::I64($v) => {
                 type $t = i64;
                 $body
             }
-            $crate::ndarray::NDDataBuffer::U64($v) => {
+            $crate::ndarray::NDDataViewMut::U64($v) => {
                 type $t = u64;
                 $body
             }
-            $crate::ndarray::NDDataBuffer::F32($v) => {
+            $crate::ndarray::NDDataViewMut::F32($v) => {
                 type $t = f32;
                 $body
             }
-            $crate::ndarray::NDDataBuffer::F64($v) => {
+            $crate::ndarray::NDDataViewMut::F64($v) => {
                 type $t = f64;
                 $body
             }
@@ -209,7 +210,7 @@ mod tests {
 
     #[test]
     fn test_with_buffer_macro() {
-        let buf = NDDataBuffer::U8(vec![1, 2, 3]);
+        let buf = NDDataBuffer::from_vec::<u8>(vec![1, 2, 3]);
         let sum: f64 = with_buffer!(&buf, |v| { v.iter().map(|x| PixelCast::to_f64(*x)).sum() });
         assert_eq!(sum, 6.0);
     }

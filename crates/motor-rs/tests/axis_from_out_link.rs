@@ -13,9 +13,11 @@ use asyn_rs::manager::PortManager;
 use asyn_rs::registry::open_owner;
 use asyn_rs::trace::{TraceFile, TraceInfoMask};
 use epics_base_rs::server::database::PvDatabase;
+use epics_base_rs::server::event_queue::EventReader;
 use epics_base_rs::server::ioc_builder::IocBuilder;
+use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::record::DevSup;
-use epics_base_rs::types::EpicsValue;
+use epics_base_rs::types::{DbFieldType, EpicsValue};
 use motor_rs::builder::{AxisSetup, MotorBuilder};
 use motor_rs::device_state::AxisSubscribers;
 use motor_rs::device_support::MotorAxis;
@@ -32,7 +34,16 @@ static SIM: DevSup = motor_interface_device("devTestSim", "TestSim");
 
 /// A model-2 port with no axis open: a record on it never reaches a write.
 fn axisless_port(name: &str, num_axes: usize) -> asyn_rs::port_handle::PortHandle {
-    asyn_port(name, num_axes, asyn_rs::port::InterfaceMask::UNMIGRATED_ALL)
+    asyn_port(
+        name,
+        num_axes,
+        asyn_rs::port::InterfaceMask::INT32
+            | asyn_rs::port::InterfaceMask::UINT32_DIGITAL
+            | asyn_rs::port::InterfaceMask::FLOAT64
+            | asyn_rs::port::InterfaceMask::FLOAT64_ARRAY
+            | asyn_rs::port::InterfaceMask::GENERIC_POINTER
+            | asyn_rs::port::InterfaceMask::DRV_USER,
+    )
 }
 
 /// A bare asyn port with `interfaces` and no parameters, in asynManager.
@@ -58,7 +69,7 @@ fn asyn_port(
         num_axes,
         PortFlags::default(),
         interfaces,
-        asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+        asyn_rs::port::InterfaceMask::NONE,
     ));
     let (runtime, _actor) = asyn_rs::runtime::port::create_port_runtime(
         &claim,
@@ -85,9 +96,8 @@ fn sim(card: i32, signal: i32) -> TraceUser {
 fn axis(user: TraceUser, position: f64) {
     let subscribers = AxisSubscribers::new();
     subscribers.store(MotorStatus {
-        position,
         done: true,
-        ..MotorStatus::default()
+        ..MotorStatus::default().with_position(position)
     });
     register_axis(unpolled(user, subscribers)).unwrap();
 }
@@ -265,9 +275,8 @@ async fn a_motor_interface_record_opens_its_axis_at_init() {
         };
         let subscribers = AxisSubscribers::new();
         subscribers.store(MotorStatus {
-            position: 70.0,
             done: true,
-            ..MotorStatus::default()
+            ..MotorStatus::default().with_position(70.0)
         });
         register_axis(unpolled(user, subscribers)).is_ok()
     });
@@ -420,6 +429,150 @@ record(motor, "E:m") { field(DTYP, "TestModel1") field(OUT, "#C7 S0 @") }
     // alarm stands.
     assert_eq!(field(&db, "E:m.STAT"), EpicsValue::Short(17));
     assert_eq!(field(&db, "E:m.SEVR"), EpicsValue::Short(3));
+}
+
+/// motordevCom.cc:489-505: the record's move reaches `motor_end_trans_com`,
+/// which finds no card and sets DMOV with RA_PROBLEM, so the move-start pass
+/// fires FLNK and completes the put (motorRecord.cc:1509).
+#[tokio::test]
+async fn a_move_on_a_card_that_does_not_exist_is_done_at_once() {
+    let db = boot(
+        r##"
+record(motor, "NC:m") { field(DTYP, "TestModel1") field(OUT, "#C10 S0 @")
+    field(MRES, "0.01") field(VELO, "1") field(FLNK, "NC:flnk") }
+record(calc, "NC:flnk") { field(CALC, "VAL+1") }
+"##,
+    )
+    .await;
+    db.scan_control().run();
+    let mut dmov = dmov_monitor(&db, "NC:m");
+
+    let completion = db
+        .put_record_field_from_ca("NC:m", "VAL", EpicsValue::Double(1.0))
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            completion,
+            epics_base_rs::server::record::ProcessCompletion::Sync
+        ),
+        "{completion:?}"
+    );
+    assert_eq!(field(&db, "NC:m.DMOV"), EpicsValue::Short(1));
+    assert_eq!(field(&db, "NC:m.MSTA"), EpicsValue::ULong(0x200));
+    assert_eq!(field(&db, "NC:flnk.VAL"), EpicsValue::Double(1.0));
+    // special's blink, then motor_end_trans_com's post; do_work found DMOV
+    // already clear, so monitor() has no mark to post.
+    assert_eq!(
+        drain(&mut dmov),
+        [EpicsValue::Short(0), EpicsValue::Short(1)]
+    );
+}
+
+/// A command whose `build_trans` result C checks is never sent with no
+/// card, so no `motor_end_trans_com` posts DMOV: a dial limit
+/// (motorRecord.cc:4236-4325) or a status refresh (STUP, :1817-1831).
+#[tokio::test]
+async fn a_card_that_does_not_exist_builds_no_limit_or_status_refresh() {
+    let db = boot(
+        r##"
+record(motor, "NG:m") { field(DTYP, "TestModel1") field(OUT, "#C11 S0 @")
+    field(MRES, "0.01") field(VELO, "1") }
+"##,
+    )
+    .await;
+    db.scan_control().run();
+    let mut dmov = dmov_monitor(&db, "NG:m");
+
+    db.put_record_field_from_ca("NG:m", "DHLM", EpicsValue::Double(5.0))
+        .await
+        .unwrap();
+    assert_eq!(field(&db, "NG:m.DHLM"), EpicsValue::Double(5.0));
+    assert_eq!(field(&db, "NG:m.HLM"), EpicsValue::Double(5.0));
+    db.put_record_field_from_ca("NG:m", "STUP", EpicsValue::Short(1))
+        .await
+        .unwrap();
+    assert_eq!(field(&db, "NG:m.STUP"), EpicsValue::Short(0));
+    assert_eq!(drain(&mut dmov), []);
+}
+
+/// `motor_end_trans_com` posts DMOV once per SEND_MSG with no card
+/// (motordevCom.cc:497-508), and load_pos sends two (motorRecord.cc:
+/// 3810-3816). A SET-mode DVAL put posts special's blink, then both; a
+/// USE-mode MRES put (do_work 1936-1990, no SET_ENC_RATIO without
+/// EA_PRESENT) posts both, then monitor()'s M_DMOV mark from load_pos.
+#[tokio::test]
+async fn a_load_pos_on_a_card_that_does_not_exist_posts_dmov_per_transaction() {
+    let db = boot(
+        r##"
+record(motor, "NP:m") { field(DTYP, "TestModel1") field(OUT, "#C12 S0 @")
+    field(MRES, "0.01") field(VELO, "1") }
+record(motor, "NQ:m") { field(DTYP, "TestModel1") field(OUT, "#C13 S0 @")
+    field(MRES, "0.01") field(VELO, "1") }
+"##,
+    )
+    .await;
+    db.scan_control().run();
+    db.put_record_field_from_ca("NP:m", "SET", EpicsValue::Short(1))
+        .await
+        .unwrap();
+    let mut dmov = dmov_monitor(&db, "NP:m");
+    db.put_record_field_from_ca("NP:m", "DVAL", EpicsValue::Double(1.0))
+        .await
+        .unwrap();
+    assert_eq!(
+        drain(&mut dmov),
+        [0, 1, 1].map(EpicsValue::Short),
+        "SET DVAL"
+    );
+
+    let mut dmov = dmov_monitor(&db, "NQ:m");
+    db.put_record_field_from_ca("NQ:m", "MRES", EpicsValue::Double(0.02))
+        .await
+        .unwrap();
+    assert_eq!(
+        drain(&mut dmov),
+        [1, 1, 1].map(EpicsValue::Short),
+        "USE MRES"
+    );
+}
+
+/// A JVEL put during a jog sends its own transaction from special()
+/// (motorRecord.cc:3059-3071), whose `motor_end_trans_com` posts DMOV
+/// inside the put with no card; JVEL is not process-passive.
+#[tokio::test]
+async fn a_jog_retune_on_a_card_that_does_not_exist_posts_dmov_from_special() {
+    let db = boot(
+        r##"
+record(motor, "NJ:m") { field(DTYP, "TestModel1") field(OUT, "#C14 S0 @")
+    field(MRES, "0.01") field(VELO, "1") field(JVEL, "1") }
+"##,
+    )
+    .await;
+    db.scan_control().run();
+    db.put_record_field_from_ca("NJ:m", "JOGF", EpicsValue::Short(1))
+        .await
+        .unwrap();
+    let mut dmov = dmov_monitor(&db, "NJ:m");
+    db.put_record_field_from_ca("NJ:m", "JVEL", EpicsValue::Double(0.5))
+        .await
+        .unwrap();
+    assert_eq!(drain(&mut dmov), [EpicsValue::Short(1)]);
+}
+
+fn dmov_monitor(db: &PvDatabase, record: &str) -> EventReader {
+    let mask = EventMask::VALUE | EventMask::LOG;
+    db.get_record(record)
+        .unwrap()
+        .write()
+        .add_subscriber("DMOV", 1, DbFieldType::Short, mask.bits())
+        .unwrap()
+}
+
+fn drain(rx: &mut EventReader) -> Vec<EpicsValue> {
+    std::iter::from_fn(|| rx.try_recv().ok())
+        .map(|event| event.value().as_value().cloned().unwrap())
+        .collect()
 }
 
 /// motorRecord.cc:646-651: a failed dset init returns before init_record's
@@ -645,7 +798,11 @@ async fn an_asyn_record_on_a_port_with_no_motor_axes_dies_where_c_s_init_stops()
             .map(|l| l.splitn(3, ' ').nth(2).unwrap().to_owned())
             .collect()
     };
-    asyn_port("NOTMOTOR", 1, InterfaceMask::UNMIGRATED_ALL);
+    asyn_port(
+        "NOTMOTOR",
+        1,
+        InterfaceMask::INT32 | InterfaceMask::FLOAT64 | InterfaceMask::DRV_USER,
+    );
     asyn_port(
         "OCTETONLY",
         1,
@@ -746,7 +903,7 @@ record(motor, "K:b") { field(DTYP, "asynMotor") field(OUT, "@asyn(TWIN,0)") fiel
     .await;
     db.scan_control().run();
     poll_cmd_tx
-        .send(motor_rs::poll_loop::PollCommand::ForcePoll)
+        .send(motor_rs::poll_loop::PollCommand::ForcePoll(None))
         .await
         .unwrap();
     assert_eq!(field(&db, "K:b.PACT"), EpicsValue::Char(0));

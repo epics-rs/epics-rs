@@ -44,6 +44,7 @@ pub mod offload;
 // on Windows, whose hosted server keeps the tokio reactor.
 #[cfg(unix)]
 pub mod readiness;
+pub mod scanf;
 pub mod socket;
 pub mod stdio;
 pub mod stdlib;

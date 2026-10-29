@@ -190,6 +190,18 @@ fn err_retryable_neither<T>(msg: impl Into<String>) -> Result<T, BootError> {
     Err(BootError::retryable_neither(msg))
 }
 
+/// The C-side path the variable `var` names. There is no default: a path
+/// that held on one machine is a guess on every other.
+pub fn c_tree(var: &str) -> Result<PathBuf, BootError> {
+    match std::env::var_os(var) {
+        Some(path) => Ok(PathBuf::from(path)),
+        None => err(
+            Side::C,
+            format!("{var} is unset. The oracle cannot run without ground truth."),
+        ),
+    }
+}
+
 /// The ports oracle processes are given. Below Linux's default
 /// `ip_local_port_range` (32768-60999) and the 49152+ ranges of macOS and
 /// Windows, so the kernel's ephemeral allocator -- which every other test,
@@ -486,37 +498,21 @@ pub struct CTools {
 }
 
 impl CTools {
-    pub const DEFAULT_BIN: &'static str = "/home/stevek/work/epics-base/bin/linux-x86_64";
-    /// The fat dbd — base's 34 record types plus busy/transform/sseq/acalcout/
-    /// scalcout/asyn. A strict superset of base's `softIoc.dbd`.
-    ///
-    /// Private on purpose: [`Self::dbd_path`] is the only way to ask where the
-    /// dbd is, so no caller can hardcode this path and silently bypass
-    /// `EPICS_ORACLE_DBD` the way every consumer of the old public constant did.
-    const DEFAULT_DBD: &'static str = "/home/stevek/work/oracle-ioc/dbd/softIoc.dbd";
-    /// The fat softIoc binary that serves the [`Self::dbd_path`] record types.
-    pub const DEFAULT_IOC_BIN: &'static str =
-        "/home/stevek/work/oracle-ioc/bin/linux-x86_64/softIoc";
-
-    /// The expanded dbd that supplies the denominator, honoring
-    /// `EPICS_ORACLE_DBD` for hosts where the C tree lives elsewhere.
-    ///
-    /// The same override discipline as `EPICS_BASE_BIN`/`EPICS_ORACLE_IOC_BIN`
-    /// in [`Self::discover`]: the harness never invents the path, but it must be
-    /// nameable, or the oracle is runnable on exactly one machine.
-    pub fn dbd_path() -> PathBuf {
-        PathBuf::from(
-            std::env::var("EPICS_ORACLE_DBD").unwrap_or_else(|_| Self::DEFAULT_DBD.to_string()),
-        )
+    /// The expanded dbd that supplies the denominator, `EPICS_ORACLE_DBD`: the
+    /// fat tree's `dbd/softIoc.dbd` — base's 34 record types plus
+    /// busy/transform/sseq/acalcout/scalcout/asyn, a strict superset of base's
+    /// `softIoc.dbd`.
+    pub fn dbd_path() -> Result<PathBuf, BootError> {
+        c_tree("EPICS_ORACLE_DBD")
     }
 
-    /// Locate the C tree, honoring `EPICS_BASE_BIN` for hosts where it lives
-    /// elsewhere. Verifies every binary the harness actually invokes, so a
+    /// Locate the C tree: base's bin dir `EPICS_BASE_BIN` and the fat softIoc
+    /// `EPICS_ORACLE_IOC_BIN`, which serves the [`Self::dbd_path`] record
+    /// types. Verifies every binary the harness actually invokes, so a
     /// missing tool is a loud error at startup rather than a mysterious
     /// "errored" on every case.
     pub fn discover() -> Result<Self, BootError> {
-        let bin = std::env::var("EPICS_BASE_BIN").unwrap_or_else(|_| Self::DEFAULT_BIN.to_string());
-        let bin = PathBuf::from(bin);
+        let bin = c_tree("EPICS_BASE_BIN")?;
         if !bin.is_dir() {
             return err(
                 Side::C,
@@ -535,15 +531,13 @@ impl CTools {
                 );
             }
         }
-        let ioc_bin = std::env::var("EPICS_ORACLE_IOC_BIN")
-            .unwrap_or_else(|_| Self::DEFAULT_IOC_BIN.to_string());
-        let ioc_bin = PathBuf::from(ioc_bin);
+        let ioc_bin = c_tree("EPICS_ORACLE_IOC_BIN")?;
         if !ioc_bin.is_file() {
             return err(
                 Side::C,
                 format!(
-                    "fat C softIoc not found at {}. Build it under oracle-ioc/ (or set \
-                     EPICS_ORACLE_IOC_BIN). The oracle cannot run without ground truth.",
+                    "fat C softIoc not found at {}. Build it under oracle-ioc/ and set \
+                     EPICS_ORACLE_IOC_BIN to it. The oracle cannot run without ground truth.",
                     ioc_bin.display()
                 ),
             );
@@ -1475,36 +1469,31 @@ pub struct PvxTools {
 }
 
 impl PvxTools {
-    /// A **tagged** pvxs tree, not the working checkout. The PVA lane's verdicts
-    /// are only meaningful against one stated pvxs version — `display.precision`
-    /// alone moved 63 channels between 1.5.2 and 1.5.3 (`8d9455a`) — and the
-    /// working checkout sits on whatever branch its owner is developing on.
-    /// A `git worktree` at the pin gives the lane a version it can name.
-    pub const DEFAULT_BIN: &'static str = "/home/stevek/work/pvxs-wt-153/bin/linux-x86_64";
-
-    /// The **fat** `softIocPVX` — QSRV2 plus the same busy/calc/asyn support the
-    /// fat CA [`CTools::DEFAULT_IOC_BIN`] links, so the PVA ground truth serves
-    /// the same record types the `.dbd` denominator enumerates.
-    ///
-    /// Stock pvxs `softIocPVX` cannot load six of them (`acalcout`, `asyn`,
-    /// `busy`, `scalcout`, `sseq`, `transform`): it exits during boot and every
-    /// channel of those types scored ERROR — 835 of 3386, which is why coverage
-    /// was capped at 75.3% by the *instrument* rather than by the port. It lives
-    /// under `oracle-ioc/` rather than in the pvxs tree, exactly like its CA
-    /// sibling; the client tools still come from `bin`. It derives its dbd from
-    /// its own exe dir, so no `-D` is passed.
-    pub const DEFAULT_IOC_BIN: &'static str =
-        "/home/stevek/work/oracle-ioc/bin/linux-x86_64/softIocPVX";
-
     /// The client tools this harness actually invokes. Verified up front so a
     /// missing binary is one loud error rather than an "errored" verdict on
     /// every case.
     const REQUIRED: [&'static str; 5] = ["pvxget", "pvxinfo", "pvxlist", "pvxmonitor", "pvxput"];
 
-    /// Locate the pvxs tree, honoring `PVXS_BIN`.
+    /// Locate the pvxs tree, `PVXS_BIN`: a **tagged** pvxs tree, not the
+    /// working checkout. The PVA lane's verdicts are only meaningful against
+    /// one stated pvxs version — `display.precision` alone moved 63 channels
+    /// between 1.5.2 and 1.5.3 (`8d9455a`) — and the working checkout sits on
+    /// whatever branch its owner is developing on. A `git worktree` at the pin
+    /// gives the lane a version it can name.
+    ///
+    /// The IOC is `EPICS_ORACLE_PVX_IOC_BIN`, the **fat** `softIocPVX` — QSRV2
+    /// plus the same busy/calc/asyn support the fat CA `EPICS_ORACLE_IOC_BIN`
+    /// links, so the PVA ground truth serves the same record types the `.dbd`
+    /// denominator enumerates. Stock pvxs `softIocPVX` cannot load six of them
+    /// (`acalcout`, `asyn`, `busy`, `scalcout`, `sseq`, `transform`): it exits
+    /// during boot and every channel of those types scored ERROR — 835 of
+    /// 3386, which is why coverage was capped at 75.3% by the *instrument*
+    /// rather than by the port. It lives under `oracle-ioc/` rather than in the
+    /// pvxs tree, exactly like its CA sibling; the client tools still come
+    /// from `bin`. It derives its dbd from its own exe dir, so no `-D` is
+    /// passed.
     pub fn discover() -> Result<Self, BootError> {
-        let bin = std::env::var("PVXS_BIN").unwrap_or_else(|_| Self::DEFAULT_BIN.to_string());
-        let bin = PathBuf::from(bin);
+        let bin = c_tree("PVXS_BIN")?;
         if !bin.is_dir() {
             return err(
                 Side::C,
@@ -1528,15 +1517,13 @@ impl PvxTools {
         // `softIocPVX` in `bin` — it cannot load six of the denominator's record
         // types, so a silent fallback would turn a missing build into 835
         // ERRORs and a 75.3% coverage number that looks like a port problem.
-        let ioc_bin = std::env::var("EPICS_ORACLE_PVX_IOC_BIN")
-            .unwrap_or_else(|_| Self::DEFAULT_IOC_BIN.to_string());
-        let ioc_bin = PathBuf::from(ioc_bin);
+        let ioc_bin = c_tree("EPICS_ORACLE_PVX_IOC_BIN")?;
         if !ioc_bin.is_file() {
             return err(
                 Side::C,
                 format!(
-                    "fat `softIocPVX` not found at {}. Build it under oracle-ioc/ (or set \
-                     EPICS_ORACLE_PVX_IOC_BIN). The PVA oracle cannot run without ground truth.",
+                    "fat `softIocPVX` not found at {}. Build it under oracle-ioc/ and set \
+                     EPICS_ORACLE_PVX_IOC_BIN to it. The PVA oracle cannot run without ground truth.",
                     ioc_bin.display()
                 ),
             );
@@ -2803,7 +2790,7 @@ time.sleep(60)
     fn an_ioc_that_holds_its_port_and_does_not_answer_is_a_hard_failure() {
         let tools = PvxTools::discover().expect(
             "the pvxs tree must be built for the PVA oracle to have ground truth; \
-             set PVXS_BIN if it is not at the default path",
+             set PVXS_BIN and EPICS_ORACLE_PVX_IOC_BIN",
         );
         let held = quiet_udp_socket();
         let ioc = FakeIoc {

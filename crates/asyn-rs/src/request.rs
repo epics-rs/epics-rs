@@ -1,5 +1,7 @@
 //! Request types for the port actor.
 
+use std::cell::Cell;
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering as AtomicOrdering};
 
@@ -10,7 +12,7 @@ use epics_libcom_rs::SharedArray;
 
 use crate::error::{AsynError, AsynResult, AsynStatus, QueueRefusal};
 use crate::param::ParamValue;
-use crate::port::PortDriver;
+use crate::port::{PortDriver, PortDriverBase};
 
 /// A closure a request carries to the actor — [`DriverCall`] or [`PortLockCall`].
 ///
@@ -244,7 +246,8 @@ impl RequestCell {
         // C starts the timer before it signals the port thread
         // (asynManager.c:1619-1628).
         if let Some(timeout) = user.queue_timeout {
-            queue_timer().arm(self, seq, std::time::Instant::now() + timeout.get());
+            let at = epics_libcom_rs::runtime::time::deadline_from_now(timeout.get());
+            queue_timer().arm(self, seq, at);
         }
         if self.queue.push(self, seq) {
             Ok(())
@@ -1080,7 +1083,12 @@ pub(crate) fn octet_outcome(ran: AsynResult<RequestResult>) -> OctetRead {
 }
 
 /// Operation the worker thread will dispatch to the port driver.
+///
+/// A byte tag: a niche in a field (`updates`' capacity, once a smaller
+/// `seq` left the gate's tag too narrow) costs every match on the op two
+/// more instructions.
 #[derive(Debug, Clone)]
+#[repr(u8)]
 pub enum RequestOp {
     OctetWrite {
         data: Vec<u8>,
@@ -1462,6 +1470,72 @@ pub enum RequestOp {
     GpibRen {
         enable: bool,
     },
+}
+
+impl RequestOp {
+    /// The interface whose method this op calls, or `None` for a manager op.
+    /// `asynCommon`'s ops are `None` too: every port registers it.
+    pub(crate) fn interface(&self) -> Option<crate::interfaces::InterfaceType> {
+        use crate::interfaces::InterfaceType as I;
+        Some(match self {
+            Self::OctetWrite { .. }
+            | Self::OctetRead { .. }
+            | Self::OctetWriteRead { .. }
+            | Self::OctetWriteBinary { .. }
+            | Self::OctetReadBinary { .. }
+            | Self::Flush
+            | Self::SetInputEos { .. }
+            | Self::SetOutputEos { .. }
+            | Self::GetInputEos
+            | Self::GetOutputEos => I::Octet,
+            Self::Int32Write { .. } | Self::Int32Read | Self::GetBoundsInt32 => I::Int32,
+            Self::Int64Write { .. } | Self::Int64Read | Self::GetBoundsInt64 => I::Int64,
+            Self::Float64Write { .. } | Self::Float64Read => I::Float64,
+            Self::UInt32DigitalWrite { .. } | Self::UInt32DigitalRead { .. } => I::UInt32Digital,
+            Self::EnumRead | Self::EnumWrite { .. } => I::Enum,
+            Self::Int8ArrayRead { .. } | Self::Int8ArrayWrite { .. } => I::Int8Array,
+            Self::Int16ArrayRead { .. } | Self::Int16ArrayWrite { .. } => I::Int16Array,
+            Self::Int32ArrayRead { .. } | Self::Int32ArrayWrite { .. } => I::Int32Array,
+            Self::Int64ArrayRead { .. } | Self::Int64ArrayWrite { .. } => I::Int64Array,
+            Self::Float32ArrayRead { .. } | Self::Float32ArrayWrite { .. } => I::Float32Array,
+            Self::Float64ArrayRead { .. } | Self::Float64ArrayWrite { .. } => I::Float64Array,
+            Self::GetOption { .. } | Self::SetOption { .. } => I::Option,
+            Self::DrvUserCreate(_) => I::DrvUser,
+            Self::GpibUniversalCmd { .. }
+            | Self::GpibAddressedCmd { .. }
+            | Self::GpibIfc
+            | Self::GpibRen { .. } => I::Gpib,
+            Self::NoIo
+            | Self::Connect
+            | Self::Disconnect
+            | Self::ShutdownPort
+            | Self::ConnectAddr
+            | Self::DisconnectAddr
+            | Self::ConnectUser
+            | Self::SetEnable { .. }
+            | Self::ExceptionDisconnect
+            | Self::ExceptionConnect
+            | Self::SetAutoConnect { .. }
+            | Self::GetEnable
+            | Self::GetAutoConnect
+            | Self::BlockProcess { .. }
+            | Self::UnblockProcess { .. }
+            | Self::CallParamCallbacks { .. }
+            | Self::SetParams { .. }
+            | Self::Report { .. }
+            | Self::WithDriver(_)
+            | Self::WithDriverAfterQueue(_)
+            | Self::LockPort(_)
+            | Self::Cell(_)
+            | Self::CellInline(_)
+            | Self::GetConnected
+            | Self::PushEchoInterpose
+            | Self::PushDelayInterpose { .. }
+            | Self::PushEosInterpose { .. }
+            | Self::SetTimeStampSource { .. }
+            | Self::PushFlushInterpose { .. } => return None,
+        })
+    }
 }
 
 /// Result returned by the worker after executing a request.
@@ -1893,28 +1967,48 @@ impl Default for CancelToken {
 #[derive(Clone, Debug)]
 pub enum SectionCallbacks {
     /// The sets of section `seq`: the actor holds the callbacks while it is
-    /// open.
-    Open { sections: Arc<Sections>, seq: u64 },
+    /// open, and runs only requests from its scope meanwhile. The number
+    /// wraps, safely: the actor trails its caller only by the sections
+    /// queued between them. A u32 keeps [`RequestOp`] at 64 bytes.
+    Open { sections: Arc<Sections>, seq: u32 },
     /// From the end of a section whose callbacks the actor holds.
     Held(Arc<Sections>),
 }
 
 impl SectionCallbacks {
-    /// The actor, sets done: `flush` each list the request owes, the
-    /// request's first, unless an open section holds them.
-    pub(crate) fn run(&self, addr: i32, updates: &[ParamSetValue], flush: impl FnMut(i32)) {
+    /// The actor, sets done: record each list the request owes, the
+    /// request's first; the scope of the open section that holds them, else
+    /// they [`Self::fire`] now.
+    pub(crate) fn owe(&self, addr: i32, updates: &[ParamSetValue]) -> Option<SectionScope> {
         match self {
-            // Only the actor takes this lock, so firing under it waits on no
-            // one.
             Self::Open { sections, seq } => {
                 let mut lists = sections.held.lock();
                 lists.push(addr);
                 push_further_lists(addr, updates, &mut lists);
-                if !sections.hold(*seq) {
-                    lists.drain(..).for_each(flush);
-                }
+                sections.hold(*seq)
             }
-            Self::Held(sections) => sections.held.lock().drain(..).for_each(flush),
+            Self::Held(_) => None,
+        }
+    }
+
+    /// The actor: post each list owed; the first error. Only the actor takes
+    /// this lock, so firing under it waits on no one.
+    pub(crate) fn fire(&self, base: &mut PortDriverBase) -> Option<AsynError> {
+        let (Self::Open { sections, .. } | Self::Held(sections)) = self;
+        let mut failed = None;
+        for list in sections.held.lock().drain(..) {
+            if let Err(e) = base.call_param_callbacks(list) {
+                failed.get_or_insert(e);
+            }
+        }
+        failed
+    }
+
+    /// The actor, sets done: an open section's `updates` go back to its
+    /// caller's gate.
+    pub(crate) fn give_back(&self, updates: Vec<ParamSetValue>) {
+        if let Self::Open { sections, .. } = self {
+            sections.give_back(updates);
         }
     }
 }
@@ -1928,28 +2022,115 @@ pub struct Sections {
     /// The open section's number, shifted left once; the low bit is set while
     /// the actor holds its callbacks.
     word: AtomicU64,
+    /// The open section's [`SectionScope`].
+    scope: AtomicU64,
     /// The lists whose callbacks the actor holds.
     held: Mutex<Vec<i32>>,
+    /// The `updates` of sections the actor has run, cleared, for the
+    /// caller's next ones. Every one is kept, so the list holds as many as
+    /// the actor has ever trailed by and a backlog that deep again allocates
+    /// none.
+    spare: Mutex<Vec<Vec<ParamSetValue>>>,
 }
 
 impl Sections {
-    /// The actor: `true` while section `seq` is open, which leaves its
-    /// callbacks to its end. A later section open means `seq` ended.
-    fn hold(&self, seq: u64) -> bool {
+    /// The actor: the scope of section `seq` while it is open, which leaves
+    /// its callbacks to its end. A later section open means `seq` ended.
+    fn hold(&self, seq: u32) -> Option<SectionScope> {
+        // Read first: a later section's scope is stored after `seq` ends, so
+        // reading it fails the exchange.
+        let scope = SectionScope(self.scope.load(AtomicOrdering::Acquire));
         self.word
             .compare_exchange(
-                seq << 1,
-                seq << 1 | 1,
+                u64::from(seq) << 1,
+                u64::from(seq) << 1 | 1,
                 AtomicOrdering::AcqRel,
                 AtomicOrdering::Acquire,
             )
             .is_ok()
+            .then_some(scope)
+    }
+
+    /// The caller, before it queues a section's sets: the scope it runs in.
+    pub(crate) fn open(&self, scope: SectionScope) {
+        self.scope.store(scope.0, AtomicOrdering::Release);
     }
 
     /// The caller, section `seq` ended: `true` when the actor holds its
     /// callbacks, which this end then owes.
-    pub(crate) fn end(&self, seq: u64) -> bool {
-        self.word.swap((seq + 1) << 1, AtomicOrdering::AcqRel) & 1 == 1
+    pub(crate) fn end(&self, seq: u32) -> bool {
+        self.word
+            .swap(u64::from(seq.wrapping_add(1)) << 1, AtomicOrdering::AcqRel)
+            & 1
+            == 1
+    }
+
+    /// The caller: an empty `updates` for its next section, one the actor
+    /// handed back when there is one.
+    pub(crate) fn updates(&self) -> Vec<ParamSetValue> {
+        self.spare.lock().pop().unwrap_or_default()
+    }
+
+    fn give_back(&self, mut updates: Vec<ParamSetValue>) {
+        updates.clear();
+        self.spare.lock().push(updates);
+    }
+}
+
+/// The thread of control a request comes from. C's port lock is recursive:
+/// while a section holds it from the sets to its `callParamCallbacks`
+/// (NDPluginDriver.cpp:332, :539), the section's own thread gets in, and so
+/// does every blocking consumer, which its callbacks run on that thread
+/// (:435-436); every other thread waits. A section's scope is the one it
+/// opens in, else a new one, and a delivery carries it to the consumer's
+/// threads, which [`Self::enter`] or [`Self::run`] it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SectionScope(u64);
+
+thread_local! {
+    /// This thread's scope; 0 outside every section.
+    static SCOPE: Cell<u64> = const { Cell::new(0) };
+}
+
+impl SectionScope {
+    /// The scope this thread is in.
+    pub fn current() -> Self {
+        Self(SCOPE.with(Cell::get))
+    }
+
+    /// The scope of a section opened from `within`: that one, so a section
+    /// of a consumer's admits its delivery's requests, else a new one.
+    pub(crate) fn for_section(within: Self) -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        match within {
+            Self(0) => Self(NEXT.fetch_add(1, AtomicOrdering::Relaxed)),
+            inside => inside,
+        }
+    }
+
+    /// Put this thread in `self` until the guard drops.
+    pub fn enter(self) -> ScopeGuard {
+        ScopeGuard(SCOPE.with(|scope| scope.replace(self.0)))
+    }
+
+    /// Poll `fut` in `self`, on whichever thread polls it.
+    pub async fn run<F: Future>(self, fut: F) -> F::Output {
+        let mut fut = std::pin::pin!(fut);
+        std::future::poll_fn(|cx| {
+            let _in = self.enter();
+            fut.as_mut().poll(cx)
+        })
+        .await
+    }
+}
+
+/// [`SectionScope::enter`]: puts the thread back in the scope it was in.
+#[must_use = "the thread leaves the scope when the guard drops"]
+pub struct ScopeGuard(u64);
+
+impl Drop for ScopeGuard {
+    fn drop(&mut self) {
+        SCOPE.with(|scope| scope.set(self.0));
     }
 }
 
@@ -1972,14 +2153,61 @@ mod tests {
     #[test]
     fn whichever_of_the_actor_and_the_caller_comes_second_fires() {
         let sections = super::Sections::default();
-        assert!(sections.hold(0));
+        let open = super::SectionScope(7);
+        sections.open(open);
+        assert_eq!(sections.hold(0), Some(open), "held in its scope");
         assert!(sections.end(0));
         assert!(!sections.end(1));
-        assert!(!sections.hold(1));
+        assert_eq!(sections.hold(1), None);
         assert!(!sections.end(2));
-        assert!(!sections.hold(2), "held for section 3");
-        assert!(sections.hold(3));
+        assert_eq!(sections.hold(2), None, "held for section 3");
+        assert!(sections.hold(3).is_some());
         assert!(sections.end(3));
+    }
+
+    /// The section after number `u32::MAX` is 0.
+    #[test]
+    fn a_section_number_wraps() {
+        let sections = super::Sections::default();
+        assert!(!sections.end(u32::MAX - 1));
+        assert!(sections.hold(u32::MAX).is_some());
+        assert!(sections.end(u32::MAX));
+        assert!(sections.hold(0).is_some(), "held after the wrap");
+        assert!(sections.end(0));
+    }
+
+    /// A future run in a scope is in it at every poll, and the thread is
+    /// back in its own scope between those polls and after them.
+    #[test]
+    fn a_scope_follows_its_future_and_only_its_future() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+        let outer = super::SectionScope::for_section(super::SectionScope::default());
+        let _outer = outer.enter();
+        let inner = super::SectionScope(outer.0 + 1);
+        let mut yielded = false;
+        let mut fut = std::pin::pin!(inner.run(async {
+            let before = super::SectionScope::current();
+            std::future::poll_fn(|_| {
+                if std::mem::replace(&mut yielded, true) {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
+            (before, super::SectionScope::current())
+        }));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(super::SectionScope::current(), outer);
+        assert_eq!(fut.as_mut().poll(&mut cx), Poll::Ready((inner, inner)));
+        assert_eq!(super::SectionScope::current(), outer);
+        assert_eq!(
+            super::SectionScope::for_section(super::SectionScope::current()),
+            outer,
+            "nested"
+        );
     }
 
     /// bab72deef: the entry the actor still holds for a request the timer took
@@ -2139,6 +2367,17 @@ mod tests {
         cell.queue(&user).unwrap();
         assert_eq!(cell.lock().state, ACTIVE_QUEUED);
         assert_eq!(cell.queue(&user), Err(QueueRefusal::AlreadyQueued));
+    }
+
+    /// A queue deadline past `Instant`'s range never fires; arming it must
+    /// not overflow `Instant::now() + timeout`.
+    #[test]
+    fn an_unrepresentable_queue_deadline_arms_without_panicking() {
+        let (queue, _body, cell) = probe(false);
+        let user = crate::user::AsynUser::new(0).with_queue_timeout(std::time::Duration::MAX);
+        cell.queue(&user).unwrap();
+        assert!(cell.cancel());
+        assert!(queue.pop().is_none());
     }
 
     /// asynManager.c:1592-1597: a queue timeout needs a timeout callback.

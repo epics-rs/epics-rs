@@ -2,7 +2,7 @@
 //!
 //! Corresponds to C++ QSRV's `pvif.h/pvif.cpp` (ScalarBuilder, etc.).
 
-use epics_base_rs::server::database::char_view::{DollarView, PvaDollar};
+use epics_base_rs::server::database::char_view::{ChannelAddr, CharServed, DollarView, PvaDollar};
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::snapshot::{ControlInfo, DisplayInfo, PropertySupport, Snapshot};
 use epics_base_rs::types::{EpicsValue, PvString, WallTime};
@@ -404,39 +404,54 @@ pub(crate) enum View {
     Field,
     /// A `$` channel.
     Dollar(DollarView),
-    /// [`ChannelValue::Text`]: no `$`, read as one.
+    /// [`ChannelValue::Text`]: no `$`, read through a char view as one.
     Text(DollarView),
 }
 
 impl View {
-    /// Of a channel whose value chain is `filters`; `None` where `$` is
-    /// refused (`dbChannel.c:486-505`).
-    pub(crate) fn of(
-        instance: &epics_base_rs::server::record::RecordInstance,
+    /// Of the channel addressed `addr` on `field` whose value chain is
+    /// `filters`; `None` where `$` is refused (`dbChannel.c:486-505`).
+    pub(crate) fn of_addr(
+        addr: &ChannelAddr,
         field: &str,
         string_view: bool,
         filters: &epics_base_rs::server::database::filters::FilterChain,
     ) -> Option<Self> {
         if !string_view {
-            return Some(
-                match ChannelValue::of_record_channel(instance, field, filters) {
-                    ChannelValue::Text(dollar) => Self::Text(dollar),
-                    _ => Self::Field,
-                },
-            );
+            return Some(match ChannelValue::of_addr(addr, field, filters) {
+                ChannelValue::Text(dollar) => Self::Text(dollar),
+                _ => Self::Field,
+            });
         }
-        DollarView::of(instance, field, filters).map(Self::Dollar)
+        addr.dollar_view(field, filters).map(Self::Dollar)
+    }
+
+    /// The type an unfiltered read of the channel addressed `addr` serves
+    /// under this view: its text, its chars, or the field's own value.
+    pub(crate) fn served_type(self, addr: &ChannelAddr) -> epics_base_rs::types::DbFieldType {
+        use epics_base_rs::types::DbFieldType;
+        match self {
+            Self::Field => addr.value_type(),
+            Self::Dollar(dollar) | Self::Text(dollar)
+                if dollar.serve == PvaDollar::Text && !dollar.scalar() =>
+            {
+                DbFieldType::String
+            }
+            Self::Dollar(_) | Self::Text(_) => DbFieldType::Char,
+        }
     }
 
     /// The served value of the field's own `value`, through `filters` in
-    /// read context. C's `dbChannelCreate` swaps the address to the char
-    /// view before any filter opens (`dbChannel.c:486-494`) and `dbGet`
+    /// read context on a log whose head is the record's `head`, the time a
+    /// `ts` value mode reads. C's `dbChannelCreate` swaps the address to the
+    /// char view before any filter opens (`dbChannel.c:486-494`) and `dbGet`
     /// reads the filtered log after, so a `$` renders before the chain and
     /// finishes after it ([`DollarView::finish`]). A chain that drops the
     /// read yields the unfiltered field: `dbChannelGet` reads the live record
     /// when the log is NULL (`dbAccess.c:924-930`).
     pub(crate) fn read(
         self,
+        head: epics_base_rs::server::pv::LogHead,
         value: EpicsValue,
         filters: &epics_base_rs::server::database::filters::FilterChain,
     ) -> EpicsValue {
@@ -444,7 +459,9 @@ impl View {
             if filters.is_empty() {
                 value
             } else {
-                filters.apply_to_read_value(value.clone()).unwrap_or(value)
+                filters
+                    .apply_to_read_log(head, value.clone())
+                    .unwrap_or(value)
             }
         };
         match self {
@@ -465,12 +482,20 @@ impl View {
         mut snap: epics_base_rs::server::snapshot::Snapshot,
         filters: &epics_base_rs::server::database::filters::FilterChain,
     ) -> epics_base_rs::server::snapshot::Snapshot {
-        match self {
-            Self::Field if !filters.is_empty() => {
+        let chain = |snap: epics_base_rs::server::snapshot::Snapshot| {
+            if filters.is_empty() {
+                snap
+            } else {
                 filters.apply_to_read_snapshot(snap.clone()).unwrap_or(snap)
             }
-            _ => {
-                snap.value = self.read(snap.value, filters);
+        };
+        match self {
+            Self::Field => chain(snap),
+            Self::Dollar(dollar) | Self::Text(dollar) => {
+                let image = dollar.render(snap.value);
+                snap.value = image.clone();
+                let mut snap = chain(snap);
+                snap.value = dollar.finish(image, snap.value);
                 snap
             }
         }
@@ -506,38 +531,58 @@ impl View {
 ///
 /// `DBF_ENUM`/`DBF_MENU`/`DBF_DEVICE` resolve to `DBR_ENUM`
 /// (`db/dbAccess.c:88-90`) and select `NTEnum` — the one element type with
-/// a shape of its own, and only while the channel is a scalar. This applies
+/// a shape of its own, and only while the channel is a scalar whose
+/// `dbChannelFinalFieldType` is still `DBR_ENUM`. This applies
 /// uniformly to `VAL` and every other field: there is no record-type-name
 /// short-circuit, so a `busy` VAL is `NTEnum` on its resolved value the way
 /// a `bi` VAL is, and a `REC.SCAN` member is `NTEnum` while a `BI.DESC` one
 /// stays an `NTScalar` string.
 ///
-/// A long string is [`ChannelValue::Text`] or
-/// [`ChannelValue::LongStringField`]; a `$` channel is [`NtType::Dollar`]
-/// instead, whatever its format.
+/// A channel read through a char view, `$` or [`ChannelValue::Text`],
+/// serves what [`DollarView::served`] answers: its text, a long string
+/// without `$` and [`NtType::Dollar`] with it, or the type and count its
+/// chain left. A long string pvxs does not re-view is
+/// [`ChannelValue::LongStringField`].
 pub(crate) fn nt_type_for_channel(
-    instance: &epics_base_rs::server::record::RecordInstance,
+    addr: &ChannelAddr,
     field_upper: &str,
-    resolved: Option<&EpicsValue>,
     view: View,
     filters: &epics_base_rs::server::database::filters::FilterChain,
 ) -> NtType {
     // The `$` view, decided first, so the single-record and group paths
     // cannot reach different answers for one channel.
-    match view {
-        View::Dollar(dollar) if dollar.scalar() => return NtType::Scalar,
-        View::Dollar(dollar) => return NtType::Dollar(dollar.serve),
-        View::Text(_) => return NtType::LongString,
-        View::Field => {}
+    let dollar = match view {
+        View::Dollar(dollar) | View::Text(dollar) => dollar.served(),
+        View::Field => return nt_type_for_field(addr, field_upper, filters),
+    };
+    match (dollar, view) {
+        (CharServed::Scalar(_), _) => NtType::Scalar,
+        (CharServed::Text, View::Text(_)) => NtType::LongString,
+        (CharServed::Text, _) => NtType::Dollar(PvaDollar::Text),
+        (CharServed::Array(epics_base_rs::types::DbFieldType::Char), View::Dollar(_)) => {
+            NtType::Dollar(PvaDollar::Chars)
+        }
+        (CharServed::Array(_), _) => NtType::ScalarArray,
     }
-    match ChannelValue::of_channel(instance, field_upper, resolved, filters) {
+}
+
+/// [`nt_type_for_channel`] of a channel read as its field.
+fn nt_type_for_field(
+    addr: &ChannelAddr,
+    field_upper: &str,
+    filters: &epics_base_rs::server::database::filters::FilterChain,
+) -> NtType {
+    match ChannelValue::of_addr(addr, field_upper, filters) {
         ChannelValue::Text(_) => NtType::LongString,
         ChannelValue::LongStringField => NtType::LongStringField,
         ChannelValue::Shaped(shape) if shape.is_array() => NtType::ScalarArray,
-        ChannelValue::Shaped(_) => match resolved {
-            Some(EpicsValue::Enum(_)) => NtType::Enum,
-            _ => NtType::Scalar,
-        },
+        ChannelValue::Shaped(_)
+            if filters.final_field_type(addr.value_type())
+                == epics_base_rs::types::DbFieldType::Enum =>
+        {
+            NtType::Enum
+        }
+        ChannelValue::Shaped(_) => NtType::Scalar,
     }
 }
 
@@ -585,7 +630,7 @@ impl BareLeaf {
     /// field's resolved value (record → common → virtual); `field_dbf` is the
     /// fallback DBF type when the field has no resolved value.
     pub(crate) fn of_channel(
-        instance: &epics_base_rs::server::record::RecordInstance,
+        addr: &ChannelAddr,
         field_upper: &str,
         resolved: Option<&EpicsValue>,
         field_dbf: epics_base_rs::types::DbFieldType,
@@ -596,7 +641,7 @@ impl BareLeaf {
             filters.final_field_type(resolved.map(|v| v.db_field_type()).unwrap_or(field_dbf)),
         );
         Self::from_nt(
-            nt_type_for_channel(instance, field_upper, resolved, view, filters),
+            nt_type_for_channel(addr, field_upper, view, filters),
             scalar,
         )
     }
@@ -612,14 +657,13 @@ impl BareLeaf {
     /// `value.type() == TypeCode::String` test cannot fire and pvxs serves a
     /// long-string field's `any` member as `int8_t[]`.
     pub(crate) fn any_payload_of_channel(
-        instance: &epics_base_rs::server::record::RecordInstance,
-        field_upper: &str,
+        addr: &ChannelAddr,
         resolved: &EpicsValue,
         filters: &epics_base_rs::server::database::filters::FilterChain,
     ) -> Self {
         let scalar =
             crate::convert::dbf_to_scalar_type(filters.final_field_type(resolved.db_field_type()));
-        match ChannelShape::of_channel(&*instance.record, field_upper, Some(resolved), filters) {
+        match ChannelShape::of_addr(addr, filters) {
             ChannelShape::Array => BareLeaf::Array(scalar),
             ChannelShape::Scalar => BareLeaf::Scalar(scalar),
         }
@@ -768,7 +812,7 @@ fn limit_scalar(t: ScalarType, v: f64) -> ScalarValue {
 ///
 /// Structure ID: `epics:nt/NTScalar:1.0`
 /// Fields: value, alarm, timeStamp, display (optional), control (optional)
-pub fn snapshot_to_nt_scalar(snapshot: &Snapshot) -> PvStructure {
+pub fn snapshot_to_nt_scalar(snapshot: &Snapshot, nsec_mask: u64) -> PvStructure {
     let mut pv = PvStructure::new("epics:nt/NTScalar:1.0");
 
     // an empty array landing in NTScalar conversion can't yield a real
@@ -799,7 +843,11 @@ pub fn snapshot_to_nt_scalar(snapshot: &Snapshot) -> PvStructure {
     // timeStamp
     pv.fields.push((
         "timeStamp".into(),
-        PvField::Structure(build_timestamp(snapshot.timestamp, snapshot.user_tag)),
+        PvField::Structure(build_timestamp(
+            snapshot.timestamp,
+            snapshot.user_tag,
+            nsec_mask,
+        )),
     ));
 
     // The NTScalar descriptor advertises `display` for every value plus
@@ -842,11 +890,14 @@ pub fn snapshot_to_nt_scalar(snapshot: &Snapshot) -> PvStructure {
 /// `display.description` field. Aligning the runtime shape and
 /// descriptor with that prevents pvxs clients from seeing
 /// a wrong-type index and missing the description field.
-pub fn snapshot_to_nt_enum(snapshot: &Snapshot) -> PvStructure {
+pub fn snapshot_to_nt_enum(snapshot: &Snapshot, nsec_mask: u64) -> PvStructure {
     let mut pv = PvStructure::new("epics:nt/NTEnum:1.0");
 
-    // value sub-structure with index + choices
-    let index = match &snapshot.value {
+    // value sub-structure with index + choices. A one-element channel on an
+    // enum buffer (`waveform` `FTVL=ENUM`, `NELM=1`) serves its first
+    // element, as `getScalarValue` reads one (`iocsource.cpp:69-116`).
+    let first = snapshot.value.first_element();
+    let index = match first.as_ref().unwrap_or(&snapshot.value) {
         EpicsValue::Enum(v) => *v as i32,
         EpicsValue::Short(v) => *v as i32,
         other => other.to_f64().map(|f| f as i32).unwrap_or(0),
@@ -877,7 +928,11 @@ pub fn snapshot_to_nt_enum(snapshot: &Snapshot) -> PvStructure {
         .push(("alarm".into(), PvField::Structure(build_alarm(snapshot))));
     pv.fields.push((
         "timeStamp".into(),
-        PvField::Structure(build_timestamp(snapshot.timestamp, snapshot.user_tag)),
+        PvField::Structure(build_timestamp(
+            snapshot.timestamp,
+            snapshot.user_tag,
+            nsec_mask,
+        )),
     ));
     // trailing `display.description` is part of pvxs's
     // QSRV NTEnum shape; populate from the DESC field when
@@ -909,7 +964,7 @@ pub fn snapshot_to_nt_enum(snapshot: &Snapshot) -> PvStructure {
 /// the scalar case — `value.isarray()` only flips the struct id — so a
 /// numeric array carries `control` and `valueAlarm` just like a scalar
 /// (pvxs `src/nt.cpp:44-112`, confirmed by `test/testqsingle.cpp:354-397`).
-pub fn snapshot_to_nt_scalar_array(snapshot: &Snapshot) -> PvStructure {
+pub fn snapshot_to_nt_scalar_array(snapshot: &Snapshot, nsec_mask: u64) -> PvStructure {
     let mut pv = PvStructure::new("epics:nt/NTScalarArray:1.0");
 
     // array metadata limits take the element scalar type.
@@ -927,7 +982,11 @@ pub fn snapshot_to_nt_scalar_array(snapshot: &Snapshot) -> PvStructure {
     // timeStamp
     pv.fields.push((
         "timeStamp".into(),
-        PvField::Structure(build_timestamp(snapshot.timestamp, snapshot.user_tag)),
+        PvField::Structure(build_timestamp(
+            snapshot.timestamp,
+            snapshot.user_tag,
+            nsec_mask,
+        )),
     ));
 
     // Same descriptor/value consistency rule as the scalar builder:
@@ -1002,22 +1061,29 @@ pub(crate) fn long_string_field_value(value: &EpicsValue) -> PvString {
 fn snapshot_to_nt_long_string(
     snapshot: &Snapshot,
     text: fn(&EpicsValue) -> PvString,
+    nsec_mask: u64,
 ) -> PvStructure {
     let mut snap = snapshot.clone();
     snap.value = EpicsValue::String(text(&snapshot.value));
-    snapshot_to_nt_scalar(&snap)
+    snapshot_to_nt_scalar(&snap, nsec_mask)
 }
 
-/// Convert a Snapshot to the appropriate NormativeType based on NtType.
-pub fn snapshot_to_pv_structure(snapshot: &Snapshot, nt_type: NtType) -> PvStructure {
+/// Convert a Snapshot to the appropriate NormativeType based on NtType,
+/// its time split along `nsec_mask`, the record's `Q:time:tag` mask.
+pub fn snapshot_to_pv_structure(
+    snapshot: &Snapshot,
+    nt_type: NtType,
+    nsec_mask: u64,
+) -> PvStructure {
+    let m = nsec_mask;
     match nt_type {
-        NtType::Scalar => snapshot_to_nt_scalar(snapshot),
-        NtType::Enum => snapshot_to_nt_enum(snapshot),
-        NtType::ScalarArray => snapshot_to_nt_scalar_array(snapshot),
-        NtType::LongString => snapshot_to_nt_long_string(snapshot, long_string_value),
-        NtType::LongStringField => snapshot_to_nt_long_string(snapshot, long_string_field_value),
-        NtType::Dollar(PvaDollar::Text) => snapshot_to_nt_scalar(snapshot),
-        NtType::Dollar(PvaDollar::Chars) => snapshot_to_nt_scalar_array(snapshot),
+        NtType::Scalar => snapshot_to_nt_scalar(snapshot, m),
+        NtType::Enum => snapshot_to_nt_enum(snapshot, m),
+        NtType::ScalarArray => snapshot_to_nt_scalar_array(snapshot, m),
+        NtType::LongString => snapshot_to_nt_long_string(snapshot, long_string_value, m),
+        NtType::LongStringField => snapshot_to_nt_long_string(snapshot, long_string_field_value, m),
+        NtType::Dollar(PvaDollar::Text) => snapshot_to_nt_scalar(snapshot, m),
+        NtType::Dollar(PvaDollar::Chars) => snapshot_to_nt_scalar_array(snapshot, m),
     }
 }
 
@@ -1344,7 +1410,11 @@ fn is_empty_array(value: &EpicsValue) -> bool {
     )
 }
 
-fn build_timestamp(time: WallTime, user_tag: i32) -> PvStructure {
+/// The one place a served qsrv `timeStamp` takes the `Q:time:tag` split:
+/// pvxs splits it while filling the reply (`iocsource.cpp:239-248`), after
+/// the chain read the whole nanoseconds.
+pub(crate) fn build_timestamp(time: WallTime, user_tag: i32, nsec_mask: u64) -> PvStructure {
+    let (time, user_tag) = epics_base_rs::server::snapshot::split_nsec(time, user_tag, nsec_mask);
     let mut ts = PvStructure::new("time_t");
     let dur = time.since_unix_epoch();
     let (secs, nanos) = (dur.as_secs() as i64, dur.subsec_nanos() as i32);
@@ -1760,7 +1830,7 @@ mod tests {
             0,
             UNIX_EPOCH,
         );
-        let pv = snapshot_to_pv_structure(&snap, NtType::LongString);
+        let pv = snapshot_to_pv_structure(&snap, NtType::LongString, 0);
         assert_eq!(pv.struct_id, "epics:nt/NTScalar:1.0");
         match pv.get_field("value") {
             Some(PvField::Scalar(ScalarValue::String(s))) => assert_eq!(s, text),
@@ -1796,7 +1866,7 @@ mod tests {
             0,
             UNIX_EPOCH,
         );
-        let pv = snapshot_to_pv_structure(&snap, NtType::LongString);
+        let pv = snapshot_to_pv_structure(&snap, NtType::LongString, 0);
         match pv.get_field("value") {
             Some(PvField::Scalar(ScalarValue::String(s))) => assert_eq!(s, "hi"),
             other => panic!("expected scalar string value, got {other:?}"),
@@ -1819,7 +1889,7 @@ mod tests {
             0,
             UNIX_EPOCH,
         );
-        let pv = snapshot_to_pv_structure(&snap, NtType::LongString);
+        let pv = snapshot_to_pv_structure(&snap, NtType::LongString, 0);
         match pv.get_field("value") {
             Some(PvField::Scalar(ScalarValue::String(s))) => assert_eq!(
                 s.as_bytes(),
@@ -1848,7 +1918,7 @@ mod tests {
         // are typed ubyte, not signed byte.
         assert_eq!(value_scalar_type(&snap.value), ScalarType::UByte);
 
-        let pv = snapshot_to_pv_structure(&snap, NtType::ScalarArray);
+        let pv = snapshot_to_pv_structure(&snap, NtType::ScalarArray, 0);
         assert_eq!(pv.struct_id, "epics:nt/NTScalarArray:1.0");
         match pv.get_field("value") {
             Some(PvField::ScalarArrayTyped(TypedScalarArray::UByte(arr))) => {
@@ -1968,7 +2038,7 @@ mod tests {
     #[test]
     fn nt_scalar_structure() {
         let snap = test_snapshot(EpicsValue::Double(42.5));
-        let pv = snapshot_to_nt_scalar(&snap);
+        let pv = snapshot_to_nt_scalar(&snap, 0);
 
         assert_eq!(pv.struct_id, "epics:nt/NTScalar:1.0");
         assert_eq!(pv.get_value(), Some(&ScalarValue::Double(42.5)));
@@ -1997,7 +2067,7 @@ mod tests {
         // alarm.status is the PVA status CLASS — UDF maps to DRIVER
         // (2) — and alarm.message is the condition string "UDF".
         let snap = test_snapshot(EpicsValue::DoubleArray(vec![].into()));
-        let pv = snapshot_to_nt_scalar(&snap);
+        let pv = snapshot_to_nt_scalar(&snap, 0);
 
         if let Some(PvField::Structure(alarm)) = pv.get_field("alarm") {
             let sev = alarm.get_field("severity");
@@ -2015,7 +2085,7 @@ mod tests {
     fn nt_scalar_non_empty_keeps_original_alarm() {
         // Sanity: non-empty array (or scalar) does NOT trigger the overlay.
         let snap = test_snapshot(EpicsValue::Double(1.0));
-        let pv = snapshot_to_nt_scalar(&snap);
+        let pv = snapshot_to_nt_scalar(&snap, 0);
         if let Some(PvField::Structure(alarm)) = pv.get_field("alarm") {
             let sev = alarm.get_field("severity");
             assert!(matches!(sev, Some(PvField::Scalar(ScalarValue::Int(0)))));
@@ -2030,7 +2100,7 @@ mod tests {
     fn nt_enum_structure() {
         let mut snap = Snapshot::new(EpicsValue::Enum(1), 0, 0, UNIX_EPOCH);
         snap.enums = Some(EnumInfo::new(vec!["Off".into(), "On".into()]));
-        let pv = snapshot_to_nt_enum(&snap);
+        let pv = snapshot_to_nt_enum(&snap, 0);
 
         assert_eq!(pv.struct_id, "epics:nt/NTEnum:1.0");
         if let Some(PvField::Structure(val)) = pv.get_field("value") {
@@ -2068,7 +2138,7 @@ mod tests {
     #[test]
     fn nt_scalar_array_structure() {
         let snap = test_snapshot(EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0].into()));
-        let pv = snapshot_to_nt_scalar_array(&snap);
+        let pv = snapshot_to_nt_scalar_array(&snap, 0);
 
         assert_eq!(pv.struct_id, "epics:nt/NTScalarArray:1.0");
         if let Some(PvField::ScalarArrayTyped(arr)) = pv.get_field("value") {
@@ -2081,7 +2151,7 @@ mod tests {
     #[test]
     fn put_roundtrip_scalar() {
         let snap = test_snapshot(EpicsValue::Double(99.0));
-        let pv = snapshot_to_nt_scalar(&snap);
+        let pv = snapshot_to_nt_scalar(&snap, 0);
         let back = pv_structure_to_epics(&pv).unwrap();
         assert_eq!(back, EpicsValue::Double(99.0));
     }
@@ -2090,7 +2160,7 @@ mod tests {
     fn put_roundtrip_enum() {
         let mut snap = Snapshot::new(EpicsValue::Enum(2), 0, 0, UNIX_EPOCH);
         snap.enums = Some(EnumInfo::new(vec!["A".into(), "B".into(), "C".into()]));
-        let pv = snapshot_to_nt_enum(&snap);
+        let pv = snapshot_to_nt_enum(&snap, 0);
         let back = pv_structure_to_epics(&pv).unwrap();
         assert_eq!(back, EpicsValue::Enum(2));
     }
@@ -2154,7 +2224,7 @@ mod tests {
     #[test]
     fn filter_by_request_empty() {
         let snap = test_snapshot(EpicsValue::Double(1.0));
-        let pv = snapshot_to_nt_scalar(&snap);
+        let pv = snapshot_to_nt_scalar(&snap, 0);
 
         // Empty request → return everything
         let req = PvStructure::new("");
@@ -2165,7 +2235,7 @@ mod tests {
     #[test]
     fn filter_by_request_value_only() {
         let snap = test_snapshot(EpicsValue::Double(1.0));
-        let pv = snapshot_to_nt_scalar(&snap);
+        let pv = snapshot_to_nt_scalar(&snap, 0);
 
         // Request only "value" field
         let mut field_spec = PvStructure::new("");
@@ -2184,7 +2254,7 @@ mod tests {
     #[test]
     fn filter_by_request_multiple_fields() {
         let snap = test_snapshot(EpicsValue::Double(1.0));
-        let pv = snapshot_to_nt_scalar(&snap);
+        let pv = snapshot_to_nt_scalar(&snap, 0);
 
         let mut field_spec = PvStructure::new("");
         field_spec
@@ -2204,7 +2274,7 @@ mod tests {
     #[test]
     fn filter_by_request_nested_subfield() {
         let snap = test_snapshot(EpicsValue::Double(1.0));
-        let pv = snapshot_to_nt_scalar(&snap);
+        let pv = snapshot_to_nt_scalar(&snap, 0);
 
         // Build request: {field: {alarm: {severity: {}}}}
         // — only return alarm.severity, not other alarm fields
@@ -2244,7 +2314,7 @@ mod tests {
         // scalar type (Int, not Double), and `display.form` must be an
         // `enum_t` sub-structure, not a scalar int.
         let snap = test_snapshot(EpicsValue::LongArray(vec![4, 5, 6, 7].into()));
-        let pv = snapshot_to_nt_scalar_array(&snap);
+        let pv = snapshot_to_nt_scalar_array(&snap, 0);
 
         // control + valueAlarm present on the array
         let control = pv.get_field("control").expect("array must carry control");
@@ -2331,7 +2401,7 @@ mod tests {
         // `display = {description, units}` — no limits, no form, no
         // control, no valueAlarm (pvxs src/nt.cpp:78-85).
         let snap = test_snapshot(EpicsValue::String("Analog input".into()));
-        let pv = snapshot_to_nt_scalar(&snap);
+        let pv = snapshot_to_nt_scalar(&snap, 0);
 
         assert!(
             pv.get_field("control").is_none(),
@@ -2382,7 +2452,7 @@ mod tests {
         // Numeric scalar, no display/control metadata.
         let snap = Snapshot::new(EpicsValue::Double(1.0), 0, 0, UNIX_EPOCH);
         assert!(snap.display.is_none() && snap.control.is_none());
-        let pv = snapshot_to_nt_scalar(&snap);
+        let pv = snapshot_to_nt_scalar(&snap, 0);
         assert_eq!(
             names(&pv),
             desc_names(&build_field_desc_for_nt(NtType::Scalar, ScalarType::Double)),
@@ -2396,7 +2466,7 @@ mod tests {
             0,
             UNIX_EPOCH,
         );
-        let pv_arr = snapshot_to_nt_scalar_array(&snap_arr);
+        let pv_arr = snapshot_to_nt_scalar_array(&snap_arr, 0);
         assert_eq!(
             names(&pv_arr),
             desc_names(&build_field_desc_for_nt(
@@ -2409,7 +2479,7 @@ mod tests {
         // String scalar (stringin-like), no metadata: `display` present,
         // no numeric `control`/`valueAlarm`.
         let snap_s = Snapshot::new(EpicsValue::String("x".into()), 0, 0, UNIX_EPOCH);
-        let pv_s = snapshot_to_nt_scalar(&snap_s);
+        let pv_s = snapshot_to_nt_scalar(&snap_s, 0);
         assert_eq!(
             names(&pv_s),
             desc_names(&build_field_desc_for_nt(NtType::Scalar, ScalarType::String)),
@@ -2427,7 +2497,7 @@ mod tests {
         let snap = test_snapshot(EpicsValue::UInt64Array(
             vec![11111111111111111, 222222222222222].into(),
         ));
-        let pv = snapshot_to_nt_scalar_array(&snap);
+        let pv = snapshot_to_nt_scalar_array(&snap, 0);
 
         // value is a ulong array
         match pv.get_field("value") {

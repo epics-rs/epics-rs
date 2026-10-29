@@ -334,13 +334,15 @@ monitor phi1Lls;
 monitor phi2Hls;
 monitor phi2Lls;
 
+/* C defect: monitored the values calcMovements puts here, so moveHR took
+ * what the PV held by then: the late echo of an earlier pass's put, or a
+ * user's edit landing after the pass assigned them. The move goes where
+ * calcMovements put. */
 double  phi1MotDesired;
 assign  phi1MotDesired to "{P}HR{N}_phi1SetAO";
-monitor phi1MotDesired;
 
 double  phi2MotDesired;
 assign  phi2MotDesired to "{P}HR{N}_phi2SetAO";
-monitor phi2MotDesired;
 
 double  phi1MotHiLim;
 assign  phi1MotHiLim to "{P}{M_PHI1}.HLM";

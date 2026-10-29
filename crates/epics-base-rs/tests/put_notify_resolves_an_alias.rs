@@ -138,7 +138,8 @@ async fn a_parked_notify_replays_when_the_release_arrives_by_alias() {
     // notify its tail replays. 1.0 is the first alone — the state this test
     // must not settle for — so poll for the terminal 2.0 rather than for any
     // increment, or a fast replay and a slow one measure different things.
-    for _ in 0..400 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if val(&db, "PARKED") >= 2.0 {
             break;
         }

@@ -73,21 +73,13 @@ mod exec_model {
 
     /// A port with nothing listening on it, for the name server the default
     /// build is pointed at — the compiled-in SLIRP address is part of the
-    /// probe rig, so a clean build must be told where to dial.
-    ///
-    /// This one keeps the probe-and-drop shape on purpose: what it wants is
-    /// the ABSENCE of a listener, and absence is the one property no bind can
-    /// reserve — a socket held open to keep the number would be the very
-    /// listener the dial must not find. A steal here cannot fail the test the
-    /// way a stolen server port does; it can only make the IOC's dial reach a
-    /// stranger instead of being refused, and what is asserted is that the
-    /// dial happens at all.
+    /// probe rig, so a clean build must be told where to dial. Held for the
+    /// whole run by a socket that never listens, so the dial is refused and
+    /// no stranger can take the number and answer.
     #[cfg(not(feature = "bringup-probes"))]
     fn closed_port() -> u16 {
-        let tcp = std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral TCP port");
-        let port = tcp.local_addr().unwrap().port();
-        drop(tcp);
-        port
+        static HOLD: std::sync::OnceLock<named_port::HeldPort> = std::sync::OnceLock::new();
+        HOLD.get_or_init(named_port::HeldPort::closed_tcp).port
     }
 
     /// The record set the IOC reports, or `None` while that report is still
@@ -182,11 +174,11 @@ mod exec_model {
     fn init_path_runs_without_a_panic() {
         let dir = tempfile::tempdir().expect("temp dir");
         let db = dir.path().join("pvalink.db");
-        // A `pva://` INP makes the record a client of a server this IOC has to
+        // A pva INP makes the record a client of a server this IOC has to
         // search for, which is what drives the search engine and the dial.
         std::fs::write(
             &db,
-            "record(ai, \"LOCAL:PAI\") { field(INP, \"pva://UPSTREAM:AI CP\") }\n\
+            "record(ai, \"LOCAL:PAI\") { field(INP, \"{pva:{pv:'UPSTREAM:AI',proc:'CP'}}\") }\n\
              record(ai, \"LOCAL:JSON\") { field(INP, {pva:\"UPSTREAM:AI\"}) }\n",
         )
         .expect("write the db");
@@ -268,7 +260,7 @@ mod exec_model {
         // stage-5 probe, so the clean build has no console line to wait on —
         // the NS dial logs at debug, below the console subscriber's INFO
         // floor. The seam is still crossed there (the client and its dial are
-        // production code, driven by the same `pva://` link); the *evidence*
+        // production code, driven by the same pva link); the *evidence*
         // is only asserted in the `bringup-probes` run of this test, which is
         // why the exec-backend gate runs both configurations.
         #[cfg(feature = "bringup-probes")]
@@ -285,7 +277,7 @@ mod exec_model {
                 );
                 assert!(
                     Instant::now() < deadline,
-                    "realtime-pva-ioc never started searching for its pva:// link \
+                    "realtime-pva-ioc never started searching for its pva link \
                      within {SEARCH_BUDGET:?}:\n{console}"
                 );
                 std::thread::sleep(Duration::from_millis(50));

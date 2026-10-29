@@ -6,7 +6,8 @@
 
 #[cfg(test)]
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Default)]
 pub(crate) enum LivenessClock {
@@ -17,12 +18,14 @@ pub(crate) enum LivenessClock {
 }
 
 impl LivenessClock {
+    /// Nanoseconds on a monotonic timeline: a wall-clock step must not
+    /// read a live peer as silent, as pvxs's bufferevent timeouts do not.
     pub(crate) fn now_nanos(&self) -> u64 {
         match self {
-            Self::System => std::time::SystemTime::now()
-                .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0),
+            Self::System => {
+                static ORIGIN: OnceLock<Instant> = OnceLock::new();
+                ORIGIN.get_or_init(Instant::now).elapsed().as_nanos() as u64
+            }
             #[cfg(test)]
             Self::Manual(clock) => clock.now_nanos(),
         }
@@ -38,13 +41,13 @@ impl LivenessClock {
 
     /// A periodic ticker with `runtime::task::interval`'s semantics: the
     /// first tick is immediate and missed ticks burst.
-    pub(crate) fn interval(&self, period: Duration) -> LivenessTicker {
+    pub(crate) fn interval(&self, period: epics_base_rs::runtime::task::Period) -> LivenessTicker {
         match self {
             Self::System => LivenessTicker::System(epics_base_rs::runtime::task::interval(period)),
             #[cfg(test)]
             Self::Manual(clock) => LivenessTicker::Manual {
                 next: clock.now_nanos(),
-                period: period.as_nanos() as u64,
+                period: period.get().as_nanos() as u64,
                 clock: clock.clone(),
             },
         }
@@ -160,5 +163,25 @@ impl ManualClock {
             std::task::Poll::Pending
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A CLOCK_REALTIME step cannot be made from a test, so pin the
+    /// timeline: the system clock must not read the wall clock.
+    #[test]
+    fn system_clock_is_not_the_wall_clock() {
+        let wall = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        let now = LivenessClock::System.now_nanos();
+        assert!(
+            wall.abs_diff(now) > Duration::from_secs(86_400).as_nanos() as u64,
+            "liveness clock {now} tracks the wall clock {wall}"
+        );
     }
 }

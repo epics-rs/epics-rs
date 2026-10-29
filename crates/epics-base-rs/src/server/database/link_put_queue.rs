@@ -199,7 +199,7 @@ pub(crate) struct LinkKey {
 /// stronger than C and is what makes "no pending put loses its
 /// classification silently" hold by construction rather than by review.
 enum PutCompletion {
-    /// A put-notify chain's callback: the oneshot the chain awaits.
+    /// A `dbCaPutLinkCallback` callback: the oneshot its writer awaits.
     Notify(Option<tokio::sync::oneshot::Sender<Result<(), String>>>),
     /// C `dbCaCallbackProcess` → `dbLinkAsyncComplete` (`dbCa.c:317-322`,
     /// `dbLink.c`): the `devXxxSoftCallback` record's completing pass, which
@@ -251,8 +251,8 @@ impl Drop for PutCompletion {
 pub(crate) enum PutWaiter<'a> {
     /// C `dbCaPutLink`: nobody.
     None,
-    /// A put-notify chain's `dbCaPutLinkCallback`: the receiver
-    /// [`LinkPutQueue::stage_put`] returns.
+    /// `dbCaPutLinkCallback`: the receiver [`LinkPutQueue::stage_put`]
+    /// returns.
     Notify,
     /// C `dbPutLinkAsync` from a `devXxxSoftCallback` (`dbCaPutAsync`,
     /// `dbCa.c:537-542`): the record's own completion, on the given band.
@@ -422,7 +422,7 @@ pub(crate) struct LinkPutQueue {
     /// `IocApplication::run` and for a test is inside its `#[tokio::test]`.
     ///
     /// The queue is the one place on the record-processing chain that cannot
-    /// live on the background executor: `LinkSet::connect_link` for a `ca://`
+    /// live on the background executor: `LinkSet::connect_link` for a CA
     /// target builds a `CaClient`, whose transport manager and search engine
     /// own `tokio::net` sockets. Staging, by contrast, happens on whatever
     /// thread processed the record — often a blocking connection thread with
@@ -473,12 +473,18 @@ impl LinkPutQueue {
     /// [`Self::reactor`], and it is a *refusal*, never a fallback: there is no
     /// second executor that could do the work. The process-global background
     /// executor cannot — `runtime::task::spawn_background` documents that it
-    /// deliberately has no `tokio::net` reactor — so sending a `ca://` open or
+    /// deliberately has no `tokio::net` reactor — so sending a CA open or
     /// put there only moves the panic onto a callback-pool worker. Callers
     /// refuse instead; [`super::PvDatabase::external_put_gate`] turns that
     /// into the record's LINK alarm before anything is staged.
     pub(crate) fn network(&self) -> Option<&crate::runtime::task::BlockingBridge> {
         self.reactor.as_ref()
+    }
+
+    /// Wake the owner for a local link action (`addAction`'s
+    /// `epicsEventSignal(workListEvent)`, `dbCa.c:159-160`).
+    pub(super) fn wake(&self) {
+        self.work.notify_one();
     }
 
     /// Stage `value` on `key`, coalescing latest-wins onto any pending value
@@ -974,7 +980,7 @@ impl LinkPutQueue {
 /// keeping at most one write in flight per link (so per-link write ordering
 /// is preserved) while distinct links proceed independently. C gets that for
 /// free because `ca_array_put` only queues into libca's send buffer; ours has
-/// to spawn because `LinkSet::put_value` for `pva://` is a full PUT round
+/// to spawn because `LinkSet::put_value` for pva is a full PUT round
 /// trip, and one slow target must not stall every other link's writes.
 async fn owner_loop(
     queue: Weak<LinkPutQueue>,
@@ -999,7 +1005,7 @@ async fn owner_loop(
         let notified = work.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
-        let serviced = {
+        let (serviced, ran) = {
             let Some(q) = queue.upgrade() else { return };
             match q.network() {
                 Some(reactor) => {
@@ -1010,7 +1016,22 @@ async fn owner_loop(
                     while let Some((key, init)) = q.take_ready_open() {
                         let Some(inner) = db.upgrade() else { return };
                         let lset = resolve_lset(&inner, key.scheme);
+                        let ca_links = inner.ca_links.clone();
                         drop(inner);
+                        // A channel this database serves opens here, as
+                        // `dbCaTask`'s own `CA_CONNECT`: local links connect,
+                        // and are monitored, in the order they were added.
+                        let init = if key.scheme == "ca" && !key.link.is_removed() {
+                            match ca_links.connect_served(key.link_ref(), init).await {
+                                Ok(()) => {
+                                    q.finish_open(key);
+                                    continue;
+                                }
+                                Err(init) => init,
+                            }
+                        } else {
+                            init
+                        };
                         let q2 = q.clone();
                         reactor.spawn(async move {
                             match lset {
@@ -1056,6 +1077,14 @@ async fn owner_loop(
                     }
                 }
             }
+            // `dbCaTask` services no link action before `dbCaRun`
+            // (`dbCa.c:1171-1173`).
+            let ran = ca_run.as_ref().is_some_and(|gate| gate.has_run());
+            if ran && let Some(inner) = db.upgrade() {
+                let ca_links = inner.ca_links.clone();
+                drop(inner);
+                ca_links.service_actions();
+            }
             // `dbCaTask` is paused until `dbCaRun`, and a first event's
             // `CA_DBPROCESS` is queued behind every link's monitor queued by
             // then (`dbCa.c:1171-1173`, `:1209-1236`): the queue waits whole,
@@ -1073,19 +1102,21 @@ async fn owner_loop(
             }
             // The strong reference must not survive the await below, or the
             // queue could never drop and its teardown would never run.
-            serviced
+            (serviced, ran)
         };
-        // The poll's read, not a fresh one: a gate serviced since the poll
-        // skipped the CP slots ends `monitors_serviced` at once, where a
-        // fresh read would park on `work`, which their queued wakes never
-        // signal again.
-        match ca_run.as_ref().filter(|_| !serviced) {
+        // The poll's reads, not fresh ones: a gate serviced or run since the
+        // poll skipped the CP slots or the link actions ends its wait at
+        // once, where a fresh read would park on `work`, which their queued
+        // wakes never signal again.
+        match ca_run.as_ref().filter(|_| !serviced || !ran) {
             Some(gate) => {
-                let serviced = gate.monitors_serviced();
-                tokio::pin!(serviced);
+                let monitors = gate.monitors_serviced();
+                let reached = gate.reached();
+                tokio::pin!(monitors, reached);
                 std::future::poll_fn(|cx| {
                     if notified.as_mut().poll(cx).is_ready()
-                        || serviced.as_mut().poll(cx).is_ready()
+                        || (!serviced && monitors.as_mut().poll(cx).is_ready())
+                        || (!ran && reached.as_mut().poll(cx).is_ready())
                     {
                         std::task::Poll::Ready(())
                     } else {
@@ -1187,7 +1218,7 @@ pub(super) fn resolve_lset(inner: &super::PvDatabaseInner, scheme: &str) -> Opti
 /// The failure is reported the way C reports a put it could not deliver — on
 /// the task, through `errlogPrintf` (`db/dbCa.c:1111-1114`
 /// (`dbCaTask`); epics-base R7.0.10) — and the completion is resolved so the
-/// put-notify chain unblocks with an error instead of waiting for a wire write
+/// writer unblocks with an error instead of waiting for a wire write
 /// that will never be attempted.
 fn refuse_for_want_of_a_reactor(key: &LinkKey) -> Written {
     let msg = format!(

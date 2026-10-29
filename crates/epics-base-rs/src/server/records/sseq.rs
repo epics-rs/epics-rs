@@ -1,17 +1,16 @@
 use super::link_status::{
-    DBF_NOACCESS, DBF_UNKNOWN, LINK_CON as LNKV_CON, LINK_EXT_NC as LNKV_EXT_NC,
-    LINK_LOC as LNKV_LOC, LINK_RECHECK, LINK_STATUS_CHOICES as SSEQ_LNKV_CHOICES, LinkCheckSpec,
-    LinkCheckState, LinkCheckTail, LinkRole, LinkRule, LinkStatusGen, classify_link,
-    link_is_external,
+    DBF_NOACCESS, DBF_UNKNOWN, LINK_CON as LNKV_CON, LINK_EXT_NC as LNKV_EXT_NC, LINK_RECHECK,
+    LINK_STATUS_CHOICES as SSEQ_LNKV_CHOICES, LinkCheckSpec, LinkCheckState, LinkCheckTail,
+    LinkRole, LinkRule, LinkStatusGen, classify_link,
 };
 use crate::error::{CaError, CaResult};
 use crate::server::database::{AsyncDbHandle, PostRule};
 use crate::server::record::{CycleCell, CycleRead, CycleValue};
 use crate::server::record::{
-    CycleMarks, CyclePostMask, LinkReadAs, LinkType, OutTarget, PostStage, ProcessAction,
-    ProcessActions, ProcessOutcome, Record, RecordProcessResult, parse_link_v2,
+    CycleMarks, CyclePostMask, LinkReadAs, OutTarget, PostStage, ProcessAction, ProcessActions,
+    ProcessOutcome, Record, RecordProcessResult,
 };
-use crate::types::{DbFieldType, EpicsValue, PvString};
+use crate::types::{DbfCode, EpicsValue, PvString};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Notify;
@@ -112,16 +111,13 @@ const WERR_FIELDS: [&str; NUM_STEPS] = [
 /// wait on a link C cannot attach a put-completion callback to.
 ///
 /// C raises it in exactly ONE of `checkLinks`'s three link-type branches — the
-/// link is a `DB_LINK` (a local PV, so `LNKnV == LOC`) and `WAITn` is not
-/// `NoWait` — and rescinds it in the other two (`CA_LINK`, and
-/// `CONSTANT`/unset). A `WAITn` on a constant is NOT an error: there is no put
-/// at all, so there is nothing to wait for.
-///
-/// This is the same question [`SseqRecord::lnk_is_ca`] asks for the fire-time
-/// wait gate, from the other side: `fire_current_step` drops the wait on a
-/// non-CA link, and `WERRn` is the record telling the user it was dropped.
-fn wait_config_err(wait: i16, lnk_status: i16) -> i16 {
-    i16::from(wait != 0 && lnk_status == LNKV_LOC)
+/// link is a `DB_LINK` and `WAITn` is not `NoWait` — and rescinds it in the
+/// other two (`CA_LINK`, and `CONSTANT`/unset). A `WAITn` on a constant is NOT
+/// an error: there is no put at all, so there is nothing to wait for. The
+/// branch is the link's type, not `LNKnV`: a `CA` link to a local record reads
+/// `Local PV` and still waits.
+fn wait_config_err(wait: i16, db_link: bool) -> i16 {
+    i16::from(wait != 0 && db_link)
 }
 
 /// C `checkLinks`' walk, `plinkGroup->dol` then `->lnk` of each group: link
@@ -170,12 +166,23 @@ enum LinkPass {
     Special { step: usize, lnk: bool },
 }
 
-/// `checkLinks`' `waitConfigErr` (sseqRecord.c:912-933), from the statuses
+impl LinkPass {
+    /// `init_record` makes only a local `DB_LINK` `Local PV` (sseqRecord.c:208,
+    /// :227); `special()` asks `dbNameToAddr` alone (:1006, :1051).
+    fn rule(self) -> LinkRule {
+        match self {
+            Self::Init => LinkRule::DbLink,
+            Self::Special { .. } => LinkRule::Locality,
+        }
+    }
+}
+
+/// `checkLinks`' `waitConfigErr` (sseqRecord.c:912-933), from the link types
 /// the pass just read.
 impl LinkCheckTail for [SseqStep; NUM_STEPS] {
-    fn pass(&mut self, statuses: &[i16]) -> u64 {
+    fn pass(&mut self, db_links: u64) -> u64 {
         self.iter_mut().enumerate().fold(0, |moved, (i, step)| {
-            let werr = wait_config_err(step.wait, statuses[link_ix(i, true)]);
+            let werr = wait_config_err(step.wait, db_links & 1 << link_ix(i, true) != 0);
             let changed = step.wait_err != werr;
             step.wait_err = werr;
             moved | u64::from(changed) << i
@@ -291,12 +298,10 @@ struct InFlight {
 /// A single step in the string sequence.
 #[derive(Clone)]
 struct SseqStep {
-    dly: f64,      // Delay before executing this step
-    dol: PvString, // Input link (DOLn)
-    dov: f64,      // Numeric value (DOn)
-    lnk: PvString, // Output link (LNKn)
-    /// `lnk`'s link type, written with it by the `LNKn` put arm, its one writer.
-    lnk_type: LinkType,
+    dly: f64,          // Delay before executing this step
+    dol: PvString,     // Input link (DOLn)
+    dov: f64,          // Numeric value (DOn)
+    lnk: PvString,     // Output link (LNKn)
     str_val: PvString, // String value (STRn)
     wait: i16,         // Wait mode: 0=NoWait, 1=Wait, 2..=After1..After9
     // WTGn — an outstanding put-callback for this step. C's `plinkGroup->waiting`
@@ -375,7 +380,6 @@ impl Default for SseqStep {
             dol: PvString::new(),
             dov: 0.0,
             lnk: PvString::new(),
-            lnk_type: LinkType::Empty,
             str_val: PvString::default(),
             wait: 0,
             waiting: 0,
@@ -765,36 +769,6 @@ impl SseqRecord {
         }
     }
 
-    /// Whether step `i`'s `LNKn` is what C calls a `CA_LINK` — the single
-    /// question C's put-with-completion turns on (`plinkGroup->lnk.type ==
-    /// CA_LINK`, sseqRecord.c:717/739/763) and the one `checkLinks` turns
-    /// `WERRn` on (:912-933).
-    ///
-    /// C decides it at `dbInitLink` by LOCALITY: an explicit `CA` link, or a
-    /// PV name that is not a record of this IOC, is a `CA_LINK`; a name that
-    /// resolves here is a `DB_LINK`; an empty link is `CONSTANT`. Both halves
-    /// are answered here — the scheme from the link string itself, the
-    /// locality from the cached `LNKnV` classification (`checkLinks`'s own
-    /// `lnk_status`, which [`link_is_external`] reads as C's `CA_LINK`).
-    ///
-    /// C's `lnk.type` is likewise a CACHE, set at `init_record` and refreshed
-    /// by `special()`/`checkLinks`. The port's cache is filled by the spawned
-    /// [`Self::refresh_link_status`], so a DB-syntax link whose classification
-    /// has not landed yet reads its `CON` default and is treated as NOT a CA
-    /// link — the local reading, which is what the same link gets in C when
-    /// the name does resolve here.
-    fn lnk_is_ca(&self, i: usize) -> bool {
-        match self.steps[i].lnk_type {
-            // Explicit `ca://` / `pva://`: a CA link whatever it resolves to,
-            // so this needs no classification round-trip.
-            LinkType::Ca | LinkType::Other => true,
-            // DB syntax: a CA link exactly when the name is NOT on this IOC.
-            LinkType::Db => link_is_external(self.link_status[link_ix(i, true)]),
-            // Constant / unset: C `CONSTANT`, never a CA link.
-            LinkType::Empty | LinkType::Constant => false,
-        }
-    }
-
     /// Fire `active[cursor]` (C `processCallback`): forward the step value to
     /// `LNKn`, then advance. A `WAITn` step is dispatched WITHOUT blocking the
     /// machine — its put-callback joins `in_flight` and the sequence moves on,
@@ -820,8 +794,11 @@ impl SseqRecord {
         // INSIDE a class arm, i.e. only where a put is made at all. A `WAITn` on
         // a DB link takes the plain `dbPutLink` and never waits — C cannot
         // attach a callback to it, and says so through `WERRn` (`checkLinks`,
-        // :915-927).
-        let waits = self.steps[i].wait != 0 && self.lnk_is_ca(i);
+        // :915-927). The type is the resolved link's, not `LNKnV`: a `CA` link
+        // to a local record reads `Local PV` and waits, a PV Access link
+        // (`JSON_LINK`) does not.
+        let waits = self.steps[i].wait != 0
+            && self.steps[i].lnk_target.link_type == crate::server::record::LinkType::Ca;
 
         if let Some(value) = buffer {
             if waits {
@@ -1097,7 +1074,11 @@ impl SseqRecord {
     /// [`Record::link_check`], which this arms as C does: 1 s after
     /// `init_record` left an `Ext PV NC` (sseqRecord.c:252), 0.5 s after a
     /// `special` that sets `LINKS_NOT_OK` (:1018, :1073).
-    fn refresh_link_status(&self, trigger: LinkPass) {
+    ///
+    /// On a complete database a `special` stores the put link's status and
+    /// type before the put returns, as C does (:1003-1018, :1044-1071); the
+    /// task only posts it.
+    fn refresh_link_status(&mut self, trigger: LinkPass) {
         let Some((name, handle)) = &self.async_ctx else {
             return;
         };
@@ -1117,6 +1098,27 @@ impl SseqRecord {
             LinkPass::Special { step, lnk } => 1 << link_ix(step, lnk),
         };
         let token = self.link_gen.next_for(claim);
+        let rule = trigger.rule();
+        let stored = match trigger {
+            LinkPass::Special { step, lnk } if handle.classifies_links_at_once() => {
+                let (dol, lnk_str) = &groups[step];
+                let (link, role) = if lnk {
+                    (lnk_str, LinkRole::Output)
+                } else {
+                    (dol, LinkRole::Input)
+                };
+                let (status, dbf) = classify_link(&handle, link, role, rule);
+                let ix = link_ix(step, lnk);
+                self.link_status[ix] = status;
+                // C stores -1 for a named PV until the next checkLinks:
+                // special() runs before dbAddLink attaches the link
+                // (sseqRecord.c:1016, :1069; dbAccess.c:1181, :1208). That C
+                // defect is not copied.
+                self.link_types[ix] = dbf;
+                Some(status)
+            }
+            _ => None,
+        };
         let sched = handle.clone();
         // Through the database's `iocInit` owner — see `schedule_record_init`.
         // The parking key; `name` itself moves into the future below.
@@ -1125,8 +1127,8 @@ impl SseqRecord {
             let class: Vec<(i16, i16, i16, i16)> = groups
                 .iter()
                 .map(|(dol, lnk)| {
-                    let (ds, dt) = classify_link(&handle, dol, LinkRole::Input, LinkRule::DbLink);
-                    let (ls, lt) = classify_link(&handle, lnk, LinkRole::Output, LinkRule::DbLink);
+                    let (ds, dt) = classify_link(&handle, dol, LinkRole::Input, rule);
+                    let (ls, lt) = classify_link(&handle, lnk, LinkRole::Output, rule);
                     (ds, dt, ls, lt)
                 })
                 .collect();
@@ -1156,29 +1158,32 @@ impl SseqRecord {
                     // sseqRecord.c:1005-1011 (DOLn), :1047-1057 (LNKn).
                     let (ds, dt, ls, lt) = class[step];
                     let link = link_ix(step, lnk);
-                    let put = if lnk {
-                        push(link, LNKV_FIELDS[step], status(ls), PostRule::Always);
-                        push(
-                            link,
-                            LT_FIELDS[step],
-                            EpicsValue::Short(lt),
-                            PostRule::Silent,
-                        );
-                        ls
+                    let (field, type_field, put, dbf) = if lnk {
+                        (LNKV_FIELDS[step], LT_FIELDS[step], ls, lt)
                     } else {
-                        push(link, DOLV_FIELDS[step], status(ds), PostRule::Always);
-                        push(
-                            link,
-                            DT_FIELDS[step],
-                            EpicsValue::Short(dt),
-                            PostRule::Silent,
-                        );
-                        ds
+                        (DOLV_FIELDS[step], DT_FIELDS[step], ds, dt)
+                    };
+                    let put = match stored {
+                        Some(put) => {
+                            push(link, field, status(put), PostRule::Held);
+                            put
+                        }
+                        None => {
+                            push(link, field, status(put), PostRule::Always);
+                            push(link, type_field, EpicsValue::Short(dbf), PostRule::Silent);
+                            put
+                        }
                     };
                     // `special` runs before `dbAddLink` (dbAccess.c:1181,
                     // :1208), so a put naming a PV reads `dbGetLinkDBFtype`
                     // -1 and sets LINKS_NOT_OK (:1015, :1070); a constant has
                     // no `pv_link.pvname` and skips that check.
+                    //
+                    // C arms on a constant only while LINKS_NOT_OK
+                    // (sseqRecord.c:1019, :1072), which a pass that found every
+                    // CA link up cleared (:952), so a CA link dropped since
+                    // keeps a stale "Ext PV OK". That C defect is not copied:
+                    // `not_ok` holds while any link names a non-local PV.
                     Some((put != LNKV_CON || not_ok).then_some(LINK_RECHECK))
                 }
             };
@@ -1655,8 +1660,7 @@ impl Record for SseqRecord {
     /// - `DBF_STRING`/`ENUM`/`MENU`/`DEVICE`/`INLINK`/`OUTLINK`/`FWDLINK`
     ///   (:644-661) — `DBR_STRING` into `s`/`STRn`, then `dov = atof(s)`. For an
     ///   `ENUM`/`MENU` source that is the state LABEL ("Busy"), so `DOn` becomes
-    ///   `atof("Busy") == 0`, NOT the state index. The seven classes are the same
-    ///   set [`OutTarget::puts_as_string`] reports for the destination switch.
+    ///   `atof("Busy") == 0`, NOT the state index.
     /// - `DBF_SHORT`..`DBF_DOUBLE` (:663-680) — `DBR_DOUBLE` into `dov`/`DOn`,
     ///   then `STRn` is re-rendered at the record's PREC.
     /// - `DBF_CHAR`/`DBF_UCHAR` (:682-700) — `min(n_elements, 40)` bytes into the
@@ -1687,22 +1691,25 @@ impl Record for SseqRecord {
         _link_field: &str,
         source: &OutTarget,
     ) -> Option<LinkReadAs> {
-        if source.puts_as_string {
-            return Some(LinkReadAs::String);
-        }
         match source.field_type? {
-            DbFieldType::String | DbFieldType::Enum => Some(LinkReadAs::String),
-            DbFieldType::Char | DbFieldType::UChar => Some(LinkReadAs::CharArrayAsString {
+            DbfCode::String
+            | DbfCode::Enum
+            | DbfCode::Menu
+            | DbfCode::Device
+            | DbfCode::Inlink
+            | DbfCode::Outlink
+            | DbfCode::Fwdlink => Some(LinkReadAs::String),
+            DbfCode::Char | DbfCode::UChar => Some(LinkReadAs::CharArrayAsString {
                 // C `if (n_elements>40) n_elements=40` against `char s[40]`.
                 max_elements: source.element_count.clamp(1, SSEQ_STRING_SIZE as i64) as usize,
             }),
-            DbFieldType::Short
-            | DbFieldType::UShort
-            | DbFieldType::Long
-            | DbFieldType::ULong
-            | DbFieldType::Float
-            | DbFieldType::Double => Some(LinkReadAs::Double),
-            DbFieldType::Int64 | DbFieldType::UInt64 => None,
+            DbfCode::Short
+            | DbfCode::UShort
+            | DbfCode::Long
+            | DbfCode::ULong
+            | DbfCode::Float
+            | DbfCode::Double => Some(LinkReadAs::Double),
+            DbfCode::Int64 | DbfCode::UInt64 | DbfCode::NoAccess => None,
         }
     }
 
@@ -1727,9 +1734,12 @@ impl Record for SseqRecord {
     /// left — and it is C's.
     fn constant_init_links(&self) -> Vec<crate::server::record::ConstantInitLink> {
         (0..NUM_STEPS)
-            .map(|i| crate::server::record::ConstantInitLink::new(DOL_FIELDS[i], STR_FIELDS[i]))
+            .map(|i| {
+                crate::server::record::ConstantInitLink::new(DOL_FIELDS[i], STR_FIELDS[i])
+                    .type_constant()
+            })
             .chain(std::iter::once(
-                crate::server::record::ConstantInitLink::new("SELL", "SELN"),
+                crate::server::record::ConstantInitLink::new("SELL", "SELN").type_constant(),
             ))
             .collect()
     }
@@ -1743,9 +1753,7 @@ impl Record for SseqRecord {
     /// choice, exactly as C's `switch (plinkGroup->lnk_field_type)`:
     ///
     /// - `DBF_STRING`/`ENUM`/`MENU`/`DEVICE`/`INLINK`/`OUTLINK`/`FWDLINK`
-    ///   (:715-736) — `DBR_STRING` from `s`/`STRn`. All seven classes are
-    ///   reported by [`OutTarget::puts_as_string`] (the port's `DbFieldType`
-    ///   is a DBR wire type, with no `Menu`/`Device` variant to match on).
+    ///   (:715-736) — `DBR_STRING` from `s`/`STRn`.
     /// - `DBF_SHORT`/`USHORT`/`LONG`/`ULONG`/`FLOAT`/`DOUBLE` (:737-758) —
     ///   `DBR_DOUBLE` from `dov`/`DOn`.
     /// - `DBF_CHAR`/`DBF_UCHAR` (:759-792) — `n_elements > 1` (the long-string
@@ -1763,14 +1771,15 @@ impl Record for SseqRecord {
             return None;
         };
         let step = &self.steps[i];
-        if target.puts_as_string {
-            return Some(EpicsValue::String(step.str_val.clone()));
-        }
         match target.field_type? {
-            DbFieldType::String | DbFieldType::Enum => {
-                Some(EpicsValue::String(step.str_val.clone()))
-            }
-            DbFieldType::Char | DbFieldType::UChar => {
+            DbfCode::String
+            | DbfCode::Enum
+            | DbfCode::Menu
+            | DbfCode::Device
+            | DbfCode::Inlink
+            | DbfCode::Outlink
+            | DbfCode::Fwdlink => Some(EpicsValue::String(step.str_val.clone())),
+            DbfCode::Char | DbfCode::UChar => {
                 if target.element_count > 1 {
                     // C puts `n` bytes straight out of the 40-byte `s`, so the
                     // string is NUL-padded out to the requested count.
@@ -1782,15 +1791,15 @@ impl Record for SseqRecord {
                     Some(EpicsValue::Double(step.dov))
                 }
             }
-            DbFieldType::Short
-            | DbFieldType::UShort
-            | DbFieldType::Long
-            | DbFieldType::ULong
-            | DbFieldType::Float
-            | DbFieldType::Double => Some(EpicsValue::Double(step.dov)),
-            // C's switch has no `DBF_INT64`/`DBF_UINT64` case → `default:
-            // break` → no put.
-            DbFieldType::Int64 | DbFieldType::UInt64 => None,
+            DbfCode::Short
+            | DbfCode::UShort
+            | DbfCode::Long
+            | DbfCode::ULong
+            | DbfCode::Float
+            | DbfCode::Double => Some(EpicsValue::Double(step.dov)),
+            // C's switch has no `DBF_INT64`/`DBF_UINT64` or `DBF_NOACCESS`
+            // case → `default: break` → no put.
+            DbfCode::Int64 | DbfCode::UInt64 | DbfCode::NoAccess => None,
         }
     }
 
@@ -2041,7 +2050,6 @@ impl Record for SseqRecord {
                         "LNK" => match value {
                             EpicsValue::String(s) => {
                                 step.lnk = s;
-                                step.lnk_type = parse_link_v2(&step.lnk).link_type();
                                 Ok(())
                             }
                             _ => Err(CaError::TypeMismatch(name.into())),
@@ -2364,63 +2372,20 @@ mod tests {
     }
 
     /// R16-3 — `WERRn` follows C `checkLinks` (sseqRecord.c:912-933): raised
-    /// ONLY for a local DB link with `WAITn` set, cleared for a CA link and
-    /// for a constant. One case per branch of C's link-type switch, times the
+    /// ONLY for a DB link with `WAITn` set, cleared for a CA link and for a
+    /// constant. One case per branch of C's link-type switch, times the
     /// `WAITn` on/off boundary.
     #[test]
     fn test_sseq_wait_config_err_matches_c_check_links() {
-        // DB_LINK (local PV) + wait: the one branch C raises. C cannot
+        // DB_LINK + wait: the one branch C raises. C cannot
         // dbCaPutLinkCallback a DB link, so the requested wait is dropped.
-        assert_eq!(wait_config_err(1, LNKV_LOC), 1);
+        assert_eq!(wait_config_err(1, true), 1);
         // Same link, NoWait: rescinded.
-        assert_eq!(wait_config_err(0, LNKV_LOC), 0);
-        // CA_LINK: the wait works — never an error, wait or not. Both external
-        // statuses ("Ext PV NC" = 0, "Ext PV OK" = 1) are CA links to C.
-        assert_eq!(wait_config_err(1, LNKV_EXT_NC), 0);
-        assert_eq!(wait_config_err(1, 1), 0);
-        // CONSTANT / unset: no put is issued at all, so nothing to wait for.
-        // C's `else` branch rescinds the error here; the pre-fix port RAISED
-        // it, which is the inversion R16-3 names.
-        assert_eq!(wait_config_err(1, LNKV_CON), 0);
-        assert_eq!(wait_config_err(0, LNKV_CON), 0);
-    }
-
-    /// R16-3 — the fire-time wait gate keys on C's `lnk.type == CA_LINK`
-    /// (sseqRecord.c:717/739/763), which `dbInitLink` decides by LOCALITY.
-    /// One case per `LinkType`, plus the DB-syntax local/remote split.
-    #[test]
-    fn test_sseq_lnk_is_ca_matches_c_link_type() {
-        let mut rec = SseqRecord::new();
-        // Empty / constant → C CONSTANT: never a CA link.
-        assert!(!rec.lnk_is_ca(0));
-        rec.put_field("LNK1", EpicsValue::String("3.14".into()))
-            .unwrap();
-        assert!(!rec.lnk_is_ca(0));
-        // Explicit ca:// → CA_LINK regardless of what it resolves to.
-        rec.put_field("LNK1", EpicsValue::String("ca://other:pv.VAL".into()))
-            .unwrap();
-        assert!(rec.lnk_is_ca(0));
-        // DB syntax naming a record of THIS IOC → DB_LINK.
-        rec.put_field("LNK1", EpicsValue::String("local:pv.VAL PP".into()))
-            .unwrap();
-        rec.link_status[link_ix(0, true)] = LNKV_LOC;
-        assert!(!rec.lnk_is_ca(0));
-        // DB syntax naming a PV that is NOT on this IOC → C resolves it
-        // through CA, so it is a CA_LINK.
-        rec.link_status[link_ix(0, true)] = LNKV_EXT_NC;
-        assert!(rec.lnk_is_ca(0));
-        // DB syntax not yet classified (the refresh has not landed): read as
-        // the LOCAL case, never as a CA link — a step must never park on a
-        // put-callback the link cannot deliver.
-        rec.link_status[link_ix(0, true)] = LNKV_CON;
-        assert!(!rec.lnk_is_ca(0));
-        // A runtime put repoints: the type moves with the text.
-        rec.put_field("LNK1", EpicsValue::String("ca://other:pv.VAL".into()))
-            .unwrap();
-        assert!(rec.lnk_is_ca(0));
-        rec.put_field("LNK1", EpicsValue::String("".into()))
-            .unwrap();
-        assert!(!rec.lnk_is_ca(0));
+        assert_eq!(wait_config_err(0, true), 0);
+        // CA_LINK, and CONSTANT / unset (no put is issued at all): C's other
+        // two branches rescind it, wait or not.
+        assert_eq!(wait_config_err(1, false), 0);
+        assert_eq!(wait_config_err(0, false), 0);
     }
 
     /// R16-2 — `DOn` and `STRn` are two views of ONE value, reconciled at

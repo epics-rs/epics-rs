@@ -10,7 +10,6 @@ mod calink_ioc;
 mod hop_rule;
 
 use std::collections::HashMap;
-use std::time::Duration;
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -107,7 +106,7 @@ async fn an_out_targets_failed_process_alarms_the_parked_writer() {
 async fn an_out_loop_through_a_parked_writer_terminates() {
     hop_rule::sweep(|rule| async move {
         let db = ioc().await;
-        epics_base_rs::runtime::task::timeout(Duration::from_secs(5), db.process_record("Q"))
+        epics_base_rs::runtime::task::timeout(fact_budget::FACT_BUDGET, db.process_record("Q"))
             .await
             .expect("the loop through a waiting L1 terminates")
             .unwrap();

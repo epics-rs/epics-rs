@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use ad_core_rs::color::NDColorMode;
 use ad_core_rs::error::ADResult;
-use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDimension};
+use ad_core_rs::ndarray::{NDArray, NDDataView, NDDataViewMut, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::{NDPluginProcess, ParamUpdate, ProcessResult};
 use parking_lot::Mutex;
@@ -167,11 +167,11 @@ pub fn apply_transform(
     };
 
     let dims = dims_for(info.color_mode, dst_w, dst_h, color, src.dims.len());
-    let mut arr = pool.alloc(dims, src.data.data_type())?;
+    let mut arr = pool.alloc(dims, src.data().data_type())?;
     macro_rules! same_type {
         ($($variant:ident),*) => {
-            match (&src.data, &mut arr.data) {
-                $((NDDataBuffer::$variant(v), NDDataBuffer::$variant(o)) => {
+            match (src.data().view(), arr.data_mut().view_mut()) {
+                $((NDDataView::$variant(v), NDDataViewMut::$variant(o)) => {
                     geometry.transform_into(v, o)
                 })*
                 _ => unreachable!("the output was allocated in the source type"),
@@ -593,8 +593,8 @@ mod tests {
             "T",
             1,
             Default::default(),
-            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+            asyn_rs::port::InterfaceMask::NONE,
+            asyn_rs::port::InterfaceMask::NONE,
         );
         let clamp = WriteVerdict::Refuse {
             keep: 1,
@@ -612,7 +612,7 @@ mod tests {
             clamp
         );
     }
-    use ad_core_rs::ndarray::NDDataType;
+    use ad_core_rs::ndarray::{NDDataBuffer, NDDataType};
 
     #[test]
     fn test_register_params_seeds_the_processor_transform() {
@@ -625,8 +625,8 @@ mod tests {
                 "TRANS_INIT",
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::NONE,
+                InterfaceMask::NONE,
             );
             let mut proc = TransformProcessor::new(t);
             ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base).unwrap();
@@ -647,10 +647,10 @@ mod tests {
         let arr = make_3x2();
         let first = apply_transform(&pool, &arr, TransformType::Rot90CW).unwrap();
         assert_eq!(first.pool_id(), pool.id());
-        let ptr = first.data.as_u8_slice().as_ptr();
+        let ptr = first.data().as_u8_slice().as_ptr();
         drop(first);
         let second = apply_transform(&pool, &arr, TransformType::Rot90CW).unwrap();
-        assert_eq!(second.data.as_u8_slice().as_ptr(), ptr);
+        assert_eq!(second.data().as_u8_slice().as_ptr(), ptr);
         assert_eq!(pool.num_alloc_buffers(), 1);
         assert_eq!(get_u8(&second), &[4, 1, 5, 2, 6, 3]);
     }
@@ -682,7 +682,7 @@ mod tests {
                 .map(|i| (i * 7919 % 65521) as u16)
                 .collect();
             let dims = dims_for(mode, w, h, color, if color == 1 { 2 } else { 3 });
-            let mut arr = NDArray::with_data(dims, NDDataBuffer::U16(data.clone()));
+            let mut arr = NDArray::with_data(dims, NDDataBuffer::from_vec::<u16>(data.clone()));
             arr.attributes.add(NDAttribute::new_static(
                 "ColorMode",
                 "Color mode",
@@ -713,8 +713,8 @@ mod tests {
                         }
                     }
                 }
-                let got = match &out.data {
-                    NDDataBuffer::U16(v) => v.as_slice(),
+                let got = match out.data().view() {
+                    NDDataView::U16(v) => v,
                     _ => unreachable!(),
                 };
                 assert_eq!(got, want.as_slice(), "{mode:?} {transform:?}");
@@ -783,15 +783,15 @@ mod tests {
             vec![NDDimension::new(3), NDDimension::new(2)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
-            *v = vec![1, 2, 3, 4, 5, 6];
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
+            v.copy_from_slice(&[1, 2, 3, 4, 5, 6]);
         }
         arr
     }
 
     fn get_u8(arr: &NDArray) -> &[u8] {
-        match &arr.data {
-            NDDataBuffer::U8(v) => v,
+        match arr.data().view() {
+            NDDataView::U8(v) => v,
             _ => panic!("not u8"),
         }
     }
@@ -942,7 +942,7 @@ mod tests {
             NDAttrSource::Driver,
             NDAttrValue::Int32(NDColorMode::RGB1 as i32),
         ));
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             // layout: index = y*(x*c) + x*c + c, with x_stride=3, y_stride=6
             for y in 0..2 {
                 for x in 0..2 {
@@ -965,7 +965,7 @@ mod tests {
         assert_eq!(out.dims[0].size, 3);
         assert_eq!(out.dims[1].size, 2);
         assert_eq!(out.dims[2].size, 2);
-        if let NDDataBuffer::U8(v) = &out.data {
+        if let NDDataView::U8(v) = out.data().view() {
             // pixel (x=0,y=0) should now hold source (x=1,y=0): 10,11,12
             assert_eq!(&v[0..3], &[10, 11, 12]);
             // pixel (x=1,y=0) holds source (x=0,y=0): 0,1,2
@@ -985,7 +985,7 @@ mod tests {
         assert_eq!(out.dims[0].size, 3);
         assert_eq!(out.dims[1].size, 2);
         assert_eq!(out.dims[2].size, 2);
-        if let NDDataBuffer::U8(v) = &out.data {
+        if let NDDataView::U8(v) = out.data().view() {
             // Rot90CW maps src (sx,sy) -> (src_h-1-sy, sx).
             // dest (0,0) <- src (sx,sy) with src_h-1-sy=0, sx=0 => sy=1,sx=0
             // src (0,1) = 100,101,102

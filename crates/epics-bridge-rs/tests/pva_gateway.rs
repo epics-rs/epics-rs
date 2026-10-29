@@ -31,6 +31,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use epics_base_rs::runtime::task::Period;
 use epics_base_rs::types::RecordName;
 
 /// The executor a test body spawns on. Every `#[tokio::test]` here is
@@ -101,7 +102,7 @@ async fn gateway_get_forwards_upstream_value() {
     let cfg = PvaGatewayConfig {
         upstream_client: Some(upstream_client),
         server_config,
-        cleanup_interval: Duration::from_secs(60),
+        cleanup_interval: Period::new(Duration::from_secs(60)).unwrap(),
         connect_timeout: Duration::from_secs(2),
         max_cache_entries: 1024,
         max_subscribers: 1024,
@@ -144,7 +145,7 @@ async fn gateway_monitor_fans_out_to_two_clients() {
     let cfg = PvaGatewayConfig {
         upstream_client: Some(upstream_client),
         server_config,
-        cleanup_interval: Duration::from_secs(60),
+        cleanup_interval: Period::new(Duration::from_secs(60)).unwrap(),
         connect_timeout: Duration::from_secs(2),
         max_cache_entries: 1024,
         max_subscribers: 1024,
@@ -249,7 +250,7 @@ async fn gateway_155_monitor_seeds_current_value_once() {
     let cfg = PvaGatewayConfig {
         upstream_client: Some(upstream_client),
         server_config,
-        cleanup_interval: Duration::from_secs(60),
+        cleanup_interval: Period::new(Duration::from_secs(60)).unwrap(),
         connect_timeout: Duration::from_secs(2),
         max_cache_entries: 1024,
         max_subscribers: 1024,
@@ -361,7 +362,7 @@ async fn gateway_control_prefix_cache_size() {
     let cfg = PvaGatewayConfig {
         upstream_client: Some(upstream_client),
         server_config,
-        cleanup_interval: Duration::from_secs(60),
+        cleanup_interval: Period::new(Duration::from_secs(60)).unwrap(),
         connect_timeout: Duration::from_secs(2),
         max_cache_entries: 1024,
         max_subscribers: 1024,
@@ -610,7 +611,7 @@ fn gateway_cfg(upstream: Arc<PvaClient>) -> PvaGatewayConfig {
     PvaGatewayConfig {
         upstream_client: Some(upstream),
         server_config: PvaServerConfig::isolated(),
-        cleanup_interval: Duration::from_secs(60),
+        cleanup_interval: Period::new(Duration::from_secs(60)).unwrap(),
         connect_timeout: Duration::from_secs(2),
         max_cache_entries: 1024,
         max_subscribers: 1024,
@@ -801,7 +802,11 @@ async fn br_r6_gateway_typed_put_passthrough() {
     );
     // Use GatewayChannelSource directly — same put_value code path, no
     // downstream auth layer that would route to a per-credential client.
-    let cache = ChannelCache::new(test_reactor(), upstream_client, Duration::from_secs(60));
+    let cache = ChannelCache::new(
+        test_reactor(),
+        upstream_client,
+        Period::new(Duration::from_secs(60)).unwrap(),
+    );
     let mut src = GatewayChannelSource::new(cache);
     src.connect_timeout = Duration::from_secs(2);
 
@@ -870,7 +875,11 @@ async fn gateway_is_writable_proxies_upstream_connection_not_cache_presence() {
             .timeout(Duration::from_secs(2))
             .build(),
     );
-    let cache = ChannelCache::new(test_reactor(), upstream_client, Duration::from_secs(60));
+    let cache = ChannelCache::new(
+        test_reactor(),
+        upstream_client,
+        Period::new(Duration::from_secs(60)).unwrap(),
+    );
     let mut src = GatewayChannelSource::new(cache);
     src.connect_timeout = Duration::from_millis(400);
 
@@ -933,7 +942,11 @@ async fn br_r41_typed_subscribe_delivers_updates() {
             .timeout(Duration::from_secs(2))
             .build(),
     );
-    let cache = ChannelCache::new(test_reactor(), upstream_client, Duration::from_secs(60));
+    let cache = ChannelCache::new(
+        test_reactor(),
+        upstream_client,
+        Period::new(Duration::from_secs(60)).unwrap(),
+    );
     let mut src = GatewayChannelSource::new(cache);
     src.connect_timeout = Duration::from_secs(2);
 
@@ -1547,7 +1560,7 @@ async fn gateway_get_frames_upstream_marks_not_a_full_mask() {
         PvaGatewayConfig {
             upstream_client: Some(upstream_client.clone()),
             server_config: PvaServerConfig::isolated(),
-            cleanup_interval: Duration::from_secs(60),
+            cleanup_interval: Period::new(Duration::from_secs(60)).unwrap(),
             connect_timeout: Duration::from_secs(2),
             max_cache_entries: 1024,
             max_subscribers: 1024,
@@ -1681,7 +1694,11 @@ async fn r18_28_gateway_monitor_seed_declares_whole_structure() {
             .timeout(Duration::from_secs(2))
             .build(),
     );
-    let cache = ChannelCache::new(test_reactor(), upstream_client, Duration::from_secs(60));
+    let cache = ChannelCache::new(
+        test_reactor(),
+        upstream_client,
+        Period::new(Duration::from_secs(60)).unwrap(),
+    );
     let mut src = GatewayChannelSource::new(cache);
     src.connect_timeout = Duration::from_secs(5);
 

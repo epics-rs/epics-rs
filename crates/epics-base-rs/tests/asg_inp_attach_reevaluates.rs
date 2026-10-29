@@ -20,7 +20,7 @@ use epics_base_rs::types::EpicsValue;
 const ACF: &str = r#"ASG(DEFAULT) { RULE(1, READ) }
     ASG(G) { INPA("GATE") RULE(1, WRITE) { CALC("A=1") } }"#;
 
-const WAIT: Duration = Duration::from_secs(5);
+const WAIT: Duration = fact_budget::FACT_BUDGET;
 
 async fn gate_db() -> Arc<PvDatabase> {
     let db = Arc::new(PvDatabase::new());

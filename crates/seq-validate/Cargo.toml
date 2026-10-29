@@ -1,0 +1,23 @@
+[package]
+name = "seq-validate"
+version.workspace = true
+edition.workspace = true
+description = "Test-only: sequencer R2-2-9 test/validate, compiled by snc-rs and run on epics-seq-rs against C's epicsUnitTest results"
+license-file = "LICENSE"
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+epics-base-rs = { workspace = true }
+epics-seq-rs = { workspace = true, features = ["runtime"] }
+parking_lot = "0.12"
+
+[build-dependencies]
+epics-seq-rs = { workspace = true, features = ["snc"] }
+
+[dev-dependencies]
+epics-ca-rs = { workspace = true }
+serial_test = "3"
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }

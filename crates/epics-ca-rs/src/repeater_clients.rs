@@ -716,33 +716,45 @@ mod tests {
     /// here), so only the bind-test sweep can reap it.
     #[test]
     fn new_registration_bind_test_sweeps_departed_clients() {
-        // A departed client: bind to learn a port, then drop the socket so the
-        // port is free — exactly what `verify()`'s bind test detects.
-        let departed_port = {
-            let s = StdUdpSocket::bind("127.0.0.1:0").expect("bind departed");
-            s.local_addr().unwrap().port()
-        };
-        let departed = src_v4(127, 0, 0, 1, departed_port);
+        // A departed client: a number no socket holds — exactly what
+        // `verify()`'s bind test detects. A socket that takes the number
+        // before the sweep is a client alive there, so it is drawn again.
+        let (clients, departed_port, live, newcomer, _socks) =
+            named_port::on_a_named_port(|departed_port| {
+                let departed = src_v4(127, 0, 0, 1, departed_port);
 
-        // A live client, still holding its port.
-        let live_sock = StdUdpSocket::bind("127.0.0.1:0").expect("bind live");
-        let live = live_sock.local_addr().unwrap();
+                // A live client, still holding its port.
+                let live_sock = StdUdpSocket::bind("127.0.0.1:0").expect("bind live");
+                let live = live_sock.local_addr().unwrap();
 
-        let mut clients: HashMap<u16, RepeaterClient> = HashMap::new();
-        clients.insert(
-            departed_port,
-            RepeaterClient::new(departed, quiet()).expect("departed client sock"),
-        );
-        clients.insert(
-            live.port(),
-            RepeaterClient::new(live, quiet()).expect("live sock"),
-        );
-        assert_eq!(clients.len(), 2);
+                let mut clients: HashMap<u16, RepeaterClient> = HashMap::new();
+                clients.insert(
+                    departed_port,
+                    RepeaterClient::new(departed, quiet()).expect("departed client sock"),
+                );
+                clients.insert(
+                    live.port(),
+                    RepeaterClient::new(live, quiet()).expect("live sock"),
+                );
+                assert_eq!(clients.len(), 2);
 
-        // A brand-new client registers. C: newClient ⇒ verifyClients().
-        let newcomer_sock = StdUdpSocket::bind("127.0.0.1:0").expect("bind newcomer");
-        let newcomer = newcomer_sock.local_addr().unwrap();
-        register_client(&mut clients, newcomer, quiet());
+                // A brand-new client registers. C: newClient ⇒ verifyClients().
+                let newcomer_sock = StdUdpSocket::bind("127.0.0.1:0").expect("bind newcomer");
+                let newcomer = newcomer_sock.local_addr().unwrap();
+                register_client(&mut clients, newcomer, quiet());
+                if clients.contains_key(&departed_port)
+                    && named_port::udp_port_is_held(departed_port)
+                {
+                    return None;
+                }
+                Some((
+                    clients,
+                    departed_port,
+                    live,
+                    newcomer,
+                    (live_sock, newcomer_sock),
+                ))
+            });
 
         assert!(
             !clients.contains_key(&departed_port),

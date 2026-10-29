@@ -281,13 +281,21 @@ const BSD_PCB_LOOKUP: bool = cfg!(all(unix, not(target_os = "linux")));
 impl HeldPort {
     /// A TCP number for a listener under test, which binds beside the hold:
     /// on unix both sides set `SO_REUSEADDR` and the hold is not listening;
-    /// on Windows a specific bind over an unoptioned wildcard succeeds.
+    /// on Windows a specific bind over an unoptioned wildcard succeeds. A
+    /// connect while no subject listens is refused, as on a free number:
+    /// Darwin and the BSDs would drop its SYN, so there the hold is
+    /// connected to a loopback peer it keeps (`BSD_PCB_LOOKUP`).
     pub fn tcp() -> Self {
         let hold = Socket::new(Domain::IPV4, Type::STREAM, None).expect("open a TCP hold");
         #[cfg(unix)]
         hold.set_reuse_address(true)
             .expect("SO_REUSEADDR on the hold");
-        Self::bind(hold)
+        let held = Self::bind(hold);
+        if BSD_PCB_LOOKUP {
+            held.connected()
+        } else {
+            held
+        }
     }
 
     /// A UDP number for a socket under test that sets the datagram fanout
@@ -466,7 +474,11 @@ fn unanswered_on(lo: IpAddr, port: u16) -> std::io::Result<Vec<Socket>> {
     filler.connect(&hold.local_addr()?)?;
     // The queue is full once the listener has the filler, which can be
     // after the filler's connect returns.
-    let queued = poll_ready(&hold, Readiness::Readable, 10_000)?;
+    let queued = poll_ready(
+        &hold,
+        Readiness::Readable,
+        Some(std::time::Duration::from_secs(10)),
+    )?;
     assert!(queued, "the filler never reached the accept queue");
     Ok(vec![hold, filler])
 }
@@ -524,23 +536,42 @@ mod tests {
     }
 
     /// The held/free boundary: a bound socket reads held, the number it
-    /// leaves behind reads free.
+    /// leaves behind reads free. A released number any socket may take, so
+    /// one that reads held is drawn again; a probe that reads every
+    /// released number held fails after [`ATTEMPTS`].
     #[test]
     fn a_bound_port_reads_held_and_a_released_one_free() {
-        let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
-        let udp = UdpSocket::bind("0.0.0.0:0").unwrap();
-        let (t, u) = (
-            tcp.local_addr().unwrap().port(),
-            udp.local_addr().unwrap().port(),
-        );
-        assert!(tcp_port_is_held(t) && udp_port_is_held(u));
-        drop((tcp, udp));
-        assert!(!tcp_port_is_held(t) && !udp_port_is_held(u));
+        on_a_named_port(|port| {
+            let bound = |e: std::io::Error| {
+                assert!(port_held(&e), "{port} refused but not held: {e}");
+            };
+            let tcp = TcpListener::bind(("127.0.0.1", port)).map_err(bound).ok()?;
+            let udp = UdpSocket::bind(("0.0.0.0", port)).map_err(bound).ok()?;
+            assert!(tcp_port_is_held(port) && udp_port_is_held(port));
+            drop((tcp, udp));
+            (!tcp_port_is_held(port) && !udp_port_is_held(port)).then_some(())
+        });
     }
 
     fn plain_bind(ty: Type, ip: [u8; 4], port: u16) -> std::io::Result<Socket> {
         let s = Socket::new(Domain::IPV4, ty, None).unwrap();
         s.bind(&SocketAddr::from((ip, port)).into()).map(|()| s)
+    }
+
+    /// A dialer is refused on the TCP hold as on a free number, before the
+    /// subject listens and after it is gone, and reaches the subject between.
+    #[test]
+    fn a_tcp_hold_refuses_a_connect_while_no_subject_listens() {
+        let held = HeldPort::tcp();
+        let at = SocketAddr::from(([127, 0, 0, 1], held.port));
+        // Bounded: a dropped SYN would leave the connect in progress.
+        let dial = || std::net::TcpStream::connect_timeout(&at, std::time::Duration::from_secs(10));
+        let refused = || dial().unwrap_err().kind();
+        assert_eq!(refused(), std::io::ErrorKind::ConnectionRefused);
+        let subject = TcpListener::bind(at).unwrap();
+        dial().unwrap();
+        drop(subject);
+        assert_eq!(refused(), std::io::ErrorKind::ConnectionRefused);
     }
 
     /// The hold keeps a plain bind off the number and lets the subject's on.

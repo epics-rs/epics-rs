@@ -48,7 +48,7 @@ impl LinkSet for Slow {
 }
 
 const DB: &str = r#"
-record(printf, "A") { field(DTYP, "Async Soft Channel") field(FMT, "x") field(OUT, "ca://R") }
+record(printf, "A") { field(DTYP, "Async Soft Channel") field(FMT, "x") field(OUT, "R CA") }
 record(printf, "S") { field(FMT, "x") }
 "#;
 
@@ -80,7 +80,8 @@ async fn the_completing_pass_keeps_the_first_pass_time() {
     assert!(pact(&db, "A"), "A waits for its put");
     let first = time(&db, "A");
     assert_ne!(first, before, "the first pass stamps ahead of the write");
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if !pact(&db, "A") {
             break;
         }

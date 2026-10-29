@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use asyn_rs::error::AsynResult;
-use asyn_rs::interfaces::motor::{AsynMotor, Model1Motor, MotorStatus, PollFailure};
+use asyn_rs::interfaces::motor::{Model1Motor, MotorStatus, PollFailure};
 use asyn_rs::user::AsynUser;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::record::DevSup;
@@ -30,41 +30,46 @@ struct Card {
     moves: Arc<Mutex<Vec<f64>>>,
 }
 
-/// `motor_init` reads the card with the status function the task queries.
 impl Model1Motor for Card {
-    fn take_init_status(&mut self) -> MotorStatus {
-        let mut status = MotorStatus::default();
-        self.poll(&AsynUser::default(), &mut status)
-            .expect("the card answers");
-        status
+    fn set_velocity(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        Ok(())
     }
-}
-
-impl AsynMotor for Card {
-    fn move_absolute(&mut self, _: &AsynUser, p: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
+    fn set_vel_base(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn set_accel(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn move_absolute(&mut self, _: &AsynUser, p: f64) -> AsynResult<()> {
         self.moves.lock().unwrap().push(p);
         self.busy = true;
         Ok(())
     }
-    fn move_relative(
-        &mut self,
-        _: &AsynUser,
-        _distance: f64,
-        _: f64,
-        _: f64,
-        _: f64,
-    ) -> AsynResult<()> {
+    fn move_relative(&mut self, _: &AsynUser, _distance: f64) -> AsynResult<()> {
         Ok(())
     }
-    fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> AsynResult<()> {
+    fn move_velocity(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
         Ok(())
     }
-    fn stop(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+    fn home(&mut self, _: &AsynUser, _: bool) -> AsynResult<()> {
+        Ok(())
+    }
+    fn stop(&mut self, _: &AsynUser) -> AsynResult<()> {
         self.stopped = true;
         Ok(())
     }
     fn set_position(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
         Ok(())
+    }
+    /// `motor_init` reads the card with the status function the task queries.
+    fn update_delay(&self) -> Duration {
+        Duration::ZERO
+    }
+    fn take_init_status(&mut self) -> MotorStatus {
+        let mut status = MotorStatus::default();
+        self.poll(&AsynUser::default(), &mut status)
+            .expect("the card answers");
+        status
     }
     fn no_motion_test(&self) -> bool {
         false
@@ -78,10 +83,9 @@ impl AsynMotor for Card {
             self.position = 508.0;
         }
         *status = MotorStatus {
-            position: self.position,
             done: !self.busy,
             direction: true,
-            ..MotorStatus::default()
+            ..MotorStatus::default().with_position(self.position)
         };
         Ok(())
     }

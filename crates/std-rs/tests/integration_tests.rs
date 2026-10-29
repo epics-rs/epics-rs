@@ -219,7 +219,9 @@ record(throttle, "TEST:THR3") {
 #[tokio::test]
 async fn test_epid_pid_via_framework() {
     let db_str = r#"
+record(ao, "TEST:PID:CV") {}
 record(epid, "TEST:PID") {
+    field(INP, "TEST:PID:CV")
     field(STPL, "100")
     field(KP, "2.0")
     field(KI, "0")
@@ -290,7 +292,9 @@ record(epid, "TEST:PID") {
 #[tokio::test]
 async fn test_epid_pid_via_process_record_path() {
     let db_str = r#"
+record(ao, "TEST:PID2:CV") {}
 record(epid, "TEST:PID2") {
+    field(INP, "TEST:PID2:CV")
     field(STPL, "100")
     field(KP, "2.0")
     field(KI, "0")
@@ -368,7 +372,9 @@ record(epid, "TEST:PID2") {
 #[tokio::test]
 async fn test_epid_supervisory_empty_stpl_never_runs_do_pid() {
     let db_str = r#"
+record(ao, "TEST:PIDSUP:CV") {}
 record(epid, "TEST:PIDSUP") {
+    field(INP, "TEST:PIDSUP:CV")
     field(KP, "2.0")
     field(KI, "0")
     field(KD, "0")
@@ -459,7 +465,9 @@ async fn test_epid_closed_loop_working_stpl_runs_do_pid() {
 record(ao, "TEST:PIDSRC") {
     field(VAL, "100")
 }
+record(ao, "TEST:PIDCL:CV") {}
 record(epid, "TEST:PIDCL") {
+    field(INP, "TEST:PIDCL:CV")
     field(SMSL, "1")
     field(STPL, "TEST:PIDSRC.VAL")
     field(KP, "2.0")
@@ -726,7 +734,7 @@ record(timestamp, "TEST:TSNP") {
 // ============================================================
 #[tokio::test]
 async fn test_ca_trig_epid_fires_flnk_exactly_once() {
-    // The CA TRIG link `ca://...` points at a remote PV that does
+    // The CA TRIG link `CA` points at a remote PV that does
     // not exist in-test; the trigger write simply does not land, but
     // the asynchronous two-pass sequence (trigger pass -> reprocess
     // pass) still runs — which is exactly what this test exercises.
@@ -745,7 +753,7 @@ record(epid, "PID") {
     field(DRVH, "1000")
     field(DRVL, "-1000")
     field(MDT, "0")
-    field(TRIG, "ca://REMOTE:READBACK")
+    field(TRIG, "REMOTE:READBACK CA")
     field(TVAL, "42.0")
     field(FLNK, "CTR")
 }
@@ -1005,7 +1013,9 @@ async fn test_epid_non_val_put_does_not_process() {
 record(ao, "TEST:PIDNV:SRC") {
     field(VAL, "100")
 }
+record(ao, "TEST:PIDNV:CV") {}
 record(epid, "TEST:PIDNV") {
+    field(INP, "TEST:PIDNV:CV")
     field(SMSL, "1")
     field(STPL, "TEST:PIDNV:SRC.VAL")
     field(KP, "2.0")
@@ -1315,7 +1325,7 @@ record(ai, "CV2") { field(VAL, "2") }
 record(epid, "E") {
     field(DTYP, "Async Soft Channel")
     field(INP, "CV")
-    field(TRIG, "ca://REMOTE:READBACK")
+    field(TRIG, "REMOTE:READBACK CA")
 }
 "#;
     let (name, factory) = std_rs::epid_record_factory();
@@ -1371,11 +1381,26 @@ async fn a_device_link_put_drops_the_trigger_in_flight() {
                 tpro: 0,
             });
         inst.record.pre_input_link_actions(false, &mut inst.dpvt);
+        // What the cycle's `ResolveOutTarget` stores for the CA TRIG.
+        inst.record.set_resolved_out_target(
+            "TRIG",
+            epics_base_rs::server::record::OutTarget {
+                link_type: epics_base_rs::server::record::LinkType::Ca,
+                ..epics_base_rs::server::record::OutTarget::UNRESOLVED
+            },
+        );
         let writes = inst
             .record
             .gate_after_pre_input_reads(&[], &mut inst.dpvt)
             .unwrap();
         assert!(!writes.is_empty());
+        // `dbCaPutLinkCallback` took the put.
+        inst.record.set_out_link_write_status(
+            "TRIG",
+            &EpicsValue::Double(0.0),
+            Ok(()),
+            &mut inst.dpvt,
+        );
         assert!(matches!(inst.dpvt, Dpvt::Triggered));
         inst.enter_pact();
     }
@@ -1383,6 +1408,108 @@ async fn a_device_link_put_drops_the_trigger_in_flight() {
         .await
         .unwrap();
     assert!(matches!(rec.read().dpvt, Dpvt::Null));
+}
+
+/// A TRIG naming no record of this IOC is a `CA_LINK` after `dbInitLink`
+/// (`dbLink.c:76-110`), so `devEpidSoftCallback.c:117` takes the
+/// `dbCaPutLinkCallback` arm and, the link being connected, the PID waits
+/// for the trigger.
+#[tokio::test]
+async fn a_trig_naming_no_local_record_is_waited_on() {
+    use epics_base_rs::server::database::{LinkPutOp, LinkRef, LinkSet};
+    use epics_base_rs::server::device_support::Dpvt;
+    struct Up;
+    #[epics_base_rs::async_trait]
+    impl LinkSet for Up {
+        fn is_connected(&self, _: LinkRef<'_>) -> bool {
+            true
+        }
+        fn get_cached_value(&self, _: LinkRef<'_>) -> Option<EpicsValue> {
+            None
+        }
+        async fn get_value(&self, _: LinkRef<'_>) -> Option<EpicsValue> {
+            None
+        }
+        async fn put_value(
+            &self,
+            _: LinkRef<'_>,
+            _: EpicsValue,
+            _: LinkPutOp,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+    }
+    let db_str = r#"
+record(ai, "CV") { field(VAL, "1") }
+record(epid, "E") {
+    field(DTYP, "Async Soft Channel")
+    field(INP, "CV")
+    field(TRIG, "REMOTE:READBACK")
+    field(UDF, "0")
+}
+"#;
+    let (name, factory) = std_rs::epid_record_factory();
+    let ioc = epics_base_rs::server::ioc_builder::IocBuilder::new()
+        .register_record_type(name, factory)
+        .register_link_type("ca", |db| async move {
+            db.register_link_set("ca", std::sync::Arc::new(Up)).await;
+            Vec::new()
+        })
+        .db_string(db_str, &HashMap::new())
+        .unwrap()
+        .build_ioc()
+        .await
+        .unwrap();
+    let db = ioc.database().clone();
+    // `dbCaRun`: before it no CA link is connected (`dbCa.c:529-532`).
+    assert!(ioc.run().await);
+    db.put_record_field_from_ca("E", "PROC", EpicsValue::Char(1))
+        .await
+        .unwrap();
+    let rec = db.get_record("E").unwrap();
+    assert!(matches!(rec.read().dpvt, Dpvt::Triggered));
+    // The trigger's re-entry runs the PID.
+    epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(db.get_pv("E.CVAL").unwrap().to_f64(), Some(1.0));
+    assert_eq!(db.get_pv("E.SEVR").unwrap().to_f64(), Some(0.0));
+}
+
+async fn epid_db(db_str: &str) -> std::sync::Arc<epics_base_rs::server::database::PvDatabase> {
+    let (name, factory) = std_rs::epid_record_factory();
+    let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+        .register_record_type(name, factory)
+        .db_string(db_str, &HashMap::new())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    db
+}
+
+/// `{const:3}` is a `JSON_LINK`, not the `CONSTANT` of `devEpidSoft.c:110`,
+/// so no SOFT alarm is raised; its `dbGetLink` reads nothing
+/// (`lnkConst.c:553-559`), leaving `CVAL` 0.
+#[tokio::test]
+async fn a_json_const_inp_raises_no_soft_alarm() {
+    let db = epid_db(
+        r#"record(epid, "E") { field(DTYP, "Soft Channel") field(INP, "{const:3}") field(UDF, "0") }"#,
+    )
+    .await;
+    db.put_record_field_from_ca("E", "PROC", EpicsValue::Char(1))
+        .await
+        .unwrap();
+    assert_eq!(db.get_pv("E.CVAL").unwrap().to_f64(), Some(0.0));
+    assert_eq!(db.get_pv("E.SEVR").unwrap().to_f64(), Some(0.0));
+    assert_eq!(db.get_pv("E.STAT").unwrap().to_f64(), Some(0.0));
+}
+
+/// `{const:5}` is a `JSON_LINK`, and `epidRecord.c:161` seeds `VAL` only
+/// for `type == CONSTANT`, so `VAL` and `UDF` stay as the record was born.
+#[tokio::test]
+async fn a_json_const_stpl_does_not_seed_val() {
+    let db = epid_db(r#"record(epid, "E") { field(STPL, "{const:5}") }"#).await;
+    assert_eq!(db.get_pv("E.VAL").unwrap().to_f64(), Some(0.0));
+    assert_eq!(db.get_pv("E.UDF").unwrap().to_f64(), Some(1.0));
 }
 
 // ============================================================
@@ -1757,7 +1884,8 @@ record(epid, "EE") { field(SMSL, "closed_loop") field(KP, "1") field(INP, "CV") 
 #[tokio::test]
 async fn epid_skipped_cycle_raise_survives_process_local() {
     let db_str = r#"
-record(epid, "E") { field(KP, "1") }
+record(ao, "E:CV") {}
+record(epid, "E") { field(KP, "1") field(INP, "E:CV") }
 "#;
     let (name, factory) = std_rs::epid_record_factory();
     let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
@@ -1786,7 +1914,9 @@ record(epid, "E") { field(KP, "1") }
 async fn an_epid_inside_mdt_returns_do_pids_status() {
     let db_str = r#"
 record(ao, "MDT:SRC") { field(VAL, "1") }
+record(ao, "MDT:CV") {}
 record(epid, "MDT:PID") {
+    field(INP, "MDT:CV")
     field(SMSL, "1")
     field(STPL, "MDT:SRC.VAL")
     field(MDT, "1000")

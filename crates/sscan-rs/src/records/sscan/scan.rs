@@ -67,23 +67,31 @@ impl SscanRecord {
 
     /// Read-back or detector `li`'s value: `dbGet(.., ty, ..)` for a local
     /// PV, else `recDynLinkGet`. `None` leaves C's target untouched.
-    fn input_get1(&mut self, li: usize, ty: DbFieldType) -> Option<f64> {
+    fn input_get1(&mut self, own: OwnFrame<'_>, li: usize, ty: DbFieldType) -> Option<f64> {
         if self.lpvt[li].local.is_some() {
-            return self.db_get(li, ty, 1).and_then(|s| s.value.to_f64());
+            return self.db_get(own, li, ty, 1).and_then(|s| s.value.to_f64());
         }
         self.link_get1(li)
     }
 
-    /// [`Self::input_get1`] of up to `n` elements.
-    fn input_get(&mut self, li: usize, ty: DbFieldType, n: usize) -> Option<Vec<f64>> {
+    /// [`Self::input_get1`] of up to `n` elements. A failed get reads no
+    /// elements, so the caller's zero-fill past the read zeroes it all. C
+    /// ignores the status and leaves its buffer as it was, which a non-add
+    /// read keeps from two scans before and an add read sums from the
+    /// previous detector (CBUG-AB5, sscanRecord.c:3777-3806).
+    fn input_get(&mut self, own: OwnFrame<'_>, li: usize, ty: DbFieldType, n: usize) -> Vec<f64> {
         if self.lpvt[li].local.is_none() {
-            return self.links[li].get(n).map(<[f64]>::to_vec);
+            return self.links[li]
+                .get(n)
+                .map(<[f64]>::to_vec)
+                .unwrap_or_default();
         }
-        Some(match self.db_get(li, ty, n)?.value {
-            EpicsValue::DoubleArray(v) => v.iter().copied().collect(),
-            EpicsValue::FloatArray(v) => v.iter().map(|x| f64::from(*x)).collect(),
-            v => v.to_f64().into_iter().collect(),
-        })
+        match self.db_get(own, li, ty, n).map(|s| s.value) {
+            Some(EpicsValue::DoubleArray(v)) => v.iter().copied().collect(),
+            Some(EpicsValue::FloatArray(v)) => v.iter().map(|x| f64::from(*x)).collect(),
+            Some(v) => v.to_f64().into_iter().collect(),
+            None => Vec::new(),
+        }
     }
 
     /// The fly-or-array test C repeats: `p_sm == FLY || acqt == 1D_ARRAY`.
@@ -93,7 +101,7 @@ impl SscanRecord {
 
     /// C `process()`. `true` when it reaches the `recGblFwdLink` /
     /// `recGblResetAlarms` tail; `false` for each early `return`.
-    pub(crate) fn process_pass(&mut self) -> bool {
+    pub(crate) fn process_pass(&mut self, own: OwnFrame<'_>) -> bool {
         self.clamp_npts();
 
         if self.kill != 0 {
@@ -126,7 +134,7 @@ impl SscanRecord {
                         self.name
                     ));
                 }
-                self.pack_data();
+                self.pack_data(own);
                 self.check_monitors();
             }
             if self.dstate == dstate::SAVE_DATA_WAIT {
@@ -210,7 +218,7 @@ impl SscanRecord {
             // Operator abort.
             if self.any_callbacks() {
                 if self.dstate < dstate::PACKED {
-                    self.pack_data();
+                    self.pack_data(own);
                     self.check_monitors();
                 }
                 self.set_smsg("Abort: waiting for callback(s)");
@@ -221,7 +229,7 @@ impl SscanRecord {
             }
             self.clear_waits();
             self.errlog(&format!("{}:process: Scan aborted by operator", self.name));
-            self.end_scan();
+            self.end_scan(own);
         } else if self.faze == faze::BEFORE_SCAN_WAIT {
             self.init_scan();
         } else if self.xsc == 1 {
@@ -236,18 +244,18 @@ impl SscanRecord {
                     "{}:process: Lost connection to Control PV",
                     self.name
                 ));
-                self.end_scan();
+                self.end_scan(own);
             } else if matches!(
                 self.dstate,
                 dstate::SAVE_DATA_WAIT | dstate::ARRAY_READ_WAIT | dstate::RECORD_ARRAY_DATA
             ) {
-                self.end_scan();
+                self.end_scan(own);
             } else {
-                self.cont_scan();
+                self.cont_scan(own);
             }
         } else if self.busy != 0 {
             if self.dstate < dstate::PACKED {
-                self.pack_data();
+                self.pack_data(own);
                 if self.dstate < dstate::PACKED {
                     self.set_smsg("waiting for packData");
                     return false;
@@ -258,7 +266,7 @@ impl SscanRecord {
                 faze::AFTER_SCAN_DO => self.after_scan(),
                 faze::AFTER_SCAN_WAIT | faze::SCAN_DONE => self.set_faze(faze::SCAN_DONE),
                 faze::READ_DETCTRS | faze::CHECK_MOTORS if self.dstate == dstate::PACKED => {
-                    self.end_scan()
+                    self.end_scan(own)
                 }
                 _ => self.errlog(&format!(
                     "{}:process: How did I get here? (faze='{}', dstate='{}', calledBy = {})",
@@ -352,7 +360,7 @@ impl SscanRecord {
     }
 
     /// C `contScan`.
-    fn cont_scan(&mut self) {
+    fn cont_scan(&mut self, own: OwnFrame<'_>) {
         let mut stage = self.faze;
         if stage == faze::TRIG_DETCTRS {
             self.request_do_puts();
@@ -363,14 +371,17 @@ impl SscanRecord {
                 if self.pos[i].r_dl == 0.0 || self.nv[R1_IN + i] != PV_OK || self.nv[i] != PV_OK {
                     continue;
                 }
-                if let Some(v) = self.input_get1(R1_IN + i, DbFieldType::Double) {
+                if let Some(v) = self.input_get1(own, R1_IN + i, DbFieldType::Double) {
                     self.pos[i].r_cv = v;
                 }
                 let q = &self.pos[i];
                 let err = (q.dv - q.r_cv).abs();
                 let reason = if q.r_dl > 0.0 && err > q.r_dl {
                     "delta"
-                } else if q.r_dl < 0.0 && q.sm != SM_TABLE && err > (q.si * nint(q.r_dl)).abs() {
+                } else if q.r_dl < 0.0
+                    && q.sm != SM_TABLE
+                    && err > (q.si * nint(q.r_dl) as f64).abs()
+                {
                     "stepsize"
                 } else {
                     continue;
@@ -382,7 +393,7 @@ impl SscanRecord {
                     self.name,
                     i + 1
                 ));
-                self.end_scan();
+                self.end_scan(own);
                 return;
             }
 
@@ -440,7 +451,7 @@ impl SscanRecord {
             stage = faze::RECORD_SCALAR_DATA;
         }
         if stage == faze::RECORD_SCALAR_DATA {
-            self.record_scalar_data();
+            self.record_scalar_data(own);
         }
     }
 
@@ -456,12 +467,12 @@ impl SscanRecord {
     }
 
     /// `contScan`'s `sscanFAZE_RECORD_SCALAR_DATA` case.
-    fn record_scalar_data(&mut self) {
+    fn record_scalar_data(&mut self, own: OwnFrame<'_>) {
         let cpt = self.cpt.max(0) as usize;
         let fill = self.fill();
         for i in 0..NUM_POS {
             if self.nv[R1_IN + i] == PV_OK {
-                if let Some(v) = self.input_get1(R1_IN + i, DbFieldType::Double) {
+                if let Some(v) = self.input_get1(own, R1_IN + i, DbFieldType::Double) {
                     self.pos[i].r_cv = v;
                 }
             } else if self.lpvt[R1_IN + i].ts {
@@ -498,7 +509,7 @@ impl SscanRecord {
                 continue;
             }
             let mut cv = if self.nv[D1_IN + i] == PV_OK {
-                self.input_get1(D1_IN + i, DbFieldType::Float)
+                self.input_get1(own, D1_IN + i, DbFieldType::Float)
                     .map_or(self.det[i].cv, |v| v as f32)
             } else {
                 0.0
@@ -545,15 +556,15 @@ impl SscanRecord {
             self.set_faze(faze::MOVE_MOTORS);
             self.request_do_puts();
         } else {
-            self.end_scan();
+            self.end_scan(own);
             self.scan_err = 0;
         }
     }
 
     /// C `endScan`.
-    pub(crate) fn end_scan(&mut self) {
+    pub(crate) fn end_scan(&mut self, own: OwnFrame<'_>) {
         if self.dstate < dstate::PACKED {
-            self.pack_data();
+            self.pack_data(own);
         }
         if self.dstate < dstate::PACKED {
             return;
@@ -569,7 +580,7 @@ impl SscanRecord {
     }
 
     /// C `readArrays`.
-    fn read_arrays(&mut self) {
+    fn read_arrays(&mut self, own: OwnFrame<'_>) {
         let npts = self.npts.max(0) as usize;
         if self.dstate == dstate::ARRAY_READ_WAIT {
             for i in 0..NUM_POS {
@@ -603,12 +614,11 @@ impl SscanRecord {
             let (sp, si) = (self.pos[i].sp, self.pos[i].si);
             if self.lpvt[li].nelem > 1 {
                 if self.nv[li] == PV_OK {
-                    if let Some(v) = self.input_get(li, DbFieldType::Double, npts) {
-                        let n = v.len();
-                        let buf = &mut self.pos_buf[i][fill];
-                        buf[..n].copy_from_slice(&v);
-                        buf[n..npts].fill(0.0);
-                    }
+                    let v = self.input_get(own, li, DbFieldType::Double, npts);
+                    let n = v.len();
+                    let buf = &mut self.pos_buf[i][fill];
+                    buf[..n].copy_from_slice(&v);
+                    buf[n..npts].fill(0.0);
                 } else {
                     for (j, x) in self.pos_buf[i][fill][..npts].iter_mut().enumerate() {
                         *x = sp + j as f64 * si;
@@ -635,12 +645,11 @@ impl SscanRecord {
                 self.det_buf[i].as_ref().expect("checked")[fill][..npts].to_vec()
             };
             if self.nv[li] == PV_OK {
-                if let Some(v) = self.input_get(li, DbFieldType::Float, npts) {
-                    for (dst, src) in read.iter_mut().zip(&v) {
-                        *dst = *src as f32;
-                    }
-                    read[v.len()..npts].fill(0.0);
+                let v = self.input_get(own, li, DbFieldType::Float, npts);
+                for (dst, src) in read.iter_mut().zip(&v) {
+                    *dst = *src as f32;
                 }
+                read[v.len()..npts].fill(0.0);
             } else {
                 read[..npts].fill(0.0);
             }
@@ -711,7 +720,7 @@ impl SscanRecord {
     }
 
     /// C `packData`.
-    pub(crate) fn pack_data(&mut self) {
+    pub(crate) fn pack_data(&mut self, own: OwnFrame<'_>) {
         if self.dstate == dstate::PACKED {
             return;
         }
@@ -725,7 +734,7 @@ impl SscanRecord {
                     }
                     self.dstate = dstate::ARRAY_READ_WAIT;
                 }
-                self.read_arrays();
+                self.read_arrays(own);
                 if self.dstate == dstate::ARRAY_GET_CALLBACK_WAIT {
                     return;
                 }
@@ -1219,11 +1228,10 @@ impl SscanRecord {
     }
 
     /// C's posts of both buffers of every positioner and acquired detector,
-    /// then of `nullArray`. They reach `PnRA` but never `PnCA`, whose address
-    /// is `p_ca`, which C never sets (sscanRecord.c:545, :1880).
+    /// then of `nullArray`.
     pub(crate) fn post_arrays(&mut self, mask: EventMask) {
         for i in 0..NUM_POS {
-            self.post_mask(pf(i, p::RA), mask);
+            self.post_pos_buffers(i, mask);
         }
         for i in 0..NUM_DET {
             if self.acq[i] {
@@ -1232,6 +1240,14 @@ impl SscanRecord {
             }
         }
         self.post_null_served(mask);
+    }
+
+    /// C's post of positioner `i`'s buffers. C addresses `PnRA` at `pBufA`
+    /// but `PnCA` at `p_ca`, which it never sets, so no post reaches `PnCA`
+    /// (CBUG-AB4, sscanRecord.c:822, :1880); both are posted here.
+    pub(crate) fn post_pos_buffers(&mut self, i: usize, mask: EventMask) {
+        self.post_mask(pf(i, p::RA), mask);
+        self.post_mask(pf(i, p::CA), mask);
     }
 
     /// C's post of `nullArray`. It reaches a detector's `DnnDA`/`DnnCA` only

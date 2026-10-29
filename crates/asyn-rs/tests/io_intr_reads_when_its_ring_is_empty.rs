@@ -81,8 +81,23 @@ fn port(name: &str, can_block: bool, db: &PvDatabase) -> (PortRuntimeHandle, Arc
             can_block,
             ..PortFlags::default()
         },
-        InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_INTERRUPTS,
+        InterfaceMask::INT32
+            | InterfaceMask::UINT32_DIGITAL
+            | InterfaceMask::FLOAT64
+            | InterfaceMask::OCTET
+            | InterfaceMask::INT32_ARRAY
+            | InterfaceMask::FLOAT64_ARRAY
+            | InterfaceMask::ENUM
+            | InterfaceMask::INT64
+            | InterfaceMask::DRV_USER,
+        InterfaceMask::INT32
+            | InterfaceMask::UINT32_DIGITAL
+            | InterfaceMask::FLOAT64
+            | InterfaceMask::OCTET
+            | InterfaceMask::INT32_ARRAY
+            | InterfaceMask::FLOAT64_ARRAY
+            | InterfaceMask::ENUM
+            | InterfaceMask::INT64,
     );
     for (param, ty) in [
         ("I32", ParamType::Int32),

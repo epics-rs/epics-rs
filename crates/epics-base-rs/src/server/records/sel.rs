@@ -791,6 +791,7 @@ impl Record for SelRecord {
         let mut seeds = vec![crate::server::record::ConstantInitLink::new("NVL", "SELN")];
         seeds.extend(crate::server::record::seed_input_links(
             self.multi_input_links(),
+            crate::server::record::SeedGuard::LoadLink,
         ));
         seeds
     }

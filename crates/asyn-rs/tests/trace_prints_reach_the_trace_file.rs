@@ -79,8 +79,21 @@ fn fixture_of<D: PortDriver>(
         port,
         1,
         flags,
-        InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_INTERRUPTS,
+        InterfaceMask::INT32
+            | InterfaceMask::UINT32_DIGITAL
+            | InterfaceMask::FLOAT64
+            | InterfaceMask::OCTET
+            | InterfaceMask::FLOAT64_ARRAY
+            | InterfaceMask::ENUM
+            | InterfaceMask::INT64
+            | InterfaceMask::DRV_USER,
+        InterfaceMask::INT32
+            | InterfaceMask::UINT32_DIGITAL
+            | InterfaceMask::FLOAT64
+            | InterfaceMask::OCTET
+            | InterfaceMask::FLOAT64_ARRAY
+            | InterfaceMask::ENUM
+            | InterfaceMask::INT64,
     );
     base.create_param("VAL", ParamType::Float64).unwrap();
     base.create_param("MSG", ParamType::Octet).unwrap();

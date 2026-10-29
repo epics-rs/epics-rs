@@ -65,7 +65,7 @@ const QUEUE: i32 = FRAMES as i32 * 4;
 fn burn(array: &NDArray) -> u64 {
     let mut acc = 0u64;
     for _ in 0..96 {
-        for d in array.data.as_u8_slice() {
+        for d in array.data().as_u8_slice() {
             acc = acc.wrapping_add(*d as u64).rotate_left(1);
         }
     }
@@ -79,8 +79,8 @@ struct Unlocked {
 
 impl NDPluginProcess for Unlocked {
     const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_CANBLOCK;
-    const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
-    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS;
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::NONE;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::NONE;
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         let acc = burn(array);
         *self.sink.lock() = acc;
@@ -102,8 +102,8 @@ struct Locked {
 
 impl NDPluginProcess for Locked {
     const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_CANBLOCK;
-    const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
-    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS;
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::NONE;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::NONE;
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         let mut sink = self.sink.lock();
         *sink = burn(array);
@@ -132,13 +132,13 @@ fn frames() -> Vec<PublishedArray> {
         x ^= x << 13;
         x ^= x >> 7;
         x ^= x << 17;
-        seed.data.set_from_f64(i, (x % 4096) as f64);
+        seed.data_mut().set_from_f64(i, (x % 4096) as f64);
     }
     let pool = DriverPool::standalone(0);
     (0..FRAMES as i32)
         .map(|id| {
             let mut arr = pool.alloc_copy(&seed).unwrap();
-            arr.unique_id = id;
+            arr.fill().set_unique_id(id);
             arr.share()
         })
         .collect()

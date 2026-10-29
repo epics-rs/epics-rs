@@ -199,7 +199,8 @@ async fn the_task_writes_the_first_sequence_file_after_the_period() {
     let slot0 = dir.path().join("s.sav0");
     sleep(Duration::from_secs(9)).await;
     assert!(!slot0.exists(), "the 5 s look is inside the period");
-    for _ in 0..70 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if slot0.exists() {
             break;
         }
@@ -233,7 +234,8 @@ async fn a_config_menu_save_lets_the_sequence_file_be_written() {
         .save_to(set.get_channel_values(&db), &dir.path().join("cfg.sav"))
         .await;
     let slot0 = dir.path().join("s.sav0");
-    for _ in 0..170 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if slot0.exists() {
             break;
         }

@@ -1,7 +1,7 @@
 //! A `menu()` field must be SERVED as `DBR_ENUM` carrying its choice labels.
 //!
 //! Every expectation here is what the compiled C softIoc actually answers —
-//! measured on `/home/stevek/work/epics-base/bin/linux-x86_64/softIoc`, not read
+//! measured on `$EPICS_BASE/bin/linux-x86_64/softIoc`, not read
 //! off the `.dbd`:
 //!
 //! ```text

@@ -10,8 +10,9 @@
 //! it is a property of the CA server's per-subscription queues, not of the
 //! record.
 //!
-//! Requires the built oracle IOC (`EPICS_ORACLE_SCALER_IOC_BIN`, or the default
-//! path) and fails loudly rather than skipping when it is absent.
+//! Requires the built oracle IOC (`EPICS_ORACLE_SCALER_IOC_BIN`) and the C CA
+//! tools (`EPICS_BASE_BIN`, `EPICS_ORACLE_IOC_BIN`), and fails loudly rather
+//! than skipping when one is absent.
 
 #![cfg(feature = "scaler")]
 
@@ -25,25 +26,19 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use epics_oracle_rs::ioc::{
-    BootNames, CTools, LogPolicy, PortClaim, RustIoc, boot_on_free_port, claim_port,
+    BootNames, CTools, LogPolicy, PortClaim, RustIoc, boot_on_free_port, c_tree, claim_port,
 };
-
-const DEFAULT_SCALER_IOC: &str =
-    "/home/stevek/work/epics-modules/oracle-ioc/bin/linux-x86_64/oracleScalerIoc";
 
 /// The camonitored PVs, without the prefix.
 const WATCHED: [&str; 6] = ["SC.CNT", "SC.US", "SC.SS", "SC.S1", "SC.T", "SCF"];
 
 /// `oracleScalerIoc` and the directory its `st-scaler.cmd` runs from.
 fn scaler_ioc() -> (PathBuf, PathBuf) {
-    let bin = PathBuf::from(
-        std::env::var("EPICS_ORACLE_SCALER_IOC_BIN")
-            .unwrap_or_else(|_| DEFAULT_SCALER_IOC.to_string()),
-    );
+    let bin = c_tree("EPICS_ORACLE_SCALER_IOC_BIN").expect("oracleScalerIoc");
     assert!(
         bin.is_file(),
-        "oracleScalerIoc not found at {}; build oracle-ioc or set \
-         EPICS_ORACLE_SCALER_IOC_BIN — there is no ground truth without it",
+        "oracleScalerIoc not found at {}; build oracle-ioc and set \
+         EPICS_ORACLE_SCALER_IOC_BIN to it — there is no ground truth without it",
         bin.display()
     );
     let top = bin

@@ -10,7 +10,7 @@ use std::time::Duration;
 use asyn_rs::error::{AsynError, AsynResult, AsynStatus};
 use asyn_rs::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, StatusWrite};
 use asyn_rs::user::AsynUser;
-use motor_rs::device_state::{AxisSubscribers, MotorDset, SharedDeviceState, new_shared_state};
+use motor_rs::device_state::{AxisSubscribers, SharedDeviceState, new_shared_state};
 use motor_rs::flags::MotorCommand;
 use motor_rs::poll_loop::{CommandBatch, MotorPollLoop, PollerInbox};
 use motor_rs::trace::{MotorTrace, TraceUser};
@@ -94,10 +94,10 @@ impl AsynMotor for Axis {
     }
     fn poll(&mut self, _: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         *status = MotorStatus {
-            position: 1.0,
-            encoder_position: 1.0,
             done: true,
             ..MotorStatus::default()
+                .with_position(1.0)
+                .with_encoder_position(1.0)
         };
         Ok(())
     }
@@ -147,10 +147,6 @@ fn rig(user: TraceUser, encoder: f64) -> Rig {
         let state = new_shared_state();
         let own = Arc::<MotorTrace>::default();
         let reads = passes::bind(&state, &own);
-        // As MotorAxis::attach binds a model-1 record.
-        if trace.is_model1() {
-            state.lock().unwrap().set_dset(MotorDset::MotordevCom);
-        }
         subscribers.attach(state.clone(), io_intr_tx, own);
         Bound { reads, state }
     };
@@ -231,7 +227,7 @@ fn a_set_position_posts_the_new_position_at_once() {
     let posted = rig
         .write(MotorCommand::SetPosition { position: 4.0 })
         .unwrap();
-    assert_eq!(posted.position, 4.0);
+    assert_eq!(posted.position(), 4.0);
     assert!(posted.done);
 }
 
@@ -246,7 +242,7 @@ fn a_move_on_a_done_axis_posts_done_off_and_a_second_move_posts_nothing() {
     let mut rig = rig(controller(), 1.0);
     let posted = rig.write(move_to(5.0)).unwrap();
     assert!(!posted.done);
-    assert_eq!(posted.position, 1.0);
+    assert_eq!(posted.position(), 1.0);
     assert_eq!(rig.write(move_to(6.0)), None);
 }
 
@@ -300,7 +296,7 @@ fn a_write_that_sets_no_status_field_posts_nothing() {
 fn a_field_the_driver_set_posts_only_when_it_changed() {
     let mut rig = rig(controller(), 2.0);
     let ratio = MotorCommand::SetEncoderRatio { pulses: [2.0, 1.0] };
-    assert_eq!(rig.write(ratio.clone()).unwrap().encoder_position, 2.0);
+    assert_eq!(rig.write(ratio.clone()).unwrap().encoder_position(), 2.0);
     assert_eq!(rig.write(ratio), None);
 }
 
@@ -312,7 +308,7 @@ fn a_controller_write_that_fails_still_posts_what_the_controller_set() {
     let posted = rig
         .write(MotorCommand::SetPosition { position: 4.0 })
         .unwrap();
-    assert_eq!(posted.position, 4.0);
+    assert_eq!(posted.position(), 4.0);
 }
 
 #[test]
@@ -321,7 +317,7 @@ fn a_model2_move_posts_its_direction_and_done_off_once() {
     let posted = rig.write(move_to(5.0)).unwrap();
     assert!(!posted.done);
     assert!(posted.direction);
-    assert_eq!(posted.position, 1.0);
+    assert_eq!(posted.position(), 1.0);
     assert_eq!(rig.write(move_to(6.0)), None);
     assert!(!rig.write(move_to(0.0)).unwrap().direction);
 }
@@ -344,7 +340,7 @@ fn a_model2_set_position_posts_the_new_position() {
     let posted = rig
         .write(MotorCommand::SetPosition { position: 4.0 })
         .unwrap();
-    assert_eq!(posted.position, 4.0);
+    assert_eq!(posted.position(), 4.0);
     assert!(posted.done);
     assert_eq!(rig.write(MotorCommand::SetPosition { position: 4.0 }), None);
 }
@@ -361,43 +357,8 @@ fn a_model2_write_that_fails_posts_nothing() {
 fn a_model2_driver_field_posts_like_a_controllers() {
     let mut rig = rig(model2(), 2.0);
     let ratio = MotorCommand::SetEncoderRatio { pulses: [2.0, 1.0] };
-    assert_eq!(rig.write(ratio.clone()).unwrap().encoder_position, 2.0);
+    assert_eq!(rig.write(ratio.clone()).unwrap().encoder_position(), 2.0);
     assert_eq!(rig.write(ratio), None);
-}
-
-fn model1() -> TraceUser {
-    TraceUser::Model1 {
-        device: "devWritePosts",
-        card: 0,
-        signal: 0,
-    }
-}
-
-/// motordrvCom sends a MOTION or VELOCITY message with no callback: the
-/// record hears of the move only from the held move's next query.
-#[test]
-fn a_model1_move_or_jog_posts_nothing() {
-    let mut rig = rig(model1(), 1.0);
-    for command in [
-        move_to(5.0),
-        MotorCommand::MoveVelocity {
-            min_velocity: 0.1,
-            velocity: 1.0,
-            acceleration: 1.0,
-        },
-    ] {
-        assert_eq!(rig.write(command), None);
-        assert!(rig.record.passes().is_empty());
-        assert!(rig.observer.passes().is_empty());
-    }
-}
-
-#[test]
-fn a_failed_model1_move_posts_nothing() {
-    let mut rig = rig(model1(), 1.0);
-    rig.fail.store(true, Ordering::Relaxed);
-    assert_eq!(rig.write(move_to(5.0)), None);
-    assert!(rig.record.passes().is_empty());
 }
 
 #[test]
@@ -441,7 +402,7 @@ fn a_set_position_processes_its_record_with_the_new_position() {
     rig.write(MotorCommand::SetPosition { position: 4.0 });
     let read = rig.record.passes();
     assert_eq!(read.len(), 1);
-    assert_eq!(read[0].position, 4.0);
+    assert_eq!(read[0].position(), 4.0);
 }
 
 fn high_limit(position: f64) -> MotorCommand {

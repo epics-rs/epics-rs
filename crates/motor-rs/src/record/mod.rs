@@ -6,16 +6,17 @@ mod state_machine;
 mod status_update;
 
 use epics_base_rs::error::CaResult;
+use epics_base_rs::server::device_support::DevicePost;
 use epics_base_rs::server::record::{
-    CycleMarks, CyclePostMask, FieldDesc, FieldIx, MonitorValueClasses, MonitorValueGate,
-    ParsedLink, ProcessAction, ProcessActions, ProcessOutcome, Record, ResolvedInputLinks,
-    parse_link_v2,
+    CycleMarks, CyclePostMask, EventMask, FieldDesc, FieldIx, LinkType, MonitorValueClasses,
+    MonitorValueGate, ParsedLink, ProcessAction, ProcessActions, ProcessOutcome, Record,
+    ResolvedInputLinks, load_constant_link_scalar, parse_link_v2,
 };
-use epics_base_rs::types::EpicsValue;
+use epics_base_rs::types::{DbFieldType, EpicsValue};
 
 use crate::coordinate;
 use crate::device_state::*;
-use crate::device_support::{DialLimitReset, LimitBuild};
+use crate::device_support::{DialLimitReset, EndTrans, LimitBuild};
 use crate::fields::*;
 use crate::flags::*;
 
@@ -54,6 +55,9 @@ pub struct MotorRecord {
     initialized: bool,
     /// Monotonic counter for delay request IDs
     next_delay_id: u64,
+    /// C `pmr->dol.type`, the framework's ([`Record::set_link_type`]): only
+    /// the DOL as `iocInit` resolved it tells a local name from a CA one.
+    dol_type: LinkType,
 }
 
 /// C `CALLBACK_VALUE`: why a pass reaches do_work.
@@ -190,6 +194,7 @@ impl Default for MotorRecord {
             device_state: None,
             initialized: false,
             next_delay_id: 0,
+            dol_type: LinkType::Constant,
         }
     }
 }
@@ -267,9 +272,48 @@ impl MotorRecord {
             return false;
         };
         if let Some(port) = &self.port {
-            port.send(commands, false);
+            let end = port.send(commands, false);
+            if let Some(post) = self.end_trans(end) {
+                self.internal.put_post_values.push_back(post);
+            }
         }
         true
+    }
+
+    /// One of init_controller's writes, sent as [`Self::send_special`] sends
+    /// and returning once it ran where its port runs it then
+    /// ([`CommandPort::send_init`](crate::device_support::CommandPort::send_init)).
+    /// Whether it ran.
+    pub(crate) fn send_init(&mut self, command: MotorCommand) -> bool {
+        if self.port.is_none() {
+            return false;
+        }
+        let Some(commands) = self.transaction(vec![command]) else {
+            return false;
+        };
+        self.port
+            .as_ref()
+            .is_some_and(|port| port.send_init(commands))
+    }
+
+    /// What `motor_end_trans_com` did to the record (motordevCom.cc:497-508):
+    /// with no card it sets DMOV and RA_PROBLEM, and posts DMOV there and
+    /// then, outside `monitor()`. The post is returned for the caller's
+    /// context to make: the device's in a pass, the put's in `special()`.
+    #[must_use]
+    pub(crate) fn end_trans(&mut self, end: EndTrans) -> Option<DevicePost> {
+        match end {
+            EndTrans::Passed => None,
+            EndTrans::NoCard => {
+                self.stat.dmov = 1;
+                self.stat.msta.insert(MstaFlags::PROBLEM);
+                Some(DevicePost {
+                    field: "DMOV",
+                    mask: EventMask::VALUE | EventMask::LOG,
+                    value: EpicsValue::Short(self.stat.dmov),
+                })
+            }
+        }
     }
 
     /// C `set_dial_highlimit`/`set_dial_lowlimit` (4236-4325): send the
@@ -418,7 +462,24 @@ impl MotorRecord {
     /// bypassed and VAL arrives only through the DOL link; a constant or
     /// CA DOL leaves the collection active even under closed loop.
     pub(crate) fn closed_loop_dol_collection(&self) -> bool {
-        self.links.omsl == 1 && matches!(parse_link_v2(&self.links.dol), ParsedLink::Db(_))
+        self.links.omsl == 1 && self.dol_type == LinkType::Db
+    }
+
+    /// The DOL under C init_record's `dol.type == CONSTANT` (677), the one
+    /// gate of the VAL seed and the UDF clear: an unset DOL is CONSTANT, a
+    /// `{const:…}` one a JSON_LINK.
+    fn constant_dol(&self) -> Option<ParsedLink> {
+        Some(parse_link_v2(&self.links.dol)).filter(ParsedLink::is_constant_type)
+    }
+
+    /// C init_record 680: `recGblInitConstantLink(&dol, DBF_DOUBLE, &val)`.
+    pub(crate) fn seed_val_from_dol(&mut self) {
+        let Some(dol) = self.constant_dol() else {
+            return;
+        };
+        if let Some(EpicsValue::Double(v)) = load_constant_link_scalar(&dol, DbFieldType::Double) {
+            self.pos.val = v;
+        }
     }
 
     /// True when a position field (VAL/DVAL/RVAL/RLV) was written during
@@ -512,7 +573,35 @@ impl MotorRecord {
         {
             self.limits.lvio = 1;
         }
+        // The closing monitor() (747) moves MLST/ALST to the init readback.
+        let _ = self.rbv_deadband();
         let _ = self.take_monitor_marks();
+    }
+
+    /// C `monitor()`'s RBV block (motorRecord.cc:3468-3507): the value and
+    /// archive classes RBV posts with, consuming its mark and moving the
+    /// record's own MLST/ALST on a crossing.
+    fn rbv_deadband(&mut self) -> (bool, bool) {
+        let marked = self.internal.mmap & m::RBV as u32 != 0;
+        self.unmark(m::RBV);
+        let (mdel, adel, rbv) = (self.disp.mdel, self.disp.adel, self.pos.rbv);
+        let crossed = |del: f64, last: &mut f64| {
+            del == 0.0
+                || ((*last - rbv).abs() > del && {
+                    *last = rbv;
+                    true
+                })
+        };
+        if !marked {
+            (false, false)
+        } else if mdel == 0.0 && adel == 0.0 {
+            (true, true)
+        } else {
+            (
+                crossed(mdel, &mut self.disp.mlst),
+                crossed(adel, &mut self.disp.alst),
+            )
+        }
     }
 
     /// The marks `monitor()` posts from, cleared as its `UNMARK_ALL` does
@@ -674,9 +763,9 @@ impl Record for MotorRecord {
         // CLOSED_LOOP: drive VAL from the DOL link (motorRecord.cc:1994-1999).
         // C reads DOL into .val only when `omsl == closed_loop && dol.type ==
         // DB_LINK`; a constant DOL is initialised once (recGblInitConstantLink,
-        // :680) and never re-read, so gate on the link parsing as a local DB
-        // link. Writing VAL records a VAL command-source, so the following
-        // process() plans the move to the link value.
+        // :680) and never re-read, and a CA one is never read, so gate on the
+        // resolved DB link. Writing VAL records a VAL command-source, so the
+        // following process() plans the move to the link value.
         //
         // Read only when DMOV (done): C calls do_work — the function holding
         // the DOL read — for `pmr->dmov` or a non-callback process, but NOT on
@@ -728,6 +817,12 @@ impl Record for MotorRecord {
         }
         if self.conv.urip && !self.conv.ueip {
             self.conv.rdbl_error = !resolved.contains("RDBL");
+        }
+    }
+
+    fn set_link_type(&mut self, link_field: &str, link_type: LinkType) {
+        if link_field == "DOL" {
+            self.dol_type = link_type;
         }
     }
 
@@ -876,6 +971,13 @@ impl Record for MotorRecord {
         CycleMarks::of(&MONITOR_POSTS, u128::from(bits))
     }
 
+    fn take_cycle_posted_value(&mut self) -> Option<(FieldIx, EventMask, EpicsValue)> {
+        let post = self.internal.put_post_values.pop_front()?;
+        let [ix] =
+            epics_base_rs::server::record::declared_set(dbd_generated::MOTOR_FIELDS, [post.field]);
+        Some((ix, post.mask, post.value))
+    }
+
     /// C `monitor()`'s RBV (motorRecord.cc:3468-3507): posted only when
     /// marked, through MDEL/ADEL unless both are zero.
     fn monitor_value_classes(
@@ -883,27 +985,7 @@ impl Record for MotorRecord {
         _gate: MonitorValueGate,
         last_posted: &mut [f64; 2],
     ) -> MonitorValueClasses {
-        let marked = self.internal.mmap & m::RBV as u32 != 0;
-        self.unmark(m::RBV);
-        let (mdel, adel, rbv) = (self.disp.mdel, self.disp.adel, self.pos.rbv);
-        let crossed = |del: f64, last: &mut f64| {
-            del == 0.0
-                || ((*last - rbv).abs() > del && {
-                    *last = rbv;
-                    true
-                })
-        };
-        let (value, archive) = if !marked {
-            (false, false)
-        } else if mdel == 0.0 && adel == 0.0 {
-            (true, true)
-        } else {
-            // C reads and writes the record's own MLST/ALST.
-            (
-                crossed(mdel, &mut self.disp.mlst),
-                crossed(adel, &mut self.disp.alst),
-            )
-        };
+        let (value, archive) = self.rbv_deadband();
         *last_posted = [self.disp.mlst, self.disp.alst];
         MonitorValueClasses {
             value,
@@ -952,16 +1034,14 @@ impl Record for MotorRecord {
     /// there: its tail and `monitor()` (`MotorRecord::init_tail`), and
     /// 677-681: a CONSTANT .dol, an unset one included, leaves the record
     /// defined. A DB_LINK / CA DOL stays undefined until the closed-loop
-    /// collection's first read (1994-2005).
+    /// collection's first read (1994-2005), and a `{const:…}` one, a
+    /// JSON_LINK, until a VAL put.
     fn post_init_finalize_undef(&mut self, udf: &mut u8) -> CaResult<()> {
         if !self.initialized {
             return Ok(());
         }
         self.init_tail();
-        if matches!(
-            parse_link_v2(&self.links.dol),
-            ParsedLink::None | ParsedLink::Constant(_)
-        ) {
+        if self.constant_dol().is_some() {
             *udf = 0;
         }
         Ok(())
@@ -1308,6 +1388,7 @@ mod tests {
         let mut rec = MotorRecord::new();
         rec.links.omsl = 1; // menuOmsl: closed_loop
         rec.links.dol = "setpoint_src.VAL".into(); // resolves to a DB link
+        rec.set_link_type("DOL", LinkType::Db);
         assert!(rec.stat.dmov != 0, "record starts done");
         assert!(
             has_dol_read(&rec.pre_process_actions()),
@@ -1320,6 +1401,7 @@ mod tests {
         let mut rec = MotorRecord::new();
         rec.links.omsl = 0; // supervisory
         rec.links.dol = "setpoint_src.VAL".into();
+        rec.set_link_type("DOL", LinkType::Db);
         assert!(
             !has_dol_read(&rec.pre_process_actions()),
             "supervisory OMSL must not read DOL"
@@ -1335,6 +1417,7 @@ mod tests {
         let mut rec = MotorRecord::new();
         rec.links.omsl = 1; // closed_loop
         rec.links.dol = "setpoint_src.VAL".into();
+        rec.set_link_type("DOL", LinkType::Db);
         assert!(rec.stat.dmov != 0, "record starts done");
         let mut common = CommonFields::default();
 
@@ -1401,11 +1484,11 @@ mod tests {
         let mut rec = MotorRecord::new();
         rec.links.dol = "".into(); // unset DOL == CONSTANT
         let status = asyn_rs::interfaces::motor::MotorStatus {
-            position: 0.0,
-            encoder_position: 0.0,
             done: true,
             moving: false,
-            ..Default::default()
+            ..asyn_rs::interfaces::motor::MotorStatus::default()
+                .with_position(0.0)
+                .with_encoder_position(0.0)
         };
         rec.initial_readback(&status);
         let mut udf = CommonFields::default().udf; // dbCommon default
@@ -1442,6 +1525,39 @@ mod tests {
         assert_eq!(rec.internal.mmap, 0, "init monitor() drains the marks");
     }
 
+    /// An idle record at dial 0 with OFF -0.49, through init's closing
+    /// monitor().
+    fn init_at_offset(mdel: f64, adel: f64) -> MotorRecord {
+        let mut rec = MotorRecord::new();
+        rec.pos.off = -0.49;
+        rec.disp.mdel = mdel;
+        rec.disp.adel = adel;
+        rec.init_record(1).unwrap();
+        rec.initial_readback(&asyn_rs::interfaces::motor::MotorStatus {
+            done: true,
+            ..Default::default()
+        });
+        rec.post_init_finalize_undef(&mut 1).unwrap();
+        rec
+    }
+
+    // C init_record's closing monitor() runs the RBV deadband (3482-3501):
+    // the init readback crossing MDEL or ADEL becomes MLST or ALST.
+    #[test]
+    fn init_monitor_moves_mlst_and_alst_to_the_readback() {
+        let rec = init_at_offset(0.001, 0.0);
+        assert_eq!((rec.disp.mlst, rec.disp.alst), (-0.49, 0.0));
+        let rec = init_at_offset(0.0, 0.001);
+        assert_eq!((rec.disp.mlst, rec.disp.alst), (0.0, -0.49));
+    }
+
+    // With both deadbands 0 C posts RBV without touching MLST/ALST (3468-3474).
+    #[test]
+    fn init_monitor_without_deadbands_leaves_mlst_and_alst() {
+        let rec = init_at_offset(0.0, 0.0);
+        assert_eq!((rec.disp.mlst, rec.disp.alst), (0.0, 0.0));
+    }
+
     // C leaves udf TRUE for a non-CONSTANT .dol (init_record only clears for
     // CONSTANT, 677-681); only the closed-loop collection's first successful
     // read clears it (1994-2005).
@@ -1451,12 +1567,13 @@ mod tests {
         let mut rec = MotorRecord::new();
         rec.links.omsl = 1; // closed_loop
         rec.links.dol = "setpoint_src.VAL".into(); // DB_LINK
+        rec.set_link_type("DOL", LinkType::Db);
         let status = asyn_rs::interfaces::motor::MotorStatus {
-            position: 0.0,
-            encoder_position: 0.0,
             done: true,
             moving: false,
-            ..Default::default()
+            ..asyn_rs::interfaces::motor::MotorStatus::default()
+                .with_position(0.0)
+                .with_encoder_position(0.0)
         };
         rec.initial_readback(&status);
         let mut udf = CommonFields::default().udf;
@@ -1487,6 +1604,7 @@ mod tests {
         let mut rec = MotorRecord::new();
         rec.links.omsl = 1;
         rec.links.dol = "setpoint_src.VAL".into();
+        rec.set_link_type("DOL", LinkType::Db);
         rec.stat.dmov = 0; // a move is in flight
         assert!(
             !has_dol_read(&rec.pre_process_actions()),
@@ -1521,11 +1639,11 @@ mod tests {
         // Driver reports completion; next process finalizes DMOV false→true.
         rec.set_event(MotorEvent::DeviceUpdate(
             asyn_rs::interfaces::motor::MotorStatus {
-                position: 10.0,
-                encoder_position: 10.0,
                 done: true,
                 moving: false,
-                ..Default::default()
+                ..asyn_rs::interfaces::motor::MotorStatus::default()
+                    .with_position(10.0)
+                    .with_encoder_position(10.0)
             },
         ));
         let _ = rec.process();

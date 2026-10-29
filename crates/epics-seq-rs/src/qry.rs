@@ -21,6 +21,7 @@ use epics_base_rs::server::builtin_devices::timestamp::epics_time_to_strftime_in
 use epics_base_rs::types::EpicsValue;
 use epics_libcom_rs::cfmt::CFloat;
 
+use crate::c::CSrc;
 use crate::prog::{seq_find_state_set, seq_traverse_prog};
 use crate::program::ProgOptions;
 use crate::pv::{pv_size_n, pv_time_get_current_double};
@@ -509,13 +510,14 @@ impl<V: ProgramVars> Program<V> {
                 };
                 pr!("  Status = {}\n", meta.status as i32);
                 pr!("  Severity = {}\n", meta.severity as i32);
-                let message = meta.message.as_deref().unwrap_or_default();
-                let end = message
-                    .iter()
-                    .position(|&b| b == 0)
-                    .unwrap_or(message.len());
+                let message = &meta.message;
+                let message = if message.is_null() {
+                    Vec::new()
+                } else {
+                    message.to_c_vec()
+                };
                 pr!("  Message = ");
-                pr_padded(&message[..end], 0);
+                pr_padded(&message, 0);
                 pr!("\n");
                 let ts = epics_time_to_strftime_in(28, "%Y-%m-%d %H:%M:%S.%06f", meta.timestamp);
                 pr!("  Time stamp = {ts}\n");
@@ -741,7 +743,9 @@ mod tests {
             timestamp: WallTime::UNIX_EPOCH,
             status,
             severity,
-            message: message.map(|m| Arc::from(m.as_bytes())),
+            message: message.map_or_else(crate::types::CharPtr::default, |m| {
+                crate::types::CharPtr::from_bytes(m.as_bytes())
+            }),
         }
     }
 
@@ -761,6 +765,7 @@ mod tests {
             stack_size: 0,
             gate: Arc::default(),
             pv_sys: PvSystem::create(&PvDatabase::new()),
+            db: PvDatabase::new(),
             chans: table
                 .chan
                 .iter()

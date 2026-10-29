@@ -1,0 +1,4 @@
+1..1
+# before put: x==1
+# on entry to state test_x: x==2
+ok  1 - when(): x==1

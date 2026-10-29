@@ -29,8 +29,9 @@ pub mod serial_port;
 #[path = "serial_port_win32.rs"]
 pub mod serial_port;
 
-/// The whole-millisecond interval a wait budget maps to, for every driver that
-/// has to hand one to `poll` or `SetCommTimeouts`.
+/// The whole-millisecond interval a wait budget maps to, for the serial drivers'
+/// `poll` and `SetCommTimeouts`; a socket's `poll` takes the same rule from
+/// `epics_libcom_rs::runtime::socket::poll_ready`.
 ///
 /// Two different zeros arrive here and collapsing them is the bug this owner
 /// exists to prevent:
@@ -45,7 +46,7 @@ pub mod serial_port;
 ///
 /// C reaches the same place from the other side: `readIt`/`writeIt` compute
 /// `pollmsec = (int)(timeout * 1000.0)` and then `if (pollmsec == 0) pollmsec =
-/// 1` (`drvAsynIPPort.c:741-743`, `:662-664`). Rounding every positive budget
+/// 1` (`drvAsynIPPort.c:792-794`, `:662-664`). Rounding every positive budget
 /// up is that floor generalised — C only ever sees the caller's timeout here,
 /// whereas the deadline loops also feed this a remainder. Each of those C
 /// triples ends `if (pollmsec < 0) pollmsec = -1`, the wait-forever case a

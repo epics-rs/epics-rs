@@ -1,0 +1,22 @@
+1..1
+# passed 500 cycles
+# passed 1000 cycles
+# passed 1500 cycles
+# passed 2000 cycles
+# passed 2500 cycles
+# passed 3000 cycles
+# passed 3500 cycles
+# passed 4000 cycles
+# passed 4500 cycles
+# passed 5000 cycles
+# passed 5500 cycles
+# passed 6000 cycles
+# passed 6500 cycles
+# passed 7000 cycles
+# passed 7500 cycles
+# passed 8000 cycles
+# passed 8500 cycles
+# passed 9000 cycles
+# passed 9500 cycles
+# passed 10000 cycles
+ok  1 - no error in 10000 cycles

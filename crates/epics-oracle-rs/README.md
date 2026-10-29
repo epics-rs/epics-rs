@@ -89,12 +89,13 @@ allowlist, `--dbd` the denominator (also `EPICS_ORACLE_DBD`), and
 
 Needs **two** C trees, and `CTools::discover` fails loudly if either is missing:
 
-- base's built tree for the client tools — default
-  `/home/stevek/work/epics-base/bin/linux-x86_64`, override `EPICS_BASE_BIN`.
-- the fat ground-truth IOC — default
-  `/home/stevek/work/oracle-ioc/bin/linux-x86_64/softIoc`, override
-  `EPICS_ORACLE_IOC_BIN`. `--dbd` defaults to that same tree's
-  `dbd/softIoc.dbd`.
+- base's built tree for the client tools — `EPICS_BASE_BIN`, such as
+  `$EPICS_BASE/bin/linux-x86_64`.
+- the fat ground-truth IOC — `EPICS_ORACLE_IOC_BIN`, the
+  `bin/linux-x86_64/softIoc` of an `oracle-ioc` tree. `--dbd` defaults to
+  `EPICS_ORACLE_DBD`, that same tree's `dbd/softIoc.dbd`.
+
+None of them has a default: an unset one is an error.
 
 The Rust side needs no variable: `RustIoc::binary` finds `oracle-ioc` beside
 the `oracle` binary (and under `cargo test`, through `CARGO_BIN_EXE_*`).
@@ -119,9 +120,9 @@ loudly rather than skipping when one is absent, on either backend.
 
 **The PVA ground truth is pinned to pvxs 1.5.3**, and both halves of it have to
 be that version: the client tools under `PVXS_BIN` and the `libpvxs`/`libpvxsIoc`
-the fat `softIocPVX` links. The default `PVXS_BIN` is therefore a `git worktree`
-at the tag (`/home/stevek/work/pvxs-wt-153`) and not the pvxs working checkout,
-which sits on whatever branch its owner is developing on. This is not a
+the fat `softIocPVX` links. `PVXS_BIN` is therefore the bin dir of a
+`git worktree` at the tag and not the pvxs working checkout, which sits on
+whatever branch its owner is developing on. This is not a
 formality: `8d9455a` "ioc: serve display.precision independent of
 DBR_GR_DOUBLE", released in 1.5.3, moved 63 `pva-read` channels from EXPECTED
 DEVIATION to AGREED and retired an allowlist row. Run the lane against an older
@@ -132,8 +133,8 @@ DEVIATION to AGREED and retired an allowlist row. Run the lane against an older
 `scaler` (default) adds scaler-rs's `scaler` record and its `Asyn Scaler` soft
 port to `oracle-ioc` (`--scaler-soft`), and builds `tests/scaler_oracle.rs`,
 which diffs the control scaler of `scaler-c8.db` against the C
-`oracleScalerIoc` — `EPICS_ORACLE_SCALER_IOC_BIN`, default
-`/home/stevek/work/epics-modules/oracle-ioc/bin/linux-x86_64/oracleScalerIoc`.
+`oracleScalerIoc` — `EPICS_ORACLE_SCALER_IOC_BIN`, such as
+`$EPICS_MODULES/oracle-ioc/bin/linux-x86_64/oracleScalerIoc`.
 Without it, `oracle-ioc` has neither. `oracle-ioc` also registers `swait` and
 optics-rs's `table`, which the fat dbd does not declare.
 

@@ -132,8 +132,8 @@ fn a_flush_with_an_octet_and_an_array_changed_allocates_nothing() {
         "flushAlloc",
         1,
         PortFlags::default(),
-        InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_INTERRUPTS,
+        InterfaceMask::NONE,
+        InterfaceMask::NONE,
     );
     base.own_interrupts(InterruptGate::opened());
     let msg = base.create_param("MSG", ParamType::Octet).unwrap();
@@ -207,8 +207,8 @@ fn an_octet_set_allocates_once_for_a_new_value_and_never_for_an_unchanged_one() 
         "ALLOCSET",
         1,
         PortFlags::default(),
-        InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_INTERRUPTS,
+        InterfaceMask::NONE,
+        InterfaceMask::NONE,
     );
     let msg = pl.create_param("MSG", ParamType::Octet).unwrap();
     pl.set_string_param(msg, 0, "first value").unwrap();
@@ -243,8 +243,8 @@ fn setting_and_flushing_256_params_allocates_nothing() {
         "ALLOCSET",
         1,
         PortFlags::default(),
-        InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_INTERRUPTS,
+        InterfaceMask::NONE,
+        InterfaceMask::NONE,
     );
     let ids: Vec<usize> = (0..256)
         .map(|i| pl.create_param(&format!("P{i}"), ParamType::Int32).unwrap())
@@ -281,8 +281,8 @@ fn a_flush_into_per_reason_mailboxes_neither_allocates_nor_frees() {
         "mbxFlush",
         1,
         PortFlags::default(),
-        InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_INTERRUPTS,
+        InterfaceMask::NONE,
+        InterfaceMask::NONE,
     );
     base.own_interrupts(InterruptGate::opened());
     let msg = base.create_param("MSG", ParamType::Octet).unwrap();
@@ -434,8 +434,8 @@ fn a_flush_with_an_async_subscriber_neither_allocates_nor_frees() {
         "asyncFlush",
         1,
         PortFlags::default(),
-        InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_INTERRUPTS,
+        InterfaceMask::NONE,
+        InterfaceMask::NONE,
     );
     base.own_interrupts(InterruptGate::opened());
     let msg = base.create_param("MSG", ParamType::Octet).unwrap();

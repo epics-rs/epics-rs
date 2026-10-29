@@ -244,6 +244,39 @@ impl DeviceTable {
         Ok(())
     }
 
+    /// C `shutdownPort` (asynManager.c:2253-2310), the one way a port becomes
+    /// defunct: under the `devices` lock, refuse a port that is not
+    /// destructible, clear `enabled` on the port and on every device, set
+    /// `defunct`; then, unlocked, announce `asynExceptionShutdown` on this
+    /// thread. Idempotent.
+    pub(crate) fn shut_down(&self, destructible: bool) -> AsynResult<()> {
+        {
+            let devices = self.devices.lock();
+            if self.shared.defunct.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            if !destructible {
+                return Err(AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: "asynManager:shutdownPort: port does not support shutting down".into(),
+                });
+            }
+            self.port.enabled.store(false, Ordering::Release);
+            // The invariant is `defunct ⟹ !enabled` on *every* dpCommon this
+            // port owns, not only the port's own. Clearing the device slots here
+            // is what makes it hold by construction: `locate_device` seeds a new
+            // slot from the port's now-false `enabled`, and `enable` refuses
+            // while defunct, so nothing can raise a slot back — and
+            // `dp_enabled` needs no defunct branch to answer correctly.
+            for ds in devices.values() {
+                ds.put_enabled(false);
+            }
+            self.shared.defunct.store(true, Ordering::Release);
+        }
+        self.announcer.announce(AsynException::Shutdown, -1);
+        Ok(())
+    }
+
     /// C `autoConnectAsyn` (asynManager.c:2318-2326): store, owe the port's
     /// connect timer to the actor when a disconnected dpCommon turns it on,
     /// then announce `asynExceptionAutoConnect` on this thread.
@@ -345,10 +378,12 @@ pub fn dp_common_key(multi_device: bool, addr: i32) -> Option<i32> {
 
 /// The parameter list C's `getAddress` (asynPortDriver.cpp:1901-1906) takes
 /// for a user at `addr`: `pasynManager->getAddr` is -1 on a port without
-/// `ASYN_MULTIDEVICE`, whatever the user asked for, and -1 is list 0. A
-/// request and an interrupt client resolve through this one rule.
+/// `ASYN_MULTIDEVICE`, whatever the user asked for, and for a user at any
+/// negative address, which `connectDevice` gives no device; -1 is list 0. A
+/// request and an interrupt client resolve through this one rule; a driver's
+/// own post address does not (see [`driver_list`]).
 pub fn param_list(multi_device: bool, addr: i32) -> i32 {
-    if multi_device && addr != -1 { addr } else { 0 }
+    if multi_device && addr >= 0 { addr } else { 0 }
 }
 
 /// What C `getAddress` reads of its port: whether `getAddr` reports the
@@ -385,7 +420,7 @@ use crate::interpose::{
     EomReason, EosSet, OctetInterpose, OctetInterposeStack, OctetNext, OctetReadResult,
 };
 use crate::interrupt::{InterruptManager, InterruptValue, OctetFanOut};
-use crate::param::{EnumEntry, InterruptReason, ParamList, ParamType, ParamValue};
+use crate::param::{EnumEntry, InterruptReason, ParamList, ParamType, ParamValue, driver_list};
 use crate::trace::TraceManager;
 use crate::user::{AsynUser, ConnectCheck};
 
@@ -532,9 +567,10 @@ pub fn c_str(data: &[u8]) -> &[u8] {
 /// Runs on a client `writeOctet` of one reason, after the value is stored and
 /// before the callbacks: what a C driver overrides the virtual `writeOctet`
 /// for (asynNDArrayDriver.cpp's `NDAttributesFile` reload). Takes the address
-/// and the text before the first NUL; C discards the handler's status for the
-/// callbacks'.
-pub type OctetWriteRule = Arc<dyn Fn(&mut PortDriverBase, i32, &[u8]) + Send + Sync>;
+/// and the text before the first NUL; an `Err` fails the write once the
+/// callbacks have run.
+pub type OctetWriteRule =
+    Arc<dyn Fn(&mut PortDriverBase, i32, &[u8]) -> AsynResult<()> + Send + Sync>;
 
 /// Whether an array post of one reason holds the driver's state, as an axis
 /// does, rather than a frame's data; read at each post, so a reason can hold
@@ -857,16 +893,17 @@ impl PortDriverBase {
         interrupt_mask: InterfaceMask,
     ) -> Self {
         let max_addr = max_addr.max(1);
+        // asynCommon is always registered (asynPortDriver.cpp:4015).
+        let interface_mask = interface_mask | InterfaceMask::COMMON;
         Self {
             port_name: port_name.into(),
             max_addr,
             flags,
             get_address: port_get_address,
-            // asynCommon is always registered (asynPortDriver.cpp:4015).
-            interface_mask: interface_mask | InterfaceMask::COMMON,
+            interface_mask,
             interrupt_mask,
             params: ParamList::new(max_addr),
-            interrupts: InterruptManager::with_sources(interrupt_mask),
+            interrupts: InterruptManager::with_masks(interface_mask, interrupt_mask),
             callback_thread: false,
             // C `dpCommonInit` (asynManager.c:523): every port starts down and
             // comes up through its driver's connect, which registration queues.
@@ -915,7 +952,8 @@ impl PortDriverBase {
         &mut self,
         gate: Arc<epics_libcom_rs::runtime::interrupt_accept::InterruptGate>,
     ) {
-        self.interrupts = InterruptManager::owned_by(gate, self.interrupt_mask);
+        self.interrupts =
+            InterruptManager::owned_by(gate, self.interface_mask, self.interrupt_mask);
     }
 
     /// The EOS entry the given `asynUser` addr selects — see [`eos_device_key`].
@@ -1836,40 +1874,7 @@ impl PortDriverBase {
     /// the runtime can drive the same lifecycle via
     /// [`crate::manager::PortManager::shutdown_port`].
     pub fn shutdown_lifecycle(&mut self) -> AsynResult<()> {
-        // C holds `asynManagerLock` from the defunct check to the store
-        // (asynManager.c:2264-2306), which is what [`DeviceTable::enable`]
-        // takes: no enable can land between them.
-        let devices = Arc::clone(&self.device_states);
-        let devices = devices.lock();
-        if self.is_defunct() {
-            // Idempotent — C asynManager.c:2268-2271 returns asynSuccess.
-            return Ok(());
-        }
-        if !self.flags.destructible {
-            return Err(AsynError::Status {
-                status: AsynStatus::Error,
-                message: "asynManager:shutdownPort: port does not support shutting down".into(),
-            });
-        }
-        self.enabled.store(false, Ordering::Release);
-        // The invariant is `defunct ⟹ !enabled` on *every* dpCommon this port
-        // owns, not only the port's own. Clearing the device slots here is what
-        // makes it hold by construction: [`Self::device_state`] seeds a new slot
-        // from the port's now-false `enabled`, and [`Self::set_addr_enabled`]
-        // refuses while defunct, so nothing can raise a slot back — and
-        // [`Self::dp_enabled`] needs no defunct branch to answer correctly.
-        // Without this, a slot that happened to exist before the shutdown kept
-        // `enabled = true`, so `isEnabled(ADDR)` answered true on a port that is
-        // gone while `isEnabled(-1)` answered false — the same read disagreeing
-        // with itself depending on whether anything had ever touched that
-        // address.
-        for ds in devices.values() {
-            ds.put_enabled(false);
-        }
-        self.shared.defunct.store(true, Ordering::Release);
-        drop(devices);
-        self.announce_exception(AsynException::Shutdown, -1);
-        Ok(())
+        self.device_table().shut_down(self.flags.destructible)
     }
 
     /// Check that port + device address are both ready — the whole of C's
@@ -2314,9 +2319,10 @@ impl PortDriverBase {
         let addr = self.parse_user(user)?;
         let text = c_str(data);
         let _ = self.set_string_param(user.reason, addr, text);
-        if let Some(Some(rule)) = self.octet_write_rules.get(user.reason) {
-            rule.clone()(self, addr, text);
-        }
+        let ruled = match self.octet_write_rules.get(user.reason) {
+            Some(Some(rule)) => rule.clone()(self, addr, text),
+            _ => Ok(()),
+        };
         let writer = self.octet_writer;
         self.call_param_callbacks(addr).map_err(|e| {
             param_access_error_by(
@@ -2327,6 +2333,17 @@ impl PortDriverBase {
                 e,
                 format_args!("value={}", crate::fixed_text::LossyText(text)),
             )
+        })?;
+        ruled.map_err(|e| AsynError::Status {
+            status: e.status(),
+            message: param_access_message(
+                writer,
+                &self.params,
+                user,
+                "writeOctet",
+                e.c_status_code(),
+                format_args!("value={}", crate::fixed_text::LossyText(text)),
+            ),
         })?;
         self.trace_io_by(
             writer,
@@ -2661,11 +2678,8 @@ impl PortDriverBase {
         // C stamps every callback with getTimeStamp (asynPortDriver.cpp:610-637).
         let ts = self.time_stamp;
         let interrupts = &self.interrupts;
-        // A C driver calls back on the list `getAddress` resolved, never on
-        // getAddr's -1, and its single-device clients filter on that list.
-        let list = param_list(self.flags.multi_device, addr);
         self.params.flush_changed(addr, |params, reason| {
-            let post = scalar_callback(params, reason, addr, list, ts)?;
+            let post = scalar_callback(params, reason, addr, ts)?;
             let fired = post.is_some();
             if let Some(iv) = post {
                 interrupts.notify(iv);
@@ -2685,9 +2699,8 @@ impl PortDriverBase {
             return Ok(());
         }
         if self.params.take_changed_single(reason, addr)? {
-            let list = param_list(self.flags.multi_device, addr);
             let ts = self.time_stamp;
-            if let Some(iv) = scalar_callback(&mut self.params, reason, addr, list, ts)? {
+            if let Some(iv) = scalar_callback(&mut self.params, reason, addr, ts)? {
                 self.interrupts.notify(iv);
             }
         }
@@ -2737,8 +2750,7 @@ impl PortDriverBase {
         let ts = self.time_stamp;
         self.interrupts.notify(InterruptValue {
             reason,
-            // The list, as `call_param_callbacks` fires.
-            addr: param_list(self.flags.multi_device, addr),
+            addr: driver_list(addr),
             value,
             timestamp: ts,
             uint32_changed_mask,
@@ -2837,7 +2849,7 @@ impl PortDriverBase {
         let alarm_severity = self.get_param_alarm_severity(reason, addr).unwrap_or(0);
         self.interrupts.notify(InterruptValue {
             reason,
-            addr: param_list(self.flags.multi_device, addr),
+            addr: driver_list(addr),
             value,
             timestamp: self.time_stamp,
             uint32_changed_mask: 0,
@@ -3108,7 +3120,6 @@ fn scalar_callback(
     params: &mut ParamList,
     reason: usize,
     addr: i32,
-    list: i32,
     timestamp: SystemTime,
 ) -> AsynResult<Option<InterruptValue>> {
     let value = params.get_value(reason, addr)?;
@@ -3126,7 +3137,7 @@ fn scalar_callback(
         .unwrap_or((AsynStatus::Success, 0, 0));
     Ok(Some(InterruptValue {
         reason,
-        addr: list,
+        addr: driver_list(addr),
         value,
         timestamp,
         uint32_changed_mask,
@@ -3299,12 +3310,9 @@ pub trait PortDriver: Any + Send + Sync {
 
     /// Whether this driver registered `asynOctet` — C's
     /// `pasynStdInterfaces->octet.pinterface != NULL`, which is set from the
-    /// constructor's `interfaceMask` (asynPortDriver.cpp:4062). The Rust analogue
-    /// of that mask is [`Self::capabilities`].
+    /// constructor's `interfaceMask` (asynPortDriver.cpp:4062).
     fn has_octet_interface(&self) -> bool {
-        self.capabilities()
-            .iter()
-            .any(|c| c.interface_type() == crate::interfaces::InterfaceType::Octet)
+        self.base().interface_mask().contains(InterfaceMask::OCTET)
     }
 
     // --- Scalar I/O (cache-based defaults, timeout not applicable) ---
@@ -3489,28 +3497,32 @@ pub trait PortDriver: Any + Send + Sync {
         base.params.get_uint32_interrupt(user.reason, addr, reason)
     }
 
-    // --- Enum I/O (cache-based defaults) ---
+    // --- Enum I/O (default: not implemented, as in C) ---
 
-    fn read_enum(&mut self, user: &AsynUser) -> AsynResult<(usize, Arc<[EnumEntry]>)> {
-        self.base().params.get_enum(user.reason, user.addr)
+    fn read_enum(&mut self, _user: &AsynUser) -> AsynResult<(usize, Arc<[EnumEntry]>)> {
+        Err(AsynError::Status {
+            status: AsynStatus::Error,
+            message: "asynPortDriver:readEnum not implemented".into(),
+        })
     }
 
-    fn write_enum(&mut self, user: &mut AsynUser, index: usize) -> AsynResult<()> {
-        self.base_mut()
-            .params
-            .set_enum_index(user.reason, user.addr, index)?;
-        self.base_mut().call_param_callbacks(user.addr)
+    /// C's asynEnum has no index write; this refuses as its `writeEnum` does.
+    fn write_enum(&mut self, _user: &mut AsynUser, _index: usize) -> AsynResult<()> {
+        Err(AsynError::Status {
+            status: AsynStatus::Error,
+            message: "asynPortDriver:writeEnum not implemented".into(),
+        })
     }
 
     fn write_enum_choices(
         &mut self,
-        user: &mut AsynUser,
-        choices: Arc<[EnumEntry]>,
+        _user: &mut AsynUser,
+        _choices: Arc<[EnumEntry]>,
     ) -> AsynResult<()> {
-        self.base_mut()
-            .params
-            .set_enum_choices(user.reason, user.addr, choices)?;
-        self.base_mut().call_param_callbacks(user.addr)
+        Err(AsynError::Status {
+            status: AsynStatus::Error,
+            message: "asynPortDriver:writeEnum not implemented".into(),
+        })
     }
 
     // --- GenericPointer I/O (default: not implemented, as in C) ---
@@ -3748,14 +3760,14 @@ pub trait PortDriver: Any + Send + Sync {
     // The four command methods of C's `asynGpib` interface (asynGpibDriver.h:47-51),
     // which asynGpib.c passes straight through to the driver's `asynGpibPort`
     // (asynGpib.c:472-496). A driver that implements them declares
-    // [`crate::interfaces::Capability::Gpib`], and that declaration is what a
+    // [`crate::interfaces::InterfaceMask::GPIB`], and that declaration is what a
     // client's `findInterface(asynGpibType)` answers — asynRecord reads it into
     // GPIBIV and refuses UCMD/ACMD when it is 0 (asynRecord.c:1232-1241,
     // :1647-1651).
     //
-    // The defaults refuse: a port that has not declared the capability can only
-    // be reached here by a caller that skipped the registry, and C has nothing
-    // to call in that case (the interface pointer is NULL).
+    // The defaults refuse. The actor refuses a port that has not declared the
+    // capability before it gets here, so they answer only a driver that
+    // declares GPIB without implementing it.
     //
     // Not ported: the `asynGpibPort` methods that exist solely to drive
     // asynGpib's SRQ poll thread — `srqStatus`, `srqEnable`, `serialPollBegin`,
@@ -3827,19 +3839,6 @@ pub trait PortDriver: Any + Send + Sync {
     /// Default: [`PortDriverBase::drv_user_create`].
     fn drv_user_create(&mut self, req: &DrvUserRequest) -> AsynResult<DrvUserInfo> {
         self.base().drv_user_create(req)
-    }
-
-    // --- Capabilities ---
-
-    /// Declare the capabilities this driver supports. Default: those of the
-    /// interfaces in [`PortDriverBase::interface_mask`].
-    fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
-        self.base().interface_mask().capabilities()
-    }
-
-    /// Check if this driver supports a specific capability.
-    fn supports(&self, cap: crate::interfaces::Capability) -> bool {
-        self.capabilities().contains(&cap)
     }
 
     fn init(&mut self) -> AsynResult<()> {
@@ -4038,8 +4037,8 @@ pub(crate) mod tests {
                 "md",
                 max_addr,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::NONE,
+                InterfaceMask::NONE,
             );
             assert_eq!(base.flags.multi_device, multi, "maxAddr {max_addr}");
         }
@@ -4061,8 +4060,8 @@ pub(crate) mod tests {
                 "chunk",
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::NONE,
+                InterfaceMask::NONE,
             );
             base.octet_interrupt_process = true;
             base.init_connected(true);
@@ -4184,8 +4183,8 @@ pub(crate) mod tests {
             "octend",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.own_interrupts(gate);
         let msg = base.create_param("MSG", ParamType::Octet).unwrap();
@@ -4274,8 +4273,8 @@ pub(crate) mod tests {
             "gate",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.own_interrupts(gate.clone());
         let val = base.create_param("VAL", ParamType::Int32).unwrap();
@@ -4337,8 +4336,8 @@ pub(crate) mod tests {
             "owed",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.own_interrupts(gate.clone());
         let axis = base.create_param("AXIS", ParamType::Int32Array).unwrap();
@@ -4403,8 +4402,8 @@ pub(crate) mod tests {
             "openrecord",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.own_interrupts(owner.clone());
         let axis = base.create_param("AXIS", ParamType::Int32Array).unwrap();
@@ -4448,8 +4447,8 @@ pub(crate) mod tests {
                 "test",
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::DRV_USER,
+                InterfaceMask::NONE,
             );
             base.own_interrupts(InterruptGate::opened());
             base.create_param("VAL", ParamType::Int32).unwrap();
@@ -4570,8 +4569,8 @@ pub(crate) mod tests {
             "list_only",
             2,
             flags,
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::DRV_USER,
+            InterfaceMask::NONE,
         );
         let own = base
             .create_param_in_list(0, "OWN", ParamType::Int32)
@@ -4782,52 +4781,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_default_read_write_enum() {
-        use crate::param::EnumEntry;
-
-        let mut base = PortDriverBase::new(
-            "test_enum",
-            1,
-            PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
-        );
-        base.create_param("MODE", ParamType::Enum).unwrap();
-
-        struct EnumDriver {
-            base: PortDriverBase,
-        }
-        impl PortDriver for EnumDriver {
-            fn base(&self) -> &PortDriverBase {
-                &self.base
-            }
-            fn base_mut(&mut self) -> &mut PortDriverBase {
-                &mut self.base
-            }
-        }
-
-        let mut drv = EnumDriver { base };
-        let choices: Arc<[EnumEntry]> = Arc::from(vec![
-            EnumEntry {
-                string: "Off".into(),
-                value: 0,
-                severity: 0,
-            },
-            EnumEntry {
-                string: "On".into(),
-                value: 1,
-                severity: 0,
-            },
-        ]);
-        let mut user = AsynUser::new(0);
-        drv.write_enum_choices(&mut user, choices).unwrap();
-        drv.write_enum(&mut user, 1).unwrap();
-        let (idx, ch) = drv.read_enum(&AsynUser::new(0)).unwrap();
-        assert_eq!(idx, 1);
-        assert_eq!(ch[1].string, "On");
-    }
-
-    #[test]
     fn test_enum_callback() {
         use crate::param::{EnumEntry, ParamValue};
 
@@ -4836,8 +4789,8 @@ pub(crate) mod tests {
             "test_enum_cb",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.own_interrupts(InterruptGate::opened());
         base.create_param("MODE", ParamType::Enum).unwrap();
@@ -4890,8 +4843,8 @@ pub(crate) mod tests {
             "test_cb_enum",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.own_interrupts(InterruptGate::opened());
         let owner = base.create_param("MODE", ParamType::Enum).unwrap();
@@ -4929,8 +4882,8 @@ pub(crate) mod tests {
             "test_flush_scalars",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.own_interrupts(InterruptGate::opened());
         let count = base.create_param("COUNT", ParamType::Int32).unwrap();
@@ -4974,8 +4927,8 @@ pub(crate) mod tests {
             "test_cb_array",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.own_interrupts(InterruptGate::opened());
         let wave = base.create_param("WAVE", ParamType::Int32Array).unwrap();
@@ -5009,6 +4962,118 @@ pub(crate) mod tests {
         );
     }
 
+    /// A driver's post address is compared raw with each client's resolved
+    /// list (asynPortDriver.cpp:1848-1852): -1 is list 0, -2 is no list.
+    #[test]
+    fn a_post_at_minus_two_reaches_no_list_zero_client() {
+        use crate::interrupt::{InterruptFilter, InterruptValue};
+        use crate::param::ParamValue;
+        use std::sync::{Arc, Mutex};
+
+        let mut base = PortDriverBase::new(
+            "test_post_minus_two",
+            1,
+            PortFlags {
+                multi_device: true,
+                ..PortFlags::default()
+            },
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
+        );
+        base.own_interrupts(InterruptGate::opened());
+        let wave = base.create_param("WAVE", ParamType::Int32Array).unwrap();
+        let mode = base.create_param("MODE", ParamType::Int32).unwrap();
+        let seen: Arc<Mutex<Vec<(usize, i32)>>> = Arc::default();
+        let sink = seen.clone();
+        let _sub = base
+            .interrupts
+            .register_sync_callback(
+                InterruptFilter {
+                    addr: Some(0),
+                    ..Default::default()
+                },
+                move |iv: &InterruptValue| sink.lock().unwrap().push((iv.reason, iv.addr)),
+            )
+            .unwrap();
+        let array = || ParamValue::Int32Array(vec![1].into());
+        let int32 = |b: &PortDriverBase, addr| {
+            b.notify_interface_value(
+                mode,
+                addr,
+                InterfaceType::Int32,
+                ParamValue::Int32(1),
+                0,
+                AsynStatus::Success,
+            )
+        };
+
+        base.do_callbacks_array(wave, -2, array()).unwrap();
+        int32(&base, -2);
+        base.do_callbacks_enum(mode, -2, Vec::new().into()).unwrap();
+        base.set_int32_param(mode, 0, 2).unwrap();
+        assert!(base.call_param_callbacks(-2).is_err());
+        assert_eq!(*seen.lock().unwrap(), []);
+
+        base.do_callbacks_array(wave, -1, array()).unwrap();
+        int32(&base, 0);
+        base.call_param_callbacks(-1).unwrap();
+        assert_eq!(*seen.lock().unwrap(), [(wave, 0), (mode, 0), (mode, 0)]);
+    }
+
+    /// asynPortDriver's own readEnum and writeEnum refuse
+    /// (asynPortDriver.cpp:3464-3469, :3494-3499), whatever the param holds.
+    #[test]
+    fn the_default_enum_io_is_not_implemented() {
+        use crate::param::EnumEntry;
+
+        struct EnumDriver {
+            base: PortDriverBase,
+        }
+        impl PortDriver for EnumDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+        }
+
+        let mut base = PortDriverBase::new(
+            "test_enum_default",
+            1,
+            PortFlags::default(),
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
+        );
+        let mode = base.create_param("MODE", ParamType::Enum).unwrap();
+        let mut drv = EnumDriver { base };
+        let mut user = AsynUser::new(mode);
+        let not_implemented = |e: AsynError, op: &str| {
+            assert_eq!(
+                (e.status(), e.message()),
+                (
+                    AsynStatus::Error,
+                    format!("asynPortDriver:{op} not implemented")
+                )
+            );
+        };
+
+        let held = drv.base.params.get_enum(mode, 0).unwrap();
+        not_implemented(drv.read_enum(&user).unwrap_err(), "readEnum");
+        let choices: Arc<[EnumEntry]> = vec![EnumEntry {
+            string: "A".into(),
+            value: 0,
+            severity: 0,
+        }]
+        .into();
+        not_implemented(
+            drv.write_enum_choices(&mut user, choices).unwrap_err(),
+            "writeEnum",
+        );
+        not_implemented(drv.write_enum(&mut user, 0).unwrap_err(), "writeEnum");
+        assert_eq!(drv.base.params.get_enum(mode, 0).unwrap(), held);
+    }
+
     /// asynPortDriver's own readGenericPointer and writeGenericPointer
     /// refuse (asynPortDriver.cpp:3301-3306, :3328-3333).
     #[test]
@@ -5017,8 +5082,8 @@ pub(crate) mod tests {
             "test_gp",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.create_param("PTR", ParamType::GenericPointer).unwrap();
 
@@ -5065,8 +5130,8 @@ pub(crate) mod tests {
             "test_gp_cb",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.own_interrupts(InterruptGate::opened());
         base.create_param("PTR", ParamType::GenericPointer).unwrap();
@@ -5257,8 +5322,8 @@ pub(crate) mod tests {
                     multi_device: true,
                     ..PortFlags::default()
                 },
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::NONE,
+                InterfaceMask::NONE,
             ),
         };
 
@@ -5447,8 +5512,8 @@ pub(crate) mod tests {
             "reset_test",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.install_octet_interpose(Box::new(CountingInterpose(resets.clone())));
 
@@ -5473,8 +5538,8 @@ pub(crate) mod tests {
             "test_i64",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.create_param("BIG", ParamType::Int64).unwrap();
 
@@ -5502,8 +5567,8 @@ pub(crate) mod tests {
             "test_bounds",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         struct BoundsDriver {
             base: PortDriverBase,
@@ -5533,8 +5598,8 @@ pub(crate) mod tests {
                 can_block: false,
                 destructible: true,
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.create_param("V", ParamType::Int32).unwrap();
 
@@ -5563,8 +5628,8 @@ pub(crate) mod tests {
             "single",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.create_param("V", ParamType::Int32).unwrap();
         base.init_connected(true);
@@ -5578,8 +5643,8 @@ pub(crate) mod tests {
             "ts_test",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.create_param("V", ParamType::Int32).unwrap();
 
@@ -5612,8 +5677,8 @@ pub(crate) mod tests {
             "ts_cb",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.own_interrupts(InterruptGate::opened());
         base.create_param("V", ParamType::Int32).unwrap();
@@ -5681,8 +5746,8 @@ pub(crate) mod tests {
                 can_block: false,
                 destructible: false,
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         match base.shutdown_lifecycle() {
             Err(AsynError::Status { message, .. }) => {
@@ -5711,8 +5776,8 @@ pub(crate) mod tests {
                 can_block: false,
                 destructible: true,
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         assert!(base.is_enabled());
         assert!(!base.is_defunct());
@@ -5761,8 +5826,8 @@ pub(crate) mod tests {
                 can_block: false,
                 destructible: true,
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.create_param("V", ParamType::Int32).unwrap();
         base.init_connected(true);
@@ -5786,8 +5851,8 @@ pub(crate) mod tests {
                 can_block: false,
                 destructible: true,
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.create_param("V", ParamType::Int32).unwrap();
         base.init_connected(true);
@@ -5811,8 +5876,8 @@ pub(crate) mod tests {
                 can_block: false,
                 destructible: true,
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.create_param("V", ParamType::Int32).unwrap();
 
@@ -5835,8 +5900,8 @@ pub(crate) mod tests {
                 can_block: false,
                 destructible: true,
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.create_param("V", ParamType::Int32).unwrap();
 
@@ -5865,8 +5930,8 @@ pub(crate) mod tests {
             "bind_late",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         let worker = base.exception_announcer();
         let table = base.device_table();
@@ -5902,8 +5967,8 @@ pub(crate) mod tests {
                 can_block: false,
                 destructible: true,
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.create_param("V", ParamType::Int32).unwrap();
         let exc_mgr = Arc::new(crate::exception::ExceptionManager::new());
@@ -5953,8 +6018,8 @@ pub(crate) mod tests {
             "ac",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         let exc_mgr = Arc::new(crate::exception::ExceptionManager::new());
         base.bind_exception_sink(exc_mgr.clone());
@@ -5987,8 +6052,8 @@ pub(crate) mod tests {
             "act",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.set_auto_connect(false);
         base.set_connected(false);
@@ -6002,8 +6067,8 @@ pub(crate) mod tests {
             "act2",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.set_auto_connect(false);
         base.set_connected(false);
@@ -6015,8 +6080,8 @@ pub(crate) mod tests {
             "act3",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.init_connected(true);
         base.set_auto_connect(true);
@@ -6029,13 +6094,8 @@ pub(crate) mod tests {
             multi_device: true,
             ..PortFlags::default()
         };
-        let mut base = PortDriverBase::new(
-            "act4",
-            2,
-            multi,
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
-        );
+        let mut base =
+            PortDriverBase::new("act4", 2, multi, InterfaceMask::NONE, InterfaceMask::NONE);
         base.init_connected(true);
         assert!(base.connect_retry_at.is_none());
         base.set_auto_connect_addr(1, true);
@@ -6049,8 +6109,8 @@ pub(crate) mod tests {
             "act5",
             2,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.init_connected(true);
         base.set_auto_connect_addr(1, true);
@@ -6069,8 +6129,8 @@ pub(crate) mod tests {
             "thr",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
 
         // No transition recorded yet => always permitted (C's
@@ -6099,8 +6159,8 @@ pub(crate) mod tests {
             "thr",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.init_connected(true);
         assert!(base.last_connect_disconnect.is_none());
@@ -6122,13 +6182,8 @@ pub(crate) mod tests {
             multi_device: true,
             ..PortFlags::default()
         };
-        let mut base = PortDriverBase::new(
-            "thr",
-            4,
-            flags,
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
-        );
+        let mut base =
+            PortDriverBase::new("thr", 4, flags, InterfaceMask::NONE, InterfaceMask::NONE);
         let t0 = Instant::now();
         base.connect_addr(1);
 
@@ -6154,13 +6209,8 @@ pub(crate) mod tests {
             multi_device: true,
             ..PortFlags::default()
         };
-        let mut base = PortDriverBase::new(
-            "devarm",
-            4,
-            flags,
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
-        );
+        let mut base =
+            PortDriverBase::new("devarm", 4, flags, InterfaceMask::NONE, InterfaceMask::NONE);
         base.init_connected(true);
         base.connect_addr(1);
         base.connect_addr(2);
@@ -6183,13 +6233,8 @@ pub(crate) mod tests {
             destructible: true,
             ..PortFlags::default()
         };
-        let mut base = PortDriverBase::new(
-            "def",
-            1,
-            flags,
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
-        );
+        let mut base =
+            PortDriverBase::new("def", 1, flags, InterfaceMask::NONE, InterfaceMask::NONE);
         let exc_mgr = Arc::new(crate::exception::ExceptionManager::new());
         base.bind_exception_sink(exc_mgr.clone());
         let enable_hits = Arc::new(AtomicUsize::new(0));
@@ -6226,13 +6271,8 @@ pub(crate) mod tests {
             destructible: true,
             ..PortFlags::default()
         };
-        let mut base = PortDriverBase::new(
-            "def",
-            4,
-            flags,
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
-        );
+        let mut base =
+            PortDriverBase::new("def", 4, flags, InterfaceMask::NONE, InterfaceMask::NONE);
         let exc_mgr = Arc::new(crate::exception::ExceptionManager::new());
         base.bind_exception_sink(exc_mgr.clone());
         let enable_hits = Arc::new(AtomicUsize::new(0));
@@ -6279,13 +6319,8 @@ pub(crate) mod tests {
         };
 
         // Boundary 1: a slot that exists before the shutdown.
-        let mut base = PortDriverBase::new(
-            "shut",
-            4,
-            flags,
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
-        );
+        let mut base =
+            PortDriverBase::new("shut", 4, flags, InterfaceMask::NONE, InterfaceMask::NONE);
         base.set_addr_enabled(1, true).unwrap();
         assert!(base.device_states.lock().contains_key(&1));
         base.shutdown_lifecycle().unwrap();
@@ -6295,13 +6330,8 @@ pub(crate) mod tests {
 
         // Boundary 2: no slot at shutdown, one created afterwards — the seed
         // in `device_state` takes the port's `enabled`, which is now false.
-        let mut base = PortDriverBase::new(
-            "shut2",
-            4,
-            flags,
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
-        );
+        let mut base =
+            PortDriverBase::new("shut2", 4, flags, InterfaceMask::NONE, InterfaceMask::NONE);
         base.shutdown_lifecycle().unwrap();
         assert!(!base.dp_enabled(1));
         assert!(
@@ -6333,8 +6363,8 @@ pub(crate) mod tests {
             "uint32_int",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         let idx = base
             .params
@@ -6393,8 +6423,8 @@ pub(crate) mod tests {
             "undef_read",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         let i32_idx = base.params.create_param("I32", ParamType::Int32).unwrap();
         let i64_idx = base.params.create_param("I64", ParamType::Int64).unwrap();
@@ -6504,8 +6534,8 @@ pub(crate) mod tests {
             "errmsg",
             1,
             flags,
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::DRV_USER,
+            InterfaceMask::NONE,
         );
         for (name, t) in [
             ("I32", ParamType::Int32),
@@ -6759,8 +6789,8 @@ pub(crate) mod tests {
                 multi_device: true,
                 ..PortFlags::default()
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         let n = base.params.create_param("N", ParamType::Int32).unwrap();
         let x = base.params.create_param("X", ParamType::Float64).unwrap();
@@ -6849,17 +6879,14 @@ pub(crate) mod tests {
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.base
             }
-            fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
-                crate::interfaces::octet_transport_capabilities()
-            }
         }
 
         let mut base = PortDriverBase::new(
             "eos_rep",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OCTET_TRANSPORT,
+            InterfaceMask::OCTET,
         );
         // See `a_single_device_port_collapses_every_addr_onto_one_eos`: the
         // EOS layer is what makes a terminator settable at all (R18-71).
@@ -6909,8 +6936,8 @@ pub(crate) mod tests {
                 "opt_rep",
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::NONE,
+                InterfaceMask::NONE,
             ),
         };
         drv.set_option(&mut AsynUser::default(), "baud", "9600")
@@ -6937,8 +6964,8 @@ pub(crate) mod tests {
             "tcreate",
             2,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         services.bind(&mut base);
         let trace = services.trace();
@@ -6994,8 +7021,8 @@ pub(crate) mod tests {
             "tstat",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         services.bind(&mut base);
         let trace = services.trace();
@@ -7076,8 +7103,8 @@ pub(crate) mod tests {
             "tprint",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         services.bind(&mut base);
         let trace = services.trace();
@@ -7113,13 +7140,8 @@ pub(crate) mod tests {
             multi_device: true,
             ..PortFlags::default()
         };
-        let mut base = PortDriverBase::new(
-            "tpat",
-            4,
-            flags,
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
-        );
+        let mut base =
+            PortDriverBase::new("tpat", 4, flags, InterfaceMask::NONE, InterfaceMask::NONE);
         services.bind(&mut base);
         let trace = services.trace();
         trace.register_port("tpat", true);
@@ -7157,8 +7179,8 @@ pub(crate) mod tests {
             "tpsrc",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         services.bind(&mut base);
         let trace = services.trace();
@@ -7191,8 +7213,8 @@ pub(crate) mod tests {
             "traw",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         services.bind(&mut base);
         let trace = services.trace();

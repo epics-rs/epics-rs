@@ -59,7 +59,10 @@ fn read_after_prompt_ioc_init(db: &std::path::Path, port: u16) -> Option<Option<
             .expect("CA client");
         let ch = client.create_channel("PR");
         ch.wait_connected(Duration::from_secs(5)).await.ok()?;
-        ch.get().await.map(|(_, v)| v).ok()
+        ch.get_with_timeout(fact_budget::FACT_BUDGET)
+            .await
+            .map(|(_, v)| v)
+            .ok()
     });
     drop(rt);
 

@@ -65,15 +65,17 @@ fn a_malformed_group_file_aborts_inside_iocbuild_with_pvxs_text() {
         .stderr(out)
         .spawn()
         .expect("spawn the IOC child");
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    // It exits, or says it is serving; a clock would run out in its boot.
     let status = loop {
-        if let Some(status) = child.try_wait().unwrap() {
+        let exited = child.try_wait().unwrap();
+        let output = std::fs::read_to_string(&log).unwrap();
+        if let Some(status) = exited {
             break status;
         }
-        if std::time::Instant::now() > deadline {
+        if output.contains("iocRun: All initialization complete\n") {
             let _ = child.kill();
             let _ = child.wait();
-            panic!("the IOC kept running on a malformed group file");
+            panic!("the IOC kept running on a malformed group file: {output}");
         }
         std::thread::sleep(Duration::from_millis(50));
     };

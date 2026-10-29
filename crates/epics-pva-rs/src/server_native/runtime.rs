@@ -10,7 +10,7 @@ use crate::error::{PvaError, PvaResult};
 use super::search_engine::ServerInterfaces;
 use super::serv_iface::tcp_bind_addresses;
 use super::source::{ChannelInvalidator, ChannelSource, ChannelSourceObj, DynSource};
-use super::udp::{UdpServe, random_guid, serve_udp};
+use super::udp::{SearchReplier, random_guid, serve_udp};
 use crate::sock_attach::can_ipv6;
 
 // The config record moved to [`super::config`] so the protocol layer can name
@@ -348,15 +348,42 @@ impl PvaServer {
         // per-connection config copy, so it is stamped on before any copy.
         config.guid = guid;
         let pvxs_config = pvxs_config_text(&config, &interfaces, requested_udp_port).into();
+        // pvxs's collector reads from its bind (`udp_collector.cpp:169`), so
+        // the responders do too, answering nothing until `start`.
+        let beacons = super::beacon::beacon_destinations(
+            config.beacon_destinations.clone(),
+            config.auto_beacon,
+            &interfaces.bcast_ifaces(),
+            udp.port,
+        );
+        let (udp_alive, v4_guard) = Liveness::guarded();
+        let (udp_v6_alive, v6_guard) = Liveness::guarded();
+        let udp_v6_alive = udp.v6.is_some().then_some(udp_v6_alive);
+        let (udp_start, started) = tokio::sync::watch::channel(None);
+        let udp_handle = tokio::spawn(serve_udp(
+            udp,
+            config.ignore_addrs.clone(),
+            started,
+            beacons,
+            super::beacon::BeaconCycle::new(
+                config.beacon_period,
+                config.beacon_period_long,
+                config.beacon_burst_count,
+            ),
+            v4_guard,
+            v6_guard,
+        ));
         Ok(BoundPvaServer {
             config,
             pvxs_config,
             guid,
-            interfaces,
             tcp_listeners,
             bound_tcp_port,
             bound_tls_port,
-            udp,
+            udp_handle,
+            udp_start,
+            udp_alive,
+            udp_v6_alive,
             builtin: Arc::new(super::SharedSource::new()),
         })
     }
@@ -581,18 +608,24 @@ impl PvaServer {
 }
 
 /// A [`PvaServer`] bound by [`PvaServer::bind`] that serves nothing yet. Its
-/// listeners queue connections and its search socket queues searches until
-/// [`Self::start`], as pvxs's do until `Server::Pvt::start` (`server.cpp:555`).
+/// listeners queue connections until [`Self::start`]; its search sockets are
+/// read from the bind, forwarding a local unicast SEARCH and answering none,
+/// as pvxs's collector is until `Server::Pvt::start` (`server.cpp:555`).
+/// Dropping it closes the search sockets.
 pub struct BoundPvaServer {
     config: PvaServerConfig,
     /// [`pvxs_config_text`] of the bound server.
     pvxs_config: Arc<str>,
     guid: [u8; 12],
-    interfaces: ServerInterfaces,
     tcp_listeners: Vec<tokio::net::TcpListener>,
     bound_tcp_port: u16,
     bound_tls_port: u16,
-    udp: crate::server_native::udp::UdpBind,
+    /// The search responders, reading since the bind ([`serve_udp`]).
+    udp_handle: tokio::task::JoinHandle<PvaResult<()>>,
+    /// Their started state, sent once by [`Self::start`].
+    udp_start: tokio::sync::watch::Sender<Option<SearchReplier>>,
+    udp_alive: Liveness,
+    udp_v6_alive: Option<Liveness>,
     builtin: Arc<super::SharedSource>,
 }
 
@@ -634,11 +667,13 @@ impl BoundPvaServer {
             config,
             pvxs_config,
             guid,
-            interfaces,
             tcp_listeners,
             bound_tcp_port,
             bound_tls_port,
-            udp,
+            udp_handle,
+            udp_start,
+            udp_alive,
+            udp_v6_alive,
             builtin,
         } = self;
         // The live per-peer registry is created up-front so the
@@ -678,33 +713,15 @@ impl BoundPvaServer {
         } else {
             bound_tcp_port
         };
-        let beacons = super::beacon::beacon_destinations(
-            config.beacon_destinations.clone(),
-            config.auto_beacon,
-            &interfaces.bcast_ifaces(),
-            udp.port,
-        );
-        let (udp_alive, v4_guard) = Liveness::guarded();
-        let (udp_v6_alive, v6_guard) = Liveness::guarded();
-        let udp_v6_alive = udp.v6.is_some().then_some(udp_v6_alive);
-        let udp_handle = tokio::spawn(serve_udp(
-            udp,
-            UdpServe {
-                source: dyn_source.clone(),
-                tcp_port: advertised_tcp_port,
-                guid,
-                protocol,
-                ignore_addrs: config.ignore_addrs.clone(),
-            },
-            beacons,
-            super::beacon::BeaconCycle::new(
-                config.beacon_period,
-                config.beacon_period_long,
-                config.beacon_burst_count,
-            ),
-            v4_guard,
-            v6_guard,
-        ));
+        // pvxs's search listeners and beacon timer (`server.cpp:555-599`).
+        // A send fails only when the responders have ended, which
+        // `udp_handle` reports.
+        let _ = udp_start.send(Some(SearchReplier {
+            source: dyn_source.clone(),
+            tcp_port: advertised_tcp_port,
+            guid,
+            protocol,
+        }));
         // One accept loop per bound interface, supervised by a single
         // task so the `PvaServer` keeps its single-handle shape (Drop /
         // run / wait / report / stop are unchanged). The supervisor owns

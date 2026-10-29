@@ -19,6 +19,7 @@
 # errlog thread decides. After the run the log has "FIELD value" for VAL
 # SEVR STAT UDF PACT PROC, from dbgf. C's scanValue(long&) line ends "failed\n"
 # without a line end; the line of another file it runs into is cut off it.
+# The protocol directory, this one, is written <dir>.
 # Options (a comma list, '-' for none): "intr" makes the record SCAN
 # "I/O Intr", not processed by the script; "noproc" processes nothing;
 # "proc2" puts PROC 2, not 1; "twice" processes a second time; "tpro"
@@ -152,7 +153,7 @@ EOC
     # errlog's thread prints its "sevr=" lines when it runs, kept last,
     # and writes each whole, which may land after the thread name of a
     # line printed in pieces: that name goes back on the line after it
-    perl -ne '$_ = $carry . $_; $carry = "";
+    HERE=$here perl -ne '$_ = $carry . $_; $carry = ""; s/\Q$ENV{HERE}\E/<dir>/g;
         if (s/^(.*?)(sevr=\w+ )/$2/) { $carry = $1; push @e, $_; next } END { print map { "errlog\t$_" } @e }
         next unless $on ||= /Stream(Epics|Core)\.cc:\d+: /;
         # dbgf of an ENUM array, not the device, prints it

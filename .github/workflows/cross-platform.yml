@@ -56,7 +56,10 @@ jobs:
   build:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: ${{ matrix.timeout || 45 }}
+    # A cold Unix build (macos-arm64 17-24 min on fork runs, whose ci/*
+    # branches never restore a cache) plus the Test step's 30 min cap, so a
+    # hang still ends at that cap rather than here.
+    timeout-minutes: ${{ matrix.timeout || 60 }}
     strategy:
       # One platform failing must not cancel the others — each cell
       # reports portability independently.
@@ -158,7 +161,7 @@ jobs:
       # reads epics-base sources directly and this job provisions none.
       # Below the job timeout, so a hang fails this step and the job log is
       # kept; `--status-level slow` is what prints the SLOW line naming a
-      # stuck test (profile.ci stops at `retry`). Unix cells take ~15 min; Windows sets its own.
+      # stuck test (profile.ci stops at `retry`). Unix cells take 12-25 min; Windows sets its own.
       - name: Test (nextest)
         timeout-minutes: ${{ matrix.test_timeout || 30 }}
         run: cargo nextest run --workspace --exclude epics-oracle-rs --profile ci --status-level slow

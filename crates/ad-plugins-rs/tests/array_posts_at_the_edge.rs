@@ -114,7 +114,7 @@ fn array_posts_a_record_receives<P: NDPluginProcess>(
     let send = |values: Vec<f64>| {
         let frame = NDArray::with_data(
             vec![NDDimension::new(values.len())],
-            NDDataBuffer::F64(values),
+            NDDataBuffer::from_vec::<f64>(values),
         );
         let frame = ad_core_rs::ndarray_pool::DriverPool::standalone(0)
             .alloc_copy(&frame)

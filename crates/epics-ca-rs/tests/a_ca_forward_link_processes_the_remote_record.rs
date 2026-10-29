@@ -180,19 +180,21 @@ fn ca_forward_links_process_the_remote_record_once_per_source_process() {
 /// draws another while A stays up.
 fn forward_links_on(tgt: &std::path::Path, src: &std::path::Path, a_port: u16) -> Option<()> {
     let mut a = Ioc::start(tgt, a_port, "127.0.0.1")?;
-    let pick = || loop {
-        let p = named_port::free_for_tcp_and_udp();
-        if p != a_port {
-            break p;
-        }
-    };
     // B's first number is held here, so every run takes the retry that a
     // steal under a parallel suite forces.
-    let mut held = None;
+    let held = named_port::HeldPort::closed_udp();
+    let mut first = Some(held.port);
+    let pick = || {
+        first.take().unwrap_or_else(|| {
+            loop {
+                let p = named_port::free_for_tcp_and_udp();
+                if p != a_port {
+                    break p;
+                }
+            }
+        })
+    };
     let (mut b, b_port) = named_port::on_a_named_port_from(pick, |b_port| {
-        held.get_or_insert_with(|| {
-            std::net::UdpSocket::bind(("127.0.0.1", b_port)).expect("hold B's first port")
-        });
         Some((
             Ioc::start(src, b_port, &format!("127.0.0.1:{a_port}"))?,
             b_port,

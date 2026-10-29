@@ -10,6 +10,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
 use epics_base_rs::runtime::task::spawn_blocking_background;
+use epics_base_rs::server::record::OwnFrame;
 use epics_base_rs::server::snapshot::Snapshot;
 use epics_libcom_rs::cfmt::CFloat;
 
@@ -17,7 +18,7 @@ use crate::rec_dyn_link::{
     ACCESS_READ, ACCESS_WRITE, CaType, Deliver, FATAL_ERROR, Io, LinkEvent, LinkHost, LinkSpec,
 };
 
-/// Link events in arrival order. A link task records its event here without
+/// Link events in arrival order. A `recDynLink` thread records an event here without
 /// the record's lock, then applies the queue under it; `special`, which runs
 /// under that lock, applies it itself while it waits for a connect.
 #[derive(Default)]
@@ -55,9 +56,10 @@ impl Inbox {
 use super::*;
 
 impl SscanRecord {
-    /// The closure a link's task hands its events to: queued, then applied
-    /// under the record's lock from a callback worker, so the link reactor
-    /// never waits on that lock and keeps feeding a `special` that holds it.
+    /// The closure a link's events are handed to: queued, then applied
+    /// under the record's lock from a callback worker, so the `recDynLink`
+    /// threads never wait on that lock and keep feeding a `special` that
+    /// holds it.
     fn deliver(&self, li: usize) -> Option<Deliver> {
         let h = self.handle.clone()?;
         let name = self.name.clone();
@@ -67,17 +69,17 @@ impl SscanRecord {
             inbox.push(li, generation, event);
             let (h, name) = (h.clone(), name.clone());
             drop(spawn_blocking_background(prio, move |_| {
-                with_sscan(&h, &name, |s| s.drain_inbox())
+                with_sscan(&h, &name, |s, own| s.drain_inbox(own))
             }));
         }))
     }
 
     /// Every queued link event, oldest first: `recDynLink` applies it, then
     /// the callback C would call runs.
-    fn drain_inbox(&mut self) {
+    fn drain_inbox(&mut self, own: OwnFrame<'_>) {
         while let Some((li, generation, event)) = self.inbox.pop() {
             if let Some(cb) = self.links[li].apply(generation, event) {
-                self.dispatch(li, cb);
+                self.dispatch(own, li, cb);
             }
         }
     }
@@ -86,7 +88,7 @@ impl SscanRecord {
     /// (`sscanRecord.c:1315-1350`): up to `sscanRecordConnectWaitSeconds`.
     /// C's callbacks clear the flags without the record lock this put holds;
     /// the port's run under it, so the wait applies arriving events itself.
-    pub(crate) fn wait_for_connect(&mut self, li: usize) {
+    pub(crate) fn wait_for_connect(&mut self, own: OwnFrame<'_>, li: usize) {
         let busy = |s: &Self| {
             s.lpvt[li].connect_in_progress
                 || (link_type(li) == LinkType::PositionerIn && s.lpvt[li].waiting_for_pos_mon)
@@ -109,16 +111,16 @@ impl SscanRecord {
         // C sleeps a whole second between checks.
         let secs = knob(&SSCAN_RECORD_CONNECT_WAIT_SECONDS).max(0);
         for _ in 0..secs {
-            self.drain_inbox();
+            self.drain_inbox(own);
             if !busy(self) {
                 return;
             }
             let second = Instant::now() + std::time::Duration::from_secs(1);
             while self.inbox.wait(second) {
-                self.drain_inbox();
+                self.drain_inbox(own);
             }
         }
-        self.drain_inbox();
+        self.drain_inbox(own);
         if !busy(self) {
             return;
         }
@@ -129,9 +131,9 @@ impl SscanRecord {
         ));
     }
 
-    fn dispatch(&mut self, li: usize, cb: Cb) {
+    fn dispatch(&mut self, own: OwnFrame<'_>, li: usize, cb: Cb) {
         match cb {
-            Cb::Search => self.pv_search_callback(li),
+            Cb::Search => self.pv_search_callback(own, li),
             Cb::PosMon => self.pos_mon_callback(li),
             Cb::PosMonGet => self.pos_mon_get_cb(li),
             Cb::Notify => self.notify_callback(li),
@@ -161,7 +163,7 @@ impl SscanRecord {
     /// C `dbNameToAddr(pvn[i], pAddr)` for read-back or detector `i`: when
     /// it resolves, the PV is read by `dbGet` and the search callback runs
     /// now, with no link.
-    fn lookup_local(&mut self, i: usize) -> bool {
+    fn lookup_local(&mut self, own: OwnFrame<'_>, i: usize) -> bool {
         let nelem = self
             .handle
             .as_ref()
@@ -175,18 +177,21 @@ impl SscanRecord {
         if self.links[i].is_added() {
             self.links[i].clear();
         }
-        self.pv_search_callback(i);
+        self.pv_search_callback(own, i);
         true
     }
 
     /// C `dbGet(puserPvt->pAddr, ty, .., &nRequest = n)` on local link `li`.
-    pub(crate) fn db_get(&self, li: usize, ty: DbFieldType, n: usize) -> Option<Snapshot> {
-        self.handle.as_ref()?.db_get(
-            self.pvn[li % NUM_PVS].as_bytes(),
-            ty,
-            n,
-            Some((self.name.as_bytes(), self as &dyn Record)),
-        )
+    pub(crate) fn db_get(
+        &self,
+        own: OwnFrame<'_>,
+        li: usize,
+        ty: DbFieldType,
+        n: usize,
+    ) -> Option<Snapshot> {
+        self.handle
+            .as_ref()?
+            .db_get(self.pvn[li % NUM_PVS].as_bytes(), ty, n, Some(own.of(self)))
     }
 
     /// `recDynLinkGetNelem`, or `pAddr->no_elements` for a local PV.
@@ -197,7 +202,7 @@ impl SscanRecord {
     }
 
     /// C `lookupPV`: open the link(s) of PV name `i`.
-    pub(crate) fn lookup_pv(&mut self, i: usize) {
+    pub(crate) fn lookup_pv(&mut self, own: OwnFrame<'_>, i: usize) {
         // A `.DESC` field is read as `.VAL`.
         let b = self.pvn[i].as_bytes();
         if let Some(dot) = b.iter().rposition(|&c| c == b'.') {
@@ -225,13 +230,13 @@ impl SscanRecord {
                     return;
                 }
                 self.lpvt[i].ts = false;
-                if !self.lookup_local(i) {
+                if !self.lookup_local(own, i) {
                     self.lpvt[i].connect_in_progress = true;
                     self.add_link(i, &pv, Io::Input, CaType::Double, false);
                 }
             }
             LinkType::Detector => {
-                if !self.lookup_local(i) {
+                if !self.lookup_local(own, i) {
                     self.lpvt[i].connect_in_progress = true;
                     self.add_link(i, &pv, Io::Input, CaType::Float, false);
                 }
@@ -245,7 +250,7 @@ impl SscanRecord {
     }
 
     /// C `pvSearchCallback`: a link (dis)connected.
-    fn pv_search_callback(&mut self, li: usize) {
+    fn pv_search_callback(&mut self, own: OwnFrame<'_>, li: usize) {
         let pv = li % NUM_PVS;
         let lt = link_type(li);
         let input = matches!(
@@ -308,7 +313,7 @@ impl SscanRecord {
                 let di = pv - D1_IN;
                 let (units, precision, limits) = if self.lpvt[li].local.is_some() {
                     // C's `dbGet` fills an absent property with zeros.
-                    match self.db_get(li, DbFieldType::Float, 1) {
+                    match self.db_get(own, li, DbFieldType::Float, 1) {
                         Some(s) => {
                             let u = s.units().map_or(&[][..], |u| u.as_bytes());
                             (
@@ -669,11 +674,11 @@ mod tests {
         });
         let h = db.async_handle();
         let (done, waited) = tokio::sync::oneshot::channel();
-        // Off this runtime, which may be the one the link's task runs on.
+        // Off this runtime, which may be the one a network link runs on.
         std::thread::spawn(move || {
-            with_sscan(&h, "S", |s: &mut SscanRecord| {
+            with_sscan(&h, "S", |s: &mut SscanRecord, own| {
                 s.pvn[T1_OUT] = PvString::from_bytes(b"M");
-                s.pv_written(T1_OUT);
+                s.pv_written(own, T1_OUT);
                 {
                     let queued = |events: &std::collections::VecDeque<(usize, u64, LinkEvent)>| {
                         events
@@ -686,7 +691,7 @@ mod tests {
                 }
                 assert!(s.lpvt[T1_OUT].connect_in_progress);
                 let t0 = std::time::Instant::now();
-                s.wait_for_connect(T1_OUT);
+                s.wait_for_connect(own, T1_OUT);
                 let _ = done.send((t0.elapsed(), s.lpvt[T1_OUT].connect_in_progress));
             });
         });
@@ -724,7 +729,7 @@ mod tests {
         });
         let h = db.async_handle();
         std::thread::spawn(move || {
-            with_sscan(&h, "SNAN", |s: &mut SscanRecord| {
+            with_sscan(&h, "SNAN", |s: &mut SscanRecord, _| {
                 for cv in [f64::NAN, -f64::NAN] {
                     s.pos[0].cv = cv;
                     s.pos_mon_callback(0);

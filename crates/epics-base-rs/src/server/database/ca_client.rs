@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::task::{Context, Poll, Wake, Waker};
 
-use super::ca_link::{LocalChannel, LocalMonitor, StateNotify};
+use super::ca_link::{LocalChannel, StateNotify};
 use super::{PvDatabase, PvDatabaseInner};
 use crate::error::CaError;
 use crate::runtime::task::{
@@ -64,13 +64,16 @@ pub trait ClientChannel: Send + Sync {
     /// `ca_array_get_callback` of `count` elements of `dbr_type`.
     async fn get(&self, dbr_type: u16, count: u32) -> Result<Snapshot, String>;
 
-    /// `ca_add_masked_array_event` of `count` elements of `dbr_type`.
+    /// `ca_add_masked_array_event` of `count` elements of `dbr_type`: each
+    /// value reaches `callback` until the subscription drops, one callback
+    /// at a time per context.
     async fn subscribe(
         &self,
         dbr_type: u16,
         count: u32,
         mask: u16,
-    ) -> Result<Box<dyn ClientMonitor>, String>;
+        callback: Box<dyn Fn(Snapshot) + Send + Sync>,
+    ) -> Result<ClientSubscription, String>;
 
     /// `ca_array_put` (`callback == false`, completion `None`) or
     /// `ca_array_put_callback`: the put is issued when this returns, and its
@@ -79,10 +82,19 @@ pub trait ClientChannel: Send + Sync {
     -> Result<Option<PutCompletion>, String>;
 }
 
-/// One `evid`: each value the subscription delivers, `None` once it ended.
-#[async_trait::async_trait]
-pub trait ClientMonitor: Send {
-    async fn next(&mut self) -> Option<Snapshot>;
+/// One `evid`: dropping it is `ca_clear_subscription`. It does not wait
+/// for a callback already running.
+pub struct ClientSubscription {
+    _held: Box<dyn Send>,
+}
+
+impl ClientSubscription {
+    /// A subscription that ends when `held` drops.
+    pub fn new(held: impl Send + 'static) -> Self {
+        Self {
+            _held: Box::new(held),
+        }
+    }
 }
 
 /// The network context's half of [`CaClientContext::create_channel`].
@@ -93,14 +105,19 @@ pub trait CaClientService: Send + Sync {
     async fn create_channel(&self, name: &str) -> Option<Arc<dyn ClientChannel>>;
 }
 
-/// libca's context with `dbContext` installed as its service.
+/// libca's context with `dbContext` installed as its service. Its clones
+/// are the same context.
 #[derive(Clone)]
 pub struct CaClientContext {
     db: Weak<PvDatabaseInner>,
+    /// `dbContext`'s event context: every in-process subscription of this
+    /// context queues here.
+    events: InProcessEvents,
 }
 
 impl PvDatabase {
-    /// The CA client context records of this database open channels on.
+    /// A new CA client context (`ca_context_create`) records of this
+    /// database open channels on.
     pub fn ca_client(&self) -> CaClientContext {
         CaClientContext::from_weak(Arc::downgrade(&self.inner))
     }
@@ -108,7 +125,16 @@ impl PvDatabase {
 
 impl CaClientContext {
     pub(super) fn from_weak(db: Weak<PvDatabaseInner>) -> Self {
-        Self { db }
+        Self {
+            db,
+            events: InProcessEvents::default(),
+        }
+    }
+
+    /// The event context this context's in-process subscriptions deliver
+    /// on, and its puts run as.
+    pub fn events(&self) -> &InProcessEvents {
+        &self.events
     }
 
     fn db(&self) -> Option<PvDatabase> {
@@ -124,6 +150,7 @@ impl CaClientContext {
         if let Some(channel) = LocalChannel::create(&db, name.as_bytes()).await {
             return Some(Arc::new(LocalClientChannel {
                 channel,
+                events: self.events.clone(),
                 announced: std::sync::atomic::AtomicBool::new(false),
             }));
         }
@@ -138,7 +165,11 @@ impl CaClientContext {
         let db = self.db()?;
         let bridge = db.inner.link_puts.network()?.clone();
         let channel = in_caller(&bridge, LocalChannel::create(&db, name.as_bytes())).ok()??;
-        Some(InProcessChannel { channel, bridge })
+        Some(InProcessChannel {
+            channel,
+            bridge,
+            events: self.events.clone(),
+        })
     }
 
     /// `dbContext::createChannel`'s network context alone, for a name
@@ -185,6 +216,8 @@ fn in_caller<F: Future>(bridge: &BlockingBridge, fut: F) -> Result<F::Output, No
 pub struct InProcessChannel {
     channel: LocalChannel,
     bridge: BlockingBridge,
+    /// Its context's.
+    events: InProcessEvents,
 }
 
 impl InProcessChannel {
@@ -203,52 +236,54 @@ impl InProcessChannel {
         read(&self.channel, dbr_type, count)
     }
 
-    /// `dbChannelIO::subscribe` on `events`: the first event is queued, not
-    /// delivered, and each reaches `callback` as `count` elements of
-    /// `dbr_type`.
+    /// `dbChannelIO::subscribe` on its context's event context: the first
+    /// event is queued, not delivered, and each reaches `callback` as
+    /// `count` elements of `dbr_type`.
     pub fn subscribe(
         &self,
-        events: &InProcessEvents,
         dbr_type: u16,
         count: u32,
         mask: u16,
         callback: impl Fn(Snapshot) + Send + Sync + 'static,
     ) -> Result<InProcessSubscription, String> {
-        let events = &events.0.0;
-        events.start()?;
-        let db = self.channel.db().ok_or("database gone")?;
-        let (pre_chain, notify) = self.channel.state_notify(dbr_type);
-        let route = Arc::new(Route {
-            notify,
+        subscribe(
+            &self.channel,
+            &self.events,
+            dbr_type,
             count,
-            callback: Box::new(callback),
-            canceled: AtomicBool::new(false),
-        });
-        let context: DeliveryContext = route.clone();
-        let reader = self
-            .channel
-            .add_event(&db, &events.user, mask, &context, pre_chain)
-            .map_err(|e| format!("{e:?}"))?;
-        Ok(InProcessSubscription {
-            _reader: reader,
-            route,
-        })
+            mask,
+            Box::new(callback),
+        )
     }
 
-    /// `dbChannelIO::write`: `dbChannel_put`, done when this returns.
+    /// `dbChannelIO::write`: `dbChannel_put`, done when this returns, run
+    /// as a put of its context.
     pub fn put(&self, value: EpicsValue) -> Result<(), String> {
         let value = put_value(&self.channel, value);
-        in_caller(&self.bridge, self.channel.issue_put(value, false))
+        let put = self
+            .events
+            .0
+            .0
+            .running
+            .run(self.channel.issue_put(value, false));
+        in_caller(&self.bridge, put)
             .map_err(|e| e.to_string())?
             .map(drop)
     }
 
-    /// `dbChannelIO::write` with a notify: issued when this returns, and the
-    /// returned future is its completion. [`CaError::Timeout`] is
-    /// `dbPutNotifyBlocker`'s wait for the put in flight running out.
-    pub fn put_callback(&self, value: EpicsValue) -> Result<PutCompletion, CaError> {
+    /// `dbChannelIO::write` with a notify, run as a put of its context:
+    /// issued when this returns, and `issued` takes its completion
+    /// while the put still runs, as C's `callDone` runs inside it for a
+    /// record done at once. [`CaError::Timeout`] is `dbPutNotifyBlocker`'s
+    /// wait for the put in flight running out.
+    pub fn put_callback<R>(
+        &self,
+        value: EpicsValue,
+        issued: impl FnOnce(PutCompletion) -> R,
+    ) -> Result<R, CaError> {
         let value = put_value(&self.channel, value);
-        in_caller(&self.bridge, self.channel.put_callback(value))
+        let put = async { self.channel.put_callback(value).await.map(issued) };
+        in_caller(&self.bridge, self.events.0.0.running.run(put))
             .map_err(|e| CaError::Protocol(e.to_string()))?
     }
 }
@@ -257,8 +292,10 @@ impl InProcessChannel {
 /// every in-process subscription of a client context attaches to, and
 /// `CAC-event`, its consumer, which the first subscription starts at the
 /// lowest priority above its own thread's. Entries reach their callbacks
-/// one at a time in post order, on that thread or in [`Self::deliver`].
-/// The thread returns when the last clone drops (`db_close_events`).
+/// one at a time in post order, on that thread or in [`Self::deliver`],
+/// each after the runs of the context's puts going when it is taken
+/// (`Running`). The thread returns when the last clone
+/// drops (`db_close_events`).
 #[derive(Clone, Default)]
 pub struct InProcessEvents(Arc<EventsOwner>);
 
@@ -290,6 +327,7 @@ struct Events {
     /// Held across an entry's take and its callback, so entries reach their
     /// callbacks in post order whichever thread takes them.
     consumer: parking_lot::Mutex<()>,
+    running: Running,
     starting: parking_lot::Mutex<()>,
     started: OnceLock<Started>,
     stop: AtomicBool,
@@ -381,9 +419,74 @@ impl Events {
             if let CircuitEvent::Event { context, event, .. } = entry
                 && let Some(route) = context.downcast_ref::<Route>()
             {
+                self.running.wait();
                 route.deliver(event);
             }
         }
+    }
+}
+
+/// The puts of a client context while they run on their callers, each poll
+/// of one a run; what a run posts reaches its callback after the run. C's
+/// `CAC-event` must be woken and scheduled before it delivers, so
+/// `dbChannelIO::write` is ordinarily back in the poster first
+/// (MM4005_trajectoryScan's `pvPut(motorMDVS[j])` then
+/// `efClear(motorMDVSMon)` sees the event after the clear on 287 of 300 C
+/// boots). A put parked between polls (`dbPutNotifyBlocker`, a postponed
+/// write) runs nothing and holds up no one, as C's blocked caller does
+/// not, and no put waits for another.
+#[derive(Default)]
+struct Running {
+    /// The next run's number, and the numbers of the runs not ended.
+    runs: parking_lot::Mutex<(u64, Vec<u64>)>,
+    ended: parking_lot::Condvar,
+}
+
+impl Running {
+    /// `put`, each poll of it a run.
+    async fn run<F: Future>(&self, put: F) -> F::Output {
+        let mut put = std::pin::pin!(put);
+        std::future::poll_fn(|cx| {
+            let _run = Run::start(self);
+            put.as_mut().poll(cx)
+        })
+        .await
+    }
+
+    /// Until each run going now has ended; one started later is not waited
+    /// for.
+    fn wait(&self) {
+        let mut runs = self.runs.lock();
+        let now = runs.0;
+        while runs.1.iter().any(|&run| run < now) {
+            self.ended.wait(&mut runs);
+        }
+    }
+}
+
+/// One poll of a put, ended on every exit.
+struct Run<'a> {
+    running: &'a Running,
+    number: u64,
+}
+
+impl<'a> Run<'a> {
+    fn start(running: &'a Running) -> Self {
+        let mut runs = running.runs.lock();
+        let number = runs.0;
+        runs.0 += 1;
+        runs.1.push(number);
+        Run { running, number }
+    }
+}
+
+impl Drop for Run<'_> {
+    fn drop(&mut self) {
+        let mut runs = self.running.runs.lock();
+        if let Some(at) = runs.1.iter().position(|&run| run == self.number) {
+            runs.1.swap_remove(at);
+        }
+        self.running.ended.notify_all();
     }
 }
 
@@ -407,10 +510,11 @@ impl Route {
     }
 }
 
-/// A subscription on an [`InProcessEvents`]. Dropping it cancels the event
-/// (`db_cancel_event`), and no entry taken after reaches the callback. It
-/// does not wait for a callback already running, as C's cancel does: a drop
-/// can come under a lock that callback takes, so the client waits itself.
+/// A subscription on a context's [`InProcessEvents`]. Dropping it cancels
+/// the event (`db_cancel_event`), and no entry taken after reaches the
+/// callback. It does not wait for a callback already running, as C's
+/// cancel does: a drop can come under a lock that callback takes, so the
+/// client waits itself.
 pub struct InProcessSubscription {
     _reader: EventReader,
     route: Arc<Route>,
@@ -429,18 +533,35 @@ fn read(channel: &LocalChannel, dbr_type: u16, count: u32) -> Result<Snapshot, S
         .ok_or_else(|| "dbChannel_get failed".to_string())
 }
 
-/// `dbChannelIO::subscribe`.
+/// `dbChannelIO::subscribe` on `events`: the first event is queued, not
+/// delivered, and each reaches `callback` as `count` elements of
+/// `dbr_type`.
 fn subscribe(
     channel: &LocalChannel,
+    events: &InProcessEvents,
     dbr_type: u16,
     count: u32,
     mask: u16,
-) -> Result<Box<dyn ClientMonitor>, String> {
+    callback: Box<dyn Fn(Snapshot) + Send + Sync>,
+) -> Result<InProcessSubscription, String> {
+    let events = &events.0.0;
+    events.start()?;
     let db = channel.db().ok_or("database gone")?;
-    let monitor = channel
-        .subscribe(&db, dbr_type, mask)
+    let (pre_chain, notify) = channel.state_notify(dbr_type);
+    let route = Arc::new(Route {
+        notify,
+        count,
+        callback,
+        canceled: AtomicBool::new(false),
+    });
+    let context: DeliveryContext = route.clone();
+    let reader = channel
+        .add_event(&db, &events.user, mask, &context, pre_chain)
         .map_err(|e| format!("{e:?}"))?;
-    Ok(Box::new(LocalClientMonitor { monitor, count }))
+    Ok(InProcessSubscription {
+        _reader: reader,
+        route,
+    })
 }
 
 /// `value` as the channel's native type and element count.
@@ -454,6 +575,8 @@ fn put_value(channel: &LocalChannel, value: EpicsValue) -> EpicsValue {
 /// full access (`dbChannelIO`).
 struct LocalClientChannel {
     channel: LocalChannel,
+    /// Its context's.
+    events: InProcessEvents,
     announced: std::sync::atomic::AtomicBool,
 }
 
@@ -490,8 +613,10 @@ impl ClientChannel for LocalClientChannel {
         dbr_type: u16,
         count: u32,
         mask: u16,
-    ) -> Result<Box<dyn ClientMonitor>, String> {
-        subscribe(&self.channel, dbr_type, count, mask)
+        callback: Box<dyn Fn(Snapshot) + Send + Sync>,
+    ) -> Result<ClientSubscription, String> {
+        subscribe(&self.channel, &self.events, dbr_type, count, mask, callback)
+            .map(ClientSubscription::new)
     }
 
     async fn put(
@@ -504,19 +629,50 @@ impl ClientChannel for LocalClientChannel {
     }
 }
 
-struct LocalClientMonitor {
-    monitor: LocalMonitor,
-    count: u32,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
 
-#[async_trait::async_trait]
-impl ClientMonitor for LocalClientMonitor {
-    async fn next(&mut self) -> Option<Snapshot> {
-        loop {
-            let event = self.monitor.reader.recv().await?;
-            if let Some(snapshot) = self.monitor.state_notify(event, self.count) {
-                return Some(snapshot);
-            }
-        }
+    /// [`Running::wait`] on another thread; the receiver hears when it ends.
+    fn waiting(running: &Arc<Running>) -> mpsc::Receiver<()> {
+        let (ended, waited) = mpsc::channel();
+        let running = Arc::clone(running);
+        std::thread::spawn(move || {
+            running.wait();
+            ended.send(()).unwrap();
+        });
+        waited
+    }
+
+    const SETTLE: Duration = Duration::from_millis(50);
+
+    /// An entry waits for the runs going when it is taken, not for one
+    /// started after.
+    #[test]
+    fn a_wait_is_for_the_runs_going_when_it_starts() {
+        let running = Arc::new(Running::default());
+        let going = Run::start(&running);
+        let waited = waiting(&running);
+        std::thread::sleep(SETTLE);
+        let later = Run::start(&running);
+        assert!(waited.recv_timeout(SETTLE).is_err(), "before the run ends");
+        drop(going);
+        waited.recv_timeout(fact_budget::FACT_BUDGET).unwrap();
+        drop(later);
+    }
+
+    /// A put parked between polls, as one in `dbPutNotifyBlocker` is, holds
+    /// up no entry.
+    #[test]
+    fn a_put_parked_between_polls_is_no_run() {
+        let running = Arc::new(Running::default());
+        let mut put = std::pin::pin!(running.run(std::future::pending::<()>()));
+        let polled = put.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+        assert!(polled.is_pending());
+        waiting(&running)
+            .recv_timeout(fact_budget::FACT_BUDGET)
+            .unwrap();
     }
 }

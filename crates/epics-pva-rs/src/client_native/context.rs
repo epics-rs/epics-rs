@@ -20,8 +20,11 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Duration;
+
+use epics_base_rs::runtime::task::Period;
 
 use parking_lot::RwLock;
 
@@ -428,7 +431,7 @@ static SHARED_SEARCH_ENGINE: tokio::sync::OnceCell<SearchEngine> =
 /// (src/client.cpp:57, 666) that runs `cacheClean("", Context::Clean)` over the
 /// whole channel map so a long-lived client probing many PV names does not
 /// retain every idle channel until the context is closed.
-const CHANNEL_CACHE_CLEAN_INTERVAL: Duration = Duration::from_secs(10);
+const CHANNEL_CACHE_CLEAN_INTERVAL: Period = Period::from_secs(NonZeroU64::new(10).unwrap());
 
 /// One channel-cache entry: the cached channel plus the GC's mark bit.
 ///
@@ -546,7 +549,7 @@ pub enum CacheAction {
 /// in-flight op holds it and therefore no pending search references it (pending
 /// searches are held only by an awaiting caller's `oneshot` receiver), so
 /// dropping it here cannot orphan engine state.
-async fn cache_clean_loop(inner: std::sync::Weak<ClientInner>, period: Duration) {
+async fn cache_clean_loop(inner: std::sync::Weak<ClientInner>, period: Period) {
     // Through the seam so this loop runs on the RTEMS callback band as well as
     // the tokio runtime (stage 3). The seam ticker is `MissedTickBehavior::
     // Burst`, not `Delay`; for a periodic cache sweeper the two differ only in
@@ -1708,6 +1711,19 @@ impl PvaClient {
         let ch = self.channel(pv_name).await?;
         crate::client_native::ops_v2::op_put_begin(&ch, request, fetch_present, self.inner.timeout)
             .await
+    }
+
+    /// [`Self::pvput_begin`] with no deadline on the put
+    /// (`op_put_begin_unbounded`),
+    /// for a caller that ends it at the channel's disconnect.
+    pub(crate) async fn pvput_begin_unbounded(
+        &self,
+        pv_name: &str,
+        request: Option<&crate::pv_request::PvRequestExpr>,
+        fetch_present: bool,
+    ) -> PvaResult<PutOp> {
+        let ch = self.channel(pv_name).await?;
+        crate::client_native::ops_v2::op_put_begin_unbounded(&ch, request, fetch_present).await
     }
 
     /// PUT a pre-built [`PvField`] with a custom pvRequest. Like
@@ -3203,7 +3219,7 @@ mod tests {
         // unavailable here; a short real interval plus bounded polling keeps the
         // test deterministic without depending on one sleep landing on a tick.
         let client = PvaClient::builder().build();
-        let period = Duration::from_millis(25);
+        let period = Period::from_millis(NonZeroU64::new(25).unwrap());
         crate::test_reactor().spawn(cache_clean_loop(Arc::downgrade(&client.inner), period));
 
         // (a) a cached channel with no external Arc is swept within a few ticks.
@@ -3232,7 +3248,7 @@ mod tests {
             .channels
             .write()
             .insert("held".into(), CacheEntry::new(Arc::clone(&held)));
-        epics_base_rs::runtime::task::sleep(period * 5).await;
+        epics_base_rs::runtime::task::sleep(period.get() * 5).await;
         assert!(
             client.inner.channels.read().contains_key("held"),
             "cleaner preserves a channel that still has a live external reference"
@@ -3258,8 +3274,10 @@ mod tests {
     async fn periodic_cache_cleaner_exits_when_client_dropped() {
         let client = PvaClient::builder().build();
         let weak = Arc::downgrade(&client.inner);
-        let handle =
-            crate::test_reactor().spawn(cache_clean_loop(weak.clone(), Duration::from_millis(25)));
+        let handle = crate::test_reactor().spawn(cache_clean_loop(
+            weak.clone(),
+            Period::from_millis(NonZeroU64::new(25).unwrap()),
+        ));
 
         // Dropping the only PvaClient clone releases the last strong ref; the
         // cleaner's next `Weak::upgrade` fails and the task returns.

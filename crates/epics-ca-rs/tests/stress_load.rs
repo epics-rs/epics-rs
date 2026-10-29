@@ -112,7 +112,9 @@ async fn burst_of_writes_completes() {
 
     // Fire 100 writes in tight succession.
     for i in 0..100i32 {
-        ch.put(&EpicsValue::Long(i)).await.expect("put");
+        ch.put_with_timeout(&EpicsValue::Long(i), fact_budget::FACT_BUDGET)
+            .await
+            .expect("put");
     }
 
     // Final readback should match the last written value.
@@ -150,7 +152,9 @@ async fn monitor_keeps_up_with_high_update_rate() {
 
     let writer = tokio::spawn(async move {
         for v in 0..200i32 {
-            let _ = writer_ch.put(&EpicsValue::Long(v)).await;
+            let _ = writer_ch
+                .put_with_timeout(&EpicsValue::Long(v), fact_budget::FACT_BUDGET)
+                .await;
         }
     });
 

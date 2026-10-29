@@ -59,11 +59,12 @@ transport seam over them; `InProcessClient` is the zero-cost path that passes
 the enums straight through, and a socket client is where a multi-process
 deployment would plug in.
 
-### Typed capabilities
+### Typed interfaces
 
 `InterfaceType` converts both ways against the C interface names
-(`"asynInt32"` ↔ `InterfaceType::Int32`), `Capability` declares what a driver
-can do, and `PortDriver::capabilities()`/`supports()` answer from it.
+(`"asynInt32"` ↔ `InterfaceType::Int32`). A port's `InterfaceMask` is the one
+its C constructor registers, given to `PortDriverBase::new`, and
+`PortHandle::has_interface()` answers C `findInterface` from it.
 
 ## Ported drivers
 
@@ -110,7 +111,7 @@ can do, and `PortDriver::capabilities()`/`supports()` answer from it.
 │  PortDriver trait                            │
 │  - read/write: Int32, Float64, Octet,       │
 │    UInt32Digital, arrays                     │
-│  - InterfaceType / Capability declarations  │
+│  - InterfaceType / InterfaceMask            │
 │                                              │
 │  PortDriverBase                              │
 │  ├── ParamList (cache + change tracking)     │
@@ -132,9 +133,9 @@ Add to `Cargo.toml`:
 
 ```toml
 [dependencies]
-asyn-rs = "0.32"
+asyn-rs = "0.33"
 # Driver framework only, no record system:
-# asyn-rs = { version = "0.32", default-features = false }
+# asyn-rs = { version = "0.33", default-features = false }
 ```
 
 ### Implementing a Driver
@@ -223,7 +224,7 @@ The adapter handles:
 | `manager` | `PortManager` — named port driver registry + runtime registration |
 | `user` | `AsynUser` — per-request context (reason, addr) |
 | `trace` | `asyn_trace!` macro for debug logging |
-| `interfaces` | `InterfaceType`, `Capability`, and one module per asyn interface — int32/int64/uint32Digital/uint64/float64/octet/enum/arrays/average/gpib/motor/genericPointer |
+| `interfaces` | `InterfaceType`, `InterfaceMask`, and one module per asyn interface — int32/int64/uint32Digital/uint64/float64/octet/enum/arrays/average/gpib/motor/genericPointer |
 | `drivers` | the ported port drivers (see above) |
 | `interpose` | the octet interpose chain — eos, echo, delay, flush, com |
 | `sync_io` | the synchronous convenience API over a port's I/O |
@@ -236,6 +237,7 @@ The adapter handles:
 | `port_handle` | `PortHandle` — cloneable async handle with typed convenience methods |
 | `runtime` | `PortRuntimeHandle`, `create_port_runtime`, supervision, `RuntimeEvent` lifecycle, async runtime facade (`sync`, `task`, `select!`) |
 | `adapter` | `AsynDeviceSupport` — the record bridge *(requires `epics`)* |
+| `snl` | testIPServerApp's `ipSNCServer.st`, compiled by snc-rs and run on epics-seq-rs, with its `db/testIPServer.db`; `register_test_ip_server_dbd` makes it startable by `seq` *(requires `epics`)* |
 
 ## Runtime Facade
 

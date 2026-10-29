@@ -9,7 +9,6 @@ use std::task::{Context, Wake, Waker};
 use epics_base_rs::runtime::log::{ErrlogSevEnum, errlog_sev_vprintf};
 use epics_base_rs::runtime::task::{MandatoryThread, StackSizeClass, StackSpec, ThreadPriority};
 use epics_base_rs::runtime::taskwd::{CheckIn, taskwd_insert};
-use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::types::EpicsValue;
 
 use crate::program::{ProgOptions, StateOptions};
@@ -33,12 +32,12 @@ pub enum BufSrc<'a> {
 impl<V: ProgramVars> Program<V> {
     /// `sequencer`: the program's first thread, from `seqAddProg` to its
     /// end. `name` is that thread's, which the other state sets' extend.
-    pub(crate) fn sequencer(self: Arc<Self>, db: &PvDatabase, name: &str) {
+    pub(crate) fn sequencer(self: Arc<Self>, name: &str) {
         let _ = self.ss[0].thread_id.set(SeqThreadId::current());
         seq_add_prog(&self);
         self.pv_sys.attach();
         'run: {
-            if !self.wait_for_pini(db) {
+            if !self.wait_for_pini() {
                 break 'run;
             }
             if self.seq_connect(self.table.options.test(ProgOptions::CONN)) != PvStat::Ok {
@@ -58,9 +57,6 @@ impl<V: ProgramVars> Program<V> {
                 prog: Arc::clone(&self),
                 index: 0,
             };
-            // Each state set runs from here, or from its spawn, until its
-            // `ss_entry` ends.
-            self.gate.run(0);
             if let Some(entry) = self.table.entry_func {
                 entry(&ss0);
             }
@@ -73,7 +69,6 @@ impl<V: ProgramVars> Program<V> {
                 let ss_name = format!("{}_{nss}", &name[..len]);
                 let prog = Arc::clone(&self);
                 let thread_name = ss_name.clone();
-                self.gate.run(nss);
                 let spawned = MandatoryThread::new(
                     ss_name,
                     ThreadPriority::Custom(self.thread_priority),
@@ -89,7 +84,6 @@ impl<V: ProgramVars> Program<V> {
                         ErrlogSevEnum::Fatal,
                         format_args!("seq: epicsThreadCreate failed"),
                     );
-                    self.gate.stop(nss);
                     self.ss[nss].dead.signal();
                 }
             }
@@ -98,9 +92,7 @@ impl<V: ProgramVars> Program<V> {
                 ss.dead.wait();
             }
             if let Some(exit) = self.table.exit_func {
-                self.gate.run(0);
                 exit(&ss0);
-                self.gate.stop(0);
             }
         }
         self.seq_disconnect();
@@ -122,7 +114,7 @@ impl<V: ProgramVars> Program<V> {
     /// first: the gate waits on the first state set's `syncSem`, which
     /// `seq_exit` signals, and a stray signal left there costs one more
     /// pass over a `when`, as any pv event does.
-    fn wait_for_pini(self: &Arc<Self>, db: &PvDatabase) -> bool {
+    fn wait_for_pini(self: &Arc<Self>) -> bool {
         struct Wakeup<V: 'static>(Arc<Program<V>>);
         impl<V: ProgramVars> Wake for Wakeup<V> {
             fn wake(self: Arc<Self>) {
@@ -131,7 +123,7 @@ impl<V: ProgramVars> Program<V> {
         }
         let waker = Waker::from(Arc::new(Wakeup(Arc::clone(self))));
         let mut cx = Context::from_waker(&waker);
-        let mut pini = pin!(db.wait_for_pini());
+        let mut pini = pin!(self.db.wait_for_pini());
         loop {
             if self.die.load(Ordering::Acquire) {
                 return false;
@@ -220,7 +212,6 @@ impl<V: ProgramVars> Program<V> {
             ss.current_state.store(cur as i32, Ordering::Relaxed);
         }
         drop(watched);
-        self.gate.stop(nss);
         if nss != 0 {
             ss.dead.signal();
         }
@@ -341,13 +332,16 @@ pub fn seq_stop(tid: SeqThreadId) {
 
 #[cfg(test)]
 mod tests {
+    use epics_base_rs::server::database::PvDatabase;
     use epics_base_rs::types::WallTime;
 
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicU32};
 
     use crate::program::VarModel;
-    use crate::seq::fixture::{Vars, build, build_on, chan, program, table, w_chan};
+    use crate::seq::fixture::{
+        Vars, build, build_on, chan, hold_cac_event, program, table, w_chan,
+    };
     use crate::types::{PvSevr, PvStat, SeqMask, bit_set};
 
     const N: ChId = ChId(0);
@@ -379,7 +373,7 @@ mod tests {
             timestamp: WallTime::from_unix(secs, 0),
             status: PvStat::Hihi,
             severity: PvSevr::Major,
-            message: None,
+            message: crate::types::CharPtr::default(),
         }
     }
 
@@ -522,23 +516,21 @@ mod tests {
     #[test]
     fn the_pini_gate_opens_at_once_after_pini() {
         let p = prog(VarModel::Reentrant, 1);
-        let db = PvDatabase::new();
-        db.mark_pini_done();
-        assert!(p.wait_for_pini(&db));
+        p.db.mark_pini_done();
+        assert!(p.wait_for_pini());
     }
 
     #[test]
     fn the_pini_gate_opens_when_pini_finishes() {
         let p = prog(VarModel::Reentrant, 1);
-        let db = PvDatabase::new();
         let marker = {
-            let db = db.clone();
+            let db = p.db.clone();
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(20));
                 db.mark_pini_done();
             })
         };
-        assert!(p.wait_for_pini(&db));
+        assert!(p.wait_for_pini());
         marker.join().unwrap();
     }
 
@@ -546,7 +538,6 @@ mod tests {
     #[test]
     fn a_stop_during_the_pini_gate_ends_it() {
         let p = prog(VarModel::Reentrant, 2);
-        let db = PvDatabase::new();
         let stopper = {
             let p = Arc::clone(&p);
             std::thread::spawn(move || {
@@ -555,7 +546,7 @@ mod tests {
                 p.ss_wakeup(0);
             })
         };
-        assert!(!p.wait_for_pini(&db));
+        assert!(!p.wait_for_pini());
         stopper.join().unwrap();
     }
 
@@ -593,7 +584,7 @@ mod tests {
         let db = live_db();
         db.mark_pini_done();
         let p = build_on(table, &db);
-        Arc::clone(&p).sequencer(&db, "t");
+        Arc::clone(&p).sequencer("t");
         let d = p.dynamic.lock();
         assert!(d.dbch(N).is_some());
         (bit_test(&d.ev_flags, 1), bit_test(&d.ev_flags, 2))
@@ -617,7 +608,7 @@ mod tests {
             std::thread::spawn(move || {
                 epics_base_rs::runtime::task::test_block_on(async move {
                     let db = PvDatabase::new();
-                    for name in ["d1:n", "d2:n", "d3:n", "d4:n"] {
+                    for name in ["d1:n", "d2:n", "d3:n", "d4:n", "d5:n", "d6:n"] {
                         db.add_record(
                             name,
                             Box::new(epics_base_rs::server::records::ao::AoRecord::new(1.5)),
@@ -632,6 +623,37 @@ mod tests {
             });
             rx.recv().unwrap()
         })
+    }
+
+    /// Each program's state sets reach the database `seq` started it on,
+    /// not the one the IOC's shared pv system was made over.
+    #[test]
+    fn a_state_set_reaches_the_database_seq_started_its_program_on() {
+        static SEEN: parking_lot::Mutex<Vec<(&str, bool)>> = parking_lot::Mutex::new(Vec::new());
+        fn look(ss: &StateSet<Vars>) {
+            let served = ss.database().get_pv("d1:n").is_ok();
+            SEEN.lock().push((ss.prog.table.prog_name, served));
+            ss.prog.die.store(true, Ordering::Release);
+        }
+        let on = |prog_name| {
+            &*Box::leak(Box::new(crate::program::SeqProgram {
+                prog_name,
+                entry_func: Some(look),
+                ..program(vec![], VarModel::Reentrant, "", 1)
+            }))
+        };
+        let other = live_db();
+        other.mark_pini_done();
+        crate::seq::seq(on("onServed"), "", 0, served_db()).expect("onServed starts");
+        crate::seq::seq(on("onOther"), "", 0, &other).expect("onOther starts");
+        let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+        while SEEN.lock().len() < 2 {
+            assert!(std::time::Instant::now() < deadline, "{:?}", SEEN.lock());
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let mut seen = SEEN.lock().clone();
+        seen.sort();
+        assert_eq!(seen, [("onOther", false), ("onServed", true)]);
     }
 
     /// `sequencer` to its end over a one-state program named `pv`, found
@@ -667,7 +689,7 @@ mod tests {
         }));
         crate::cmd::seq_register_sequencer_program(table);
         let p = build_on(table, served_db());
-        p.sequencer(served_db(), "t");
+        p.sequencer("t");
     }
 
     /// A put of `v` to `pv` from a client context of its own.
@@ -733,13 +755,12 @@ mod tests {
         assert_eq!(AT_ONCE_SEEN.load(Ordering::SeqCst), 4);
     }
 
-    static OWN_AT_ZERO: AtomicBool = AtomicBool::new(true);
-    static OWN_AFTER_SLEEP: AtomicBool = AtomicBool::new(false);
+    static OWN_AT_ZERO: AtomicBool = AtomicBool::new(false);
 
-    /// A zero sleep after a put does not block: the put's own monitor has
-    /// not landed after it, and a sleep that blocks lands it.
+    /// A put's own monitor has landed by the next wait: a zero sleep after
+    /// the put finds its flag up.
     #[test]
-    fn a_zero_sleep_after_a_put_leaves_its_own_monitor_held() {
+    fn a_zero_sleep_after_a_put_finds_its_own_monitor() {
         fn event(_: &StateSet<Vars>, _: &mut usize, _: &mut usize) -> bool {
             true
         }
@@ -749,16 +770,10 @@ mod tests {
             assert_eq!(ss.pv_put(N, crate::types::CompType::Default), PvStat::Ok);
             crate::c::epicsThreadSleep(0.0);
             OWN_AT_ZERO.store(ss.ef_test(EfId(1)), Ordering::SeqCst);
-            crate::c::epicsThreadSleep(0.05);
-            OWN_AFTER_SLEEP.store(ss.ef_test(EfId(1)), Ordering::SeqCst);
             ss.prog.die.store(true, Ordering::Release);
         }
         run_one_state("d4:n", event, action);
-        assert!(!OWN_AT_ZERO.load(Ordering::SeqCst), "at the zero sleep");
-        assert!(
-            OWN_AFTER_SLEEP.load(Ordering::SeqCst),
-            "at a sleep that blocks"
-        );
+        assert!(OWN_AT_ZERO.load(Ordering::SeqCst));
     }
 
     static PASS: AtomicU32 = AtomicU32::new(0);
@@ -786,5 +801,36 @@ mod tests {
         run_one_state("d2:n", event, action);
         assert_eq!(PASS.load(Ordering::SeqCst), 2);
         assert!(!STALE_ECHO.load(Ordering::SeqCst));
+    }
+
+    static PUT_THEN_CLEAR: AtomicU32 = AtomicU32::new(0);
+    static SEEN_AFTER_CLEAR: AtomicBool = AtomicBool::new(false);
+
+    /// MM4005_trajectoryScan's `pvPut(motorMDVS[j]); efClear(motorMDVSMon)`:
+    /// the put's own monitor lands after the clear, so the next wait sees
+    /// its flag. `CAC-event` is held until the clear, as the put's return
+    /// beats it in C.
+    #[test]
+    fn an_own_put_monitor_lands_after_the_clear_that_follows_it() {
+        fn event(ss: &StateSet<Vars>, _: &mut usize, _: &mut usize) -> bool {
+            PUT_THEN_CLEAR.load(Ordering::SeqCst) == 0 || ss.ef_test(EfId(1)) || ss.delay(1.0)
+        }
+        fn action(ss: &StateSet<Vars>, _: usize, _: &mut usize) {
+            if PUT_THEN_CLEAR.fetch_add(1, Ordering::SeqCst) == 0 {
+                let (_held, release) = hold_cac_event(&ss.prog.pv_sys, "d6:n", || {
+                    post_from_another_client("d6:n", 2.0)
+                });
+                ss.var().n.set(4);
+                assert_eq!(ss.pv_put(N, crate::types::CompType::Default), PvStat::Ok);
+                ss.ef_clear(EfId(1));
+                let _ = release.send(());
+            } else {
+                SEEN_AFTER_CLEAR.store(ss.ef_test(EfId(1)), Ordering::SeqCst);
+                ss.prog.die.store(true, Ordering::Release);
+            }
+        }
+        run_one_state("d5:n", event, action);
+        assert_eq!(PUT_THEN_CLEAR.load(Ordering::SeqCst), 2);
+        assert!(SEEN_AFTER_CLEAR.load(Ordering::SeqCst));
     }
 }

@@ -157,16 +157,19 @@ async fn an_unresolved_path_pv_warns_on_the_first_pass() {
     let mgr = manager(&sav, &[("SAVEPATHPV", "NOPV"), ("SAVENAMEPV", "NN")]).await;
     let task = mgr.clone().start(db.clone());
     let set = mgr.sets()[0].0.clone();
-    for _ in 0..40 {
-        if set.list_status().code == SrStatus::Warn {
+    // The same pass's connect_list (:955) and then enable_list (:973)
+    // rewrite the text, not the code.
+    let want = (SrStatus::Warn, "Enabling list...");
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
+        let status = set.list_status();
+        if (status.code, status.text.as_str()) == want {
             break;
         }
         sleep(Duration::from_millis(50)).await;
     }
     let status = set.list_status();
-    assert_eq!(status.code, SrStatus::Warn);
-    // The same pass's enable_list (:973) rewrites the text, not the code.
-    assert_eq!(status.text, "Enabling list...");
+    assert_eq!((status.code, status.text.as_str()), want);
     let lines = Mutex::new(Vec::new());
     mgr.show_lists(&db, &|a| lines.lock().unwrap().push(a.to_string()), 0);
     mgr.shutdown();

@@ -975,11 +975,8 @@ impl ServerConn {
         reactor.spawn(async move {
             // pvxs clientconn.cpp:163-165: echo interval = max(1, min(15, tcpTimeout * 3/8))
             // pvxs clientconn.cpp:71-72: socket inactivity timeout = tcpTimeout
-            let hb_interval = Duration::from_secs_f64(crate::config::env::echo_period_secs(
-                tcp_timeout.as_secs_f64(),
-            ));
             let hb_timeout = tcp_timeout;
-            let mut tick = hb_clock.interval(hb_interval);
+            let mut tick = hb_clock.interval(crate::config::env::echo_period(tcp_timeout));
             tick.tick().await; // skip first immediate tick
             loop {
                 tokio::select! {

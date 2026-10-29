@@ -17,7 +17,6 @@ use crate::driver::ndarray_driver::{
     ArrayOwner, ND_ARRAY_DRIVER_INTERFACES, ND_ARRAY_DRIVER_INTERRUPTS, handle_write_int32,
     init_read_only_params, trace_write_int32,
 };
-use crate::ndarray::NDArray;
 use crate::ndarray_pool::{DriverArray, DriverPool, PublishedArray};
 use crate::params::ad_driver::ADDriverParams;
 use crate::plugin::channel::{NDArrayOutput, NDArraySender};
@@ -144,7 +143,7 @@ impl ADDriverBase {
         self.owner
             .attributes()
             .lock()
-            .attach(&self.port_base, &mut array);
+            .attach(&self.port_base, array.fill().attributes_mut());
 
         // G5/G6/G7: write all per-array parameters (size, dims, type, color,
         // Bayer, timestamps, codec).
@@ -288,11 +287,11 @@ impl ADDriverBase {
 
     /// C++ `asynNDArrayDriver::getAttributes`, for a driver that fills the
     /// array's attribute list itself before publishing.
-    pub fn attach_attributes(&mut self, array: &mut NDArray) {
+    pub fn attach_attributes(&mut self, attributes: &mut crate::attributes::NDAttributeList) {
         self.owner
             .attributes()
             .lock()
-            .attach(&self.port_base, array);
+            .attach(&self.port_base, attributes);
     }
 
     /// Store `ADAcquire`; its rule keeps `ADAcquireBusy` in step.
@@ -356,6 +355,7 @@ mod tests {
         assert_c_read_only_block, assert_fresh_pool_stats, assert_ndarray_data_ahead_of_params,
         record_posts,
     };
+    use crate::ndarray::NDArray;
     use crate::plugin::runtime::ASYN_CANBLOCK;
     use asyn_rs::param::ParamType;
     use asyn_rs::param::ParamValue;
@@ -375,8 +375,8 @@ mod tests {
             1,
             50_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         assert_c_read_only_block(&ad.port_base, &ad.params.base, "TEST");
@@ -453,8 +453,8 @@ mod tests {
                 1,
                 1_000_000,
                 ASYN_CANBLOCK,
-                InterfaceMask::UNMIGRATED_SUBCLASS,
-                InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+                InterfaceMask::NONE,
+                InterfaceMask::NONE,
             )
             .unwrap(),
             shutter: Vec::new(),
@@ -493,12 +493,11 @@ mod tests {
             )
             .unwrap(),
         );
-        let mut types: Vec<_> = asyn_rs::port::PortDriver::capabilities(&d)
-            .iter()
-            .map(|c| c.interface_type())
+        let mut types: Vec<_> = asyn_rs::port::PortDriver::base(&d)
+            .interface_mask()
+            .interfaces()
             .collect();
         types.sort_by_key(|t| t.asyn_name());
-        types.dedup();
         assert_eq!(
             types,
             [
@@ -520,8 +519,8 @@ mod tests {
             1,
             1_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         let p = &ad.params;
@@ -550,8 +549,8 @@ mod tests {
                 1,
                 1_000_000,
                 ASYN_CANBLOCK,
-                InterfaceMask::UNMIGRATED_SUBCLASS,
-                InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+                InterfaceMask::NONE,
+                InterfaceMask::NONE,
             )
             .unwrap(),
         );
@@ -661,8 +660,8 @@ mod tests {
                 1,
                 1_000_000,
                 flags,
-                InterfaceMask::UNMIGRATED_SUBCLASS,
-                InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+                InterfaceMask::NONE,
+                InterfaceMask::NONE,
             )
             .unwrap(),
         );
@@ -679,8 +678,8 @@ mod tests {
             4,
             1_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         assert_eq!(ad.port_base.max_addr, 4);
@@ -693,8 +692,8 @@ mod tests {
             1,
             50_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         // C++ ADDriver.cpp:180-191 — the full set of parameters the constructor
@@ -758,8 +757,8 @@ mod tests {
             1,
             50_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
 
@@ -830,8 +829,8 @@ mod tests {
             1,
             1_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         // The ArrayCallbacks record's PINI; the driver leaves it undefined.
@@ -871,8 +870,8 @@ mod tests {
             1,
             50_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         let arr = ad
@@ -903,8 +902,8 @@ mod tests {
             1,
             1_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         let (sender, _receiver) = ndarray_channel("DOWNSTREAM", 10);
@@ -948,8 +947,8 @@ mod tests {
             1,
             1_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         // The ArrayCallbacks record's PINI; the driver leaves it undefined.
@@ -982,8 +981,8 @@ mod tests {
             1,
             1_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         ad.port_base
@@ -1010,8 +1009,8 @@ mod tests {
             1,
             1_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         ad.set_shutter(true);
@@ -1030,8 +1029,8 @@ mod tests {
             1,
             1_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         ad.port_base
@@ -1065,8 +1064,8 @@ mod tests {
             1,
             1_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         ad.port_base
@@ -1102,8 +1101,8 @@ mod tests {
             1,
             1_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         let acquire = ad.params.acquire;
@@ -1132,8 +1131,8 @@ mod tests {
             1,
             1_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         let (acquire, acquire_busy) = (ad.params.acquire, ad.params.acquire_busy);
@@ -1160,8 +1159,8 @@ mod tests {
             1,
             1_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         let (acquire, queued) = (ad.params.acquire, ad.params.base.num_queued_arrays);
@@ -1193,8 +1192,8 @@ mod tests {
             1,
             1_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         ad.port_base
@@ -1218,8 +1217,8 @@ mod tests {
             1,
             1_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         ad.set_acquire(1).unwrap();
@@ -1251,8 +1250,8 @@ mod tests {
             1,
             1_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         ad.port_base
@@ -1289,8 +1288,8 @@ mod tests {
             1,
             10_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         let arr = ad
@@ -1318,8 +1317,8 @@ mod tests {
             1,
             10_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         let arr = ad
@@ -1358,8 +1357,8 @@ mod tests {
             1,
             10_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         let task_pool = ad.pool.clone();
@@ -1405,8 +1404,8 @@ mod tests {
             1,
             1_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         let handled = ad.write_int32_pool(ad.params.gain, 1).unwrap();
@@ -1422,8 +1421,8 @@ mod tests {
             1,
             1_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         ad.port_base
@@ -1453,8 +1452,8 @@ mod tests {
             1,
             1_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         // The ArrayCallbacks record's PINI; the driver leaves it undefined.
@@ -1481,7 +1480,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let _ = rt.block_on(ad.array_output.publish(to_publish));
+        rt.block_on(ad.array_output.publish(to_publish));
 
         let received = receiver.blocking_recv().unwrap();
         assert_eq!(received.unique_id, id);

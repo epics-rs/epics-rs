@@ -1,0 +1,5 @@
+1..4
+ok  1 - seqg_vars_opt_x.exit1cnt == 0
+ok  2 - seqg_vars_opt_x.exit2cnt == seqg_vars_opt_x.delayed2
+ok  3 - seqg_vars_opt_x.exit2cnt == seqg_vars_opt_x.delayed2
+ok  4 - seqg_vars_opt_x.exit2cnt == seqg_vars_opt_x.delayed2

@@ -46,7 +46,7 @@ async fn child_restore() {
             epics_base_rs::server::db_server::announce_serving("probe");
             let mgr = config.autosave_manager.unwrap();
             // The script's fdbrestore is queued once its line has run.
-            let deadline = Instant::now() + Duration::from_secs(10);
+            let deadline = Instant::now() + fact_budget::FACT_BUDGET;
             while db.get_pv("BUINT64").unwrap().count() == 0 && Instant::now() < deadline {
                 sleep(Duration::from_millis(20)).await;
             }

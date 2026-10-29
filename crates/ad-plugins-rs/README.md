@@ -47,7 +47,7 @@ No C dependencies. Pure Rust with real encoding libraries (JPEG, TIFF, LZ4, FFT)
 | Plugin | Description |
 |--------|-------------|
 | **NDFileHDF5** | HDF5 file writer via `rust-hdf5`, with the custom-layout XML engine of C's `NDFileHDF5` |
-| **NDFileJPEG** | JPEG encoding/decoding via jpeg-encoder/jpeg-decoder |
+| **NDFileJPEG** | JPEG encoding via jpeg-encoder |
 | **NDFileTIFF** | TIFF encoding/decoding via the `image` crate |
 | **NDFileNetCDF** | netCDF-4 writer, through `rust-hdf5` |
 | **NDFileNexus** | NeXus file writer |
@@ -101,29 +101,29 @@ The `parallel` feature (enabled by default) uses [rayon](https://docs.rs/rayon) 
 
 | Plugin | Parallelized Operations |
 |--------|------------------------|
-| **NDROIStat** | Per-ROI stats computation (`par_iter` over ROI regions) |
-| **NDStats** | Basic stats (fold+reduce), centroid (fold+reduce), histogram (par_chunks + merge) |
-| **NDColorConvert** | Bayer demosaic (`bayer_to_rgb1` row-parallel) |
-| **NDProcess** | Stages 1–4: background, flat field, offset/scale, clipping (element-wise `par_iter_mut`) |
+| **NDROIStat** | Per-ROI stats computation (one ROI per claim) |
+| **NDStats** | Basic stats, centroid and histogram (chunks, merged in order) |
+| **NDColorConvert** | Bayer demosaic (`bayer_to_rgb1`, one row per claim) |
+| **NDProcess** | Stages 1–4: background, flat field, offset/scale, clipping (element-wise chunks) |
 
 Not parallelized: FFT (rustfft internal SIMD), recursive filter (IIR dependency chain), profiles (memory access pattern), Overlay/Transform (lightweight).
 
 **Thread pool management:**
 
-All plugins share a single rayon `ThreadPool` to avoid over-subscription when multiple plugins process data concurrently. The pool is sized to `available_cores - 2` (minimum 1), reserving headroom for port driver data threads, autoconnect tasks, and the async runtime.
+All plugins share one rayon `ThreadPool` per L3 cache domain, to avoid over-subscription when multiple plugins process data concurrently, and a pass runs on the pool of the domain its caller runs in, whose cache holds the frame. A domain's pool has one worker per physical core the process may use there (its CPUs in sysfs within the process's affinity mask), at most `available_cores - 2`, reserving headroom for port driver data threads, autoconnect tasks, and the async runtime; its workers are pinned to those CPUs. With one domain, or no topology in sysfs (and off Linux), there is one unpinned pool of `available_cores - 2` workers (minimum 1).
 
-To override the thread count, call `set_num_threads()` before the first array is processed:
+To override the thread count, which gives one unpinned pool of that many workers, call `set_num_threads()` before the first array is processed:
 
 ```rust
 ad_plugins_rs::par_util::set_num_threads(4);
 ```
 
-A minimum element threshold (`PAR_THRESHOLD = 4096`) prevents rayon overhead from dominating on small arrays. Below this threshold, the sequential path is used automatically.
+A pass is split only when it has at least two chunks and its estimated serial time reaches the point from which the split measured faster at that site (`par_util::pool_wins`); below that, the sequential path is used, as C does for every frame. A split pass runs on the calling thread as well: it claims chunks from the first, and pool workers join as they wake, so a pass never waits for a sleeping worker (`par_util::map_indices`).
 
 To disable parallelism entirely:
 
 ```toml
-ad-plugins-rs = { version = "0.32", default-features = false }
+ad-plugins-rs = { version = "0.33", default-features = false }
 ```
 
 ## Usage

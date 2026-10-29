@@ -13,9 +13,9 @@
 //! ca_sg_delete(gid);
 //! ```
 //!
-//! each scheduled `get`/`put` spawns its op immediately (it is
-//! "in flight" the moment it is scheduled, matching libca), and the
-//! group tracks the outstanding tasks. [`SyncGroup::block`] takes `&mut self`
+//! each scheduled `get`/`put` sends its request the moment it is
+//! scheduled, as libca queues it (`CASG.cpp:212-232`), and the group
+//! tracks only the wait for each answer. [`SyncGroup::block`] takes `&mut self`
 //! and waits only for the requests issued since the last `block`/`reset`.
 //! libca `ca_sg_block` ends the batch on **every** return — success
 //! *and* timeout — because it unconditionally calls `sync_group_reset`
@@ -42,7 +42,7 @@ use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::runtime::task::TaskHandle as JoinHandle;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
-use super::CaChannel;
+use super::{CaChannel, ReqCount};
 
 /// Result of a single scheduled get.
 type GetOutput = CaResult<(DbFieldType, EpicsValue)>;
@@ -128,26 +128,40 @@ impl SyncGroup {
         Self::default()
     }
 
-    /// Schedule a get. The op is issued (spawned) immediately and runs
-    /// concurrently; the group tracks it until [`Self::block`].
+    /// Schedule a get: the READ_NOTIFY is sent now, and the group tracks
+    /// its answer until [`Self::block`].
     pub fn get(&mut self, ch: &CaChannel) {
-        let reactor = ch.reactor().clone();
-        let ch = ch.clone();
-        let handle = reactor.spawn(async move { Outcome::Get(ch.get().await) });
-        self.ops.push(SyncOp {
-            kind: OpKind::Get,
-            handle,
-            done: None,
+        let read = ch.read_plain(ReqCount::Fixed(0));
+        self.track(ch, OpKind::Get, async move {
+            Outcome::Get(async { read?.await }.await)
         });
     }
 
-    /// Schedule a put. Same in-flight semantics as [`Self::get`].
+    /// Schedule a put: the WRITE_NOTIFY is sent now, so ending the batch
+    /// drops its completion and never the write. A `ca_sg_array_put` has
+    /// no deadline of its own, only [`Self::block`]'s.
     pub fn put(&mut self, ch: &CaChannel, value: EpicsValue) {
-        let reactor = ch.reactor().clone();
-        let ch = ch.clone();
-        let handle = reactor.spawn(async move { Outcome::Put(ch.put(&value).await) });
+        let reply = ch.put_callback(&value);
+        self.track(ch, OpKind::Put, async move {
+            Outcome::Put(async { reply?.await }.await)
+        });
+    }
+
+    /// Track `answer`, the completion of a request already sent on `ch`,
+    /// which stays open until the answer comes.
+    fn track(
+        &mut self,
+        ch: &CaChannel,
+        kind: OpKind,
+        answer: impl std::future::Future<Output = Outcome> + Send + 'static,
+    ) {
+        let open = ch.clone();
+        let handle = ch.reactor().spawn(async move {
+            let _open = open;
+            answer.await
+        });
         self.ops.push(SyncOp {
-            kind: OpKind::Put,
+            kind,
             handle,
             done: None,
         });
@@ -282,6 +296,14 @@ impl SyncGroup {
     }
 }
 
+/// `ca_sg_delete` cancels the pending ops too (`CASG.cpp:44-45`): a get's
+/// only bound is `block`'s, so one left running would wait for ever.
+impl Drop for SyncGroup {
+    fn drop(&mut self) {
+        self.end_batch();
+    }
+}
+
 // Host/tokio-only: the shared `push_delayed_get` harness spawns
 // `tokio::time::sleep` through the `runtime::task` seam, which under
 // `exec_backend` lands on a background-executor worker with no tokio
@@ -309,6 +331,28 @@ mod tests {
                 done: None,
             });
         }
+    }
+
+    /// `ca_sg_delete`: what the dropped group still had in flight is
+    /// cancelled, not left to wait for an answer.
+    #[tokio::test]
+    async fn a_dropped_group_cancels_its_pending_ops() {
+        let (held, cancelled) = tokio::sync::oneshot::channel::<()>();
+        let reactor = epics_base_rs::runtime::task::Reactor::current()
+            .expect("the test driver enters an executor");
+        let handle = reactor.spawn(async move {
+            let _held = held;
+            std::future::pending::<Outcome>().await
+        });
+        let mut g = SyncGroup::new();
+        g.ops.push(SyncOp {
+            kind: OpKind::Get,
+            handle,
+            done: None,
+        });
+        drop(g);
+        let ended = tokio::time::timeout(Duration::from_secs(5), cancelled).await;
+        assert!(matches!(ended, Ok(Err(_))), "the op still runs: {ended:?}");
     }
 
     #[tokio::test]

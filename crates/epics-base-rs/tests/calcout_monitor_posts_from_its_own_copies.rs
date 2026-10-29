@@ -17,7 +17,6 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use epics_base_rs::server::database::filters::{FilteredMonitorEvent, SubscriptionFilter};
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -34,20 +33,19 @@ record(calcout, "CO") {
 }
 "#;
 
-/// Each step, and whether it starts an ODLY delay to wait out.
-const STEPS: [(&str, &str, bool); 12] = [
-    ("PROC", "1", false),
-    ("OVAL", "5", false),
-    ("PROC", "1", false),
-    ("DOPT", "Use OCAL", false),
-    ("OVAL", "7", false),
-    ("PROC", "1", false),
-    ("OVAL", "3", false),
-    ("PROC", "1", false),
-    ("DOPT", "Use CALC", false),
-    ("ODLY", "0.3", false),
-    ("PROC", "1", true),
-    ("A", "2", true),
+const STEPS: [(&str, &str); 12] = [
+    ("PROC", "1"),
+    ("OVAL", "5"),
+    ("PROC", "1"),
+    ("DOPT", "Use OCAL"),
+    ("OVAL", "7"),
+    ("PROC", "1"),
+    ("OVAL", "3"),
+    ("PROC", "1"),
+    ("DOPT", "Use CALC"),
+    ("ODLY", "0.3"),
+    ("PROC", "1"),
+    ("A", "2"),
 ];
 
 const VALUE: &str = "\
@@ -165,12 +163,16 @@ async fn calcout_posts_oval_from_its_own_povl_as_softioc_does() {
             }
         }
     }
-    for (field, value, delayed) in STEPS {
-        db.put_record_field_from_ca("CO", field, EpicsValue::String(value.into()))
+    for (field, value) in STEPS {
+        let put = db
+            .put_record_field_from_ca("CO", field, EpicsValue::String(value.into()))
             .await
             .unwrap();
-        if delayed {
-            epics_base_rs::runtime::task::sleep(Duration::from_millis(600)).await;
+        // An ODLY cycle completes when its callback has written OVAL.
+        if let Some(rx) = put.into_handle() {
+            let _ = epics_base_rs::runtime::task::timeout(fact_budget::FACT_BUDGET, rx)
+                .await
+                .expect("the delayed cycle never completed");
         }
     }
     let got: Vec<String> = streams.iter().map(|s| by_pv(&s.lock().unwrap())).collect();

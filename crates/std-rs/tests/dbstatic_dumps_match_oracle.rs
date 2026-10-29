@@ -1,5 +1,5 @@
 //! `dbStaticLib.c` dumps of std's contributions, against `oracleStdIoc`
-//! (`~/work/epics-modules/oracle-ioc`: base + std + calc, R7.0.10.1-DEV).
+//! (`$EPICS_MODULES/oracle-ioc`: base + std + calc, R7.0.10.1-DEV).
 //! Addresses are masked on both sides; `(nil)` is compared.
 
 use std::sync::Arc;

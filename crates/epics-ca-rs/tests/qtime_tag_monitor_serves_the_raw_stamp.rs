@@ -44,7 +44,9 @@ async fn a_qtime_tag_record_monitor_update_carries_the_raw_stamp() {
         .expect("monitor open")
         .expect("event");
 
-    ch.put(&EpicsValue::Double(2.0)).await.expect("put QT");
+    ch.put_with_timeout(&EpicsValue::Double(2.0), fact_budget::FACT_BUDGET)
+        .await
+        .expect("put QT");
     let update = loop {
         let snap = tokio::time::timeout(fact_budget::FACT_BUDGET, mon.recv())
             .await

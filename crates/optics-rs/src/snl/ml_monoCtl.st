@@ -85,11 +85,19 @@ sync    D D_mon;
 double  TwoD;
 
 /* E, Lambda, and Theta */
+/* C defect: monitored E, lambda and theta themselves, so an event landing
+ * between a pass's assign and its put, such as the clamp dInputChanged's
+ * DRVH/DRVL puts post, was put as the pass's value, and a theta request
+ * landing before calcMovements replaced the theta it moved to. Requests
+ * land in EReq, lambdaReq and thetaReq, which the request arms take. */
 double  E;
 assign  E to "{P}ml_monoE";
-monitor E;
+
+double  EReq;
+assign  EReq to "{P}ml_monoE";
+monitor EReq;
 evflag  E_mon;
-sync    E E_mon;
+sync    EReq E_mon;
 
 double  EHi;
 assign  EHi to "{P}ml_monoE.DRVH";
@@ -102,9 +110,12 @@ assign  ERdbk to "{P}ml_monoERdbk";
 
 double  lambda;
 assign  lambda to "{P}ml_monoLambda";
-monitor lambda;
+
+double  lambdaReq;
+assign  lambdaReq to "{P}ml_monoLambda";
+monitor lambdaReq;
 evflag  lambda_mon;
-sync    lambda lambda_mon;
+sync    lambdaReq lambda_mon;
 
 double  lambdaHi;
 assign  lambdaHi to "{P}ml_monoLambda.DRVH";
@@ -117,9 +128,12 @@ assign  lambdaRdbk to "{P}ml_monoLambdaRdbk";
 
 double  theta;
 assign  theta to "{P}ml_monoTheta";
-monitor theta;
+
+double  thetaReq;
+assign  thetaReq to "{P}ml_monoTheta";
+monitor thetaReq;
 evflag  theta_mon;
-sync    theta theta_mon;
+sync    thetaReq theta_mon;
 
 double  thetaHi;
 assign  thetaHi to "{P}ml_monoTheta.DRVH";
@@ -242,17 +256,19 @@ short   zLls;
 assign  zLls to "{P}{M_Z}.LLS";
 monitor zLls;
 
+/* C defect: monitored the values calcMovements puts here, so the move
+ * took what the PV held by then: the late echo of an earlier pass's put,
+ * or a user's edit, driven at the speeds computed for the calculated
+ * value. The move goes where calcMovements put; an edit before it is
+ * dropped. */
 double  thetaMotDesired;
 assign  thetaMotDesired to "{P}ml_monoThetaSet";
-monitor thetaMotDesired;
 
 double  theta2MotDesired;
 assign  theta2MotDesired to "{P}ml_monoTheta2Set";
-monitor theta2MotDesired;
 
 double  zMotDesired;
 assign  zMotDesired to "{P}ml_monoZSet";
-monitor zMotDesired;
 
 double  thetaMotHiLim;
 assign  thetaMotHiLim to "{P}{M_THETA}.HLM";
@@ -316,6 +332,7 @@ sync    zMotCmdMon zMotCmdMon_mon;
 
 double  thTime;
 double  oldThSpeed;
+assign  oldThSpeed to "{P}{M_THETA}.VELO";
 double  newThSpeed;
 double  thSpeed;
 assign  thSpeed to "{P}{M_THETA}.VELO";
@@ -325,6 +342,7 @@ sync    thSpeed thetaMotVel_mon;
 
 /* double  th2Time; assume same as thTime */
 double  oldTh2Speed;
+assign  oldTh2Speed to "{P}{M_THETA2}.VELO";
 double  newTh2Speed;
 double  th2Speed;
 assign  th2Speed to "{P}{M_THETA2}.VELO";
@@ -334,12 +352,25 @@ sync    th2Speed theta2MotVel_mon;
 
 double  zTime;
 double  oldZSpeed;
+assign  oldZSpeed to "{P}{M_Z}.VELO";
 double  newZSpeed;
 double  zSpeed;
 assign  zSpeed to "{P}{M_Z}.VELO";
 monitor zSpeed;
 evflag  zMotVel_mon;
 sync    zSpeed zMotVel_mon;
+
+/* C defect: put thSpeed, th2Speed and zSpeed themselves, which are
+ * monitored: the echo of the previous speed put could land before a put,
+ * which then wrote that speed. The puts go through these. */
+double  thSpeedCmd;
+assign  thSpeedCmd to "{P}{M_THETA}.VELO";
+
+double  th2SpeedCmd;
+assign  th2SpeedCmd to "{P}{M_THETA2}.VELO";
+
+double  zSpeedCmd;
+assign  zSpeedCmd to "{P}{M_Z}.VELO";
 
 double  thetaMotRdbk;
 assign  thetaMotRdbk to "{P}{M_THETA}.RBV";
@@ -392,6 +423,29 @@ monitor zMotSet;
 evflag  zMotSet_mon;
 sync    zMotSet zMotSet_mon;
 
+/* C defect: put useSetMode and the motor .SET flags themselves, which
+ * are monitored: the echo of the previous put could land before a put,
+ * which then wrote that flag. The puts, and updateSet's gets, go
+ * through these. */
+short   useSetModeCmd;
+assign  useSetModeCmd to "{P}ml_monoUseSet";
+
+short   thetaMotSetCmd;
+assign  thetaMotSetCmd to "{P}{M_THETA}.SET";
+
+short   theta2MotSetCmd;
+assign  theta2MotSetCmd to "{P}{M_THETA2}.SET";
+
+short   zMotSetCmd;
+assign  zMotSetCmd to "{P}{M_Z}.SET";
+
+/* Each flag as updateSet last put or took it, and the one it mirrors. */
+short   useSetModeLast;
+short   thetaMotSetLast;
+short   theta2MotSetLast;
+short   zMotSetLast;
+short   mirrorSet;
+
 /* tweaking PV's */
 double  ETweakVal;
 assign  ETweakVal to "{P}ml_monoETweak";
@@ -441,6 +495,16 @@ assign  yOffsetHi to "{P}ml_mono_yOffset.DRVH";
 
 double  yOffsetLo;
 assign  yOffsetLo to "{P}ml_mono_yOffset.DRVL";
+
+/* C defect: put yOffset itself, which is monitored and which both state
+ * sets assign, so a yOffset event or the other state set's assignment
+ * landing between an assignment and its put was put in its place. The
+ * readback mirrors put yMotRdbkEcho; initSequence puts yOffsetInit. */
+double  yMotRdbkEcho;
+assign  yMotRdbkEcho to "{P}ml_mono_yOffset";
+
+double  yOffsetInit;
+assign  yOffsetInit to "{P}ml_mono_yOffset";
 
 %%#include <string.h>
 %%#include <math.h>
@@ -518,16 +582,17 @@ state initSequence {
 
 		/* We're going to use the y motor readback for yOffset */
 		ml_monoCtl_pmacY_OFF = seq_macValueGet(ssId,"Y_OFF");
-		yOffset = atof(ml_monoCtl_pmacY_OFF);
-		if ((yOffset < 1) ||  (yOffset > 60.))
-			yOffset = 35.;
+		yOffsetInit = atof(ml_monoCtl_pmacY_OFF);
+		if ((yOffsetInit < 1) ||  (yOffsetInit > 60.))
+			yOffsetInit = 35.;
 
 		ml_monoCtl_pmacGEOM = seq_macValueGet(ssId,"GEOM");
 		geom = 1;
 		/* if (*ml_monoCtl_pmacGEOM == '2') geom = 2; */
 }%
 
-		pvPut(yOffset);
+		yOffset = yOffsetInit;
+		pvPut(yOffsetInit);
 		if (geom == 1) {
 		}
 		pvPut(thetaMotName);
@@ -564,9 +629,12 @@ state waitForCmndEnter {
 		if (ml_monoCtlDebug) %%printf("ml_monoCtl:waitForCmndEnter:initSeqDone\n");
 		efClear(Order_mon);
 		efClear(D_mon);
-		efClear(E_mon);
-		efClear(lambda_mon);
-		efClear(theta_mon);
+		/* C's monitored E, lambda and theta kept a request dropped here.
+		 * pvGet reads it from the PV: EReq, lambdaReq and thetaReq can
+		 * still hold the late echo of an earlier put. */
+		if (efTestAndClear(E_mon)) pvGet(E);
+		if (efTestAndClear(lambda_mon)) pvGet(lambda);
+		if (efTestAndClear(theta_mon)) pvGet(theta);
 
 		thetaMotRdbkEcho = thetaMotRdbk;
 		pvPut(thetaMotRdbkEcho);
@@ -575,7 +643,8 @@ state waitForCmndEnter {
 		zMotRdbkEcho = zMotRdbk;
 		pvPut(zMotRdbkEcho);
 		yOffset = yMotRdbk;
-		pvPut(yOffset);
+		yMotRdbkEcho = yMotRdbk;
+		pvPut(yMotRdbkEcho);
 		thetaMotVelEcho = thSpeed;
 		pvPut(thetaMotVelEcho);
 		theta2MotVelEcho = th2Speed;
@@ -666,14 +735,17 @@ state waitForCmnd {
 
 	when (efTestAndClear(E_mon)) {
 		if (ml_monoCtlDebug) %%printf("ml_monoCtl:waitForCmnd:E_mon\n");
+		E = EReq;
 	} state eChanged
 
 	when (efTestAndClear(lambda_mon)) {
 		if (ml_monoCtlDebug) %%printf("ml_monoCtl:waitForCmnd:lambda_mon\n");
+		lambda = lambdaReq;
 	} state lChanged
 
 	when (efTestAndClear(theta_mon)) {
 		if (ml_monoCtlDebug) %%printf("ml_monoCtl:waitForCmnd:theta_mon\n");
+		theta = thetaReq;
 	} state thChanged
 
 	when (putVals && delay(.1)) {
@@ -775,6 +847,8 @@ state tweak {
 state dInputChanged {
 	when () {
 		if (ml_monoCtlDebug) %%printf("ml_monoCtl:dInputChanged\n");
+		/* C's monitored theta already held a request that landed. */
+		if (efTest(theta_mon)) theta = thetaReq;
 		autoMode = 0;
 		pvPut(autoMode);
 		sprintf(seqMsg2, "Set to Manual Mode");
@@ -902,18 +976,22 @@ state calcMovements {
 		pvPut(zMotDesired);
 
 		/***** Calculate required speeds ******/
-		oldThSpeed = thSpeed;
-		oldTh2Speed = th2Speed;
-		oldZSpeed = zSpeed;
+		/* C defect: took the old speeds from thSpeed, th2Speed and zSpeed,
+		 * whose monitors can still hold the previous move's speed after its
+		 * restore, which this move's restore then put back. They are read
+		 * from VELO, and the monitored ones only feed the VelEcho mirrors. */
+		pvGet(oldThSpeed);
+		pvGet(oldTh2Speed);
+		pvGet(oldZSpeed);
 		/* C defect: divided by each motor's speed, which speed control
 		 * itself sets to 0 for a motor with no travel. A zero speed gave
 		 * an inf time, which made every speed 0, or 0/0, a NaN, which
 		 * failed the comparison below and sent theta's speed through a
 		 * division by it. A motor with no speed takes zero time. */
 		zTime = 0.0;
-		if (zSpeed > 0) zTime = fabs(zMotDesired-zMotRdbk)/zSpeed;
+		if (oldZSpeed > 0) zTime = fabs(zMotDesired-zMotRdbk)/oldZSpeed;
 		thTime = 0.0;
-		if (thSpeed > 0) thTime = fabs(theta-thetaMotRdbk)/thSpeed;
+		if (oldThSpeed > 0) thTime = fabs(theta-thetaMotRdbk)/oldThSpeed;
 		/* Frozen motors take zero time to move. (tmm) */
 		if (ccMode == MODE_FREEZE_Z) {
 			/* channel-cut mode: Z frozen */
@@ -921,19 +999,19 @@ state calcMovements {
 		}
 		/*** Test for longest time ***/
 		if (thTime >= zTime) {
-			newThSpeed = thSpeed;
-			newTh2Speed = th2Speed;
+			newThSpeed = oldThSpeed;
+			newTh2Speed = oldTh2Speed;
 			/* C defect: divided by thTime when it was 0, putting 0/0, a NaN,
 			 * into Z's VELO when neither motor had to move. */
 			if (thTime > 0) {
 				newZSpeed = fabs(zMotDesired-zMotRdbk)/thTime;
 			} else {
-				newZSpeed = zSpeed;
+				newZSpeed = oldZSpeed;
 			}
 		} else {
 			newThSpeed = fabs(theta-thetaMotRdbk)/zTime;
 			newTh2Speed = newThSpeed;
-			newZSpeed = zSpeed;
+			newZSpeed = oldZSpeed;
 		}
 
 	} state move_ml_mono
@@ -942,13 +1020,13 @@ state calcMovements {
 state move_ml_mono {
 	when (autoMode || putVals || useSetMode) {
 		if (ml_monoCtlDebug) %%printf("ml_monoCtl:move_ml_mono:auto|put\n");
-		thSpeed = newThSpeed;
-		th2Speed = newThSpeed;
-		zSpeed = newZSpeed;
-		pvPut(thSpeed);
-		pvPut(th2Speed);
+		thSpeedCmd = newThSpeed;
+		th2SpeedCmd = newThSpeed;
+		zSpeedCmd = newZSpeed;
+		pvPut(thSpeedCmd);
+		pvPut(th2SpeedCmd);
 		if (ccMode == MODE_NORMAL) {
-			pvPut(zSpeed);
+			pvPut(zSpeedCmd);
 		}
 		thetaMotCmd = thetaMotDesired;
 		theta2MotCmd = theta2MotDesired;
@@ -1059,12 +1137,12 @@ state thetaMotStopped {
 			%%printf("ml_monoCtl:thetaMotStopped:causedMove (done=%d,moving=%d)\n",
 			%%	ml_monoDone, ml_monoMoving);
 		}
-		thSpeed = oldThSpeed;
-		th2Speed = oldTh2Speed;
-		zSpeed = oldZSpeed;
-		pvPut(thSpeed);
-		pvPut(th2Speed);
-		pvPut(zSpeed);
+		thSpeedCmd = oldThSpeed;
+		th2SpeedCmd = oldTh2Speed;
+		zSpeedCmd = oldZSpeed;
+		pvPut(thSpeedCmd);
+		pvPut(th2SpeedCmd);
+		pvPut(zSpeedCmd);
 		causedMove = 0;
 	} state waitForCmndEnter
 
@@ -1216,7 +1294,8 @@ state update {
 
 	when (efTestAndClear(yMotRdbk_mon)) {
 		yOffset = yMotRdbk;
-		pvPut(yOffset);
+		yMotRdbkEcho = yMotRdbk;
+		pvPut(yMotRdbkEcho);
 	} state update
 
 	when (efTestAndClear(thetaMotVel_mon)) {
@@ -1275,43 +1354,65 @@ state update {
 ss updateSet {
 state init {
 	when () {
+		useSetModeLast = useSetMode;
+		thetaMotSetLast = thetaMotSet;
+		theta2MotSetLast = theta2MotSet;
+		zMotSetLast = zMotSet;
 	} state update
 }
 
+/* C defect: compared a flag's monitored value with the others', which
+ * can hold the late echo of an earlier mirror put, and mirrored that
+ * echo back as a new setting. An arm takes its flag only while the PV
+ * still holds it, and mirror compares with the values updateSet last
+ * put or took, never with a monitored one. */
 state update {
 	when (efTestAndClear(useSetMode_mon)) {
-		if (thetaMotSet != useSetMode) {
-			thetaMotSet = useSetMode;
-			pvPut(thetaMotSet);
-		}
-		if (theta2MotSet != useSetMode) {
-			theta2MotSet = useSetMode;
-			pvPut(theta2MotSet);
-		}
-		if (zMotSet != useSetMode) {
-			zMotSet = useSetMode;
-			pvPut(zMotSet);
-		}
-	} state update
+		pvGet(useSetModeCmd);
+		if (useSetModeCmd == useSetMode) useSetModeLast = useSetMode;
+		mirrorSet = useSetModeLast;
+	} state mirror
 
 	when (efTestAndClear(thetaMotSet_mon)) {
-		if (useSetMode != thetaMotSet) {
-			useSetMode = thetaMotSet;
-			pvPut(useSetMode);
-		}
-	} state update
+		pvGet(thetaMotSetCmd);
+		if (thetaMotSetCmd == thetaMotSet) thetaMotSetLast = thetaMotSet;
+		mirrorSet = thetaMotSetLast;
+	} state mirror
 
 	when (efTestAndClear(theta2MotSet_mon)) {
-		if (useSetMode != theta2MotSet) {
-			useSetMode = theta2MotSet;
-			pvPut(useSetMode);
-		}
-	} state update
+		pvGet(theta2MotSetCmd);
+		if (theta2MotSetCmd == theta2MotSet) theta2MotSetLast = theta2MotSet;
+		mirrorSet = theta2MotSetLast;
+	} state mirror
 
 	when (efTestAndClear(zMotSet_mon)) {
-		if (useSetMode != zMotSet) {
-			useSetMode = zMotSet;
-			pvPut(useSetMode);
+		pvGet(zMotSetCmd);
+		if (zMotSetCmd == zMotSet) zMotSetLast = zMotSet;
+		mirrorSet = zMotSetLast;
+	} state mirror
+}
+
+state mirror {
+	when () {
+		if (useSetModeLast != mirrorSet) {
+			useSetModeLast = mirrorSet;
+			useSetModeCmd = mirrorSet;
+			pvPut(useSetModeCmd);
+		}
+		if (thetaMotSetLast != mirrorSet) {
+			thetaMotSetLast = mirrorSet;
+			thetaMotSetCmd = mirrorSet;
+			pvPut(thetaMotSetCmd);
+		}
+		if (theta2MotSetLast != mirrorSet) {
+			theta2MotSetLast = mirrorSet;
+			theta2MotSetCmd = mirrorSet;
+			pvPut(theta2MotSetCmd);
+		}
+		if (zMotSetLast != mirrorSet) {
+			zMotSetLast = mirrorSet;
+			zMotSetCmd = mirrorSet;
+			pvPut(zMotSetCmd);
 		}
 	} state update
 }

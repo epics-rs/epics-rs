@@ -2322,11 +2322,11 @@ mod tests {
 
         /// Wait for `want` complete passes of the fast list, or fail.
         async fn wait_for_passes(observed: &Observed, want: i32) {
-            let deadline = Instant::now() + Duration::from_secs(30);
+            let deadline = Instant::now() + fact_budget::FACT_BUDGET;
             while observed.passes() < want {
                 assert!(
                     Instant::now() < deadline,
-                    "only {} passes in 30 s",
+                    "only {} passes in the fact budget",
                     observed.passes()
                 );
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -2336,7 +2336,7 @@ mod tests {
         /// A pass is complete when every PHAS has started and finished the
         /// same number of passes as PHAS 0 — the C test's `waitPassComplete`.
         async fn wait_pass_complete(observed: &Observed) {
-            let deadline = Instant::now() + Duration::from_secs(30);
+            let deadline = Instant::now() + fact_budget::FACT_BUDGET;
             loop {
                 let passes = observed.passes();
                 if (0..NREC.len()).all(|k| {
@@ -2590,7 +2590,7 @@ mod tests {
                 })
                 .expect("spawn the leader");
 
-            let deadline = Instant::now() + Duration::from_secs(30);
+            let deadline = Instant::now() + fact_budget::FACT_BUDGET;
             while !entered.load(Ordering::Acquire) {
                 assert!(Instant::now() < deadline, "the pass never reached the gate");
                 tokio::time::sleep(Duration::from_millis(1)).await;
@@ -2640,7 +2640,7 @@ mod tests {
         /// Polled rather than read once: a band is only observable after the
         /// thread has reached the registry, and after it has parked.
         async fn wait_for_idle_bands(want: &[(String, ThreadPriority)]) {
-            let deadline = Instant::now() + Duration::from_secs(30);
+            let deadline = Instant::now() + fact_budget::FACT_BUDGET;
             loop {
                 let report = crate::runtime::task::thread_report();
                 let wrong: Vec<String> = want
@@ -2913,7 +2913,7 @@ mod tests {
         let db = Arc::new(PvDatabase::new());
         let owner = ScanOwner::start(Arc::clone(&db));
 
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + fact_budget::FACT_BUDGET;
         while !periodic_lists_built() {
             assert!(
                 Instant::now() < deadline,
@@ -2923,7 +2923,7 @@ mod tests {
         }
 
         drop(owner);
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + fact_budget::FACT_BUDGET;
         while periodic_lists_built() {
             assert!(
                 Instant::now() < deadline,
@@ -2990,7 +2990,7 @@ mod tests {
         let task = tokio::spawn(async move { scheduler.run().await });
 
         // Wait until every rate's thread is up (7 clones + task's own).
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + fact_budget::FACT_BUDGET;
         while Arc::strong_count(&db) < 2 + periodic_scans().len() {
             assert!(Instant::now() < deadline, "scan threads never started");
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -3000,7 +3000,7 @@ mod tests {
         let _ = task.await;
 
         // Guard dropped → flag tripped → every thread wakes and exits.
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + fact_budget::FACT_BUDGET;
         while Arc::strong_count(&db) > 1 {
             assert!(
                 Instant::now() < deadline,
@@ -3068,7 +3068,7 @@ mod tests {
 
         let owner = ScanOwner::start(Arc::clone(&db));
 
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + fact_budget::FACT_BUDGET;
         let name = loop {
             if let Some(n) = seen.lock().expect("probe mutex").clone() {
                 break n;
@@ -3112,7 +3112,7 @@ mod tests {
         let db = Arc::new(PvDatabase::new());
         let owner = ScanOwner::start(Arc::clone(&db));
 
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + fact_budget::FACT_BUDGET;
         while !table().contains(&wanted) {
             assert!(
                 Instant::now() < deadline,
@@ -3123,7 +3123,7 @@ mod tests {
         }
 
         drop(owner);
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + fact_budget::FACT_BUDGET;
         while table().contains(&wanted) {
             assert!(
                 Instant::now() < deadline,
@@ -3162,7 +3162,7 @@ mod tests {
         let db = Arc::new(PvDatabase::new());
         let _owner = ScanOwner::start(Arc::clone(&db));
 
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + fact_budget::FACT_BUDGET;
         while !table().contains("scanOnce") {
             assert!(
                 Instant::now() < deadline,
@@ -3173,9 +3173,9 @@ mod tests {
         }
     }
 
-    /// Wait until `db`'s strong count satisfies `pred`, or panic after 10s.
+    /// Wait until `db`'s strong count satisfies `pred`, or panic after the fact budget.
     async fn wait_for_count(db: &Arc<PvDatabase>, what: &str, pred: impl Fn(usize) -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + fact_budget::FACT_BUDGET;
         while !pred(Arc::strong_count(db)) {
             assert!(
                 Instant::now() < deadline,

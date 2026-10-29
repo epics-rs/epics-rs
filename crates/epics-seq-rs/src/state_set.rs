@@ -11,6 +11,7 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use epics_base_rs::runtime::log::{ErrlogSevEnum, errlog_sev_vprintf};
+use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::types::WallTime;
 use epics_libcom_rs::cfmt::CFloat;
 
@@ -30,7 +31,7 @@ type ReqSlot = parking_lot::Mutex<Option<Arc<PvReq>>>;
 
 /// A `PVMETA` message from a C string literal.
 fn message(s: &str) -> CharPtr {
-    Some(Arc::from(s.as_bytes()))
+    CharPtr::from_bytes(s.as_bytes())
 }
 
 /// `"pvGet"` / `"pvPut"`, as `check_pending` names the call.
@@ -288,7 +289,8 @@ impl<V: ProgramVars> StateSet<V> {
             ),
             None => ("(null)".into(), None),
         });
-        self.set_error(ch, status, mess.clone().map(Arc::from));
+        let message = mess.as_deref().map_or_else(CharPtr::default, message);
+        self.set_error(ch, status, message);
         (name, mess)
     }
 
@@ -436,6 +438,12 @@ impl<V: ProgramVars> StateSet<V> {
         true
     }
 
+    /// The database `seq` started this program on: where a companion makes
+    /// what C code makes in its own IOC, such as asynOctetSocket's port.
+    pub fn database(&self) -> &PvDatabase {
+        &self.prog.db
+    }
+
     /// `seqg_var`: the variables this state set sees — the instance's
     /// block, or its own copy under `+s`.
     pub fn var(&self) -> &V {
@@ -489,16 +497,8 @@ impl<V: ProgramVars> StateSet<V> {
         self.pv_get_tmo(ch, comp, crate::DEFAULT_TIMEOUT)
     }
 
-    /// `seq_pvGetTmo`; `tmo` in seconds. Its return is a delivery point of
-    /// [`Program::gate`].
+    /// `seq_pvGetTmo`; `tmo` in seconds.
     pub fn pv_get_tmo(&self, ch: ChId, comp: CompType, tmo: f64) -> PvStat {
-        self.prog
-            .gate
-            .call(self.index, || self.get_tmo(ch, comp, tmo))
-    }
-
-    /// [`Self::pv_get_tmo`]'s request.
-    fn get_tmo(&self, ch: ChId, comp: CompType, tmo: f64) -> PvStat {
         let chan = self.chan(ch);
         if !self.pv_assigned(ch) {
             if self.safe() {
@@ -612,16 +612,8 @@ impl<V: ProgramVars> StateSet<V> {
         self.pv_put_tmo(ch, comp, crate::DEFAULT_TIMEOUT)
     }
 
-    /// `seq_pvPutTmo`; `tmo` in seconds. Its return is a delivery point of
-    /// [`Program::gate`], which the put's own monitor does not pass.
+    /// `seq_pvPutTmo`; `tmo` in seconds.
     pub fn pv_put_tmo(&self, ch: ChId, comp: CompType, tmo: f64) -> PvStat {
-        self.prog
-            .gate
-            .call(self.index, || self.put_tmo(ch, comp, tmo))
-    }
-
-    /// [`Self::pv_put_tmo`]'s request.
-    fn put_tmo(&self, ch: ChId, comp: CompType, tmo: f64) -> PvStat {
         let chan = self.chan(ch);
         if !self.pv_assigned(ch) {
             if self.safe() {
@@ -808,7 +800,9 @@ impl<V: ProgramVars> StateSet<V> {
 
     /// `seq_pvName`: the name after substitution, null when unassigned.
     pub fn pv_name(&self, ch: ChId) -> CharPtr {
-        self.with_dbch(ch, |d| d.map(|d| Arc::from(d.db_name.as_bytes())))
+        self.with_dbch(ch, |d| {
+            d.map_or_else(CharPtr::default, |d| message(&d.db_name))
+        })
     }
 
     /// `seq_pvCount`.
@@ -835,7 +829,7 @@ impl<V: ProgramVars> StateSet<V> {
     /// `seq_pvMessage`: `""` for an unassigned channel.
     pub fn pv_message(&self, ch: ChId) -> CharPtr {
         self.assigned_meta(ch, |m| m.message.clone())
-            .unwrap_or_else(|| Some(Arc::from(&b""[..])))
+            .unwrap_or_else(|| message(""))
     }
 
     /// `seq_pvAssigned`.
@@ -879,8 +873,10 @@ impl<V: ProgramVars> StateSet<V> {
     pub fn mac_value_get(&self, name: impl CSrc) -> CharPtr {
         // Every macro name is UTF-8, so other bytes name none.
         let name = name.to_c_vec();
-        let value = self.prog.macros.value(std::str::from_utf8(&name).ok()?)?;
-        Some(Arc::from(value.as_bytes()))
+        let value = std::str::from_utf8(&name)
+            .ok()
+            .and_then(|name| self.prog.macros.value(name));
+        value.map_or_else(CharPtr::default, message)
     }
 
     /// `seq_exit`: stop every state set of the program after this

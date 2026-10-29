@@ -49,7 +49,7 @@ fn an_unreadable_nord_errors_the_array_case_instead_of_agreeing() {
     built_oracle_ioc();
     let tools = CTools::discover().expect(
         "the C EPICS tree must be built for the oracle to have ground truth; \
-         set EPICS_BASE_BIN if it is not at the default path",
+         set EPICS_BASE_BIN and EPICS_ORACLE_IOC_BIN",
     );
     let dir = workdir(None).expect("workdir");
     let db = dir.join("array_nord.db");
@@ -120,7 +120,7 @@ fn a_stat_pv_that_does_not_connect_errors_only_its_own_case() {
     built_oracle_ioc();
     let tools = CTools::discover().expect(
         "the C EPICS tree must be built for the oracle to have ground truth; \
-         set EPICS_BASE_BIN if it is not at the default path",
+         set EPICS_BASE_BIN and EPICS_ORACLE_IOC_BIN",
     );
     let dir = workdir(None).expect("workdir");
     let db_text = format!(
@@ -211,7 +211,7 @@ fn a_monitor_whose_drive_was_refused_scores_error_not_agreement() {
     built_oracle_ioc();
     let tools = CTools::discover().expect(
         "the C EPICS tree must be built for the oracle to have ground truth; \
-         set EPICS_BASE_BIN if it is not at the default path",
+         set EPICS_BASE_BIN and EPICS_ORACLE_IOC_BIN",
     );
     let dir = workdir(None).expect("workdir");
     let db = dir.join("mon_drive_refused.db");

@@ -11,18 +11,19 @@ use ad_core_rs::ndarray::{NDArray, NDDataType, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::file_base::{NDFileOpenMode, NDFileWriter};
 use ad_core_rs::plugin::file_controller::{FileControl, FilePluginController};
-use ad_core_rs::plugin::runtime::{NDPluginProcess, PluginAttributes, ProcessResult};
+use ad_core_rs::plugin::runtime::{NDPluginProcess, PluginAttributes, PluginPool, ProcessResult};
 use epics_libcom_rs::cfmt::CFloat;
 use parking_lot::Mutex;
 
 // TIFF tag numbers. 256-339 are the baseline tags C sets through TIFFSetField
 // (NDFileTIFF.cpp:231-238, :244-267); 65000-65003 and 65010+ are the custom
-// EPICS tags (:38-42).
+// EPICS tags (:38-42). The rest are only read, as TIFFReadDirectory reads them.
 const TAG_IMAGE_WIDTH: u16 = 256;
 const TAG_IMAGE_LENGTH: u16 = 257;
 const TAG_BITS_PER_SAMPLE: u16 = 258;
 const TAG_COMPRESSION: u16 = 259;
 const TAG_PHOTOMETRIC: u16 = 262;
+const TAG_FILL_ORDER: u16 = 266;
 const TAG_IMAGE_DESCRIPTION: u16 = 270;
 const TAG_MAKE: u16 = 271;
 const TAG_MODEL: u16 = 272;
@@ -30,9 +31,22 @@ const TAG_STRIP_OFFSETS: u16 = 273;
 const TAG_SAMPLES_PER_PIXEL: u16 = 277;
 const TAG_ROWS_PER_STRIP: u16 = 278;
 const TAG_STRIP_BYTE_COUNTS: u16 = 279;
+const TAG_MIN_SAMPLE_VALUE: u16 = 280;
+const TAG_MAX_SAMPLE_VALUE: u16 = 281;
 const TAG_PLANAR_CONFIG: u16 = 284;
 const TAG_SOFTWARE: u16 = 305;
+const TAG_COLOR_MAP: u16 = 320;
+const TAG_TILE_WIDTH: u16 = 322;
+const TAG_TILE_LENGTH: u16 = 323;
+const TAG_TILE_OFFSETS: u16 = 324;
+const TAG_TILE_BYTE_COUNTS: u16 = 325;
+const TAG_EXTRA_SAMPLES: u16 = 338;
 const TAG_SAMPLE_FORMAT: u16 = 339;
+const TAG_SMIN_SAMPLE_VALUE: u16 = 340;
+const TAG_SMAX_SAMPLE_VALUE: u16 = 341;
+const TAG_DATA_TYPE: u16 = 32996;
+const TAG_IMAGE_DEPTH: u16 = 32997;
+const TAG_TILE_DEPTH: u16 = 32998;
 const TIFFTAG_NDTIMESTAMP: u16 = 65000;
 const TIFFTAG_UNIQUEID: u16 = 65001;
 const TIFFTAG_EPICSTSSEC: u16 = 65002;
@@ -40,20 +54,32 @@ const TIFFTAG_EPICSTSNSEC: u16 = 65003;
 const TIFFTAG_FIRST_ATTRIBUTE: u16 = 65010;
 
 // TIFF field types.
+const TYPE_BYTE: u16 = 1;
 const TYPE_ASCII: u16 = 2;
 const TYPE_SHORT: u16 = 3;
 const TYPE_LONG: u16 = 4;
+const TYPE_RATIONAL: u16 = 5;
+const TYPE_SBYTE: u16 = 6;
+const TYPE_SSHORT: u16 = 8;
+const TYPE_SLONG: u16 = 9;
+const TYPE_SRATIONAL: u16 = 10;
+const TYPE_FLOAT: u16 = 11;
 const TYPE_DOUBLE: u16 = 12;
+const TYPE_LONG8: u16 = 16;
+const TYPE_SLONG8: u16 = 17;
 
 // libtiff constants, as passed by C.
 const COMPRESSION_NONE: u16 = 1;
 const PHOTOMETRIC_MINISBLACK: u16 = 1;
 const PHOTOMETRIC_RGB: u16 = 2;
+const PHOTOMETRIC_PALETTE: u16 = 3;
 const PLANARCONFIG_CONTIG: u16 = 1;
 const PLANARCONFIG_SEPARATE: u16 = 2;
 const SAMPLEFORMAT_UINT: u16 = 1;
 const SAMPLEFORMAT_INT: u16 = 2;
 const SAMPLEFORMAT_IEEEFP: u16 = 3;
+const SAMPLEFORMAT_VOID: u16 = 4;
+const SAMPLEFORMAT_COMPLEXIEEEFP: u16 = 6;
 
 /// The image geometry C derives in `NDFileTIFF::openFile` (NDFileTIFF.cpp:
 /// 180-224) together with the strip layout its `writeFile` (:383-406) writes.
@@ -301,8 +327,9 @@ impl TiffWriter {
         attributes: &NDAttributeList,
         layout: &TiffLayout,
     ) -> ADResult<Vec<u8>> {
-        let raw = array.data.as_u8_slice();
-        let (sample_format, bits_per_sample) = Self::sample_format_and_bits(array.data.data_type());
+        let raw = array.data().as_u8_slice();
+        let (sample_format, bits_per_sample) =
+            Self::sample_format_and_bits(array.data().data_type());
         let bytes_per_sample = usize::from(bits_per_sample) / 8;
 
         let writes = Self::strip_writes(layout, bytes_per_sample);
@@ -452,13 +479,13 @@ impl NDFileWriter for TiffWriter {
         Ok(())
     }
 
-    fn read_file(&mut self) -> ADResult<NDArray> {
+    fn read_file(&mut self, pool: &NDArrayPool) -> ADResult<NDArray> {
         let path = self
             .current_path
             .as_ref()
             .ok_or_else(|| ADError::UnsupportedConversion("no file open".into()))?;
         let bytes = std::fs::read(path)?;
-        decode(&bytes, self.plugin_attributes.clone())
+        decode(&bytes, self.plugin_attributes.clone(), pool)
     }
 
     fn close_file(&mut self) -> ADResult<()> {
@@ -470,8 +497,30 @@ impl NDFileWriter for TiffWriter {
         false
     }
 
-    fn set_plugin_attributes(&mut self, attributes: NDAttributeList) {
-        self.plugin_attributes = attributes;
+    fn set_plugin_attributes(&mut self, attributes: &NDAttributeList) {
+        self.plugin_attributes.clone_from(attributes);
+    }
+}
+
+/// The size of one value of `kind`, for the integer types every
+/// TIFFReadDirEntry* reader takes.
+fn integer_size(kind: u16) -> Option<usize> {
+    match kind {
+        TYPE_BYTE | TYPE_SBYTE => Some(1),
+        TYPE_SHORT | TYPE_SSHORT => Some(2),
+        TYPE_LONG | TYPE_SLONG => Some(4),
+        TYPE_LONG8 | TYPE_SLONG8 => Some(8),
+        _ => None,
+    }
+}
+
+/// [`integer_size`], plus the float and rational types
+/// TIFFReadDirEntryDoubleArray also takes.
+fn double_size(kind: u16) -> Option<usize> {
+    match kind {
+        TYPE_FLOAT => Some(4),
+        TYPE_RATIONAL | TYPE_SRATIONAL | TYPE_DOUBLE => Some(8),
+        _ => integer_size(kind),
     }
 }
 
@@ -483,69 +532,268 @@ impl NDFileWriter for TiffWriter {
 /// RGB/SEPARATE/3 → RGB3 `[x, y, 3]` — a planar file always comes back as RGB3,
 /// even when written from an RGB2 array, because the strips are read in index
 /// order and that order is plane R, plane G, plane B. Anything else is an error.
-/// Strips are concatenated in index order into the array buffer (:513-524).
-/// The image starts from `attributes`, the plugin's set C `readFile` gets
-/// ahead of ColorMode (NDFileTIFF.cpp:540-543).
-fn decode(bytes: &[u8], attributes: NDAttributeList) -> ADResult<NDArray> {
+/// The image is allocated from `pool` and its strips are read into it in
+/// index order (:515-533); C dereferences a refused alloc, here the read
+/// fails. The image starts from `attributes`, the plugin's set C `readFile`
+/// gets ahead of ColorMode (NDFileTIFF.cpp:540-543).
+fn decode(bytes: &[u8], attributes: NDAttributeList, pool: &NDArrayPool) -> ADResult<NDArray> {
     let err = |m: &str| ADError::UnsupportedConversion(format!("TIFF decode error: {m}"));
 
+    // libtiff reads either byte order: the header and IFD in the file's,
+    // the samples swabbed to the host's (tif_postdecode).
+    let big_endian = match bytes.get(0..2) {
+        Some(b"II") => false,
+        Some(b"MM") => true,
+        _ => return Err(err("not a TIFF")),
+    };
+    // An offset read from a BigTIFF can be anywhere up to u64::MAX.
     let read_u16 = |off: usize| -> ADResult<u16> {
         bytes
-            .get(off..off + 2)
-            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .get(off..)
+            .and_then(|b| b.first_chunk())
+            .map(|&b| {
+                if big_endian {
+                    u16::from_be_bytes(b)
+                } else {
+                    u16::from_le_bytes(b)
+                }
+            })
             .ok_or_else(|| err("truncated"))
     };
     let read_u32 = |off: usize| -> ADResult<u32> {
         bytes
-            .get(off..off + 4)
-            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .get(off..)
+            .and_then(|b| b.first_chunk())
+            .map(|&b| {
+                if big_endian {
+                    u32::from_be_bytes(b)
+                } else {
+                    u32::from_le_bytes(b)
+                }
+            })
+            .ok_or_else(|| err("truncated"))
+    };
+    let read_u64 = |off: usize| -> ADResult<u64> {
+        bytes
+            .get(off..)
+            .and_then(|b| b.first_chunk())
+            .map(|&b| {
+                if big_endian {
+                    u64::from_be_bytes(b)
+                } else {
+                    u64::from_le_bytes(b)
+                }
+            })
             .ok_or_else(|| err("truncated"))
     };
 
-    if bytes.len() < 8 || &bytes[0..2] != b"II" || read_u16(2)? != 42 {
-        return Err(err("not a little-endian classic TIFF"));
-    }
-
-    // The reader only needs the integer tags; ASCII/DOUBLE entries are skipped.
-    let ifd = read_u32(4)? as usize;
-    let entry_count = read_u16(ifd)? as usize;
-    let mut tags: BTreeMap<u16, Vec<u64>> = BTreeMap::new();
-    for i in 0..entry_count {
-        let entry = ifd + 2 + 12 * i;
-        let tag = read_u16(entry)?;
-        let size = match read_u16(entry + 2)? {
-            TYPE_SHORT => 2usize,
-            TYPE_LONG => 4,
-            _ => continue,
-        };
-        let n = read_u32(entry + 4)? as usize;
-        let base = if n * size <= 4 {
-            entry + 8
-        } else {
-            read_u32(entry + 8)? as usize
-        };
-        let mut values = Vec::with_capacity(n);
-        for k in 0..n {
-            values.push(match size {
-                2 => u64::from(read_u16(base + 2 * k)?),
-                _ => u64::from(read_u32(base + 4 * k)?),
-            });
-        }
-        tags.insert(tag, values);
-    }
-
-    let scalar = |tag: u16| -> Option<u64> { tags.get(&tag).and_then(|v| v.first().copied()) };
-    let width = scalar(TAG_IMAGE_WIDTH).ok_or_else(|| err("no ImageWidth"))? as usize;
-    let height = scalar(TAG_IMAGE_LENGTH).ok_or_else(|| err("no ImageLength"))? as usize;
-    let bits = scalar(TAG_BITS_PER_SAMPLE).ok_or_else(|| err("no BitsPerSample"))?;
-    let samples_per_pixel = scalar(TAG_SAMPLES_PER_PIXEL).unwrap_or(1);
-    let photometric = scalar(TAG_PHOTOMETRIC).ok_or_else(|| err("no PhotometricInterpretation"))?;
-    let planar_config = scalar(TAG_PLANAR_CONFIG).unwrap_or(u64::from(PLANARCONFIG_CONTIG));
-    // C: "Sample format is not defined! Default UINT is used." (:457-463)
-    let sample_format = match scalar(TAG_SAMPLE_FORMAT) {
-        Some(0) | None => u64::from(SAMPLEFORMAT_UINT),
-        Some(v) => v,
+    // A BigTIFF widens the IFD offset, the entry count, and each entry's
+    // count and value field to 8 bytes.
+    let big = match read_u16(2)? {
+        42 => false,
+        43 if read_u16(4)? == 8 && read_u16(6)? == 0 => true,
+        _ => return Err(err("not a TIFF version 42, or 43 with 8-byte offsets")),
     };
+    let field = if big { 8 } else { 4 };
+    let word = |off: usize| -> ADResult<usize> {
+        let v = if big {
+            read_u64(off)?
+        } else {
+            u64::from(read_u32(off)?)
+        };
+        usize::try_from(v).map_err(|_| err("truncated"))
+    };
+
+    // The entry of each tag; a repeated tag keeps its first, as
+    // TIFFReadDirectory ignores the later ones.
+    let ifd = word(if big { 8 } else { 4 })?;
+    let (entry_count, first) = if big {
+        (word(ifd)?, ifd + 8)
+    } else {
+        (usize::from(read_u16(ifd)?), ifd + 2)
+    };
+    // TIFFFetchDirectory takes 1 to 4096 entries, all inside the file.
+    let entry_size = 4 + 2 * field;
+    if !(1..=4096).contains(&entry_count) || first + entry_size * entry_count > bytes.len() {
+        return Err(err("bad directory"));
+    }
+    let mut entries: BTreeMap<u16, usize> = BTreeMap::new();
+    for i in 0..entry_count {
+        let entry = first + entry_size * i;
+        entries.entry(read_u16(entry)?).or_insert(entry);
+    }
+    // An entry's type, value size and values' bytes, for a type its reader
+    // takes (`size`); another type, or values past the end of the file, fail
+    // the open.
+    let entry_bytes =
+        |tag: u16, size: fn(u16) -> Option<usize>| -> ADResult<Option<(u16, usize, &[u8])>> {
+            let Some(&entry) = entries.get(&tag) else {
+                return Ok(None);
+            };
+            let kind = read_u16(entry + 2)?;
+            let size = size(kind).ok_or_else(|| err(&format!("tag {tag} has type {kind}")))?;
+            let len = word(entry + 4)?
+                .checked_mul(size)
+                .ok_or_else(|| err("truncated"))?;
+            let at = if len <= field {
+                entry + 4 + field
+            } else {
+                word(entry + 4 + field)?
+            };
+            let raw = bytes
+                .get(at..)
+                .and_then(|b| b.get(..len))
+                .ok_or_else(|| err("truncated"))?;
+            Ok(Some((kind, size, raw)))
+        };
+    // TIFFReadDirEntry*: every integer type reads, as long as no value is
+    // negative; any other type fails the open.
+    let values = |tag: u16| -> ADResult<Option<Vec<u64>>> {
+        let Some((kind, size, raw)) = entry_bytes(tag, integer_size)? else {
+            return Ok(None);
+        };
+        let signed = matches!(kind, TYPE_SBYTE | TYPE_SSHORT | TYPE_SLONG | TYPE_SLONG8);
+        raw.chunks_exact(size)
+            .map(|v| {
+                let mut b = [0; 8];
+                let value = if big_endian {
+                    b[8 - size..].copy_from_slice(v);
+                    u64::from_be_bytes(b)
+                } else {
+                    b[..size].copy_from_slice(v);
+                    u64::from_le_bytes(b)
+                };
+                if signed && value >> (8 * size - 1) != 0 {
+                    return Err(err(&format!("tag {tag} has a negative value")));
+                }
+                Ok(value)
+            })
+            .collect::<ADResult<Vec<_>>>()
+            .map(Some)
+    };
+    // TIFFReadDirEntryShort/Long: one value, no greater than `max`.
+    let one = |tag: u16, max: u64| -> ADResult<Option<u64>> {
+        match values(tag)?.as_deref() {
+            None => Ok(None),
+            Some(&[v]) if v <= max => Ok(Some(v)),
+            Some(_) => Err(err(&format!("tag {tag} is not one value up to {max}"))),
+        }
+    };
+    let short = u64::from(u16::MAX);
+    let long = u64::from(u32::MAX);
+
+    let width = one(TAG_IMAGE_WIDTH, long)?.ok_or_else(|| err("no ImageWidth"))? as usize;
+    let height = one(TAG_IMAGE_LENGTH, long)?.ok_or_else(|| err("no ImageLength"))? as usize;
+    let samples_per_pixel = match one(TAG_SAMPLES_PER_PIXEL, short)? {
+        Some(0) => return Err(err("bad value 0 for SamplesPerPixel")),
+        Some(n) => n,
+        None => 1,
+    };
+    // One value, or one per sample all alike (TIFFReadDirEntryPersampleShort).
+    let per_sample = |tag: u16| -> ADResult<Option<u64>> {
+        let Some(v) = values(tag)? else {
+            return Ok(None);
+        };
+        let samples = samples_per_pixel as usize;
+        match v[..] {
+            [one] if one <= short => Ok(Some(one)),
+            _ if v.len() >= samples
+                && v.iter().all(|&s| s <= short)
+                && v[..samples].iter().all(|&s| s == v[0]) =>
+            {
+                Ok(Some(v[0]))
+            }
+            _ => Err(err(&format!("tag {tag} is not one value per sample"))),
+        }
+    };
+    // C decodes through libtiff's codecs; with none here, a compressed strip
+    // would come back as its raw bytes.
+    let compression = per_sample(TAG_COMPRESSION)?.unwrap_or(u64::from(COMPRESSION_NONE));
+    if compression != u64::from(COMPRESSION_NONE) {
+        return Err(err(&format!("unsupported Compression={compression}")));
+    }
+    let bits = per_sample(TAG_BITS_PER_SAMPLE)?.ok_or_else(|| err("no BitsPerSample"))?;
+    // Without a Photometric that reads, C's photoMetric is left uninitialized
+    // (TIFFReadDirectory reads the tag with recover); refused here.
+    let photometric =
+        one(TAG_PHOTOMETRIC, short)?.ok_or_else(|| err("no PhotometricInterpretation"))?;
+    // TIFFReadDirectory reads a Palette file without a ColorMap as RGB with 3
+    // samples, else MinIsBlack, from 8 bits up, and fails it below 8. A
+    // ColorMap sets only after BitsPerSample, with 3 << bits values that read.
+    let colormap = || {
+        entries.get(&TAG_BITS_PER_SAMPLE) < entries.get(&TAG_COLOR_MAP)
+            && values(TAG_COLOR_MAP).ok().flatten().is_some_and(|v| {
+                Some(v.len() as u64) == 1u64.checked_shl(bits as u32).and_then(|n| n.checked_mul(3))
+                    && v.iter().all(|&c| c <= short)
+            })
+    };
+    let photometric = if photometric == u64::from(PHOTOMETRIC_PALETTE) && !colormap() {
+        if bits < 8 {
+            return Err(err("no ColorMap for a Palette image"));
+        }
+        u64::from(if samples_per_pixel == 3 {
+            PHOTOMETRIC_RGB
+        } else {
+            PHOTOMETRIC_MINISBLACK
+        })
+    } else {
+        photometric
+    };
+    let planar_config = one(TAG_PLANAR_CONFIG, short)?.unwrap_or(u64::from(PLANARCONFIG_CONTIG));
+    // _TIFFVSetField fails the open on a SampleFormat outside 1..=6, and sets
+    // the sample format from DataType VOID..=IEEEFP as well; the later entry
+    // of the two wins. Without either, C's sampleFormat is left
+    // uninitialized; UINT here, as its 0 branch (:457-463) intends.
+    let sample_format = match per_sample(TAG_SAMPLE_FORMAT)? {
+        Some(v) if !(SAMPLEFORMAT_UINT..=SAMPLEFORMAT_COMPLEXIEEEFP).contains(&(v as u16)) => {
+            return Err(err(&format!("bad value {v} for SampleFormat")));
+        }
+        v => v,
+    };
+    let data_type_format = match per_sample(TAG_DATA_TYPE)? {
+        None => None,
+        Some(0) => Some(SAMPLEFORMAT_VOID),
+        Some(1) => Some(SAMPLEFORMAT_INT),
+        Some(2) => Some(SAMPLEFORMAT_UINT),
+        Some(3) => Some(SAMPLEFORMAT_IEEEFP),
+        Some(v) => return Err(err(&format!("bad value {v} for DataType"))),
+    };
+    let sample_format = if entries.get(&TAG_DATA_TYPE) > entries.get(&TAG_SAMPLE_FORMAT) {
+        data_type_format.map(u64::from)
+    } else {
+        sample_format
+    }
+    .unwrap_or(u64::from(SAMPLEFORMAT_UINT));
+    // TIFFReadDirectory reads these too, and fails the open where an entry
+    // does not read or its value does not set; readFile never looks at them.
+    one(TAG_IMAGE_DEPTH, long)?;
+    // A TileWidth or TileLength makes the file tiled, and readFile's
+    // TIFFReadEncodedStrip fails on a tiled file.
+    for tag in [TAG_TILE_WIDTH, TAG_TILE_LENGTH] {
+        if one(tag, long)?.is_some() {
+            return Err(err("a tiled TIFF is not read"));
+        }
+    }
+    if one(TAG_TILE_DEPTH, long)? == Some(0) {
+        return Err(err("bad value 0 for TileDepth"));
+    }
+    for tag in [TAG_MIN_SAMPLE_VALUE, TAG_MAX_SAMPLE_VALUE] {
+        per_sample(tag)?;
+    }
+    // setExtraSamples: no more than one per sample, each a known kind or
+    // Corel's 999.
+    if let Some(v) = values(TAG_EXTRA_SAMPLES)?
+        && (v.len() > samples_per_pixel as usize || v.iter().any(|&s| s > 2 && s != 999))
+    {
+        return Err(err(&format!("bad ExtraSamples {v:?}")));
+    }
+    for tag in [TAG_SMIN_SAMPLE_VALUE, TAG_SMAX_SAMPLE_VALUE] {
+        if let Some((_, size, raw)) = entry_bytes(tag, double_size)?
+            && raw.len() / size != samples_per_pixel as usize
+        {
+            return Err(err(&format!("tag {tag} is not one value per sample")));
+        }
+    }
 
     let data_type = match (bits, sample_format as u16) {
         (8, SAMPLEFORMAT_INT) => NDDataType::Int8,
@@ -594,27 +842,116 @@ fn decode(bytes: &[u8], attributes: NDAttributeList) -> ADResult<NDArray> {
         }
     };
 
-    let offsets = tags
-        .get(&TAG_STRIP_OFFSETS)
-        .ok_or_else(|| err("no StripOffsets"))?;
-    let counts = tags
-        .get(&TAG_STRIP_BYTE_COUNTS)
-        .ok_or_else(|| err("no StripByteCounts"))?;
-    if offsets.len() != counts.len() {
-        return Err(err("StripOffsets/StripByteCounts length mismatch"));
+    // libtiff refuses these at TIFFOpen (tif_dirread.c:3561, :3621, :4053).
+    if width == 0 || height == 0 {
+        return Err(err("no image"));
     }
-    let mut raw: Vec<u8> = Vec::new();
-    for (offset, byte_count) in offsets.iter().zip(counts) {
-        let (start, len) = (*offset as usize, *byte_count as usize);
-        let strip = bytes
-            .get(start..start + len)
-            .ok_or_else(|| err("strip extends past the end of the file"))?;
-        raw.extend_from_slice(strip);
+    let rows_per_strip = match one(TAG_ROWS_PER_STRIP, long)? {
+        Some(0) => return Err(err("bad value 0 for RowsPerStrip")),
+        Some(rows) => rows,
+        None => long,
+    };
+    let separate = planar_config == u64::from(PLANARCONFIG_SEPARATE);
+    let planes = if separate { samples_per_pixel } else { 1 };
+    // TIFFNumberOfStrips: howmany_32 gives 0 where height + RowsPerStrip
+    // passes a u32, _TIFFMultiply32 gives 0 where the planes do, and
+    // TIFFReadDirectory fails on 0 strips (tif_strip.c:61-72,
+    // tif_dirread.c:3620).
+    let strips_per_plane = if rows_per_strip == long {
+        1
+    } else if (height as u64) < long - (rows_per_strip - 1) {
+        (height as u64).div_ceil(rows_per_strip)
+    } else {
+        0
+    };
+    if strips_per_plane == 0 || strips_per_plane * planes > long {
+        return Err(err("zero number of strips"));
     }
-
-    let mut array = NDArray::new(dims, data_type);
-    array.data = crate::codec::buffer_from_bytes(&raw, data_type)
-        .ok_or_else(|| err("strip data is not a whole number of samples"))?;
+    let (rows_per_strip, planes) = ((rows_per_strip as usize).min(height), planes as usize);
+    let strips_per_plane = strips_per_plane as usize;
+    let num_strips = strips_per_plane * planes;
+    // TileOffsets and TileByteCounts fill the same tables as StripOffsets
+    // and StripByteCounts; the later entry in the directory wins.
+    let table = |strip: u16, tile: u16| -> ADResult<Option<Vec<u64>>> {
+        let (strip_values, tile_values) = (values(strip)?, values(tile)?);
+        Ok(if entries.get(&tile) > entries.get(&strip) {
+            tile_values
+        } else {
+            strip_values
+        })
+    };
+    // TIFFFetchStripThing cuts or zero-fills a table to the strip count; a
+    // strip past the file's entries reads 0 here without that table, which
+    // C allocates whole and crashes on for a 2^32-strip header.
+    let at = |table: &[u64], strip: usize| table.get(strip).copied().unwrap_or(0);
+    let offsets =
+        table(TAG_STRIP_OFFSETS, TAG_TILE_OFFSETS)?.ok_or_else(|| err("no StripOffsets"))?;
+    let mut array = pool.alloc(dims, data_type)?;
+    let image = array.data_mut().as_u8_slice_mut();
+    let size = image.len();
+    // TIFFScanlineSize: one row of one plane.
+    let scanline = size / height / planes;
+    let file_size = bytes.len() as u64;
+    // TIFFReadDirectory estimates the counts from the geometry (`None`) when
+    // they are missing, when a single one is 0, past the file or short of the
+    // image, or when the first two of more than two contiguous strips differ
+    // (tif_dirread.c:3901-3976).
+    let counts = match table(TAG_STRIP_BYTE_COUNTS, TAG_TILE_BYTE_COUNTS)? {
+        None if num_strips != planes => return Err(err("no StripByteCounts")),
+        Some(c)
+            if num_strips == 1
+                && at(&offsets, 0) != 0
+                && (at(&c, 0) == 0
+                    || at(&c, 0) > file_size.wrapping_sub(at(&offsets, 0))
+                    || at(&c, 0) < (scanline * height) as u64) =>
+        {
+            None
+        }
+        Some(c)
+            if !separate
+                && num_strips > 2
+                && at(&c, 0) != at(&c, 1)
+                && at(&c, 0) != 0
+                && at(&c, 1) != 0 =>
+        {
+            None
+        }
+        counts => counts,
+    };
+    let estimate = (scanline * (height / strips_per_plane)) as u64;
+    // TIFFFillStrip reverses the bits of each raw strip byte where FillOrder
+    // is LSB2MSB (tif_read.c:619-621). A FillOrder that does not read or set
+    // leaves MSB2LSB: TIFFReadDirectory ignores that failure (:3804).
+    let reverse_bits = one(TAG_FILL_ORDER, short).ok().flatten() == Some(2);
+    let mut total = 0;
+    for strip in 0..num_strips {
+        // TIFFReadEncodedStrip: the strip's rows from the geometry, capped at
+        // what the image has left; the count only has to cover them.
+        let rows = (height - strip % strips_per_plane * rows_per_strip).min(rows_per_strip);
+        let len = (rows * scanline).min(size - total);
+        let offset = at(&offsets, strip);
+        let count = counts.as_deref().map_or(estimate, |c| at(c, strip));
+        if count > file_size || offset > file_size - count {
+            return Err(err(&format!("strip {strip} runs past the end of the file")));
+        }
+        if count < len as u64 {
+            return Err(err(&format!(
+                "strip {strip} has {count} bytes, its rows {len}"
+            )));
+        }
+        let start = offset as usize;
+        let strip_bytes = &mut image[total..total + len];
+        strip_bytes.copy_from_slice(&bytes[start..start + len]);
+        if reverse_bits {
+            strip_bytes.iter_mut().for_each(|b| *b = b.reverse_bits());
+        }
+        total += len;
+    }
+    if big_endian != cfg!(target_endian = "big") {
+        image
+            .chunks_exact_mut(data_type.element_size())
+            .for_each(<[u8]>::reverse);
+    }
     array.attributes = attributes;
     TiffWriter::attach_color_mode(&mut array, color_mode);
     Ok(array)
@@ -691,6 +1028,10 @@ impl NDPluginProcess for TiffFileProcessor {
         self.attributes = Some(attributes);
     }
 
+    fn bind_pool(&mut self, pool: PluginPool) {
+        self.ctrl.get_mut().bind_pool(pool);
+    }
+
     fn plugin_type(&self) -> &str {
         "NDFileTIFF"
     }
@@ -712,7 +1053,21 @@ impl NDPluginProcess for TiffFileProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ad_core_rs::ndarray::NDDataBuffer;
+
+    /// NDPluginDriver's FilePath refusal fails the write under this
+    /// plugin's errorMessage.
+    #[test]
+    fn a_refused_file_path_write_fails() {
+        let (message, function, value) =
+            crate::test_util::refused_file_path_write("TIFF_PATH", TiffFileProcessor::new());
+        assert_eq!(
+            message,
+            format!(
+                "NDPluginDriver::writeOctet: status=3, function={function}, paramName=FILE_PATH, value={value}"
+            )
+        );
+    }
+    use ad_core_rs::ndarray::{NDDataView, NDDataViewMut};
     use ad_core_rs::plugin::file_base::NDFileMode;
     // The tests verify the bytes this module writes with an INDEPENDENT TIFF
     // decoder (the `tiff` crate), not with our own reader.
@@ -895,8 +1250,8 @@ mod tests {
 
     impl NDPluginProcess for Downstream {
         const ASYN_FLAGS: PortFlags = ad_core_rs::plugin::runtime::ASYN_CANBLOCK;
-        const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
-        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+        const INTERFACE_MASK: InterfaceMask = InterfaceMask::NONE;
+        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::NONE;
         fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
             self.0.lock().push(Seen::Frame(array.unique_id));
             ProcessResult::sink(vec![])
@@ -1403,8 +1758,8 @@ mod tests {
             "TIFFBUSY",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         let _nd_params = NDArrayDriverParams::create(&mut base).unwrap();
         let mut proc = TiffFileProcessor::new();
@@ -1498,7 +1853,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(v) = &mut arr.data {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             for i in 0..16 {
                 v[i] = i as u8;
             }
@@ -1551,7 +1906,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(v) = &mut arr.data {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             for i in 0..16 {
                 v[i] = (i * 10) as u8;
             }
@@ -1562,8 +1917,10 @@ mod tests {
             .unwrap();
         writer.write_file(&Arc::new(arr.clone())).unwrap();
 
-        let read_back = writer.read_file().unwrap();
-        if let (NDDataBuffer::U8(orig), NDDataBuffer::U8(read)) = (&arr.data, &read_back.data) {
+        let read_back = writer.read_file(&NDArrayPool::new(0)).unwrap();
+        if let (NDDataView::U8(orig), NDDataView::U8(read)) =
+            (arr.data().view(), read_back.data().view())
+        {
             assert_eq!(orig, read);
         } else {
             panic!("data type mismatch on roundtrip");
@@ -1582,7 +1939,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt16,
         );
-        if let NDDataBuffer::U16(v) = &mut arr.data {
+        if let NDDataViewMut::U16(v) = arr.data_mut().view_mut() {
             for i in 0..16 {
                 v[i] = (i * 1000) as u16;
             }
@@ -1593,8 +1950,10 @@ mod tests {
             .unwrap();
         writer.write_file(&Arc::new(arr.clone())).unwrap();
 
-        let read_back = writer.read_file().unwrap();
-        if let (NDDataBuffer::U16(orig), NDDataBuffer::U16(read)) = (&arr.data, &read_back.data) {
+        let read_back = writer.read_file(&NDArrayPool::new(0)).unwrap();
+        if let (NDDataView::U16(orig), NDDataView::U16(read)) =
+            (arr.data().view(), read_back.data().view())
+        {
             assert_eq!(orig, read);
         } else {
             panic!("data type mismatch on roundtrip");
@@ -1614,7 +1973,7 @@ mod tests {
             NDDataType::UInt8,
         );
         arr.unique_id = 77;
-        if let NDDataBuffer::U8(v) = &mut arr.data {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             for (i, item) in v.iter_mut().enumerate() {
                 *item = i as u8;
             }
@@ -1630,8 +1989,8 @@ mod tests {
             "TIFFTEST",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         let _nd_params = NDArrayDriverParams::create(&mut base).unwrap();
 
@@ -1669,11 +2028,61 @@ mod tests {
         let ad_core_rs::plugin::runtime::Published::Read(read) = &out.publish else {
             panic!("ReadFile publishes its array: {:?}", out.publish);
         };
-        match &read.data {
-            NDDataBuffer::U8(v) => assert_eq!(v.len(), 12),
+        match read.data().view() {
+            NDDataView::U8(v) => assert_eq!(v.len(), 12),
             other => panic!("unexpected data buffer: {other:?}"),
         }
 
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// C readFile takes the image from the plugin's `pNDArrayPool`
+    /// (NDFileTIFF.cpp:515), so the read frame is charged to that pool.
+    #[test]
+    fn a_read_file_allocates_the_image_from_the_plugin_pool() {
+        let path = write_tiff("tiff_read_pool", &mono_array(4, 3));
+        let pool = ad_core_rs::ndarray_pool::DriverPool::standalone(0);
+        let mut proc = TiffFileProcessor::new();
+        proc.bind_pool(ad_core_rs::plugin::runtime::PluginPool::new(pool.clone()));
+
+        let (out, _base) = crate::test_util::read_file(&mut proc, &path);
+
+        let ad_core_rs::plugin::runtime::Published::Read(read) = &out.publish else {
+            panic!("ReadFile publishes its array: {:?}", out.publish);
+        };
+        assert_eq!(read.pool_id(), pool.id());
+        assert_eq!(pool.allocated_bytes(), 12);
+        assert_eq!(
+            read.data().as_u8_slice(),
+            mono_array(4, 3).data().as_u8_slice()
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A pool over its maxMemory refuses the image. C goes on to dereference
+    /// the NULL (NDFileTIFF.cpp:517); here readFile fails and readFileBase
+    /// reports it, with nothing published.
+    #[test]
+    fn a_read_file_the_pool_refuses_publishes_nothing() {
+        let path = write_tiff("tiff_read_refused", &mono_array(4, 3));
+        let pool = ad_core_rs::ndarray_pool::DriverPool::standalone(11);
+        let mut proc = TiffFileProcessor::new();
+        proc.bind_pool(ad_core_rs::plugin::runtime::PluginPool::new(pool.clone()));
+
+        let (out, _base) = crate::test_util::read_file(&mut proc, &path);
+
+        assert!(
+            matches!(out.publish, ad_core_rs::plugin::runtime::Published::Nothing),
+            "a refused read publishes nothing: {:?}",
+            out.publish
+        );
+        let line = format!("NDPluginFile::readFileBase Error  file {}", path.display());
+        assert!(
+            out.trace.iter().any(|(_, l)| l.starts_with(&line)),
+            "{:?}",
+            out.trace
+        );
+        assert_eq!(pool.allocated_bytes(), 0);
         std::fs::remove_file(&path).ok();
     }
 
@@ -1819,7 +2228,7 @@ mod tests {
             NDDataType::Int16,
         );
         TiffWriter::attach_color_mode(&mut arr, NDColorMode::RGB1);
-        if let NDDataBuffer::I16(v) = &mut arr.data {
+        if let NDDataViewMut::I16(v) = arr.data_mut().view_mut() {
             for (i, item) in v.iter_mut().enumerate() {
                 *item = (i as i16) - 6;
             }
@@ -1856,7 +2265,7 @@ mod tests {
             NDDataType::UInt8,
         );
         TiffWriter::attach_color_mode(&mut arr, mode);
-        if let NDDataBuffer::U8(v) = &mut arr.data {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             for y in 0..h {
                 for x in 0..w {
                     for c in 0..3 {
@@ -1883,7 +2292,7 @@ mod tests {
             vec![NDDimension::new(w), NDDimension::new(h)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(v) = &mut arr.data {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             v.iter_mut().enumerate().for_each(|(i, x)| *x = i as u8);
         }
         arr
@@ -2055,7 +2464,7 @@ mod tests {
                 &NDArray::new(vec![], NDDataType::UInt8),
             )
             .unwrap();
-        let read_back = writer.read_file().unwrap();
+        let read_back = writer.read_file(&NDArrayPool::new(0)).unwrap();
         writer.close_file().unwrap();
 
         assert_eq!(
@@ -2072,8 +2481,8 @@ mod tests {
             Some(NDColorMode::RGB3 as i64)
         );
         assert_eq!(
-            read_back.data.as_u8_slice(),
-            rgb_array(NDColorMode::RGB3, w, h).data.as_u8_slice(),
+            read_back.data().as_u8_slice(),
+            rgb_array(NDColorMode::RGB3, w, h).data().as_u8_slice(),
             "the RGB2 pixels must come back as the same image in RGB3 layout"
         );
         std::fs::remove_file(&path).ok();
@@ -2096,7 +2505,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(v) = &mut arr.data {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             for (i, item) in v.iter_mut().enumerate() {
                 *item = i as u8;
             }
@@ -2112,5 +2521,802 @@ mod tests {
         assert!(std::path::Path::new(&full_name).exists());
 
         std::fs::remove_file(&path).ok();
+    }
+
+    /// How a [`StripFile`] writes StripByteCounts.
+    #[derive(Clone, Copy)]
+    enum Counts {
+        /// Each strip's geometry length.
+        Geometry,
+        Given(&'static [u32]),
+        /// No StripByteCounts tag.
+        Missing,
+    }
+
+    /// A file of the C comparison set, laid out as reviewer6's generator
+    /// lays it out so that C's reads of those files pin this reader: the
+    /// strips from offset 8, `pad` 0xee bytes, the out-of-line tag arrays,
+    /// then the IFD. Sample `i` is `i*7+1`, `i*257+3` or `i*16843009+5`.
+    #[derive(Clone, Copy)]
+    struct StripFile {
+        width: u32,
+        height: u32,
+        rows: u32,
+        counts: Counts,
+        pad: usize,
+        samples: u16,
+        separate: bool,
+        bits: u16,
+        big_endian: bool,
+        /// Cuts StripOffsets to this length, or extends it.
+        offsets_len: Option<usize>,
+        offsets: Option<&'static [u32]>,
+        /// Replaces a tag's written value.
+        overrides: &'static [(u16, u32)],
+        omit: &'static [u16],
+    }
+
+    impl Default for StripFile {
+        fn default() -> Self {
+            Self {
+                width: 4,
+                height: 3,
+                rows: 3,
+                counts: Counts::Geometry,
+                pad: 16,
+                samples: 1,
+                separate: false,
+                bits: 8,
+                big_endian: false,
+                offsets_len: None,
+                offsets: None,
+                overrides: &[],
+                omit: &[],
+            }
+        }
+    }
+
+    impl StripFile {
+        fn short(&self, value: u16) -> [u8; 2] {
+            if self.big_endian {
+                value.to_be_bytes()
+            } else {
+                value.to_le_bytes()
+            }
+        }
+
+        fn long(&self, value: u32) -> [u8; 4] {
+            if self.big_endian {
+                value.to_be_bytes()
+            } else {
+                value.to_le_bytes()
+            }
+        }
+
+        fn file(&self) -> Vec<u8> {
+            let rows = match self.rows {
+                0 => self.height,
+                rows => rows.min(self.height).max(1),
+            };
+            let samples = u32::from(self.samples);
+            let (planes, row_samples) = if self.separate {
+                (samples, self.width)
+            } else {
+                (1, self.width * samples)
+            };
+            let mut data = Vec::new();
+            let (mut offsets, mut geometry) = (Vec::new(), Vec::new());
+            for plane in 0..planes {
+                for first in (0..self.height).step_by(rows as usize) {
+                    offsets.push(8 + data.len() as u32);
+                    let start = data.len();
+                    for row in first..(first + rows).min(self.height) {
+                        for x in 0..row_samples {
+                            let i = if self.separate {
+                                (row * self.width + x) * samples + plane
+                            } else {
+                                row * row_samples + x
+                            };
+                            match self.bits {
+                                8 => data.push((i * 7 + 1) as u8),
+                                16 => data.extend(self.short((i * 257 + 3) as u16)),
+                                _ => data.extend(self.long(i * 16843009 + 5)),
+                            }
+                        }
+                    }
+                    geometry.push((data.len() - start) as u32);
+                }
+            }
+            data.extend(std::iter::repeat_n(0xee, self.pad));
+            let mut offsets = self.offsets.map_or(offsets, <[u32]>::to_vec);
+            if let Some(len) = self.offsets_len {
+                let next = offsets[offsets.len() - 1] + 4;
+                offsets.resize(len, next);
+            }
+            let counts = match self.counts {
+                Counts::Geometry => Some(geometry),
+                Counts::Given(counts) => Some(counts.to_vec()),
+                Counts::Missing => None,
+            };
+            let arrays_at = 8 + data.len() as u32;
+            let mut arrays = Vec::new();
+            let mut put = |values: &[u32], kind: u16| match values {
+                [one] => *one,
+                _ => {
+                    let at = arrays_at + arrays.len() as u32;
+                    for &value in values {
+                        if kind == TYPE_SHORT {
+                            arrays.extend(self.short(value as u16));
+                        } else {
+                            arrays.extend(self.long(value));
+                        }
+                    }
+                    at
+                }
+            };
+            let offsets_at = put(&offsets, TYPE_LONG);
+            let counts_at = counts.as_deref().map(|c| put(c, TYPE_LONG));
+            let bits = put(
+                &vec![u32::from(self.bits); usize::from(self.samples)],
+                TYPE_SHORT,
+            );
+            if arrays.len() % 2 == 1 {
+                arrays.push(0);
+            }
+            let ifd = arrays_at + arrays.len() as u32;
+            let photometric = if self.samples == 3 {
+                PHOTOMETRIC_RGB
+            } else {
+                PHOTOMETRIC_MINISBLACK
+            };
+            let planar = if self.separate {
+                PLANARCONFIG_SEPARATE
+            } else {
+                PLANARCONFIG_CONTIG
+            };
+            let mut entries = vec![
+                (TAG_IMAGE_WIDTH, TYPE_LONG, 1, self.width),
+                (TAG_IMAGE_LENGTH, TYPE_LONG, 1, self.height),
+                (TAG_BITS_PER_SAMPLE, TYPE_SHORT, samples, bits),
+                (TAG_COMPRESSION, TYPE_SHORT, 1, 1),
+                (TAG_PHOTOMETRIC, TYPE_SHORT, 1, u32::from(photometric)),
+                (
+                    TAG_STRIP_OFFSETS,
+                    TYPE_LONG,
+                    offsets.len() as u32,
+                    offsets_at,
+                ),
+                (TAG_SAMPLES_PER_PIXEL, TYPE_SHORT, 1, samples),
+                (TAG_ROWS_PER_STRIP, TYPE_LONG, 1, self.rows),
+            ];
+            if let (Some(counts), Some(at)) = (&counts, counts_at) {
+                entries.push((TAG_STRIP_BYTE_COUNTS, TYPE_LONG, counts.len() as u32, at));
+            }
+            entries.push((TAG_PLANAR_CONFIG, TYPE_SHORT, 1, u32::from(planar)));
+            entries.push((TAG_SAMPLE_FORMAT, TYPE_SHORT, 1, 1));
+            entries.retain(|(tag, ..)| !self.omit.contains(tag));
+            let mut file = if self.big_endian { b"MM" } else { b"II" }.to_vec();
+            file.extend(self.short(42));
+            file.extend(self.long(ifd));
+            file.extend(data);
+            file.extend(arrays);
+            file.extend(self.short(entries.len() as u16));
+            for (tag, kind, n, value) in entries {
+                let value = self
+                    .overrides
+                    .iter()
+                    .find(|(t, _)| *t == tag)
+                    .map_or(value, |(_, v)| *v);
+                file.extend(self.short(tag));
+                file.extend(self.short(kind));
+                file.extend(self.long(n));
+                // A lone SHORT sits in the first half of the value field.
+                if kind == TYPE_SHORT && n == 1 {
+                    file.extend(self.short(value as u16));
+                    file.extend([0, 0]);
+                } else {
+                    file.extend(self.long(value));
+                }
+            }
+            file.extend(self.long(0));
+            file
+        }
+    }
+
+    /// The buffer as C's comparison reader prints it: hex, each sample
+    /// little-endian.
+    fn sample_hex(array: &NDArray) -> String {
+        let bytes: Vec<u8> = match array.data().view() {
+            NDDataView::U8(v) => v.to_vec(),
+            NDDataView::U16(v) => v.iter().flat_map(|s| s.to_le_bytes()).collect(),
+            NDDataView::U32(v) => v.iter().flat_map(|s| s.to_le_bytes()).collect(),
+            other => panic!("{other:?}"),
+        };
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// C reads a compressed file through libtiff's codec; this reader has
+    /// none, so it refuses one even when its strips fill the image.
+    #[test]
+    fn a_compressed_file_is_refused() {
+        let none = StripFile::default();
+        let lzw = StripFile {
+            overrides: &[(TAG_COMPRESSION, 5)],
+            ..none
+        };
+        let read = decode(&lzw.file(), NDAttributeList::new(), &NDArrayPool::new(0));
+        assert!(read.is_err(), "{:?}", read.map(|a| sample_hex(&a)));
+        assert!(decode(&none.file(), NDAttributeList::new(), &NDArrayPool::new(0)).is_ok());
+    }
+
+    /// Each file of the C comparison set reads as C `readFile` reads it with
+    /// ADSupport's libtiff 4.0.6: `None` where C fails the read or the open,
+    /// else C's buffer. libtiff 4.5.1 reads the same but for `huge_last_pad`,
+    /// whose count of over 1 MiB it trims to what the strip needs.
+    #[test]
+    fn a_strip_table_reads_as_libtiff_reads_it() {
+        use Counts::{Given, Missing};
+        const GRAY: &str = "01080f161d242b323940474e";
+        const GRAY_H5: &str = "01080f161d242b323940474e555c636a71787f86";
+        const GRAY_H4: &str = "01080f161d242b323940474e555c636a";
+        const GRAY16: &str = "03000401050206030704080509060a070b080c090d0a0e0b";
+        const GRAY32: &str = "05000000060101010702020208030303090404040a0505050b0606060c0707070d0808080e0909090f0a0a0a100b0b0b";
+        const RGB1: &str =
+            "01080f161d242b323940474e555c636a71787f868d949ba2a9b0b7bec5ccd3dae1e8eff6";
+        const RGB3: &str =
+            "01162b40556a7f94a9bed3e8081d32475c71869bb0c5daef0f24394e63788da2b7cce1f6";
+        const RGB1_16: &str = "03000401050206030704080509060a070b080c090d0a0e0b0f0c100d110e120f13101411151216131714181519161a171b181c191d1a1e1b1f1c201d211e221f2320242125222623";
+        const RGB3_16: &str = "0300060309060c090f0c120f151218151b181e1b211e2421040107040a070d0a100d1310161319161c191f1c221f2522050208050b080e0b110e141117141a171d1a201d23202623";
+        let s = StripFile::default();
+        let one = StripFile { rows: 1, ..s };
+        let h5 = StripFile {
+            height: 5,
+            rows: 2,
+            ..s
+        };
+        let h4 = StripFile { height: 4, ..s };
+        let rgb = StripFile { samples: 3, ..s };
+        let be = StripFile {
+            big_endian: true,
+            ..s
+        };
+        let planes = StripFile {
+            separate: true,
+            ..rgb
+        };
+        #[rustfmt::skip]
+        let cases = [
+            ("ok1", StripFile { counts: Given(&[12]), ..s }, Some(GRAY)),
+            ("ok3", StripFile { counts: Given(&[4, 4, 4]), ..one }, Some(GRAY)),
+            ("over1", StripFile { counts: Given(&[16]), ..s }, Some(GRAY)),
+            ("over3_last", StripFile { counts: Given(&[4, 4, 6]), ..one }, Some(GRAY)),
+            ("short3_last", StripFile { counts: Given(&[4, 4, 2]), ..one }, None),
+            ("rps2", StripFile { rows: 2, counts: Given(&[8, 4]), ..s }, Some(GRAY)),
+            ("rps2_short", StripFile { rows: 2, counts: Given(&[8, 2]), ..s }, None),
+            ("rps10", StripFile { rows: 10, counts: Given(&[12]), ..s }, Some(GRAY)),
+            ("rps_absent", StripFile { omit: &[TAG_ROWS_PER_STRIP], ..s }, Some(GRAY)),
+            ("h4r3_ok", h4, Some(GRAY_H4)),
+            ("h4r3_last_short", StripFile { counts: Given(&[12, 3]), ..h4 }, None),
+            ("h5r2_ok", h5, Some(GRAY_H5)),
+            ("h5r2_same_last_over", StripFile { counts: Given(&[8, 8, 9]), ..h5 }, Some(GRAY_H5)),
+            ("h5r2_same_last_short", StripFile { counts: Given(&[8, 8, 3]), ..h5 }, None),
+            // "Bogus": one strip whose count is 0, short of the image or
+            // past the file is estimated from the geometry.
+            ("short1", StripFile { counts: Given(&[8]), ..s }, Some(GRAY)),
+            ("short1_nobytes", StripFile { counts: Given(&[8]), pad: 0, ..s }, Some(GRAY)),
+            ("over1_pasteof", StripFile { counts: Given(&[1000]), ..s }, Some(GRAY)),
+            ("c0_single", StripFile { counts: Given(&[0]), ..s }, Some(GRAY)),
+            ("single_off_past", StripFile { offsets: Some(&[100000]), ..s }, None),
+            // "Wrong": more than two contiguous strips, the first two
+            // counts differ and neither is 0. The estimate is the image's
+            // rows over the strip count, rounded down, for every strip.
+            ("short3_mid", StripFile { counts: Given(&[4, 2, 4]), ..one }, Some(GRAY)),
+            ("over3_first_short_mid", StripFile { counts: Given(&[6, 2, 4]), ..one }, Some(GRAY)),
+            ("h5r2_wrong", StripFile { counts: Given(&[8, 4, 4]), ..h5 }, None),
+            ("c0_first_multi", StripFile { counts: Given(&[0, 4, 4]), ..one }, None),
+            // The strip tables are cut or zero-filled to the strip count; a
+            // zero offset reads the header.
+            ("offs_short", StripFile { offsets_len: Some(2), ..one }, Some("01080f161d242b3249492a00")),
+            ("offs_long", StripFile { offsets_len: Some(5), ..one }, Some(GRAY)),
+            ("counts_short", StripFile { counts: Given(&[4, 4]), ..one }, None),
+            ("counts_long", StripFile { counts: Given(&[4, 4, 4, 99]), ..one }, Some(GRAY)),
+            ("counts_short_wrong", StripFile { counts: Given(&[6, 4]), ..one }, Some(GRAY)),
+            // The end-of-file check takes the count, not the rows' length.
+            ("huge_last_pad", StripFile { counts: Given(&[4, 4, 2000000]), pad: 5000, ..one }, None),
+            ("huge_last_nopad", StripFile { counts: Given(&[4, 4, 2000000]), ..one }, None),
+            // No StripByteCounts: estimated for one strip per plane, else
+            // the open fails.
+            ("nocounts1", StripFile { counts: Missing, ..s }, Some(GRAY)),
+            ("nocounts3", StripFile { counts: Missing, ..one }, None),
+            ("h5r2_nocounts", StripFile { counts: Missing, ..h5 }, None),
+            ("no_offsets", StripFile { omit: &[TAG_STRIP_OFFSETS], ..s }, None),
+            ("rps0", StripFile { rows: 0, counts: Given(&[12]), ..s }, None),
+            ("w0", StripFile { overrides: &[(TAG_IMAGE_WIDTH, 0)], ..s }, None),
+            ("h0", StripFile { overrides: &[(TAG_IMAGE_LENGTH, 0)], ..s }, None),
+            ("u16_ok", StripFile { bits: 16, ..one }, Some(GRAY16)),
+            ("u16_wrong", StripFile { bits: 16, counts: Given(&[8, 4, 8]), ..one }, Some(GRAY16)),
+            ("u16_short1", StripFile { bits: 16, counts: Given(&[20]), ..s }, Some(GRAY16)),
+            ("le_u32", StripFile { bits: 32, ..one }, Some(GRAY32)),
+            // A big-endian file's samples come back in the host's order.
+            ("be_ok", be, Some(GRAY)),
+            ("be_u16", StripFile { rows: 1, bits: 16, ..be }, Some(GRAY16)),
+            ("be_u16_short1", StripFile { bits: 16, counts: Given(&[20]), ..be }, Some(GRAY16)),
+            ("be_u32", StripFile { rows: 1, bits: 32, ..be }, Some(GRAY32)),
+            ("be_rgb1_u16", StripFile { samples: 3, rows: 2, bits: 16, ..be }, Some(RGB1_16)),
+            ("be_rgb3_u16", StripFile { samples: 3, separate: true, bits: 16, ..be }, Some(RGB3_16)),
+            ("rgb1_ok", StripFile { rows: 1, ..rgb }, Some(RGB1)),
+            ("rgb1_wrong", StripFile { rows: 1, counts: Given(&[12, 6, 12]), ..rgb }, Some(RGB1)),
+            ("rgb1_short1", StripFile { counts: Given(&[30]), ..rgb }, Some(RGB1)),
+            ("rgb3_ok", planes, Some(RGB3)),
+            // Separate planes: one strip per plane is estimated with the
+            // plane's rows, and there is no "Wrong" re-estimate.
+            ("rgb3_nocounts", StripFile { counts: Missing, ..planes }, Some(RGB3)),
+            ("rgb3_mid_short", StripFile { counts: Given(&[12, 8, 12]), ..planes }, None),
+            ("rgb3_mid_over", StripFile { counts: Given(&[16, 8, 12]), ..planes }, None),
+            ("rgb3_r1_nocounts", StripFile { rows: 1, counts: Missing, ..planes }, None),
+            (
+                "rgb3_r1_diff",
+                StripFile { rows: 1, counts: Given(&[4, 2, 4, 4, 4, 4, 4, 4, 4]), ..planes },
+                None,
+            ),
+        ];
+        let wrong: Vec<_> = cases
+            .iter()
+            .filter_map(|(name, file, c)| {
+                let read = decode(&file.file(), NDAttributeList::new(), &NDArrayPool::new(0));
+                let rs = read.as_ref().ok().map(sample_hex);
+                (rs.as_deref() != *c).then(|| format!("{name}: {:?}", read.map(|a| sample_hex(&a))))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// A file of reviewer6's tag-type set, written as their generator
+    /// writes it so that C's reads of those files pin this reader: a 4-wide
+    /// image whose sample bytes run `(j+1)*7` from offset 8, 16 0xee bytes,
+    /// the out-of-line tag values, then the IFD. `types` rewrites a tag's
+    /// entry type and `values` its values, `omit` leaves tags out; `lead`
+    /// entries go ahead of the rest and `extra` entries after them. `big`
+    /// writes a BigTIFF, its data from offset 16, and `big_endian` an "MM"
+    /// file; `patch` then overwrites single bytes and `cut` drops the last
+    /// bytes.
+    #[derive(Clone, Copy)]
+    struct TagFile {
+        height: u32,
+        rows: u32,
+        samples: u16,
+        separate: bool,
+        bits: u16,
+        format: u16,
+        types: &'static [(u16, u16)],
+        values: &'static [(u16, &'static [i64])],
+        omit: &'static [u16],
+        lead: &'static [(u16, u16, &'static [i64])],
+        extra: &'static [(u16, u16, &'static [i64])],
+        big: bool,
+        big_endian: bool,
+        patch: &'static [(usize, u8)],
+        cut: usize,
+    }
+
+    impl Default for TagFile {
+        fn default() -> Self {
+            Self {
+                height: 3,
+                rows: 1,
+                samples: 1,
+                separate: false,
+                bits: 8,
+                format: 1,
+                types: &[],
+                values: &[],
+                omit: &[],
+                lead: &[],
+                extra: &[],
+                big: false,
+                big_endian: false,
+                patch: &[],
+                cut: 0,
+            }
+        }
+    }
+
+    impl TagFile {
+        fn file(&self) -> Vec<u8> {
+            let width = 4;
+            let (header, field) = if self.big { (16, 8) } else { (8, 4) };
+            let put = |v: u64, size: usize| {
+                if self.big_endian {
+                    v.to_be_bytes()[8 - size..].to_vec()
+                } else {
+                    v.to_le_bytes()[..size].to_vec()
+                }
+            };
+            let word = |v: usize| put(v as u64, field);
+            let samples = u32::from(self.samples);
+            let bytes = u32::from(self.bits / 8);
+            let rows = self.rows.min(self.height).max(1);
+            let (planes, row_samples) = if self.separate {
+                (samples, width)
+            } else {
+                (1, width * samples)
+            };
+            let mut data = Vec::new();
+            let (mut offsets, mut counts) = (Vec::new(), Vec::new());
+            for plane in 0..planes {
+                for first in (0..self.height).step_by(rows as usize) {
+                    offsets.push((header + data.len()) as i64);
+                    let start = data.len();
+                    for row in first..(first + rows).min(self.height) {
+                        for x in 0..row_samples {
+                            let i = if self.separate {
+                                (row * width + x) * samples + plane
+                            } else {
+                                row * row_samples + x
+                            };
+                            data.extend((0..bytes).map(|k| ((i * bytes + k + 1) * 7) as u8));
+                        }
+                    }
+                    counts.push((data.len() - start) as i64);
+                }
+            }
+            data.extend([0xee; 16]);
+            let photometric = if self.samples == 3 {
+                PHOTOMETRIC_RGB
+            } else {
+                PHOTOMETRIC_MINISBLACK
+            };
+            let planar = if self.separate {
+                PLANARCONFIG_SEPARATE
+            } else {
+                PLANARCONFIG_CONTIG
+            };
+            let bits = vec![i64::from(self.bits); usize::from(self.samples)];
+            let mut tags = vec![
+                (TAG_IMAGE_WIDTH, TYPE_LONG, vec![i64::from(width)]),
+                (TAG_IMAGE_LENGTH, TYPE_LONG, vec![i64::from(self.height)]),
+                (TAG_BITS_PER_SAMPLE, TYPE_SHORT, bits),
+                (TAG_COMPRESSION, TYPE_SHORT, vec![1]),
+                (TAG_PHOTOMETRIC, TYPE_SHORT, vec![i64::from(photometric)]),
+                (TAG_STRIP_OFFSETS, TYPE_LONG, offsets),
+                (
+                    TAG_SAMPLES_PER_PIXEL,
+                    TYPE_SHORT,
+                    vec![i64::from(self.samples)],
+                ),
+                (TAG_ROWS_PER_STRIP, TYPE_LONG, vec![i64::from(self.rows)]),
+                (TAG_STRIP_BYTE_COUNTS, TYPE_LONG, counts),
+                (TAG_PLANAR_CONFIG, TYPE_SHORT, vec![i64::from(planar)]),
+                (TAG_SAMPLE_FORMAT, TYPE_SHORT, vec![i64::from(self.format)]),
+            ];
+            for (tag, kind, values) in &mut tags {
+                if let Some(&(_, k)) = self.types.iter().find(|(t, _)| t == tag) {
+                    *kind = k;
+                }
+                if let Some(&(_, v)) = self.values.iter().find(|(t, _)| t == tag) {
+                    *values = v.to_vec();
+                }
+            }
+            tags.retain(|(tag, _, _)| !self.omit.contains(tag));
+            let entry = |&(t, k, v): &(u16, u16, &[i64])| (t, k, v.to_vec());
+            let tags: Vec<_> = self
+                .lead
+                .iter()
+                .map(entry)
+                .chain(tags)
+                .chain(self.extra.iter().map(entry))
+                .collect();
+            let arrays_at = header + data.len();
+            let mut arrays = Vec::new();
+            let mut ifd = if self.big {
+                word(tags.len())
+            } else {
+                put(tags.len() as u64, 2)
+            };
+            for (tag, kind, values) in tags {
+                let size = match kind {
+                    TYPE_BYTE | TYPE_SBYTE | TYPE_ASCII => 1,
+                    TYPE_SHORT | TYPE_SSHORT => 2,
+                    TYPE_LONG | TYPE_SLONG | TYPE_FLOAT => 4,
+                    _ => 8,
+                };
+                let raw: Vec<u8> = values.iter().flat_map(|&v| put(v as u64, size)).collect();
+                ifd.extend(put(tag.into(), 2));
+                ifd.extend(put(kind.into(), 2));
+                ifd.extend(word(values.len()));
+                if raw.len() <= field {
+                    ifd.extend(&raw);
+                    ifd.extend(std::iter::repeat_n(0, field - raw.len()));
+                } else {
+                    ifd.extend(word(arrays_at + arrays.len()));
+                    arrays.extend(raw);
+                    if arrays.len() % 2 == 1 {
+                        arrays.push(0);
+                    }
+                }
+            }
+            ifd.extend(word(0));
+            let mut file = if self.big_endian { b"MM" } else { b"II" }.to_vec();
+            if self.big {
+                file.extend([put(43, 2), put(8, 2), put(0, 2)].concat());
+            } else {
+                file.extend(put(42, 2));
+            }
+            file.extend(word(arrays_at + arrays.len()));
+            file.extend(data);
+            file.extend(arrays);
+            file.extend(ifd);
+            for &(at, byte) in self.patch {
+                file[at] = byte;
+            }
+            file.truncate(file.len() - self.cut);
+            file
+        }
+    }
+
+    /// A read as C's comparison reader prints it: the type, the dims, then
+    /// each sample's bytes little-endian.
+    fn c_read(array: &NDArray) -> String {
+        let bytes: Vec<u8> = match array.data().view() {
+            NDDataView::U8(v) => v.to_vec(),
+            NDDataView::U16(v) => v.iter().flat_map(|s| s.to_le_bytes()).collect(),
+            NDDataView::I16(v) => v.iter().flat_map(|s| s.to_le_bytes()).collect(),
+            other => panic!("{other:?}"),
+        };
+        let dims: Vec<_> = array.dims.iter().map(|d| d.size.to_string()).collect();
+        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        format!("{:?} {} {hex}", array.data().data_type(), dims.join(","))
+    }
+
+    /// Each file reads as C `readFile` reads it with ADSupport's libtiff
+    /// 4.0.6: `None` where the open or a strip read fails, else C's type, dims
+    /// and buffer. The `le_tt_*` files are reviewer6's; the rest cover the
+    /// readers' other types, ranges and counts.
+    #[test]
+    fn tag_entries_read_as_libtiff_reads_them() {
+        const GRAY: &str = "UInt8 4,3 070e151c232a31383f464d54";
+        const GRAY_H4: &str = "UInt8 4,4 070e151c232a31383f464d545b626970";
+        const GRAY16_H4: &str =
+            "UInt16 4,4 070e151c232a31383f464d545b626970777e858c939aa1a8afb6bdc4cbd2d9e0";
+        const GRAY16: &str = "UInt16 4,3 070e151c232a31383f464d545b626970777e858c939aa1a8";
+        const BE_GRAY16: &str = "UInt16 4,3 0e071c152a233831463f544d625b70697e778c859a93a8a1";
+        // FillOrder 2: each byte of GRAY, GRAY16, BE_GRAY16 and RGB3
+        // bit-reversed.
+        const LSB_GRAY: &str = "UInt8 4,3 e070a838c4548c1cfc62b22a";
+        const LSB_GRAY16: &str = "UInt16 4,3 e070a838c4548c1cfc62b22ada46960eee7ea131c9598515";
+        const LSB_BE_GRAY16: &str = "UInt16 4,3 70e038a854c41c8c62fc2ab246da0e967eee31a159c91585";
+        const LSB_RGB3: &str =
+            "UInt8 4,3,3 e0388c62da0ea159f5239b7770c41cb246ee31856dd307afa854fc2a967ec915bd4be73f";
+        const RGB1_16: &str = "UInt16 3,4,3 070e151c232a31383f464d545b626970777e858c939aa1a8afb6bdc4cbd2d9e0e7eef5fc030a11181f262d343b424950575e656c737a81888f969da4abb2b9c0c7ced5dce3eaf1f8";
+        const RGB1: &str =
+            "UInt8 3,4,3 070e151c232a31383f464d545b626970777e858c939aa1a8afb6bdc4cbd2d9e0e7eef5fc";
+        const RGB3: &str =
+            "UInt8 4,3,3 071c31465b70859aafc4d9ee0e23384d62778ca1b6cbe0f5152a3f54697e93a8bdd2e7fc";
+        const INT16: &str = "Int16 4,3 070e151c232a31383f464d545b626970777e858c939aa1a8";
+        const RGB1_I16: &str = "Int16 3,4,3 070e151c232a31383f464d545b626970777e858c939aa1a8afb6bdc4cbd2d9e0e7eef5fc030a11181f262d343b424950575e656c737a81888f969da4abb2b9c0c7ced5dce3eaf1f8";
+        const TYPE_IFD8: u16 = 18;
+        // An unknown tag, repeated to fill a directory past the 11 base tags.
+        const UNKNOWN: (u16, u16, &[i64]) = (65000, TYPE_SHORT, &[0]);
+        static TO_4096: [(u16, u16, &[i64]); 4085] = [UNKNOWN; 4085];
+        static TO_4097: [(u16, u16, &[i64]); 4086] = [UNKNOWN; 4086];
+        let s = TagFile::default();
+        let rgb = TagFile { samples: 3, ..s };
+        #[rustfmt::skip]
+        let cases = [
+            ("le_tt_w_short", TagFile { types: &[(TAG_IMAGE_WIDTH, TYPE_SHORT)], ..s }, Some(GRAY)),
+            ("le_tt_h_short", TagFile { types: &[(TAG_IMAGE_LENGTH, TYPE_SHORT)], ..s }, Some(GRAY)),
+            ("le_tt_rps_short", TagFile { types: &[(TAG_ROWS_PER_STRIP, TYPE_SHORT)], ..s }, Some(GRAY)),
+            ("le_tt_offs_short3", TagFile { types: &[(TAG_STRIP_OFFSETS, TYPE_SHORT)], ..s }, Some(GRAY)),
+            ("le_tt_counts_short3", TagFile { types: &[(TAG_STRIP_BYTE_COUNTS, TYPE_SHORT)], ..s }, Some(GRAY)),
+            ("le_tt_both_short2", TagFile { height: 4, rows: 2, types: &[(TAG_STRIP_OFFSETS, TYPE_SHORT), (TAG_STRIP_BYTE_COUNTS, TYPE_SHORT)], ..s }, Some(GRAY_H4)),
+            ("le_tt_both_short2_u16", TagFile { height: 4, rows: 2, bits: 16, types: &[(TAG_STRIP_OFFSETS, TYPE_SHORT), (TAG_STRIP_BYTE_COUNTS, TYPE_SHORT)], ..s }, Some(GRAY16_H4)),
+            ("le_tt_counts_short1", TagFile { rows: 3, types: &[(TAG_STRIP_BYTE_COUNTS, TYPE_SHORT)], ..s }, Some(GRAY)),
+            ("le_tt_offs_short1", TagFile { rows: 3, types: &[(TAG_STRIP_OFFSETS, TYPE_SHORT)], ..s }, Some(GRAY)),
+            ("le_tt_bps_long", TagFile { bits: 16, types: &[(TAG_BITS_PER_SAMPLE, TYPE_LONG)], ..s }, Some(GRAY16)),
+            ("le_tt_bps_long_rgb", TagFile { bits: 16, rows: 2, types: &[(TAG_BITS_PER_SAMPLE, TYPE_LONG)], ..rgb }, Some(RGB1_16)),
+            ("le_tt_spp_long", TagFile { types: &[(TAG_SAMPLES_PER_PIXEL, TYPE_LONG)], ..rgb }, Some(RGB1)),
+            ("le_tt_pm_long", TagFile { types: &[(TAG_PHOTOMETRIC, TYPE_LONG)], ..s }, Some(GRAY)),
+            ("le_tt_pc_long", TagFile { separate: true, types: &[(TAG_PLANAR_CONFIG, TYPE_LONG)], ..rgb }, Some(RGB3)),
+            ("le_tt_sf_long", TagFile { bits: 16, format: 2, types: &[(TAG_SAMPLE_FORMAT, TYPE_LONG)], ..s }, Some(INT16)),
+            ("le_tt_comp_long", TagFile { types: &[(TAG_COMPRESSION, TYPE_LONG)], ..s }, Some(GRAY)),
+            ("le_tt_pm_byte", TagFile { types: &[(TAG_PHOTOMETRIC, TYPE_BYTE)], ..s }, Some(GRAY)),
+            ("le_tt_sf_sshort", TagFile { bits: 16, format: 2, types: &[(TAG_SAMPLE_FORMAT, TYPE_SSHORT)], ..s }, Some(INT16)),
+            ("le_tt_w_slong", TagFile { types: &[(TAG_IMAGE_WIDTH, TYPE_SLONG)], ..s }, Some(GRAY)),
+            ("le_tt_rps_byte", TagFile { types: &[(TAG_ROWS_PER_STRIP, TYPE_BYTE)], ..s }, Some(GRAY)),
+            ("le_tt_bps_byte", TagFile { bits: 16, types: &[(TAG_BITS_PER_SAMPLE, TYPE_BYTE)], ..s }, Some(GRAY16)),
+            ("w_sbyte", TagFile { types: &[(TAG_IMAGE_WIDTH, TYPE_SBYTE)], ..s }, Some(GRAY)),
+            ("w_slong8", TagFile { types: &[(TAG_IMAGE_WIDTH, TYPE_SLONG8)], ..s }, Some(GRAY)),
+            ("h_sshort", TagFile { types: &[(TAG_IMAGE_LENGTH, TYPE_SSHORT)], ..s }, Some(GRAY)),
+            ("h_long8", TagFile { types: &[(TAG_IMAGE_LENGTH, TYPE_LONG8)], ..s }, Some(GRAY)),
+            ("spp_sshort", TagFile { types: &[(TAG_SAMPLES_PER_PIXEL, TYPE_SSHORT)], ..rgb }, Some(RGB1)),
+            ("pc_byte", TagFile { separate: true, types: &[(TAG_PLANAR_CONFIG, TYPE_BYTE)], ..rgb }, Some(RGB3)),
+            ("offs_byte", TagFile { types: &[(TAG_STRIP_OFFSETS, TYPE_BYTE)], ..s }, Some(GRAY)),
+            ("offs_long8", TagFile { types: &[(TAG_STRIP_OFFSETS, TYPE_LONG8)], ..s }, Some(GRAY)),
+            ("offs_long8_max", TagFile { types: &[(TAG_STRIP_OFFSETS, TYPE_LONG8)], values: &[(TAG_STRIP_OFFSETS, &[8, 12, -1])], ..s }, None),
+            ("counts_long8_max", TagFile { types: &[(TAG_STRIP_BYTE_COUNTS, TYPE_LONG8)], values: &[(TAG_STRIP_BYTE_COUNTS, &[4, 4, -1])], ..s }, None),
+            ("counts_sbyte", TagFile { types: &[(TAG_STRIP_BYTE_COUNTS, TYPE_SBYTE)], ..s }, Some(GRAY)),
+            ("counts_slong8", TagFile { types: &[(TAG_STRIP_BYTE_COUNTS, TYPE_SLONG8)], ..s }, Some(GRAY)),
+            ("bps_sbyte_rgb", TagFile { types: &[(TAG_BITS_PER_SAMPLE, TYPE_SBYTE)], ..rgb }, Some(RGB1)),
+            ("w_ascii", TagFile { types: &[(TAG_IMAGE_WIDTH, TYPE_ASCII)], ..s }, None),
+            ("h_rational", TagFile { types: &[(TAG_IMAGE_LENGTH, TYPE_RATIONAL)], ..s }, None),
+            ("bps_double", TagFile { types: &[(TAG_BITS_PER_SAMPLE, TYPE_DOUBLE)], ..s }, None),
+            ("sf_float", TagFile { bits: 16, format: 2, types: &[(TAG_SAMPLE_FORMAT, TYPE_FLOAT)], ..s }, None),
+            ("w_negative", TagFile { types: &[(TAG_IMAGE_WIDTH, TYPE_SLONG)], values: &[(TAG_IMAGE_WIDTH, &[-4])], ..s }, None),
+            ("sf_negative", TagFile { bits: 16, types: &[(TAG_SAMPLE_FORMAT, TYPE_SSHORT)], values: &[(TAG_SAMPLE_FORMAT, &[-2])], ..s }, None),
+            ("offs_negative", TagFile { types: &[(TAG_STRIP_OFFSETS, TYPE_SLONG)], values: &[(TAG_STRIP_OFFSETS, &[8, -12, 16])], ..s }, None),
+            ("bps_over_short", TagFile { types: &[(TAG_BITS_PER_SAMPLE, TYPE_LONG)], values: &[(TAG_BITS_PER_SAMPLE, &[65544])], ..s }, None),
+            ("pc_over_short", TagFile { types: &[(TAG_PLANAR_CONFIG, TYPE_LONG)], values: &[(TAG_PLANAR_CONFIG, &[65537])], ..s }, None),
+            ("w_two", TagFile { values: &[(TAG_IMAGE_WIDTH, &[4, 4])], ..s }, None),
+            ("spp_two", TagFile { values: &[(TAG_SAMPLES_PER_PIXEL, &[1, 1])], ..s }, None),
+            ("spp0", TagFile { values: &[(TAG_SAMPLES_PER_PIXEL, &[0])], ..s }, None),
+            ("bps_one_rgb", TagFile { values: &[(TAG_BITS_PER_SAMPLE, &[8])], ..rgb }, Some(RGB1)),
+            ("bps_two_rgb", TagFile { values: &[(TAG_BITS_PER_SAMPLE, &[8, 8])], ..rgb }, None),
+            ("bps_four_rgb", TagFile { values: &[(TAG_BITS_PER_SAMPLE, &[8, 8, 8, 16])], ..rgb }, Some(RGB1)),
+            ("bps_mixed_rgb", TagFile { values: &[(TAG_BITS_PER_SAMPLE, &[8, 8, 16])], ..rgb }, None),
+            ("sf_mixed_rgb", TagFile { values: &[(TAG_SAMPLE_FORMAT, &[1, 1, 2])], ..rgb }, None),
+            ("sf_three_rgb", TagFile { values: &[(TAG_SAMPLE_FORMAT, &[1, 1, 1])], ..rgb }, Some(RGB1)),
+            ("dup_pm", TagFile { extra: &[(TAG_PHOTOMETRIC, TYPE_SHORT, &[2])], ..s }, Some(GRAY)),
+            ("dup_w", TagFile { extra: &[(TAG_IMAGE_WIDTH, TYPE_LONG, &[5])], ..s }, Some(GRAY)),
+            ("dup_sf", TagFile { bits: 16, extra: &[(TAG_SAMPLE_FORMAT, TYPE_SHORT, &[2])], ..s }, Some(GRAY16)),
+            ("comp_lzw", TagFile { values: &[(TAG_COMPRESSION, &[5])], ..s }, None),
+            ("comp_packbits", TagFile { values: &[(TAG_COMPRESSION, &[32773])], ..s }, None),
+            ("comp_unknown", TagFile { values: &[(TAG_COMPRESSION, &[12345])], ..s }, None),
+            ("comp_byte", TagFile { types: &[(TAG_COMPRESSION, TYPE_BYTE)], ..s }, Some(GRAY)),
+            ("comp_ascii", TagFile { types: &[(TAG_COMPRESSION, TYPE_ASCII)], ..s }, None),
+            ("comp_negative", TagFile { types: &[(TAG_COMPRESSION, TYPE_SSHORT)], values: &[(TAG_COMPRESSION, &[-1])], ..s }, None),
+            ("comp_two", TagFile { values: &[(TAG_COMPRESSION, &[1, 1])], ..s }, Some(GRAY)),
+            ("comp_three_rgb", TagFile { values: &[(TAG_COMPRESSION, &[1, 1, 1])], ..rgb }, Some(RGB1)),
+            ("comp_two_rgb", TagFile { values: &[(TAG_COMPRESSION, &[1, 1])], ..rgb }, None),
+            ("comp_mixed_rgb", TagFile { values: &[(TAG_COMPRESSION, &[1, 1, 5])], ..rgb }, None),
+            ("comp_lzw_rgb", TagFile { values: &[(TAG_COMPRESSION, &[5, 5, 5])], ..rgb }, None),
+            ("sf0", TagFile { format: 0, ..s }, None),
+            ("sf0_rgb", TagFile { values: &[(TAG_SAMPLE_FORMAT, &[0, 0, 0])], ..rgb }, None),
+            ("sf4", TagFile { format: 4, ..s }, None),
+            ("sf6", TagFile { format: 6, ..s }, None),
+            ("sf7", TagFile { format: 7, ..s }, None),
+            ("pc0", TagFile { values: &[(TAG_PLANAR_CONFIG, &[0])], ..s }, None),
+            ("pc3", TagFile { values: &[(TAG_PLANAR_CONFIG, &[3])], ..s }, None),
+            ("pc3_rgb", TagFile { values: &[(TAG_PLANAR_CONFIG, &[3])], ..rgb }, None),
+            ("rps0", TagFile { values: &[(TAG_ROWS_PER_STRIP, &[0])], ..s }, None),
+            ("rps_ascii", TagFile { types: &[(TAG_ROWS_PER_STRIP, TYPE_ASCII)], ..s }, None),
+            ("rps_two", TagFile { values: &[(TAG_ROWS_PER_STRIP, &[1, 1])], ..s }, None),
+            ("rps_over_long", TagFile { types: &[(TAG_ROWS_PER_STRIP, TYPE_LONG8)], values: &[(TAG_ROWS_PER_STRIP, &[1 << 32])], ..s }, None),
+            ("rps_wrap_edge", TagFile { rows: 3, values: &[(TAG_ROWS_PER_STRIP, &[0xffff_fffc])], ..s }, Some(GRAY)),
+            ("rps_wraps", TagFile { rows: 3, values: &[(TAG_ROWS_PER_STRIP, &[0xffff_fffd])], ..s }, None),
+            ("rps_max", TagFile { rows: 3, values: &[(TAG_ROWS_PER_STRIP, &[0xffff_ffff])], ..s }, Some(GRAY)),
+            ("height_wraps", TagFile { values: &[(TAG_IMAGE_LENGTH, &[0xffff_ffff])], ..s }, None),
+            ("planes_wrap", TagFile { values: &[(TAG_IMAGE_LENGTH, &[0x5555_5556])], separate: true, ..rgb }, None),
+            ("depth_one", TagFile { extra: &[(TAG_IMAGE_DEPTH, TYPE_LONG, &[1])], ..s }, Some(GRAY)),
+            ("depth_ascii", TagFile { extra: &[(TAG_IMAGE_DEPTH, TYPE_ASCII, &[1])], ..s }, None),
+            ("depth_two", TagFile { extra: &[(TAG_IMAGE_DEPTH, TYPE_LONG, &[1, 1])], ..s }, None),
+            ("tdepth0", TagFile { extra: &[(TAG_TILE_DEPTH, TYPE_LONG, &[0])], ..s }, None),
+            ("tdepth_one", TagFile { extra: &[(TAG_TILE_DEPTH, TYPE_LONG, &[1])], ..s }, Some(GRAY)),
+            ("tdepth_ascii", TagFile { extra: &[(TAG_TILE_DEPTH, TYPE_ASCII, &[1])], ..s }, None),
+            ("tw_ascii", TagFile { extra: &[(TAG_TILE_WIDTH, TYPE_ASCII, &[16])], ..s }, None),
+            ("tw_negative", TagFile { extra: &[(TAG_TILE_WIDTH, TYPE_SLONG, &[-16])], ..s }, None),
+            ("tl_two", TagFile { extra: &[(TAG_TILE_LENGTH, TYPE_LONG, &[16, 16])], ..s }, None),
+            ("min_one", TagFile { extra: &[(TAG_MIN_SAMPLE_VALUE, TYPE_SHORT, &[0])], ..s }, Some(GRAY)),
+            ("min_ascii", TagFile { extra: &[(TAG_MIN_SAMPLE_VALUE, TYPE_ASCII, &[0])], ..s }, None),
+            ("max_over_short", TagFile { extra: &[(TAG_MAX_SAMPLE_VALUE, TYPE_LONG, &[65536])], ..s }, None),
+            ("max_three_rgb", TagFile { extra: &[(TAG_MAX_SAMPLE_VALUE, TYPE_SHORT, &[255, 255, 255])], ..rgb }, Some(RGB1)),
+            ("max_mixed_rgb", TagFile { extra: &[(TAG_MAX_SAMPLE_VALUE, TYPE_SHORT, &[255, 255, 0])], ..rgb }, None),
+            ("dt_uint", TagFile { extra: &[(TAG_DATA_TYPE, TYPE_SHORT, &[2])], ..s }, Some(GRAY)),
+            ("dt4", TagFile { extra: &[(TAG_DATA_TYPE, TYPE_SHORT, &[4])], ..s }, None),
+            ("dt_ascii", TagFile { extra: &[(TAG_DATA_TYPE, TYPE_ASCII, &[2])], ..s }, None),
+            ("dt_mixed_rgb", TagFile { extra: &[(TAG_DATA_TYPE, TYPE_SHORT, &[2, 2, 1])], ..rgb }, None),
+            ("smin_double", TagFile { extra: &[(TAG_SMIN_SAMPLE_VALUE, TYPE_DOUBLE, &[0])], ..s }, Some(GRAY)),
+            ("smin_rational", TagFile { extra: &[(TAG_SMIN_SAMPLE_VALUE, TYPE_RATIONAL, &[1])], ..s }, Some(GRAY)),
+            ("smin_negative", TagFile { extra: &[(TAG_SMIN_SAMPLE_VALUE, TYPE_SSHORT, &[-1])], ..s }, Some(GRAY)),
+            ("smin_two", TagFile { extra: &[(TAG_SMIN_SAMPLE_VALUE, TYPE_DOUBLE, &[0, 0])], ..s }, None),
+            ("smin_ascii", TagFile { extra: &[(TAG_SMIN_SAMPLE_VALUE, TYPE_ASCII, &[0])], ..s }, None),
+            ("smax_one_rgb", TagFile { extra: &[(TAG_SMAX_SAMPLE_VALUE, TYPE_SHORT, &[255])], ..rgb }, None),
+            ("smax_three_rgb", TagFile { extra: &[(TAG_SMAX_SAMPLE_VALUE, TYPE_FLOAT, &[0, 0, 0])], ..rgb }, Some(RGB1)),
+            ("extra_empty", TagFile { extra: &[(TAG_EXTRA_SAMPLES, TYPE_SHORT, &[])], ..s }, Some(GRAY)),
+            ("extra_one", TagFile { extra: &[(TAG_EXTRA_SAMPLES, TYPE_SHORT, &[0])], ..s }, Some(GRAY)),
+            ("extra_two", TagFile { extra: &[(TAG_EXTRA_SAMPLES, TYPE_SHORT, &[0, 0])], ..s }, None),
+            ("extra3", TagFile { extra: &[(TAG_EXTRA_SAMPLES, TYPE_SHORT, &[3])], ..s }, None),
+            ("extra999", TagFile { extra: &[(TAG_EXTRA_SAMPLES, TYPE_SHORT, &[999])], ..s }, Some(GRAY)),
+            ("extra_ascii", TagFile { extra: &[(TAG_EXTRA_SAMPLES, TYPE_ASCII, &[0])], ..s }, None),
+            ("extra_one_rgb", TagFile { extra: &[(TAG_EXTRA_SAMPLES, TYPE_SHORT, &[2])], ..rgb }, Some(RGB1)),
+            ("toffs_ascii", TagFile { extra: &[(TAG_TILE_OFFSETS, TYPE_ASCII, &[8])], ..s }, None),
+            ("tcounts_negative", TagFile { extra: &[(TAG_TILE_BYTE_COUNTS, TYPE_SSHORT, &[-1])], ..s }, None),
+            ("tiled_w", TagFile { extra: &[(TAG_TILE_WIDTH, TYPE_LONG, &[16])], ..s }, None),
+            ("tiled_l", TagFile { extra: &[(TAG_TILE_LENGTH, TYPE_LONG, &[16])], ..s }, None),
+            ("tiled_wl", TagFile { extra: &[(TAG_TILE_WIDTH, TYPE_LONG, &[16]), (TAG_TILE_LENGTH, TYPE_LONG, &[16])], ..s }, None),
+            ("tiled_w5", TagFile { extra: &[(TAG_TILE_WIDTH, TYPE_LONG, &[5])], ..s }, None),
+            ("toffs_shift", TagFile { extra: &[(TAG_TILE_OFFSETS, TYPE_LONG, &[9, 13, 17])], ..s }, Some("UInt8 4,3 0e151c232a31383f464d54ee")),
+            ("toffs_one", TagFile { rows: 3, extra: &[(TAG_TILE_OFFSETS, TYPE_LONG, &[10])], ..s }, Some("UInt8 4,3 151c232a31383f464d54eeee")),
+            ("toffs_only", TagFile { omit: &[TAG_STRIP_OFFSETS], extra: &[(TAG_TILE_OFFSETS, TYPE_LONG, &[8, 12, 16])], ..s }, Some(GRAY)),
+            ("toffs_first", TagFile { lead: &[(TAG_TILE_OFFSETS, TYPE_LONG, &[9, 13, 17])], ..s }, Some(GRAY)),
+            ("tcounts_fix", TagFile { values: &[(TAG_STRIP_BYTE_COUNTS, &[4, 4, 2])], extra: &[(TAG_TILE_BYTE_COUNTS, TYPE_LONG, &[4, 4, 4])], ..s }, Some(GRAY)),
+            ("palette", TagFile { values: &[(TAG_PHOTOMETRIC, &[3])], ..s }, Some(GRAY)),
+            ("palette_rgb", TagFile { values: &[(TAG_PHOTOMETRIC, &[3])], ..rgb }, Some(RGB1)),
+            ("palette_u16", TagFile { bits: 16, values: &[(TAG_PHOTOMETRIC, &[3])], ..s }, Some(GRAY16)),
+            ("palette_rgb3", TagFile { separate: true, values: &[(TAG_PHOTOMETRIC, &[3])], ..rgb }, Some(RGB3)),
+            ("palette_bits4", TagFile { bits: 4, values: &[(TAG_PHOTOMETRIC, &[3])], ..s }, None),
+            ("palette_cmap", TagFile { values: &[(TAG_PHOTOMETRIC, &[3])], extra: &[(TAG_COLOR_MAP, TYPE_SHORT, &[0; 768])], ..s }, None),
+            ("palette_cmap_short", TagFile { values: &[(TAG_PHOTOMETRIC, &[3])], extra: &[(TAG_COLOR_MAP, TYPE_SHORT, &[0; 3])], ..s }, Some(GRAY)),
+            ("palette_cmap_ascii", TagFile { values: &[(TAG_PHOTOMETRIC, &[3])], extra: &[(TAG_COLOR_MAP, TYPE_ASCII, &[0; 768])], ..s }, Some(GRAY)),
+            ("palette_cmap_over", TagFile { values: &[(TAG_PHOTOMETRIC, &[3])], extra: &[(TAG_COLOR_MAP, TYPE_LONG, &[65536; 768])], ..s }, Some(GRAY)),
+            ("palette_cmap_first", TagFile { values: &[(TAG_PHOTOMETRIC, &[3])], lead: &[(TAG_COLOR_MAP, TYPE_SHORT, &[0; 768])], ..s }, Some(GRAY)),
+            ("dt_int16", TagFile { bits: 16, extra: &[(TAG_DATA_TYPE, TYPE_SHORT, &[1])], ..s }, Some(INT16)),
+            ("dt_void", TagFile { extra: &[(TAG_DATA_TYPE, TYPE_SHORT, &[0])], ..s }, None),
+            ("dt_uint_over_int", TagFile { bits: 16, format: 2, extra: &[(TAG_DATA_TYPE, TYPE_SHORT, &[2])], ..s }, Some(GRAY16)),
+            ("dt_int_rgb", TagFile { bits: 16, rows: 2, extra: &[(TAG_DATA_TYPE, TYPE_SHORT, &[1, 1, 1])], ..rgb }, Some(RGB1_I16)),
+            ("dt_first", TagFile { bits: 16, lead: &[(TAG_DATA_TYPE, TYPE_SHORT, &[1])], ..s }, Some(GRAY16)),
+            ("tcounts_only", TagFile { omit: &[TAG_STRIP_BYTE_COUNTS], extra: &[(TAG_TILE_BYTE_COUNTS, TYPE_LONG, &[4, 4, 4])], ..s }, Some(GRAY)),
+            ("big_gray", TagFile { big: true, ..s }, Some(GRAY)),
+            ("big_rgb", TagFile { big: true, ..rgb }, Some(RGB1)),
+            ("big_rgb3", TagFile { big: true, separate: true, ..rgb }, Some(RGB3)),
+            ("big_u16", TagFile { big: true, bits: 16, ..s }, Some(GRAY16)),
+            ("big_int16", TagFile { big: true, bits: 16, format: 2, ..s }, Some(INT16)),
+            ("big_rows2", TagFile { big: true, height: 4, rows: 2, ..s }, Some(GRAY_H4)),
+            ("big_offs_short3", TagFile { big: true, types: &[(TAG_STRIP_OFFSETS, TYPE_SHORT)], ..s }, Some(GRAY)),
+            ("big_offs_long8", TagFile { big: true, types: &[(TAG_STRIP_OFFSETS, TYPE_LONG8), (TAG_STRIP_BYTE_COUNTS, TYPE_LONG8)], ..s }, Some(GRAY)),
+            ("big_one_strip_long8", TagFile { big: true, rows: 3, types: &[(TAG_STRIP_OFFSETS, TYPE_LONG8), (TAG_STRIP_BYTE_COUNTS, TYPE_LONG8)], ..s }, Some(GRAY)),
+            ("big_offs_ifd8", TagFile { big: true, types: &[(TAG_STRIP_OFFSETS, TYPE_IFD8)], ..s }, None),
+            ("be_big_gray", TagFile { big: true, big_endian: true, ..s }, Some(GRAY)),
+            ("be_big_u16", TagFile { big: true, big_endian: true, bits: 16, ..s }, Some(BE_GRAY16)),
+            ("be_big_rows2", TagFile { big: true, big_endian: true, height: 4, rows: 2, ..s }, Some(GRAY_H4)),
+            ("be_big_offs_long8", TagFile { big: true, big_endian: true, types: &[(TAG_STRIP_OFFSETS, TYPE_LONG8), (TAG_STRIP_BYTE_COUNTS, TYPE_LONG8)], ..s }, Some(GRAY)),
+            ("be_big_offs_short3", TagFile { big: true, big_endian: true, types: &[(TAG_STRIP_OFFSETS, TYPE_SHORT)], ..s }, Some(GRAY)),
+            ("be_big_ifd_hi", TagFile { big: true, big_endian: true, patch: &[(8, 1)], ..s }, None),
+            ("be_u16", TagFile { big_endian: true, bits: 16, ..s }, Some(BE_GRAY16)),
+            ("fill_lsb", TagFile { extra: &[(TAG_FILL_ORDER, TYPE_SHORT, &[2])], ..s }, Some(LSB_GRAY)),
+            ("fill_lsb_u16", TagFile { bits: 16, extra: &[(TAG_FILL_ORDER, TYPE_SHORT, &[2])], ..s }, Some(LSB_GRAY16)),
+            ("be_fill_lsb_u16", TagFile { big_endian: true, bits: 16, extra: &[(TAG_FILL_ORDER, TYPE_SHORT, &[2])], ..s }, Some(LSB_BE_GRAY16)),
+            ("big_fill_lsb", TagFile { big: true, extra: &[(TAG_FILL_ORDER, TYPE_SHORT, &[2])], ..s }, Some(LSB_GRAY)),
+            ("fill_lsb_rgb3", TagFile { separate: true, extra: &[(TAG_FILL_ORDER, TYPE_SHORT, &[2])], ..rgb }, Some(LSB_RGB3)),
+            ("fill_lsb_byte", TagFile { extra: &[(TAG_FILL_ORDER, TYPE_BYTE, &[2])], ..s }, Some(LSB_GRAY)),
+            ("fill_lsb_long8", TagFile { extra: &[(TAG_FILL_ORDER, TYPE_LONG8, &[2])], ..s }, Some(LSB_GRAY)),
+            ("fill_msb", TagFile { extra: &[(TAG_FILL_ORDER, TYPE_SHORT, &[1])], ..s }, Some(GRAY)),
+            ("fill_3", TagFile { extra: &[(TAG_FILL_ORDER, TYPE_SHORT, &[3])], ..s }, Some(GRAY)),
+            ("fill_two", TagFile { extra: &[(TAG_FILL_ORDER, TYPE_SHORT, &[2, 2])], ..s }, Some(GRAY)),
+            ("fill_ascii", TagFile { extra: &[(TAG_FILL_ORDER, TYPE_ASCII, &[2])], ..s }, Some(GRAY)),
+            ("fill_negative", TagFile { extra: &[(TAG_FILL_ORDER, TYPE_SSHORT, &[-2])], ..s }, Some(GRAY)),
+            ("fill_over_short", TagFile { extra: &[(TAG_FILL_ORDER, TYPE_LONG, &[65538])], ..s }, Some(GRAY)),
+            ("big_smin_double", TagFile { big: true, extra: &[(TAG_SMIN_SAMPLE_VALUE, TYPE_DOUBLE, &[0])], ..s }, Some(GRAY)),
+            ("big_version44", TagFile { big: true, patch: &[(2, 44)], ..s }, None),
+            ("big_offsize4", TagFile { big: true, patch: &[(4, 4)], ..s }, None),
+            ("big_unused", TagFile { big: true, patch: &[(6, 1)], ..s }, None),
+            // big_gray's IFD is at 68, its entry n at 76 + 20n.
+            ("big_ifd_hi", TagFile { big: true, patch: &[(12, 1)], ..s }, None),
+            ("big_w_count_hi", TagFile { big: true, patch: &[(84, 1)], ..s }, None),
+            ("big_offs_hi", TagFile { big: true, patch: &[(192, 1)], ..s }, None),
+            ("dir_no_next", TagFile { cut: 4, ..s }, Some(GRAY)),
+            ("dir_cut", TagFile { extra: &[UNKNOWN], cut: 5, ..s }, None),
+            ("dir_4096", TagFile { extra: &TO_4096, ..s }, Some(GRAY)),
+            ("dir_4097", TagFile { extra: &TO_4097, ..s }, None),
+            ("big_dir_no_next", TagFile { big: true, cut: 8, ..s }, Some(GRAY)),
+            ("big_dir_cut", TagFile { big: true, extra: &[UNKNOWN], cut: 9, ..s }, None),
+            ("big_dir_4096", TagFile { big: true, extra: &TO_4096, ..s }, Some(GRAY)),
+            ("big_dir_4097", TagFile { big: true, extra: &TO_4097, ..s }, None),
+        ];
+        let wrong: Vec<_> = cases
+            .iter()
+            .filter_map(|(name, file, c): &(_, _, Option<&str>)| {
+                let read = decode(&file.file(), NDAttributeList::new(), &NDArrayPool::new(0))
+                    .map(|a| c_read(&a));
+                (read.as_deref().ok() != *c).then(|| format!("{name}: {read:?}"))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// C sizes its strip tables to the strip count before it reads a strip,
+    /// and crashes on a header of 2^32 - 2 one-row strips; the tables here
+    /// hold the file's entries, so the pool's limit refuses the image.
+    #[test]
+    fn strip_tables_are_not_sized_by_the_geometry() {
+        let file = TagFile {
+            values: &[(TAG_IMAGE_LENGTH, &[0xffff_fffe])],
+            ..TagFile::default()
+        };
+        let read = decode(
+            &file.file(),
+            NDAttributeList::new(),
+            &NDArrayPool::new(1 << 20),
+        );
+        assert!(read.is_err());
     }
 }

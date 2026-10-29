@@ -30,7 +30,7 @@ position monitors, and other optical components.
 | Simulated HSC-1 and quad BPM | `drivers::hsc`, `drivers::qxbpm` | none (rs only) |
 
 Each `snl` module is the upstream `.st`, with C defects fixed in place under
-a comment, compiled by epics-snc-rs in `build.rs` and run on epics-seq-rs; the `.rs` beside it supplies what the
+a comment, compiled by snc-rs in `build.rs` and run on epics-seq-rs; the `.rs` beside it supplies what the
 program's escaped C supplied. As in C, each state set runs on its own OS
 thread.
 

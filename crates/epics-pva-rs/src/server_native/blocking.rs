@@ -161,7 +161,7 @@ use std::net::{
     UdpSocket,
 };
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -180,7 +180,7 @@ use tracing::{debug, warn};
 use super::config::PvaServerConfig;
 use super::peers::{ConnSlot, PeerEntry, PeerRegistry};
 use super::search_engine::{
-    Origin, SearchOutput, filter_inbound, process_search_datagram, random_guid,
+    Origin, SearchOutput, SearchReplier, filter_inbound, process_search_datagram, random_guid,
 };
 #[cfg(not(epics_embedded_target))]
 use super::search_engine::{SearchListeners, ServerInterfaces, local_v4_addrs};
@@ -843,7 +843,9 @@ impl BlockingPvaServer {
         self.active.load(Ordering::Acquire)
     }
 
-    /// Answer UDP SEARCHes on `socket` until [`shutdown`](Self::shutdown).
+    /// Answer UDP SEARCHes on `socket` until [`shutdown`](Self::shutdown),
+    /// from the first one: a server that must stay silent until it serves
+    /// reads its sockets through [`super::serving::PvaSockets`].
     ///
     /// Blocks the calling thread and takes it to `PVA_UDP_PRIORITY`, so give
     /// it a thread of its own — a *different* one from [`serve`](Self::serve),
@@ -855,11 +857,20 @@ impl BlockingPvaServer {
     /// thread exists, and for an ephemeral port can read the number back off
     /// the socket it still holds.
     pub fn serve_udp_search(&self, socket: SearchSocket) -> PvaResult<()> {
+        let udp_port = socket
+            .local_addr()
+            .map_or(self.config.udp_port, |a| a.port());
+        let replier = OnceLock::from(SearchReplier {
+            source: self.source.clone(),
+            tcp_port: self.config.tcp_port,
+            guid: self.config.guid,
+            protocol: "tcp",
+        });
         handle_udp_search_blocking(
             socket,
-            &self.source,
-            &self.config,
-            self.config.tcp_port,
+            &self.config.ignore_addrs,
+            udp_port,
+            &replier,
             &self.shutdown,
         )
     }
@@ -1435,7 +1446,9 @@ fn send_search_reply(
     socket.send_to(bytes, dest)
 }
 
-/// Answer UDP SEARCHes on one socket until `shutdown` is set.
+/// Read UDP SEARCHes on one socket until `shutdown` is set, answering them
+/// once `replier` is set: before that it only forwards a local unicast one,
+/// as pvxs's collector does between its bind and `Server::start`.
 ///
 /// The decode is [`process_search_datagram`] — the same function the hosted
 /// responder drives, moved onto neutral ground by stage D part 1 — so replies
@@ -1455,9 +1468,9 @@ fn send_search_reply(
 ///   to the group, so it receives the tagged copies of its own forwards.
 pub(super) fn handle_udp_search_blocking(
     socket: SearchSocket,
-    source: &DynSource,
-    config: &PvaServerConfig,
-    tcp_port: u16,
+    ignore_addrs: &[(IpAddr, u16)],
+    udp_port: u16,
+    replier: &OnceLock<SearchReplier>,
     shutdown: &AtomicBool,
 ) -> PvaResult<()> {
     let want_pktinfo = socket.pktinfo();
@@ -1487,7 +1500,7 @@ pub(super) fn handle_udp_search_blocking(
                 continue;
             }
         };
-        if !filter_inbound(src, &config.ignore_addrs) {
+        if !filter_inbound(src, ignore_addrs) {
             continue;
         }
 
@@ -1518,16 +1531,13 @@ pub(super) fn handle_udp_search_blocking(
         // RTEMS `block_on_sync` parks this thread; on a host test it does the
         // same, since this loop owns its thread outright.
         let outputs = match block_on_sync(process_search_datagram(
-            source,
+            replier.get(),
             forward,
-            config.udp_port,
+            udp_port,
             frame,
             src,
             reply_iface_ip,
             origin,
-            tcp_port,
-            config.guid,
-            "tcp",
         )) {
             Ok(v) => v,
             Err(_) => {
@@ -1952,6 +1962,22 @@ pub(super) mod tests {
             wire_byte_order: ByteOrder::Little,
             ..PvaServerConfig::isolated()
         }
+    }
+
+    /// A member of the ORIGIN_TAG group on `port` that sees only the group's
+    /// datagrams: bound to the group address, so a unicast SEARCH to the port
+    /// reaches the collector alone.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn origin_tag_member(port: u16) -> UdpSocket {
+        use socket2::{Domain, Protocol, Socket, Type};
+        let group = epics_base_rs::net::ORIGIN_TAG_MCAST_GROUP;
+        let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).expect("member");
+        sock.set_reuse_address(true).expect("SO_REUSEADDR");
+        sock.bind(&SocketAddr::from((group, port)).into())
+            .expect("bind the group address");
+        sock.join_multicast_v4(&group, &Ipv4Addr::LOCALHOST)
+            .expect("join the group on loopback");
+        sock.into()
     }
 
     /// The port a TCP SEARCH for `dut`, sent over a connection to `addr`, is

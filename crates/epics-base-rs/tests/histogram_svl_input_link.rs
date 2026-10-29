@@ -21,7 +21,7 @@
 //! was inert — while `field(INP,...)`, which C's dbd refuses outright, worked.
 //!
 //! Expectations are from a built softIoc
-//! (`/home/stevek/work/epics-base/bin/linux-x86_64/softIoc`) driving these exact
+//! (`$EPICS_BASE/bin/linux-x86_64/softIoc`) driving these exact
 //! records over CA. Its loader rejects the INP form with
 //! `ERROR: histogram record 'H:INP' doesn't have a field 'INP'`.
 

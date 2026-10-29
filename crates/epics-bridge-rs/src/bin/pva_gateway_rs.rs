@@ -63,6 +63,7 @@
 
 use std::fs;
 use std::net::IpAddr;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -71,6 +72,8 @@ use std::time::Duration;
 use clap::Parser;
 use serde::Deserialize;
 
+#[cfg(tokio_backend)]
+use epics_base_rs::runtime::task::Period;
 #[cfg(tokio_backend)]
 use epics_bridge_rs::pva_gateway::{
     MultiTenantPvaGateway, MultiTenantPvaGatewayBuilder, PvaGateway, PvaGatewayConfig,
@@ -124,8 +127,9 @@ struct Args {
     /// this flag overrides `EPICS_PVA_GW_CLEANUP_INTERVAL`, which
     /// overrides the 30 s default. Omit to take the env value (or the
     /// default).
+    // Nonzero: the period feeds `runtime::task::interval`, which panics on 0.
     #[arg(long)]
-    cleanup_interval_secs: Option<u64>,
+    cleanup_interval_secs: Option<NonZeroU64>,
 
     /// Pre-warm the cache with these PV names (flag mode only). Useful
     /// when you know the workload ahead of time and want the first
@@ -391,7 +395,7 @@ fn downstream_config(s: &ServerSpec) -> Result<PvaServerConfig, String> {
 fn build_gateway(
     reactor: &epics_base_rs::runtime::task::Reactor,
     cfg: &GatewayConfigFile,
-    cleanup: Duration,
+    cleanup: Period,
     connect: Duration,
     max_cache_entries: usize,
     max_subscribers: usize,
@@ -453,7 +457,7 @@ fn build_gateway(
 async fn run_from_config(
     path: &Path,
     check_only: bool,
-    cleanup: Duration,
+    cleanup: Period,
     connect: Duration,
     max_cache_entries: usize,
     max_subscribers: usize,
@@ -542,7 +546,7 @@ fn init_tracing(verbose: u8) {
 #[cfg(tokio_backend)]
 struct ResolvedConfig {
     base: PvaGatewayConfig,
-    cleanup: Duration,
+    cleanup: Period,
     connect: Duration,
 }
 
@@ -552,7 +556,7 @@ impl ResolvedConfig {
         let base = PvaGatewayConfig::default().with_env();
         let cleanup = args
             .cleanup_interval_secs
-            .map(Duration::from_secs)
+            .map(Period::from_secs)
             .unwrap_or(base.cleanup_interval);
         let connect = args
             .connect_timeout_secs
@@ -869,7 +873,7 @@ mod tests {
             "EPICS_PVA_GW_MAX_CACHE_ENTRIES applied"
         );
         assert_eq!(
-            cfg.cleanup_interval,
+            cfg.cleanup_interval.get(),
             Duration::from_secs(11),
             "env cleanup interval applies when the flag is omitted"
         );
@@ -885,6 +889,19 @@ mod tests {
             std::env::remove_var("EPICS_PVA_GW_MAX_CACHE_ENTRIES");
             std::env::remove_var("EPICS_PVA_GW_CLEANUP_INTERVAL");
         }
+    }
+
+    /// The cleanup period feeds `runtime::task::interval`, which panics on
+    /// zero: 0 is a usage error and 1 is the floor.
+    #[test]
+    fn a_zero_cleanup_interval_flag_is_a_usage_error() {
+        let e = Args::try_parse_from(["pva-gateway-rs", "--cleanup-interval-secs", "0"])
+            .expect_err("0 is refused");
+        assert_eq!(e.kind(), clap::error::ErrorKind::ValueValidation);
+        assert_eq!(e.exit_code(), 2);
+        let args = Args::try_parse_from(["pva-gateway-rs", "--cleanup-interval-secs", "1"])
+            .expect("1 s is the floor");
+        assert_eq!(args.cleanup_interval_secs.map(u64::from), Some(1));
     }
 
     #[test]

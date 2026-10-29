@@ -1,12 +1,7 @@
 use asyn_rs::port::InterfaceMask;
 use std::sync::Arc;
 
-// Not gated on `parallel`: `should_parallelize` is the whole decision now
-// and this file asks it on both arms.
 use crate::par_util;
-#[cfg(feature = "parallel")]
-use rayon::prelude::*;
-
 use ad_core_rs::error::ADResult;
 use ad_core_rs::ndarray::{NDArray, NDDataType};
 use ad_core_rs::ndarray_pool::NDArrayPool;
@@ -132,7 +127,7 @@ impl Default for ProcessConfig {
 /// C++ `pNDArrayPool->convert(pArray, &pOut, NDFloat64)` reduced to what the
 /// background / flat-field buffers actually need: the elements as f64.
 fn elements_as_f64(array: &NDArray) -> Vec<f64> {
-    array.data.to_f64_vec()
+    array.data().to_f64_vec()
 }
 
 /// State for the process plugin (holds background, flat field, and filter state).
@@ -258,13 +253,13 @@ impl ProcessState {
     /// C++: scale = maxScale / (maxValue - minValue); offset = -minValue;
     /// Also enables offset/scale processing and clipping (matching C++ lines 238-249).
     pub fn auto_offset_scale(&mut self, array: &NDArray) {
-        let n = array.data.len();
+        let n = array.data().len();
         if n == 0 {
             return;
         }
         let mut min_val = f64::MAX;
         let mut max_val = f64::MIN;
-        ad_core_rs::with_buffer!(&array.data, |v| {
+        ad_core_rs::with_buffer!(array.data(), |v| {
             for &e in v.iter() {
                 let v = ad_core_rs::pixel_cast::PixelCast::to_f64(e);
                 if v < min_val {
@@ -278,7 +273,7 @@ impl ProcessState {
         let range = max_val - min_val;
         if range > 0.0 {
             // C++: maxScale = pow(2, bytesPerElement*8) - 1
-            let bytes_per_elem = match self.config.output_type.unwrap_or(array.data.data_type()) {
+            let bytes_per_elem = match self.config.output_type.unwrap_or(array.data().data_type()) {
                 NDDataType::Int8 | NDDataType::UInt8 => 1,
                 NDDataType::Int16 | NDDataType::UInt16 => 2,
                 NDDataType::Int32 | NDDataType::UInt32 => 4,
@@ -492,7 +487,7 @@ impl ProcessState {
     /// same steps itself so it can hold the state lock for `begin_frame`,
     /// `run_filter` and `end_frame` only.
     pub fn process(&mut self, pool: &NDArrayPool, src: &NDArray) -> ADResult<Option<Arc<NDArray>>> {
-        let frame = self.begin_frame(src.data.len());
+        let frame = self.begin_frame(src.data().len());
         if !frame.any_process() {
             // C still runs `endProcessCallbacks` on this path (it reaches
             // `doCallbacks` with `doCallbacks` still 1), so the output is
@@ -516,10 +511,7 @@ impl ProcessState {
     }
 }
 
-/// Elements per parallel chunk of the element-wise pass: large enough that
-/// the per-chunk dispatch is noise, small enough to split a frame across the
-/// pool.
-#[cfg(feature = "parallel")]
+/// Elements per chunk of the pooled element-wise pass.
 const PAR_CHUNK: usize = 1 << 16;
 
 /// Stages 1-4 of one frame with every switch resolved: each stage is present
@@ -544,7 +536,6 @@ struct ElementOps<'a> {
 
 impl ElementOps<'_> {
     /// The same stages over `len` elements from `start`.
-    #[cfg(any(feature = "simd", feature = "parallel"))]
     fn slice(&self, start: usize, len: usize) -> ElementOps<'_> {
         ElementOps {
             bg: self.bg.map(|bg| &bg[start..start + len]),
@@ -799,7 +790,7 @@ impl ProcessFrame {
     /// type and jumps to the callbacks. Same-type output is then a buffer copy
     /// of the input, which is what `convert_type` does through `alloc_copy`.
     fn pass_through(&self, pool: &NDArrayPool, src: &NDArray) -> ADResult<NDArray> {
-        let out_type = self.config.output_type.unwrap_or(src.data.data_type());
+        let out_type = self.config.output_type.unwrap_or(src.data().data_type());
         pool.convert_type(src, out_type)
     }
 
@@ -807,9 +798,8 @@ impl ProcessFrame {
     /// with the state lock released -- which is the whole point of taking the
     /// snapshot, since this is the frame-sized loop.
     fn apply_element_ops(&self, values: &mut [f64]) {
-        let n = values.len();
         // Stages 1-4: element-wise operations (background, flat field, offset+scale, clipping)
-        // These can be combined into a single pass and parallelized.
+        // These can be combined into a single pass.
         let needs_element_ops = self.config.enable_background
             || self.config.enable_flat_field
             || self.config.enable_offset_scale
@@ -854,15 +844,14 @@ impl ProcessFrame {
                     .then_some((self.config.low_clip_thresh, self.config.low_clip_value)),
             };
 
-            if par_util::should_parallelize(n) {
-                #[cfg(feature = "parallel")]
-                par_util::thread_pool().install(|| {
-                    values
-                        .par_chunks_mut(PAR_CHUNK)
-                        .enumerate()
-                        .for_each(|(k, chunk)| {
-                            ops.slice(k * PAR_CHUNK, chunk.len()).apply(chunk);
-                        });
+            // 330 ps per element serially from cache; the split measured
+            // faster from 1300 us (f64 2048x2048 0.88x serial, u16 1.00x;
+            // u16 1024x1024 1.10x), as the next pass reads back what other
+            // cores wrote.
+            let split = par_util::Split::new(values.len(), 1, PAR_CHUNK);
+            if par_util::pool_wins(values.len(), 330, 1300, split.chunks()) {
+                par_util::for_each_chunk_mut(values, split, |at, chunk| {
+                    ops.slice(at, chunk.len()).apply(chunk)
                 });
             } else {
                 ops.apply(values);
@@ -878,9 +867,9 @@ impl ProcessFrame {
     /// `pNDArrayPool->convert(pScratch, &pArrayOut, dataType)`
     /// (NDPluginProcess.cpp:235).
     fn build_output(&self, pool: &NDArrayPool, src: &NDArray, values: &[f64]) -> ADResult<NDArray> {
-        let out_type = self.config.output_type.unwrap_or(src.data.data_type());
+        let out_type = self.config.output_type.unwrap_or(src.data().data_type());
         let mut arr = pool.alloc(src.dims.clone(), out_type)?;
-        arr.data.fill_from_f64(values);
+        arr.data_mut().fill_from_f64(values);
         arr.unique_id = src.unique_id;
         arr.copy_time_stamps_from(src);
         arr.attributes = src.attributes.clone();
@@ -963,9 +952,8 @@ impl NDPluginProcess for ProcessProcessor {
         .or(InterfaceMask::GENERIC_POINTER);
     const INTERRUPT_MASK: InterfaceMask = Self::INTERFACE_MASK;
 
-    /// C `NDPluginProcess::writeInt32` drops the base class status
-    /// (`status = (asynStatus) callParamCallbacks(addr);`, NDPluginProcess.cpp:318): a refused NDPluginDriver write keeps
-    /// its clamp and succeeds.
+    /// C `NDPluginProcess::writeInt32` drops the base refusal (NDPluginProcess.cpp:318); not copied.
+    /// A kept refusal carries the errorMessage C's `if (status)` sets (:320-323).
     ///
     /// SaveBackground/SaveFlatField save and clear themselves inside the
     /// write (:287-310); AutoOffsetScale is only stored, and the frame that
@@ -1000,7 +988,16 @@ impl NDPluginProcess for ProcessProcessor {
             self.state.lock().config.auto_offset_scale_pending = value != 0;
             WriteOutcome::from(WriteVerdict::Accept(value)).settled()
         } else {
-            verdict.succeed().into()
+            match verdict {
+                WriteVerdict::Refuse { keep, .. } => WriteVerdict::Refuse {
+                    keep,
+                    message: format!(
+                        "NDPluginProcess:writeInt32: status=3, function={reason}, value={value}"
+                    ),
+                },
+                accepted => accepted,
+            }
+            .into()
         }
     }
     fn process_array(&self, array: &Arc<NDArray>, pool: &NDArrayPool) -> ProcessResult {
@@ -1011,7 +1008,7 @@ impl NDPluginProcess for ProcessProcessor {
         // to post the readbacks. Drive `ProcessState`'s steps here rather than
         // calling `process`, so the two frame-sized loops -- the element-wise
         // pass and the output conversion -- run with the lock down.
-        let frame = self.state.lock().begin_frame(array.data.len());
+        let frame = self.state.lock().begin_frame(array.data().len());
 
         // No stage is on: convert the INPUT to the output type and emit, as C
         // does at NDPluginProcess.cpp:140-144. The f64 round-trip below is the
@@ -1031,7 +1028,7 @@ impl NDPluginProcess for ProcessProcessor {
             }
         } else {
             let mut values = self.scratch.lock().pop().unwrap_or_default();
-            array.data.copy_to_f64(&mut values);
+            array.data().copy_to_f64(&mut values);
             frame.apply_element_ops(&mut values);
 
             let (emitted, num_filtered) = {
@@ -1299,35 +1296,19 @@ impl NDPluginProcess for ProcessProcessor {
 mod tests {
     use super::*;
 
-    /// `status = (asynStatus) callParamCallbacks(addr);` (NDPluginProcess.cpp:318).
+    /// NDPluginProcess.cpp:318 drops the base refusal; a Process port returns it.
     #[test]
-    fn a_refused_base_write_succeeds_as_c_write_int32_does() {
-        use ad_core_rs::plugin::runtime::WriteVerdict;
-        let proc = ProcessProcessor::new(ProcessConfig::default());
-        let mut base = asyn_rs::port::PortDriverBase::new(
-            "T",
-            1,
-            Default::default(),
-            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+    fn a_refused_base_write_fails() {
+        let (message, function, value) = crate::test_util::refused_base_write(
+            "PROCESS_REFUSED",
+            ProcessProcessor::new(ProcessConfig::default()),
         );
-        let clamp = WriteVerdict::Refuse {
-            keep: 1,
-            message: String::new(),
-        };
         assert_eq!(
-            proc.validate_int32(
-                0,
-                0,
-                98,
-                clamp,
-                &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base)
-            )
-            .verdict,
-            WriteVerdict::Accept(1)
+            message,
+            format!("NDPluginProcess:writeInt32: status=3, function={function}, value={value}")
         );
     }
-    use ad_core_rs::ndarray::{NDDataBuffer, NDDimension};
+    use ad_core_rs::ndarray::{NDDataView, NDDataViewMut, NDDimension};
 
     #[test]
     fn test_register_params_seeds_the_c_constructor_values() {
@@ -1338,8 +1319,8 @@ mod tests {
             "PROC_INIT",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         let mut proc = ProcessProcessor::new(ProcessConfig::default());
         proc.register_params(&mut base).unwrap();
@@ -1354,6 +1335,23 @@ mod tests {
 
     fn pool() -> Arc<NDArrayPool> {
         NDArrayPool::new(0)
+    }
+
+    /// C's output is the pool array its dims size (NDPluginProcess.cpp:235):
+    /// a source buffer longer than its dims does not stretch it.
+    #[test]
+    fn the_output_holds_what_its_dims_size() {
+        let src = NDArray::with_data(
+            vec![NDDimension::new(4)],
+            ad_core_rs::ndarray::NDDataBuffer::from_vec::<u8>((1..=10).collect()),
+        );
+        let mut state = ProcessState::new(ProcessConfig {
+            enable_offset_scale: true,
+            ..Default::default()
+        });
+        let out = state.process(&pool(), &src).unwrap().unwrap();
+        assert_eq!(out.data().as_slice::<u8>(), Some(&[1, 2, 3, 4][..]));
+        assert_eq!(out.data().total_bytes(), out.data_size());
     }
 
     /// Both halves of the timestamp pair travel to `build_output`'s result.
@@ -1386,7 +1384,7 @@ mod tests {
 
     fn make_array(vals: &[u8]) -> NDArray {
         let mut arr = NDArray::new(vec![NDDimension::new(vals.len())], NDDataType::UInt8);
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             v.copy_from_slice(vals);
         }
         arr
@@ -1407,7 +1405,7 @@ mod tests {
 
     fn make_f64_array(vals: &[f64]) -> NDArray {
         let mut arr = NDArray::new(vec![NDDimension::new(vals.len())], NDDataType::Float64);
-        if let NDDataBuffer::F64(ref mut v) = arr.data {
+        if let NDDataViewMut::F64(v) = arr.data_mut().view_mut() {
             v.copy_from_slice(vals);
         }
         arr
@@ -1425,7 +1423,7 @@ mod tests {
         seed_background(&mut state, &bg_arr);
 
         let result = state.process(&pool(), &input).unwrap().unwrap();
-        if let NDDataBuffer::U8(ref v) = result.data {
+        if let NDDataView::U8(v) = result.data().view() {
             assert_eq!(v[0], 5);
             assert_eq!(v[1], 5);
             assert_eq!(v[2], 5);
@@ -1451,7 +1449,7 @@ mod tests {
         // Size mismatch → background ignored → output unchanged; valid recomputed
         // false at process time.
         assert!(!state.config.valid_background);
-        if let NDDataBuffer::U8(ref v) = result.data {
+        if let NDDataView::U8(v) = result.data().view() {
             assert_eq!(v, &[15, 25, 35]);
         } else {
             panic!("expected U8 output");
@@ -1473,7 +1471,7 @@ mod tests {
         seed_flat_field(&mut state, &ff_arr);
 
         let result = state.process(&pool(), &input).unwrap().unwrap();
-        if let NDDataBuffer::U8(ref v) = result.data {
+        if let NDDataView::U8(v) = result.data().view() {
             assert_eq!(v[0], 100); // 100*100/100
             assert_eq!(v[1], 50); //  100*100/200
             assert_eq!(v[2], 200); // 100*100/50
@@ -1496,7 +1494,7 @@ mod tests {
         });
         seed_flat_field(&mut state, &ff_arr);
         let result = state.process(&pool(), &input).unwrap().unwrap();
-        if let NDDataBuffer::U8(ref v) = result.data {
+        if let NDDataView::U8(v) = result.data().view() {
             assert_eq!(v, &[0, 0, 0]);
         } else {
             panic!("expected U8 output");
@@ -1514,7 +1512,7 @@ mod tests {
         });
 
         let result = state.process(&pool(), &input).unwrap().unwrap();
-        if let NDDataBuffer::U8(ref v) = result.data {
+        if let NDDataView::U8(v) = result.data().view() {
             // C++: value = (value + offset) * scale
             assert_eq!(v[0], 30); // (10+5)*2
             assert_eq!(v[1], 50); // (20+5)*2
@@ -1536,10 +1534,54 @@ mod tests {
         });
 
         let result = state.process(&pool(), &input).unwrap().unwrap();
-        if let NDDataBuffer::U8(ref v) = result.data {
+        if let NDDataView::U8(v) = result.data().view() {
             assert_eq!(v[0], 10); // clipped up
             assert_eq!(v[1], 50); // unchanged
             assert_eq!(v[2], 100); // clipped down
+        }
+    }
+
+    /// Stages 1-4 over a frame of several pool chunks: each chunk takes the
+    /// background and flat-field values at its own offset in the frame.
+    #[test]
+    fn element_ops_over_pool_chunks_match_the_scalar_stages() {
+        let n = 2 * PAR_CHUNK + 5;
+        let at = |i: usize, m: usize| ((i * 7919) % m) as f64;
+        let bg: Vec<f64> = (0..n).map(|i| at(i, 13)).collect();
+        let ff: Vec<f64> = (0..n).map(|i| at(i, 5)).collect();
+        let input: Vec<f64> = (0..n).map(|i| 50.0 + at(i, 211)).collect();
+        let mut state = ProcessState::new(ProcessConfig {
+            enable_background: true,
+            enable_flat_field: true,
+            scale_flat_field: 3.0,
+            enable_offset_scale: true,
+            offset: 2.0,
+            scale: 1.5,
+            enable_high_clip: true,
+            high_clip_thresh: 300.0,
+            high_clip_value: 300.0,
+            enable_low_clip: true,
+            low_clip_thresh: 60.0,
+            low_clip_value: -1.0,
+            ..Default::default()
+        });
+        seed_background(&mut state, &make_f64_array(&bg));
+        seed_flat_field(&mut state, &make_f64_array(&ff));
+        let result = (state.process(&pool(), &make_f64_array(&input)))
+            .unwrap()
+            .unwrap();
+        let NDDataView::F64(got) = result.data().view() else {
+            panic!("expected F64 output");
+        };
+        for i in 0..n {
+            let mut v = input[i] - bg[i];
+            if ff[i] != 0.0 {
+                v = v * 3.0 / ff[i];
+            }
+            v = (v + 2.0) * 1.5;
+            v = if v > 300.0 { 300.0 } else { v };
+            v = if v < 60.0 { -1.0 } else { v };
+            assert_eq!(got[i], v, "element {i}");
         }
     }
 
@@ -1560,7 +1602,7 @@ mod tests {
             ..Default::default()
         });
         let result = state.process(&pool(), &input).unwrap().unwrap();
-        if let NDDataBuffer::F64(ref v) = result.data {
+        if let NDDataView::F64(v) = result.data().view() {
             assert_eq!(v[0], 999.0);
         } else {
             panic!("expected F64 output");
@@ -1606,7 +1648,7 @@ mod tests {
         // data   = 0 + 1*100 + 0*0 = 100
         // filter = 0 + 0.5*100 + 0.5*0(orig data) = 50
         let result = state.process(&pool(), &input2).unwrap().unwrap();
-        if let NDDataBuffer::U8(ref v) = result.data {
+        if let NDDataView::U8(v) = result.data().view() {
             // Output is data = O1*filter = 1*100 = 100
             assert_eq!(v[0], 100);
             assert_eq!(v[1], 100);
@@ -1622,7 +1664,7 @@ mod tests {
         });
 
         let result = state.process(&pool(), &input).unwrap().unwrap();
-        assert_eq!(result.data.data_type(), NDDataType::Float64);
+        assert_eq!(result.data().data_type(), NDDataType::Float64);
     }
 
     // --- ProcessProcessor tests ---
@@ -1640,7 +1682,7 @@ mod tests {
         let input = make_array(&[10, 20, 30]);
         let result = proc.process_array(&Arc::new(input), &pool);
         assert_eq!(result.output_arrays.len(), 1);
-        if let NDDataBuffer::U8(ref v) = result.output_arrays[0].data {
+        if let NDDataView::U8(v) = result.output_arrays[0].data().view() {
             assert_eq!(v[0], 22); // (10+1)*2 = 22 (C++: offset first, then scale)
         }
     }
@@ -1679,7 +1721,7 @@ mod tests {
             .process(&pool(), &make_f64_array(&[100.0]))
             .unwrap()
             .unwrap();
-        let v0 = r0.data.get_as_f64(0).unwrap();
+        let v0 = r0.data().get_as_f64(0).unwrap();
         assert!((v0 - 100.0).abs() < 1e-9, "frame 0: got {v0}");
 
         // Frame 1: data=100, filter=200 (from prev)
@@ -1692,7 +1734,7 @@ mod tests {
             .process(&pool(), &make_f64_array(&[100.0]))
             .unwrap()
             .unwrap();
-        let v1 = r1.data.get_as_f64(0).unwrap();
+        let v1 = r1.data().get_as_f64(0).unwrap();
         assert!((v1 - 200.0).abs() < 1e-9, "frame 1: got {v1}");
     }
 
@@ -1725,7 +1767,7 @@ mod tests {
             .process(&pool(), &make_f64_array(&[100.0]))
             .unwrap()
             .unwrap();
-        let v0 = r0.data.get_as_f64(0).unwrap();
+        let v0 = r0.data().get_as_f64(0).unwrap();
         assert!((v0 - 100.0).abs() < 1e-9, "frame 0: got {v0}");
 
         // Frame 1: data=200, filter=200
@@ -1736,7 +1778,7 @@ mod tests {
             .process(&pool(), &make_f64_array(&[200.0]))
             .unwrap()
             .unwrap();
-        let v1 = r1.data.get_as_f64(0).unwrap();
+        let v1 = r1.data().get_as_f64(0).unwrap();
         assert!((v1 - 100.0).abs() < 1e-9, "frame 1: got {v1}");
 
         // Frame 2: data=300, filter=400
@@ -1747,7 +1789,7 @@ mod tests {
             .process(&pool(), &make_f64_array(&[300.0]))
             .unwrap()
             .unwrap();
-        let v2 = r2.data.get_as_f64(0).unwrap();
+        let v2 = r2.data().get_as_f64(0).unwrap();
         let expected = 400.0 / 3.0;
         assert!((v2 - expected).abs() < 1e-9, "frame 2: got {v2}");
     }
@@ -1786,7 +1828,7 @@ mod tests {
             .process(&pool(), &make_f64_array(&[100.0]))
             .unwrap()
             .unwrap();
-        let v0 = r0.data.get_as_f64(0).unwrap();
+        let v0 = r0.data().get_as_f64(0).unwrap();
         assert!((v0 - 100.0).abs() < 1e-9, "frame 0: got {v0}");
 
         // Frame 1: data=200, filter=100, N=2
@@ -1797,7 +1839,7 @@ mod tests {
             .process(&pool(), &make_f64_array(&[200.0]))
             .unwrap()
             .unwrap();
-        let v1 = r1.data.get_as_f64(0).unwrap();
+        let v1 = r1.data().get_as_f64(0).unwrap();
         assert!((v1 - 100.0).abs() < 1e-9, "frame 1: got {v1}");
 
         // Frame 2: data=300, filter=150, N=3
@@ -1808,7 +1850,7 @@ mod tests {
             .process(&pool(), &make_f64_array(&[300.0]))
             .unwrap()
             .unwrap();
-        let v2 = r2.data.get_as_f64(0).unwrap();
+        let v2 = r2.data().get_as_f64(0).unwrap();
         assert!((v2 - 150.0).abs() < 1e-9, "frame 2: got {v2}");
     }
 
@@ -1842,7 +1884,7 @@ mod tests {
             .process(&pool(), &make_array(&[10, 20, 30]))
             .unwrap()
             .unwrap();
-        assert_eq!(out.data.get_as_f64(0), Some(20.0));
+        assert_eq!(out.data().get_as_f64(0), Some(20.0));
 
         // SaveBackground now copies THAT OUTPUT (20,40,60), not the input and not
         // the next frame.
@@ -1920,8 +1962,8 @@ mod tests {
             "R9_68",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         proc.register_params(&mut base).unwrap();
         let pool = NDArrayPool::new(1_000_000);
@@ -1970,8 +2012,8 @@ mod tests {
             "T",
             1,
             Default::default(),
-            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+            asyn_rs::port::InterfaceMask::NONE,
+            asyn_rs::port::InterfaceMask::NONE,
         );
         proc.register_params(&mut base).unwrap();
         let reason = proc.params.auto_offset_scale.unwrap();
@@ -2084,7 +2126,7 @@ mod tests {
             .process(&pool(), &make_f64_array(&[50.0]))
             .unwrap()
             .unwrap();
-        let v0 = r0.data.get_as_f64(0).unwrap();
+        let v0 = r0.data().get_as_f64(0).unwrap();
         assert!((v0 - 155.0).abs() < 1e-9, "frame 0: got {v0}");
 
         // Frame 1: data=20, filter=110
@@ -2095,7 +2137,7 @@ mod tests {
             .process(&pool(), &make_f64_array(&[20.0]))
             .unwrap()
             .unwrap();
-        let v1 = r1.data.get_as_f64(0).unwrap();
+        let v1 = r1.data().get_as_f64(0).unwrap();
         assert!((v1 - 335.0).abs() < 1e-9, "frame 1: got {v1}");
     }
 
@@ -2176,7 +2218,7 @@ mod tests {
         // Reset uses the PREVIOUS filter (100), not the current data (10):
         //   newFilter = 1.0 + 0.5*100 + 2.0*10 = 71
         // Output (O1 = 1) is that reinitialized filter value.
-        assert_eq!(out.data.get_as_f64(0).unwrap(), 71.0);
+        assert_eq!(out.data().get_as_f64(0).unwrap(), 71.0);
         assert_eq!(state.num_filtered, 1);
         // A buffer re-seeded from the current frame would have given
         // 1.0 + 0.5*10 + 2.0*10 = 26 — the pre-fix behaviour.
@@ -2211,7 +2253,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(state.filter_state.as_ref().unwrap().len(), 2);
-        assert_eq!(out.data.get_as_f64(0).unwrap(), 26.0);
+        assert_eq!(out.data().get_as_f64(0).unwrap(), 26.0);
         assert_eq!(state.num_filtered, 1);
     }
 
@@ -2234,7 +2276,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!state.config.auto_offset_scale_pending); // one-shot consumed
-        if let NDDataBuffer::U8(v) = &out1.data {
+        if let NDDataView::U8(v) = out1.data().view() {
             assert_eq!(v, &[10, 20, 30]); // trigger frame NOT transformed
         } else {
             panic!("expected u8 output");
@@ -2250,7 +2292,7 @@ mod tests {
             .process(&pool(), &make_f64_array(&[10.0, 20.0, 30.0]))
             .unwrap()
             .unwrap();
-        if let NDDataBuffer::U8(v) = &out2.data {
+        if let NDDataView::U8(v) = out2.data().view() {
             assert_eq!(v[0], 0); // (10-10)*12.75 = 0
             assert_eq!(v[2], 255); // (30-10)*12.75 = 255
         } else {
@@ -2350,7 +2392,7 @@ mod tests {
                 .process(&pool(), &make_f64_array(&[inputs[k]]))
                 .unwrap()
                 .unwrap();
-            let v = r.data.get_as_f64(0).unwrap();
+            let v = r.data().get_as_f64(0).unwrap();
             assert!(
                 (v - expected_data[k]).abs() < 1e-9,
                 "frame {k}: data got {v}, expected {}",
@@ -2393,11 +2435,11 @@ mod tests {
         });
 
         let result = state.process(&pool(), &input).unwrap().unwrap();
-        let NDDataBuffer::F64(ref v) = result.data else {
-            panic!("expected an F64 output buffer, got {:?}", result.data);
+        let NDDataView::F64(v) = result.data().view() else {
+            panic!("expected an F64 output buffer, got {:?}", result.data());
         };
         assert_eq!(
-            v.as_slice(),
+            v,
             [5.0, 5.0, 5.0],
             "RC1=RC2=0 makes C's reset `filter[i] = rOffset`; O2=0 drops the NaN \
              data term. Every element is rOffset — 0.0 * NaN must not be summed in"
@@ -2407,7 +2449,7 @@ mod tests {
         // fully finite frame still comes out clean.
         let clean = make_f64_array(&[7.0, 8.0, 9.0]);
         let result = state.process(&pool(), &clean).unwrap().unwrap();
-        let NDDataBuffer::F64(ref v) = result.data else {
+        let NDDataView::F64(v) = result.data().view() else {
             panic!("expected an F64 output buffer");
         };
         assert!(
@@ -2429,7 +2471,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(first.pool_id(), pool.id());
-        let NDDataBuffer::F32(v) = &first.data else {
+        let NDDataView::F32(v) = first.data().view() else {
             panic!("expected F32 output");
         };
         assert_eq!(v, &[1.0, 2.0, 3.0]);
@@ -2442,7 +2484,7 @@ mod tests {
             .process(&pool, &make_array(&[4, 5, 6]))
             .unwrap()
             .unwrap();
-        let NDDataBuffer::F32(v) = &second.data else {
+        let NDDataView::F32(v) = second.data().view() else {
             panic!("expected F32 output");
         };
         assert_eq!(v, &[4.0, 5.0, 6.0]);
@@ -2556,7 +2598,7 @@ mod tests {
         let out = proc.process_array(&Arc::new(input), &pool);
         assert_eq!(out.output_arrays.len(), 1);
         let arr = &out.output_arrays[0];
-        let NDDataBuffer::U8(v) = &arr.data else {
+        let NDDataView::U8(v) = arr.data().view() else {
             panic!("expected the input's UInt8 type");
         };
         assert_eq!(v, &[10, 20, 30]);
@@ -2569,7 +2611,7 @@ mod tests {
             ..Default::default()
         });
         let out = proc.process_array(&Arc::new(make_array(&[10, 20, 30])), &pool);
-        let NDDataBuffer::F64(v) = &out.output_arrays[0].data else {
+        let NDDataView::F64(v) = out.output_arrays[0].data().view() else {
             panic!("expected Float64 output");
         };
         assert_eq!(v, &[10.0, 20.0, 30.0]);
@@ -2594,8 +2636,8 @@ mod tests {
             "R132",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         proc.register_params(&mut base).unwrap();
 

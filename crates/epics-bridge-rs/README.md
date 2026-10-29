@@ -6,7 +6,7 @@ Hosts multiple bridge implementations as feature-gated sub-modules:
 
 - **`qsrv`** (default) — Record ↔ pvAccess channels (C++ QSRV equivalent)
 - **`ca_gateway`** (default) — CA fan-out gateway (C++ ca-gateway equivalent)
-- **`pvalink`** — `pva://` links for record INP/OUT, pulled in by `qsrv`
+- **`pvalink`** — `{pva:…}` links for record INP/OUT, pulled in by `qsrv`
 - **`pva_gateway`** — PVA-to-PVA proxy, with tower-style middleware and a
   multi-tenant variant
 
@@ -22,7 +22,7 @@ only the CLI (`clap`, `tracing-subscriber`) for its binary:
 | `calink-core` | the network half of the `ca` link set over `epics-ca-rs/client-core`; a link to a local record resolves in `epics-base-rs` without it |
 | `ca-gateway` (default) | the CA fan-out gateway |
 | `ca-gateway-tls` | the gateway over `epics-ca-rs/experimental-rust-tls` |
-| `pvalink` | `pva://` record links on their own |
+| `pvalink` | `{pva:…}` record links on their own |
 | `pva-gateway` | the PVA-to-PVA proxy |
 | `dual-ioc` | one IOC serving CA and PVA together |
 | `dual-gateway` | the CA and PVA gateways in one process, TOML-configured |
@@ -221,14 +221,14 @@ epics-bridge-rs/src/
 
 ```toml
 [dependencies]
-epics-rs = { version = "0.32", features = ["bridge"] }
+epics-rs = { version = "0.33", features = ["bridge"] }
 ```
 
 Or directly:
 
 ```toml
 [dependencies]
-epics-bridge-rs = "0.32"
+epics-bridge-rs = "0.33"
 ```
 
 ### Example

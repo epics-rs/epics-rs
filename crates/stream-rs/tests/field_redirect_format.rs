@@ -30,3 +30,17 @@ record(ao, "e") { field(DTYP, "stream") field(OUT, "@redirect.proto chars R") }
         assert_eq!(got, ["7", "3", "7.0", "mm", "hello"]);
     });
 }
+
+/// `%(PACT)` is C's `dbGet` of `prec->pact`: 0 in the `out` that
+/// `Stream::process` formats before it sets PACT, 1 in the next, which
+/// runs from the write's completion (StreamEpics.cc `process`).
+#[test]
+fn an_own_pact_format_prints_the_records_pact() {
+    epics_base_rs::runtime::task::test_block_on(async {
+        let db = ioc(
+            r#"record(ao, "p") { field(DTYP, "stream") field(OUT, "@redirect.proto own_pact R") }"#,
+        )
+        .await;
+        assert_eq!(process(&db, "p", 2).await, ["0", "1"]);
+    });
+}

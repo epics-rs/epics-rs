@@ -33,7 +33,7 @@ compare the port against.
 
 ```toml
 [dependencies]
-epics-stream-rs = "0.32"
+epics-stream-rs = "0.33"
 ```
 
 `dev::register_app` brings what C's `streamApp.dbd` does: asyn device

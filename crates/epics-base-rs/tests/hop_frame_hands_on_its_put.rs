@@ -63,8 +63,24 @@ async fn put(db: &PvDatabase, rec: &str, field: &str, v: f64) {
         .unwrap();
 }
 
-async fn sleep(ms: u64) {
-    epics_base_rs::runtime::task::sleep(Duration::from_millis(ms)).await;
+/// Until `count` reads `n` and `rec`, the delayed record feeding it, is idle
+/// with no RPRO owed. A PACT poll alone cannot wait out RPRO: the restart
+/// leaves PACT clear before the rerun begins.
+async fn counted(db: &PvDatabase, count: &str, n: f64, rec: &str) {
+    let cell = db.get_record(rec).unwrap();
+    epics_base_rs::runtime::task::timeout(fact_budget::FACT_BUDGET, async {
+        loop {
+            if num(db, count) >= n {
+                let g = cell.read();
+                if !g.is_processing() && g.common.rpro == 0 {
+                    return;
+                }
+            }
+            epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{count} never reached {n} with {rec} idle"));
 }
 
 /// T2B is busy in its ODLY when U2B's put reaches it: `processTarget` sets
@@ -76,7 +92,7 @@ async fn a_hop_frames_put_carries_its_putf_to_a_busy_target() {
         let db = ioc().await;
         put(&db, "T2B", "PROC", 1.0).await;
         put(&db, "S2B", "VAL", 1.0).await;
-        sleep(1800).await;
+        counted(&db, "N2B", 2.0, "T2B").await;
         assert_eq!(num(&db, "N2B"), 2.0, "{rule}: T2B reprocessed on RPRO");
     })
     .await;
@@ -90,7 +106,7 @@ async fn a_hop_frames_forward_link_carries_its_putf_to_a_busy_target() {
         let db = ioc().await;
         put(&db, "TF", "PROC", 1.0).await;
         put(&db, "PF", "VAL", 1.0).await;
-        sleep(1800).await;
+        counted(&db, "NF", 2.0, "TF").await;
         assert_eq!(num(&db, "NF"), 2.0, "{rule}: TF reprocessed on RPRO");
     })
     .await;
@@ -113,7 +129,7 @@ async fn a_hop_frames_put_carries_its_wait_set_on() {
                 .is_err(),
             "{rule}: completed before T3B's ODLY ran out"
         );
-        epics_base_rs::runtime::task::timeout(Duration::from_secs(3), rx)
+        epics_base_rs::runtime::task::timeout(fact_budget::FACT_BUDGET, rx)
             .await
             .expect("completes once T3B finishes")
             .unwrap();

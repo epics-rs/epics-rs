@@ -122,7 +122,7 @@ mod tests {
                 timestamp: WallTime::UNIX_EPOCH,
                 status: PvStat::Ok,
                 severity: PvSevr::None,
-                message: None,
+                message: crate::types::CharPtr::default(),
             },
         }
     }

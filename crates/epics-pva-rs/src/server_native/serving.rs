@@ -7,19 +7,22 @@
 
 use std::fmt;
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::sync::{Arc, Condvar, Mutex};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
 use epics_base_rs::runtime::task::{Reactor, StackSizeClass};
 use epics_base_rs::runtime::worker_pool::ThreadCharge;
 
-use super::blocking::{SearchSocket, bind_udp_search, bind_udp_search_v6};
+use super::blocking::{
+    SearchSocket, bind_udp_search, bind_udp_search_v6, handle_udp_search_blocking,
+};
 use super::config::PvaServerConfig;
 use super::driver::{self, BeaconSender, DriverKind, PvaServerDriver};
 use super::report::{Liveness, LivenessGuard, Running, ServerReportHandle, pvxs_config_text};
-use super::search_engine::ServerInterfaces;
+use super::search_engine::{SearchReplier, ServerInterfaces};
 use super::serv_iface::ServListeners;
 use super::shared_pv::SharedSource;
 use super::source::DynSource;
@@ -68,31 +71,56 @@ impl std::error::Error for ServeError {}
 
 /// pvxs's v4 and v6 search collectors, each opened only when
 /// `EPICS_PVAS_INTF_ADDR_LIST` has an entry of its family, both on one port
-/// (`server.cpp:411-426`). At least one is bound.
+/// (`server.cpp:411-426`), and each read on its own thread from the bind. At
+/// least one is bound. Dropping it ends the readers.
 pub struct SearchSockets {
-    pub v4: Option<SearchSocket>,
-    pub v6: Option<SearchSocket>,
+    local_port: io::Result<u16>,
+    v4: Option<Liveness>,
+    v6: Option<Liveness>,
+    gate: Arc<SearchGate>,
 }
 
 impl SearchSockets {
     /// The search port, the first bound collector's.
     pub fn local_port(&self) -> io::Result<u16> {
-        match (&self.v4, &self.v6) {
-            (Some(s), _) | (None, Some(s)) => Ok(s.local_addr()?.port()),
-            (None, None) => Err(io::Error::other("no search socket bound")),
+        match &self.local_port {
+            Ok(port) => Ok(*port),
+            Err(e) => Err(io::Error::new(e.kind(), e.to_string())),
         }
     }
+
+    /// pvxs's search listeners starting (`server.cpp:555-599`): the readers
+    /// answer from the next datagram on.
+    fn answer(&self, replier: SearchReplier) {
+        let _ = self.gate.replier.set(replier);
+    }
+}
+
+impl Drop for SearchSockets {
+    fn drop(&mut self) {
+        self.gate.stop.store(true, Ordering::Release);
+    }
+}
+
+/// What the search readers take from their [`SearchSockets`]: who answers,
+/// set only by [`BoundPva::serve`], and the stop.
+#[derive(Default)]
+struct SearchGate {
+    replier: OnceLock<SearchReplier>,
+    stop: AtomicBool,
 }
 
 /// The search responder's bind outcome: the socket, or the port it was
 /// asked for and why it could not be had.
 pub type SearchBind = Result<SearchSockets, (u16, io::Error)>;
 
-/// A bound server whose threads have not started.
+/// A bound server whose threads have not started, the search readers aside.
 pub struct BoundPva {
     server: Arc<dyn PvaServerDriver>,
     kind: DriverKind,
     search: SearchBind,
+    ended_tx: mpsc::UnboundedSender<PvaResult<()>>,
+    ended: mpsc::UnboundedReceiver<PvaResult<()>>,
     beacons: BeaconSender,
     udp_port: u16,
     ignore_addrs: usize,
@@ -109,6 +137,8 @@ pub struct PvaSockets {
     config: PvaServerConfig,
     listeners: ServListeners,
     search: SearchBind,
+    ended_tx: mpsc::UnboundedSender<PvaResult<()>>,
+    ended: mpsc::UnboundedReceiver<PvaResult<()>>,
     udp_port: u16,
     /// [`pvxs_config_text`] of the bound server.
     pvxs_config: Arc<str>,
@@ -121,6 +151,10 @@ impl PvaSockets {
     /// The TCP listeners on `config`'s address, and the search responder
     /// wildcard on its UDP port — wildcard so it receives broadcast and
     /// multicast SEARCHes, as pvxs binds it (`udp_collector.cpp:140-151`).
+    ///
+    /// The search sockets are read from here, as pvxs's collector is from
+    /// its constructor (`udp_collector.cpp:169`): a local unicast SEARCH is
+    /// forwarded at once, and none is answered until [`BoundPva::serve`].
     pub fn bind(config: PvaServerConfig) -> Result<Self, ServeError> {
         let kind = DriverKind::from_env().map_err(ServeError::Driver)?;
         let (tcp_port, config_udp_port) = (config.tcp_port, config.udp_port);
@@ -130,13 +164,22 @@ impl PvaSockets {
             config.auto_beacon,
         )
         .map_err(ServeError::Interfaces)?;
-        let search =
-            bind_search(config_udp_port, &config, &interfaces).map_err(|e| (config_udp_port, e));
+        let search = bind_search(config_udp_port, &config, &interfaces);
         let listeners = ServListeners::bind(SocketAddr::new(config.bind_ip, tcp_port), &config)
             .map_err(|cause| ServeError::Tcp {
                 port: tcp_port,
                 cause,
             })?;
+        let (ended_tx, ended) = mpsc::unbounded_channel();
+        let search = match search {
+            Ok(sockets) => Ok(read_search(
+                sockets,
+                config_udp_port,
+                &config.ignore_addrs,
+                &ended_tx,
+            )?),
+            Err(e) => Err((config_udp_port, e)),
+        };
         let udp_port = match &search {
             Ok(s) => s.local_port().unwrap_or(config_udp_port),
             Err(_) => config_udp_port,
@@ -149,6 +192,8 @@ impl PvaSockets {
             config,
             listeners,
             search,
+            ended_tx,
+            ended,
             udp_port,
             pvxs_config,
             builtin: Arc::new(SharedSource::new()),
@@ -214,6 +259,8 @@ impl BoundPva {
             config,
             listeners,
             search,
+            ended_tx,
+            ended,
             udp_port,
             pvxs_config,
             builtin,
@@ -227,6 +274,8 @@ impl BoundPva {
             server,
             kind,
             search,
+            ended_tx,
+            ended,
             beacons,
             udp_port,
             ignore_addrs,
@@ -247,10 +296,9 @@ impl BoundPva {
         &self.search
     }
 
-    /// Start the accept loop on `reactor` and the search responder.
+    /// Start the accept loop on `reactor` and the search answers.
     pub fn serve(self, reactor: &Reactor) -> Result<PvaServing, ServeError> {
-        let udp_port = self.udp_port;
-        let (ended_tx, ended) = mpsc::unbounded_channel();
+        let (udp_port, ended_tx) = (self.udp_port, self.ended_tx);
         let (tcp_alive, tcp_guard) = Liveness::guarded();
         let srv = self.server.clone();
         let reactor = reactor.clone();
@@ -258,16 +306,16 @@ impl BoundPva {
             srv.serve(&reactor);
             Ok(())
         })?;
-        let (udp_alive, udp_v6_alive) = match self.search {
-            Ok(SearchSockets { v4, v6 }) => {
-                let v4 = match v4 {
-                    Some(v4) => search_thread("PVAS-UDP", &self.server, v4, &ended_tx)?,
-                    None => Liveness::new(|| false),
-                };
-                let v6 = v6
-                    .map(|v6| search_thread("PVAS-UDP6", &self.server, v6, &ended_tx))
-                    .transpose()?;
-                (v4, v6)
+        let (udp_alive, udp_v6_alive) = match &self.search {
+            Ok(search) => {
+                search.answer(SearchReplier {
+                    source: self.server.source().clone(),
+                    tcp_port: self.server.tcp_port(),
+                    guid: self.server.guid(),
+                    protocol: "tcp",
+                });
+                let v4 = search.v4.clone().unwrap_or_else(|| Liveness::new(|| false));
+                (v4, search.v6.clone())
             }
             Err(_) => (Liveness::new(|| false), None),
         };
@@ -299,7 +347,8 @@ impl BoundPva {
             server: self.server.clone(),
             beacon_stop,
             kind: self.kind,
-            ended,
+            _search: self.search,
+            ended: self.ended,
             report,
         })
     }
@@ -312,6 +361,8 @@ pub struct PvaServing {
     server: Arc<dyn PvaServerDriver>,
     beacon_stop: Arc<BeaconStop>,
     kind: DriverKind,
+    /// Held for its drop, which ends the search readers.
+    _search: SearchBind,
     ended: mpsc::UnboundedReceiver<PvaResult<()>>,
     report: ServerReportHandle,
 }
@@ -397,33 +448,22 @@ fn bind_search(
     port: u16,
     config: &PvaServerConfig,
     interfaces: &ServerInterfaces,
-) -> io::Result<SearchSockets> {
+) -> io::Result<(Option<SearchSocket>, Option<SearchSocket>)> {
     const EPHEMERAL_TRIES: usize = 32;
     let v6 = interfaces.v6();
     if !interfaces.has_v4() {
         let listen = v6.ok_or_else(|| io::Error::other("no search interface"))?;
         let v6 = bind_udp_search_v6(port, interfaces, listen)?;
-        return Ok(SearchSockets {
-            v4: None,
-            v6: Some(v6),
-        });
+        return Ok((None, Some(v6)));
     }
     let mut tries = 1;
     loop {
         let v4 = bind_udp_search(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port), config)?;
         let Some(listen) = v6.clone() else {
-            return Ok(SearchSockets {
-                v4: Some(v4),
-                v6: None,
-            });
+            return Ok((Some(v4), None));
         };
         match bind_udp_search_v6(v4.local_addr()?.port(), interfaces, listen) {
-            Ok(v6) => {
-                return Ok(SearchSockets {
-                    v4: Some(v4),
-                    v6: Some(v6),
-                });
-            }
+            Ok(v6) => return Ok((Some(v4), Some(v6))),
             Err(e) if port == 0 && epics_base_rs::net::port_held(&e) && tries < EPHEMERAL_TRIES => {
                 tries += 1;
             }
@@ -432,17 +472,46 @@ fn bind_search(
     }
 }
 
-/// A `name` thread answering SEARCHes on `socket`; its liveness.
+/// `sockets` each read on its own thread, forwarding to the first one's
+/// port, or `config_port` where that cannot be read back.
+fn read_search(
+    (v4, v6): (Option<SearchSocket>, Option<SearchSocket>),
+    config_port: u16,
+    ignore_addrs: &[(IpAddr, u16)],
+    ended: &mpsc::UnboundedSender<PvaResult<()>>,
+) -> Result<SearchSockets, ServeError> {
+    let local_port = match v4.as_ref().or(v6.as_ref()) {
+        Some(s) => s.local_addr().map(|a| a.port()),
+        None => Err(io::Error::other("no search socket bound")),
+    };
+    let udp_port = *local_port.as_ref().unwrap_or(&config_port);
+    let gate = Arc::new(SearchGate::default());
+    // Built before the threads, so a failed second spawn stops the first.
+    let mut search = SearchSockets {
+        local_port,
+        v4: None,
+        v6: None,
+        gate: gate.clone(),
+    };
+    let thread = |name, socket| search_thread(name, socket, udp_port, ignore_addrs, &gate, ended);
+    search.v4 = v4.map(|s| thread("PVAS-UDP", s)).transpose()?;
+    search.v6 = v6.map(|s| thread("PVAS-UDP6", s)).transpose()?;
+    Ok(search)
+}
+
+/// A `name` thread reading SEARCHes on `socket` under `gate`; its liveness.
 fn search_thread(
     name: &'static str,
-    server: &Arc<dyn PvaServerDriver>,
     socket: SearchSocket,
+    udp_port: u16,
+    ignore_addrs: &[(IpAddr, u16)],
+    gate: &Arc<SearchGate>,
     ended: &mpsc::UnboundedSender<PvaResult<()>>,
 ) -> Result<Liveness, ServeError> {
     let (alive, guard) = Liveness::guarded();
-    let srv = server.clone();
+    let (ignore_addrs, gate) = (ignore_addrs.to_vec(), gate.clone());
     serving_thread(name, guard, ended.clone(), move || {
-        srv.serve_udp_search(socket)
+        handle_udp_search_blocking(socket, &ignore_addrs, udp_port, &gate.replier, &gate.stop)
     })?;
     Ok(alive)
 }
@@ -636,6 +705,85 @@ mod tests {
             "tcp",
         );
         assert_eq!(&buf[..n], &golden[..]);
+    }
+
+    /// pvxs's collector reads from its bind (`udp_collector.cpp:169`) and
+    /// forwards a local unicast SEARCH at once (`forwardM`, `:385-397`), while
+    /// its search listeners start only in `Server::Pvt::start`
+    /// (`server.cpp:555-599`): a SEARCH that reaches the bound sockets before
+    /// `serve` is never answered, and a unicast one is forwarded then.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_search_before_serve_is_dropped_and_a_unicast_one_forwarded() {
+        use crate::proto::Command;
+        use crate::server_native::blocking::tests::origin_tag_member;
+        let sockets = PvaSockets::bind(isolated_config()).expect("bind ephemeral");
+        let port = sockets.report_handle().report().udp_port;
+        let group = SocketAddr::from((epics_base_rs::net::ORIGIN_TAG_MCAST_GROUP, port));
+        let member = origin_tag_member(port);
+        member
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        // The group datagram that took `needle` in, within the timeout.
+        let saw = |needle: &[u8]| {
+            let mut buf = [0u8; 1500];
+            while let Ok(n) = member.recv(&mut buf) {
+                if buf[..n].windows(needle.len()).any(|w| w == needle) {
+                    return true;
+                }
+            }
+            false
+        };
+        let client = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        socket2::SockRef::from(&client)
+            .set_multicast_if_v4(&Ipv4Addr::LOCALHOST)
+            .unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let codec = crate::codec::PvaCodec { big_endian: false };
+        let tagged = |seq| {
+            let mut frame =
+                crate::codec::PvaCodec::build_origin_tag_prefix(Ipv4Addr::LOCALHOST).to_vec();
+            let reply_port = client.local_addr().unwrap().port();
+            frame.extend(codec.build_search(seq, 7, "dut", [127, 0, 0, 1], reply_port, false));
+            frame
+        };
+        // Answered once served; seen by the member when the collector has it.
+        client.send_to(&tagged(1), group).unwrap();
+        assert!(saw(b"dut"), "the group SEARCH reached the group");
+        // Queued behind it on the collector, so its forward is proof the
+        // collector read the group SEARCH before `serve`.
+        let sink = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let unicast = codec.build_search(
+            2,
+            8,
+            "pre.start.forward",
+            [127, 0, 0, 1],
+            sink.local_addr().unwrap().port(),
+            true,
+        );
+        client
+            .send_to(&unicast, (Ipv4Addr::LOCALHOST, port))
+            .unwrap();
+        let forwarded = saw(b"pre.start.forward");
+
+        let _serving = BoundPva::attach(sockets, test_source())
+            .expect("attach")
+            .serve(&harness_reactor())
+            .expect("serve");
+        let mut buf = [0u8; 1500];
+        let answered = client.recv(&mut buf).is_ok();
+        assert_eq!(
+            (forwarded, answered),
+            (true, false),
+            "(unicast forwarded before serve, group SEARCH answered after)"
+        );
+        client.send_to(&tagged(3), group).unwrap();
+        let n = client
+            .recv(&mut buf)
+            .expect("a SEARCH_RESPONSE once served");
+        assert_eq!(buf[..n][3], Command::SearchResponse.code());
     }
 
     /// Each fixed thread states its class and carries its charge inside the

@@ -17,7 +17,7 @@ epics-libcom-rs = { workspace = true }
 epics-base-rs = { workspace = true, optional = true }
 epics-ca-rs = { workspace = true, optional = true }
 tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
-futures-util = "0.3"
+smallvec = "1.15"
 tracing = "0.1"
 thiserror = "2"
 # Same run-time level dispatch as ad-plugins-rs (`Level::new` + `dispatch!`):
@@ -26,6 +26,8 @@ thiserror = "2"
 fearless_simd = { version = "1.0", optional = true }
 fearless_simd_macros = { version = "0.1", optional = true }
 parking_lot = "0.12"
+# NDDataBuffer's typed views of its untyped storage, without unsafe.
+bytemuck = { version = "1.25", features = ["derive", "extern_crate_alloc"] }
 
 [features]
 default = ["simd"]

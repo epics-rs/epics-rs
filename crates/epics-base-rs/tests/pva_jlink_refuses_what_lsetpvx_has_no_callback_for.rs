@@ -131,7 +131,7 @@ record(ai, "R:OK2") {}"#,
 /// (`pva_parse_string` stores it, `pvxs/ioc/pvalink_jlif.cpp:147-148`).
 #[epics_base_rs::epics_test]
 async fn an_empty_pva_name_loads_and_puts() {
-    for text in [r#"{pva:{pv:""}}"#, r#"{pva:""}"#, r#""pva://""#] {
+    for text in [r#"{pva:{pv:""}}"#, r#"{pva:""}"#] {
         let db = format!(r#"record(ai, "R:E") {{ field(INP, {text}) }}"#);
         let (db, _) = IocBuilder::new()
             .register_link_type("pva", |_db| async { Vec::new() })
@@ -155,12 +155,7 @@ record(ai, "R:OK2") {}"#,
         .await
         .unwrap();
     db.ioc_init().await;
-    for text in [
-        r#"{pva:{pv:""}}"#,
-        r#"{pva:""}"#,
-        "pva://",
-        r#"{pva:{pv:" ",Q:7}}"#,
-    ] {
+    for text in [r#"{pva:{pv:""}}"#, r#"{pva:""}"#, r#"{pva:{pv:" ",Q:7}}"#] {
         db.put_record_field_from_ca("R:OK", "INP", EpicsValue::String(text.into()))
             .await
             .unwrap_or_else(|e| panic!("{text}: {e:?}"));
@@ -226,7 +221,7 @@ record(ai, "R:OK2") {}"#,
         .await
         .unwrap();
     db.ioc_init().await;
-    for text in ["{pva:\"A\u{1f}B\"}", "pva://A\u{1f}B"] {
+    for text in ["{pva:\"A\u{1f}B\"}"] {
         let put = db
             .put_record_field_from_ca("R:OK", "INP", EpicsValue::String(text.into()))
             .await;

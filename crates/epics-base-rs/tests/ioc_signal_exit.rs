@@ -80,7 +80,7 @@ fn wait_ready(child: &mut Child) -> std::sync::mpsc::Receiver<String> {
     }
     forward(child.stdout.take().unwrap(), tx.clone());
     forward(child.stderr.take().unwrap(), tx);
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
     loop {
         let line = rx
             .recv_timeout(deadline.saturating_duration_since(Instant::now()))
@@ -104,7 +104,7 @@ fn sig_bit(child: &Child, field: &str, sig: i32) -> bool {
 /// Wait until the child catches `sig`: the handler is installed when the
 /// post-init wait first polls, after iocInit has reported.
 fn wait_caught(child: &Child, sig: i32) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
     while !sig_bit(child, "SigCgt", sig) {
         assert!(Instant::now() < deadline, "the child never caught {sig}");
         std::thread::sleep(Duration::from_millis(10));
@@ -161,7 +161,7 @@ fn stopped_by(test: &str, sig: i32) {
         wait_caught(&child, sig);
     }
     kill(&child, sig);
-    let st = ended(&mut child, Duration::from_secs(10)).expect("the IOC outlived the signal");
+    let st = ended(&mut child, fact_budget::FACT_BUDGET).expect("the IOC outlived the signal");
     assert_eq!(st.signal(), Some(sig), "{st:?}");
     let ran = rest(&rx).iter().any(|l| l.contains(AT_EXIT));
     assert_eq!(ran, cfg!(tokio_backend), "exit callbacks ran: {ran}");
@@ -199,7 +199,7 @@ fn ignores_inherited(test: &str, ignored: i32, other: i32) {
     kill(&child, ignored);
     assert_eq!(ended(&mut child, Duration::from_millis(500)), None);
     kill(&child, other);
-    let st = ended(&mut child, Duration::from_secs(10)).expect("the IOC outlived the signal");
+    let st = ended(&mut child, fact_budget::FACT_BUDGET).expect("the IOC outlived the signal");
     assert_eq!(st.signal(), Some(other), "{st:?}");
 }
 

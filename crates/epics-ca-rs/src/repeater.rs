@@ -360,44 +360,8 @@ fn spawn_repeater() {
 
     // Try external binary first
     if let Some(ref bin) = repeater_bin {
-        if bin.exists() {
-            use std::process::{Command, Stdio};
-            // Windows has no CLOEXEC: `CreateProcess` inherits every
-            // inheritable handle we hold, and the stdout/stderr pipe a
-            // capturing parent (`Command::output`, a shell `$(caput …)`,
-            // nextest) handed us stays inheritable. The repeater is a
-            // detached daemon that outlives us, so if it inherits that
-            // pipe the capturing parent never sees EOF and blocks until
-            // the daemon exits — i.e. forever. Unix avoids this because
-            // `Stdio::null()` redirects the child's fds 0/1/2 and the pipe
-            // only ever lived on fd 1. Clear the inherit flag on our own
-            // standard handles first so the daemon cannot hold them — the
-            // Windows analogue of the CLOEXEC unix already gets.
-            #[cfg(windows)]
-            unsafe {
-                use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
-                use windows_sys::Win32::System::Console::{
-                    GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
-                };
-                for id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
-                    let h = GetStdHandle(id);
-                    // A closed/redirected slot is null; an unset one is
-                    // INVALID_HANDLE_VALUE. Skip both — only real handles
-                    // carry the inheritable pipe we must detach.
-                    if !h.is_null() && h != windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
-                        SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0);
-                    }
-                }
-            }
-            if Command::new(bin)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .is_ok()
-            {
-                return;
-            }
+        if bin.exists() && spawn_detached(bin) {
+            return;
         }
     }
 
@@ -419,6 +383,88 @@ fn spawn_repeater() {
             .expect("repeater runtime");
         let _ = rt.block_on(run_repeater());
     });
+}
+
+/// The daemon `osiSpawnDetachedProcess` starts, with null stdio. It outlives
+/// us, so a capturing ancestor's pipe it held (a shell `$(caput …)`, nextest)
+/// would see no EOF until it exits.
+///
+/// Windows: no handle inherited, as C (WIN32/osdProcess.c:67-79). `Command`
+/// passes every inheritable handle we hold, among them a pipe our own parent
+/// gave us that is not our stdio.
+#[cfg(windows)]
+fn spawn_detached(bin: &std::path::Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr::null;
+    use windows_sys::Win32::Foundation::{CloseHandle, FALSE};
+    use windows_sys::Win32::System::Threading::{
+        CREATE_NEW_PROCESS_GROUP, CreateProcessW, DETACHED_PROCESS, PROCESS_INFORMATION,
+        STARTF_USESTDHANDLES, STARTUPINFOW,
+    };
+
+    let app: Vec<u16> = bin.as_os_str().encode_wide().chain([0]).collect();
+    // argv[0], quoted for a path with spaces; CreateProcessW may write to it.
+    let mut cmdline: Vec<u16> = "\""
+        .encode_utf16()
+        .chain(bin.as_os_str().encode_wide())
+        .chain("\"\0".encode_utf16())
+        .collect();
+    // SAFETY: both are plain C structs, valid all-zero.
+    let mut startup: STARTUPINFOW = unsafe { std::mem::zeroed() };
+    let mut info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+    startup.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+    // Null standard handles, not our handle values copied unopened.
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    // SAFETY: `app` and `cmdline` are NUL-terminated and outlive the call,
+    // which reads `startup` and writes `info`.
+    let created = unsafe {
+        CreateProcessW(
+            app.as_ptr(),
+            cmdline.as_mut_ptr(),
+            null(),
+            null(),
+            FALSE,
+            CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS,
+            null(),
+            null(),
+            &startup,
+            &mut info,
+        )
+    };
+    if created == 0 {
+        return false;
+    }
+    // SAFETY: the call returned both handles to us; each is closed once.
+    unsafe {
+        CloseHandle(info.hProcess);
+        CloseHandle(info.hThread);
+    }
+    true
+}
+
+/// Unix: every descriptor past stdio closes at exec, as C closes them
+/// (posix/osdProcess.c:110-126); std marks its own CLOEXEC, not those our
+/// parent left us. Marked rather than closed, so std's exec-error pipe works.
+#[cfg(not(windows))]
+fn spawn_detached(bin: &std::path::Path) -> bool {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+    // SAFETY: sysconf has no preconditions.
+    let open_max = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) }.clamp(0, libc::c_int::MAX as _);
+    let mut cmd = Command::new(bin);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // SAFETY: the hook only calls fcntl, which is async-signal-safe.
+    unsafe {
+        cmd.pre_exec(move || {
+            for fd in 3..open_max as libc::c_int {
+                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+            }
+            Ok(())
+        });
+    }
+    cmd.spawn().is_ok()
 }
 
 /// C reports a bind-test socket it cannot create exactly once
@@ -473,6 +519,18 @@ pub(crate) fn is_local_source(src: SocketAddr, diag: Diag) -> bool {
     };
     let probe: socket2::SockAddr = SocketAddrV4::new(*v4.ip(), 0).into();
     sock.bind(&probe).is_ok()
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    /// A start that fails falls back to the in-process repeater, which no
+    /// leak check tells apart from the daemon.
+    #[test]
+    fn a_detached_start_with_no_inherited_handle_runs_the_program() {
+        let root = std::env::var_os("SystemRoot").expect("SystemRoot");
+        let whoami = std::path::Path::new(&root).join(r"System32\whoami.exe");
+        assert!(super::spawn_detached(&whoami));
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -769,5 +827,34 @@ mod tests {
                  reach stderr; got {err:?}"
             );
         }
+    }
+
+    /// A pipe our parent left us without CLOEXEC reads EOF once we close it,
+    /// though the daemon outlives us.
+    #[test]
+    fn a_detached_daemon_holds_no_descriptor_past_stdio() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = dir.path().join("daemon");
+        std::fs::write(&daemon, "#!/bin/sh\nexec sleep 3\n").unwrap();
+        std::fs::set_permissions(&daemon, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut fds = [0; 2];
+        // SAFETY: `fds` has room for both ends; pipe(2) leaves them inheritable.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        assert!(spawn_detached(&daemon));
+        let mut hup = libc::pollfd {
+            fd: fds[0],
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: both fds are ours; `hup` is one valid pollfd.
+        let ready = unsafe {
+            libc::close(fds[1]);
+            let ready = libc::poll(&mut hup, 1, 1000);
+            libc::close(fds[0]);
+            ready
+        };
+        assert_eq!(ready, 1, "the daemon holds the write end");
     }
 }

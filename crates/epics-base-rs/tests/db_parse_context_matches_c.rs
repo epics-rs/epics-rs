@@ -1,7 +1,7 @@
 //! **A `.db` rejection reaches the operator through ONE owner, on stderr,
 //! with C's sentence.**
 //!
-//! Measured against `~/work/epics-base/bin/linux-x86_64/softIoc`
+//! Measured against `$EPICS_BASE/bin/linux-x86_64/softIoc`
 //! (R7.0.10-146-g8f5015b663d764ad75df) driven with
 //! `dbLoadRecords("<file>")` from a startup script, stdin on `/dev/null`,
 //! ANSI stripped, `softMain`'s trailing `epics> ` prompt dropped. The

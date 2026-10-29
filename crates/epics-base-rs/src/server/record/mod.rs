@@ -25,7 +25,9 @@ pub use alarm::{AlarmLimit, AlarmLimitField, AlarmSeverity, AnalogAlarmConfig};
 pub(crate) use common_fields::StampBegun;
 pub use common_fields::{BkptFlag, CommonFields, CommonText, StampMode, TimeLast};
 pub(crate) use constant_link::{constant_load_as, constant_load_scalar};
-pub use constant_link::{rec_gbl_init_constant_link, reseed_constant_input_link};
+pub use constant_link::{
+    load_constant_link_scalar, rec_gbl_init_constant_link, reseed_constant_input_link,
+};
 pub use contributed_dbd::{ContributedDbd, register_contributed_dbd};
 pub(crate) use contributed_dbd::{
     menus, record_declaration_order, record_fields, record_no_prompt, record_types,
@@ -45,11 +47,11 @@ pub(crate) use device_menu_registry::{
 pub use link::{
     CaLink, CalcArg, CalcLink, CalcVal, ConstLoadError, ConstantLink, DbLink, DbLinkType,
     ExternalForward, ExternalRef, ForwardSlot, HwLink, HwLinkKind, JlinkValue, JsonLinkParse,
-    LinkFieldType, LinkProcessPolicy, LinkType, LsLoad, MonitorSwitch, OpenLatch,
+    LinkFieldType, LinkProcessPolicy, LinkSetTarget, LinkType, LsLoad, MonitorSwitch, OpenLatch,
     PVAJSON_IDENTITY_SEP, ParsedLink, PvaChannelLink, PvaJsonLink, StateLink, StatePut, StateVal,
     VxiAddr, ca_forward_flag, check_json_link_text, check_link_assignment, check_link_text,
-    declared_link_type, link_field_type, link_type_refusal, load_link_ls, out_link_discards_cp,
-    parse_c_double, parse_forward_link_v2, parse_link_field, parse_link_v2, parse_output_link_v2,
+    declared_link_type, link_type_refusal, load_link_ls, out_link_discards_cp, parse_c_double,
+    parse_forward_link_v2, parse_link_field, parse_link_v2, parse_output_link_v2,
     pvajson_identity_key, pvajson_identity_parts,
 };
 pub(crate) use link::{
@@ -80,18 +82,18 @@ pub use record_trait::{
     AfterGate, AnalogAlarmInput, ArrayMonitorPost, Asl, Base, CommonFieldPutResult,
     ConstantInitLink, ContextSubroutineFn, CycleCell, CycleHooks, CycleList, CycleMarks,
     CyclePostMask, CycleRead, CycleValue, DeadbandCells, DeclaredFields, DeclaredStore,
-    DelayedCallbackOutcome, DolStatus, EPICS_TIME_EVENT_DEVICE_TIME, EnumSlots, FORCE_GENERAL,
-    FieldDeclaration, FieldDesc, FieldMetadataOverride, FieldSlot, InitLinkReads, InputFetchPolicy,
-    InputLinkRequest, LinkRead, LinkReadAs, MonitorDeadbandCells, MonitorValueClasses,
-    MonitorValueGate, OutTarget, OutView, Pact, PostName, PostStage, PostTable, PostedValue,
-    ProcessAction, ProcessActions, ProcessContext, ProcessOutcome, ProcessSnapshot,
-    ProcessStatusRule, RawSoftEntry, Record, RecordProcessResult, ResolvedInputLinks, ReturnPact,
-    SecondaryTake, SharedAfterWork, SimmCells, SlotMut, SlotRef, SoftStatus, Special, StampPoint,
-    Subroutine, SubroutineFn, ValuePostGate, ValueView, arg_letter_offset, arg_link_field,
-    calc_class_link_backed_metadata_field, coerce_put_value, covers_every_slot, dbput_coerce_value,
-    declared_field_ix, declared_post_table, declared_set, field_at, input_link_slots_of,
-    link_value_in_field_shape, monitor_deadband_classes, put_field_internal_default,
-    put_value_in_field_shape, seed_input_links, uniform_post_table,
+    DelayedCallback, DelayedCallbackOutcome, DolStatus, EPICS_TIME_EVENT_DEVICE_TIME, EnumSlots,
+    FORCE_GENERAL, FieldDeclaration, FieldDesc, FieldMetadataOverride, FieldSlot, InitLinkReads,
+    InputFetchPolicy, InputLinkRequest, LinkRead, LinkReadAs, MonitorDeadbandCells,
+    MonitorValueClasses, MonitorValueGate, OutTarget, OutView, OwnFrame, OwnRecord, Pact, PostName,
+    PostStage, PostTable, PostedValue, ProcessAction, ProcessActions, ProcessContext,
+    ProcessOutcome, ProcessSnapshot, ProcessStatusRule, RawSoftEntry, Record, RecordProcessResult,
+    ResolvedInputLinks, ReturnPact, SecondaryTake, SeedGuard, SharedAfterWork, SimmCells, SlotMut,
+    SlotRef, SoftStatus, Special, StampPoint, Subroutine, SubroutineFn, ValuePostGate, ValueView,
+    arg_letter_offset, arg_link_field, calc_class_link_backed_metadata_field, coerce_put_value,
+    covers_every_slot, dbput_coerce_value, declared_field_ix, declared_post_table, declared_set,
+    field_at, input_link_slots_of, link_value_in_field_shape, monitor_deadband_classes,
+    put_field_internal_default, put_value_in_field_shape, seed_input_links, uniform_post_table,
 };
 pub(crate) use record_trait::{InitGetFailure, InitRead};
 pub(crate) use record_trait::{

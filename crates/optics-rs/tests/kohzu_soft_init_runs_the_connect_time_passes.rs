@@ -2,7 +2,7 @@
 //! the connect-time monitors its waitForCmndEnter leaves set, in its order:
 //! thetaLimits, the theta readback (thetaMotStopped `!causedMove`), then
 //! yOffset. Unlike kohzuCtl, a manual-mode pass that would violate a limit
-//! is not rolled back (`kohzuCtl_soft.st:907`). A zero readback holds init
+//! is not rolled back (`kohzuCtl_soft.st:982`). A zero readback holds init
 //! in chkMotorLimits.
 //!
 //! Expected values are a C kohzuIoc's (sequencer 2.2.9, optics, motorSim
@@ -29,7 +29,7 @@ use std::time::Duration;
 const KOHZU_DB: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/db/kohzuSeq_soft.db");
 /// GEOM is left to the program's own `GEOM=1` (`kohzuCtl_soft.st:1`).
 const SEQ_MACROS: &str = "P=K:,MONO=m:,M_THETA=th,M_Y=y,M_Z=z";
-/// initSequence's radConv (`kohzuCtl_soft.st:481`).
+/// initSequence's radConv (`kohzuCtl_soft.st:540`).
 const RAD_CONV: f64 = 57.2958;
 // kohzuSeq_soft.db has no SpeedCtrl record for the one kohzuCtl_soft assigns.
 const MOTORS: &str = r#"
@@ -385,7 +385,7 @@ async fn use_set_and_motor_sets(ioc: &PvDatabase) -> [f64; 4] {
     ]
 }
 
-/// updateSet (kohzuCtl_soft.st:1259-1302) runs on the connect-time monitors with UseSet first,
+/// updateSet (kohzuCtl_soft.st:1334-1399) runs on the connect-time monitors with UseSet first,
 /// so UseSet's value wins: a preset motor .SET is put back (C kohzuIoc
 /// oracle: th.SET=Set before seq gives all Use).
 #[epics_base_rs::epics_test]
@@ -464,7 +464,7 @@ async fn idle(db: &PvDatabase, ack: &str, msg1: &str) {
 }
 
 /// Run `posts` once the sequencer has passed waitForCmndEnter's efClears
-/// (kohzuCtl_soft.st:562-605): `ack` sends it there, and the enter's `opAck = 0` follows them.
+/// (kohzuCtl_soft.st:625-671): `ack` sends it there, and the enter's `opAck = 0` follows them.
 /// Its puts are queued, so no record lock can hold it inside the enter.
 async fn post_after_enter(db: &PvDatabase, ack: &str, posts: impl FnOnce(&PvDatabase)) {
     idle(db, ack, "K:m:SeqMsg1").await;
@@ -512,6 +512,38 @@ async fn an_e_put_below_1e_12_off_still_moves() {
     eventually_near(&ioc, "K:y.VAL", -17.77).await;
 }
 
+/// A lambda request landing while an E pass puts lambda is taken by its own
+/// pass or dropped, never put as the E pass's lambda: E stays the one for
+/// ThetaSet.
+#[epics_base_rs::epics_test]
+async fn a_lambda_request_during_an_e_pass_leaves_e_for_theta_set() {
+    let ioc = boot([10.0, -17.77, 100.78]).await;
+    ready(&ioc, "y offset changed to 17.500000").await;
+    let d = f64_of(&ioc, "K:m:2dSpacing").await;
+    post(&ioc, "K:m:E", EpicsValue::Double(12.0));
+    eventually_near(&ioc, "K:m:Theta", RAD_CONV * (12.3984244 / 12.0 / d).asin()).await;
+    post(&ioc, "K:m:Lambda", EpicsValue::Double(0.9));
+    task::sleep(Duration::from_secs(2)).await;
+    let theta = f64_of(&ioc, "K:m:ThetaSet").await;
+    assert_near(&ioc, "K:m:E", 12.3984244 / (d * (theta / RAD_CONV).sin())).await;
+}
+
+/// A theta request landing between thChanged and calcMovements is taken by
+/// its own pass or dropped, never moved to as the pass's ThetaSet: E stays
+/// the one for ThetaSet.
+#[epics_base_rs::epics_test]
+async fn a_theta_request_during_a_theta_pass_leaves_e_for_theta_set() {
+    let ioc = boot([10.0, -17.77, 100.78]).await;
+    ready(&ioc, "y offset changed to 17.500000").await;
+    let d = f64_of(&ioc, "K:m:2dSpacing").await;
+    post(&ioc, "K:m:Theta", EpicsValue::Double(20.0));
+    eventually_near(&ioc, "K:m:Lambda", d * (20.0 / RAD_CONV).sin()).await;
+    post(&ioc, "K:m:Theta", EpicsValue::Double(30.0));
+    task::sleep(Duration::from_secs(2)).await;
+    let theta = f64_of(&ioc, "K:m:ThetaSet").await;
+    assert_near(&ioc, "K:m:E", 12.3984244 / (d * (theta / RAD_CONV).sin())).await;
+}
+
 /// kohzuMoving is a monitor variable (kohzuCtl_soft.st:83-85): a Moving
 /// write that posts nothing (dbPut through an NPP link, dbAccess.c:1416)
 /// leaves it 0, so the next waitForCmndEnter does not clear Moving (C
@@ -535,7 +567,7 @@ async fn a_moving_write_with_no_monitor_is_not_cleared() {
 
 /// Readbacks at the yOffset pass's own Y and Z for theta 10 leave every
 /// motor nothing to do, so thTime is 0: Put keeps each speed, where C put
-/// 0/0, a NaN, into Y's and Z's VELO (`kohzuCtl_soft.st:882-892`).
+/// 0/0, a NaN, into Y's and Z's VELO (`kohzuCtl_soft.st:957-967`).
 /// th.VELO stays only if the pass took that thTime = 0 branch.
 #[epics_base_rs::epics_test]
 async fn a_move_with_nothing_to_do_keeps_the_motor_speeds() {
@@ -556,7 +588,7 @@ async fn a_move_with_nothing_to_do_keeps_the_motor_speeds() {
 }
 
 /// Theta at VELO 0, as speed control leaves it after a move without theta
-/// travel, takes zero time (`kohzuCtl_soft.st:858-868`): Z is the slowest
+/// travel, takes zero time (`kohzuCtl_soft.st:933-943`): Z is the slowest
 /// to theta 20, so it keeps its speed and theta and Y get their travel over
 /// Z's time. C took an infinite thTime and put 0 into every VELO.
 #[epics_base_rs::epics_test]
@@ -591,8 +623,278 @@ async fn a_zero_theta_speed_takes_no_time() {
     .await;
 }
 
+async fn put_process(ioc: &PvDatabase, pv: &str, v: f64) {
+    optics_rs::db_access::DbChannel::new(ioc, pv)
+        .put_f64_process(v)
+        .await
+        .unwrap();
+}
+
+/// Post DMOV on the three motors as their driver would: they have none.
+fn post_dmov(db: &PvDatabase, done: bool) {
+    for motor in ["K:th", "K:y", "K:z"] {
+        let rec = db.get_record(motor).unwrap();
+        let mut inst = rec.write();
+        inst.record
+            .as_any_mut()
+            .and_then(|a| a.downcast_mut::<motor_rs::MotorRecord>())
+            .unwrap()
+            .stat
+            .dmov = i16::from(done);
+        inst.notify_field("DMOV", EventMask::VALUE | EventMask::LOG);
+    }
+}
+
+const SPEEDS: [(&str, f64); 3] = [("K:th.VELO", 1.0), ("K:y.VELO", 2.0), ("K:z.VELO", 3.0)];
+
+/// Theta's speed for a move from its readback 10 to `theta`: Z, at
+/// [`SPEEDS`], is the slowest.
+fn th_speed(theta: f64) -> f64 {
+    let z = 17.5 / (theta / RAD_CONV).sin();
+    (theta - 10.0) / ((z - 100.78).abs() / 3.0)
+}
+
+/// Boot at [`SPEEDS`] with speed control into auto mode, the motors not
+/// done. thSpeed holds th's speed once ThetaVel, its monitor's mirror,
+/// shows it.
+async fn boot_speeds() -> Kohzu {
+    let presets: Vec<_> = SPEEDS.into_iter().chain([("K:m:SpeedCtrl", 1.0)]).collect();
+    let ioc = boot_with([10.0, -17.77, 100.78], &presets).await;
+    ready(&ioc, "y offset changed to 17.500000").await;
+    eventually_near(&ioc, "K:m:ThetaVel", 1.0).await;
+    post_dmov(&ioc, false);
+    put_process(&ioc, "K:m:Mode", 1.0).await;
+    ioc
+}
+
+/// The motors done before the echo of Move's th.VELO put is in get their
+/// old speeds back (C defect, kohzuCtl_soft.st:403-413).
+#[epics_base_rs::epics_test]
+async fn a_move_done_before_its_speed_echo_puts_the_old_speeds_back() {
+    let ioc = boot_speeds().await;
+    put_process(&ioc, "K:m:Theta", 20.0).await;
+    // Z's VAL is Move's last motor put.
+    eventually_near(&ioc, "K:z.VAL", 17.5 / (20.0 / RAD_CONV).sin()).await;
+    post_dmov(&ioc, true);
+    for (pv, speed) in SPEEDS {
+        eventually_near(&ioc, pv, speed).await;
+    }
+}
+
+/// A move started before the echo of the previous move's speed restore is
+/// in gets its own speeds (C defect, kohzuCtl_soft.st:403-413).
+#[epics_base_rs::epics_test]
+async fn a_move_before_the_restore_echo_puts_its_own_speeds() {
+    let ioc = boot_speeds().await;
+    put_process(&ioc, "K:m:Theta", 20.0).await;
+    eventually_near(&ioc, "K:th.VELO", th_speed(20.0)).await;
+    // Done once Move's speed echo is in, as a real move would be.
+    eventually_near(&ioc, "K:m:ThetaVel", th_speed(20.0)).await;
+    post_dmov(&ioc, true);
+    eventually_near(&ioc, "K:th.VELO", 1.0).await;
+    // DMOV 0 during the restore's readback pass would hold it in updateRdbk.
+    post_after_enter(&ioc, "K:m:OperAck", |db| {
+        post_dmov(db, false);
+        post(db, "K:m:Theta", EpicsValue::Double(30.0));
+    })
+    .await;
+    eventually_near(&ioc, "K:th.VELO", th_speed(30.0)).await;
+}
+
+/// Wait for an event of `sub` at `want`.
+async fn shows(sub: &mut DbSubscription, want: f64) {
+    loop {
+        let got = task::timeout(Duration::from_secs(10), sub.recv_f64())
+            .await
+            .unwrap_or_else(|_| panic!("no event at {want}"))
+            .unwrap();
+        if (got - want).abs() <= 1e-4 * want.abs().max(1.0) {
+            return;
+        }
+    }
+}
+
+/// The next move puts back the speeds VELO holds, though this move's speed
+/// echo is in only after its restore (C defect, kohzuCtl_soft.st:926-932).
+#[epics_base_rs::epics_test]
+async fn a_speed_echo_after_its_restore_leaves_the_next_move_the_old_speeds() {
+    let ioc = boot_speeds().await;
+    let mut vel = DbSubscription::subscribe(&ioc, "K:m:ThetaVel")
+        .await
+        .unwrap();
+    put_process(&ioc, "K:m:Theta", 20.0).await;
+    eventually_near(&ioc, "K:th.VELO", th_speed(20.0)).await;
+    // The move takes its time.
+    task::sleep(Duration::from_millis(1500)).await;
+    post_dmov(&ioc, true);
+    eventually_near(&ioc, "K:th.VELO", 1.0).await;
+    // The next move starts once the speed echo is in.
+    shows(&mut vel, th_speed(20.0)).await;
+    post_after_enter(&ioc, "K:m:OperAck", |db| {
+        post_dmov(db, false);
+        post(db, "K:m:Theta", EpicsValue::Double(30.0));
+    })
+    .await;
+    // Z's VAL is Move's last motor put.
+    eventually_near(&ioc, "K:z.VAL", 17.5 / (30.0 / RAD_CONV).sin()).await;
+    post_dmov(&ioc, true);
+    for (pv, speed) in SPEEDS {
+        eventually_near(&ioc, pv, speed).await;
+    }
+}
+
+/// UseSet put twice leaves every motor .SET at the second value, though
+/// the first pass's .SET echo is in only during the second pass's put
+/// (C defect, kohzuCtl_soft.st:463-477).
+#[epics_base_rs::epics_test]
+async fn use_set_put_twice_leaves_the_motor_sets_at_the_second() {
+    let ioc = boot([10.0, -17.77, 100.78]).await;
+    ready(&ioc, "y offset changed to 17.500000").await;
+    sets_reach(&ioc, [0.0; 4]).await;
+    put_process(&ioc, "K:m:UseSet", 1.0).await;
+    // The second lands while the first one's pass runs.
+    task::sleep(Duration::from_millis(50)).await;
+    put_process(&ioc, "K:m:UseSet", 0.0).await;
+    // Nothing to wait on for the mirrors to settle: give them time.
+    task::sleep(Duration::from_secs(2)).await;
+    sets_reach(&ioc, [0.0; 4]).await;
+}
+
+/// The same for a motor .SET put twice and the UseSet echo
+/// (C defect, kohzuCtl_soft.st:463-477).
+#[epics_base_rs::epics_test]
+async fn a_motor_set_put_twice_leaves_use_set_at_the_second() {
+    let ioc = boot([10.0, -17.77, 100.78]).await;
+    ready(&ioc, "y offset changed to 17.500000").await;
+    sets_reach(&ioc, [0.0; 4]).await;
+    put_process(&ioc, "K:th.SET", 1.0).await;
+    task::sleep(Duration::from_millis(50)).await;
+    put_process(&ioc, "K:th.SET", 0.0).await;
+    task::sleep(Duration::from_secs(2)).await;
+    sets_reach(&ioc, [0.0; 4]).await;
+}
+
+/// UseSet off again before the first pass's .SET echoes are in stays off:
+/// the late echoes are not mirrored back (C defect, kohzuCtl_soft.st:1344-1348).
+#[epics_base_rs::epics_test]
+async fn a_late_motor_set_echo_is_not_mirrored_back_to_use_set() {
+    let ioc = boot([10.0, -17.77, 100.78]).await;
+    ready(&ioc, "y offset changed to 17.500000").await;
+    sets_reach(&ioc, [0.0; 4]).await;
+    put_process(&ioc, "K:m:UseSet", 1.0).await;
+    sets_reach(&ioc, [1.0; 4]).await;
+    put_process(&ioc, "K:m:UseSet", 0.0).await;
+    let mut sub = DbSubscription::subscribe(&ioc, "K:m:UseSet").await.unwrap();
+    stays(&mut sub, 0.0).await;
+    sets_reach(&ioc, [0.0; 4]).await;
+}
+
+/// The same for th.SET off again before the UseSet echo is in
+/// (C defect, kohzuCtl_soft.st:1344-1348).
+#[epics_base_rs::epics_test]
+async fn a_late_use_set_echo_is_not_mirrored_back_to_the_motor_set() {
+    let ioc = boot([10.0, -17.77, 100.78]).await;
+    ready(&ioc, "y offset changed to 17.500000").await;
+    sets_reach(&ioc, [0.0; 4]).await;
+    put_process(&ioc, "K:th.SET", 1.0).await;
+    eventually_near(&ioc, "K:m:UseSet", 1.0).await;
+    put_process(&ioc, "K:th.SET", 0.0).await;
+    let mut sub = DbSubscription::subscribe(&ioc, "K:th.SET").await.unwrap();
+    stays(&mut sub, 0.0).await;
+    sets_reach(&ioc, [0.0; 4]).await;
+}
+
+/// Fail on an event of `sub` other than `want` for three seconds.
+async fn stays(sub: &mut DbSubscription, want: f64) {
+    let end = std::time::Instant::now() + Duration::from_secs(3);
+    while let Ok(got) = task::timeout(
+        end.saturating_duration_since(std::time::Instant::now()),
+        sub.recv_f64(),
+    )
+    .await
+    {
+        assert_eq!(got.unwrap(), want, "a late echo was mirrored back");
+    }
+}
+
+/// Move goes where the last pass calculated, though the previous pass's
+/// Desired echoes are in only after it (C defect, kohzuCtl_soft.st:300-304).
+#[epics_base_rs::epics_test]
+async fn a_late_desired_echo_leaves_the_move_at_the_last_pass() {
+    let ioc = boot([10.0, -17.77, 100.78]).await;
+    ready(&ioc, "y offset changed to 17.500000").await;
+    put_process(&ioc, "K:m:Theta", 20.0).await;
+    eventually_near(&ioc, "K:m:ThetaSet", 20.0).await;
+    // The 20 pass's echoes land between the 30 pass and Move.
+    task::sleep(Duration::from_secs(1)).await;
+    put_process(&ioc, "K:m:Theta", 30.0).await;
+    eventually_near(&ioc, "K:m:ThetaSet", 30.0).await;
+    task::sleep(Duration::from_millis(1500)).await;
+    moves_to(&ioc, 30.0).await;
+}
+
+/// A Desired edit before Move is dropped: Move goes where the pass
+/// calculated, where C took the edit (C defect, kohzuCtl_soft.st:300-304).
+#[epics_base_rs::epics_test]
+async fn a_desired_edit_before_move_is_dropped() {
+    let ioc = boot([10.0, -17.77, 100.78]).await;
+    ready(&ioc, "y offset changed to 17.500000").await;
+    put_process(&ioc, "K:m:Theta", 20.0).await;
+    eventually_near(&ioc, "K:m:ThetaSet", 20.0).await;
+    for (pv, v) in [
+        ("K:m:ThetaSet", 25.0),
+        ("K:m:YSet", -20.0),
+        ("K:m:ZSet", 40.0),
+    ] {
+        put_process(&ioc, pv, v).await;
+    }
+    task::sleep(Duration::from_millis(500)).await;
+    moves_to(&ioc, 20.0).await;
+}
+
+/// Press Move, then find each motor's VAL at the move to `theta`.
+async fn moves_to(ioc: &PvDatabase, theta: f64) {
+    put_process(ioc, "K:m:Put", 1.0).await;
+    eventually_near(ioc, "K:m:Put", 0.0).await;
+    let th = theta / RAD_CONV;
+    for (pv, want) in [
+        ("K:th.VAL", theta),
+        ("K:y.VAL", -17.5 / th.cos()),
+        ("K:z.VAL", 17.5 / th.sin()),
+    ] {
+        assert_near(ioc, pv, want).await;
+    }
+}
+
+/// A theta request landing in waitForCmndEnter's delay is taken at its
+/// clears, as C's monitored theta kept it, so the next yOffset pass
+/// calculates for it (`kohzuCtl_soft.st:632-637`). A request during
+/// a move cannot reach them here: the Theta motor posts no VAL put while
+/// it is moving.
+#[epics_base_rs::epics_test]
+async fn a_theta_request_in_the_enter_is_the_yoffset_pass_theta() {
+    let ioc = boot([10.0, -17.77, 100.78]).await;
+    ready(&ioc, "y offset changed to 17.500000").await;
+    idle(&ioc, "K:m:OperAck", "K:m:SeqMsg1").await;
+    // The opAck arm's SeqMsg2 is its last put before the enter's delay(.1);
+    // it posts no event, as SeqMsg2 was " " already.
+    post(&ioc, "K:m:SeqMsg2", EpicsValue::String("-".into()));
+    put_process(&ioc, "K:m:OperAck", 1.0).await;
+    let mut polls = 0;
+    while string_of(&ioc, "K:m:SeqMsg2").await != " " {
+        polls += 1;
+        assert!(polls < 5000, "opAck arm never ran");
+        task::sleep(Duration::from_millis(2)).await;
+    }
+    put_process(&ioc, "K:m:Theta", 20.0).await;
+    eventually_near(&ioc, "K:m:OperAck", 0.0).await;
+    // DRVH holds yOffset to 17.500001.
+    put_process(&ioc, "K:m:yOffset", 18.0).await;
+    eventually_near(&ioc, "K:m:ThetaSet", 20.0).await;
+}
+
 /// initSequence's escaped block names each motor `{P}{M_x}`
-/// (`kohzuCtl_soft.st:494-512`) and publishes the names.
+/// (`kohzuCtl_soft.st:553-571`) and publishes the names.
 #[epics_base_rs::epics_test]
 async fn init_names_the_motors_from_p_and_their_macros() {
     let ioc = boot([10.0, -17.77, 100.78]).await;

@@ -7,9 +7,10 @@
 //! assert is the thing the harness stakes its credibility on: that it never
 //! turns "I could not measure this" into "this agreed".
 //!
-//! Requires the built C EPICS tree (`EPICS_BASE_BIN`, or the default path). If
-//! it is absent the tests fail loudly rather than skipping — a silently skipped
-//! oracle is exactly the false-clean this project is trying to escape.
+//! Requires the built C EPICS tree (`EPICS_BASE_BIN`, `EPICS_ORACLE_IOC_BIN`,
+//! `EPICS_ORACLE_DBD`). If one is absent the tests fail loudly rather than
+//! skipping — a silently skipped oracle is exactly the false-clean this
+//! project is trying to escape.
 
 // RTEMS-EXEC-MODEL-ALLOW(1): checked, not waived —
 // `the_denominator_probe_uses_the_configuration_under_test` ran and
@@ -33,12 +34,13 @@ use epics_oracle_rs::surface::{Surface, probe_supported_record_types};
 fn tools() -> CTools {
     CTools::discover().expect(
         "the C EPICS tree must be built for the oracle to have ground truth; \
-         set EPICS_BASE_BIN if it is not at the default path",
+         set EPICS_BASE_BIN and EPICS_ORACLE_IOC_BIN",
     )
 }
 
 fn dbd() -> Dbd {
-    Dbd::parse_file(&CTools::dbd_path()).expect("expanded softIoc.dbd parses")
+    let path = CTools::dbd_path().expect("set EPICS_ORACLE_DBD to the fat dbd");
+    Dbd::parse_file(&path).expect("expanded softIoc.dbd parses")
 }
 
 /// The denominator is derived from the spec, and it is not empty or absurd.

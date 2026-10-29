@@ -9,7 +9,7 @@
 //! a redefinition does not move its entry — `rawval` writes through the
 //! entry `lookup` found (`macCore.c:610-619`).
 //!
-//! Measured on `softIoc` built from `~/work/epics-base` (`R7.0.10`), with
+//! Measured on `softIoc` built from `$EPICS_BASE` (`R7.0.10`), with
 //! the two definitions delivered raw through a `.substitutions` row so
 //! they reach `macLib` unexpanded, and with the alphabetical order and
 //! the definition order deliberately opposed:

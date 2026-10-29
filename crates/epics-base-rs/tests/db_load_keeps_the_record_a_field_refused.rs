@@ -8,7 +8,7 @@
 //!
 //! The port handed the whole field slice to one `apply_fields` call, so the
 //! FIRST refusal aborted the record and every field behind it. Measured
-//! against `~/work/epics-base/bin/linux-x86_64/softIoc` on the fixture below,
+//! against `$EPICS_BASE/bin/linux-x86_64/softIoc` on the fixture below,
 //! driven with `dbLoadRecords("<file>")` then `dbl` from a startup script with
 //! stdin on `/dev/null`: C's `dbl` printed `N1` and `N2`, the port's printed
 //! nothing at all.

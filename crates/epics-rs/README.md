@@ -1,7 +1,7 @@
 # epics-rs
 
 Umbrella crate that re-exports the epics-rs sub-crates. Use feature flags to select which modules you need.
-`sscan-rs`, `epics-stream-rs`, `epics-seq-rs`/`epics-snc-rs`, `mqtt-rs` and
+`sscan-rs`, `epics-stream-rs`, `epics-seq-rs`, `mqtt-rs` and
 `epics-modbus-rs` are not re-exported; depend on them directly.
 
 **Repository:** <https://github.com/epics-rs/epics-rs>
@@ -33,7 +33,7 @@ you through `epics-base-rs`, so the features select nothing.
 
 ```toml
 [dependencies]
-epics-rs = { version = "0.32", features = ["motor", "ad"] }
+epics-rs = { version = "0.33", features = ["motor", "ad"] }
 ```
 
 ```rust

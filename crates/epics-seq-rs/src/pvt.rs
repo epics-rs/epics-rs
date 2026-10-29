@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use epics_base_rs::runtime::general_time::epics_epoch;
+use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::types::WallTime;
 use parking_lot::Mutex;
 
@@ -46,7 +47,7 @@ impl PvMeta {
             timestamp: epics_epoch(),
             status: PvStat::Ok,
             severity: PvSevr::None,
-            message: None,
+            message: CharPtr::default(),
         }
     }
 }
@@ -319,8 +320,9 @@ pub struct Program<V: 'static> {
     pub thread_priority: u32,
     pub stack_size: u32,
     pub pv_sys: PvSystem,
-    /// What the program's monitor events pass: each state set is in it
-    /// while it runs, so an event lands only while every one is blocked.
+    /// The database `seq` started the program on.
+    pub db: PvDatabase,
+    /// Where a state set takes in the monitor events queued.
     pub gate: Arc<EventGate>,
     pub chans: Box<[Chan<V>]>,
     pub queues: Box<[SeqQueue]>,

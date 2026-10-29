@@ -7,11 +7,9 @@
 // SNL calls these by their C names.
 #![allow(non_snake_case)]
 
-use std::sync::Arc;
-
 use crate::data::chantler::{FILTER_MATERIALS, attenuation};
+use epics_seq_rs::CharPtr;
 use epics_seq_rs::c::*;
-use epics_seq_rs::{CharPtr, Place};
 
 macro_rules! seqg_escaped {
     (r#"#include <string.h>"#) => {};
@@ -26,7 +24,7 @@ epics_seq_rs::include_program!("filterDrive");
 /// `cvtToBin` (`filterDrive.st:240-264`): the low `nBits` of `val` into
 /// `buff`, most significant first with a `.` before every fourth, or all
 /// `*` when `val` has bits above them; returns `buff`.
-fn cvtToBin<B: CBuf>(buff: &impl Place<B>, val: i32, nBits: i32) -> CharPtr {
+fn cvtToBin(buff: impl CDst, val: i32, nBits: i32) -> CharPtr {
     let v = val as u32;
     let n = nBits.max(0) as usize;
     let mut s = Vec::with_capacity(n + n / 4);
@@ -43,8 +41,8 @@ fn cvtToBin<B: CBuf>(buff: &impl Place<B>, val: i32, nBits: i32) -> CharPtr {
     if v.checked_shr(n as u32).unwrap_or(0) != 0 {
         s.fill(b'*');
     }
-    strcpy(buff, &s[..]);
-    Some(buff.modify(|b| Arc::from(b.bytes_mut().split(|&c| c == 0).next().unwrap_or(&[]))))
+    strcpy(&buff, &s[..]);
+    buff.with_c_dst(|b| CharPtr::from_bytes(b.split(|&c| c == 0).next().unwrap_or(&[])))
 }
 
 /// `calcTrans` (`filterDrive.st:267-317`): the transmission of `thickness`
@@ -128,7 +126,7 @@ mod tests {
     /// `cvtToBin`'s result, and what it left in the buffer.
     fn bin(val: i32, nBits: i32) -> (String, String) {
         let buff = SeqVar::new(SeqString::new());
-        let r = cvtToBin(&buff, val, nBits).unwrap();
+        let r = cvtToBin(&buff, val, nBits).to_c_vec();
         let s = |b: &[u8]| String::from_utf8(b.to_vec()).unwrap();
         (s(&r), buff.modify(|b| s(b.as_bytes())))
     }

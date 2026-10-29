@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use epics_base_rs::runtime::task::sleep;
 use epics_base_rs::server::autosave::AutosaveStartupConfig;
-use epics_base_rs::server::ioc_app::IocApplication;
+use epics_base_rs::server::ioc_app::{IocApplication, RunOutcome};
 
 #[epics_macros_rs::epics_test]
 async fn the_script_after_iocinit_runs_with_the_task_saving() {
@@ -27,13 +27,13 @@ async fn the_script_after_iocinit_runs_with_the_task_saving() {
     );
     std::fs::write(d.join("st.cmd"), script).unwrap();
     let sav = d.join("s.sav");
-    IocApplication::new()
+    let outcome = IocApplication::new()
         .port(0)
         .autosave_startup(Arc::new(Mutex::new(AutosaveStartupConfig::new())))
         .startup_script(d.join("st.cmd").to_str().unwrap())
-        .run(move |_| async move {
+        .run_outcome(move |_| async move {
             epics_base_rs::server::db_server::announce_serving("probe");
-            let deadline = Instant::now() + Duration::from_secs(30);
+            let deadline = Instant::now() + fact_budget::FACT_BUDGET;
             loop {
                 let text = std::fs::read_to_string(&sav).unwrap_or_default();
                 if text.lines().any(|l| l == "A 3") {
@@ -45,4 +45,5 @@ async fn the_script_after_iocinit_runs_with_the_task_saving() {
         })
         .await
         .unwrap();
+    assert_eq!(outcome, RunOutcome::Served);
 }

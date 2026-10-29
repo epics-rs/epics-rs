@@ -115,7 +115,7 @@ async fn test_get_double() {
     let ch = client.create_channel("TEST:VAL");
     ch.wait_connected(Duration::from_secs(3)).await.unwrap();
 
-    let (dbr_type, value) = ch.get().await.unwrap();
+    let (dbr_type, value) = ch.get_with_timeout(fact_budget::FACT_BUDGET).await.unwrap();
     assert_eq!(dbr_type, DbFieldType::Double);
     assert_eq!(value, EpicsValue::Double(42.0));
 }
@@ -130,9 +130,11 @@ async fn test_put_and_readback() {
     let ch = client.create_channel("TEST:SP");
     ch.wait_connected(Duration::from_secs(3)).await.unwrap();
 
-    ch.put(&EpicsValue::Double(99.5)).await.unwrap();
+    ch.put_with_timeout(&EpicsValue::Double(99.5), fact_budget::FACT_BUDGET)
+        .await
+        .unwrap();
 
-    let (_, value) = ch.get().await.unwrap();
+    let (_, value) = ch.get_with_timeout(fact_budget::FACT_BUDGET).await.unwrap();
     assert_eq!(value, EpicsValue::Double(99.5));
 }
 
@@ -150,7 +152,10 @@ async fn test_get_with_metadata_time_double() {
     let ch = client.create_channel("TEST:TEMP");
     ch.wait_connected(Duration::from_secs(3)).await.unwrap();
 
-    let snap = ch.get_with_metadata(DbrClass::Time).await.unwrap();
+    let snap = ch
+        .get_with_metadata(DbrClass::Time, fact_budget::FACT_BUDGET)
+        .await
+        .unwrap();
     assert_eq!(snap.value, EpicsValue::Double(25.0));
     // Timestamp should be non-zero (server sets current time)
     assert!(snap.timestamp > std::time::SystemTime::UNIX_EPOCH.into());
@@ -166,7 +171,10 @@ async fn test_get_with_metadata_time_short() {
     let ch = client.create_channel("TEST:INT");
     ch.wait_connected(Duration::from_secs(3)).await.unwrap();
 
-    let snap = ch.get_with_metadata(DbrClass::Time).await.unwrap();
+    let snap = ch
+        .get_with_metadata(DbrClass::Time, fact_budget::FACT_BUDGET)
+        .await
+        .unwrap();
     assert_eq!(snap.value, EpicsValue::Short(7));
 }
 
@@ -180,7 +188,10 @@ async fn test_get_with_metadata_time_string() {
     let ch = client.create_channel("TEST:STR");
     ch.wait_connected(Duration::from_secs(3)).await.unwrap();
 
-    let snap = ch.get_with_metadata(DbrClass::Time).await.unwrap();
+    let snap = ch
+        .get_with_metadata(DbrClass::Time, fact_budget::FACT_BUDGET)
+        .await
+        .unwrap();
     assert_eq!(snap.value, EpicsValue::String("hello".into()));
 }
 
@@ -198,7 +209,10 @@ async fn test_get_with_metadata_ctrl_double() {
     let ch = client.create_channel("TEST:CTRL");
     ch.wait_connected(Duration::from_secs(3)).await.unwrap();
 
-    let snap = ch.get_with_metadata(DbrClass::Ctrl).await.unwrap();
+    let snap = ch
+        .get_with_metadata(DbrClass::Ctrl, fact_budget::FACT_BUDGET)
+        .await
+        .unwrap();
     assert_eq!(snap.value, EpicsValue::Double(PI));
     // SimplePv has no display metadata, so fields should be default/zero
     assert_eq!(snap.alarm.status, 0);
@@ -219,7 +233,10 @@ async fn test_get_with_metadata_sts() {
     let ch = client.create_channel("TEST:STS");
     ch.wait_connected(Duration::from_secs(3)).await.unwrap();
 
-    let snap = ch.get_with_metadata(DbrClass::Sts).await.unwrap();
+    let snap = ch
+        .get_with_metadata(DbrClass::Sts, fact_budget::FACT_BUDGET)
+        .await
+        .unwrap();
     assert_eq!(snap.value, EpicsValue::Double(1.0));
     assert_eq!(snap.alarm.status, 0);
 }
@@ -241,7 +258,7 @@ async fn test_monitor_receives_updates() {
     let mut monitor = ch.subscribe().await.unwrap();
 
     // First callback is the current value
-    let snap = tokio::time::timeout(Duration::from_secs(3), monitor.recv())
+    let snap = tokio::time::timeout(fact_budget::FACT_BUDGET, monitor.recv())
         .await
         .unwrap()
         .unwrap()
@@ -249,9 +266,11 @@ async fn test_monitor_receives_updates() {
     assert_eq!(snap.value, EpicsValue::Double(0.0));
 
     // Put a new value and expect the monitor to fire
-    ch.put(&EpicsValue::Double(123.0)).await.unwrap();
+    ch.put_with_timeout(&EpicsValue::Double(123.0), fact_budget::FACT_BUDGET)
+        .await
+        .unwrap();
 
-    let snap = tokio::time::timeout(Duration::from_secs(3), monitor.recv())
+    let snap = tokio::time::timeout(fact_budget::FACT_BUDGET, monitor.recv())
         .await
         .unwrap()
         .unwrap()
@@ -305,7 +324,10 @@ async fn test_get_with_metadata_all_native_types() {
         let ch = client.create_channel(name);
         ch.wait_connected(Duration::from_secs(3)).await.unwrap();
 
-        let snap = ch.get_with_metadata(DbrClass::Time).await.unwrap();
+        let snap = ch
+            .get_with_metadata(DbrClass::Time, fact_budget::FACT_BUDGET)
+            .await
+            .unwrap();
         assert_eq!(snap.value, expected, "mismatch for {name}");
     }
 }

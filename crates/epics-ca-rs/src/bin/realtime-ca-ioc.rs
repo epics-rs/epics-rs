@@ -19,10 +19,10 @@
 //!    plain thread with no runtime entered that selects `park_on`: the thread
 //!    polls the build future and parks between polls. `build()` awaits only
 //!    runtime-agnostic in-process locks, so nothing here needs a reactor.
-//! 3. **`ca://` record links** —
+//! 3. **CA record links** —
 //!    [`install_calink_resolver`](epics_ca_rs::calink::install_calink_resolver)
 //!    mounts the CA external record-link resolver on the database (C
-//!    `dbCaLinkInit`, `dbCa.c:352-355`), so a ` CA`-modified or `ca://...`
+//!    `dbCaLinkInit`, `dbCa.c:352-355`), so a ` CA`-modified or non-local
 //!    INP/OUT field resolves through a live `CaClient`. The client binds the
 //!    UDP SEARCH socket and additionally dials `EPICS_CA_NAME_SERVERS` over
 //!    TCP, as it does on a host — see `epics_base_rs::net::search_udp`.
@@ -84,7 +84,7 @@
 //! main thread, which deliberately never enters one. A hosted build that
 //! reached `ioc::main` therefore fails when it builds the client, at an
 //! `expect` that names the contract, rather than surviving to the first
-//! `ca://` link and dying inside a spawn on tokio's "there is no reactor
+//! CA link and dying inside a spawn on tokio's "there is no reactor
 //! running". Reporting that at startup is the honest behaviour; silently
 //! starting a runtime would defeat the purpose of the binary.
 //!
@@ -109,7 +109,7 @@ mod demo_db {
     /// scalar read, write and monitor paths over CA.
     ///
     /// IOC content only, and **link-free** by construction: no record here
-    /// carries an INP/OUT field, so a default build is the no-`ca://`-link
+    /// carries an INP/OUT field, so a default build is the no-CA-link
     /// image. The C6 measurement rig — every probe record and both probe
     /// threads — is behind the `bringup-probes` feature (`C6_PROBE_DB`).
     pub const DEMO_DB: &str = concat!(
@@ -127,7 +127,7 @@ mod demo_db {
         "record(bo, \"RTEMS:BO\") { field(ZNAM, \"Off\") field(ONAM, \"On\") }\n",
     );
 
-    /// C6 PROBE (topology A): the 14 measurement-rig records, loaded on top of
+    /// C6 PROBE (topology A): the 15 measurement-rig records, loaded on top of
     /// [`DEMO_DB`] only under the `bringup-probes` feature (§11.7 item 3 —
     /// they are the measurement rig, not IOC content).
     ///
@@ -141,32 +141,34 @@ mod demo_db {
         // NOT `@ca://…`: a leading `@` is INST_IO and `dbCanSetLink`
         // (`record/link.rs:487`, C `dbStaticLib.c:2400`) refuses INST_IO on
         // a record whose bound device support declares CONSTANT — a soft
-        // `ai`. Measured on target for the PVA twin (§12.2 there), and the
-        // §6 table for this stage already spells both surviving forms:
+        // `ai`. Measured on target for the PVA twin (§12.2 there).
         //
-        //   * `INP=UPSTREAM:AI CP`      — the bare ` CA`-modifier spelling,
-        //     C `pvlOptCA`. A `Db` link until `initialize_link_locality`
-        //     turns it into a `Ca` link, which is exactly why the entry
-        //     point runs that phase.
-        //   * `INP=ca://UPSTREAM:AI CP` — this tree's scheme form.
-        //
-        // Both resolve through `strip_ca_scheme`, and §6 asks for both.
+        // `INP=UPSTREAM:AI CP` is a `Db` link until `initialize_link_locality`
+        // turns it into a `Ca` link, which is exactly why the entry point runs
+        // that phase. DOWN2 carries the same text: the probe tables name both
+        // records.
         "record(ai, \"RTEMS:CA:DOWN\") {\n",
         "  field(INP, \"UPSTREAM:AI CP\")\n",
         "  field(PREC, \"3\") field(EGU, \"V\") field(SCAN, \"Passive\")\n",
         "}\n",
         "record(ai, \"RTEMS:CA:DOWN2\") {\n",
-        "  field(INP, \"ca://UPSTREAM:AI CP\")\n",
+        "  field(INP, \"UPSTREAM:AI CP\")\n",
         "  field(PREC, \"3\") field(EGU, \"V\") field(SCAN, \"Passive\")\n",
         "}\n",
-        // The OUT link. One record covers both `LinkPutOp` flavours
-        // because the op is chosen by the *originating* write, not by the
-        // link: `Database::external_put_op` (`database/links.rs:1801-1806`)
-        // returns `Async` when the source record carries a put-notify
-        // wait-set and `Plain` otherwise. So `caput` exercises `put_nowait`
-        // and `caput -c` exercises `put`, through the same field.
+        // The OUT link. A Soft Channel ao puts it plain (`put_nowait`)
+        // for `caput` and `caput -c` alike: C `dbPutLink` on a CA link is
+        // `dbCaPutLink` (`dbCa.c:627-631`).
         "record(ao, \"RTEMS:CA:UPLNK\") {\n",
-        "  field(OUT, \"ca://UPSTREAM:AO\")\n",
+        "  field(OUT, \"UPSTREAM:AO CA\")\n",
+        "  field(PREC, \"3\") field(EGU, \"V\") field(OMSL, \"supervisory\")\n",
+        "  field(SCAN, \"Passive\")\n",
+        "}\n",
+        // The same OUT with a put callback: `devAoSoftCallback` writes with
+        // `dbPutLinkAsync` (`devAoSoftCallback.c:49`), a CA put with
+        // callback (`dbCaPutLinkCallback`, `dbCa.c:544`), and the record
+        // completes when it returns.
+        "record(ao, \"RTEMS:CA:UPLNKCB\") {\n",
+        "  field(DTYP, \"Async Soft Channel\") field(OUT, \"UPSTREAM:AO CA\")\n",
         "  field(PREC, \"3\") field(EGU, \"V\") field(OMSL, \"supervisory\")\n",
         "  field(SCAN, \"Passive\")\n",
         "}\n",
@@ -184,7 +186,7 @@ mod demo_db {
         // FLNK runs C1..C8: nine records processed inline per upstream
         // event, which is the shape §5.4 says is unbounded.
         "record(ai, \"RTEMS:CA:FAST\") {\n",
-        "  field(INP, \"ca://UPSTREAM:FAST CP\")\n",
+        "  field(INP, \"UPSTREAM:FAST CP\")\n",
         "  field(PREC, \"3\") field(SCAN, \"Passive\") field(FLNK, \"RTEMS:CA:C1\")\n",
         "}\n",
         "record(calc, \"RTEMS:CA:C1\") { field(CALC, \"A+1\") field(INPA, \"RTEMS:CA:FAST\") field(FLNK, \"RTEMS:CA:C2\") }\n",
@@ -195,12 +197,12 @@ mod demo_db {
         "record(calc, \"RTEMS:CA:C6\") { field(CALC, \"A+1\") field(INPA, \"RTEMS:CA:C5\") field(FLNK, \"RTEMS:CA:C7\") }\n",
         "record(calc, \"RTEMS:CA:C7\") { field(CALC, \"A+1\") field(INPA, \"RTEMS:CA:C6\") field(FLNK, \"RTEMS:CA:C8\") }\n",
         "record(calc, \"RTEMS:CA:C8\") { field(CALC, \"A+1\") field(INPA, \"RTEMS:CA:C7\") }\n",
-        // The victim: a second, independent `ca://` link whose
+        // The victim: a second, independent CA link whose
         // monitor→record latency is what the measurement reads. No FLNK,
         // no chain — every millisecond it gains under load is a
         // millisecond the chain took from the band.
         "record(ai, \"RTEMS:CA:OTHER\") {\n",
-        "  field(INP, \"ca://UPSTREAM:OTHER CP\")\n",
+        "  field(INP, \"UPSTREAM:OTHER CP\")\n",
         "  field(PREC, \"3\") field(SCAN, \"Passive\")\n",
         "}\n",
         // The other victim: a timer callback on the same band. Driven by
@@ -348,7 +350,7 @@ mod ioc {
     /// here so the next reader does not have to rediscover why.
     const STATUS_PREFIX: &str = "RTEMS";
 
-    /// C6 PROBE: the upstream CA name server the guest's `ca://` links
+    /// C6 PROBE: the upstream CA name server the guest's CA links
     /// resolve through. SLIRP puts the host at `10.0.2.2`; the port is the
     /// host-side upstream IOC's CA port, which cannot be the guest's own
     /// 5064 because that belongs to the inbound `hostfwd`.
@@ -632,6 +634,7 @@ mod ioc {
             "RTEMS:CA:DOWN",
             "RTEMS:CA:DOWN2",
             "RTEMS:CA:UPLNK",
+            "RTEMS:CA:UPLNKCB",
             "RTEMS:CA:FAST",
             "RTEMS:CA:C8",
             "RTEMS:CA:OTHER",
@@ -783,7 +786,7 @@ mod ioc {
     /// reactor is involved.
     fn load_database(db_files: &[String]) -> CaResult<(BareIoc, CaLinkResolver)> {
         let macros = HashMap::new();
-        // The `ca://` / ` CA` record-link resolver, installed by the build at
+        // The ` CA` record-link resolver, installed by the build at
         // C `dbCaLinkInit` so the link passes and PINI that follow it see the
         // link set. The CA client it builds lazily reads the `EPICS_CA_*`
         // variables `main` set before this call; its tasks land on the
@@ -1057,7 +1060,7 @@ mod ioc {
         //     it needs an answer.
         #[cfg(feature = "bringup-probes")]
         udp_search_report(port, "RTEMS:AO");
-        // The calink resolver is mounted, so ` CA`-modified and `ca://...`
+        // The calink resolver is mounted, so ` CA`-modified and non-local
         // INP/OUT links resolve. Reported at every boot — including
         // `link_count == 0`, when the loaded database configured none —
         // because on a target with no shell the console is the only place an
@@ -1096,8 +1099,8 @@ mod ioc {
         }
         let link_count = resolver.link_count();
         println!(
-            "realtime-ca-ioc: calink resolver installed — {link_count}/{} ca:// record \
-             link{} registered ({}); ` CA`-modified and ca://... INP/OUT resolve over \
+            "realtime-ca-ioc: calink resolver installed — {link_count}/{} CA record \
+             link{} registered ({}); ` CA`-modified and non-local INP/OUT links resolve over \
              UDP search and any EPICS_CA_NAME_SERVERS TCP circuits)",
             declared.len(),
             if declared.len() == 1 { "" } else { "s" },
@@ -1439,7 +1442,7 @@ mod tests {
     /// exists for the same reason: a regression that dropped the
     /// `install_calink_resolver` call would leave an IOC that still boots,
     /// still serves every record and still answers searches — and silently
-    /// resolves no ` CA`-modified or `ca://...` INP/OUT link at all, with no
+    /// resolves no ` CA`-modified or non-local INP/OUT link at all, with no
     /// shell on the target to notice. The banner line is the only place an
     /// operator can confirm from the console that the resolver came up and how
     /// many links it registered, so it is checked too.
@@ -1451,7 +1454,7 @@ mod tests {
         assert!(
             prod.contains(concat!("install_calink_", "resolver(&db, reactor)")),
             "the calink resolver is no longer installed; ` CA`-modified and \
-             ca://... record links would silently never resolve, and there is no \
+             non-local record links would silently never resolve, and there is no \
              shell on the target to say so"
         );
         assert!(
@@ -1462,7 +1465,7 @@ mod tests {
         assert!(
             prod.contains("link_count"),
             "the banner no longer reports the registered link count, the one number \
-             that tells an operator whether the database's ca:// links were seen"
+             that tells an operator whether the database's CA links were seen"
         );
     }
 
@@ -1656,7 +1659,7 @@ mod tests {
         }
     }
 
-    /// With the feature on, the rig is exactly the 14 records the C6
+    /// With the feature on, the rig is exactly the 15 records the C6
     /// measurement was built from, on top of the same clean demo set — so the
     /// bring-up image is one
     /// cargo flag away, not a code edit away.
@@ -1670,20 +1673,21 @@ mod tests {
             .expect("the demo + probe database must parse");
         // The demo half of this total has an owner already
         // (`the_default_database_is_clean_and_link_free`), so read it rather
-        // than restate it: this test is about the rig's own 14, and hard-coding
+        // than restate it: this test is about the rig's own 15, and hard-coding
         // the sum is what made adding `RTEMS:BO` to `DEMO_DB` fail here.
         let demo =
             epics_base_rs::server::db_loader::parse_db(crate::demo_db::DEMO_DB, &HashMap::new())
                 .expect("the demo database must parse");
         assert_eq!(
             recs.len(),
-            demo.len() + 14,
-            "the demo records plus the 14-record rig"
+            demo.len() + 15,
+            "the demo records plus the 15-record rig"
         );
         for name in [
             "RTEMS:CA:DOWN",
             "RTEMS:CA:DOWN2",
             "RTEMS:CA:UPLNK",
+            "RTEMS:CA:UPLNKCB",
             "RTEMS:CA:FAST",
             "RTEMS:CA:C1",
             "RTEMS:CA:C2",
@@ -1701,18 +1705,30 @@ mod tests {
                 "probe record {name} is missing from the rig"
             );
         }
-        // Both link spellings the C6 stage table asks for survive the split:
-        // the bare ` CA`-modifier and the `ca://` scheme.
-        let inp = |name: &str| {
+        // Both probe records keep their CA link through the split.
+        let field = |name: &str, field: &str| {
             recs.iter()
                 .find(|r| r.name == name)
-                .and_then(|r| r.fields.iter().find(|f| f.name == "INP"))
+                .and_then(|r| r.fields.iter().find(|f| f.name == field))
                 .map(|f| f.value.to_string())
         };
-        assert_eq!(inp("RTEMS:CA:DOWN").as_deref(), Some("UPSTREAM:AI CP"));
         assert_eq!(
-            inp("RTEMS:CA:DOWN2").as_deref(),
-            Some("ca://UPSTREAM:AI CP")
+            field("RTEMS:CA:DOWN", "INP").as_deref(),
+            Some("UPSTREAM:AI CP")
+        );
+        assert_eq!(
+            field("RTEMS:CA:DOWN2", "INP").as_deref(),
+            Some("UPSTREAM:AI CP")
+        );
+        // A CA OUT put both ways: plain from a Soft Channel ao, with a
+        // callback from an Async Soft Channel one.
+        for rec in ["RTEMS:CA:UPLNK", "RTEMS:CA:UPLNKCB"] {
+            assert_eq!(field(rec, "OUT").as_deref(), Some("UPSTREAM:AO CA"));
+        }
+        assert_eq!(field("RTEMS:CA:UPLNK", "DTYP"), None);
+        assert_eq!(
+            field("RTEMS:CA:UPLNKCB", "DTYP").as_deref(),
+            Some("Async Soft Channel")
         );
     }
 }

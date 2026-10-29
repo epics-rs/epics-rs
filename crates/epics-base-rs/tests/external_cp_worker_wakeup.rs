@@ -40,9 +40,9 @@ impl CounterLset {
     }
 }
 
-/// Spin until `done`, failing after 5 s.
+/// Spin until `done`, failing after the fact budget.
 fn until(done: impl Fn() -> bool, what: &str) {
-    let end = Instant::now() + Duration::from_secs(5);
+    let end = Instant::now() + fact_budget::FACT_BUDGET;
     while !done() {
         assert!(Instant::now() < end, "timed out waiting until {what}");
         std::thread::yield_now();
@@ -80,12 +80,10 @@ async fn holder_db(lset: Arc<CounterLset>) -> PvDatabase {
     {
         let rec = db.get_record("HOLDER").unwrap();
         let mut inst = rec.write();
-        inst.common.text.inp = "ca://UP:PV CP".into();
+        inst.common.text.inp = "UP:PV CP".into();
         inst.install_link_cache(
             "INP",
-            Arc::new(epics_base_rs::server::record::parse_link_v2(
-                "ca://UP:PV CP",
-            )),
+            Arc::new(epics_base_rs::server::record::parse_link_v2("UP:PV CP")),
         )
         .expect("a common link");
     }

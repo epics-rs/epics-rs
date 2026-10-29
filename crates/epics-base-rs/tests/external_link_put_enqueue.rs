@@ -1,4 +1,4 @@
-//! External-link put parity with C `dbCa.c`: a record's `ca://`/`pva://` OUT
+//! External-link put parity with C `dbCa.c`: a record's CA / pva OUT
 //! write is STAGED on the database's link-put queue and the record returns —
 //! the wire write happens on the queue owner, never inside the record's
 //! advisory write gate.
@@ -15,7 +15,8 @@
 //! * completion — `dbCaPutLinkCallback` / `dbCaPutAsync` (`dbCa.c:508-513`)
 //!   stage identically but carry `putCallback`; the task issues
 //!   `ca_array_put_callback` (`dbCa.c:1233-1236`) and `putComplete`
-//!   (`dbCa.c:994-1012`) later drives the originating record's completion.
+//!   (`dbCa.c:994-1012`) later reports to the writer. Only a writer that
+//!   asks for it gets it: a put-notify chain's `dbPutLink` is the plain one.
 //!
 //! The status C returns from either entry point is the STAGING status: -1 only
 //! when the link is down or read-only (`dbCa.c:529-532`).
@@ -126,10 +127,8 @@ impl LinkSet for RecordingLset {
     }
 }
 
-/// Soft-Channel ao with the given OUT link and VAL, optionally armed with a
-/// put-notify wait-set (which is what selects the completion flavour, C
-/// `dbPutLinkAsync`).
-async fn add_ao(db: &PvDatabase, name: &str, out: &str, val: f64, notify: bool) {
+/// Soft-Channel ao with the given OUT link and VAL.
+async fn add_ao(db: &PvDatabase, name: &str, out: &str, val: f64) {
     db.add_record(name, Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();
@@ -142,33 +141,6 @@ async fn add_ao(db: &PvDatabase, name: &str, out: &str, val: f64, notify: bool) 
     inst.record
         .put_field("VAL", EpicsValue::Double(val))
         .unwrap();
-    if notify {
-        // Leaked on purpose: the test only inspects what the OUT write did,
-        // and a live receiver keeps the completion `send` from observing a
-        // closed channel.
-        let (tx, rx) = epics_base_rs::runtime::sync::oneshot::channel();
-        std::mem::forget(rx);
-        inst.install_or_queue_notify(tx)
-            .expect("the record is free, so the wait-set installs");
-    }
-}
-
-/// `add_ao` with a put-notify wait-set whose completion receiver is handed
-/// BACK, so a test can observe when the chain settles. The leaked-receiver
-/// variant above is for tests that only inspect the write itself.
-async fn add_ao_notify(
-    db: &PvDatabase,
-    name: &str,
-    out: &str,
-    val: f64,
-) -> epics_base_rs::runtime::sync::oneshot::Receiver<()> {
-    add_ao(db, name, out, val, false).await;
-    let (tx, rx) = epics_base_rs::runtime::sync::oneshot::channel();
-    let rec = db.get_record(name).expect("just added");
-    rec.write()
-        .install_or_queue_notify(tx)
-        .expect("the record is free, so the wait-set installs");
-    rx
 }
 
 async fn set_val(db: &PvDatabase, name: &str, val: f64) {
@@ -222,7 +194,7 @@ async fn plain_put_returns_before_the_wire_write_completes() {
     .await;
     db.process_cp_links_on_connect().await;
 
-    add_ao(&db, "AO_ENQ", "ca://REMOTE:OUT", 3.5, false).await;
+    add_ao(&db, "AO_ENQ", "REMOTE:OUT CA", 3.5).await;
     process(&db, "AO_ENQ").await;
 
     // process() has returned. The write is only now reaching the lset...
@@ -270,7 +242,7 @@ async fn disconnected_link_stages_nothing_and_alarms() {
     .await;
     db.process_cp_links_on_connect().await;
 
-    add_ao(&db, "AO_DOWN", "ca://REMOTE:OUT", 1.0, false).await;
+    add_ao(&db, "AO_DOWN", "REMOTE:OUT CA", 1.0).await;
     process(&db, "AO_DOWN").await;
     db.sync_external_link_puts().await;
 
@@ -321,7 +293,7 @@ async fn pending_put_is_overwritten_latest_wins() {
     .await;
     db.process_cp_links_on_connect().await;
 
-    add_ao(&db, "AO_COALESCE", "ca://REMOTE:OUT", 1.0, false).await;
+    add_ao(&db, "AO_COALESCE", "REMOTE:OUT CA", 1.0).await;
     process(&db, "AO_COALESCE").await;
     assert_eq!(
         entered_rx.recv().await,
@@ -365,7 +337,7 @@ async fn per_link_put_ordering_is_preserved() {
         .await;
     db.process_cp_links_on_connect().await;
 
-    add_ao(&db, "AO_ORDER", "ca://REMOTE:OUT", 1.0, false).await;
+    add_ao(&db, "AO_ORDER", "REMOTE:OUT CA", 1.0).await;
     for v in [1.0, 2.0, 3.0, 4.0] {
         set_val(&db, "AO_ORDER", v).await;
         process(&db, "AO_ORDER").await;
@@ -383,21 +355,17 @@ async fn per_link_put_ordering_is_preserved() {
     assert_eq!(db.external_link_puts_coalesced(), 0);
 }
 
-/// Boundary — the completion flavour does NOT hold the record thread either.
+/// Boundary — the completion flavour does NOT hold the writer either.
 ///
 /// C `dbCaPutLinkCallback` stores `pca->putCallback`, calls `addAction` and
-/// RETURNS (`dbCa.c:585-595`), identically to the plain flavour; what keeps a
-/// put-notify chain outstanding is the RECORD staying active, not the record
-/// thread parking on the wire. `putComplete` (`dbCa.c:994-1012`) later fires
-/// the callback — `dbCaCallbackProcess` → `dbLinkAsyncComplete`
-/// (`dbCa.c:304-309`) — which is what settles the chain.
+/// RETURNS (`dbCa.c:585-595`), identically to the plain flavour.
+/// `putComplete` (`dbCa.c:994-1012`) later fires the callback, which is what
+/// settles the writer's wait-set (sseq's `putCallbackCB`).
 ///
-/// So: `process()` must return while `put_value` is still blocked, and the
-/// source record's `NotifyWaitSet` must stay unsettled until the completion
-/// resolves. On the pre-H6 shape `process()` awaited the completion, so this
-/// test would deadlock on the gate rather than fail an assertion.
+/// So: the put must return while `put_value` is still blocked, and the
+/// wait-set must stay unsettled until the completion resolves.
 #[epics_macros_rs::epics_test]
-async fn async_put_completion_is_reported_through_the_notify_chain() {
+async fn async_put_completion_is_reported_to_its_writer() {
     let completed = Arc::new(Mutex::new(Vec::new()));
     let settled = Arc::new(tokio::sync::Notify::new());
     let (entered, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -419,10 +387,14 @@ async fn async_put_completion_is_reported_through_the_notify_chain() {
     .await;
     db.process_cp_links_on_connect().await;
 
-    let mut notify_rx = add_ao_notify(&db, "AO_NOTIFY", "ca://REMOTE:OUT", 9.0).await;
-    process(&db, "AO_NOTIFY").await;
+    add_ao(&db, "AO_NOTIFY", "REMOTE:OUT CA", 0.0).await;
+    let unprocessed = alarm_of(&db, "AO_NOTIFY").await;
+    let mut notify_rx = db
+        .put_link_notify("AO_NOTIFY", "OUT", EpicsValue::Double(9.0))
+        .await
+        .expect("AO_NOTIFY is loaded");
 
-    // The record thread is back with the wire write still in flight.
+    // The writer is back with the wire write still in flight.
     assert_eq!(
         entered_rx.recv().await,
         Some(9.0),
@@ -430,14 +402,13 @@ async fn async_put_completion_is_reported_through_the_notify_chain() {
     );
     assert!(
         completed.lock().unwrap().is_empty(),
-        "the wire write has NOT completed, yet process() already returned — \
+        "the wire write has NOT completed, yet the put already returned — \
          C `dbCaPutLinkCallback` stages and returns (dbCa.c:585-595)"
     );
     assert!(
         notify_rx.try_recv().is_err(),
-        "the put-notify chain is still outstanding: the record stays active \
-         until putComplete (dbCa.c:1056-1074), which is what the external put \
-         joined the wait-set for"
+        "the writer's wait-set is still outstanding until putComplete \
+         (dbCa.c:1056-1074), which is what the external put joined it for"
     );
 
     release.add_permits(1);
@@ -445,16 +416,16 @@ async fn async_put_completion_is_reported_through_the_notify_chain() {
     assert_eq!(completed.lock().unwrap().as_slice(), [9.0]);
     notify_rx
         .await
-        .expect("the completion settles the put-notify chain");
+        .expect("the completion settles the writer's wait-set");
     assert_eq!(
         alarm_of(&db, "AO_NOTIFY").await,
-        (alarm_status::NO_ALARM, AlarmSeverity::NoAlarm),
+        unprocessed,
         "a completion that succeeded raises nothing"
     );
 }
 
 /// Boundary twin — a completion flavour whose WIRE write fails does NOT alarm
-/// the source record; it settles the chain and goes to errlog.
+/// the source record; it settles the writer's wait-set and goes to errlog.
 ///
 /// C's `putComplete` reads `pca->putCallback` and calls it, discarding
 /// `arg.status` entirely (`dbCa.c:994-1012`) — the callback runs whether the
@@ -468,7 +439,7 @@ async fn async_put_completion_is_reported_through_the_notify_chain() {
 /// test would hang rather than fail — which is why `PutCompletion` resolves on
 /// `Drop` as well as on the success path.
 #[epics_macros_rs::epics_test]
-async fn async_put_wire_failure_settles_the_chain_without_alarming() {
+async fn async_put_wire_failure_settles_the_writer_without_alarming() {
     let writes = Arc::new(Mutex::new(Vec::new()));
     let db = PvDatabase::new();
     // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
@@ -484,8 +455,12 @@ async fn async_put_wire_failure_settles_the_chain_without_alarming() {
     .await;
     db.process_cp_links_on_connect().await;
 
-    let notify_rx = add_ao_notify(&db, "AO_NOTIFY_ERR", "ca://REMOTE:OUT", 4.0).await;
-    process(&db, "AO_NOTIFY_ERR").await;
+    add_ao(&db, "AO_NOTIFY_ERR", "REMOTE:OUT CA", 0.0).await;
+    let unprocessed = alarm_of(&db, "AO_NOTIFY_ERR").await;
+    let notify_rx = db
+        .put_link_notify("AO_NOTIFY_ERR", "OUT", EpicsValue::Double(4.0))
+        .await
+        .expect("AO_NOTIFY_ERR is loaded");
     db.sync_external_link_puts().await;
 
     assert_eq!(
@@ -494,12 +469,12 @@ async fn async_put_wire_failure_settles_the_chain_without_alarming() {
         "the write was attempted on the wire"
     );
     notify_rx.await.expect(
-        "a failed wire write still settles the chain — C putComplete \
+        "a failed wire write still settles the writer — C putComplete \
                  discards arg.status and calls the callback regardless",
     );
     assert_eq!(
         alarm_of(&db, "AO_NOTIFY_ERR").await,
-        (alarm_status::NO_ALARM, AlarmSeverity::NoAlarm),
+        unprocessed,
         "the record's alarm comes from the staging gate, not the wire status \
          (dbCa.c:529-532 / dbLink.c:432-446)"
     );
@@ -534,8 +509,8 @@ async fn a_blocked_link_does_not_stall_other_links() {
     .await;
     db.process_cp_links_on_connect().await;
 
-    add_ao(&db, "AO_SLOW", "ca://SLOW:OUT", 1.0, false).await;
-    add_ao(&db, "AO_FAST", "ca://FAST:OUT", 2.0, false).await;
+    add_ao(&db, "AO_SLOW", "SLOW:OUT CA", 1.0).await;
+    add_ao(&db, "AO_FAST", "FAST:OUT CA", 2.0).await;
 
     process(&db, "AO_SLOW").await;
     assert_eq!(entered_rx.recv().await, Some(1.0), "SLOW:OUT is blocked");
@@ -551,12 +526,12 @@ async fn a_blocked_link_does_not_stall_other_links() {
             settled.notified().await;
         }
     };
-    if epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(30), fast_done)
+    if epics_base_rs::runtime::task::timeout(fact_budget::FACT_BUDGET, fast_done)
         .await
         .is_err()
     {
         panic!(
-            "FAST:OUT not completed 30 s after it reached the lset; completed = {:?}",
+            "FAST:OUT not completed within the fact budget after it reached the lset; completed = {:?}",
             completed.lock().unwrap()
         );
     }

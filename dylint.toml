@@ -5,6 +5,5 @@ allow = [
     { path = "crates/epics-base-rs/src/server/database/filters/parser.rs", arg = "val", reason = "C's arm is %.*g at the option's size - 7 (chfPlugin.c:211-218), but no shipped String option converts (sync.c:60-66 pass Conv 0), so no filter reaches it" },
     { path = "tools/dbd-codegen/src/breaktable.rs", arg = "raw", reason = "emits Rust source: {:?} is the f64 literal that round-trips, which a C breakpoint table never prints" },
     { path = "tools/dbd-codegen/src/breaktable.rs", arg = "eng", reason = "emits Rust source: {:?} is the f64 literal that round-trips, which a C breakpoint table never prints" },
-    { path = "crates/epics-bridge-rs/src/pvalink/integration.rs", arg = "real", reason = "a scalar OUT put's transport text, parsed back into the channel's type; pvxs puts the value typed (pvalink_lset.cpp:608 pvaPutValueX), so the digits must round-trip, not print" },
     { path = "crates/epics-libcom-rs/src/cfmt.rs", arg = "a", reason = "CFloat's own digits: a finite non-negative magnitude, whose Rust digits are exact and to which cfmt adds C's sign, exponent and NaN/inf spelling" },
 ]

@@ -207,6 +207,15 @@ async fn a_constant_imp_seeds_mp_once() {
     assert_eq!(f(&db, "P.NP"), 7.0);
 }
 
+/// `scanparmRecord.c:122-124` seeds MP only for `imp.type == CONSTANT`, and a
+/// `{const:…}` IMP is a `JSON_LINK` (`dbStaticLib.c:2280-2287`).
+#[epics_base_rs::epics_test]
+async fn a_json_imp_does_not_seed_mp() {
+    sscan_rs::register_sscan_dbd();
+    let db = ioc(&format!("{TARGETS}{}", scanparm("{const:7}", "S:busy NPP"))).await;
+    assert_eq!(f(&db, "P.MP"), 0.0);
+}
+
 /// No IMP at all leaves MP 0, so every process pulls NP down to 2.
 #[epics_base_rs::epics_test]
 async fn no_imp_holds_np_at_two() {

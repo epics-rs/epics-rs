@@ -9,7 +9,7 @@
 //! a per-link vtable, so there is nothing for them to wrap. They stay absent.
 //!
 //! Every expectation below is a measurement of
-//! `/home/stevek/work/epics-base/bin/linux-x86_64/softIoc` (R7.0.10-146)
+//! `$EPICS_BASE/bin/linux-x86_64/softIoc` (R7.0.10-146)
 //! driving these exact records, not a reading of the C.
 //!
 //! The one case a test written against states it creates itself cannot see:

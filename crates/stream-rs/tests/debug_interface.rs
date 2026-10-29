@@ -248,19 +248,11 @@ fn masked(l: &str) -> String {
     out + rest
 }
 
-/// The C log, made comparable: the protocol path is the oracle directory.
+/// The C log, made comparable.
 fn expected(name: &str) -> Vec<String> {
     let log = std::fs::read_to_string(oracle_dir().join(format!("{name}.log"))).unwrap();
-    let dir = log
-        .lines()
-        .find_map(|l| l.strip_prefix("StreamProtocolParser::path = "))
-        .unwrap()
-        .to_string();
     log.split_inclusive('\n')
-        .map(|l| {
-            let l = l.strip_suffix('\n').unwrap_or(l).replace(&dir, "<dir>");
-            masked(&fixed_convert_text(&l))
-        })
+        .map(|l| masked(&fixed_convert_text(l.strip_suffix('\n').unwrap_or(l))))
         .collect()
 }
 

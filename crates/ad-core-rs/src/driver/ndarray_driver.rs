@@ -14,7 +14,7 @@ use crate::attributes::{
     NDAttributeFunctionRegistry, ParamAttributeSource, PvAttrDbrType,
 };
 use crate::color::NDColorMode;
-use crate::ndarray::NDArray;
+use crate::ndarray::{NDArray, NDArrayMut};
 use crate::ndarray_pool::{DriverArray, DriverPool, NDArrayPool, PersistentArray, PublishedArray};
 use crate::params::ndarray_driver::NDArrayDriverParams;
 use crate::plugin::channel::{NDArrayOutput, NDArraySender, QueuedArrayCounter};
@@ -334,7 +334,7 @@ pub(crate) fn write_array_params(
     port_base.set_int32_param(params.n_dimensions, 0, array.dims.len() as i32)?;
 
     // G7: data type and color mode.
-    port_base.set_int32_param(params.data_type, 0, array.data.data_type() as i32)?;
+    port_base.set_int32_param(params.data_type, 0, array.data().data_type() as i32)?;
     port_base.set_int32_param(params.color_mode, 0, info.color_mode as i32)?;
 
     // G5: Bayer pattern, derived from the `bayerPattern` array attribute.
@@ -720,13 +720,17 @@ impl DriverAttributes {
     }
 
     /// C++ `asynNDArrayDriver::getAttributes(pArray->pAttributeList)`:
-    /// re-evaluate every attribute and merge the values onto `array`. An empty
-    /// set leaves the array untouched, so a plain array is never deep-copied
-    /// through `Arc::make_mut`.
-    pub fn attach(&mut self, port_base: &PortDriverBase, array: &mut NDArray) {
+    /// re-evaluate every attribute and merge the values onto an array's
+    /// `attributes`. An empty set leaves them untouched, so a plain array is
+    /// never deep-copied through `Arc::make_mut`.
+    pub fn attach(
+        &mut self,
+        port_base: &PortDriverBase,
+        attributes: &mut crate::attributes::NDAttributeList,
+    ) {
         if !self.list.is_empty() {
-            let fresh = self.update(port_base);
-            array.attributes.copy_from(&fresh);
+            self.update_values(port_base, &[]);
+            attributes.copy_from(&self.list);
         }
     }
 
@@ -930,15 +934,13 @@ impl DriverAttributes {
     /// attributes read whatever value a CA-monitor task last fed into their
     /// cell. `CONST` / `DRIVER` attributes are static.
     pub fn update(&mut self, port_base: &PortDriverBase) -> crate::attributes::NDAttributeList {
-        let reads = self.param_reads(port_base, &[]);
-        self.update_with(&reads, &[])
+        self.update_values(port_base, &[]);
+        self.list.clone()
     }
 
-    /// The store half of [`Self::update`]: every `PARAM` attribute's read,
-    /// taken now. A read `pending` covers is not taken, since C would read
-    /// the value it has just set (see [`Self::update_with`]).
-    pub fn param_reads(&self, port_base: &PortDriverBase, pending: &[PendingParam]) -> ParamReads {
-        let mut reads = Vec::new();
+    /// [`Self::update`] in place, with `pending` read as
+    /// [`Self::update_with`] reads it.
+    pub fn update_values(&mut self, port_base: &PortDriverBase, pending: &[PendingParam]) {
         for attr in self.list.iter() {
             let Some(src) = attr.param_source() else {
                 continue;
@@ -951,33 +953,77 @@ impl DriverAttributes {
                 .get_value(index, src.addr)
                 .ok()
                 .map(std::mem::discriminant);
-            let read = ParamRead {
-                name: src.param_name.clone(),
-                addr: src.addr,
-                param_type: src.param_type,
-                index,
-                stored,
-                value: None,
+            let value = match latest_pending(pending, index, src.addr, stored) {
+                Some(value) => read_as(value, src.param_type),
+                None => Self::read_param_value(port_base, src),
             };
-            let value = match read.pending(pending) {
+            if let Some(value) = value {
+                src.cell().set(value);
+            }
+        }
+        self.list.update_values();
+    }
+
+    /// The store half of [`Self::update`]: every `PARAM` attribute's read,
+    /// taken now, into `reads`. A read `pending` covers is not taken, since
+    /// C would read the value it has just set (see [`Self::update_with`]).
+    pub fn param_reads(
+        &self,
+        port_base: &PortDriverBase,
+        pending: &[PendingParam],
+        reads: &mut ParamReads,
+    ) {
+        let mut taken = 0;
+        for attr in self.list.iter() {
+            let Some(src) = attr.param_source() else {
+                continue;
+            };
+            let Some(index) = port_base.params.find_param(&src.param_name) else {
+                continue;
+            };
+            let stored = port_base
+                .params
+                .get_value(index, src.addr)
+                .ok()
+                .map(std::mem::discriminant);
+            let value = match latest_pending(pending, index, src.addr, stored) {
                 Some(_) => None,
                 None => Self::read_param_value(port_base, src),
             };
-            reads.push(ParamRead { value, ..read });
+            match reads.0.get_mut(taken) {
+                Some(read) => {
+                    read.name.clone_from(&src.param_name);
+                    read.addr = src.addr;
+                    read.param_type = src.param_type;
+                    read.index = index;
+                    read.stored = stored;
+                    read.value = value;
+                }
+                None => reads.0.push(ParamRead {
+                    name: src.param_name.clone(),
+                    addr: src.addr,
+                    param_type: src.param_type,
+                    index,
+                    stored,
+                    value,
+                }),
+            }
+            taken += 1;
         }
-        ParamReads(reads)
+        reads.0.truncate(taken);
     }
 
     /// Re-evaluate the set from `reads`, with `pending` — values set ahead
     /// of the call and not yet flushed — read in place of the store, as C's
     /// `getXxxParam` reads its own earlier `setXxxParam`. A pending value of
     /// another type than the stored one is one C's set refused, so the store
-    /// is read. Nothing is written to the store.
+    /// is read. Nothing is written to the store. The set lands in `list`.
     pub fn update_with(
         &mut self,
         reads: &ParamReads,
         pending: &[PendingParam],
-    ) -> crate::attributes::NDAttributeList {
+        list: &mut crate::attributes::NDAttributeList,
+    ) {
         for attr in self.list.iter() {
             let Some(src) = attr.param_source() else {
                 continue;
@@ -996,7 +1042,7 @@ impl DriverAttributes {
             }
         }
         self.list.update_values();
-        self.list.clone()
+        list.clone_from(&self.list);
     }
 
     /// Read a `Param` attribute's current value from the asyn parameter
@@ -1059,15 +1105,25 @@ struct ParamRead {
 }
 
 impl ParamRead {
-    /// The latest pending set of this param that C's set would have stored.
     fn pending<'a>(&self, pending: &'a [PendingParam]) -> Option<&'a ParamValue> {
-        pending
-            .iter()
-            .rev()
-            .find(|(reason, addr, _)| *reason == self.index && *addr == self.addr)
-            .map(|(_, _, value)| value)
-            .filter(|value| Some(std::mem::discriminant(*value)) == self.stored)
+        latest_pending(pending, self.index, self.addr, self.stored)
     }
+}
+
+/// The latest pending set of a param that C's set would have stored: one of
+/// the `stored` value's type.
+fn latest_pending(
+    pending: &[PendingParam],
+    index: usize,
+    addr: i32,
+    stored: Option<std::mem::Discriminant<ParamValue>>,
+) -> Option<&ParamValue> {
+    pending
+        .iter()
+        .rev()
+        .find(|(reason, at, _)| *reason == index && *at == addr)
+        .map(|(_, _, value)| value)
+        .filter(|value| Some(std::mem::discriminant(*value)) == stored)
 }
 
 /// `value` through the getter `param_type` names; a type the getter cannot
@@ -1147,6 +1203,10 @@ pub const ASYN_ND_ARRAY_DRIVER: asyn_rs::port::OctetWriter = asyn_rs::port::Octe
 /// `NDAttributesFile` / `NDAttributesMacros` reload the attribute set, and
 /// `FilePath` runs `checkPath`, then `createFilePath` bounded by `CREATE_DIR`
 /// and `checkPath` again when the directory is missing.
+///
+/// A FilePath still missing fails the write: C overwrites checkPath's status
+/// with callParamCallbacks' (:540), so the write succeeds; not copied. C never
+/// takes the reload's status (:528).
 pub(crate) fn write_octet_rules(
     port_base: &mut PortDriverBase,
     params: &NDArrayDriverParams,
@@ -1157,17 +1217,25 @@ pub(crate) fn write_octet_rules(
     let attrs = Arc::clone(attributes);
     let reload = move |base: &mut PortDriverBase, _addr, _text: &[u8]| {
         let _ = attrs.lock().read_file(base, &p);
+        Ok(())
     };
     port_base.set_write_octet_rule(params.attributes_file, Arc::new(reload.clone()));
     port_base.set_write_octet_rule(params.attributes_macros, Arc::new(reload));
     port_base.set_write_octet_rule(
         params.file_path,
         Arc::new(move |base: &mut PortDriverBase, _addr, text: &[u8]| {
-            if let Ok(false) = check_path(base, &p) {
+            let missing = |base: &mut PortDriverBase| matches!(check_path(base, &p), Ok(false));
+            if missing(base) {
                 let depth = base.get_int32_param(p.create_dir, 0).unwrap_or(0);
                 let _ = NDArrayDriverBase::create_file_path(&octet_text(text), depth);
-                let _ = check_path(base, &p);
+                if missing(base) {
+                    return Err(asyn_rs::error::AsynError::Status {
+                        status: asyn_rs::error::AsynStatus::Error,
+                        message: format!("checkPath: {} does not exist", octet_text(text)),
+                    });
+                }
             }
+            Ok(())
         }),
     );
 }
@@ -1273,6 +1341,42 @@ pub struct ArrayOwner {
     port: std::sync::OnceLock<asyn_rs::port_handle::WeakPortHandle>,
     attributes: Arc<parking_lot::Mutex<DriverAttributes>>,
     arrays: parking_lot::Mutex<Vec<Option<Held>>>,
+}
+
+/// [`ArrayOwner::persistent`]'s array, refilled and published in place. Only
+/// [`ArrayOwner::replace_persistent`] replaces it, releasing the old buffer
+/// before the new one is allocated, as C does.
+///
+/// ```compile_fail,E0308
+/// # use ad_core_rs::ndarray::{NDDataType, NDDimension};
+/// # use ad_core_rs::ndarray_pool::{DriverPool, PersistentArray};
+/// # let pool = DriverPool::standalone(16);
+/// # let alloc = || pool.alloc(vec![NDDimension::new(2)], NDDataType::Int32).unwrap();
+/// # let owner = pool.owner().clone();
+/// owner.replace_persistent(0, || Some(alloc()));
+/// let next = PersistentArray::new(alloc());
+/// owner.persistent(0, |p| *p = next);
+/// ```
+pub struct PersistentArrayMut<'a>(&'a mut PersistentArray);
+
+impl PersistentArrayMut<'_> {
+    /// [`PersistentArray::refill`].
+    pub fn refill(&mut self) -> NDArrayMut<'_> {
+        self.0.refill()
+    }
+
+    /// [`PersistentArray::published`].
+    pub fn published(&mut self) -> PublishedArray {
+        self.0.published()
+    }
+}
+
+impl std::ops::Deref for PersistentArrayMut<'_> {
+    type Target = NDArray;
+
+    fn deref(&self) -> &NDArray {
+        self.0
+    }
 }
 
 /// What C's `pArrays[addr]` points at.
@@ -1394,10 +1498,10 @@ impl ArrayOwner {
     pub fn persistent<R>(
         &self,
         addr: usize,
-        f: impl FnOnce(&mut PersistentArray) -> R,
+        f: impl FnOnce(&mut PersistentArrayMut<'_>) -> R,
     ) -> Option<R> {
         match self.arrays.lock().get_mut(addr)? {
-            Some(Held::Persistent(array)) => Some(f(array)),
+            Some(Held::Persistent(array)) => Some(f(&mut PersistentArrayMut(array))),
             _ => None,
         }
     }
@@ -1411,7 +1515,7 @@ impl ArrayOwner {
         &self,
         addr: usize,
         array: PublishedArray,
-        change: impl FnOnce(&mut NDArray),
+        change: impl FnOnce(&mut NDArrayMut<'_>),
     ) -> crate::error::ADResult<PublishedArray> {
         let mut arrays = self.arrays.lock();
         let slot = Self::slot(&mut arrays, addr);
@@ -1427,7 +1531,7 @@ impl ArrayOwner {
                 }
             },
         };
-        change(&mut array);
+        change(&mut array.fill());
         let array = array.share();
         *slot = Some(Held::Shared(array.array().clone()));
         Ok(array)
@@ -1443,10 +1547,14 @@ impl ArrayOwner {
     /// C++ `getAttributes(pArray->pAttributeList)` from a driver's own task
     /// (simDetector.cpp:828), which holds the driver lock: the set is
     /// re-evaluated on the port's actor, where its `PARAM` values live, and
-    /// merged onto `array`. An empty set or a stopped port leaves it alone.
-    pub async fn get_attributes(&self, array: &mut NDArray) -> AsynResult<()> {
+    /// merged onto an array's `attributes`. An empty set or a stopped port
+    /// leaves them alone.
+    pub async fn get_attributes(
+        &self,
+        attributes: &mut crate::attributes::NDAttributeList,
+    ) -> AsynResult<()> {
         if let Some(fresh) = self.evaluate_attributes().await? {
-            array.attributes.copy_from(&fresh);
+            attributes.copy_from(&fresh);
         }
         Ok(())
     }
@@ -1478,55 +1586,45 @@ impl ArrayOwner {
     }
 
     /// C++ `getAttributes(pList)` from a plugin's `processCallbacks`, which
-    /// holds the port lock: the set re-evaluated on the port's actor, `None`
-    /// when it is empty or the port has stopped. `pending` are values the
-    /// plugin has set ahead of the call but not yet flushed; a `PARAM`
-    /// attribute reads them as C reads its own sets
-    /// ([`DriverAttributes::update_with`]). Blocks the caller, which must not
-    /// be the port's actor.
-    pub fn evaluate_attributes_blocking(
+    /// holds the port lock: the set re-evaluated under the port, here, and
+    /// merged onto `list`; whether it was, which an empty set or a stopped
+    /// port is not. `pending` are values the plugin has set ahead of the call
+    /// but not yet flushed; a `PARAM` attribute reads them as C reads its own
+    /// sets ([`DriverAttributes::update_with`]). Blocks the caller, which
+    /// must not be the port's actor.
+    pub fn get_attributes_blocking(
         &self,
-        pending: Vec<PendingParam>,
-    ) -> Option<crate::attributes::NDAttributeList> {
+        list: &mut crate::attributes::NDAttributeList,
+        pending: &[PendingParam],
+    ) -> bool {
         if self.attributes.lock().list.is_empty() {
-            return None;
+            return false;
         }
-        let port = self.port()?;
-        let attributes = self.attributes.clone();
-        let fresh = Arc::new(parking_lot::Mutex::new(None));
-        let slot = fresh.clone();
-        let call = asyn_rs::request::DriverCall::new(move |driver| {
-            let base = driver.base();
-            let mut attributes = attributes.lock();
-            let reads = attributes.param_reads(base, &pending);
-            *slot.lock() = Some(attributes.update_with(&reads, &pending));
-        });
-        let _ = port.submit_blocking(
-            asyn_rs::request::RequestOp::WithDriver(call),
-            asyn_rs::user::AsynUser::default(),
-        );
-        fresh.lock().take()
+        let Some(port) = self.port() else {
+            return false;
+        };
+        port.lent_driver_blocking(|driver| {
+            let mut attributes = self.attributes.lock();
+            attributes.update_values(driver.base(), pending);
+            list.copy_from(&attributes.list);
+        })
+        .is_ok()
     }
 
-    /// The store half of [`Self::evaluate_attributes_blocking`], for a
-    /// caller that evaluates later against what has been set by then. `None`
-    /// when the set is empty or the port has stopped.
-    pub fn param_reads_blocking(&self, pending: Vec<PendingParam>) -> Option<ParamReads> {
-        if self.attributes.lock().list.is_empty() {
-            return None;
-        }
-        let port = self.port()?;
-        let attributes = self.attributes.clone();
-        let taken = Arc::new(parking_lot::Mutex::new(None));
-        let slot = taken.clone();
-        let call = asyn_rs::request::DriverCall::new(move |driver| {
-            *slot.lock() = Some(attributes.lock().param_reads(driver.base(), &pending));
-        });
-        let _ = port.submit_blocking(
-            asyn_rs::request::RequestOp::WithDriver(call),
-            asyn_rs::user::AsynUser::default(),
-        );
-        taken.lock().take()
+    /// The store half of [`Self::get_attributes_blocking`] into `reads`, for
+    /// a caller that evaluates later against what has been set by then;
+    /// whether they were taken, which a stopped port does not. Blocks the
+    /// caller, which must not be the port's actor.
+    pub fn param_reads_blocking(&self, pending: &[PendingParam], reads: &mut ParamReads) -> bool {
+        let Some(port) = self.port() else {
+            return false;
+        };
+        port.lent_driver_blocking(|driver| {
+            self.attributes
+                .lock()
+                .param_reads(driver.base(), pending, reads);
+        })
+        .is_ok()
     }
 }
 
@@ -1640,7 +1738,7 @@ impl NDArrayDriverBase {
         self.owner
             .attributes
             .lock()
-            .attach(&self.port_base, &mut array);
+            .attach(&self.port_base, array.fill().attributes_mut());
 
         // G5/G6/G7: write all per-array parameters (size, dims, type, color,
         // Bayer, timestamps, codec).
@@ -1743,7 +1841,7 @@ impl NDArrayDriverBase {
     /// when there is one; `timeStamp` is always derived from `epicsTS` — the
     /// two cannot disagree. `NDArrayPool::alloc` sets neither; this is the
     /// only place that sets them for a newly produced frame.
-    pub fn update_time_stamps(&mut self, array: &mut NDArray) {
+    pub fn update_time_stamps(&mut self, array: &mut NDArrayMut<'_>) {
         array.update_time_stamps(self.port_base.update_time_stamp().into());
     }
 
@@ -2017,8 +2115,8 @@ pub(crate) mod tests {
             1,
             1_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         drv.port_base
@@ -2062,11 +2160,11 @@ pub(crate) mod tests {
     /// publish, read as its current publish, on its one pool charge.
     #[test]
     fn a_persistent_slot_is_written_in_place_and_read_as_its_publish() {
-        use crate::ndarray::{NDDataBuffer, NDDataType, NDDimension};
+        use crate::ndarray::{NDDataType, NDDataView, NDDimension};
         let pool = crate::ndarray_pool::DriverPool::standalone(1_000_000);
         let owner = pool.owner().clone();
-        let f64s = |a: &NDArray| match &a.data {
-            NDDataBuffer::F64(v) => v.clone(),
+        let f64s = |a: &NDArray| match a.data().view() {
+            NDDataView::F64(v) => v.to_vec(),
             other => panic!("{:?}", other.data_type()),
         };
         assert!(owner.replace_persistent(0, || {
@@ -2074,7 +2172,7 @@ pub(crate) mod tests {
                 .ok()
         }));
         let held = owner.persistent(0, |a| a.published()).unwrap();
-        owner.persistent(0, |a| a.refill().data = NDDataBuffer::F64(vec![1.0, 2.0]));
+        owner.persistent(0, |a| a.refill().data_mut().fill_from_f64(&[1.0, 2.0]));
         assert_eq!(f64s(&owner.array(0).unwrap()), [1.0, 2.0]);
         assert_eq!(f64s(held.array()), [0.0, 0.0]);
         assert_eq!(pool.num_alloc_buffers(), 1);
@@ -2084,6 +2182,23 @@ pub(crate) mod tests {
         assert!(owner.array(0).is_none());
         assert!(owner.persistent(0, |_| ()).is_none());
         assert_eq!(pool.num_free_buffers(), 1);
+    }
+
+    /// C releases the old array before allocating its replacement
+    /// (NDDriverStdArrays.cpp:153-158), so a pool with room for one buffer
+    /// still replaces it.
+    #[test]
+    fn a_persistent_replacement_releases_the_old_buffer_first() {
+        use crate::ndarray::{NDDataType, NDDimension};
+        let pool = crate::ndarray_pool::DriverPool::standalone(8);
+        let owner = pool.owner().clone();
+        let alloc = || {
+            pool.alloc(vec![NDDimension::new(2)], NDDataType::Int32)
+                .ok()
+        };
+        assert!(owner.replace_persistent(0, alloc));
+        assert!(owner.replace_persistent(0, alloc));
+        assert_eq!(pool.num_alloc_buffers(), 1);
     }
 
     /// C changes `pArrays[0]` under the driver lock (simDetector.cpp:824-828),
@@ -2103,7 +2218,7 @@ pub(crate) mod tests {
         let mut reader = None;
         let image = owner
             .refill(0, image, |array| {
-                array.unique_id = 7;
+                array.set_unique_id(7);
                 let owner = owner.clone();
                 reader = Some(std::thread::spawn(move || {
                     owner.array(0).map(|a| a.unique_id)
@@ -2127,8 +2242,8 @@ pub(crate) mod tests {
             1,
             3 * 64,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         let template = drv
@@ -2202,8 +2317,8 @@ pub(crate) mod tests {
             3,
             1_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         assert_eq!(drv.port_base.max_addr, 3);
@@ -2216,8 +2331,8 @@ pub(crate) mod tests {
             1,
             4_194_304,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         assert_c_read_only_block(&drv.port_base, &drv.params, "TEST");
@@ -2239,8 +2354,8 @@ pub(crate) mod tests {
             1,
             1_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         let (acquire, busy, wait, queued) = (
@@ -2290,8 +2405,8 @@ pub(crate) mod tests {
             1,
             1_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         drv.port_base.own_interrupts(InterruptGate::opened());
@@ -2348,8 +2463,8 @@ pub(crate) mod tests {
             1,
             1_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         let p = drv.params;
@@ -2415,8 +2530,8 @@ pub(crate) mod tests {
             1,
             64,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         let pool = drv.pool.clone();
@@ -2466,8 +2581,8 @@ pub(crate) mod tests {
             1,
             1_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         let counter = Arc::downgrade(drv.owner.queued());
@@ -2506,8 +2621,8 @@ pub(crate) mod tests {
             1,
             1_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         drv.read_nd_attributes_file().unwrap();
@@ -2529,8 +2644,8 @@ pub(crate) mod tests {
             1,
             1_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         assert!(
@@ -2547,8 +2662,8 @@ pub(crate) mod tests {
             1,
             1_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         let arr = drv
@@ -2577,8 +2692,8 @@ pub(crate) mod tests {
             1,
             1_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         let arr = drv
@@ -2615,8 +2730,8 @@ pub(crate) mod tests {
             1,
             1_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         drv.port_base
@@ -2643,8 +2758,8 @@ pub(crate) mod tests {
             1,
             1_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         drv.port_base
@@ -2681,8 +2796,8 @@ pub(crate) mod tests {
             1,
             1_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         let tmp = std::env::temp_dir();
@@ -2736,8 +2851,8 @@ pub(crate) mod tests {
             1,
             1_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         drv.port_base
@@ -2806,8 +2921,8 @@ pub(crate) mod tests {
             1,
             1_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         // The platform temp dir exists on every OS; a hard-coded `/tmp`
@@ -2828,8 +2943,8 @@ pub(crate) mod tests {
             1,
             1_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         drv.port_base
@@ -2847,8 +2962,8 @@ pub(crate) mod tests {
             1,
             1_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         let dims = drv.params.array_dimensions;
@@ -2875,8 +2990,8 @@ pub(crate) mod tests {
             1,
             1_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         let mut arr = drv
@@ -2889,11 +3004,11 @@ pub(crate) mod tests {
                 crate::ndarray::NDDataType::UInt16,
             )
             .unwrap();
-        arr.time_stamp = 100.5;
-        arr.timestamp = crate::timestamp::EpicsTimestamp {
+        arr.fill().set_time_stamp(100.5);
+        arr.fill().set_timestamp(crate::timestamp::EpicsTimestamp {
             sec: 1234,
             nsec: 5678,
-        };
+        });
         drv.prepare_array(arr).unwrap();
 
         assert_eq!(
@@ -2938,8 +3053,8 @@ pub(crate) mod tests {
             1,
             1_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         let mut arr = drv
@@ -2949,15 +3064,15 @@ pub(crate) mod tests {
                 crate::ndarray::NDDataType::UInt8,
             )
             .unwrap();
-        arr.codec = Some(crate::codec::Codec {
+        arr.fill().set_codec(Some(crate::codec::Codec {
             name: crate::codec::CodecName::BSLZ4,
             compressed_size: 9,
             level: 0,
             shuffle: 0,
             compressor: 0,
             original_data_type: crate::ndarray::NDDataType::UInt8,
-        });
-        arr.attributes.add(NDAttribute {
+        }));
+        arr.fill().attributes_mut().add(NDAttribute {
             name: "bayerPattern".into(),
             description: String::new(),
             source: NDAttrSource::Driver,
@@ -2991,8 +3106,8 @@ pub(crate) mod tests {
             1,
             1_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         drv.port_base
@@ -3016,7 +3131,7 @@ pub(crate) mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let _ = rt.block_on(drv.array_output.publish(to_publish));
+        rt.block_on(drv.array_output.publish(to_publish));
 
         let received = receiver.blocking_recv().unwrap();
         assert_eq!(received.unique_id, id);
@@ -3053,8 +3168,8 @@ pub(crate) mod tests {
             1,
             1_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         let xml = r#"<Attributes>
@@ -3095,8 +3210,8 @@ pub(crate) mod tests {
             1,
             1_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         drv.port_base
@@ -3192,8 +3307,8 @@ pub(crate) mod tests {
             1,
             1_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         drv.port_base
@@ -3246,8 +3361,8 @@ pub(crate) mod tests {
             1,
             1_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         drv.port_base
@@ -3315,8 +3430,8 @@ pub(crate) mod tests {
             1,
             1_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         let xml = r#"<Attributes>
@@ -3365,8 +3480,8 @@ pub(crate) mod tests {
             1,
             1_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         let xml = r#"<Attributes>
@@ -3400,8 +3515,8 @@ pub(crate) mod tests {
             1,
             1_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         let xml = r#"<Attributes>
@@ -3434,8 +3549,8 @@ pub(crate) mod tests {
             1,
             1_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         // Register a function whose return value changes on each call.
@@ -3485,8 +3600,8 @@ pub(crate) mod tests {
             1,
             1_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         let xml = r#"<Attributes>
@@ -3510,8 +3625,8 @@ pub(crate) mod tests {
             1,
             1_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         drv.owner
@@ -3536,8 +3651,8 @@ pub(crate) mod tests {
             1,
             1_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         drv.port_base
@@ -3564,8 +3679,8 @@ pub(crate) mod tests {
             1,
             1_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         let manager = PortServices::global().trace().clone();
@@ -3616,8 +3731,8 @@ pub(crate) mod tests {
             1,
             1_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         let file_name = drv.params.file_name;
@@ -3659,8 +3774,8 @@ pub(crate) mod tests {
             1,
             1_000_000,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         let base = std::env::temp_dir().join(format!(
@@ -3694,5 +3809,40 @@ pub(crate) mod tests {
             1
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_write_octet_file_path_left_missing_fails() {
+        let mut drv = NDArrayDriverBase::new(
+            "TEST",
+            1,
+            1_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
+        )
+        .unwrap();
+        let missing = std::env::temp_dir()
+            .join(format!("ad_core_rs_miss_{}", std::process::id()))
+            .join("sub");
+        let path = format!("{}/", missing.to_string_lossy());
+        let reason = drv.params.file_path;
+        let Err(asyn_rs::error::AsynError::Status { message, .. }) =
+            drv.write_octet(&AsynUser::new(reason), path.as_bytes())
+        else {
+            panic!("a missing FilePath must fail the write");
+        };
+        assert_eq!(
+            message,
+            format!(
+                "asynNDArrayDriver:writeOctet: status=3, function={reason}, paramName=FILE_PATH, value={path}"
+            )
+        );
+        assert_eq!(
+            drv.port_base
+                .get_int32_param(drv.params.file_path_exists, 0)
+                .unwrap(),
+            0
+        );
     }
 }

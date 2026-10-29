@@ -6,12 +6,16 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use asyn_rs::asyn_record::AsynRecord;
 use asyn_rs::error::{AsynError, AsynResult, AsynStatus};
 use asyn_rs::param::ParamType;
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::PortDriver;
 use asyn_rs::port::PortDriverBase;
 use asyn_rs::registry::open_owner;
 use asyn_rs::user::AsynUser;
+use epics_base_rs::server::ioc_builder::IocBuilder;
+use epics_base_rs::types::EpicsValue;
 use motor_rs::controller_port::{
     AxisUser, BASE_PARAMS, ControllerCtx, ControllerParams, ControllerPort, ControllerReport,
     FinishedWrite, PROFILE_EXECUTE_DONE, PROFILE_TIME_MODE_FIXED, ParamDelta, ParamWrite,
@@ -33,6 +37,9 @@ struct Pmacish {
 }
 
 impl ControllerParams for Pmacish {
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::NONE;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::NONE;
+
     fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
         self.feed_rate = base.create_param("FEEDRATE", ParamType::Int32)?;
         Ok(())
@@ -216,6 +223,14 @@ struct Sends {
 }
 
 impl ControllerParams for Sends {
+    // omsBaseController.cpp:51-52
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::INT32
+        .or(InterfaceMask::FLOAT64)
+        .or(InterfaceMask::OCTET);
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::INT32
+        .or(InterfaceMask::FLOAT64)
+        .or(InterfaceMask::OCTET);
+
     fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
         self.send = base.create_param("SEND", ParamType::Octet)?;
         Ok(())
@@ -240,7 +255,13 @@ fn a_driver_write_octet_override_runs_in_place_of_the_base() {
     let params = Sends::default();
     let sent = params.sent.clone();
     let port = register_controller_port(&open_owner(), "CPOCTET", 1, params).unwrap();
-    let io = asyn_rs::sync_io::SyncIOHandle::from_handle(port, 0, Duration::from_secs(1));
+    let io = asyn_rs::sync_io::SyncIOHandle::from_handle(
+        port,
+        0,
+        Duration::from_secs(1),
+        asyn_rs::interfaces::InterfaceType::Octet,
+    )
+    .unwrap();
     let send = BASE_PARAMS.len();
     assert_eq!(io.write_octet(send, b"AX RP").unwrap(), 5);
     assert_eq!(*sent.lock().unwrap(), [b"AX RP".to_vec()]);
@@ -262,6 +283,10 @@ struct Options {
 }
 
 impl ControllerParams for Options {
+    // phytronAxisMotor.cpp:106-107
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::OCTET.or(InterfaceMask::OPTION);
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::OCTET;
+
     fn read_option(
         &self,
         _: &PortDriverBase,
@@ -312,10 +337,34 @@ fn a_driver_option_override_runs_in_place_of_the_base() {
     assert!(port.get_option_blocking(user(1), "other").is_err());
 }
 
+/// C `getAxis` returns NULL with no errorMessage, and the base function
+/// returns a bare asynError (asynMotorController.cpp:199-200, :281-282,
+/// :443-444, :477-478, :532-556).
+fn assert_bare_error<T: std::fmt::Debug>(result: AsynResult<T>) {
+    match result {
+        Err(AsynError::Status {
+            status: AsynStatus::Error,
+            message,
+        }) => assert_eq!(message, ""),
+        other => panic!("{other:?}"),
+    }
+}
+
 #[test]
-fn a_write_where_the_controller_has_no_axis_fails() {
+fn a_request_where_the_controller_has_no_axis_fails_with_no_message() {
     let port = register_controller_port(&open_owner(), "CPNOAXIS", 2, ()).unwrap();
-    assert!(port.write_int32_blocking(index::STOP, 1, 1).is_err());
+    assert_bare_error(port.write_int32_blocking(index::STOP, 1, 1));
+    assert_bare_error(port.write_float64_blocking(index::ACCEL, 1, 1.0));
+    assert_bare_error(write_array(&port, index::PROFILE_TIME_ARRAY, 1, vec![1.0]));
+    assert_bare_error(read_array(&port, index::PROFILE_READBACKS, 1, 1));
+}
+
+/// A driver's own call on an axis the controller lacks, C's subclass
+/// `getAxis` returning NULL.
+#[test]
+fn a_driver_call_where_the_controller_has_no_axis_fails_with_no_message() {
+    let port = register_controller_port(&open_owner(), "CPNOAXISRUN", 1, Servo::default()).unwrap();
+    assert_bare_error(port.write_int32_blocking(BASE_PARAMS.len(), 0, 1));
 }
 
 #[test]
@@ -467,6 +516,9 @@ fn initialize_profile_sizes_every_axis_and_reaches_the_axis_drivers() {
 struct OwnInit(usize);
 
 impl ControllerParams for OwnInit {
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::NONE;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::NONE;
+
     fn initialize_profile(
         &mut self,
         ctx: &mut ControllerCtx<'_>,
@@ -805,6 +857,9 @@ fn an_array_write_to_another_parameter_fails() {
 struct Scaled;
 
 impl ControllerParams for Scaled {
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::NONE;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::NONE;
+
     fn define_profile(
         &mut self,
         ctx: &mut ControllerCtx<'_>,
@@ -949,6 +1004,10 @@ struct Registers {
 }
 
 impl ControllerParams for Registers {
+    // LC400MotorDriver.cpp:101-102
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::UINT32_DIGITAL;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UINT32_DIGITAL;
+
     fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
         self.servo = base.create_param("SERVO", ParamType::Int32)?;
         Ok(())
@@ -1057,6 +1116,9 @@ fn a_failed_profile_build_prints_cs_writeint32_error_line() {
 struct UndefinedBuild;
 
 impl ControllerParams for UndefinedBuild {
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::NONE;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::NONE;
+
     fn build_profile(
         &mut self,
         _: &mut motor_rs::controller_port::ControllerCtx<'_>,
@@ -1206,6 +1268,10 @@ impl Hooked {
 }
 
 impl ControllerParams for Hooked {
+    // LC400MotorDriver.cpp:101-102
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::UINT32_DIGITAL;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UINT32_DIGITAL;
+
     fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
         self.registers.create_params(base)
     }
@@ -1377,6 +1443,9 @@ fn the_hook_refuses_a_record_write_before_the_driver() {
 struct Reporting;
 
 impl ControllerParams for Reporting {
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::NONE;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::NONE;
+
     fn report(&self, ctx: &ControllerReport<'_>, out: &mut dyn std::fmt::Write, level: i32) {
         let _ = writeln!(out, "driver {} numAxes={}", ctx.port_name(), ctx.num_axes());
         ctx.report(out, level);
@@ -1439,6 +1508,10 @@ fn the_controller_report_runs_the_driver_then_each_axis_then_the_base() {
 struct SoftLimits;
 
 impl ControllerParams for SoftLimits {
+    // motorSimDriver.cpp:77-78
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::INT32.or(InterfaceMask::FLOAT64);
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::INT32.or(InterfaceMask::FLOAT64);
+
     fn report(&self, ctx: &ControllerReport<'_>, out: &mut dyn std::fmt::Write, _level: i32) {
         let high = ctx.float64_param(1, index::HIGH_LIMIT).unwrap();
         let low = ctx.float64_param(1, index::LOW_LIMIT).unwrap();
@@ -1469,6 +1542,10 @@ struct BinaryOut {
 }
 
 impl ControllerParams for BinaryOut {
+    // ACRMotorDriver.cpp:40-41
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::UINT32_DIGITAL;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UINT32_DIGITAL;
+
     fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
         self.out = base.create_param("BINARY_OUT", ParamType::UInt32Digital)?;
         base.create_param("BINARY_STORED", ParamType::UInt32Digital)?;
@@ -1497,7 +1574,13 @@ fn a_uint32_digital_write_reaches_the_driver_s_own_code() {
     let seen = regs.seen.clone();
     let port = register_controller_port(&open_owner(), "CPBINOUT", 1, regs).unwrap();
     let _ax = axis("CPBINOUT", 0);
-    let io = SyncIOHandle::from_handle(port.clone(), 0, Duration::from_secs(1));
+    let io = SyncIOHandle::from_handle(
+        port.clone(),
+        0,
+        Duration::from_secs(1),
+        asyn_rs::interfaces::InterfaceType::UInt32Digital,
+    )
+    .unwrap();
     let (out, stored) = (BASE_PARAMS.len(), BASE_PARAMS.len() + 1);
     io.write_uint32_digital(out, 1, 0x4).unwrap();
     assert_eq!(*seen.lock().unwrap(), [(1, 0x4)]);
@@ -1521,6 +1604,10 @@ struct Queried {
 }
 
 impl ControllerParams for Queried {
+    // phytronAxisMotor.cpp:106-107
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::OCTET.or(InterfaceMask::OPTION);
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::OCTET;
+
     fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
         self.current = base.create_param("CURRENT", ParamType::Int32)?;
         self.temp = base.create_param("TEMP", ParamType::Float64)?;
@@ -1581,6 +1668,9 @@ fn tag_address(space: asyn_rs::port::AddressSpace, addr: i32) -> Result<i32, i32
 }
 
 impl ControllerParams for Programs {
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::NONE;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::NONE;
+
     fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
         self.start = base.create_param("START_", ParamType::Int32)?;
         base.set_get_address(tag_address);
@@ -1658,6 +1748,10 @@ struct ControllerWrites {
 }
 
 impl ControllerParams for ControllerWrites {
+    // phytronAxisMotor.cpp:106-107
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::OCTET.or(InterfaceMask::OPTION);
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::OCTET;
+
     fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
         self.reset = base.create_param("RESET", ParamType::Int32)?;
         self.refused = base.create_param("REFUSED", ParamType::Int32)?;
@@ -1794,6 +1888,9 @@ impl Addrs {
 }
 
 impl ControllerParams for Addrs {
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::UINT32_DIGITAL.or(InterfaceMask::OPTION);
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::NONE;
+
     fn write_int32(&mut self, _: &mut PortDriverBase, user: AxisUser<'_>, _: i32) -> ParamWrite {
         self.saw(user.addr);
         ParamWrite::Handled(Ok(()))
@@ -1858,7 +1955,13 @@ fn every_subclass_entry_is_handed_getaddress_s_axis() {
         .unwrap();
     port.read_int32_blocking(index::STOP, -1).unwrap();
     port.read_float64_blocking(index::VELOCITY, -1).unwrap();
-    let io = asyn_rs::sync_io::SyncIOHandle::from_handle(port.clone(), -1, Duration::from_secs(1));
+    let io = asyn_rs::sync_io::SyncIOHandle::from_handle(
+        port.clone(),
+        -1,
+        Duration::from_secs(1),
+        asyn_rs::interfaces::InterfaceType::Common,
+    )
+    .unwrap();
     io.write_octet(index::PROFILE_BUILD_MESSAGE, b"x").unwrap();
     io.write_uint32_digital(index::STOP, 1, 1).unwrap();
     let user = || AsynUser::default().with_addr(-1);
@@ -1915,6 +2018,10 @@ struct Servo {
 }
 
 impl ControllerParams for Servo {
+    // PIasynController.cpp:56-57
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::INT32.or(InterfaceMask::FLOAT64);
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::INT32.or(InterfaceMask::FLOAT64);
+
     fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
         self.reason = base.create_param("SERVO", ParamType::Int32)?;
         Ok(())
@@ -2018,4 +2125,74 @@ fn a_driver_write_overlapping_a_record_move_does_not_deadlock() {
     write.join().unwrap().unwrap();
     poller.join().unwrap();
     assert_eq!(*seen.lock().unwrap(), ["servo true", "move 5"]);
+}
+
+/// A driver handing asynMotorController masks of its own: parker's
+/// asynUInt32DigitalMask and phytron's asynOptionMask.
+struct OwnMasks;
+
+impl ControllerParams for OwnMasks {
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::UINT32_DIGITAL.or(InterfaceMask::OPTION);
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UINT32_DIGITAL;
+}
+
+/// The port registers asynMotorController's interfaces ORed with the
+/// driver's (asynMotorController.cpp:48-49), plus asynCommon
+/// (asynPortDriver.cpp:4015).
+#[test]
+fn a_controller_port_registers_c_s_masks() {
+    let base = InterfaceMask::OCTET
+        .or(InterfaceMask::INT32)
+        .or(InterfaceMask::FLOAT64)
+        .or(InterfaceMask::FLOAT64_ARRAY)
+        .or(InterfaceMask::GENERIC_POINTER);
+    let masks = |b: &PortDriverBase| (b.interface_mask(), b.interrupt_mask());
+    let port = ControllerPort::new("CPMASKBASE", 1, ()).unwrap();
+    assert_eq!(
+        masks(port.base()),
+        (
+            base.or(InterfaceMask::DRV_USER).or(InterfaceMask::COMMON),
+            base
+        )
+    );
+    let port = ControllerPort::new("CPMASKOWN", 1, OwnMasks).unwrap();
+    assert_eq!(
+        masks(port.base()),
+        (
+            base.or(InterfaceMask::DRV_USER)
+                .or(InterfaceMask::COMMON)
+                .or(OwnMasks::INTERFACE_MASK),
+            base.or(OwnMasks::INTERRUPT_MASK)
+        )
+    );
+}
+
+/// An asyn record on a controller port reads OPTIONIV and UI32IV 0 unless
+/// the driver passes asynOptionMask or asynUInt32DigitalMask, as micos's
+/// SMChydra and SMCcorvus do not.
+#[epics_base_rs::epics_test]
+async fn an_asyn_record_on_a_controller_port_reads_its_interfaces() {
+    register_controller_port(&open_owner(), "CPIFBASE", 1, ()).unwrap();
+    register_controller_port(&open_owner(), "CPIFOWN", 1, OwnMasks).unwrap();
+    let (db, _) = IocBuilder::new()
+        .register_record_type("asyn", || Box::new(AsynRecord::default()))
+        .db_string(
+            "record(asyn, \"CPIF:base\") { field(PORT, \"CPIFBASE\") }\n\
+             record(asyn, \"CPIF:own\") { field(PORT, \"CPIFOWN\") }\n",
+            &HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let ivs = |rec: &str| {
+        ["OCTETIV", "I32IV", "UI32IV", "F64IV", "OPTIONIV", "GPIBIV"].map(|f| {
+            match db.get_pv(format!("{rec}.{f}")).unwrap() {
+                EpicsValue::Long(v) => v,
+                other => panic!("{rec}.{f}: {other:?}"),
+            }
+        })
+    };
+    assert_eq!(ivs("CPIF:base"), [1, 1, 0, 1, 0, 0]);
+    assert_eq!(ivs("CPIF:own"), [1, 1, 1, 1, 1, 0]);
 }

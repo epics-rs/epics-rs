@@ -67,9 +67,12 @@ async fn server_with_double_waveform(
     ch.wait_connected(fact_budget::FACT_BUDGET)
         .await
         .expect("connect");
-    ch.put(&EpicsValue::DoubleArray(seed.into()))
-        .await
-        .expect("seed waveform");
+    ch.put_with_timeout(
+        &EpicsValue::DoubleArray(seed.into()),
+        fact_budget::FACT_BUDGET,
+    )
+    .await
+    .expect("seed waveform");
     (client, ch)
 }
 
@@ -113,7 +116,7 @@ async fn enum_default_readback_is_state_label() {
 
     // What the default (no -d, no -n) caget path requests for an enum.
     let snap = ch
-        .get_with_dbr_type(DBR_STRING, 0)
+        .get_with_dbr_type(DBR_STRING, 0, fact_budget::FACT_BUDGET)
         .await
         .expect("DBR_STRING get on enum");
     assert_eq!(
@@ -160,7 +163,7 @@ async fn enum_numeric_readback_via_time_int() {
 
     // What the `-n` caget/camonitor path requests for an enum.
     let snap = ch
-        .get_with_dbr_type(DBR_TIME_INT, 0)
+        .get_with_dbr_type(DBR_TIME_INT, 0, fact_budget::FACT_BUDGET)
         .await
         .expect("DBR_TIME_INT get on enum");
     assert_eq!(
@@ -268,7 +271,7 @@ async fn caget_dbr_type_honors_exact_value_type() {
     let (_client, ch) = server_with_double_waveform("CAFR4:WF:FLT", vec![1.5, 2.5, 3.5]).await;
 
     let as_float = ch
-        .get_with_dbr_type(DBR_TIME_FLOAT, 0)
+        .get_with_dbr_type(DBR_TIME_FLOAT, 0, fact_budget::FACT_BUDGET)
         .await
         .expect("DBR_TIME_FLOAT get");
     match &as_float.value {
@@ -277,7 +280,7 @@ async fn caget_dbr_type_honors_exact_value_type() {
     }
 
     let as_double = ch
-        .get_with_dbr_type(DBR_TIME_DOUBLE, 0)
+        .get_with_dbr_type(DBR_TIME_DOUBLE, 0, fact_budget::FACT_BUDGET)
         .await
         .expect("DBR_TIME_DOUBLE get");
     match &as_double.value {
@@ -296,7 +299,7 @@ async fn caget_dbr_type_reaches_class_name() {
     let (_client, ch) = server_with_double_waveform("CAFR4:WF:CLS", vec![0.0, 0.0]).await;
 
     let snap = ch
-        .get_with_dbr_type(DBR_CLASS_NAME, 0)
+        .get_with_dbr_type(DBR_CLASS_NAME, 0, fact_budget::FACT_BUDGET)
         .await
         .expect("DBR_CLASS_NAME get");
     assert_eq!(
@@ -334,7 +337,7 @@ async fn long_string_autosize_returns_40_nul_padded() {
 
     // Autosize (count=0) must return exactly 40 elements (field_size).
     let snap = ch
-        .get_with_dbr_type(DBR_CHAR, 0)
+        .get_with_dbr_type(DBR_CHAR, 0, fact_budget::FACT_BUDGET)
         .await
         .expect("autosize DBR_CHAR get");
     // The wire carrier: a `$` channel ships DBR_CHAR, and `dbr_char_t` is
@@ -387,7 +390,7 @@ async fn long_string_count_clamp_trims_char_array() {
     // `nRequest - 1` for a DBF_STRING field (`dbAccess.c:1040-1044`);
     // softIoc R7.0.10 answers `caget -d DBR_CHAR -# 3 SI.VAL$` with 104 101 0.
     let snap = ch
-        .get_with_dbr_type(DBR_CHAR, 3)
+        .get_with_dbr_type(DBR_CHAR, 3, fact_budget::FACT_BUDGET)
         .await
         .expect("count-3 DBR_CHAR get");
     // The wire carrier: a `$` channel ships DBR_CHAR, and `dbr_char_t` is
@@ -450,7 +453,7 @@ async fn printf_val_native_type_is_scalar_dbr_string() {
 
     // Plain access delivers the value as a scalar string, not a byte array.
     let snap = ch
-        .get_with_dbr_type(DBR_STRING, 0)
+        .get_with_dbr_type(DBR_STRING, 0, fact_budget::FACT_BUDGET)
         .await
         .expect("DBR_STRING get on printf VAL");
     assert_eq!(
@@ -508,7 +511,7 @@ async fn lsi_val_native_type_is_scalar_dbr_string_and_clips() {
     );
 
     let snap = ch
-        .get_with_dbr_type(DBR_STRING, 0)
+        .get_with_dbr_type(DBR_STRING, 0, fact_budget::FACT_BUDGET)
         .await
         .expect("DBR_STRING get on lsi VAL");
     let s = match snap.value {
@@ -545,7 +548,7 @@ async fn a_dbr_type_past_the_protocol_bound_never_leaves_the_client() {
     let over = LAST_BUFFER_TYPE + 1;
 
     assert!(
-        matches!(ch.get_with_dbr_type(over, 0).await, Err(CaError::UnsupportedType(t)) if t == over),
+        matches!(ch.get_with_dbr_type(over, 0, fact_budget::FACT_BUDGET).await, Err(CaError::UnsupportedType(t)) if t == over),
         "a read past the protocol bound is refused locally"
     );
     assert!(
@@ -566,7 +569,7 @@ async fn a_dbr_type_past_the_protocol_bound_never_leaves_the_client() {
     // The circuit is untouched: had any of the three reached the server, it
     // would have answered ECA_BADTYPE and dropped, and this read would fail.
     let snap = ch
-        .get_with_dbr_type(DBR_STRING, 0)
+        .get_with_dbr_type(DBR_STRING, 0, fact_budget::FACT_BUDGET)
         .await
         .expect("the circuit survives a refused request");
     assert_eq!(snap.value, EpicsValue::String("On".into()));

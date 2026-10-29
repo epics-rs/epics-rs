@@ -25,7 +25,7 @@ use std::io::Read;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 
-use epics_base_rs::server::ioc_app::IocApplication;
+use epics_base_rs::server::ioc_app::{IocApplication, RunOutcome};
 use epics_base_rs::server::iocsh::registry::{ArgValue, CommandDef, CommandOutcome};
 
 /// The address the test's protocol runner is listening on, published the
@@ -154,17 +154,18 @@ async fn a_script_line_after_ioc_init_reaches_the_running_server() {
 /// through the runner arm onto the signal arms.
 #[epics_macros_rs::epics_test]
 async fn the_signal_arms_are_not_polled_without_a_reactor() {
-    IocApplication::new()
+    let outcome = IocApplication::new()
         .port(0)
         .startup_script(&st_cmd(
             "ioc_init_signal_arms.cmd",
             &["on error break", "iocInit"],
         ))
-        .run(move |_config| async move {
+        .run_outcome(move |_config| async move {
             epics_base_rs::server::db_server::announce_serving("probe");
             epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(300)).await;
             Ok(())
         })
         .await
         .expect("the runner finishes without the signal arms panicking");
+    assert_eq!(outcome, RunOutcome::Served);
 }

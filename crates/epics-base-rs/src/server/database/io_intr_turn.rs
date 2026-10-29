@@ -42,18 +42,16 @@ impl IoIntrTurns {
         rx
     }
 
-    /// Return once `record`'s pump has processed every interrupt queued to
-    /// it now; at once for a record with no running pump.
-    pub(crate) async fn turn(&self, record: &Arc<RecordCell>) {
+    /// A turn on `record`'s pump, answered once the pump has processed
+    /// every interrupt queued to it now. `None` for a record with no
+    /// running pump.
+    pub(crate) fn ask(&self, record: &Arc<RecordCell>) -> Option<oneshot::Receiver<()>> {
         let (turn, done) = oneshot::channel();
-        let sent = self
-            .pumps
+        self.pumps
             .lock()
             .get(&(Arc::as_ptr(record) as usize))
-            .is_some_and(|pump| pump.send(turn).is_ok());
-        if sent {
-            let _ = done.await;
-        }
+            .is_some_and(|pump| pump.send(turn).is_ok())
+            .then_some(done)
     }
 }
 
@@ -134,7 +132,7 @@ mod tests {
         db.scan_control().run();
         let started = || {
             started
-                .recv_timeout(Duration::from_secs(10))
+                .recv_timeout(fact_budget::FACT_BUDGET)
                 .expect("a read starts")
         };
 
@@ -142,7 +140,7 @@ mod tests {
         started();
         // Queued behind the read in flight, before the turn is asked.
         pulse.try_send(()).unwrap();
-        let mut turn = std::pin::pin!(db.io_intr_turn(&src));
+        let mut turn = std::pin::pin!(db.ask_io_intr_turn(&src).expect("SRC has a pump"));
         let mut poll =
             async || std::future::poll_fn(|cx| Poll::Ready(turn.as_mut().poll(cx))).await;
         assert!(poll().await.is_pending(), "the turn is asked");
@@ -155,8 +153,9 @@ mod tests {
         );
 
         release.send(()).unwrap();
-        crate::runtime::task::timeout(Duration::from_secs(10), turn)
+        crate::runtime::task::timeout(fact_budget::FACT_BUDGET, turn)
             .await
-            .expect("the turn is answered once the queued interrupt is processed");
+            .expect("the turn is answered once the queued interrupt is processed")
+            .expect("the pump answers the turn");
     }
 }

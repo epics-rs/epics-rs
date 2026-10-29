@@ -38,10 +38,9 @@ async fn a_calc_put_posts_the_clcv_monitor() {
         .await
         .unwrap();
 
-    let posted =
-        epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(1), sub.recv())
-            .await
-            .expect("special() must post CLCV");
+    let posted = epics_base_rs::runtime::task::timeout(fact_budget::FACT_BUDGET, sub.recv())
+        .await
+        .expect("special() must post CLCV");
     assert_eq!(posted, Some(EpicsValue::Long(POSTFIX_ERR)));
 }
 

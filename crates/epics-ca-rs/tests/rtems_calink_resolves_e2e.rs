@@ -1,10 +1,10 @@
-//! A `ca://` record link RESOLVES end to end on the exec backend — value
+//! A CA record link RESOLVES end to end on the exec backend — value
 //! included.
 //!
 //! `realtime_ca_ioc_boots.rs` proves the whole init path runs and the
 //! name-server dial is *attempted* (it points the client at a closed port
 //! and waits for the refusal). Nothing proved the other half: that under
-//! `EPICS_RS_BUILD_EXEC_BACKEND=thread` a `ca://UPSTREAM CP` input link
+//! `EPICS_RS_BUILD_EXEC_BACKEND=thread` an `UPSTREAM CP` input link
 //! actually reaches a live upstream, resolves through
 //! `EPICS_CA_NAME_SERVERS`, opens a monitor, and lands the upstream value
 //! in the downstream record. That is the difference between "the seam does
@@ -18,7 +18,7 @@
 //!   uses — on an OS-assigned loopback port. Never 5064: `bind() ⟹
 //!   listening`, and an ephemeral port cannot collide with anything.
 //! * **Downstream**: a second database whose one record carries
-//!   `INP = ca://UPSTREAM:VAL CP`, with the calink resolver installed and
+//!   `INP = UPSTREAM:VAL CP`, with the calink resolver installed and
 //!   iocInit's three link phases run in `realtime-ca-ioc`'s exact order.
 //!
 //! `EPICS_CA_NAME_SERVERS` names the upstream server's TCP port and the UDP
@@ -76,11 +76,11 @@ const UPSTREAM_DB: &str =
     "record(ao, \"UPSTREAM:VAL\") { field(VAL, \"42.5\") field(PREC, \"3\") }\n";
 
 /// The downstream IOC: one Passive `ai` that can only get a value through
-/// the `ca://` CP link — Passive, so nothing scans it; the CP monitor is the
+/// the CA CP link — Passive, so nothing scans it; the CP monitor is the
 /// only way it ever processes.
 const DOWNSTREAM_DB: &str = concat!(
     "record(ai, \"DOWN:AI\") {\n",
-    "  field(INP, \"ca://UPSTREAM:VAL CP\")\n",
+    "  field(INP, \"UPSTREAM:VAL CP\")\n",
     "  field(PREC, \"3\") field(SCAN, \"Passive\")\n",
     "}\n",
 );
@@ -143,7 +143,7 @@ fn a_ca_link_resolves_end_to_end_on_the_exec_backend() {
     }
 
     // Downstream: mount the resolver, then iocInit's link phases in
-    // `realtime-ca-ioc`'s order — locality first (a no-op for the `ca://`
+    // `realtime-ca-ioc`'s order — locality first (a no-op for the CA
     // spelling, kept for order fidelity), then the CP warm-up that stages
     // this link's open, then the stage for everything else.
     let downstream = build_db(DOWNSTREAM_DB);
@@ -170,7 +170,7 @@ fn a_ca_link_resolves_end_to_end_on_the_exec_backend() {
     while resolver.link_count() < 1 {
         assert!(
             Instant::now() < deadline,
-            "the ca:// link never registered within {RESOLVE_BUDGET:?} — \
+            "the CA link never registered within {RESOLVE_BUDGET:?} — \
              resolution through EPICS_CA_NAME_SERVERS={addr} did not complete \
              (report: {:?})",
             resolver.link_report(),

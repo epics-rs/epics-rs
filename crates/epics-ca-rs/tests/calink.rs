@@ -244,43 +244,6 @@ async fn ca_link_init_ready_flips_after_metadata_fetch() {
 }
 
 #[cfg(tokio_backend)]
-/// Gap 2 — the `ca://` scheme prefix is accepted: `epics-base-rs`
-/// stores a `ca://X` link verbatim in `ParsedLink::Ca`, so the
-/// resolver must strip it.
-#[tokio::test(flavor = "multi_thread")]
-#[serial(epics_env)]
-async fn ca_link_resolves_with_scheme_prefix() {
-    let server = CaServer::builder()
-        .port(0)
-        .pv("CALINK:SCHEME", EpicsValue::Long(404))
-        .build()
-        .await
-        .expect("CA server");
-    let port = server.udp_port();
-    let _server = tokio::spawn(async move { server.run().await });
-
-    let client = Arc::new(pinned_client(port).await);
-    let resolver = CaLinkResolver::with_client(client);
-
-    use epics_base_rs::server::database::LinkSet;
-    let open = OpenLatch::ca(LinkProcessPolicy::NoProcess, LinkFieldType::In);
-    let link = LinkRef::new(b"ca://CALINK:SCHEME", &open);
-    LinkSet::connect_link(&resolver, link, None).await;
-    let connected = resolver
-        .wait_for_link_connected("ca://CALINK:SCHEME", fact_budget::FACT_BUDGET)
-        .await;
-    assert!(connected, "scheme-prefixed CA link must connect");
-
-    assert_eq!(
-        LinkSet::get_value(&resolver, link)
-            .await
-            .and_then(|v| v.to_f64()),
-        Some(404.0),
-        "scheme-prefixed CA link must resolve to the upstream value"
-    );
-}
-
-#[cfg(tokio_backend)]
 /// Gap 2 end-to-end — a soft-channel `ai` record whose INP is a CA
 /// link, processed through `process_record_with_links`, fetches the
 /// remote PV value into its own VAL. This is the exact C path:
@@ -450,7 +413,7 @@ async fn ca_cp_holder_processes_on_remote_change() {
     wch.wait_connected(fact_budget::FACT_BUDGET)
         .await
         .expect("writer channel connects");
-    wch.put(&EpicsValue::Double(42.0))
+    wch.put_with_timeout(&EpicsValue::Double(42.0), fact_budget::FACT_BUDGET)
         .await
         .expect("remote write to source");
 
@@ -540,7 +503,10 @@ async fn ca_link_out_write_updates_remote_pv() {
     ch.wait_connected(fact_budget::FACT_BUDGET)
         .await
         .expect("verify channel connects");
-    let (_dbf, read_back) = ch.get().await.expect("verify GET");
+    let (_dbf, read_back) = ch
+        .get_with_timeout(fact_budget::FACT_BUDGET)
+        .await
+        .expect("verify GET");
     assert_eq!(
         read_back.to_f64(),
         Some(88.0),
@@ -550,7 +516,7 @@ async fn ca_link_out_write_updates_remote_pv() {
 
 #[cfg(tokio_backend)]
 /// Gap 2 OUT write, completion-aware arm — a `LinkPutOp::Async` put
-/// (the put-notify / blocking-put chain case, C `dbCaPutLinkCallback`
+/// (the `Async Soft Channel` / sseq WAITn case, C `dbCaPutLinkCallback`
 /// → `ca_array_put_callback`) issues a CA WRITE_NOTIFY and waits for
 /// the server's put-completion reply, then the value lands on the
 /// upstream PV. Contrast with `ca_link_out_write_updates_remote_pv`,
@@ -595,61 +561,15 @@ async fn ca_link_out_write_async_waits_for_completion() {
     ch.wait_connected(fact_budget::FACT_BUDGET)
         .await
         .expect("verify channel connects");
-    let (_dbf, read_back) = ch.get().await.expect("verify GET");
+    let (_dbf, read_back) = ch
+        .get_with_timeout(fact_budget::FACT_BUDGET)
+        .await
+        .expect("verify GET");
     assert_eq!(
         read_back.to_f64(),
         Some(42.0),
         "upstream CA server PV must reflect the completion-aware OUT write"
     );
-}
-
-#[cfg(tokio_backend)]
-/// Gap 2 OUT write — the `ca://` scheme-prefixed form of an OUT link
-/// is accepted by `put_value` (the resolver strips the prefix), same
-/// as the INP-side `ca_link_resolves_with_scheme_prefix` test.
-#[tokio::test(flavor = "multi_thread")]
-#[serial(epics_env)]
-async fn ca_link_out_write_accepts_scheme_prefix() {
-    let server = CaServer::builder()
-        .port(0)
-        .pv("CALINK:OUT:SCHEME", EpicsValue::Long(7))
-        .build()
-        .await
-        .expect("CA server");
-    let port = server.udp_port();
-    let _server = tokio::spawn(async move { server.run().await });
-
-    let client = Arc::new(pinned_client(port).await);
-    let resolver = CaLinkResolver::with_client(client);
-
-    use epics_base_rs::server::database::{LinkPutOp, LinkSet};
-    let open = OpenLatch::default();
-    let link = LinkRef::new(b"ca://CALINK:OUT:SCHEME", &open);
-    LinkSet::connect_link(&resolver, link, None).await;
-    let connected = resolver
-        .wait_for_link_connected("ca://CALINK:OUT:SCHEME", fact_budget::FACT_BUDGET)
-        .await;
-    assert!(connected, "scheme-prefixed CA OUT link must connect");
-
-    LinkSet::put_value(&resolver, link, EpicsValue::Long(123), LinkPutOp::Plain)
-        .await
-        .expect("scheme-prefixed CA-link OUT write must succeed");
-
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
-    loop {
-        if LinkSet::get_value(&resolver, link)
-            .await
-            .and_then(|v| v.to_f64())
-            == Some(123.0)
-        {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "scheme-prefixed CA OUT write did not propagate"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
 }
 
 #[cfg(tokio_backend)]
@@ -760,7 +680,7 @@ async fn install_registers_ca_scheme() {
 #[test]
 fn ca_modifier_link_classifies_as_ca() {
     assert_eq!(
-        epics_base_rs::server::record::link_field_type("REMOTE:PV.VAL CA"),
+        epics_base_rs::server::record::parse_link_v2("REMOTE:PV.VAL CA").link_type(),
         LinkType::Ca,
     );
 }
@@ -782,13 +702,15 @@ fn ca_modifier_link_classifies_as_ca() {
 ///
 /// The holder record and its bare ` CP` INP link are loaded via
 /// `dbLoadRecords` from an st.cmd — the real iocInit path, where INP is set
-/// before `setup_cp_links` runs. A custom protocol runner (in place of
-/// `run_ca_ioc`) observes the warmed VAL and returns `Ok(())`, so `run`
-/// completes instead of serving forever.
+/// before `setup_cp_links` runs. The script ends in `iocInit`: without it,
+/// and with no `before_ioc_init` gate, `run` builds nothing and never calls
+/// the runner. A custom protocol runner (in place of `run_ca_ioc`) hands
+/// back the VAL it saw and returns `Ok(())`, so `run` completes instead of
+/// serving forever, and the test asserts on what it handed back.
 #[tokio::test(flavor = "multi_thread")]
 #[serial(epics_env)]
 async fn calink_warms_cp_holder_via_iocapplication_run_seam() {
-    use epics_base_rs::server::ioc_app::IocApplication;
+    use epics_base_rs::server::ioc_app::{IocApplication, RunOutcome};
 
     let server = CaServer::builder()
         .port(0)
@@ -822,9 +744,10 @@ async fn calink_warms_cp_holder_via_iocapplication_run_seam() {
     let stcmd_path = dir.path().join("st.cmd");
     std::fs::write(
         &stcmd_path,
-        format!("dbLoadRecords(\"{}\")\n", db_path.display()),
+        format!("dbLoadRecords(\"{}\")\niocInit\n", db_path.display()),
     )
     .expect("write st.cmd");
+    let (seen_tx, seen_rx) = std::sync::mpsc::channel();
 
     // The seam under test: register the calink installer at construction.
     // It fires at `AfterCaLinkInit`, before `setup_cp_links` — zero further
@@ -836,7 +759,7 @@ async fn calink_warms_cp_holder_via_iocapplication_run_seam() {
                 .expect("the test is awaited on the IOC's reactor");
             move |db| epics_ca_rs::calink::calink_link_set_install(db, reactor)
         })
-        .run(|config| async move {
+        .run_outcome(|config| async move {
             // By here iocInit has already run `setup_cp_links` and the
             // external-link wait. Poll the holder until the warm's monitor
             // event drives VAL to the source's 5.0 — with NO explicit
@@ -851,18 +774,22 @@ async fn calink_warms_cp_holder_via_iocapplication_run_seam() {
                     let inst = rec.read();
                     inst.record.val().and_then(|v| v.to_f64())
                 };
-                if v == Some(5.0) {
+                if v == Some(5.0) || std::time::Instant::now() >= deadline {
+                    seen_tx.send(v).unwrap();
                     return Ok(());
                 }
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "CP holder VAL must reach the warmed source value 5.0 via \
-                     the IocApplication::run seam (got {v:?}) — the installer \
-                     fired after setup_cp_links, or not at all"
-                );
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
         })
         .await;
-    result.expect("IOC run returns Ok once the CP holder warmed");
+    let outcome = result.expect("IOC run returns Ok once the runner is done");
+    assert_eq!(outcome, RunOutcome::Served);
+    let seen = seen_rx.try_recv().expect("the IOC ran the protocol runner");
+    assert_eq!(
+        seen,
+        Some(5.0),
+        "CP holder VAL must reach the warmed source value 5.0 via the \
+         IocApplication::run seam — the installer fired after setup_cp_links, \
+         or not at all"
+    );
 }

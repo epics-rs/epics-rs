@@ -1,8 +1,8 @@
 //! `calink` — Channel Access links for EPICS record INP/OUT fields.
 //!
-//! When a record's INP / OUT / DOL / STPL link field carries a
-//! `ca://<pv>` string, or a legacy `<rec.field> CA` string (the bare
-//! ` CA` modifier — C `dbStaticLib.c:2372` `pvlOptCA`), this module
+//! When a record's INP / OUT / DOL / STPL link field names a PV this IOC
+//! does not have, or carries the ` CA` modifier (C `dbStaticLib.c:2372`
+//! `pvlOptCA`), this module
 //! resolves that link to a live CA client whose monitor keeps a cached
 //! snapshot of the remote PV.
 //!

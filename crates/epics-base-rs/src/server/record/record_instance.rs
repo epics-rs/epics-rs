@@ -11,7 +11,7 @@ use crate::server::pv::{SubscribeRefused, Subscriber};
 use crate::server::recgbl::EventMask;
 use crate::server::snapshot::{EnumStringForm, PropertySupport};
 use crate::types::c_parse::Converted;
-use crate::types::{DbFieldType, EpicsValue, PvString, c_parse};
+use crate::types::{DbFieldType, DbfCode, EpicsValue, PvString, c_parse};
 
 use super::alarm::{AlarmLimit, AlarmLimitField, AlarmSeverity, AnalogAlarmConfig};
 use super::common_fields::{BkptFlag, CommonFields};
@@ -98,7 +98,7 @@ pub(crate) fn render_link_field(class: crate::types::DbfLinkClass, raw: &[u8]) -
         };
     }
 
-    // C's `ppind` chain (`:1938-1943`) tests `PP` before `CA`, so a `ca://`
+    // C's `ppind` chain (`:1938-1943`) tests `PP` before `CA`, so a CA
     // link that also asked for `PP` renders ` PP`; and a `CP`/`CPP` link that
     // resolved to a CA channel still renders its own class, because C reads
     // `pvlMask` and not the type the link ended up with.
@@ -931,7 +931,7 @@ pub(crate) enum ForwardTarget {
         putf: bool,
         notify: bool,
     },
-    /// An external `pva://` / `ca://` PV, C `dbScanFwdLink` → the link set's
+    /// An external PV, C `dbScanFwdLink` → the link set's
     /// `scanForward` (pvxs `pvaScanForward`) — a process-only trigger. The
     /// dispatch reads FLNK again, as C reads `plink` there.
     External,
@@ -1224,7 +1224,6 @@ impl ProcessPlan {
             multi_inputs_read_native: record.input_link_answers_fixed_at_type()
                 && record.multi_input_links().iter().all(|(lf, _)| {
                     record.input_link_request(lf) == InputLinkRequest::As(LinkReadAs::Native)
-                        && !record.input_link_failure_is_inert(lf)
                 }),
             dispatches_generic_multi_output: !crate::server::database::multi_output_dispatch_owned(
                 rtype,
@@ -1710,6 +1709,17 @@ mod link_cache {
         }
     }
 
+    /// A slot write the instance has yet to finish: what the slot's new parse
+    /// changes outside it, which `RecordInstance::slot_written` alone applies.
+    #[must_use]
+    pub(crate) struct SlotWrite(usize);
+
+    impl SlotWrite {
+        pub(super) fn slot(&self) -> usize {
+            self.0
+        }
+    }
+
     /// Sixteen slotted links by slot index. The slots are in the type's
     /// declaration order, so a row is settled once, when the instance is built.
     #[derive(Debug, Clone, Copy)]
@@ -1915,18 +1925,19 @@ mod link_cache {
         }
 
         /// Slot `i` takes `parsed`: every write after the build comes here.
-        fn set(&mut self, i: usize, parsed: Arc<ParsedLink>) {
+        fn set(&mut self, i: usize, parsed: Arc<ParsedLink>) -> SlotWrite {
             let mut parsed = parsed;
-            self.swap(i, &mut parsed);
+            self.swap(i, &mut parsed)
         }
 
         /// [`Self::set`] handing the old parse back in `parsed`, for a caller
         /// that drops it after the hold.
-        pub(super) fn swap(&mut self, i: usize, parsed: &mut Arc<ParsedLink>) {
+        pub(super) fn swap(&mut self, i: usize, parsed: &mut Arc<ParsedLink>) -> SlotWrite {
             if usize::from(self.1.slot) == i {
                 self.1.const_lset = has_const_lset(parsed);
             }
             std::mem::swap(&mut self.0[i].parsed, parsed);
+            SlotWrite(i)
         }
 
         #[inline(always)]
@@ -1942,28 +1953,30 @@ mod link_cache {
             i: usize,
             desc: &crate::server::record::FieldDesc,
             text: &[u8],
-        ) {
+        ) -> SlotWrite {
             let Some(ftype) = slot_type(desc) else {
-                return;
+                return SlotWrite(i);
             };
-            self.set(i, parse(text, ftype));
+            let write = self.set(i, parse(text, ftype));
             #[cfg(debug_assertions)]
             {
                 self.0[i].text = text.into();
             }
+            write
         }
 
         /// Move `link` into its slot; the parse was made outside the hold.
-        pub(super) fn install(&mut self, link: PreparedLink) {
+        pub(super) fn install(&mut self, link: PreparedLink) -> Option<SlotWrite> {
             let Some(i) = self.position(link.field) else {
                 debug_assert!(false, "{}: PreparedLink without a slot", link.field);
-                return;
+                return None;
             };
-            self.set(i, link.parsed);
+            let write = self.set(i, link.parsed);
             #[cfg(debug_assertions)]
             {
                 self.0[i].text = link.text;
             }
+            Some(write)
         }
 
         #[inline(always)]
@@ -1989,10 +2002,18 @@ mod link_cache {
             self.0.iter().map(|slot| &slot.parsed)
         }
 
+        /// Each slot's field and parse, in slot order.
+        pub(super) fn fields_and_links(
+            &self,
+        ) -> impl Iterator<Item = (&'static str, &Arc<ParsedLink>)> {
+            self.0.iter().map(|slot| (slot.field, &slot.parsed))
+        }
+
         /// C `dbRemoveLink` on slot `i`.
-        pub(super) fn remove(&mut self, i: usize) {
-            if let Some(removed) = removed(&self.0[i].parsed) {
-                self.set(i, removed);
+        pub(super) fn remove(&mut self, i: usize) -> SlotWrite {
+            match removed(&self.0[i].parsed) {
+                Some(removed) => self.set(i, removed),
+                None => SlotWrite(i),
             }
         }
 
@@ -2102,10 +2123,10 @@ mod link_cache {
             let mut slots = LinkSlots::of(&ai);
             assert!(!slots.siml_has_const_lset());
             let i = slots.position("SIML").unwrap();
-            slots.remove(i);
+            let _ = slots.remove(i);
             assert!(!slots.siml_has_const_lset());
             let desc = super::super::field_desc_in(ai.field_list(), "SIML").unwrap();
-            slots.install_text(i, desc, b"");
+            let _ = slots.install_text(i, desc, b"");
             assert!(slots.siml_has_const_lset());
             assert!(LinkSlots::default().siml_has_const_lset(), "no SIML");
         }
@@ -2134,7 +2155,7 @@ mod link_cache {
 
 pub(crate) use link_cache::{
     CycleLink, CycleLinkSlots, LinkRow, LinkSlots, NewDset, OutTarget, PreparedCommonLink,
-    PreparedLink, PreparedLinks,
+    PreparedLink, PreparedLinks, SlotWrite,
 };
 pub use link_cache::{LinkCache, OutLinkCache};
 
@@ -2177,6 +2198,9 @@ pub(crate) struct CycleFacts {
     /// The device takes its record lent around `read_begin` and
     /// `write_begin` ([`crate::server::device_support::DeviceSupport::lends_held`]).
     pub(crate) device_held: bool,
+    /// The device reads through the frame the cycle lends
+    /// ([`crate::server::device_support::DeviceSupport::reads_own`]).
+    pub(crate) device_reads_own: bool,
 }
 
 /// What a record's TYPE can reach in a process cycle.
@@ -2249,13 +2273,12 @@ pub(crate) struct ProcessPlan {
     /// Whether a failed multi-input read owes C's `setLinkAlarm` — see
     /// [`Record::multi_input_fetch_is_db_get_link`].
     pub(crate) multi_input_is_db_get_link: bool,
-    /// Every declared multi-input link reads [`LinkReadAs::Native`] and none
-    /// declares its failure inert — the framework default, which every base
-    /// numeric type gives. The fetch loop then carries the answer instead of
-    /// asking [`Record::input_link_request`] and
-    /// [`Record::input_link_failure_is_inert`] through the vtable per link,
-    /// per cycle. Only settled here for a type whose answers are fixed at the
-    /// type ([`Record::input_link_answers_fixed_at_type`]).
+    /// Every declared multi-input link reads [`LinkReadAs::Native`] — the
+    /// framework default, which every base numeric type gives. The fetch loop
+    /// then carries the answer instead of asking
+    /// [`Record::input_link_request`] through the vtable per link, per cycle.
+    /// Only settled here for a type whose answers are fixed at the type
+    /// ([`Record::input_link_answers_fixed_at_type`]).
     pub(crate) multi_inputs_read_native: bool,
     /// This type declares generic multi-output pairs
     /// ([`Record::multi_output_links`]) for the pre-commit output stage to
@@ -2435,10 +2458,11 @@ pub struct RecordCell {
     /// contention, and there is none.
     borrow: std::sync::atomic::AtomicIsize,
     /// C `cvt_dbaddr` owed by a lock-free `dbNameToAddr`
-    /// ([`Self::resolve_addr`]): bit `i` is entry `i` of
-    /// [`Self::dbaddr_counts`]. A resolve that finds the record busy cannot
-    /// run [`super::Record::cvt_dbaddr`], so it owes the cell to its lock set,
-    /// and the set's next fresh hold runs it before anything reads the record.
+    /// ([`Self::resolve_addr`]): bit `i` of this word and then of
+    /// [`Self::cvt_pending_more`]'s is entry `i` of [`Self::dbaddr_counts`].
+    /// A resolve that finds the record busy cannot run
+    /// [`super::Record::cvt_dbaddr`], so it owes the cell to its lock set, and
+    /// the set's next fresh hold runs it before anything reads the record.
     cvt_pending: std::sync::atomic::AtomicU64,
     /// The type-static answers a process cycle tests — see [`ProcessPlan`].
     /// Fixed by the type, like `rdes`, so it is reachable without a borrow
@@ -2514,29 +2538,85 @@ pub struct RecordCell {
     /// move ([`Self::settle_addr_facts`]) and read with no lock.
     string_typed: std::sync::atomic::AtomicU64,
     /// C `paddr->no_elements` of each `SPC_DBADDR` field, by its index in
-    /// `rdes.fields`: what `cvt_dbaddr` answers, settled with
-    /// [`Self::string_typed`] so `dbNameToAddr` reads it with no lock, as C
-    /// reads `prec->nelm`. The capacity fields are `SPC_NOMOD`.
-    dbaddr_counts: arc_swap::ArcSwap<Vec<(u16, u32)>>,
+    /// `rdes.fields`: what `cvt_dbaddr` answers, so `dbNameToAddr` reads it
+    /// with no lock, as C reads `prec->nelm`. A capacity can follow a field a
+    /// client writes (acalcout `SIZE`, `NUSE`), so a store that can move one
+    /// re-reads them ([`Settle::Counts`]); a create that finds the record
+    /// busy counts what the last committed put left.
+    dbaddr_counts: Box<[(u16, std::sync::atomic::AtomicU32)]>,
+    /// The `field_type` `cvt_dbaddr` gives each [`FieldDesc::runtime_typed`]
+    /// field of `rdes.fields`, in order: settled with [`Self::string_typed`]
+    /// so `dbNameToAddr` types another thread's record with no lock, as C
+    /// reads `prec->ftvl` (`waveformRecord.c:184`).
+    runtime_types: arc_swap::ArcSwap<Vec<Option<DbFieldType>>>,
+    /// [`Self::cvt_pending`]'s words past the first, for a type with over 64
+    /// `SPC_DBADDR` fields (sscan has 152).
+    cvt_pending_more: Box<[std::sync::atomic::AtomicU64]>,
+    /// The [`Self::dbaddr_counts`] entries a resolve has run or owed the
+    /// `cvt_dbaddr` of, bit for bit as [`Self::cvt_pending`]. C's `cvt_dbaddr`
+    /// is idempotent (acalcout charges a buffer when it allocates it), so only
+    /// the first resolve of a field has one to run, and a server that makes
+    /// its channel per operation owes the record's set nothing after it.
+    cvt_resolved: Box<[std::sync::atomic::AtomicU64]>,
+    /// The long-string fields' `SIZV`, the `field_size` their `cvt_dbaddr`
+    /// stores (`lsiRecord.c:144`) and so their `$` address's `no_elements`;
+    /// settled with [`Self::string_typed`]. `SIZV` is `SPC_NOMOD`.
+    long_string_size: std::sync::atomic::AtomicU32,
+    /// `info(Q:form, "String")`, by which pvxs serves a `$` channel on `VAL`
+    /// as text; settled with [`Self::string_typed`], after the load has set
+    /// the info tags.
+    form_string: AtomicBool,
+    /// The [`PutFacts`] of a field off `rdes.fields`, by whether it is the
+    /// primary field (`Record::is_udf_defining_put`'s default answer); their
+    /// settle is `Counts` for a type with [`Self::dbaddr_counts`] and no
+    /// [`Record::dbaddr_capacity_inputs`].
+    off_list_facts: [PutFacts; 2],
+    /// pvxs `MappingInfo::nsecMask` of `info(Q:time:tag)`
+    /// ([`RecordInstance::qtime_nsec_mask`]), which pvxs reads with no lock
+    /// once per channel (`typeutils.cpp:79-88`); settled with
+    /// [`Self::form_string`].
+    nsec_mask: std::sync::atomic::AtomicU64,
 }
 
 const _: () = assert!(std::mem::offset_of!(RecordCell, data) == 0);
 
+/// [`RecordCell::long_string_size`] of `inst`: 0 for a type with no long
+/// string.
+fn long_string_size_of(inst: &RecordInstance) -> u32 {
+    if inst.record.field_list().iter().any(|f| f.long_string) {
+        crate::server::database::char_view::long_string_sizv(inst) as u32
+    } else {
+        0
+    }
+}
+
 /// [`RecordCell::dbaddr_counts`] of `inst`.
-fn dbaddr_counts_of(inst: &RecordInstance) -> Vec<(u16, u32)> {
+fn dbaddr_counts_of(inst: &RecordInstance) -> Box<[(u16, std::sync::atomic::AtomicU32)]> {
     let rec = &*inst.record;
     rec.field_list()
         .iter()
         .enumerate()
         .filter(|(_, f)| !f.long_string && rec.field_is_dbaddr(f.name))
-        .map(|(i, f)| {
-            let count = rec
-                .dbaddr_count(f.name)
-                .or_else(|| inst.resolve_field(f.name).map(|v| v.count() as u32))
-                .unwrap_or(1);
-            (i as u16, count)
-        })
+        .map(|(i, f)| (i as u16, dbaddr_count_of(inst, f.name).into()))
         .collect()
+}
+
+/// [`Record::dbaddr_capacity_inputs`] of a type with
+/// [`RecordCell::dbaddr_counts`], `None` for one with no entry to move.
+fn counts_inputs(
+    inst: &RecordInstance,
+    counts: &[(u16, std::sync::atomic::AtomicU32)],
+) -> Option<Option<&'static [&'static str]>> {
+    (!counts.is_empty()).then(|| inst.record.dbaddr_capacity_inputs())
+}
+
+/// One [`RecordCell::dbaddr_counts`] entry of `inst`: a type with no
+/// [`super::Record::dbaddr_capacity`] answer counts the value it holds.
+fn dbaddr_count_of(inst: &RecordInstance, field: &str) -> u32 {
+    inst.record
+        .dbaddr_count(field)
+        .or_else(|| inst.resolve_field(field).map(|v| v.count() as u32))
+        .unwrap_or(1)
 }
 
 /// [`RecordCell::string_typed`] of `inst`.
@@ -2551,6 +2631,16 @@ fn string_typed_mask(inst: &RecordInstance) -> u64 {
             _ => mask,
         }
     })
+}
+
+/// [`RecordCell::runtime_types`] of `inst`.
+fn runtime_types_of(inst: &RecordInstance) -> Vec<Option<DbFieldType>> {
+    let rec = &*inst.record;
+    rec.field_list()
+        .iter()
+        .filter(|f| f.runtime_typed)
+        .map(|f| rec.get_field(f.name).map(|v| v.db_field_type()))
+        .collect()
 }
 
 /// A record type's declaration, C's `dbRecordType` behind `precord->rdes`:
@@ -2685,7 +2775,9 @@ impl FieldAddr {
         Self::resolve_at(rec, field).0
     }
 
-    /// [`Self::resolve_in`] and the field's index in `rdes.fields`.
+    /// [`Self::resolve_in`] and the index in `rdes.fields` of the field it
+    /// names, which indexes `put_facts`: the facts follow the desc, as the
+    /// lean store follows the slot.
     fn resolve_at(rec: &RecordCell, field: &str) -> (Self, Option<usize>) {
         // One scan of the type's own list answers both the desc and, by the
         // same index, the slot; only a miss falls to `dbCommon`.
@@ -2710,7 +2802,7 @@ impl FieldAddr {
             "{}.{field}: a field slot must name a declared, readable field",
             rec.rdes().record_type
         );
-        (addr, at.filter(|_| declared))
+        (addr, at)
     }
 
     /// The record's own handle for the field ([`Record::field_slot`]), when
@@ -2727,6 +2819,16 @@ impl FieldAddr {
     #[inline(always)]
     pub(crate) fn char_view(&self) -> bool {
         self.char_view
+    }
+
+    /// The text `dbGet` answers every request of this `$` address from: a
+    /// link keeps its `DBF_xxLINK` and an attribute its `SPC_ATTRIBUTE`, so
+    /// the `DBR_CHAR` image is not what a conversion starts from.
+    pub(crate) fn text_route(&self) -> Option<crate::server::database::char_view::TextRoute> {
+        if !self.char_view {
+            return None;
+        }
+        crate::server::database::char_view::source_of(self.desc).text_route()
     }
 }
 
@@ -2791,14 +2893,54 @@ impl SlotKind {
     }
 }
 
-/// What a put needs of the record at a declared field, asked by
+/// What the cell re-reads after a put at a field: C's `cvt_dbaddr` answers
+/// from the record at each create, and the cell keeps its answers for a
+/// create with no lock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Settle {
+    Nothing,
+    /// [`RecordCell::dbaddr_counts`]: the field is a
+    /// [`Record::dbaddr_capacity_inputs`] one, or the type names none.
+    Counts,
+    /// Every address fact ([`RecordCell::settle_addr_facts`]): the field's
+    /// `special()` retypes ([`Record::special_retypes`]).
+    All,
+}
+
+impl Settle {
+    /// A field's settle, `inputs` being [`counts_inputs`].
+    fn of(record: &dyn Record, inputs: Option<Option<&[&str]>>, field: &str) -> Self {
+        if record.special_retypes(field) {
+            Self::All
+        } else if inputs.is_some_and(|l| l.is_none_or(|l| l.contains(&field))) {
+            Self::Counts
+        } else {
+            Self::Nothing
+        }
+    }
+}
+
+/// [`RecordCold::recounts`]: the [`Settle::Counts`] fields of a store no
+/// `special()` follows, which leaves nothing retyped.
+#[derive(Clone, Copy)]
+enum Recounts {
+    Never,
+    /// [`Record::dbaddr_capacity_inputs`].
+    Of(&'static [&'static str]),
+    Every,
+}
+
+/// What a put needs of the record at a field of `rdes.fields`, asked by
 /// [`RecordCell::new`] while it owns the instance.
 #[derive(Clone, Copy)]
 struct PutFacts {
-    /// The slot's [`SlotMut`](super::record_trait::SlotMut) variant.
-    kind: Option<SlotKind>,
+    /// The slot's [`SlotMut`](super::record_trait::SlotMut) variant a lean
+    /// store writes; `None` for no slot, or for a put with a [`Settle`],
+    /// which only the general arm makes.
+    lean: Option<SlotKind>,
     /// [`Record::is_udf_defining_put`], C `dbIsValueField`.
     udf: bool,
+    settle: Settle,
 }
 
 /// `putStringString`'s copy length for a `DBF_STRING` field: `field_size -
@@ -2807,20 +2949,31 @@ fn str_cap(desc: &FieldDesc) -> u16 {
     desc.size.clamp(1, 40) - 1
 }
 
-/// Each declared field's [`PutFacts`], with every `Str` slot reserved to its
-/// cap here, so a lean store never grows it under a hold.
+/// Each field's [`PutFacts`], with every `Str` slot reserved to its cap
+/// here, so a lean store never grows it under a hold. `inputs` is
+/// [`counts_inputs`].
 fn put_facts(
     inst: &mut RecordInstance,
     slots: &[Option<super::record_trait::FieldSlot>],
+    inputs: Option<Option<&[&str]>>,
 ) -> Box<[PutFacts]> {
     use super::record_trait::SlotMut;
     let fields = inst.record.field_list();
+    debug_assert!(
+        inputs
+            .flatten()
+            .unwrap_or_default()
+            .iter()
+            .all(|name| fields.iter().any(|f| f.name == *name)),
+        "{}: a dbaddr_capacity_inputs name off its field list",
+        inst.record.record_type()
+    );
     fields
         .iter()
         .zip(slots)
-        .map(|(desc, slot)| PutFacts {
-            udf: inst.record.is_udf_defining_put(desc.name),
-            kind: slot
+        .map(|(desc, slot)| {
+            let settle = Settle::of(&*inst.record, inputs, desc.name);
+            let kind = slot
                 .and_then(|slot| inst.record.slot_mut(slot))
                 .map(|m| match m {
                     SlotMut::Str(s) => {
@@ -2829,7 +2982,12 @@ fn put_facts(
                         SlotKind::Str
                     }
                     m => SlotKind::of(&m),
-                }),
+                });
+            PutFacts {
+                udf: inst.record.is_udf_defining_put(desc.name),
+                settle,
+                lean: kind.filter(|_| settle == Settle::Nothing),
+            }
         })
         .collect()
 }
@@ -2904,6 +3062,9 @@ pub(crate) struct PutAddr {
     /// The value field when it is `pp(TRUE)`, whose put-time post the
     /// processing cycle makes instead (`dbput_post_put_field`).
     post_suppressed: bool,
+    /// [`PutFacts::settle`], made by the general arm once `special()` is
+    /// done ([`RecordCell::settle_after_put`]).
+    settle: Settle,
 }
 
 /// What [`RecordInstance::notify_field_written_if_changed_at`] compares a put
@@ -2916,17 +3077,7 @@ impl PutAddr {
     /// [`FieldAddr::resolve_in`].
     pub(crate) fn resolve_in(rec: &RecordCell, field: &str) -> Self {
         let (addr, at) = FieldAddr::resolve_at(rec, field);
-        let facts = at.map(|i| rec.put_facts[i]);
-        let put = match (addr.desc, addr.slot, facts.and_then(|f| f.kind)) {
-            (Some(desc), Some(slot), Some(kind)) => {
-                lean_put_fn(rec.rdes().record_type, desc, slot, kind)
-            }
-            _ => PutFn::General,
-        };
-        // A type with no field list still has `Record::is_udf_defining_put`'s
-        // default answer, its primary field.
-        let udf = facts.map_or(field == rec.rdes().primary_field, |f| f.udf);
-        Self::of(rec, field, addr, put, udf)
+        Self::of(rec, field, addr, rec.put_facts_at(at, field))
     }
 
     /// A by-name put's address: [`RecordCell::put_name`]'s field, through
@@ -2954,22 +3105,28 @@ impl PutAddr {
         if addr.desc.is_some_and(|d| !rec.takes_string_view(d)) {
             return None;
         }
-        let udf = at.map_or(field == rec.rdes().primary_field, |i| rec.put_facts[i].udf);
         let addr = FieldAddr {
             slot: None,
             char_view: true,
             ..addr
         };
         // A name-only `DBF_NOACCESS` row is neither class `$` takes.
-        let at = Self::of(rec, field, addr, PutFn::General, udf);
+        let at = Self::of(rec, field, addr, rec.put_facts_at(at, field));
         (!at.noaccess).then_some(at)
     }
 
-    fn of(rec: &RecordCell, field: &str, addr: FieldAddr, put: PutFn, udf: bool) -> Self {
+    /// `facts` is the field's [`PutFacts`]; a lean put also needs the slot,
+    /// which a `$` name drops.
+    fn of(rec: &RecordCell, field: &str, addr: FieldAddr, facts: &PutFacts) -> Self {
         let rdes = rec.rdes();
         PutAddr {
-            put,
-            udf_defining: udf,
+            put: match (addr.desc, addr.slot, facts.lean) {
+                (Some(desc), Some(slot), Some(kind)) => {
+                    lean_put_fn(rdes.record_type, desc, slot, kind)
+                }
+                _ => PutFn::General,
+            },
+            udf_defining: facts.udf,
             dbaddr: addr
                 .desc
                 .is_some_and(|d| d.declared_special == super::record_trait::Special::DbAddr),
@@ -2980,6 +3137,7 @@ impl PutAddr {
             ),
             watched: RecordInstance::field_posts_property(addr.desc),
             post_suppressed: field == rdes.primary_field && rdes.is_pp(field),
+            settle: facts.settle,
             field: addr,
         }
     }
@@ -3018,6 +3176,12 @@ impl PutAddr {
     /// Whether `dbPut` leaves this field's put-time post to the cycle.
     pub(crate) fn post_suppressed(&self) -> bool {
         self.post_suppressed
+    }
+
+    /// What the cell re-reads after the put.
+    #[inline(always)]
+    pub(crate) fn settle(&self) -> Settle {
+        self.settle
     }
 }
 
@@ -3503,6 +3667,21 @@ impl RecordCell {
         live_borrows::count()
     }
 
+    /// Each [`Self::dbaddr_counts`] entry as `(field, held, counted now)`,
+    /// for a census that the writers keep them coherent.
+    #[doc(hidden)]
+    pub fn dbaddr_counts_census(&self) -> Vec<(&'static str, u32, u32)> {
+        let inst = self.read();
+        self.dbaddr_counts
+            .iter()
+            .map(|(at, held)| {
+                let field = self.rdes.fields[usize::from(*at)].name;
+                let held = held.load(std::sync::atomic::Ordering::Relaxed);
+                (field, held, dbaddr_count_of(&inst, field))
+            })
+            .collect()
+    }
+
     /// The cell for `instance`, registered at record-table `index` if given.
     pub(crate) fn new(
         mut instance: RecordInstance,
@@ -3527,6 +3706,23 @@ impl RecordCell {
             .iter()
             .map(|f| instance.record.field_slot(f.name))
             .collect();
+        let dbaddr_counts = dbaddr_counts_of(&instance);
+        let inputs = counts_inputs(&instance, &dbaddr_counts);
+        let put_facts = put_facts(&mut instance, &slots, inputs);
+        let settle = match inputs {
+            Some(None) => Settle::Counts,
+            _ => Settle::Nothing,
+        };
+        let off_list_facts = [false, true].map(|udf| PutFacts {
+            lean: None,
+            udf,
+            settle,
+        });
+        instance.cold.recounts = match inputs {
+            None | Some(Some([])) => Recounts::Never,
+            Some(Some(inputs)) => Recounts::Of(inputs),
+            Some(None) => Recounts::Every,
+        };
         Self {
             lock_record: crate::server::database::LockRecord::bootstrap(),
             borrow: std::sync::atomic::AtomicIsize::new(0),
@@ -3534,7 +3730,7 @@ impl RecordCell {
             bkpt: instance.common.bkpt.share(),
             rdes: RecordDesc::of(&*instance.record),
             name: instance.name.clone(),
-            put_facts: put_facts(&mut instance, &slots),
+            put_facts,
             slots,
             multi_input_val_slots: instance
                 .record
@@ -3550,7 +3746,20 @@ impl RecordCell {
             chain_pact: AtomicBool::new(false),
             lent: std::sync::atomic::AtomicU32::new(0),
             string_typed: std::sync::atomic::AtomicU64::new(string_typed_mask(&instance)),
-            dbaddr_counts: arc_swap::ArcSwap::from_pointee(dbaddr_counts_of(&instance)),
+            cvt_pending_more: (0..dbaddr_counts.len().saturating_sub(1) / 64)
+                .map(|_| std::sync::atomic::AtomicU64::new(0))
+                .collect(),
+            cvt_resolved: (0..dbaddr_counts.len().div_ceil(64))
+                .map(|_| std::sync::atomic::AtomicU64::new(0))
+                .collect(),
+            dbaddr_counts,
+            off_list_facts,
+            runtime_types: arc_swap::ArcSwap::from_pointee(runtime_types_of(&instance)),
+            long_string_size: std::sync::atomic::AtomicU32::new(long_string_size_of(&instance)),
+            form_string: AtomicBool::new(crate::server::database::char_view::form_string_of(
+                &instance,
+            )),
+            nsec_mask: std::sync::atomic::AtomicU64::new(instance.qtime_nsec_mask()),
             data: LockSetGuarded(std::cell::UnsafeCell::new(instance)),
         }
     }
@@ -3598,72 +3807,162 @@ impl RecordCell {
             .swap(false, std::sync::atomic::Ordering::AcqRel)
     }
 
-    /// Re-read [`Self::string_typed`] and [`Self::dbaddr_counts`] from
-    /// `inst`, this cell's record, after a load or an `init_record` that may
-    /// have moved a type selector or a capacity.
+    /// Re-read [`Self::string_typed`], [`Self::dbaddr_counts`],
+    /// [`Self::runtime_types`], [`Self::long_string_size`],
+    /// [`Self::form_string`] and [`Self::nsec_mask`] from `inst`, this cell's
+    /// record, after a load or an `init_record` that may have moved a type
+    /// selector or a capacity.
     pub(crate) fn settle_addr_facts(&self, inst: &RecordInstance) {
-        self.string_typed.store(
-            string_typed_mask(inst),
-            std::sync::atomic::Ordering::Relaxed,
+        use std::sync::atomic::Ordering::Relaxed;
+        self.string_typed.store(string_typed_mask(inst), Relaxed);
+        for (at, count) in &self.dbaddr_counts {
+            count.store(
+                dbaddr_count_of(inst, self.rdes.fields[usize::from(*at)].name),
+                Relaxed,
+            );
+        }
+        self.runtime_types.store(Arc::new(runtime_types_of(inst)));
+        self.long_string_size
+            .store(long_string_size_of(inst), Relaxed);
+        self.settle_info_facts(inst);
+    }
+
+    /// The [`PutFacts`] of the field at `at` in `rdes.fields`, or of
+    /// `field` off it.
+    #[inline(always)]
+    fn put_facts_at(&self, at: Option<usize>, field: &str) -> &PutFacts {
+        match at {
+            Some(i) => &self.put_facts[i],
+            None => &self.off_list_facts[usize::from(field == self.rdes.primary_field)],
+        }
+    }
+
+    /// The re-read a `dbPut` at a field owes once its `special()` is done:
+    /// [`PutAddr::settle`].
+    #[inline(always)]
+    pub(crate) fn settle_after_put(&self, inst: &RecordInstance, settle: Settle) {
+        match settle {
+            Settle::Nothing => {}
+            Settle::Counts => self.republish_dbaddr_counts(inst),
+            Settle::All => self.settle_addr_facts(inst),
+        }
+    }
+
+    /// Re-read [`Self::dbaddr_counts`] from `inst` after a store that can
+    /// move them, with no allocation: the capacities
+    /// [`super::Record::dbaddr_capacity`] answers. An entry the type leaves
+    /// to its value moves only with the type selectors, which
+    /// [`Self::settle_addr_facts`] re-reads.
+    pub(crate) fn republish_dbaddr_counts(&self, inst: &RecordInstance) {
+        for (at, count) in &self.dbaddr_counts {
+            let field = self.rdes.fields[usize::from(*at)].name;
+            if let Some(n) = inst.record.dbaddr_capacity(field) {
+                count.store(n, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Re-read [`Self::form_string`] and [`Self::nsec_mask`], the facts taken
+    /// from the record's info tags.
+    fn settle_info_facts(&self, inst: &RecordInstance) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.form_string.store(
+            crate::server::database::char_view::form_string_of(inst),
+            Relaxed,
         );
-        self.dbaddr_counts.store(Arc::new(dbaddr_counts_of(inst)));
+        self.nsec_mask.store(inst.qtime_nsec_mask(), Relaxed);
+    }
+
+    /// [`Self::long_string_size`]: a long-string field's `$` `no_elements`.
+    pub(crate) fn long_string_size(&self) -> usize {
+        self.long_string_size
+            .load(std::sync::atomic::Ordering::Relaxed) as usize
+    }
+
+    /// [`Self::form_string`]: the record carries `info(Q:form, "String")`.
+    pub(crate) fn form_string(&self) -> bool {
+        self.form_string.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// [`RecordInstance::qtime_nsec_mask`], settled on the cell, with no lock.
+    pub fn qtime_nsec_mask(&self) -> u64 {
+        self.nsec_mask.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// C `dbNameToAddr(name, &addr)` on this record succeeding, answered with
     /// `addr.no_elements` (1, or an array field's capacity), with no lock:
     /// the field is resolved against the type's declaration and the capacity
-    /// was settled at init. `None` is a field the type does not declare.
+    /// is the one the record's last `dbPut` left (`dbaddr_counts`).
+    /// `None` is a field the type does not declare.
     pub fn no_elements(&self, field: &str) -> Option<u32> {
         let named = |f: &&FieldDesc| f.name.eq_ignore_ascii_case(field);
         let Some(i) = self.rdes.fields.iter().position(|f| named(&f)) else {
-            return super::dbd_generated::DB_COMMON_FIELDS
+            return (super::dbd_generated::DB_COMMON_FIELDS
                 .iter()
                 .any(|f| named(&f))
-                .then_some(1);
+                || self.names_bare_noaccess(field))
+            .then_some(1);
         };
-        let counts = self.dbaddr_counts.load();
         Some(
-            counts
+            self.dbaddr_counts
                 .iter()
                 .find(|(at, _)| usize::from(*at) == i)
-                .map_or(1, |(_, n)| *n),
+                .map_or(1, |(_, n)| n.load(std::sync::atomic::Ordering::Relaxed)),
         )
     }
 
-    /// C `dbNameToAddr`'s `field_type` for `field`: the declaration, or the
-    /// variant a runtime-typed field holds, read from `own` when the caller
-    /// holds this record and otherwise only while the record is free.
+    /// C `dbNameToAddr`'s `field_type` for `field`, the `dbfType` itself
+    /// ([`FieldDesc::addressed_dbf`]), or the variant a runtime-typed field
+    /// holds, read from `own` when the caller holds this record and otherwise
+    /// from [`Self::runtime_types`].
     pub(crate) fn addressed_field_type(
         &self,
         field: &str,
         own: Option<&dyn Record>,
-    ) -> Option<DbFieldType> {
-        let desc = field_desc_in(self.rdes.fields, field)?;
-        if !desc.runtime_typed {
-            return Some(desc.dbf_type);
-        }
-        let value = match own {
-            Some(record) => record.get_field(field),
-            None => self.try_read()?.record.get_field(field),
+    ) -> Option<DbfCode> {
+        let Some(desc) = field_desc_in(self.rdes.fields, field) else {
+            return self.names_bare_noaccess(field).then_some(DbfCode::NoAccess);
         };
-        value.map(|v| v.db_field_type())
+        if !desc.runtime_typed {
+            return Some(desc.addressed_dbf());
+        }
+        let served = match own {
+            Some(record) => record.get_field(field).map(|v| v.db_field_type()),
+            None => {
+                let mut runtime_typed = self.rdes.fields.iter().filter(|f| f.runtime_typed);
+                let at = runtime_typed.position(|f| f.name == desc.name)?;
+                self.runtime_types.load().get(at).copied().flatten()
+            }
+        };
+        served.map(DbFieldType::dbf_code)
+    }
+
+    /// A `DBF_NOACCESS` name the port carries with no [`FieldDesc`]: dbCommon's
+    /// `MLOK`/`MLIS`/`BKLNK`, a type's `calc.RPCL`. C has a `dbFldDes` for each
+    /// and `dbNameToAddr` resolves it, one `DBF_NOACCESS` element.
+    fn names_bare_noaccess(&self, field: &str) -> bool {
+        is_dbcommon_noaccess(field) || self.rdes.noaccess.contains(&field)
     }
 
     /// [`Self::no_elements`] as C's `dbNameToAddr` RUNS it: the record's
-    /// `cvt_dbaddr` too, now if the record is free, else owed to the next
-    /// fresh hold of its set (`record_lock::owe_cvt`).
+    /// `cvt_dbaddr` too, on the field's first resolve ([`Self::cvt_resolved`]),
+    /// now if the record is free, else owed to the next fresh hold of its set
+    /// (`record_lock::owe_cvt`).
     pub(crate) fn resolve_addr(self: &Arc<Self>, field: &str) -> Option<u32> {
+        use std::sync::atomic::Ordering::{Relaxed, Release};
         let count = self.no_elements(field)?;
-        let counts = self.dbaddr_counts.load();
-        let at = counts.iter().position(|(at, _)| {
+        let at = self.dbaddr_counts.iter().position(|(at, _)| {
             self.rdes.fields[usize::from(*at)]
                 .name
                 .eq_ignore_ascii_case(field)
         });
-        if let Some(bit) = at {
-            debug_assert!(bit < 64, "{} has over 64 SPC_DBADDR fields", self.name);
-            self.cvt_pending
-                .fetch_or(1 << bit, std::sync::atomic::Ordering::Release);
+        if let Some(entry) = at {
+            let bit = 1 << (entry % 64);
+            let resolved = &self.cvt_resolved[entry / 64];
+            if resolved.load(Relaxed) & bit != 0 || resolved.fetch_or(bit, Relaxed) & bit != 0 {
+                return Some(count);
+            }
+            self.cvt_word(entry / 64).fetch_or(bit, Release);
             match self.try_read() {
                 // SAFETY: `_held` is a shared borrow of this record.
                 Some(_held) => unsafe { self.apply_cvt_pending() },
@@ -3680,21 +3979,27 @@ impl RecordCell {
     /// This thread holds a guard of the record, or holds its lock set with no
     /// borrow of the record live — so no `&mut` to the data exists.
     pub(crate) unsafe fn apply_cvt_pending(&self) {
-        let mut owed = self
-            .cvt_pending
-            .swap(0, std::sync::atomic::Ordering::Acquire);
-        if owed == 0 {
-            return;
-        }
-        let counts = self.dbaddr_counts.load();
         // SAFETY: the caller's contract.
         let inst = unsafe { &*self.data.0.get() };
-        while owed != 0 {
-            let bit = owed.trailing_zeros() as usize;
-            owed &= owed - 1;
-            let (at, _) = counts[bit];
-            inst.record
-                .cvt_dbaddr(self.rdes.fields[usize::from(at)].name);
+        for word in 0..=self.cvt_pending_more.len() {
+            let mut owed = self
+                .cvt_word(word)
+                .swap(0, std::sync::atomic::Ordering::Acquire);
+            while owed != 0 {
+                let entry = word * 64 + owed.trailing_zeros() as usize;
+                owed &= owed - 1;
+                let (at, _) = self.dbaddr_counts[entry];
+                inst.record
+                    .cvt_dbaddr(self.rdes.fields[usize::from(at)].name);
+            }
+        }
+    }
+
+    /// Word `word` of [`Self::cvt_pending`]'s bits.
+    fn cvt_word(&self, word: usize) -> &std::sync::atomic::AtomicU64 {
+        match word {
+            0 => &self.cvt_pending,
+            more => &self.cvt_pending_more[more - 1],
         }
     }
 
@@ -3728,6 +4033,12 @@ impl RecordCell {
     /// The record type's declaration — C `precord->rdes`.
     pub(crate) fn rdes(&self) -> &RecordDesc {
         &self.rdes
+    }
+
+    /// The record's type name — C `precord->rdes->name` — without taking its
+    /// lock set.
+    pub fn record_type(&self) -> &'static str {
+        self.rdes.record_type
     }
 
     /// The field name a by-name entry works with: the declared spelling of
@@ -4190,6 +4501,17 @@ impl Drop for RecordMut<'_> {
 }
 
 impl<'a> RecordMut<'a> {
+    /// [`RecordInstance::set_info`], with the facts the cell takes from info
+    /// tags re-read: pvxs reads `Q:form` and `Q:time:tag` each time a channel
+    /// is made (`ioc/channel.cpp:43`, `ioc/typeutils.cpp:83`), so a tag set on
+    /// a live record reaches the next channel.
+    pub fn set_info(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        let instance: &mut RecordInstance = self;
+        instance.set_info(key, value);
+        let cell = self.cell;
+        cell.settle_info_facts(self);
+    }
+
     /// The borrow let go and the set kept, for a dset call the record is lent
     /// to as a `HeldInstance`.
     pub(crate) fn lend(mut self) -> LentRecord<'a> {
@@ -4290,12 +4612,11 @@ pub(crate) struct ParsedInputLink {
     /// need not read the field to know.
     generation: Option<u64>,
     parsed: Arc<ParsedLink>,
-    /// [`Record::input_link_failure_is_inert`] and
     /// [`Record::input_link_request`] for this link, with the
-    /// [`Record::input_links_generation`] they were asked at: a record that
-    /// answers a generation moves it on every write that can change either,
-    /// so an answer stamped with the current generation is still the answer.
-    answers: Option<(u64, bool, super::record_trait::InputLinkRequest)>,
+    /// [`Record::input_links_generation`] it was asked at: a record that
+    /// answers a generation moves it on every write that can change it, so
+    /// an answer stamped with the current generation is still the answer.
+    request: Option<(u64, super::record_trait::InputLinkRequest)>,
     /// C's `dbAddr` from `dbDbInitLink` (`dbDbLink.c:88-111`): the target
     /// record, resolved once and read through until something can have
     /// changed the answer. C re-resolves only when the link text is put; the
@@ -4341,8 +4662,8 @@ pub(crate) struct NativeRead {
 impl NativeRead {
     /// The read the reader's hold makes of `parsed` at `target`, or `None`
     /// when it is not this frame's: a read of the reader's own field, a `PP`
-    /// source (processed with the guard released), a filtered channel, or
-    /// not a local record read at all.
+    /// source (processed with the guard released), a filtered channel, a
+    /// `$` text route (no native read), or not a local record read at all.
     fn of(
         parsed: &ParsedLink,
         target: &ResolvedTarget,
@@ -4357,6 +4678,7 @@ impl NativeRead {
         if Arc::ptr_eq(&target.rec, reader)
             || db.policy == LinkProcessPolicy::ProcessPassive
             || channel.json_suffix.is_some()
+            || target.put.field().text_route().is_some()
         {
             return None;
         }
@@ -4437,7 +4759,7 @@ impl ParsedInputLink {
             text,
             generation: None,
             parsed: removed,
-            answers: None,
+            request: None,
             target: None,
         }
     }
@@ -4451,43 +4773,38 @@ impl ParsedInputLink {
             text: text.into(),
             generation: None,
             parsed: installed.map_or_else(|| Arc::new(parse_link_v2(text)), Arc::clone),
-            answers: None,
+            request: None,
             target: None,
         }
     }
 
-    /// What the record answers for this link's failure and request: asked of
-    /// the record once per [`Record::input_links_generation`] it answers, and
-    /// every time for a record that answers none.
+    /// What the record requests for this link: asked of the record once per
+    /// [`Record::input_links_generation`] it answers, and every time for a
+    /// record that answers none.
     #[inline(always)]
-    pub(crate) fn link_answers(
+    pub(crate) fn link_request(
         &mut self,
         record: &dyn Record,
         link_field: &str,
         generation: Option<u64>,
-    ) -> (bool, super::record_trait::InputLinkRequest) {
-        let ask = || {
-            (
-                record.input_link_failure_is_inert(link_field),
-                record.input_link_request(link_field),
-            )
-        };
+    ) -> super::record_trait::InputLinkRequest {
+        let ask = || record.input_link_request(link_field);
         let Some(generation) = generation else {
             return ask();
         };
-        if let Some((at, inert, request)) = self.answers
+        if let Some((at, request)) = self.request
             && at == generation
         {
             debug_assert!(
-                (inert, request) == ask(),
-                "{link_field}: an input_link answer changed under generation {generation} — \
+                request == ask(),
+                "{link_field}: an input_link_request answer changed under generation {generation} — \
                  a writer of what it reads does not move input_links_generation"
             );
-            return (inert, request);
+            return request;
         }
-        let (inert, request) = ask();
-        self.answers = Some((generation, inert, request));
-        (inert, request)
+        let request = ask();
+        self.request = Some((generation, request));
+        request
     }
 
     /// The parse, shared: the cycle hands it to reads that run after the
@@ -4616,6 +4933,10 @@ pub(crate) struct ResolvedTarget {
     /// The slot a `DBR_DOUBLE` read takes straight off the record: the link
     /// addresses an unfiltered `VAL` the record serves as `DBF_DOUBLE`.
     pub(crate) f64_slot: Option<super::record_trait::FieldSlot>,
+    /// `dbGetNelements` of the link: its channel's `final_no_elements`, the
+    /// field's `addr.no_elements` through the link's filter chain, settled
+    /// with the address as `dbChannelCreate` settles it at link init.
+    pub(crate) final_no_elements: u32,
 }
 
 /// Where a DB link's local target comes from — `PvDatabase` in production.
@@ -5064,7 +5385,7 @@ pub struct RecordInstance {
     /// read — see [`ParsedInputLink::validated`], the one writer. An entry
     /// whose text is not the record's text is re-parsed at the next read; a
     /// field with a link slot reads the slot's parse, so every write of a
-    /// slot drops the field's entry ([`Self::forget_input_entry`]). C parses
+    /// slot drops the field's entry ([`Self::slot_written`]). C parses
     /// a link once at `dbInitLink`; the port parsed every set
     /// `INPA`..`INPL` on every cycle.
     pub(crate) parsed_inputs: Vec<Option<ParsedInputLink>>,
@@ -5248,10 +5569,13 @@ pub struct RecordInstance {
 
 /// [`RecordInstance`]'s fields no process cycle reads, behind one pointer so
 /// the lines a cycle does read sit closer together.
-struct RecordCold {
+pub(crate) struct RecordCold {
     /// The cell holding this instance — none for one not yet in a cell — for
     /// the PACT field's read of [`RecordCell::hold_chain_pact`]'s flag.
     cell: std::sync::Weak<RecordCell>,
+    /// The stores that move the cell's [`RecordCell::dbaddr_counts`]. Set
+    /// with the cell.
+    recounts: Recounts,
     /// The by-name function registry this record's PENDING `init_record` pass
     /// 1 will resolve INAM/SNAM against — C `registryFunctionFind`, reading a
     /// process-global table from inside `init_record`.
@@ -5345,6 +5669,20 @@ struct RecordCold {
     /// cycle's [`crate::server::record::ProcessAction::PutAfterEpilogue`], so
     /// no other cycle pays for it.
     alarm_reset: crate::server::recgbl::EventMask,
+    /// The timers [`crate::server::record::ProcessAction::DelayedCallbackAfter`]
+    /// arms, apart from `reprocess_generation`.
+    delayed_callbacks: crate::server::database::DelayedCallbackTimers,
+}
+
+impl RecordCold {
+    pub(crate) fn cell(&self) -> &std::sync::Weak<RecordCell> {
+        &self.cell
+    }
+
+    /// [`RecordInstance::attribute`] of the instance this is the cold half of.
+    fn attribute(&self, name: &str) -> Option<String> {
+        self.db.upgrade()?.attribute(&*self.cell.upgrade()?, name)
+    }
 }
 
 /// The cycle status [`RecordInstance::run_registered_subroutine`] reports when
@@ -5984,8 +6322,8 @@ impl MetaFields {
 
 /// C's `dbGet` options — the rset slots, keyed by field — read from the
 /// record's fields on every call, as C calls the slots. A record inside its
-/// own processing serves them from `&dyn Record` ([`own_field_snapshot`]) as
-/// C's lock-free `dbGet` does.
+/// own processing serves them from `&dyn Record` and its dbCommon
+/// ([`own_field_snapshot`]) as C's lock-free `dbGet` does.
 pub(crate) trait FieldMetaSource {
     fn rec(&self) -> &dyn Record;
     /// [`MetaFields::of`] the record's type.
@@ -6012,6 +6350,93 @@ pub(crate) trait FieldMetaSource {
     fn description(&self) -> PvString;
     /// `display.form`: the `Q:form` info tag.
     fn q_form_index(&self) -> Option<i16>;
+    /// The record's dbCommon.
+    fn common(&self) -> &CommonFields;
+
+    /// What [`SourceRender`] needs of this record to render `value`, just read
+    /// from `field`, as `DBR_STRING`: taken under the read's hold, so the
+    /// render after it never goes back for the record.
+    ///
+    /// C `dbGetLink` converts at the source, through `dbConvert.c`'s
+    /// `[field_type][DBR_STRING]` table, inside `dbGet`: a float field renders
+    /// at its own precision (`getDoubleString`), a `DBF_ENUM`/`DBF_MENU` index
+    /// as its state label (`getEnumString`/`getMenuString`), and a long-string
+    /// field is `DBF_STRING` to C's `cvt_dbaddr`, not an array. The label goes
+    /// through [`Self::enum_string_form`], the owner the CA/PVA encoders
+    /// use, so a link read and a `caget -t` of one field cannot disagree.
+    fn source_render_of(&self, field: &str, value: &EpicsValue) -> SourceRender {
+        // Only an array value reads the flag, so a scalar pays no lookup.
+        let long_string = value.is_array() && self.rec().field_is_long_string(field);
+        let mut render = SourceRender {
+            long_string,
+            precision: None,
+            label: None,
+        };
+        let head = if value.is_array() && !long_string {
+            value.first_element()
+        } else {
+            None
+        };
+        match head.as_ref().unwrap_or(value) {
+            EpicsValue::Double(_) | EpicsValue::Float(_) => {
+                render.precision = Some(self.dbr_string_precision(field, value));
+            }
+            // A `DBF_ENUM` index, and a `DBF_MENU` index (stored as a short),
+            // render through the field's string source. A short field that is
+            // neither has no source and stays the plain number C converts it to.
+            &EpicsValue::Enum(idx) => render.label = self.label_of(field, idx),
+            // A menu index is an `epicsEnum16`: a negative short reads as its
+            // unsigned bits, which `cvt_menu_st` prints with `%u`.
+            &EpicsValue::Short(v) => render.label = self.label_of(field, v as u16),
+            _ => {}
+        }
+        render
+    }
+
+    /// [`Self::enum_string_form`]'s label for `idx`; a menu's or a `VAL`
+    /// state's is cloned from where it lives, without building the form under
+    /// the read's hold.
+    fn label_of(&self, field: &str, idx: u16) -> Option<PvString> {
+        let desc = field_desc_of(self.rec(), field);
+        if is_device(desc) {
+            // `cvt_device_st`: a type with no device menu reads ""
+            // (`dbFastLinkConv.c:1615-1618`).
+            return Some(
+                device_choices_of(self.rec().record_type(), self.common().dtyp.as_str())
+                    .map_or_else(PvString::default, |c| EnumStringForm::device(c).render(idx)),
+            );
+        }
+        if let Some(choices) = menu_choices_with(self.rec(), field, desc) {
+            return Some(match choices.get(idx as usize) {
+                Some(choice) => PvString::from(*choice),
+                None => PvString::from(idx.to_string().as_str()),
+            });
+        }
+        if field.eq_ignore_ascii_case("VAL") {
+            return self
+                .rec()
+                .enum_slots()
+                .map(|slots| PvString::from(slots.label(idx)));
+        }
+        self.enum_string_form(field).map(|form| form.render(idx))
+    }
+
+    /// C `getDoubleString`'s precision for `field` holding `value`: seeded 6
+    /// and overwritten by the rset's `get_precision` — the answer the
+    /// DBR_STRING encoder reads off [`Snapshot::precision`].
+    ///
+    /// [`Snapshot::precision`]: crate::server::snapshot::Snapshot::precision
+    fn dbr_string_precision(&self, field: &str, value: &EpicsValue) -> u16 {
+        let meta = self.meta();
+        let support = meta.slots.narrowed_to_field(value.db_field_type(), false);
+        if !support.precision {
+            return 6;
+        }
+        self.rec()
+            .field_metadata_override(field)
+            .and_then(|ov| ov.precision)
+            .unwrap_or_else(|| self.metadata_limit(meta.prec) as i16) as u16
+    }
 
     /// The record's VAL metadata into `snap`, read from its fields as they
     /// stand, as C's `dbGet` calls the rset slots on every read. Returns the
@@ -6687,6 +7112,9 @@ impl FieldMetaSource for RecordInstance {
     fn rec(&self) -> &dyn Record {
         self.record.as_ref()
     }
+    fn common(&self) -> &CommonFields {
+        &self.common
+    }
     fn meta(&self) -> &'static MetaFields {
         self.monitor_plan.meta
     }
@@ -6736,59 +7164,398 @@ impl FieldMetaSource for RecordInstance {
     }
 }
 
-/// A record read from inside its own processing: its type's code and
-/// nothing behind its lock set.
-struct OwnRecord<'a>(&'a dyn Record, &'static MetaFields);
+/// `value` stamped with the alarm, time and tag of the record whose dbCommon
+/// is `common`.
+fn common_snapshot(common: &CommonFields, value: EpicsValue) -> super::super::snapshot::Snapshot {
+    let mut snap =
+        super::super::snapshot::Snapshot::new(value, common.stat, common.sevr as u16, common.time);
+    // Default the served `timeStamp.userTag` to the record's `utag`,
+    // mirroring pvxs `iocsource.cpp:245` (`auto utag = meta.utag;`).
+    // The 64-bit `epicsUTag` narrows to the int32 NT wire field by
+    // truncating to the low 32 bits — pvxs assigns the same uint64
+    // straight into the `Int32` `timeStamp.userTag`. A PVA reader's
+    // `Q:time:tag` split overrides this when configured, matching
+    // pvxs `if(info.nsecMask) utag = meta.time.nsec & info.nsecMask;`
+    // (:246-247 — the test and its assignment); CA serves it raw.
+    snap.user_tag = common.utag as i32;
+    // Carry the record's committed alarm message (`common.amsg`) so a
+    // PVA read serves `alarm.message` from the record's own amsg
+    // (pvxs `iocsource.cpp:230-236` prefers `meta.amsg`) rather than a
+    // string re-synthesized from the condition code. Empty for records
+    // that raise no message (C's plain `recGblSetSevr` clears namsg).
+    snap.alarm.amsg = String::from(&common.amsg);
+    snap
+}
 
-impl FieldMetaSource for OwnRecord<'_> {
-    fn rec(&self) -> &dyn Record {
-        self.0
+/// [`RecordInstance::has_device_list`] of `record_type`.
+fn has_device_list_of(record_type: &str) -> bool {
+    super::dbd_generated::device_menu(record_type).is_some()
+        || super::has_contributed_device_menu(record_type)
+}
+
+/// [`RecordInstance::device_choices`] of `record_type` with `DTYP` = `dtyp`.
+pub(crate) fn device_choices_of(record_type: &str, dtyp: &str) -> Option<Vec<PvString>> {
+    // Base's build-time menu (`epics-base-rs/dbd`), then the menus a
+    // downstream crate whose device support has no vendored `device()` line
+    // registered at runtime (asyn's `asynInt32`, `asynFloat64`, ...). C's
+    // `dbDeviceMenu` is the concatenation of every `device()` the loaded
+    // `.dbd` set declares, in load order — base first, then asyn — so the
+    // merge appends the contributed choices AFTER the declared ones.
+    // The C None-vs-empty distinction (`dbAccess.c:176-179` vs `:205`): the
+    // menu is present iff the loaded `.dbd` set declares ANY `device()` for
+    // this type. A type base declares none for but asyn does (structurally
+    // possible, though none of asyn's are such) is therefore present, not
+    // None; a type neither declares for (calc) stays None.
+    if !has_device_list_of(record_type) {
+        return None;
     }
-    fn meta(&self) -> &'static MetaFields {
-        self.1
+    // `merged_device_menu` = declared + contributed, the SAME source the
+    // CA-put validation (`coerce_put_value`'s DTYP branch) resolves against,
+    // so a client can put exactly the DTYP names it can read here.
+    let mut names: Vec<PvString> = super::merged_device_menu(record_type)
+        .into_iter()
+        .map(PvString::from)
+        .collect();
+    if !dtyp.is_empty() && !names.iter().any(|n| n.as_str_lossy() == dtyp) {
+        names.push(PvString::from(dtyp));
     }
-    fn read_field(&self, field: &str) -> Option<EpicsValue> {
-        self.0.get_field(field)
+    Some(names)
+}
+
+/// The value of the `DTYP` field of a `record_type` record with `DTYP` =
+/// `dtyp`: the index of the bound device support in its device menu. An unset
+/// DTYP is index 0, exactly as in C.
+fn dtyp_index_of(record_type: &str, dtyp: &str) -> u16 {
+    if dtyp.is_empty() {
+        return 0;
     }
-    fn enum_string_form(&self, field: &str) -> Option<EnumStringForm> {
-        // `DTYP` lives in dbCommon, behind the lock set.
-        enum_string_form_with(self.0, field, || None)
-    }
-    fn metadata_at(&self, desc: &'static FieldDesc) -> Option<EpicsValue> {
-        self.0.get_field(desc.name)
-    }
-    // dbCommon and the info tags are behind the lock set.
-    fn description(&self) -> PvString {
-        PvString::default()
-    }
-    fn q_form_index(&self) -> Option<i16> {
-        None
+    // A record type with no device menu has no slot for any DTYP, so the
+    // index stays 0 — the same answer the old `unwrap_or(&[])` gave.
+    device_choices_of(record_type, dtyp)
+        .unwrap_or_default()
+        .iter()
+        .position(|c| c.as_str_lossy() == dtyp)
+        .unwrap_or(0) as u16
+}
+
+/// The PACT field of the instance whose flag is `pact` and whose cell is
+/// `cell`: its own PACT, or [`RecordCell::hold_chain_pact`]'s.
+pub(crate) fn pact_field(pact: &AtomicBool, cell: &std::sync::Weak<RecordCell>) -> bool {
+    pact.load(Ordering::Acquire)
+        || cell
+            .upgrade()
+            .is_some_and(|cell| cell.chain_pact.load(Ordering::Relaxed))
+}
+
+/// The value of the `dbCommon` field `field` of `record`, whose dbCommon is
+/// `common` — all but `PACT`, which lives on the instance.
+fn common_field_of(
+    record: &dyn Record,
+    common: &CommonFields,
+    field: CommonField,
+) -> Option<EpicsValue> {
+    match field {
+        CommonField::Sevr => Some(EpicsValue::Short(common.sevr as i16)),
+        CommonField::Stat => Some(EpicsValue::Short(common.stat as i16)),
+        CommonField::Nsev => Some(EpicsValue::Short(common.nsev as i16)),
+        CommonField::Nsta => Some(EpicsValue::Short(common.nsta as i16)),
+        // epics-base PR #568 / #566 — alarm message string.
+        CommonField::Amsg => Some(EpicsValue::String(String::from(&common.amsg).into())),
+        CommonField::Namsg => Some(EpicsValue::String(String::from(&common.namsg).into())),
+        CommonField::Acks => Some(EpicsValue::Short(common.acks as i16)),
+        // `ACKT` and `PINI` are `DBF_MENU` (`menuYesNo` /`menuPini`,
+        // `dbCommon.dbd.pod:335,169`), not `DBF_UCHAR`: they carry a menu
+        // index, which `promote_menu_value` lifts to `DBR_ENUM` with the
+        // menu's choice strings. Storing them as `Short` is what makes
+        // them eligible for that promotion — see `promote_menu_value`.
+        CommonField::Ackt => Some(EpicsValue::Short(if common.ackt { 1 } else { 0 })),
+        // DBF_UCHAR: served as UChar (declared type) so the raw put byte
+        // round-trips to the wire — see the DISP/TPRO comment above.
+        CommonField::Udf => Some(EpicsValue::UChar(common.udf)),
+        CommonField::Udfs => Some(EpicsValue::Short(common.udfs)),
+        CommonField::Scan => Some(EpicsValue::Enum(common.scan.to_u16())),
+        CommonField::Sscn => Some(EpicsValue::Enum(common.sscn.to_u16())),
+        // `OLDSIMM` is `DBF_MENU`/`menu(menuSimm)`, stored as the menu index
+        // and promoted to `DBR_ENUM` with the NO/YES/RAW labels by
+        // `promote_menu_value` (shared registry — the saved copy is ALWAYS
+        // menuSimm, unlike the live SIMM). Written only by the simulation
+        // owner (`rec_gbl_save_simm`); `special(SPC_NOMOD)` for clients.
+        CommonField::Oldsimm => Some(EpicsValue::Short(common.oldsimm)),
+        CommonField::Pini => Some(EpicsValue::Short(common.pini)),
+        // DISP/TPRO/RPRO/UDF are `DBF_UCHAR` in `dbCommon.dbd`. Serve them
+        // as `UChar` — their DECLARED type — so `project_to_declared_type`
+        // is identity and the raw put byte reaches the wire untouched (C
+        // stores the byte and `caget` renders `DBR_CHAR` signed: 255 → -1).
+        // Serving `Char` here instead routed the value through the lossy
+        // `Char → UChar` projection (signed −1 clamped to 0), so a
+        // `caput DISP 255` read back as 0 rather than C's -1. `BKPT` is
+        // `DBF_NOACCESS`: no `FieldDesc`, no projection, served `Char`.
+        CommonField::Tpro => Some(EpicsValue::UChar(common.tpro)),
+        CommonField::Bkpt => Some(EpicsValue::Char(common.bkpt.get())),
+        CommonField::Flnk => Some(EpicsValue::String(common.text.flnk.clone().into())),
+        // A record type whose C `.dbd` has no INP has no `.INP` channel
+        // either — C's dbChannel resolution is the dbd, so `dbgf HI.INP` on
+        // a histogram answers "PV 'HI.INP' not found". The port keeps INP on
+        // `CommonFields` for every record, so `declares_inp_link()` is what
+        // stands in for the dbd, and it must gate the read side as well as
+        // the write side (`put_common_field`) — otherwise the field is
+        // unloadable and unwritable yet still resolves as a channel.
+        CommonField::Inp if record.declares_inp_link() => {
+            Some(EpicsValue::String(common.text.inp.clone().into()))
+        }
+        CommonField::Out => Some(EpicsValue::String(common.text.out.clone().into())),
+        // C's DTYP is `DBF_DEVICE`: an epicsEnum16 index into the record
+        // type's device menu, NOT the name. The name is what this port
+        // stores and dispatches on; the index is what the wire carries.
+        CommonField::Dtyp => Some(EpicsValue::Enum(dtyp_index_of(
+            record.record_type(),
+            common.dtyp.as_str(),
+        ))),
+        CommonField::Tse => Some(EpicsValue::Short(common.tse())),
+        CommonField::Tsel => Some(EpicsValue::String(common.text.tsel.clone().into())),
+        // C `UTAG` is DBF_UINT64 — exposed natively as the unsigned
+        // 64-bit value variant so values above i64::MAX round-trip.
+        CommonField::Utag => Some(EpicsValue::UInt64(common.utag)),
+        CommonField::Asg => Some(EpicsValue::String(common.text.asg.clone().into())),
+        CommonField::Asl => Some(EpicsValue::Char(common.asl)),
+        CommonField::Desc => Some(EpicsValue::String(common.text.desc.clone())),
+        CommonField::Phas => Some(EpicsValue::Short(common.phas)),
+        CommonField::Evnt => Some(EpicsValue::String(common.text.evnt.clone())),
+        CommonField::Prio => Some(EpicsValue::Short(common.prio)),
+        CommonField::Disv => Some(EpicsValue::Short(common.disv)),
+        CommonField::Disa => Some(EpicsValue::Short(common.disa)),
+        CommonField::Sdis => Some(EpicsValue::String(common.text.sdis.clone().into())),
+        CommonField::Diss => Some(EpicsValue::Short(common.diss)),
+        CommonField::Hyst => Some(EpicsValue::Double(common.hyst)),
+        CommonField::Lcnt => Some(EpicsValue::Short(common.lcnt)),
+        CommonField::Disp => Some(EpicsValue::UChar(common.disp)),
+        CommonField::Putf => Some(EpicsValue::Char(if common.putf { 1 } else { 0 })),
+        CommonField::Rpro => Some(EpicsValue::UChar(common.rpro)),
+        // C `dbCommon.dbd`: `field(PROC,DBF_UCHAR)` — the raw put byte is
+        // retained in `prec->proc` and served back SIGNED as `DBR_CHAR`
+        // (`caput PROC 255` → `caget` = -1), exactly like DISP/RPRO. The
+        // `pp(TRUE)` force-process is orthogonal: writing PROC still
+        // reprocesses the record (put-path intercept), but the byte sticks.
+        CommonField::Proc => Some(EpicsValue::UChar(common.proc_field)),
+        // Analog alarm fields
+        CommonField::Hihi => common
+            .analog_alarm
+            .as_ref()
+            .map(|a| a.limit(AlarmLimitField::Hihi).to_epics_value()),
+        CommonField::High => common
+            .analog_alarm
+            .as_ref()
+            .map(|a| a.limit(AlarmLimitField::High).to_epics_value()),
+        CommonField::Low => common
+            .analog_alarm
+            .as_ref()
+            .map(|a| a.limit(AlarmLimitField::Low).to_epics_value()),
+        CommonField::Lolo => common
+            .analog_alarm
+            .as_ref()
+            .map(|a| a.limit(AlarmLimitField::Lolo).to_epics_value()),
+        CommonField::Hhsv => common
+            .analog_alarm
+            .as_ref()
+            .map(|a| EpicsValue::Short(a.hhsv)),
+        CommonField::Hsv => common
+            .analog_alarm
+            .as_ref()
+            .map(|a| EpicsValue::Short(a.hsv)),
+        CommonField::Lsv => common
+            .analog_alarm
+            .as_ref()
+            .map(|a| EpicsValue::Short(a.lsv)),
+        CommonField::Llsv => common
+            .analog_alarm
+            .as_ref()
+            .map(|a| EpicsValue::Short(a.llsv)),
+        _ => None,
     }
 }
 
-/// C `dbGet` of `field` (canonical) of `record`, from inside that record's
-/// own processing: the value and the field's metadata from `record` itself,
-/// which needs no lock. What lives behind the lock set — dbCommon's `DESC`
-/// and alarm ladder, the info tags — reads as absent. `None` for a field the
-/// record type does not serve itself (dbCommon's). A link-backed field gets
-/// its C seeds: resolving its link would read through the lock set this
-/// record holds. `meta` is the record's [`RecordDesc::meta`].
-pub(crate) fn own_field_snapshot(
+/// A record read from inside its own processing: its type's code and what
+/// its holder lent it, nothing else behind its lock set.
+struct OwnView<'a> {
+    own: crate::server::record::OwnRecord<'a>,
+    meta: &'static MetaFields,
+}
+
+impl crate::server::record::OwnRecord<'_> {
+    /// [`RecordInstance::resolve_field`] of the record the caller is inside:
+    /// the same chain, through its code and what its holder lent.
+    pub(crate) fn resolve_field(self, name: &str) -> Option<EpicsValue> {
+        let name = upper_field(name);
+        let name = name.as_ref();
+        let record = self.record();
+        let desc = field_desc_of(record, name);
+        let value = match desc {
+            Some(desc) if desc.unreadable() => return None,
+            Some(desc) => record
+                .get_field(name)
+                .or_else(|| match CommonField::by_name(name)? {
+                    CommonField::Pact => Some(EpicsValue::Char(self.pact() as u8)),
+                    field => common_field_of(record, self.common(), field),
+                })
+                .or_else(|| (name == "NAME").then(|| EpicsValue::String(self.name().into())))
+                .or_else(|| self.cold().declared_overrides.get(name).cloned())
+                .or_else(|| declared_default_of(record, name, desc))?,
+            None => EpicsValue::String(self.attribute(name)?.into()),
+        };
+        Some(reader_sees(
+            record,
+            self.common(),
+            self.link_slots(),
+            self.dpvt(),
+            desc,
+            value,
+        ))
+    }
+
+    /// [`RecordInstance::attribute`] of the record the caller is inside.
+    pub(crate) fn attribute(self, name: &str) -> Option<String> {
+        self.cold().attribute(name)
+    }
+}
+
+/// C `dbGet`'s link arm applied to one resolved field of the record whose
+/// code is `record`: a link field reads as `dbGetString` renders it
+/// ([`render_link_field`]), everything else as itself.
+#[inline]
+fn reader_sees(
     record: &dyn Record,
+    common: &CommonFields,
+    link_slots: &LinkSlots,
+    dpvt: &crate::server::device_support::Dpvt,
+    desc: Option<&'static FieldDesc>,
+    value: EpicsValue,
+) -> EpicsValue {
+    let EpicsValue::String(ref text) = value else {
+        return value;
+    };
+    let Some((class, desc)) = desc.and_then(|d| Some((crate::types::link_class_of(d)?, d))) else {
+        return value;
+    };
+    let text = text.as_bytes();
+    let rendered = match link_slots.parse_of(desc.name).map(|l| &**l) {
+        Some(ParsedLink::Removed(ty)) => render_removed_link(class, *ty, text),
+        // [`RecordInstance::inp_is_pn_link`].
+        _ if desc.name == "INP" && dpvt.callback().is_some() => render_pn_link(text),
+        _ if matches!(desc.name, "INP" | "OUT")
+            && super::declared_link_type(
+                record.record_type(),
+                Some(common.dtyp.as_str()),
+                desc.name,
+            ) == Some(super::DbLinkType::PnLink) =>
+        {
+            render_pn_link(text)
+        }
+        _ => render_link_field(class, text),
+    };
+    EpicsValue::String(rendered)
+}
+
+/// [`RecordInstance::declared_default`] of `name`, declared `desc`, on the
+/// record whose code is `record`.
+fn declared_default_of(record: &dyn Record, name: &str, desc: &FieldDesc) -> Option<EpicsValue> {
+    // A `runtime_typed` field (`VAL`/`BG`, re-typed from `FTVL`/`SDEF`) is
+    // record-owned by definition and its placeholder `dbf_type` is not what
+    // it serves; never synthesise one here — the record itself answers it.
+    if desc.runtime_typed {
+        return None;
+    }
+    let initial = desc.initial.unwrap_or("");
+    if let Some(choices) = desc
+        .menu
+        .or_else(|| record.menu_field_choices(name))
+        .or_else(|| super::shared_menu_choices(name))
+    {
+        // A menu field with no `initial(...)` is index 0, exactly as an
+        // empty numeric field is 0 below.
+        if initial.is_empty() {
+            return Some(EpicsValue::Enum(0));
+        }
+        return super::resolve_menu_field_string_db_load(name, choices, desc.dbf_type, initial)
+            .ok();
+    }
+    // `parse` maps an empty string to the declared type's zero, so this one
+    // call serves both `initial(...)` and no-initial fields.
+    EpicsValue::parse_bytes(desc.dbf_type, initial.as_bytes()).ok()
+}
+
+impl FieldMetaSource for OwnView<'_> {
+    fn rec(&self) -> &dyn Record {
+        self.own.record()
+    }
+    fn meta(&self) -> &'static MetaFields {
+        self.meta
+    }
+    fn read_field(&self, field: &str) -> Option<EpicsValue> {
+        self.own.resolve_field(field)
+    }
+    fn enum_string_form(&self, field: &str) -> Option<EnumStringForm> {
+        let record = self.own.record();
+        enum_string_form_with(record, field, || {
+            device_choices_of(record.record_type(), self.own.common().dtyp.as_str())
+        })
+    }
+    fn metadata_at(&self, desc: &'static FieldDesc) -> Option<EpicsValue> {
+        self.own.resolve_field(desc.name)
+    }
+    fn description(&self) -> PvString {
+        self.own.common().text.desc.clone()
+    }
+    // The info tags are behind the lock set.
+    fn q_form_index(&self) -> Option<i16> {
+        None
+    }
+    fn common(&self) -> &CommonFields {
+        self.own.common()
+    }
+}
+
+/// C `dbGet` of `field` (canonical) of the record `own`, from inside that
+/// record's own processing: the value and the field's metadata from its code
+/// and what its holder lent it, which need no lock. The info tags, behind the
+/// lock set, read as absent. A link-backed field gets its C seeds: resolving
+/// its link would read through the lock set this record holds. `meta` is the
+/// record's [`RecordDesc::meta`]; `string_view` is
+/// [`RecordInstance::channel_snapshot_for_field`]'s.
+pub(crate) fn own_field_snapshot(
+    own: crate::server::record::OwnRecord<'_>,
     meta: &'static MetaFields,
     field: &str,
+    string_view: bool,
 ) -> Option<super::super::snapshot::Snapshot> {
-    let value = record.get_field(field)?;
-    let value = match declared_projection_of(declared_field_type_of(record, field), &value, || {
-        record.field_is_long_string(field)
-    }) {
-        Some(declared) => value.into_type(declared),
-        None => value,
+    let view = OwnView { own, meta };
+    let record = own.record();
+    let value = if string_view {
+        crate::server::database::char_view::string_view_value(&own, field)?
+    } else {
+        let value = own.resolve_field(field)?;
+        match declared_projection_of(declared_field_type_of(record, field), &value, || {
+            record.field_is_long_string(field)
+        }) {
+            Some(declared) => value.into_type(declared),
+            None => value,
+        }
     };
-    let mut snap =
-        super::super::snapshot::Snapshot::new(value, 0, 0, std::time::SystemTime::UNIX_EPOCH);
-    OwnRecord(record, meta).finish_metadata(field, LinkBacking::none(), &mut snap);
+    let mut snap = common_snapshot(own.common(), value);
+    view.finish_metadata(field, LinkBacking::none(), &mut snap);
     Some(snap)
+}
+
+/// [`RecordInstance::field_as_dbr_string`] of the record the caller is
+/// inside.
+pub(crate) fn own_field_as_dbr_string(
+    own: crate::server::record::OwnRecord<'_>,
+    meta: &'static MetaFields,
+    field: &str,
+) -> Option<PvString> {
+    let value = own.resolve_field(field)?;
+    OwnView { own, meta }
+        .source_render_of(field, &value)
+        .dbr_string(value)
 }
 
 /// [`field_desc_of`] against a type's table — C `dbFindFieldPart`: the
@@ -6885,14 +7652,18 @@ pub(crate) fn declared_field_type_of<R: Record + ?Sized>(
 }
 
 /// The `DBF_*` type a link to `field` addresses — C `dbNameToAddr`'s
-/// `field_type` once `cvt_dbaddr` has run: the declaration, or, for a
-/// runtime-typed field, the variant the record holds.
+/// `field_type` once `cvt_dbaddr` has run: [`FieldDesc::addressed_dbf`], or,
+/// for a runtime-typed or undeclared field, the variant the record holds.
 pub(crate) fn addressed_field_type_of<R: Record + ?Sized>(
     record: &R,
     field: &str,
-) -> Option<DbFieldType> {
-    declared_field_type_of(record, field)
-        .or_else(|| record.get_field(field).map(|v| v.db_field_type()))
+) -> Option<DbfCode> {
+    match field_desc_of(record, field) {
+        Some(desc) if !desc.runtime_typed => Some(desc.addressed_dbf()),
+        _ => record
+            .get_field(field)
+            .map(|v| v.db_field_type().dbf_code()),
+    }
 }
 
 /// The source record's part of a `DBR_STRING` link read — C's
@@ -6909,17 +7680,6 @@ pub(crate) struct SourceRender {
 }
 
 impl SourceRender {
-    /// The render of a record seen only through its [`Record`] face: no
-    /// display precision or choice table to apply.
-    pub(crate) fn of_record(rec: &dyn Record, field: &str, value: &EpicsValue) -> Self {
-        use crate::server::record::record_trait::FieldDeclaration;
-        Self {
-            long_string: value.is_array() && rec.field_is_long_string(field),
-            precision: None,
-            label: None,
-        }
-    }
-
     /// The value as C `dbGetLink(plink, DBR_STRING, ...)` delivers it: one
     /// element, so an array source converts its element 0 (none, at NORD 0,
     /// is a failed read).
@@ -7072,8 +7832,8 @@ impl RecordInstance {
         let mut link = link;
         if let Some(i) = self.link_slots.position(field) {
             self.invalidate_plan_for(field);
-            self.link_slots.swap(i, &mut link);
-            self.forget_input_entry(field);
+            let write = self.link_slots.swap(i, &mut link);
+            self.slot_written(write);
             return Ok(link);
         }
         if self.swap_link_cache(field, &mut link) {
@@ -7147,11 +7907,11 @@ impl RecordInstance {
         &mut self,
     ) -> crate::error::CaResult<crate::server::record::ProcessOutcome> {
         use crate::server::record::CycleHooks;
-        if self
-            .monitor_plan
-            .hooks
-            .has(CycleHooks::CONTEXT.union(CycleHooks::PROCESS_POSTED))
-        {
+        if self.monitor_plan.hooks.has(
+            CycleHooks::CONTEXT
+                .union(CycleHooks::PROCESS_POSTED)
+                .union(CycleHooks::OWN_FRAME),
+        ) {
             return self.process_hooked();
         }
         self.process_record()
@@ -7168,14 +7928,44 @@ impl RecordInstance {
     #[inline(never)]
     fn process_hooked(&mut self) -> crate::error::CaResult<crate::server::record::ProcessOutcome> {
         self.push_process_context();
-        let result = self.process_record();
+        let result = if self.has_hook(crate::server::record::CycleHooks::OWN_FRAME) {
+            let (record, own) = self.split_own();
+            record.process_own(own)
+        } else {
+            self.process_record()
+        };
         self.drain_process_posts();
         result
     }
 
+    /// The record's code, and the [`crate::server::record::OwnFrame`] its
+    /// holder, the caller, lends it.
+    pub(crate) fn split_own(&mut self) -> (&mut dyn Record, crate::server::record::OwnFrame<'_>) {
+        let own = crate::server::record::OwnFrame::new(
+            self.name.as_bytes(),
+            &self.common,
+            &self.pact,
+            &self.cold,
+            &self.link_slots,
+            &self.dpvt,
+        );
+        (&mut *self.record, own)
+    }
+
+    /// The one [`Record::special`] call: [`Record::special_own`] for a type
+    /// that declares [`crate::server::record::CycleHooks::OWN_FRAME`].
+    pub(crate) fn special(&mut self, field: &str, after: bool) -> crate::error::CaResult<()> {
+        if self.has_hook(crate::server::record::CycleHooks::OWN_FRAME) {
+            let (record, own) = self.split_own();
+            return record.special_own(field, after, own);
+        }
+        self.record.special(field, after, &self.common)
+    }
+
     /// The drain of what a processing step posted: a type without
     /// `PROCESS_POSTED` pays this one bit test. Private: the callers are
-    /// [`Self::process_hooked`] and [`Self::apply_invalid_output_value_and_drain`].
+    /// [`Self::process_hooked`], [`Self::apply_invalid_output_value_and_drain`]
+    /// and [`Self::delayed_callback_fire_and_drain`].
     #[inline(always)]
     fn drain_process_posts(&mut self) {
         if self
@@ -7200,6 +7990,19 @@ impl RecordInstance {
         let applied = self.record.apply_invalid_output_value(ivov);
         self.drain_process_posts();
         applied
+    }
+
+    /// [`Record::delayed_callback_fire`] with this instance's PACT, and the
+    /// drain of what it posted: scaler's `updateCounts` posts the counts from
+    /// the callback itself (`scalerRecord.c:579-588`).
+    pub(crate) fn delayed_callback_fire_and_drain(
+        &mut self,
+        callback: crate::server::record::DelayedCallback,
+    ) -> crate::server::record::DelayedCallbackOutcome {
+        let pact = self.is_processing();
+        let outcome = self.record.delayed_callback_fire(callback, pact);
+        self.drain_process_posts();
+        outcome
     }
 
     /// The table names are upper-case, so the read skips `resolve_field`'s
@@ -7377,6 +8180,7 @@ impl RecordInstance {
             not_simulating,
             device_posts: self.device.as_ref().is_some_and(|d| d.posts_from_device()),
             device_held: self.device.as_ref().is_some_and(|d| d.lends_held()),
+            device_reads_own: self.device.as_ref().is_some_and(|d| d.reads_own()),
         };
         let plain = plan.is_plain_input()
             && not_simulating
@@ -7491,7 +8295,24 @@ impl RecordInstance {
         self.debug_assert_not_slotted(field, &value);
         let put = self.record.put_field_internal(field, value);
         self.refresh_dol_mode(field);
+        self.recount_after_store(field);
         put
+    }
+
+    /// The cell's counts re-read after a store of `field` that no
+    /// `special()` follows; the `dbPut` funnels
+    /// ([`Self::put_declared_field`], [`Self::put_link_field`],
+    /// [`Self::put_common_field_prepared`]) leave it to `dbPut`, which
+    /// settles after its `special()` ([`RecordCell::settle_after_put`]).
+    pub(crate) fn recount_after_store(&self, field: &str) {
+        let moves = match self.cold.recounts {
+            Recounts::Never => false,
+            Recounts::Of(inputs) => inputs.contains(&field),
+            Recounts::Every => true,
+        };
+        if let Some(cell) = moves.then(|| self.cold.cell.upgrade()).flatten() {
+            cell.republish_dbaddr_counts(self);
+        }
     }
 
     /// The funnel for a put of a field the record TYPE declares (as opposed
@@ -7521,6 +8342,7 @@ impl RecordInstance {
             None => Err(CaError::FieldNotFound(field.to_string())),
         };
         self.refresh_dol_mode(field);
+        self.recount_after_store(field);
         stored
     }
 
@@ -7532,16 +8354,18 @@ impl RecordInstance {
         self.invalidate_plan_for(field);
         match PreparedLink::for_put(self.record.field_list(), field, &value) {
             Some(link) => {
-                let field = link.field();
-                self.record.load_field(field, value)?;
-                self.link_slots.install(link);
-                self.forget_input_entry(field);
+                self.record.load_field(link.field(), value)?;
+                if let Some(write) = self.link_slots.install(link) {
+                    self.slot_written(write);
+                }
+                self.recount_after_store(field);
                 Ok(())
             }
             None => {
                 self.debug_assert_not_slotted(field, &value);
                 let put = self.record.load_field(field, value);
                 self.refresh_dol_mode(field);
+                self.recount_after_store(field);
                 put
             }
         }
@@ -7553,8 +8377,9 @@ impl RecordInstance {
         let field = link.field();
         self.invalidate_plan_for(field);
         self.record.put_field(field, value)?;
-        self.link_slots.install(link);
-        self.forget_input_entry(field);
+        if let Some(write) = self.link_slots.install(link) {
+            self.slot_written(write);
+        }
         Ok(())
     }
 
@@ -7574,8 +8399,10 @@ impl RecordInstance {
         let field = link.field();
         self.invalidate_plan_for(field);
         self.record.put_field_internal(field, value)?;
-        self.link_slots.install(link);
-        self.forget_input_entry(field);
+        if let Some(write) = self.link_slots.install(link) {
+            self.slot_written(write);
+        }
+        self.recount_after_store(field);
         Ok(Some(field))
     }
 
@@ -7910,7 +8737,10 @@ impl RecordInstance {
         self.device_done.set_prio(prio);
     }
 
-    pub fn new_boxed(name: impl Into<crate::types::RecordName>, record: Box<dyn Record>) -> Self {
+    pub fn new_boxed(
+        name: impl Into<crate::types::RecordName>,
+        mut record: Box<dyn Record>,
+    ) -> Self {
         let rtype = record.record_type();
         // The reverse index of `Record::link_backed_metadata_field`, built once
         // from the record's own declaration so no second list can go stale.
@@ -7977,6 +8807,9 @@ impl RecordInstance {
         common.analog_alarm = analog_alarm;
         let multi_input_slots = record.multi_input_links().len();
         let link_slots = LinkSlots::of(record.as_ref());
+        for (field, link) in link_slots.fields_and_links() {
+            record.set_link_type(field, link.link_type());
+        }
         let cycle_links = link_slots.cycle_slots();
         let dol_mode = (
             menu_index_of(&*record, "OMSL"),
@@ -8032,6 +8865,7 @@ impl RecordInstance {
             ran_arm: CyclePlan::General,
             cold: Box::new(RecordCold {
                 cell: std::sync::Weak::new(),
+                recounts: Recounts::Never,
                 init_subroutines: None,
                 db: Default::default(),
                 io_intr_pump: None,
@@ -8044,8 +8878,14 @@ impl RecordInstance {
                 info: HashMap::new(),
                 q_form: None,
                 alarm_reset: crate::server::recgbl::EventMask::NONE,
+                delayed_callbacks: Default::default(),
             }),
         }
+    }
+
+    /// The timers of this record's own `CALLBACK`s.
+    pub(crate) fn delayed_callbacks(&self) -> &crate::server::database::DelayedCallbackTimers {
+        &self.cold.delayed_callbacks
     }
 
     /// Record what this cycle's `recGblResetAlarms` returned. See
@@ -8282,7 +9122,13 @@ impl RecordInstance {
         err: &dyn Fn(&str),
     ) -> Option<crate::server::device_support::OwedDeviceInit> {
         let _init = crate::server::database::InitPass::enter();
-        if let Err(e) = self.record.init_record_with_links(reads) {
+        let init = if self.has_hook(crate::server::record::CycleHooks::OWN_FRAME) {
+            let (record, own) = self.split_own();
+            record.init_record_own(reads, own)
+        } else {
+            self.record.init_record_with_links(reads)
+        };
+        if let Err(e) = init {
             crate::stderr_println!("init_record(1) failed for {name}: {e}");
         }
         reads.apply(&mut self.common);
@@ -9266,29 +10112,14 @@ impl RecordInstance {
     /// field with, so a string read pays no second scan for it.
     #[inline]
     fn as_a_reader_sees(&self, desc: Option<&'static FieldDesc>, value: EpicsValue) -> EpicsValue {
-        let EpicsValue::String(ref text) = value else {
-            return value;
-        };
-        let Some((class, desc)) = desc.and_then(|d| Some((crate::types::link_class_of(d)?, d)))
-        else {
-            return value;
-        };
-        let text = text.as_bytes();
-        let rendered = match self.declared_record_link(desc.name).map(|l| &**l) {
-            Some(ParsedLink::Removed(ty)) => render_removed_link(class, *ty, text),
-            _ if desc.name == "INP" && self.inp_is_pn_link() => render_pn_link(text),
-            _ if matches!(desc.name, "INP" | "OUT")
-                && super::declared_link_type(
-                    self.record.record_type(),
-                    Some(self.common.dtyp.as_str()),
-                    desc.name,
-                ) == Some(super::DbLinkType::PnLink) =>
-            {
-                render_pn_link(text)
-            }
-            _ => render_link_field(class, text),
-        };
-        EpicsValue::String(rendered)
+        reader_sees(
+            &*self.record,
+            &self.common,
+            &self.link_slots,
+            &self.dpvt,
+            desc,
+            value,
+        )
     }
 
     /// C `!dbLinkIsDefined(plink)` for a link a runtime put removed or its
@@ -9375,30 +10206,7 @@ impl RecordInstance {
     /// `initial()` into the fields the record *does* store, from the same
     /// generated table, so the two paths agree by construction.
     fn declared_default(&self, name: &str) -> Option<EpicsValue> {
-        let desc = self.field_desc(name)?;
-        // A `runtime_typed` field (`VAL`/`BG`, re-typed from `FTVL`/`SDEF`) is
-        // record-owned by definition and its placeholder `dbf_type` is not what
-        // it serves; never synthesise one here — the record itself answers it.
-        if desc.runtime_typed {
-            return None;
-        }
-        let initial = desc.initial.unwrap_or("");
-        if let Some(choices) = desc
-            .menu
-            .or_else(|| self.record.menu_field_choices(name))
-            .or_else(|| super::shared_menu_choices(name))
-        {
-            // A menu field with no `initial(...)` is index 0, exactly as an
-            // empty numeric field is 0 below.
-            if initial.is_empty() {
-                return Some(EpicsValue::Enum(0));
-            }
-            return super::resolve_menu_field_string_db_load(name, choices, desc.dbf_type, initial)
-                .ok();
-        }
-        // `parse` maps an empty string to the declared type's zero, so this one
-        // call serves both `initial(...)` and no-initial fields.
-        EpicsValue::parse_bytes(desc.dbf_type, initial.as_bytes()).ok()
+        declared_default_of(&*self.record, name, self.field_desc(name)?)
     }
 
     /// Resolve a field for EPICS `$` long-string (character-array) access:
@@ -9408,9 +10216,7 @@ impl RecordInstance {
     /// one owner of the `$` rule, so a long-string record's `VAL` (a CHAR
     /// carrier here, `DBF_STRING` to C) takes the modifier like any string.
     pub fn resolve_string_view_field(&self, name: &str) -> Option<EpicsValue> {
-        let mut text = crate::server::database::char_view::char_view(self, name)?.bytes();
-        text.truncate(text.iter().position(|&c| c == 0).unwrap_or(text.len()));
-        Some(EpicsValue::String(crate::types::PvString::from_bytes(text)))
+        crate::server::database::char_view::string_view_value(self, name)
     }
 
     /// Choice table for a field served as `DBR_ENUM` from a `DBF_MENU`:
@@ -9444,9 +10250,7 @@ impl RecordInstance {
     }
 
     fn has_device_list(&self) -> bool {
-        let record_type = self.record.record_type();
-        super::dbd_generated::device_menu(record_type).is_some()
-            || super::has_contributed_device_menu(record_type)
+        has_device_list_of(self.record.record_type())
     }
 
     /// The choices this record's `DTYP` selects among — C's `dbDeviceMenu` for
@@ -9476,33 +10280,7 @@ impl RecordInstance {
     /// `record(calc,"X"){}` — whose record type has no `device()` line — served
     /// `value.choices = {0}[]` where QSRV2 omits the leaf entirely.
     pub(crate) fn device_choices(&self) -> Option<Vec<PvString>> {
-        let record_type = self.record.record_type();
-        // Base's build-time menu (`epics-base-rs/dbd`), then the menus a
-        // downstream crate whose device support has no vendored `device()` line
-        // registered at runtime (asyn's `asynInt32`, `asynFloat64`, ...). C's
-        // `dbDeviceMenu` is the concatenation of every `device()` the loaded
-        // `.dbd` set declares, in load order — base first, then asyn — so the
-        // merge appends the contributed choices AFTER the declared ones.
-        // The C None-vs-empty distinction (`dbAccess.c:176-179` vs `:205`): the
-        // menu is present iff the loaded `.dbd` set declares ANY `device()` for
-        // this type. A type base declares none for but asyn does (structurally
-        // possible, though none of asyn's are such) is therefore present, not
-        // None; a type neither declares for (calc) stays None.
-        if !self.has_device_list() {
-            return None;
-        }
-        // `merged_device_menu` = declared + contributed, the SAME source the
-        // CA-put validation (`coerce_put_value`'s DTYP branch) resolves against,
-        // so a client can put exactly the DTYP names it can read here.
-        let mut names: Vec<PvString> = super::merged_device_menu(record_type)
-            .into_iter()
-            .map(PvString::from)
-            .collect();
-        let dtyp = self.common.dtyp.as_str();
-        if !dtyp.is_empty() && !names.iter().any(|n| n.as_str_lossy() == dtyp) {
-            names.push(PvString::from(dtyp));
-        }
-        Some(names)
+        device_choices_of(self.record.record_type(), self.common.dtyp.as_str())
     }
 
     /// C `dbPutFieldLink`'s link-type gate (`dbAccess.c:1125-1137`): a link
@@ -9538,22 +10316,6 @@ impl RecordInstance {
         )
     }
 
-    /// The value of the `DTYP` field: the index of the bound device support in
-    /// [`Self::device_choices`]. An unset DTYP is index 0, exactly as in C.
-    pub(crate) fn dtyp_index(&self) -> u16 {
-        let dtyp = self.common.dtyp.as_str();
-        if dtyp.is_empty() {
-            return 0;
-        }
-        // A record type with no device menu has no slot for any DTYP, so the
-        // index stays 0 — the same answer the old `unwrap_or(&[])` gave.
-        self.device_choices()
-            .unwrap_or_default()
-            .iter()
-            .position(|c| c.as_str_lossy() == dtyp)
-            .unwrap_or(0) as u16
-    }
-
     /// **The** owner of "what string does this enum-valued field render as" —
     /// C's `[DBF_*][DBR_STRING]` conversion row, chosen by the field's DBF
     /// class. Every path that renders an enum as a string goes through here:
@@ -9581,51 +10343,6 @@ impl RecordInstance {
         enum_string_form_with(self.record.as_ref(), field, || self.device_choices())
     }
 
-    /// Is `field` one of the DBF classes C's soft device support writes as
-    /// `DBR_STRING`?
-    ///
-    /// `devsCalcoutSoft.c:128-130` (and its async twin, :83-85) switches the
-    /// scalcout OUT put on the TARGET field's DBF type and sends `OSV` — the
-    /// string result — for seven of them:
-    ///
-    /// ```c
-    /// case DBF_STRING: case DBF_ENUM: case DBF_MENU: case DBF_DEVICE:
-    /// case DBF_INLINK: case DBF_OUTLINK: case DBF_FWDLINK:
-    ///     status = dbPutLink(&pscalcout->out, DBR_STRING, &pscalcout->osv, 1);
-    /// ```
-    ///
-    /// [`DbFieldType`] is the port's DBR *wire* type and cannot express
-    /// `DBF_MENU` / `DBF_DEVICE` — C's DBF class is not the DBR type. The
-    /// classification therefore lives here, with the record's field metadata,
-    /// where each class is already known:
-    ///
-    /// * `DBF_STRING` and the three link classes — the port stores links and
-    ///   `DTYP` (C's only `DBF_DEVICE` field) as strings;
-    /// * `DBF_ENUM` — an enum-typed field;
-    /// * `DBF_MENU` — a menu-index field, i.e. one this record resolves choice
-    ///   labels for ([`Self::menu_choices_for`]): `PRIO`, `STAT`, `SEVR`,
-    ///   `DISS`, `ACKT`, `SCAN`, `IVOA`, `OMSL`, … The index is stored as a
-    ///   short, so a same-named field that is NOT a menu index (scalcout's
-    ///   string `OSV` shares a name with the alarm-severity menu) is
-    ///   classified by its own type, not by the name collision.
-    ///
-    /// Everything else (`DBF_DOUBLE`, `DBF_LONG`, `DBF_CHAR`, …) falls to the
-    /// device support's `default:` arm.
-    ///
-    /// The question is about the target field's DECLARED class, so it is asked
-    /// of the declaration ([`Self::declared_field_type`]) and not of the
-    /// variant the record stores: C's `switch` is on `dbAddr.field_type`, which
-    /// `dbNameToAddr` took from the `dbFldDes`. `DBF_MENU` and `DBF_DEVICE` both
-    /// map to `DbFieldType::Enum` in the generated tables (`mapDBFToDBR`), and
-    /// the three link classes to `DbFieldType::String`, so the seven C arms are
-    /// exactly these two.
-    pub(crate) fn field_puts_as_string(&self, field: &str) -> bool {
-        let Some(declared) = self.declared_field_type(field) else {
-            return false;
-        };
-        matches!(declared, DbFieldType::String | DbFieldType::Enum)
-    }
-
     /// The field's value as C `dbGetLink(plink, DBR_STRING, ...)` delivers it —
     /// the SOURCE side of an input link read with
     /// [`LinkReadAs::String`].
@@ -9645,92 +10362,6 @@ impl RecordInstance {
     pub(crate) fn field_as_dbr_string(&self, field: &str) -> Option<PvString> {
         let value = self.resolve_field(field)?;
         self.source_render_of(field, &value).dbr_string(value)
-    }
-
-    /// What [`SourceRender`] needs of this record to render `value`, just read
-    /// from `field`, as `DBR_STRING`: taken under the read's hold, so the
-    /// render after it never goes back for the record.
-    ///
-    /// C `dbGetLink` converts at the source, through `dbConvert.c`'s
-    /// `[field_type][DBR_STRING]` table, inside `dbGet`: a float field renders
-    /// at its own precision (`getDoubleString`), a `DBF_ENUM`/`DBF_MENU` index
-    /// as its state label (`getEnumString`/`getMenuString`), and a long-string
-    /// field is `DBF_STRING` to C's `cvt_dbaddr`, not an array. The label goes
-    /// through [`Self::enum_string_form_for`], the owner the CA/PVA encoders
-    /// use, so a link read and a `caget -t` of one field cannot disagree.
-    pub(crate) fn source_render_of(&self, field: &str, value: &EpicsValue) -> SourceRender {
-        // Only an array value reads the flag, so a scalar pays no lookup.
-        let long_string = value.is_array() && self.record.field_is_long_string(field);
-        let mut render = SourceRender {
-            long_string,
-            precision: None,
-            label: None,
-        };
-        let head = if value.is_array() && !long_string {
-            value.first_element()
-        } else {
-            None
-        };
-        match head.as_ref().unwrap_or(value) {
-            EpicsValue::Double(_) | EpicsValue::Float(_) => {
-                render.precision = Some(self.dbr_string_precision(field, value));
-            }
-            // A `DBF_ENUM` index, and a `DBF_MENU` index (stored as a short),
-            // render through the field's string source. A short field that is
-            // neither has no source and stays the plain number C converts it to.
-            &EpicsValue::Enum(idx) => render.label = self.label_of(field, idx),
-            // A menu index is an `epicsEnum16`: a negative short reads as its
-            // unsigned bits, which `cvt_menu_st` prints with `%u`.
-            &EpicsValue::Short(v) => render.label = self.label_of(field, v as u16),
-            _ => {}
-        }
-        render
-    }
-
-    /// [`Self::enum_string_form_for`]'s label for `idx`; a menu's or a `VAL`
-    /// state's is cloned from where it lives, without building the form under
-    /// the read's hold.
-    fn label_of(&self, field: &str, idx: u16) -> Option<PvString> {
-        let desc = field_desc_of(self.record.as_ref(), field);
-        if is_device(desc) {
-            // `cvt_device_st`: a type with no device menu reads ""
-            // (`dbFastLinkConv.c:1615-1618`).
-            return Some(
-                self.device_choices()
-                    .map_or_else(PvString::default, |c| EnumStringForm::device(c).render(idx)),
-            );
-        }
-        if let Some(choices) = menu_choices_with(self.record.as_ref(), field, desc) {
-            return Some(match choices.get(idx as usize) {
-                Some(choice) => PvString::from(*choice),
-                None => PvString::from(idx.to_string().as_str()),
-            });
-        }
-        if field.eq_ignore_ascii_case("VAL") {
-            return self
-                .record
-                .enum_slots()
-                .map(|slots| PvString::from(slots.label(idx)));
-        }
-        self.enum_string_form_for(field)
-            .map(|form| form.render(idx))
-    }
-
-    /// C `getDoubleString`'s precision for `field` holding `value`: seeded 6
-    /// and overwritten by the rset's `get_precision` — the answer the
-    /// DBR_STRING encoder reads off [`Snapshot::precision`].
-    ///
-    /// [`Snapshot::precision`]: crate::server::snapshot::Snapshot::precision
-    fn dbr_string_precision(&self, field: &str, value: &EpicsValue) -> u16 {
-        let meta = self.meta();
-        let support = meta.slots.narrowed_to_field(value.db_field_type(), false);
-        if !support.precision {
-            return 6;
-        }
-        self.record
-            .field_metadata_override(field)
-            .and_then(|ov| ov.precision)
-            .unwrap_or_else(|| self.metadata_limit(meta.prec) as i16) as u16
     }
 
     /// The field's declaration — its `dbFldDes`, in C's terms.
@@ -9933,28 +10564,7 @@ impl RecordInstance {
         value: EpicsValue,
         backing: LinkBacking<'_>,
     ) -> super::super::snapshot::Snapshot {
-        let mut snap = super::super::snapshot::Snapshot::new(
-            value,
-            self.common.stat,
-            self.common.sevr as u16,
-            self.common.time,
-        );
-        // Default the served `timeStamp.userTag` to the record's `utag`,
-        // mirroring pvxs `iocsource.cpp:245` (`auto utag = meta.utag;`).
-        // The 64-bit `epicsUTag` narrows to the int32 NT wire field by
-        // truncating to the low 32 bits — pvxs assigns the same uint64
-        // straight into the `Int32` `timeStamp.userTag`. A PVA reader's
-        // `Q:time:tag` split overrides this when configured, matching
-        // pvxs `if(info.nsecMask) utag = meta.time.nsec & info.nsecMask;`
-        // (:246-247 — the test and its assignment); CA serves it raw.
-        snap.user_tag = self.common.utag as i32;
-        // Carry the record's committed alarm message (`common.amsg`) so a
-        // PVA read serves `alarm.message` from the record's own amsg
-        // (pvxs `iocsource.cpp:230-236` prefers `meta.amsg`) rather than a
-        // string re-synthesized from the condition code. Empty for records
-        // that raise no message (C's plain `recGblSetSevr` clears namsg).
-        snap.alarm.amsg = String::from(&self.common.amsg);
-
+        let mut snap = common_snapshot(&self.common, value);
         self.finish_metadata(field, backing, &mut snap);
         snap
     }
@@ -10044,133 +10654,10 @@ impl RecordInstance {
     /// The value of the field [`Self::get_common_field`] answers as `field`.
     fn common_field(&self, field: CommonField) -> Option<EpicsValue> {
         match field {
-            CommonField::Sevr => Some(EpicsValue::Short(self.common.sevr as i16)),
-            CommonField::Stat => Some(EpicsValue::Short(self.common.stat as i16)),
-            CommonField::Nsev => Some(EpicsValue::Short(self.common.nsev as i16)),
-            CommonField::Nsta => Some(EpicsValue::Short(self.common.nsta as i16)),
-            // epics-base PR #568 / #566 — alarm message string.
-            CommonField::Amsg => Some(EpicsValue::String(String::from(&self.common.amsg).into())),
-            CommonField::Namsg => Some(EpicsValue::String(String::from(&self.common.namsg).into())),
-            CommonField::Acks => Some(EpicsValue::Short(self.common.acks as i16)),
-            // `ACKT` and `PINI` are `DBF_MENU` (`menuYesNo` /`menuPini`,
-            // `dbCommon.dbd.pod:335,169`), not `DBF_UCHAR`: they carry a menu
-            // index, which `promote_menu_value` lifts to `DBR_ENUM` with the
-            // menu's choice strings. Storing them as `Short` is what makes
-            // them eligible for that promotion — see `promote_menu_value`.
-            CommonField::Ackt => Some(EpicsValue::Short(if self.common.ackt { 1 } else { 0 })),
-            // DBF_UCHAR: served as UChar (declared type) so the raw put byte
-            // round-trips to the wire — see the DISP/TPRO comment above.
-            CommonField::Udf => Some(EpicsValue::UChar(self.common.udf)),
-            CommonField::Udfs => Some(EpicsValue::Short(self.common.udfs)),
-            CommonField::Scan => Some(EpicsValue::Enum(self.common.scan.to_u16())),
-            CommonField::Sscn => Some(EpicsValue::Enum(self.common.sscn.to_u16())),
-            // `OLDSIMM` is `DBF_MENU`/`menu(menuSimm)`, stored as the menu index
-            // and promoted to `DBR_ENUM` with the NO/YES/RAW labels by
-            // `promote_menu_value` (shared registry — the saved copy is ALWAYS
-            // menuSimm, unlike the live SIMM). Written only by the simulation
-            // owner (`rec_gbl_save_simm`); `special(SPC_NOMOD)` for clients.
-            CommonField::Oldsimm => Some(EpicsValue::Short(self.common.oldsimm)),
-            CommonField::Pini => Some(EpicsValue::Short(self.common.pini)),
-            // DISP/TPRO/RPRO/UDF are `DBF_UCHAR` in `dbCommon.dbd`. Serve them
-            // as `UChar` — their DECLARED type — so `project_to_declared_type`
-            // is identity and the raw put byte reaches the wire untouched (C
-            // stores the byte and `caget` renders `DBR_CHAR` signed: 255 → -1).
-            // Serving `Char` here instead routed the value through the lossy
-            // `Char → UChar` projection (signed −1 clamped to 0), so a
-            // `caput DISP 255` read back as 0 rather than C's -1. `BKPT` is
-            // `DBF_NOACCESS`: no `FieldDesc`, no projection, served `Char`.
-            CommonField::Tpro => Some(EpicsValue::UChar(self.common.tpro)),
-            CommonField::Bkpt => Some(EpicsValue::Char(self.common.bkpt.get())),
-            CommonField::Flnk => Some(EpicsValue::String(self.common.text.flnk.clone().into())),
-            // A record type whose C `.dbd` has no INP has no `.INP` channel
-            // either — C's dbChannel resolution is the dbd, so `dbgf HI.INP` on
-            // a histogram answers "PV 'HI.INP' not found". The port keeps INP on
-            // `CommonFields` for every record, so `declares_inp_link()` is what
-            // stands in for the dbd, and it must gate the read side as well as
-            // the write side (`put_common_field`) — otherwise the field is
-            // unloadable and unwritable yet still resolves as a channel.
-            CommonField::Inp if self.record.declares_inp_link() => {
-                Some(EpicsValue::String(self.common.text.inp.clone().into()))
-            }
-            CommonField::Out => Some(EpicsValue::String(self.common.text.out.clone().into())),
-            // C's DTYP is `DBF_DEVICE`: an epicsEnum16 index into the record
-            // type's device menu, NOT the name. The name is what this port
-            // stores and dispatches on; the index is what the wire carries.
-            CommonField::Dtyp => Some(EpicsValue::Enum(self.dtyp_index())),
-            CommonField::Tse => Some(EpicsValue::Short(self.common.tse())),
-            CommonField::Tsel => Some(EpicsValue::String(self.common.text.tsel.clone().into())),
-            // C `UTAG` is DBF_UINT64 — exposed natively as the unsigned
-            // 64-bit value variant so values above i64::MAX round-trip.
-            CommonField::Utag => Some(EpicsValue::UInt64(self.common.utag)),
-            CommonField::Asg => Some(EpicsValue::String(self.common.text.asg.clone().into())),
-            CommonField::Asl => Some(EpicsValue::Char(self.common.asl)),
-            CommonField::Desc => Some(EpicsValue::String(self.common.text.desc.clone())),
-            CommonField::Phas => Some(EpicsValue::Short(self.common.phas)),
-            CommonField::Evnt => Some(EpicsValue::String(self.common.text.evnt.clone())),
-            CommonField::Prio => Some(EpicsValue::Short(self.common.prio)),
-            CommonField::Disv => Some(EpicsValue::Short(self.common.disv)),
-            CommonField::Disa => Some(EpicsValue::Short(self.common.disa)),
-            CommonField::Sdis => Some(EpicsValue::String(self.common.text.sdis.clone().into())),
-            CommonField::Diss => Some(EpicsValue::Short(self.common.diss)),
-            CommonField::Hyst => Some(EpicsValue::Double(self.common.hyst)),
-            CommonField::Lcnt => Some(EpicsValue::Short(self.common.lcnt)),
-            CommonField::Disp => Some(EpicsValue::UChar(self.common.disp)),
-            CommonField::Putf => Some(EpicsValue::Char(if self.common.putf { 1 } else { 0 })),
-            CommonField::Rpro => Some(EpicsValue::UChar(self.common.rpro)),
             CommonField::Pact => Some(EpicsValue::Char(
-                (self.is_processing()
-                    || (self.cold.cell.upgrade())
-                        .is_some_and(|cell| cell.chain_pact.load(Ordering::Relaxed)))
-                    as u8,
+                pact_field(&self.pact, &self.cold.cell) as u8
             )),
-            // C `dbCommon.dbd`: `field(PROC,DBF_UCHAR)` — the raw put byte is
-            // retained in `prec->proc` and served back SIGNED as `DBR_CHAR`
-            // (`caput PROC 255` → `caget` = -1), exactly like DISP/RPRO. The
-            // `pp(TRUE)` force-process is orthogonal: writing PROC still
-            // reprocesses the record (put-path intercept), but the byte sticks.
-            CommonField::Proc => Some(EpicsValue::UChar(self.common.proc_field)),
-            // Analog alarm fields
-            CommonField::Hihi => self
-                .common
-                .analog_alarm
-                .as_ref()
-                .map(|a| a.limit(AlarmLimitField::Hihi).to_epics_value()),
-            CommonField::High => self
-                .common
-                .analog_alarm
-                .as_ref()
-                .map(|a| a.limit(AlarmLimitField::High).to_epics_value()),
-            CommonField::Low => self
-                .common
-                .analog_alarm
-                .as_ref()
-                .map(|a| a.limit(AlarmLimitField::Low).to_epics_value()),
-            CommonField::Lolo => self
-                .common
-                .analog_alarm
-                .as_ref()
-                .map(|a| a.limit(AlarmLimitField::Lolo).to_epics_value()),
-            CommonField::Hhsv => self
-                .common
-                .analog_alarm
-                .as_ref()
-                .map(|a| EpicsValue::Short(a.hhsv)),
-            CommonField::Hsv => self
-                .common
-                .analog_alarm
-                .as_ref()
-                .map(|a| EpicsValue::Short(a.hsv)),
-            CommonField::Lsv => self
-                .common
-                .analog_alarm
-                .as_ref()
-                .map(|a| EpicsValue::Short(a.lsv)),
-            CommonField::Llsv => self
-                .common
-                .analog_alarm
-                .as_ref()
-                .map(|a| EpicsValue::Short(a.llsv)),
-            _ => None,
+            field => common_field_of(&*self.record, &self.common, field),
         }
     }
 
@@ -10600,6 +11087,7 @@ impl RecordInstance {
         let put = self
             .put_common_field_with(name, value, bound, &mut link)
             .map(|moved| moved.unlent(self));
+        self.recount_after_store(name);
         let scan = match link.as_mut() {
             Some(link) => self.take_link_scan(link).unlent(self),
             None => CommonFieldPutResult::NoChange,
@@ -10629,7 +11117,9 @@ impl RecordInstance {
         value: EpicsValue,
         link: &mut Option<PreparedCommonLink>,
     ) -> CaResult<ScanMove> {
-        self.put_common_field_with(name, value, MenuBound::DbLoad, link)
+        let put = self.put_common_field_with(name, value, MenuBound::DbLoad, link);
+        self.recount_after_store(name);
+        put
     }
 
     /// C `dbPutFieldLink`'s `isDevLink` arm (`dbAccess.c:1127-1131`,
@@ -10887,24 +11377,28 @@ impl RecordInstance {
     /// `dbPutSpecial(paddr, 0)` refuses an `SPC_NOMOD` field, and the error
     /// path does not restore it, so aSub's SUBL reads nothing afterwards.
     pub(crate) fn remove_link_slot(&mut self, i: usize) {
-        let field = self.link_slots.field(i);
-        self.invalidate_plan_for(field);
-        self.link_slots.remove(i);
-        self.forget_input_entry(field);
+        self.invalidate_plan_for(self.link_slots.field(i));
+        let write = self.link_slots.remove(i);
+        self.slot_written(write);
     }
 
-    /// Drop `field`'s [`Self::parsed_inputs`] entry after its slot was
-    /// written, so the next read takes the slot's new parse.
-    fn forget_input_entry(&mut self, field: &str) {
-        if let Some(i) = self
+    /// Finish a slot write: drop the field's [`Self::parsed_inputs`] entry,
+    /// so the next read takes the slot's new parse, and give the record the
+    /// link type the new parse has ([`Record::set_link_type`]).
+    fn slot_written(&mut self, write: SlotWrite) {
+        let i = write.slot();
+        let field = self.link_slots.field(i);
+        if let Some(input) = self
             .record
             .multi_input_links()
             .iter()
             .position(|(f, _)| *f == field)
-            && let Some(entry) = self.parsed_inputs.get_mut(i)
+            && let Some(entry) = self.parsed_inputs.get_mut(input)
         {
             *entry = None;
         }
+        let link_type = self.link_slots.at(i).link_type();
+        self.record.set_link_type(field, link_type);
     }
 
     /// An `openLink` that left `field`'s link with no lset
@@ -10921,7 +11415,8 @@ impl RecordInstance {
             return;
         };
         if let Some(i) = self.link_slots.position(field) {
-            self.link_slots.remove(i);
+            let write = self.link_slots.remove(i);
+            self.slot_written(write);
         }
         if let Some(slot) = self
             .record
@@ -11076,7 +11571,7 @@ impl RecordInstance {
                 let moved = self.set_scan(new_scan);
                 if !matches!(moved, ScanMove::Done(CommonFieldPutResult::NoChange)) {
                     self.record.on_put(&name);
-                    if let Err(e) = self.record.special(&name, true, &self.common) {
+                    if let Err(e) = self.special(&name, true) {
                         let _ = moved.unlent(self);
                         return Err(e);
                     }
@@ -11256,7 +11751,7 @@ impl RecordInstance {
                     if old_phas != v && self.common.scan.scan_list().is_some() {
                         let scan = self.common.scan;
                         self.record.on_put(&name);
-                        self.record.special(&name, true, &self.common)?;
+                        self.special(&name, true)?;
                         return Ok(ScanMove::Done(CommonFieldPutResult::PhasChanged {
                             scan,
                             old_phas,
@@ -11441,7 +11936,7 @@ impl RecordInstance {
         // `dbPutSpecial(paddr, 1)` status to the caller — the stored value
         // stays, but the monitor post and the process are skipped and the
         // client sees the failure. Never drop it.
-        let special = self.record.special(&name, true, &self.common);
+        let special = self.special(&name, true);
         match link {
             Some(link) if matches!(&*name, "INP" | "OUT") => {
                 self.rebind_device_link(bound, link, special)?
@@ -11541,8 +12036,8 @@ impl RecordInstance {
                 if let (Some(i), EpicsValue::String(text)) =
                     (self.link_slots.position(desc.name), &coerced)
                 {
-                    self.link_slots.install_text(i, desc, text.as_bytes());
-                    self.forget_input_entry(desc.name);
+                    let write = self.link_slots.install_text(i, desc, text.as_bytes());
+                    self.slot_written(write);
                 }
                 self.cold
                     .declared_overrides
@@ -11568,14 +12063,7 @@ impl RecordInstance {
     /// `dbFindFieldPart` missed, so `motor.VERS` hides the attribute — and on
     /// a record no database owns.
     pub(crate) fn attribute(&self, name: &str) -> Option<String> {
-        let cell = self.cold.cell.upgrade()?;
-        if cell.declares_name(name) {
-            return None;
-        }
-        self.cold
-            .db
-            .upgrade()?
-            .record_type_attribute(self.record.record_type(), name)
+        self.cold.attribute(name)
     }
 
     /// Evaluate alarms based on record type and current value.
@@ -12755,11 +13243,11 @@ impl RecordInstance {
         (classes.value, classes.archive)
     }
 
-    /// The record's half of every field log a post makes now
-    /// (`db_create_field_log`, `dbEvent.c:704-713`). `always`: every
+    /// The record's half of every field log a post or a filtered read makes
+    /// now (`db_create_field_log`, `dbEvent.c:704-713`). `always`: every
     /// monitored post runs it, and out of line it cost +32 instr/cycle.
     #[inline(always)]
-    fn log_head(&self) -> crate::server::pv::LogHead {
+    pub fn log_head(&self) -> crate::server::pv::LogHead {
         #[cfg(test)]
         HEADS.with(|n| n.set(n.get() + 1));
         crate::server::pv::LogHead {
@@ -14064,6 +14552,13 @@ mod record_cell_layout_tests {
             bkpt,
             string_typed,
             dbaddr_counts,
+            runtime_types,
+            cvt_pending_more,
+            cvt_resolved,
+            long_string_size,
+            form_string,
+            off_list_facts,
+            nsec_mask,
         });
         packed_in_order(cell);
 
@@ -14157,7 +14652,10 @@ mod device_menu_marking_tests {
     #[test]
     fn dtyp_index_is_zero_when_the_record_type_has_no_device_menu() {
         let inst = RecordInstance::new("X", CalcRecord::default());
-        assert_eq!(inst.dtyp_index(), 0);
+        assert_eq!(
+            inst.common_field(CommonField::Dtyp),
+            Some(EpicsValue::Enum(0))
+        );
     }
 
     /// A DTYP put runs under the record's hold, so a menu choice must land as
@@ -14197,7 +14695,7 @@ mod device_menu_marking_tests {
     /// A downstream crate's registered device menu (asyn's) is merged AFTER the
     /// base-declared choices, matching a C fat softIoc that loaded `asyn.dbd`:
     /// `mbbo.DTYP` = the three base soft entries then `asynInt32`,
-    /// `asynUInt32Digital`, in that order. `dtyp_index` reads the merged list,
+    /// `asynUInt32Digital`, in that order. The `DTYP` read indexes the merged list,
     /// so an `mbbo` bound to `asynInt32` reports index 3 — the wire value C
     /// serves — instead of the appended-as-own-slot index the port gave before
     /// the menu was known.
@@ -14229,8 +14727,8 @@ mod device_menu_marking_tests {
 
         inst.common.dtyp = "asynInt32".into();
         assert_eq!(
-            inst.dtyp_index(),
-            3,
+            inst.common_field(CommonField::Dtyp),
+            Some(EpicsValue::Enum(3)),
             "an asyn DTYP indexes into the merged menu, not an appended own slot"
         );
     }
@@ -17424,6 +17922,26 @@ mod mlis_tests {
         assert!(owning >= 28, "{owning} owned common names");
     }
 
+    /// An info tag set on a live record reaches the facts the cell settled
+    /// from it, as pvxs reads the tag afresh for each channel.
+    #[epics_macros_rs::epics_test]
+    async fn an_info_tag_set_on_a_live_record_resettles_its_facts() {
+        let (db, _) = crate::server::ioc_builder::IocBuilder::new()
+            .db_string(r#"record(ai, "INFO:LIVE") {}"#, &Default::default())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        db.ioc_init().await;
+        let rec = db.get_record("INFO:LIVE").unwrap();
+        assert!(!rec.form_string());
+        assert_eq!(rec.qtime_nsec_mask(), 0);
+        rec.write().set_info("Q:form", "String");
+        rec.write().set_info("Q:time:tag", "nsec:lsb:4");
+        assert!(rec.form_string());
+        assert_eq!(rec.qtime_nsec_mask(), 0xF);
+    }
+
     /// A record whose one monitor watches the field its cycle posts: a
     /// by-name match there answers from `ptr::eq` before any byte, so only a
     /// count taken on entry to `watches_str` sees it.
@@ -17447,7 +17965,14 @@ mod mlis_tests {
         db.put_record_field_from_ca_no_notify("CL:PTR", "PROC", EpicsValue::Short(1))
             .await
             .unwrap();
-        crate::runtime::task::sleep(std::time::Duration::from_millis(300)).await;
+        // The ODLY callback's pass clears DLYA, then PACT.
+        crate::runtime::task::timeout(fact_budget::FACT_BUDGET, async {
+            while rec.read().is_processing() {
+                crate::runtime::task::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("CL:PTR never left PACT");
         assert_eq!(NAME_BYTE_COMPARES.with(|n| n.get()), 0);
         assert_eq!(drained(&mut rx).len(), 2, "DLYA set and cleared");
     }
@@ -17966,7 +18491,7 @@ mod link_cache_fact_tests {
         let mut inst = RecordInstance::new("LCF", AiRecord::new(0.0));
         let fresh = &inst.parsed_out;
         assert!(fresh.is_constant() && !fresh.is_writable_out_link());
-        for text in ["OTHER.VAL", "5", "ca://OTHER", "@hw 1", "OTHER NPP", ""] {
+        for text in ["OTHER.VAL", "5", "OTHER CA", "@hw 1", "OTHER NPP", ""] {
             let parse = parse_link_field(text, LinkFieldType::Out);
             for field in ["OUT", "SDIS", "FLNK"] {
                 assert!(inst.set_link_cache(field, parse.clone()));
@@ -18005,7 +18530,7 @@ mod link_cache_fact_tests {
             ("OTHER.VAL NPP MSI", None, MonitorSwitch::MaximizeIfInvalid),
             // C `dbParseLink` defaults an output link to NPP.
             ("OTHER", None, MonitorSwitch::NoMaximize),
-            ("ca://OTHER.PROC MSS", None, MonitorSwitch::MaximizeStatus),
+            ("OTHER.PROC CA MSS", None, MonitorSwitch::MaximizeStatus),
             ("5", None, MonitorSwitch::NoMaximize),
         ] {
             assert!(inst.set_link_cache("OUT", parse_link_field(text, LinkFieldType::Out)));
@@ -18186,7 +18711,7 @@ record(stringout, "SOI") { field(OMSL, "closed_loop") field(DOL, "BAD MS")
             let rec = db.get_record("R").unwrap();
             let rdes = rec.rdes();
             for (i, desc) in rdes.fields.iter().enumerate() {
-                let (Some(slot), Some(recorded)) = (rec.slots[i], rec.put_facts[i].kind) else {
+                let (Some(slot), Some(recorded)) = (rec.slots[i], rec.put_facts[i].lean) else {
                     continue;
                 };
                 if lean_put_fn(rdes.record_type, desc, slot, recorded) == PutFn::General {

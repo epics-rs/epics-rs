@@ -34,9 +34,8 @@ struct Parked {
 
 fn at_5() -> MotorStatus {
     MotorStatus {
-        position: 5.0,
         done: true,
-        ..MotorStatus::default()
+        ..MotorStatus::default().with_position(5.0)
     }
 }
 

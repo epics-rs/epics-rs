@@ -257,6 +257,20 @@ pub fn block_on_sync<F: Future>(fut: F) -> Result<F::Output, NotBlockable> {
     }
 }
 
+/// Drive a dedicated thread's loop on the current-thread runtime the thread
+/// owns: a port actor's, a driver's or a plugin's, each looping on its queue
+/// for life as C's thread does.
+///
+/// A `block_on` grows the deferred-waker list it keeps on its first deferred
+/// yield, which a loop meets when its coop budget runs out mid-burst; taken
+/// here before `fut`, that yield no longer allocates mid-burst.
+pub fn block_on_thread_loop<F: Future>(rt: &tokio::runtime::Runtime, fut: F) -> F::Output {
+    rt.block_on(async {
+        tokio::task::yield_now().await;
+        fut.await
+    })
+}
+
 /// A capability, captured where the backend's executor is reachable, to run
 /// async work from a plain blocking thread (iocsh, a REPL, a script thread).
 ///
@@ -597,6 +611,15 @@ pub fn background_callback_stats(
     )
 }
 
+/// How many entries the background timer has ever queued, 0 before it starts
+/// — see [`TimerHandle::scheduled_total`](crate::runtime::background::TimerHandle::scheduled_total).
+/// Reads `BACKGROUND` for the same reason [`background_callback_stats`] does.
+pub fn background_timer_scheduled_total() -> u64 {
+    BACKGROUND
+        .get()
+        .map_or(0, |exec| exec.timer().handle().scheduled_total())
+}
+
 /// Create the process-global `scanOnce` worker thread now — C `initOnce`
 /// (`dbScan.c:768-780`), called from the port's `scanInit` equivalent so the
 /// thread exists from IOC init rather than from the first one-shot. Idempotent.
@@ -674,6 +697,36 @@ where
     spawn_future(&background().callbacks().handle(), priority, future)
 }
 
+/// [`spawn_background`] `delay` from now — C `callbackRequestDelayed`
+/// (`callback.c:410-419`). The timer starts at this call and `future` joins
+/// the tail of `priority`'s band when it fires, so a band busy past the delay
+/// runs it next rather than only then starting the wait. A zero delay is
+/// [`spawn_background`] itself: C's timer queue fires it at once into
+/// `callbackRequest`, as for the SDLY of 0 an output passes
+/// (`aoRecord.c:585`).
+pub fn spawn_background_after<F>(
+    priority: CallbackPriority,
+    delay: Duration,
+    future: F,
+) -> BackgroundTaskHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    use crate::runtime::background::spawn_future_after;
+    if delay.is_zero() {
+        return spawn_background(priority, future);
+    }
+    let exec = background();
+    spawn_future_after(
+        &exec.callbacks().handle(),
+        &exec.timer().handle(),
+        priority,
+        delay,
+        future,
+    )
+}
+
 /// [`spawn_background`] for a blocking closure — runs it on a callback-pool
 /// worker of the named band, holding that worker for the whole run. For work
 /// that belongs on the band (C `callbackRequest`); `f` gets the [`OnBand`]
@@ -701,8 +754,13 @@ pub fn request_cell<B: crate::runtime::background::CallbackBody>(
     background().callbacks().request_cell(priority, cell)
 }
 
-/// Sleep on the process-global delayed-callback timer — C
-/// `callbackRequestDelayed` (callback.c:410) — measured on `std::time`.
+/// Wait `duration` on the process-global delayed-callback timer, measured on
+/// `std::time` — C `callbackRequestDelayed` (`callback.c:410-419`) of the
+/// running callback from its own body. Like C's timer queue, the wait never
+/// completes on its first poll (see
+/// [`timer_sleep`](crate::runtime::background::timer_sleep)): a delay lapsed by
+/// then puts a [`spawn_background`] task back at the tail of its band, so a
+/// loop of lapsed re-arms never holds the band.
 ///
 /// The delay counterpart to [`spawn_background`]: a tail deferred there must
 /// wait on a timer that exists without a runtime, which `tokio::time` does not.
@@ -710,9 +768,22 @@ pub async fn sleep_background(duration: Duration) {
     crate::runtime::background::timer_sleep::sleep(&background().timer().handle(), duration).await;
 }
 
+/// Resume the running [`spawn_background`] task from the tail of its band — C
+/// `callbackRequest` of the running callback from its own body
+/// (`seqRecord.c:215`). It runs again only after every request queued before
+/// it, as from [`sleep_background`] of a zero delay, without building a timer
+/// wait.
+///
+/// Not [`yield_now`]: on the tokio backend that defers to tokio's scheduler,
+/// whereas this is the band's FIFO on either backend.
+#[inline]
+pub fn requeue_background() -> impl Future<Output = ()> {
+    YieldNow(false)
+}
+
 /// Periodic ticker on the process-global delayed-callback timer — the
 /// [`interval`] counterpart for work spawned by [`spawn_background`].
-pub fn interval_background(period: Duration) -> crate::runtime::background::TimerInterval {
+pub fn interval_background(period: Period) -> crate::runtime::background::TimerInterval {
     crate::runtime::background::timer_sleep::interval(&background().timer().handle(), period)
 }
 
@@ -899,20 +970,23 @@ pub async fn yield_now() {
 /// scheduling point, which is all `yield_now` promises.
 #[cfg(exec_backend)]
 pub async fn yield_now() {
-    struct YieldNow(bool);
-    impl Future for YieldNow {
-        type Output = ();
-        fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-            if self.0 {
-                Poll::Ready(())
-            } else {
-                self.0 = true;
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
+    YieldNow(false).await;
+}
+
+/// `Pending` once with the waker already woken.
+struct YieldNow(bool);
+
+impl Future for YieldNow {
+    type Output = ();
+    fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if self.0 {
+            Poll::Ready(())
+        } else {
+            self.0 = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
         }
     }
-    YieldNow(false).await;
 }
 
 /// Run a blocking closure on a worker thread.
@@ -1190,44 +1264,177 @@ pub async fn sleep_until(deadline: Instant) {
 }
 
 /// Periodic ticker — the seam replacement for `tokio::time::interval`, so no
-/// production site names `tokio::time` directly (decision A2). The hosted build
-/// wraps `tokio::time::Interval`, preserving its default
-/// `MissedTickBehavior::Burst` catch-up and immediate first tick; the RTEMS
-/// build substitutes the runtime-free
-/// [`crate::runtime::background::timer_sleep::TimerInterval`], which reproduces
-/// the same semantics over the delayed-callback timer.
-#[cfg(tokio_backend)]
+/// production site names `tokio::time` directly (decision A2), with tokio's
+/// defaults: an immediate first tick and `MissedTickBehavior::Burst` catch-up.
+///
+/// One body for both backends, on the timer the polling thread can reach (see
+/// `sleep_on_reachable_timer`): the hosted half wrapped
+/// `tokio::time::Interval`, which panics on a thread with no runtime.
 pub struct Interval {
-    inner: tokio::time::Interval,
+    period: Duration,
+    /// Next tick deadline, anchored at construction so catch-up bursts.
+    next: Instant,
+    first: bool,
+    /// Armed on the first wait and re-armed in place after each tick, as
+    /// tokio's `Interval` does, so a `tick()` dropped by a losing `select!` arm
+    /// leaves it armed and the next `tick()` arms no timer.
+    delay: Option<TickTimer>,
 }
 
+/// One re-armable sleep on the timer the arming thread can reach.
+enum TickTimer {
+    #[cfg(tokio_backend)]
+    Runtime(std::pin::Pin<Box<tokio::time::Sleep>>),
+    Background(crate::runtime::background::Sleep),
+}
+
+impl TickTimer {
+    fn until(deadline: Instant) -> Self {
+        #[cfg(tokio_backend)]
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return Self::Runtime(Box::pin(tokio::time::sleep_until(deadline)));
+        }
+        Self::Background(crate::runtime::background::timer_sleep::sleep_until(
+            &background().timer().handle(),
+            std_instant(deadline),
+        ))
+    }
+
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        match self {
+            #[cfg(tokio_backend)]
+            Self::Runtime(s) => s.as_mut().poll(cx),
+            Self::Background(s) => std::pin::Pin::new(s).poll(cx),
+        }
+    }
+
+    fn reset(&mut self, deadline: Instant) {
+        match self {
+            #[cfg(tokio_backend)]
+            Self::Runtime(s) => s.as_mut().reset(deadline),
+            Self::Background(s) => s.reset(std_instant(deadline)),
+        }
+    }
+}
+
+/// A deadline on the background timer's clock. Only a thread with no runtime
+/// arms that timer, and there tokio's clock is the wall clock.
 #[cfg(tokio_backend)]
+fn std_instant(deadline: Instant) -> std::time::Instant {
+    deadline.into_std()
+}
+#[cfg(exec_backend)]
+fn std_instant(deadline: Instant) -> std::time::Instant {
+    deadline
+}
+
+/// A re-armable sleep, `tokio::time::Sleep`'s shape on both backends. Held
+/// across a `select!` loop and polled through `&mut`, a losing arm drops no
+/// timer, and a pass that does not [`reset`](Self::reset) it arms none.
+pub struct Sleep {
+    deadline: Instant,
+    timer: TickTimer,
+}
+
+impl Sleep {
+    /// Complete at `deadline`, on the timer the calling thread can reach.
+    pub fn until(deadline: Instant) -> Self {
+        Self {
+            deadline,
+            timer: TickTimer::until(deadline),
+        }
+    }
+
+    pub fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
+    /// Re-arm for `deadline` in place.
+    pub fn reset(&mut self, deadline: Instant) {
+        self.deadline = deadline;
+        self.timer.reset(deadline);
+    }
+}
+
+impl Future for Sleep {
+    type Output = ();
+
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        self.get_mut().timer.poll(cx)
+    }
+}
+
 impl Interval {
     /// Complete at the next tick. The first tick is immediate (tokio parity);
     /// callers that want to skip it await `tick()` once up front.
     pub async fn tick(&mut self) {
-        self.inner.tick().await;
+        std::future::poll_fn(|cx| self.poll_tick(cx)).await
+    }
+
+    fn poll_tick(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        if self.first {
+            self.first = false;
+            return Poll::Ready(());
+        }
+        let next = self.next;
+        let delay = self.delay.get_or_insert_with(|| TickTimer::until(next));
+        std::task::ready!(delay.poll(cx));
+        // From the previous deadline, not from now, so an overdue deadline
+        // stays in the past and the next tick bursts.
+        self.next = deadline_after(self.next, self.period);
+        delay.reset(self.next);
+        Poll::Ready(())
     }
 }
 
-/// RTEMS: the periodic ticker is the runtime-free `TimerInterval` (same
-/// immediate-first-tick + Burst catch-up semantics, same `tick()` surface).
-#[cfg(exec_backend)]
-pub type Interval = crate::runtime::background::timer_sleep::TimerInterval;
-
-/// Build a periodic ticker firing every `period` — the seam replacement for
-/// `tokio::time::interval`.
-#[cfg(tokio_backend)]
-pub fn interval(period: Duration) -> Interval {
+/// Build a periodic ticker firing every `period`. `Period` has no zero, the
+/// spin loop that `tokio::time::interval` refuses with a panic.
+pub fn interval(period: Period) -> Interval {
+    let period = period.get();
     Interval {
-        inner: tokio::time::interval(period),
+        period,
+        next: deadline_from_now(period),
+        first: true,
+        delay: None,
     }
 }
 
-/// RTEMS: build the periodic ticker on the delayed-callback timer.
-#[cfg(exec_backend)]
-pub fn interval(period: Duration) -> Interval {
-    crate::runtime::background::timer_sleep::interval(&background().timer().handle(), period)
+/// A period [`interval`] accepts: a `Duration` that is not zero. A config
+/// field of this type cannot carry the zero that panics the ticker inside the
+/// task it is handed to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Period(Duration);
+
+impl Period {
+    /// `None` for a zero `period`.
+    pub const fn new(period: Duration) -> Option<Self> {
+        if period.is_zero() {
+            None
+        } else {
+            Some(Self(period))
+        }
+    }
+
+    pub const fn from_secs(secs: std::num::NonZeroU64) -> Self {
+        Self(Duration::from_secs(secs.get()))
+    }
+
+    pub const fn from_millis(millis: std::num::NonZeroU64) -> Self {
+        Self(Duration::from_millis(millis.get()))
+    }
+
+    /// The shortest period, one nanosecond.
+    pub const MIN: Self = Self(Duration::from_nanos(1));
+
+    /// `period`, raised to `floor` when shorter: the total conversion for a
+    /// computed `Duration` whose own lower bound is a `Period`.
+    pub fn at_least(period: Duration, floor: Period) -> Self {
+        Self(period.max(floor.0))
+    }
+
+    pub const fn get(self) -> Duration {
+        self.0
+    }
 }
 
 /// The timeout's error — "the deadline elapsed before the future completed".
@@ -1971,6 +2178,7 @@ fn prepare_current_thread() {
     name_current_thread();
     build_park_state();
     build_drive_state();
+    build_tokio_park_state();
 }
 
 /// `parking_lot_core` builds a thread's park state on its first park, and
@@ -2001,6 +2209,20 @@ fn build_park_state() {
 fn build_drive_state() {
     drop(current_thread_waker());
     let _ = RuntimeHandle::try_current();
+}
+
+/// tokio builds a thread's parker (an `Arc`) on its first wait outside a
+/// runtime's own park, which an unbounded channel's `try_recv` makes when it
+/// meets a send half done: a port actor's first such race, mid-cycle. A ready
+/// `blocking_recv` builds it here. A thread already in a tokio context may be
+/// driving one, where blocking panics; it is no fresh thread, so it is left.
+fn build_tokio_park_state() {
+    if RuntimeHandle::try_current().is_ok() {
+        return;
+    }
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let _ = tx.send(());
+    let _ = rx.blocking_recv();
 }
 
 /// C `epicsThreadSetPriority(epicsThreadGetIdSelf(), prio)` on a thread that
@@ -4254,6 +4476,93 @@ mod tests {
         );
     }
 
+    /// A band task resumes behind what was queued meanwhile, from
+    /// [`requeue_background`] and from [`sleep_background`] of a zero delay
+    /// and of a positive one, lapsed by its first poll or not.
+    #[epics_macros_rs::epics_test]
+    async fn band_waits_resume_behind_the_band() {
+        for delay in [
+            None,
+            Some(Duration::ZERO),
+            Some(Duration::from_nanos(1)),
+            Some(Duration::from_millis(5)),
+        ] {
+            let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let log = Arc::clone(&order);
+            let walk = spawn_background(CallbackPriority::Low, async move {
+                log.lock().unwrap().push("first");
+                let other = Arc::clone(&log);
+                drop(spawn_background(CallbackPriority::Low, async move {
+                    other.lock().unwrap().push("queued");
+                }));
+                match delay {
+                    None => requeue_background().await,
+                    Some(delay) => sleep_background(delay).await,
+                }
+                log.lock().unwrap().push("second");
+            });
+            timeout(Duration::from_secs(3), walk)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                *order.lock().unwrap(),
+                ["first", "queued", "second"],
+                "{delay:?}"
+            );
+        }
+    }
+
+    /// The delay of [`spawn_background_after`] runs from the call, as C
+    /// `callbackRequestDelayed`'s timer does: on a band held past the delay
+    /// the task waits only for the band, and runs ahead of work queued after
+    /// its timer fired.
+    #[epics_macros_rs::epics_test]
+    async fn spawn_background_after_times_the_delay_from_the_request() {
+        const DELAY: Duration = Duration::from_millis(200);
+        let (started_tx, started) = std::sync::mpsc::channel();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        drop(spawn_background(CallbackPriority::Low, async move {
+            started_tx.send(()).unwrap();
+            let _ = held.recv();
+        }));
+        timeout(Duration::from_secs(3), async {
+            while started.try_recv().is_err() {
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the band is held");
+
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = Arc::clone(&order);
+        let delayed = spawn_background_after(CallbackPriority::Low, DELAY, async move {
+            log.lock().unwrap().push("delayed");
+            std::time::Instant::now()
+        });
+        sleep(DELAY * 2).await;
+        let log = Arc::clone(&order);
+        let queued = spawn_background(CallbackPriority::Low, async move {
+            log.lock().unwrap().push("queued");
+        });
+        let freed = std::time::Instant::now();
+        release.send(()).unwrap();
+        let ran = timeout(Duration::from_secs(3), delayed)
+            .await
+            .unwrap()
+            .unwrap();
+        timeout(Duration::from_secs(3), queued)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(*order.lock().unwrap(), ["delayed", "queued"]);
+        let waited = ran.saturating_duration_since(freed);
+        assert!(
+            waited < DELAY / 2,
+            "ran {waited:?} after the band freed, a delay timed from the pick-up"
+        );
+    }
+
     /// A process that never started a runtime still gets a blocking pool.
     #[test]
     fn spawn_blocking_from_a_thread_with_no_runtime() {
@@ -4600,6 +4909,116 @@ mod tests {
         assert!(started.elapsed() >= Duration::from_millis(10));
     }
 
+    #[test]
+    fn an_interval_on_a_thread_with_no_runtime_ticks() {
+        let started = std::time::Instant::now();
+        park_on(async {
+            let mut every = interval(Period::new(Duration::from_millis(10)).unwrap());
+            every.tick().await;
+            every.tick().await;
+            every.tick().await;
+        });
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_millis(20) && waited < Duration::from_secs(2),
+            "the re-armed third tick came two periods in (waited {waited:?})"
+        );
+    }
+
+    /// A `tick()` that loses a `select!` race is dropped mid-wait. The ticker
+    /// keeps its timer armed through that drop, so the next `tick()` arms
+    /// nothing and the deadline stays put: the per-iteration cost of a loop
+    /// that selects on it.
+    #[test]
+    fn a_dropped_tick_leaves_its_timer_armed_for_the_next() {
+        let timer = background().timer().handle();
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut every = interval(Period::new(Duration::from_secs(180)).unwrap());
+        assert!(Box::pin(every.tick()).as_mut().poll(&mut cx).is_ready());
+        let (before, armed, due) = (
+            timer.scheduled_count(),
+            background_timer_scheduled_total(),
+            every.next,
+        );
+        for _ in 0..8 {
+            let mut t = Box::pin(every.tick());
+            assert!(t.as_mut().poll(&mut cx).is_pending());
+            drop(t);
+            assert_eq!(
+                timer.scheduled_count(),
+                before + 1,
+                "one entry, held by the ticker across dropped ticks"
+            );
+        }
+        assert_eq!(
+            background_timer_scheduled_total(),
+            armed + 1,
+            "armed once, not once per poll"
+        );
+        assert_eq!(every.next, due, "a pending poll moved the tick");
+    }
+
+    /// `MissedTickBehavior::Burst`: deadlines stay anchored at construction,
+    /// so after a stall every overdue tick is due at once, not re-spaced a
+    /// period from now. Due, not ready: a lapsed background `Sleep` yields its
+    /// first poll with a wake of its own, so no tick waits on the timer.
+    #[test]
+    fn an_interval_bursts_to_catch_up_after_a_stall() {
+        struct Wakes(std::sync::atomic::AtomicUsize);
+        impl Wake for Wakes {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let wakes = Arc::new(Wakes(std::sync::atomic::AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&wakes));
+        let mut cx = Context::from_waker(&waker);
+        let period = Duration::from_millis(50);
+        let mut every = interval(Period::new(period).unwrap());
+        assert!(Box::pin(every.tick()).as_mut().poll(&mut cx).is_ready());
+        std::thread::sleep(8 * period);
+        for n in 1..=4 {
+            let mut tick = Box::pin(every.tick());
+            if tick.as_mut().poll(&mut cx).is_pending() {
+                assert_eq!(
+                    wakes.0.swap(0, std::sync::atomic::Ordering::SeqCst),
+                    1,
+                    "overdue tick {n} waits on the timer"
+                );
+                assert!(
+                    tick.as_mut().poll(&mut cx).is_ready(),
+                    "overdue tick {n} waited"
+                );
+            }
+        }
+    }
+
+    /// A `Period` is what `interval` accepts, and no public constructor builds
+    /// a zero one: `new` refuses it, the `NonZeroU64` constructors cannot be
+    /// handed it, and `at_least` lifts it to its floor.
+    #[test]
+    fn a_period_is_a_non_zero_duration() {
+        assert_eq!(Period::new(Duration::ZERO), None);
+        let ns = Duration::from_nanos(1);
+        assert_eq!(Period::new(ns).map(Period::get), Some(ns));
+        assert_eq!(Period::MIN.get(), ns);
+        assert_eq!(
+            Period::from_secs(std::num::NonZeroU64::MIN).get(),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            Period::from_millis(std::num::NonZeroU64::MIN).get(),
+            Duration::from_millis(1)
+        );
+        assert_eq!(Period::at_least(Duration::ZERO, Period::MIN), Period::MIN);
+        let floor = Period::from_millis(std::num::NonZeroU64::new(100).unwrap());
+        assert_eq!(Period::at_least(Duration::from_millis(99), floor), floor);
+        assert_eq!(
+            Period::at_least(Duration::from_millis(101), floor).get(),
+            Duration::from_millis(101)
+        );
+    }
+
     /// The other half of the same boundary: a runtime thread must still take
     /// tokio's timer, because that is the only one that moves with tokio's
     /// clock — which `#[tokio::test(start_paused = true)]` makes virtual. The
@@ -4615,6 +5034,25 @@ mod tests {
         );
         let r = timeout(Duration::from_millis(10), std::future::pending::<()>()).await;
         assert!(r.is_err());
+        assert!(
+            BACKGROUND.get().is_none(),
+            "a runtime thread armed tokio's timer, not the background one"
+        );
+    }
+
+    #[cfg(tokio_backend)]
+    #[tokio::test]
+    async fn an_interval_on_a_runtime_thread_keeps_the_runtime_s_timer() {
+        assert!(
+            BACKGROUND.get().is_none(),
+            "the premise: nothing has started the background facility yet"
+        );
+        let started = Instant::now();
+        let mut every = interval(Period::new(Duration::from_millis(10)).unwrap());
+        every.tick().await;
+        every.tick().await;
+        every.tick().await;
+        assert!(started.elapsed() >= Duration::from_millis(20));
         assert!(
             BACKGROUND.get().is_none(),
             "a runtime thread armed tokio's timer, not the background one"

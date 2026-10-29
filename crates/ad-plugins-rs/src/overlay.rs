@@ -2,7 +2,7 @@ use asyn_rs::port::InterfaceMask;
 use std::sync::Arc;
 
 use ad_core_rs::error::ADResult;
-use ad_core_rs::ndarray::{NDArray, NDDataBuffer};
+use ad_core_rs::ndarray::{NDArray, NDDataViewMut};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::{NDPluginProcess, ProcessResult};
 use parking_lot::Mutex;
@@ -384,36 +384,36 @@ pub fn draw_overlays(
     let info = arr.info();
     let ts = arr.timestamp;
 
-    match &mut arr.data {
-        NDDataBuffer::U8(data) => {
-            draw_on_typed_buffer!(data.as_mut_slice(), u8, overlays, &info, ts);
+    match arr.data_mut().view_mut() {
+        NDDataViewMut::U8(data) => {
+            draw_on_typed_buffer!(data, u8, overlays, &info, ts);
         }
-        NDDataBuffer::U16(data) => {
-            draw_on_typed_buffer!(data.as_mut_slice(), u16, overlays, &info, ts);
+        NDDataViewMut::U16(data) => {
+            draw_on_typed_buffer!(data, u16, overlays, &info, ts);
         }
-        NDDataBuffer::I16(data) => {
-            draw_on_typed_buffer!(data.as_mut_slice(), i16, overlays, &info, ts);
+        NDDataViewMut::I16(data) => {
+            draw_on_typed_buffer!(data, i16, overlays, &info, ts);
         }
-        NDDataBuffer::I32(data) => {
-            draw_on_typed_buffer!(data.as_mut_slice(), i32, overlays, &info, ts);
+        NDDataViewMut::I32(data) => {
+            draw_on_typed_buffer!(data, i32, overlays, &info, ts);
         }
-        NDDataBuffer::U32(data) => {
-            draw_on_typed_buffer!(data.as_mut_slice(), u32, overlays, &info, ts);
+        NDDataViewMut::U32(data) => {
+            draw_on_typed_buffer!(data, u32, overlays, &info, ts);
         }
-        NDDataBuffer::F32(data) => {
-            draw_on_typed_buffer!(data.as_mut_slice(), f32, overlays, &info, ts);
+        NDDataViewMut::F32(data) => {
+            draw_on_typed_buffer!(data, f32, overlays, &info, ts);
         }
-        NDDataBuffer::F64(data) => {
-            draw_on_typed_buffer!(data.as_mut_slice(), f64, overlays, &info, ts);
+        NDDataViewMut::F64(data) => {
+            draw_on_typed_buffer!(data, f64, overlays, &info, ts);
         }
-        NDDataBuffer::I8(data) => {
-            draw_on_typed_buffer!(data.as_mut_slice(), i8, overlays, &info, ts);
+        NDDataViewMut::I8(data) => {
+            draw_on_typed_buffer!(data, i8, overlays, &info, ts);
         }
-        NDDataBuffer::I64(data) => {
-            draw_on_typed_buffer!(data.as_mut_slice(), i64, overlays, &info, ts);
+        NDDataViewMut::I64(data) => {
+            draw_on_typed_buffer!(data, i64, overlays, &info, ts);
         }
-        NDDataBuffer::U64(data) => {
-            draw_on_typed_buffer!(data.as_mut_slice(), u64, overlays, &info, ts);
+        NDDataViewMut::U64(data) => {
+            draw_on_typed_buffer!(data, u64, overlays, &info, ts);
         }
     }
 
@@ -661,10 +661,9 @@ impl NDPluginProcess for OverlayProcessor {
         self.slots.lock().len()
     }
 
-    /// C `NDPluginOverlay::writeInt32` drops the base class status
-    /// (`NDPluginDriver::writeInt32(pasynUser, value);`, NDPluginOverlay.cpp:508): a refused NDPluginDriver write keeps
-    /// its clamp and succeeds. A Position/Center/Size write sets the other
-    /// of Position/Center from the params and the freeze flag (:466-506).
+    /// C `NDPluginOverlay::writeInt32` drops the base refusal (NDPluginOverlay.cpp:508); not copied.
+    /// A Position/Center/Size write sets the other of Position/Center from
+    /// the params and the freeze flag (:466-506).
     fn validate_int32(
         &self,
         reason: usize,
@@ -673,7 +672,7 @@ impl NDPluginProcess for OverlayProcessor {
         verdict: ad_core_rs::plugin::runtime::WriteVerdict<i32>,
         params: &mut ad_core_rs::plugin::runtime::WritePort<'_>,
     ) -> ad_core_rs::plugin::runtime::WriteOutcome<i32> {
-        let outcome = ad_core_rs::plugin::runtime::WriteOutcome::from(verdict.succeed());
+        let outcome = ad_core_rs::plugin::runtime::WriteOutcome::from(verdict);
         let p = &self.params;
         for (x, pos, center, size) in [
             (true, p.position_x, p.center_x, p.size_x),
@@ -862,35 +861,16 @@ impl NDPluginProcess for OverlayProcessor {
 mod tests {
     use super::*;
 
-    /// `NDPluginDriver::writeInt32(pasynUser, value);` (NDPluginOverlay.cpp:508).
+    /// NDPluginOverlay.cpp:508 drops the base refusal; an Overlay port returns it.
     #[test]
-    fn a_refused_base_write_succeeds_as_c_write_int32_does() {
-        use ad_core_rs::plugin::runtime::WriteVerdict;
-        let proc = OverlayProcessor::new(8, vec![]);
-        let mut base = asyn_rs::port::PortDriverBase::new(
-            "T",
-            1,
-            Default::default(),
-            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+    fn a_refused_base_write_fails() {
+        let (message, _, _) = crate::test_util::refused_base_write(
+            "OVERLAY_REFUSED",
+            OverlayProcessor::new(8, vec![]),
         );
-        let clamp = WriteVerdict::Refuse {
-            keep: 1,
-            message: String::new(),
-        };
-        assert_eq!(
-            proc.validate_int32(
-                0,
-                0,
-                98,
-                clamp,
-                &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base)
-            )
-            .verdict,
-            WriteVerdict::Accept(1)
-        );
+        assert_eq!(message, "");
     }
-    use ad_core_rs::ndarray::{NDDataType, NDDimension};
+    use ad_core_rs::ndarray::{NDDataType, NDDataView, NDDimension};
 
     fn pool() -> Arc<NDArrayPool> {
         NDArrayPool::new(0)
@@ -964,7 +944,7 @@ mod tests {
         }];
 
         let out = draw_overlays(&pool(), &arr, &overlays).unwrap();
-        let NDDataBuffer::U16(ref v) = out.data else {
+        let NDDataView::U16(v) = out.data().view() else {
             panic!("expected U16 buffer");
         };
         assert_eq!(v[8 + 1], 65535, "full-scale 16-bit marker must survive");
@@ -983,8 +963,8 @@ mod tests {
             "R6_72",
             9,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         proc.register_params(&mut base).unwrap();
 
@@ -1039,7 +1019,7 @@ mod tests {
         }];
 
         let out = draw_overlays(&pool(), &arr, &overlays).unwrap();
-        if let NDDataBuffer::U8(ref v) = out.data {
+        if let NDDataView::U8(v) = out.data().view() {
             // Top edge of rectangle at y=1, x=1..4
             assert_eq!(v[1 * 8 + 1], 255);
             assert_eq!(v[1 * 8 + 2], 255);
@@ -1073,7 +1053,7 @@ mod tests {
         }];
         let out = draw_overlays(&pool(), &arr, &overlays).unwrap();
         let px = |x: usize, y: usize| {
-            if let NDDataBuffer::U8(ref v) = out.data {
+            if let NDDataView::U8(v) = out.data().view() {
                 v[y * 10 + x]
             } else {
                 0
@@ -1099,7 +1079,7 @@ mod tests {
     #[test]
     fn test_xor_mode() {
         let mut arr = make_8x8();
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             v[0] = 0xFF;
         }
 
@@ -1117,7 +1097,7 @@ mod tests {
         }];
 
         let out = draw_overlays(&pool(), &arr, &overlays).unwrap();
-        if let NDDataBuffer::U8(ref v) = out.data {
+        if let NDDataView::U8(v) = out.data().view() {
             // C++ Cross visits each pixel exactly once, so the center is
             // XOR'd a single time: 0xFF ^ 0xFF = 0x00 (not double-toggled).
             assert_eq!(v[0], 0x00);
@@ -1145,7 +1125,7 @@ mod tests {
         }];
 
         let out = draw_overlays(&pool(), &arr, &overlays).unwrap();
-        if let NDDataBuffer::U8(ref v) = out.data {
+        if let NDDataView::U8(v) = out.data().view() {
             assert_eq!(v[4 * 8 + 4], 200); // center
             assert_eq!(v[4 * 8 + 6], 200); // right arm
             assert_eq!(v[6 * 8 + 4], 200); // bottom arm
@@ -1175,7 +1155,7 @@ mod tests {
         }];
         let out = draw_overlays(&pool(), &arr, &overlays).unwrap();
         let px = |x: usize, y: usize| {
-            if let NDDataBuffer::U8(ref v) = out.data {
+            if let NDDataView::U8(v) = out.data().view() {
                 v[y * 20 + x]
             } else {
                 0
@@ -1222,7 +1202,7 @@ mod tests {
                 width_y: 1,
             }];
             let out = draw_overlays(&pool(), &arr, &overlays).unwrap();
-            if let NDDataBuffer::U8(ref v) = out.data {
+            if let NDDataView::U8(v) = out.data().view() {
                 v.iter().filter(|&&p| p != 0).count()
             } else {
                 0
@@ -1260,10 +1240,11 @@ mod tests {
                 width_x: 1,
                 width_y: 1,
             }];
-            let NDDataBuffer::U8(v) = &draw_overlays(&pool(), &arr, &overlays).unwrap().data else {
+            let out = draw_overlays(&pool(), &arr, &overlays).unwrap();
+            let NDDataView::U8(v) = out.data().view() else {
                 panic!("u8 output")
             };
-            v.clone()
+            v.to_vec()
         };
         let (utf8, ctl) = (render("\u{e9}H"), render("\x01\x01H"));
         assert!(ctl.iter().any(|p| *p != 0));
@@ -1295,7 +1276,7 @@ mod tests {
         }];
 
         let out = draw_overlays(&pool(), &arr, &overlays).unwrap();
-        if let NDDataBuffer::U8(ref v) = out.data {
+        if let NDDataView::U8(v) = out.data().view() {
             let w = 40;
             let bmp = &FONTS[0];
             // Every drawn pixel of each glyph must agree with font_pixel().
@@ -1338,7 +1319,7 @@ mod tests {
                 width_y: 1,
             }];
             let out = draw_overlays(&pool(), &arr, &ov).unwrap();
-            if let NDDataBuffer::U8(v) = &out.data {
+            if let NDDataView::U8(v) = out.data().view() {
                 v.iter().filter(|&&p| p != 0).count()
             } else {
                 0
@@ -1371,7 +1352,7 @@ mod tests {
             width_y: 1,
         }];
         let out = draw_overlays(&pool(), &arr, &ov).unwrap();
-        if let NDDataBuffer::U8(v) = &out.data {
+        if let NDDataView::U8(v) = out.data().view() {
             let w = 40;
             // The second glyph would start at column 6 == xmax, so nothing
             // past column 5 may be set.
@@ -1404,7 +1385,7 @@ mod tests {
         }];
 
         let out = draw_overlays(&pool(), &arr, &overlays).unwrap();
-        if let NDDataBuffer::U16(ref v) = out.data {
+        if let NDDataView::U16(v) = out.data().view() {
             // Top edge at y=1, x=1
             assert_eq!(v[1 * 8 + 1], 200);
             assert_eq!(v[1 * 8 + 4], 200);
@@ -1456,7 +1437,7 @@ mod tests {
         }];
 
         let out = draw_overlays(&pool(), &arr, &overlays).unwrap();
-        let NDDataBuffer::U8(ref v) = out.data else {
+        let NDDataView::U8(v) = out.data().view() else {
             panic!("expected U8 buffer");
         };
         let base = 3 * (3 * 8 + 4); // colorStride=1, xStride=3, yStride=24
@@ -1487,7 +1468,7 @@ mod tests {
             width_y: 1,
         }];
         let out = draw_overlays(&pool(), &arr, &overlays).unwrap();
-        let NDDataBuffer::U8(ref v) = out.data else {
+        let NDDataView::U8(v) = out.data().view() else {
             panic!("expected U8 buffer");
         };
         assert!(
@@ -1508,7 +1489,7 @@ mod tests {
             NDDataType::Float32,
         );
         // Seed the two pixels we check: 12.75 truncates to 12, 0.0 to 0.
-        if let NDDataBuffer::F32(ref mut v) = arr.data {
+        if let NDDataViewMut::F32(v) = arr.data_mut().view_mut() {
             v[4 * 8 + 4] = 12.75;
         }
         let overlays = vec![OverlayDef {
@@ -1525,7 +1506,7 @@ mod tests {
         }];
 
         let out = draw_overlays(&pool(), &arr, &overlays).unwrap();
-        let NDDataBuffer::F32(ref v) = out.data else {
+        let NDDataView::F32(v) = out.data().view() else {
             panic!("expected F32 buffer");
         };
         // (int)12.75 == 12; 12 ^ 100 == 104 (the fraction is dropped, as in C).
@@ -1542,7 +1523,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::Int64,
         );
-        if let NDDataBuffer::I64(ref mut v) = arr.data {
+        if let NDDataViewMut::I64(v) = arr.data_mut().view_mut() {
             v[1 * 4 + 1] = 0x0000_0007_0000_0005; // high word must be discarded
         }
         let overlays = vec![OverlayDef {
@@ -1559,7 +1540,7 @@ mod tests {
         }];
 
         let out = draw_overlays(&pool(), &arr, &overlays).unwrap();
-        let NDDataBuffer::I64(ref v) = out.data else {
+        let NDDataView::I64(v) = out.data().view() else {
             panic!("expected I64 buffer");
         };
         // C: (epicsInt64)((int)0x0000000700000005 ^ 3) == (epicsInt64)(5 ^ 3) == 6
@@ -1587,7 +1568,7 @@ mod tests {
             width_y: 4,
         }];
         let out = draw_overlays(&pool(), &arr, &overlays).unwrap();
-        if let NDDataBuffer::U8(ref v) = out.data {
+        if let NDDataView::U8(v) = out.data().view() {
             let w = 20;
             // The horizontal band spans rows [cy-2, cy+2] = [8, 12]. A column
             // away from the vertical strip (e.g. x=7) is set inside the band
@@ -1621,7 +1602,7 @@ mod tests {
             width_y: 3,
         }];
         let out = draw_overlays(&pool(), &arr, &overlays).unwrap();
-        if let NDDataBuffer::U8(ref v) = out.data {
+        if let NDDataView::U8(v) = out.data().view() {
             // Any non-zero pixel must be exactly 0xFF — a double-toggled pixel
             // would have wrapped back to 0x00, so the ellipse would have a
             // hole. Count drawn pixels to confirm the ellipse is non-empty.
@@ -1666,7 +1647,7 @@ mod tests {
                 width_y: 1,
             }];
             let out = draw_overlays(&pool(), arr, &ov).unwrap();
-            if let NDDataBuffer::U8(v) = &out.data {
+            if let NDDataView::U8(v) = out.data().view() {
                 v.iter().filter(|&&p| p != 0).count()
             } else {
                 0
@@ -1716,7 +1697,7 @@ mod tests {
     /// Pixels of an 8x8 mono frame the processor's overlays turn non-zero.
     fn drawn(p: &OverlayProcessor) -> Vec<(usize, usize)> {
         let out = p.process_array(&Arc::new(make_8x8()), &pool());
-        let NDDataBuffer::U8(v) = &out.output_arrays[0].data else {
+        let NDDataView::U8(v) = out.output_arrays[0].data().view() else {
             panic!("u8 output")
         };
         (0..64)
@@ -1890,8 +1871,8 @@ mod tests {
             "OV_TEST",
             8,
             asyn_rs::port::PortFlags::default(),
-            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+            asyn_rs::port::InterfaceMask::NONE,
+            asyn_rs::port::InterfaceMask::NONE,
         );
         p.register_params(&mut base).unwrap();
         let params = OverlayParamIndices {
@@ -1965,8 +1946,8 @@ mod tests {
             "OV_MAX",
             3,
             asyn_rs::port::PortFlags::default(),
-            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+            asyn_rs::port::InterfaceMask::NONE,
+            asyn_rs::port::InterfaceMask::NONE,
         );
         p.register_params(&mut base).unwrap();
         let use_overlay = p.params.use_overlay.unwrap();
@@ -2054,7 +2035,7 @@ mod tests {
     fn overlay_output_comes_from_the_pool_and_is_reused() {
         let pool = pool();
         let mut arr = make_8x8();
-        if let NDDataBuffer::U8(v) = &mut arr.data {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             v[0] = 7;
         }
         let overlays = vec![OverlayDef {
@@ -2072,7 +2053,7 @@ mod tests {
 
         let first = draw_overlays(&pool, &arr, &overlays).unwrap();
         assert_eq!(first.pool_id(), pool.id());
-        let NDDataBuffer::U8(v) = &first.data else {
+        let NDDataView::U8(v) = first.data().view() else {
             panic!("expected U8 buffer");
         };
         assert_eq!(v[0], 7, "the copy carries the source pixels");
@@ -2081,7 +2062,7 @@ mod tests {
         drop(first);
 
         let second = draw_overlays(&pool, &arr, &overlays).unwrap();
-        let NDDataBuffer::U8(v) = &second.data else {
+        let NDDataView::U8(v) = second.data().view() else {
             panic!("expected U8 buffer");
         };
         assert_eq!(v.as_ptr(), ptr, "the second frame reuses the freed buffer");

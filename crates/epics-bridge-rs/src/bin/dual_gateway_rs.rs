@@ -33,6 +33,7 @@
 #![cfg_attr(exec_backend, allow(dead_code, unused_imports))]
 
 use std::net::IpAddr;
+use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -40,6 +41,8 @@ use std::time::Duration;
 use clap::parser::ValueSource;
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser};
 
+#[cfg(tokio_backend)]
+use epics_base_rs::runtime::task::Period;
 #[cfg(tokio_backend)]
 use epics_bridge_rs::ca_gateway::{GatewayConfig, GatewayServer, PutLogScope};
 #[cfg(tokio_backend)]
@@ -154,13 +157,15 @@ struct Args {
     #[arg(long, default_value_t = 1)]
     ca_heartbeat_interval: u64,
 
+    // The three interval periods feed `runtime::task::interval`, which
+    // panics on zero, so their CLI and TOML types refuse 0.
     /// CA gateway: cleanup interval in seconds.
-    #[arg(long, default_value_t = 10)]
-    ca_cleanup_interval: u64,
+    #[arg(long, default_value = "10")]
+    ca_cleanup_interval: NonZeroU64,
 
     /// CA gateway: stats refresh interval in seconds.
-    #[arg(long, default_value_t = 10)]
-    ca_stats_interval: u64,
+    #[arg(long, default_value = "10")]
+    ca_stats_interval: NonZeroU64,
 
     /// CA gateway: upstream connect timeout in seconds
     /// (C `-connect_timeout`).
@@ -215,7 +220,7 @@ struct Args {
     /// PVA cache cleanup interval in seconds. Omit to take
     /// `EPICS_PVA_GW_CLEANUP_INTERVAL`, then the 30 s default.
     #[arg(long)]
-    pva_cleanup_interval_secs: Option<u64>,
+    pva_cleanup_interval_secs: Option<NonZeroU64>,
 
     /// PVA control_prefix for runtime-diagnostic PVs. An explicit empty
     /// string disables the feature; omit to take
@@ -279,8 +284,8 @@ struct CaSection {
     no_cache: Option<bool>,
     stats_prefix: Option<String>,
     heartbeat_interval: Option<u64>,
-    cleanup_interval: Option<u64>,
-    stats_interval: Option<u64>,
+    cleanup_interval: Option<NonZeroU64>,
+    stats_interval: Option<NonZeroU64>,
     connect_timeout: Option<u64>,
     inactive_timeout: Option<u64>,
     dead_timeout: Option<u64>,
@@ -296,7 +301,7 @@ struct PvaSection {
     tcp_port: Option<u16>,
     udp_port: Option<u16>,
     connect_timeout_secs: Option<u64>,
-    cleanup_interval_secs: Option<u64>,
+    cleanup_interval_secs: Option<NonZeroU64>,
     control_prefix: Option<String>,
     prefetch: Option<Vec<String>>,
 }
@@ -390,13 +395,9 @@ async fn run_ca_gateway(args: &Args) -> Result<(), String> {
             .ca_stats_prefix
             .clone()
             .unwrap_or_else(epics_bridge_rs::ca_gateway::default_stats_prefix),
-        cleanup_interval: Duration::from_secs(args.ca_cleanup_interval),
-        stats_interval: Duration::from_secs(args.ca_stats_interval),
-        heartbeat_interval: if args.ca_heartbeat_interval == 0 {
-            None
-        } else {
-            Some(Duration::from_secs(args.ca_heartbeat_interval))
-        },
+        cleanup_interval: Period::from_secs(args.ca_cleanup_interval),
+        stats_interval: Period::from_secs(args.ca_stats_interval),
+        heartbeat_interval: NonZeroU64::new(args.ca_heartbeat_interval).map(Period::from_secs),
         read_only: args.ca_read_only,
         // C `cacheMode` / `-no_cache`: NoCache forwards every get to the
         // IOC and lazily creates the upstream monitor only while a
@@ -461,7 +462,7 @@ async fn run_pva_gateway(args: &Args) -> Result<(), String> {
         server_config,
         cleanup_interval: args
             .pva_cleanup_interval_secs
-            .map(Duration::from_secs)
+            .map(Period::from_secs)
             .unwrap_or(base.cleanup_interval),
         connect_timeout: args
             .pva_connect_timeout_secs
@@ -916,6 +917,52 @@ mod tests {
         assert_eq!(args.pva_udp_port, None);
         assert_eq!(args.pva_connect_timeout_secs, None);
         assert_eq!(args.pva_cleanup_interval_secs, None);
+    }
+
+    /// The CA cleanup/stats and PVA cleanup periods feed
+    /// `runtime::task::interval`, which panics on zero: 0 is a usage error
+    /// on the command line and a parse error in the TOML; 1 is the floor.
+    #[test]
+    fn a_zero_period_is_refused_on_the_cli_and_in_toml() {
+        for flag in [
+            "--ca-cleanup-interval",
+            "--ca-stats-interval",
+            "--pva-cleanup-interval-secs",
+        ] {
+            let e = Args::command()
+                .try_get_matches_from(["dual-gateway-rs", flag, "0"])
+                .expect_err(flag);
+            assert_eq!(e.kind(), clap::error::ErrorKind::ValueValidation, "{flag}");
+            assert_eq!(e.exit_code(), 2, "{flag}");
+        }
+        for src in [
+            "[ca]\ncleanup_interval = 0\n",
+            "[ca]\nstats_interval = 0\n",
+            "[pva]\ncleanup_interval_secs = 0\n",
+        ] {
+            assert!(toml::from_str::<ConfigFile>(src).is_err(), "{src}");
+        }
+
+        let (args, _) = args_and_matches(&[
+            "dual-gateway-rs",
+            "--ca-cleanup-interval",
+            "1",
+            "--ca-stats-interval",
+            "1",
+            "--pva-cleanup-interval-secs",
+            "1",
+        ]);
+        assert_eq!(u64::from(args.ca_cleanup_interval), 1);
+        assert_eq!(u64::from(args.ca_stats_interval), 1);
+        assert_eq!(args.pva_cleanup_interval_secs.map(u64::from), Some(1));
+        let (mut args, matches) = args_and_matches(&["dual-gateway-rs"]);
+        let c = cfg(
+            "[ca]\ncleanup_interval = 1\nstats_interval = 1\n[pva]\ncleanup_interval_secs = 1\n",
+        );
+        merge_config(&mut args, &c, &matches);
+        assert_eq!(u64::from(args.ca_cleanup_interval), 1);
+        assert_eq!(u64::from(args.ca_stats_interval), 1);
+        assert_eq!(args.pva_cleanup_interval_secs.map(u64::from), Some(1));
     }
 
     #[test]

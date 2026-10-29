@@ -81,7 +81,8 @@ async fn the_set_saves_every_period() {
     let sav = dir.path().join("settings.sav");
     let mut saves = 0;
     let mut last = None;
-    for _ in 0..120 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         let now = std::fs::metadata(&sav).and_then(|m| m.modified()).ok();
         if now.is_some() && now != last {
             saves += 1;

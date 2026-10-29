@@ -12,7 +12,7 @@
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use c_ca_tools::{LineCollector, require_tool, run_caget, run_caput};
+use c_ca_tools::{LineCollector, Reaped, require_tool, run_caget, run_caput};
 use serial_test::serial;
 
 const TEST_DB: &str = "
@@ -144,19 +144,21 @@ fn c_camonitor_sees_rust_ioc_changes() {
     require_tool("caput");
     let ioc = spawn_rust_ioc(TEST_DB);
 
-    let mut mon = Command::new("camonitor")
-        .arg("TEST:LOUT")
-        .env("EPICS_CA_ADDR_LIST", "127.0.0.1")
-        .env("EPICS_CA_AUTO_ADDR_LIST", "NO")
-        .env("EPICS_CA_SERVER_PORT", ioc.port.to_string())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("camonitor");
+    let mut mon = Reaped(
+        Command::new("camonitor")
+            .arg("TEST:LOUT")
+            .env("EPICS_CA_ADDR_LIST", "127.0.0.1")
+            .env("EPICS_CA_AUTO_ADDR_LIST", "NO")
+            .env("EPICS_CA_SERVER_PORT", ioc.port.to_string())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("camonitor"),
+    );
 
     // Wait for camonitor's leading event (it prints the current value on
     // connect) rather than assuming a fixed sleep covers search + connect.
-    let out_lines = c_ca_tools::LineCollector::spawn(mon.stdout.take().expect("piped stdout"));
+    let out_lines = c_ca_tools::LineCollector::spawn(mon.0.stdout.take().expect("piped stdout"));
     assert!(
         out_lines.wait_for(fact_budget::FACT_BUDGET, |t| t.contains("TEST:LOUT")),
         "camonitor never connected; got:\n{}",
@@ -171,8 +173,7 @@ fn c_camonitor_sees_rust_ioc_changes() {
 
     // Wait for the final value to be observed, then stop camonitor.
     let saw_final = out_lines.wait_for(fact_budget::FACT_BUDGET, |t| t.contains("30"));
-    let _ = mon.kill();
-    let _ = mon.wait();
+    drop(mon);
     assert!(
         saw_final,
         "camonitor never observed final value 30; got:\n{}",

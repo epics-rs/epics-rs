@@ -101,7 +101,7 @@ macro_rules! seqg_escaped {
         let p = $env.mac_value_get("P");
         for (name, motor) in [(&v.phi1MotName, "M_PHI1"), (&v.phi2MotName, "M_PHI2")] {
             let m = $env.mac_value_get(motor);
-            if p.is_none() || m.is_none() {
+            if p.is_null() || m.is_null() {
                 sprintf(name, "??????", &[]);
             } else {
                 sprintf(name, "%s%s", &[CArg::from(p.clone()), CArg::from(m)]);

@@ -20,7 +20,7 @@ use epics_base_rs::server::autosave::manager::{AutosaveBuilder, AutosaveManager,
 use epics_base_rs::server::autosave::save_set::{SaveSetConfig, SaveStrategy};
 use epics_base_rs::server::autosave::settings::SrSettings;
 use epics_base_rs::server::database::PvDatabase;
-use epics_base_rs::server::ioc_app::IocApplication;
+use epics_base_rs::server::ioc_app::{IocApplication, RunOutcome};
 use epics_base_rs::server::records::ao::AoRecord;
 
 const CHILD: &str = "AUTOSAVE_CONNECT_LIST_CHILD";
@@ -79,7 +79,8 @@ async fn first_pass_of(loading: bool, pvs: &[&str]) {
     // Detached; `shutdown` ends the task.
     drop(mgr.clone().start(db.clone()));
     let set = mgr.sets()[0].0.clone();
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if set.list_status().text == "Enabling list..." {
             break;
         }
@@ -214,7 +215,8 @@ async fn early_list_of(
 async fn a_list_made_before_ioc_init_counts_every_member_unconnected() {
     let (mgr, task, _dir) = early_list(Arc::default()).await;
     let set = mgr.sets()[0].0.clone();
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if set.not_connected() > 0 {
             break;
         }
@@ -239,19 +241,27 @@ async fn child_reconnect() {
         .store(10, std::sync::atomic::Ordering::Relaxed);
     let (mgr, task, db, _dir) = early_list_of(settings, &["TEMP", "LATE"]).await;
     let set = mgr.sets()[0].0.clone();
-    let wait_for = async |n: i32, secs: u64| {
-        let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+    let wait_for = async |n: i32, within: Duration| {
+        let deadline = std::time::Instant::now() + within;
         while set.not_connected() != n && std::time::Instant::now() < deadline {
             epics_base_rs::runtime::task::sleep(Duration::from_millis(100)).await;
         }
         set.not_connected()
     };
-    assert_eq!(wait_for(2, 5).await, 2, "the first pass");
+    assert_eq!(
+        wait_for(2, fact_budget::FACT_BUDGET).await,
+        2,
+        "the first pass"
+    );
     db.ioc_init().await;
     db.add_record("LATE", Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();
-    assert_eq!(wait_for(0, 75).await, 0, "the reconnect pass");
+    assert_eq!(
+        wait_for(0, Duration::from_secs(75)).await,
+        0,
+        "the reconnect pass"
+    );
     mgr.shutdown();
     drop(task);
 }
@@ -301,14 +311,15 @@ async fn child_ioc() {
         ),
     )
     .unwrap();
-    IocApplication::new()
+    let outcome = IocApplication::new()
         .port(0)
         .autosave_startup(Arc::new(Mutex::new(AutosaveStartupConfig::new())))
         .startup_script(d.join("st.cmd").to_str().unwrap())
-        .run(|config| async move {
+        .run_outcome(|config| async move {
             let mgr = config.autosave_manager.unwrap();
             let set = mgr.sets()[0].0.clone();
-            for _ in 0..100 {
+            let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+            while std::time::Instant::now() < deadline {
                 if set.not_connected() > 0 {
                     break;
                 }
@@ -319,6 +330,8 @@ async fn child_ioc() {
         })
         .await
         .unwrap();
+    // A set that never saw `iocInit` connects nothing either.
+    assert_eq!(outcome, RunOutcome::Served);
 }
 
 /// The st.cmd path makes its sets before `iocInit` too.

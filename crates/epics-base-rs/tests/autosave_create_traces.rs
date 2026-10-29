@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use epics_base_rs::server::autosave::AutosaveStartupConfig;
-use epics_base_rs::server::ioc_app::IocApplication;
+use epics_base_rs::server::ioc_app::{IocApplication, RunOutcome};
 
 const CHILD: &str = "AUTOSAVE_CREATE_TRACES_DIR";
 
@@ -16,11 +16,11 @@ async fn child_ioc() {
     let Some(dir) = std::env::var_os(CHILD).map(std::path::PathBuf::from) else {
         return;
     };
-    IocApplication::new()
+    let outcome = IocApplication::new()
         .port(0)
         .autosave_startup(Arc::new(Mutex::new(AutosaveStartupConfig::new())))
         .startup_script(dir.join("st.cmd").to_str().unwrap())
-        .run(|config| async move {
+        .run_outcome(|config| async move {
             epics_base_rs::server::db_server::announce_serving("probe");
             epics_base_rs::runtime::task::sleep(Duration::from_secs(2)).await;
             if let Some(mgr) = config.autosave_manager {
@@ -30,6 +30,9 @@ async fn child_ioc() {
         })
         .await
         .unwrap();
+    // `==init` straight before `==reload` is iocInit tracing nothing, which
+    // an iocInit that never ran gives too.
+    assert_eq!(outcome, RunOutcome::Served);
 }
 
 #[test]

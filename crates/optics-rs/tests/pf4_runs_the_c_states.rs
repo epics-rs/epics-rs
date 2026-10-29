@@ -1,7 +1,7 @@
 //! The compiled `pf4.st` on `pf4common.db`/`pf4bank.db` and four `bo`
 //! hardware bits: the `{BP}{Bn}` monitors, `displayBit` as a NoMon output,
 //! and the `bankctl` 3→2→1 cascade through its own posts
-//! (`pf4.st:268-332`). The hand port's cases, on C's states.
+//! (`pf4.st:282-347`). The hand port's cases, on C's states.
 
 use epics_base_rs::runtime::task;
 use epics_base_rs::server::database::PvDatabase;
@@ -147,16 +147,22 @@ async fn a_hardware_bit_sets_display_bit_and_fpos() {
     let f = boot_with(KICK_A2).await;
     let (xmit, bits) = bank();
     let pos = numInArray(16, &bits, 2) as usize;
+    // `trans` is put by bankControl 2, after filterBits puts `fPos`.
+    let want = (pos as f64, 1.0, 1.0, xmit[pos]);
+    let mut got = (0.0, 0.0, 0.0, 0.0);
     for _ in 0..100 {
-        if f64_of(&f.ioc, "PF:pf:fPosA").await == pos as f64 {
+        got = (
+            f64_of(&f.ioc, "PF:pf:fPosA").await,
+            f64_of(&f.ioc, "PF:pf:displayBit2A").await,
+            f64_of(&f.ioc, "PF:A2").await,
+            f64_of(&f.ioc, "PF:pf:transA").await,
+        );
+        if got == want {
             break;
         }
         task::sleep(Duration::from_millis(50)).await;
     }
-    assert_eq!(f64_of(&f.ioc, "PF:pf:fPosA").await, pos as f64);
-    assert_eq!(f64_of(&f.ioc, "PF:pf:displayBit2A").await, 1.0);
-    assert_eq!(f64_of(&f.ioc, "PF:A2").await, 1.0);
-    assert_eq!(f64_of(&f.ioc, "PF:pf:transA").await, xmit[pos]);
+    assert_eq!(got, want, "fPosA, displayBit2A, A2, transA");
     seq_stop(f.tid);
 }
 
@@ -331,13 +337,22 @@ async fn a_display_bit_put_leaves_the_hardware_bit() {
 }
 
 /// `PVPUT` is `pvPut(var, SYNC)` (`seqPVmacros.h:167-171`): `filterPos` puts
-/// `b1` and waits for it before `displayBit1` (`pf4.st:231`). With `b1` a
+/// `b1` and waits for it before `displayBit1` (`pf4.st:246`). With `b1` a
 /// `busy` left set, `displayBit1` stays 0 while the put is pending, and
-/// the busy reset completes it.
+/// the busy reset completes it. `A2`-`A4` are processed at init, so taking
+/// them out posts nothing: a first process posts its alarm change, which
+/// can land after `efClear(b2_mon)`..`efClear(b4_mon)`, in C as here, and
+/// send `idle` on to `filterBits`.
 #[epics_base_rs::epics_test]
 async fn filter_pos_waits_for_a_bit_put_before_its_display_bit() {
-    let hw = HW.replace(r#"record(bo, "PF:A1") {}"#, r#"record(busy, "PF:A1") {}"#);
-    let f = boot_on(&hw, "").await;
+    let hw = r#"
+record(busy, "PF:A1") {}
+record(bo, "PF:A2") { field(VAL, "0") field(PINI, "YES") }
+record(bo, "PF:A3") { field(VAL, "0") field(PINI, "YES") }
+record(bo, "PF:A4") { field(VAL, "0") field(PINI, "YES") }
+record(ao, "PF:mono") { field(VAL, "10") }
+"#;
+    let f = boot_on(hw, "").await;
     let (_, bits) = bank();
     let pos = numInArray(16, &bits, 1);
     put(&f.ioc, "PF:pf:fPosA", EpicsValue::Enum(pos as u16)).await;

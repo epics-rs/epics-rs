@@ -8,8 +8,11 @@
 //! vector built from repeatable `-P` (`procServ.cc:386`), so several
 //! endpoints can be requested at once.
 
+use std::cell::Cell;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+
+use epics_base_rs::runtime::scanf::{self, ScanTarget};
 
 /// One listening endpoint, fully resolved. The localhost-vs-any-interface
 /// decision is already baked into the [`SocketAddr`], exactly as C bakes
@@ -71,30 +74,39 @@ impl UnixEndpoint {
 /// it binds the requested interface, or `0.0.0.0` for a bare port. The
 /// flag is irrelevant for UNIX sockets.
 pub fn parse_endpoint(spec: &str, local: bool) -> Result<Endpoint, String> {
-    let spec = spec.trim();
+    let (port, junk) = (Cell::new(0u32), Cell::new(0u8));
+    let a: [Cell<u32>; 4] = Default::default();
 
-    // 1. A bare unsigned integer is a TCP port (C `sscanf("%u %c")==1`,
-    //    `acceptFactory.cc:113-124`).
-    if let Ok(port) = spec.parse::<u32>() {
+    // 1. A bare unsigned integer is a TCP port (`acceptFactory.cc:113-124`).
+    if scanf::sscanf(spec, "%u %c", &[&port, &junk]) == 1 {
         return Ok(Endpoint::Tcp(tcp_addr(
             local_ip(local, Ipv4Addr::UNSPECIFIED),
-            port,
+            port.get(),
         )?));
     }
 
-    // 2. A `unix:` prefix is a UNIX-domain socket (`acceptFactory.cc:138`).
-    if let Some(rest) = spec.strip_prefix("unix:") {
-        return Ok(Endpoint::Unix(parse_unix(rest)?));
+    // 2. `A.B.C.D:port` binds a specific interface
+    //    (`acceptFactory.cc:125-137`). When `local`, C ignores the interface
+    //    and still binds loopback (`local ? INADDR_LOOPBACK : A.B.C.D`).
+    let fields: [&dyn ScanTarget; 6] = [&a[0], &a[1], &a[2], &a[3], &port, &junk];
+    if scanf::sscanf(spec, "%u . %u . %u . %u : %u %c", &fields) == 5 {
+        let ip = if local {
+            Ipv4Addr::LOCALHOST
+        } else {
+            // C defect not copied: `A[0]<<24 | A[1]<<16 | ...` carries an
+            // octet above 255 into its neighbour; it is refused instead.
+            let octet = |i: usize| u8::try_from(a[i].get());
+            match (octet(0), octet(1), octet(2), octet(3)) {
+                (Ok(a0), Ok(a1), Ok(a2), Ok(a3)) => Ipv4Addr::new(a0, a1, a2, a3),
+                _ => return Err(format!("Invalid socket spec '{spec}'")),
+            }
+        };
+        return Ok(Endpoint::Tcp(tcp_addr(ip, port.get())?));
     }
 
-    // 3. `A.B.C.D:port` binds a specific interface (C
-    //    `sscanf("%u.%u.%u.%u:%u")==5`, `acceptFactory.cc:125-137`). When
-    //    `local`, C ignores the interface and still binds loopback
-    //    (`local ? INADDR_LOOPBACK : A.B.C.D`); reproduced faithfully.
-    if let Some((host, port_s)) = spec.rsplit_once(':')
-        && let (Ok(v4), Ok(port)) = (host.parse::<Ipv4Addr>(), port_s.parse::<u32>())
-    {
-        return Ok(Endpoint::Tcp(tcp_addr(local_ip(local, v4), port)?));
+    // 3. A `unix:` prefix is a UNIX-domain socket (`acceptFactory.cc:138`).
+    if let Some(rest) = spec.strip_prefix("unix:") {
+        return Ok(Endpoint::Unix(parse_unix(rest)?));
     }
 
     Err(format!("Invalid socket spec '{spec}'"))
@@ -110,7 +122,11 @@ fn local_ip(local: bool, addr: Ipv4Addr) -> Ipv4Addr {
 /// (`acceptFactory.cc:118-122,131-135`).
 fn tcp_addr(ip: Ipv4Addr, port: u32) -> Result<SocketAddr, String> {
     if port > 0xffff {
-        return Err(format!("invalid control port {port} (must be <65536)"));
+        // C prints the `unsigned` port with `%d`.
+        return Err(format!(
+            "invalid control port {} (must be <65536)",
+            port as i32
+        ));
     }
     Ok(SocketAddr::new(IpAddr::V4(ip), port as u16))
 }
@@ -310,6 +326,26 @@ mod tests {
         let u = unix(&parse_endpoint("unix:@ioc-console", true).unwrap()).clone();
         assert!(u.abstract_socket);
         assert_eq!(u.name, PathBuf::from("ioc-console"));
+    }
+
+    /// C's two `sscanf`s, as glibc 2.43 reads them: `%u` skips C whitespace
+    /// and takes a sign, `%u`'s `unsigned` keeps the low 32 bits, and a
+    /// space in the format matches any run of whitespace.
+    #[test]
+    fn spec_scans_as_glibc_sscanf() {
+        let addr = |spec: &str| tcp(&parse_endpoint(spec, false).unwrap());
+        assert_eq!(addr(" 4051 "), "0.0.0.0:4051".parse().unwrap());
+        assert_eq!(addr("+4051"), "0.0.0.0:4051".parse().unwrap());
+        assert_eq!(addr("4294971347"), "0.0.0.0:4051".parse().unwrap());
+        assert_eq!(addr("1 . 2 . 3 . 4 : 5"), "1.2.3.4:5".parse().unwrap());
+        assert_eq!(addr("01.02.03.04:4051"), "1.2.3.4:4051".parse().unwrap());
+        // `%d` prints the `unsigned` `-1` stored.
+        let err = parse_endpoint("-1", false).unwrap_err();
+        assert!(err.contains("invalid control port -1 "), "{err}");
+        for spec in [" unix:/x", "\u{a0}4051", "4051x", "1.2.3.256:5"] {
+            let err = parse_endpoint(spec, false).unwrap_err();
+            assert!(err.contains("Invalid socket spec"), "{spec:?} {err}");
+        }
     }
 
     #[test]

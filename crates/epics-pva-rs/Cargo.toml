@@ -33,6 +33,8 @@ dashmap = "6"
 # handler into an error reply rather than letting it skip the exec
 # reply (PVXS-SR-21). Already a workspace dep (epics-ca-rs, ad-core-rs).
 futures-util = "0.3"
+# `pvalink`'s forward-link slot, which its worker stores once the channel opens.
+arc-swap = { version = "1", optional = true }
 
 # TLS for `pvas://` (opt-in at runtime via `EPICS_PVAS_TLS_KEYCHAIN`, and at
 # compile time via the `tls` feature — ON by default, so a hosted build is
@@ -94,12 +96,13 @@ x509-parser = { version = "0.16", optional = true }
 default = ["tls", "pkcs12", "client"]
 # The native PVA client — `client_native` (connection pool, UDP search
 # engine, per-operation tasks) plus the `client` re-export module,
-# `PvaServer::client_config()`, and the `pv*` command-line binaries. ON by
+# `PvaServer::client_config()`, the `pv*` command-line binaries, and
+# `pvalink`, the `{pva:}` record link the IOC entries register. ON by
 # default. Turning it off leaves a server-only build (design doc §9 phase 6,
 # scope decision: a PVA *gateway* on RTEMS is out of scope, so the client is
 # gate-out territory). The wire decoder the server needs is NOT part of this
 # feature — it is the always-compiled `crate::decode`.
-client = []
+client = ["dep:arc-swap"]
 # The RTEMS bring-up measurement rig's client-side instrumentation — the twin
 # of `epics-ca-rs/bringup-probes`, and forwarded from
 # `epics-bridge-rs/bringup-probes` so `realtime-pva-ioc`'s probe image can read
@@ -198,6 +201,7 @@ windows-sys = { version = "0.59", features = [
 ] }
 
 [dev-dependencies]
+epics-base-rs = { workspace = true, features = ["test-hooks"] }
 # Dev-only and `path`-only, so `cargo package` drops it from the uploaded
 # manifest: the source guards in this crate share one production-slice rule.
 source-guard = { path = "../source-guard" }
@@ -214,6 +218,10 @@ fact-budget = { path = "../fact-budget" }
 rcgen = "0.13"
 tempfile = "3"
 serial_test = "3"
+# Dev-only, path-only: `pvalink`'s interop tests boot softIocPVX through it.
+# It depends on this crate; a dev-dependency cycle is legal, and those tests
+# hand it no type of this crate's.
+epics-oracle-rs = { path = "../epics-oracle-rs" }
 
 # The `pv*` command-line tools ARE the native client, so they carry
 # `required-features = ["client"]` — with the feature off there is no client

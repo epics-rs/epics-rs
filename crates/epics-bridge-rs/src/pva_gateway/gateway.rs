@@ -13,6 +13,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use epics_base_rs::runtime::task::Period;
 use epics_base_rs::server::access_security::{AccessSecurityConfig, parse_acf};
 use epics_pva_rs::client::PvaClient;
 use epics_pva_rs::config::env as pva_env;
@@ -52,7 +53,7 @@ pub struct PvaGatewayConfig {
     pub server_config: PvaServerConfig,
     /// How often the cache prunes idle entries. Pass
     /// [`DEFAULT_CLEANUP_INTERVAL`] (30 s) to match pvxs.
-    pub cleanup_interval: Duration,
+    pub cleanup_interval: Period,
     /// Per-PV connect timeout: the maximum time `has_pv` /
     /// `get_value` / `subscribe` wait for the upstream IOC to deliver
     /// a first monitor event. Default 5 s.
@@ -166,8 +167,13 @@ impl PvaGatewayConfig {
         // panics above `u64::MAX` seconds. The resolver rejects it and the
         // configured default stands.
         if let Ok(s) = std::env::var("EPICS_PVA_GW_CLEANUP_INTERVAL") {
-            if let Some(secs) = pva_env::parse_timeout_env("EPICS_PVA_GW_CLEANUP_INTERVAL", &s) {
-                self.cleanup_interval = Duration::from_secs_f64(secs);
+            // A value that rounds to a zero `Duration` has no `Period`, so
+            // it counts as 0 and the default stands.
+            if let Some(period) = pva_env::parse_timeout_env("EPICS_PVA_GW_CLEANUP_INTERVAL", &s)
+                .map(Duration::from_secs_f64)
+                .and_then(Period::new)
+            {
+                self.cleanup_interval = period;
             }
         }
         if let Ok(s) = std::env::var("EPICS_PVA_GW_CONNECT_TMO") {
@@ -496,7 +502,7 @@ mod tests {
             }
         }
         let cfg = PvaGatewayConfig::default().with_env();
-        assert_eq!(cfg.cleanup_interval, Duration::from_secs(7));
+        assert_eq!(cfg.cleanup_interval.get(), Duration::from_secs(7));
         assert_eq!(cfg.connect_timeout, Duration::from_secs(7));
         unsafe {
             for (n, p) in names.iter().zip(prev) {
@@ -504,6 +510,31 @@ mod tests {
                     Some(v) => std::env::set_var(n, v),
                     None => std::env::remove_var(n),
                 }
+            }
+        }
+    }
+
+    /// `EPICS_PVA_GW_CLEANUP_INTERVAL` feeds `runtime::task::interval`,
+    /// which panics on a zero period. A value that rounds to a zero
+    /// `Duration` counts as 0, and the default stands as it does for 0.
+    #[test]
+    #[serial_test::serial(epics_env)]
+    fn gw_cleanup_interval_env_that_rounds_to_zero_keeps_default() {
+        const N: &str = "EPICS_PVA_GW_CLEANUP_INTERVAL";
+        let prev = std::env::var(N).ok();
+        for (raw, want) in [
+            ("0", DEFAULT_CLEANUP_INTERVAL.get()),
+            ("1e-10", DEFAULT_CLEANUP_INTERVAL.get()),
+            ("1e-9", Duration::from_nanos(1)),
+        ] {
+            unsafe { std::env::set_var(N, raw) };
+            let cfg = PvaGatewayConfig::default().with_env();
+            assert_eq!(cfg.cleanup_interval.get(), want, "{raw}");
+        }
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(N, v),
+                None => std::env::remove_var(N),
             }
         }
     }

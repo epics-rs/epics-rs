@@ -4,7 +4,6 @@ pub mod math;
 pub use engine::cvt;
 pub use engine::error::{CalcError, calc_error_str};
 pub use engine::opcodes::{CoreOp, Opcode};
-pub use engine::random::seed_random_from_time;
 pub use engine::{
     CALC_NARGS, CalcResult, CompiledExpr, ExprKind, NumericInputs, Rpcl, infix_to_postfix_size,
 };

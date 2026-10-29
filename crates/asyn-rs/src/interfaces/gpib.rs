@@ -13,7 +13,7 @@
 //!
 //! The pass-through means the two halves are one interface here: the driver
 //! implements [`crate::port::PortDriver::gpib_universal_cmd`] and its three
-//! siblings, declares [`super::Capability::Gpib`], and callers reach them
+//! siblings, declares [`super::InterfaceMask::GPIB`], and callers reach them
 //! through [`crate::port_handle::PortHandle`] — the port actor is the
 //! `pasynGpib` vtable.
 //!

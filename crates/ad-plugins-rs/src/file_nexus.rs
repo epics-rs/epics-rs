@@ -18,13 +18,13 @@ use std::sync::Arc;
 
 use ad_core_rs::attributes::NDAttributeList;
 use ad_core_rs::error::{ADError, ADResult};
-use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType};
+use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDataView};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::file_base::{NDFileOpenMode, NDFileWriter};
 use ad_core_rs::plugin::file_controller::{
     FileControl, FilePluginController, SettingsStore, WriterSettings,
 };
-use ad_core_rs::plugin::runtime::{NDPluginProcess, PluginAttributes, ProcessResult};
+use ad_core_rs::plugin::runtime::{NDPluginProcess, PluginAttributes, PluginPool, ProcessResult};
 use parking_lot::Mutex;
 
 use rust_hdf5::{H5Dataset, H5File};
@@ -35,17 +35,17 @@ use rust_hdf5::{H5Dataset, H5File};
 /// host-endian `as_u8_slice()` bytes is only correct on a little-endian host.
 /// This makes the on-disk bytes match the declared LE datatype on every host.
 fn nd_buffer_to_le_bytes(buf: &NDDataBuffer) -> Vec<u8> {
-    match buf {
-        NDDataBuffer::I8(v) => v.iter().map(|&x| x as u8).collect(),
-        NDDataBuffer::U8(v) => v.clone(),
-        NDDataBuffer::I16(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
-        NDDataBuffer::U16(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
-        NDDataBuffer::I32(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
-        NDDataBuffer::U32(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
-        NDDataBuffer::I64(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
-        NDDataBuffer::U64(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
-        NDDataBuffer::F32(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
-        NDDataBuffer::F64(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
+    match buf.view() {
+        NDDataView::I8(v) => v.iter().map(|&x| x as u8).collect(),
+        NDDataView::U8(v) => v.to_vec(),
+        NDDataView::I16(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
+        NDDataView::U16(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
+        NDDataView::I32(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
+        NDDataView::U32(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
+        NDDataView::I64(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
+        NDDataView::U64(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
+        NDDataView::F32(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
+        NDDataView::F64(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
     }
 }
 
@@ -696,7 +696,7 @@ impl NDFileWriter for NexusWriter {
 
         // The frame bytes serialized explicitly little-endian (rust-hdf5
         // 0.2.15 records LE datatypes and copies write_chunk bytes verbatim).
-        let frame_bytes = nd_buffer_to_le_bytes(&array.data);
+        let frame_bytes = nd_buffer_to_le_bytes(array.data());
 
         if self.frame_count == 0 {
             // First frame: create a chunked dataset with leading frame dim.
@@ -729,7 +729,7 @@ impl NDFileWriter for NexusWriter {
             }
             macro_rules! create_typed {
                 ($group:expr, $name:expr) => {{
-                    match array.data.data_type() {
+                    match array.data().data_type() {
                         NDDataType::Int8 => create_image_ds!($group, i8, $name),
                         NDDataType::UInt8 => create_image_ds!($group, u8, $name),
                         NDDataType::Int16 => create_image_ds!($group, i16, $name),
@@ -853,7 +853,7 @@ impl NDFileWriter for NexusWriter {
 
     /// Unreachable through `readFileBase`, whose open is refused first; C's
     /// `readFile` is a stub that fails (NDFileNexus.cpp:115-130).
-    fn read_file(&mut self) -> ADResult<NDArray> {
+    fn read_file(&mut self, _pool: &NDArrayPool) -> ADResult<NDArray> {
         Err(ADError::UnsupportedConversion(
             "NDFileNexus cannot read".into(),
         ))
@@ -868,8 +868,8 @@ impl NDFileWriter for NexusWriter {
         Ok(())
     }
 
-    fn set_plugin_attributes(&mut self, attributes: NDAttributeList) {
-        self.plugin_attributes = attributes;
+    fn set_plugin_attributes(&mut self, attributes: &NDAttributeList) {
+        self.plugin_attributes.clone_from(attributes);
     }
 
     fn supports_multiple_arrays(&self) -> bool {
@@ -956,15 +956,27 @@ impl NDPluginProcess for NexusFileProcessor {
     /// C `NDFileNexus::writeOctet` (NDFileNexus.cpp:776-813) loads the
     /// template inside the write, from the path and file in the param
     /// library, so a capture opened next uses it; a file write in progress
-    /// does not hold the write up.
+    /// does not hold the write up. NDPluginFile's failure carries Nexus's
+    /// errorMessage: C overwrites that status with callParamCallbacks'
+    /// (:801), so the write succeeds; not copied.
     fn validate_octet(
         &self,
         reason: usize,
         _addr: i32,
-        _value: &str,
+        value: &str,
         verdict: ad_core_rs::plugin::runtime::WriteVerdict<String>,
         params: &asyn_rs::port::PortDriverBase,
     ) -> ad_core_rs::plugin::runtime::WriteOutcome<String> {
+        use ad_core_rs::plugin::runtime::WriteVerdict;
+        let verdict = match verdict {
+            WriteVerdict::Refuse { keep, .. } => WriteVerdict::Refuse {
+                keep,
+                message: format!(
+                    "NDFileNexus:writeOctet: status=3, function={reason}, value={value}"
+                ),
+            },
+            accepted => accepted,
+        };
         let out = ad_core_rs::plugin::runtime::WriteOutcome::from(verdict);
         let stored = |idx: Option<usize>| {
             if Some(reason) == idx {
@@ -1008,6 +1020,10 @@ impl NDPluginProcess for NexusFileProcessor {
         self.attributes = Some(attributes);
     }
 
+    fn bind_pool(&mut self, pool: PluginPool) {
+        self.ctrl.get_mut().bind_pool(pool);
+    }
+
     fn plugin_type(&self) -> &str {
         "NDFileNexus"
     }
@@ -1040,7 +1056,19 @@ impl NDPluginProcess for NexusFileProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ad_core_rs::ndarray::NDDimension;
+
+    /// NDPluginDriver's FilePath refusal fails the write under this
+    /// plugin's errorMessage.
+    #[test]
+    fn a_refused_file_path_write_fails() {
+        let (message, function, value) =
+            crate::test_util::refused_file_path_write("NEXUS_PATH", NexusFileProcessor::new());
+        assert_eq!(
+            message,
+            format!("NDFileNexus:writeOctet: status=3, function={function}, value={value}")
+        );
+    }
+    use ad_core_rs::ndarray::{NDDataViewMut, NDDimension};
 
     fn temp_path(prefix: &str) -> PathBuf {
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -1071,7 +1099,10 @@ mod tests {
         writer.close_file().unwrap();
         let mut proc = NexusFileProcessor::new();
         let (out, _base) = crate::test_util::read_file(&mut proc, &path);
-        assert_eq!(out.trace, crate::test_util::read_refused_lines(&path));
+        assert_eq!(
+            out.trace,
+            crate::test_util::read_refused_lines(&path, &_base)
+        );
         assert_eq!(out.publish, ad_core_rs::plugin::runtime::Published::Nothing);
         std::fs::remove_file(&path).ok();
     }
@@ -1085,7 +1116,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             for i in 0..16 {
                 v[i] = i as u8;
             }
@@ -1117,7 +1148,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr1.data {
+        if let NDDataViewMut::U8(v) = arr1.data_mut().view_mut() {
             for i in 0..16 {
                 v[i] = i as u8;
             }
@@ -1127,7 +1158,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr2.data {
+        if let NDDataViewMut::U8(v) = arr2.data_mut().view_mut() {
             for i in 0..16 {
                 v[i] = (i + 100) as u8;
             }
@@ -1253,7 +1284,7 @@ mod tests {
             vec![NDDimension::new(3), NDDimension::new(2)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             for (i, x) in v.iter_mut().enumerate() {
                 *x = i as u8;
             }
@@ -1357,8 +1388,8 @@ mod tests {
             "nexus_tmpl_test",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         let mut proc = NexusFileProcessor::new();
         proc.register_params(&mut base).unwrap();
@@ -1431,7 +1462,7 @@ mod tests {
                 vec![NDDimension::new(3), NDDimension::new(2)],
                 NDDataType::UInt8,
             );
-            if let NDDataBuffer::U8(ref mut v) = arr.data {
+            if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
                 for (i, x) in v.iter_mut().enumerate() {
                     *x = base + i as u8;
                 }
@@ -1478,7 +1509,7 @@ mod tests {
             vec![NDDimension::new(3), NDDimension::new(2)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             v.iter_mut().enumerate().for_each(|(i, x)| *x = i as u8);
         }
         writer
@@ -1540,17 +1571,17 @@ mod tests {
             let mut writer = NexusWriter::new();
             let mut arr = NDArray::new(vec![NDDimension::new(2), NDDimension::new(2)], dt);
             // Distinct, type-revealing values: negatives for signed types.
-            match arr.data {
-                NDDataBuffer::I8(ref mut v) => v.copy_from_slice(&[-1, 2, -3, 4]),
-                NDDataBuffer::U8(ref mut v) => v.copy_from_slice(&[1, 2, 3, 4]),
-                NDDataBuffer::I16(ref mut v) => v.copy_from_slice(&[-1, 2, -3, 4]),
-                NDDataBuffer::U16(ref mut v) => v.copy_from_slice(&[1, 2, 3, 4]),
-                NDDataBuffer::I32(ref mut v) => v.copy_from_slice(&[-1, 2, -3, 4]),
-                NDDataBuffer::U32(ref mut v) => v.copy_from_slice(&[1, 2, 3, 4]),
-                NDDataBuffer::I64(ref mut v) => v.copy_from_slice(&[-1, 2, -3, 4]),
-                NDDataBuffer::U64(ref mut v) => v.copy_from_slice(&[1, 2, 3, 4]),
-                NDDataBuffer::F32(ref mut v) => v.copy_from_slice(&[-1.5, 2.5, -3.5, 4.5]),
-                NDDataBuffer::F64(ref mut v) => v.copy_from_slice(&[-1.5, 2.5, -3.5, 4.5]),
+            match arr.data_mut().view_mut() {
+                NDDataViewMut::I8(v) => v.copy_from_slice(&[-1, 2, -3, 4]),
+                NDDataViewMut::U8(v) => v.copy_from_slice(&[1, 2, 3, 4]),
+                NDDataViewMut::I16(v) => v.copy_from_slice(&[-1, 2, -3, 4]),
+                NDDataViewMut::U16(v) => v.copy_from_slice(&[1, 2, 3, 4]),
+                NDDataViewMut::I32(v) => v.copy_from_slice(&[-1, 2, -3, 4]),
+                NDDataViewMut::U32(v) => v.copy_from_slice(&[1, 2, 3, 4]),
+                NDDataViewMut::I64(v) => v.copy_from_slice(&[-1, 2, -3, 4]),
+                NDDataViewMut::U64(v) => v.copy_from_slice(&[1, 2, 3, 4]),
+                NDDataViewMut::F32(v) => v.copy_from_slice(&[-1.5, 2.5, -3.5, 4.5]),
+                NDDataViewMut::F64(v) => v.copy_from_slice(&[-1.5, 2.5, -3.5, 4.5]),
             }
 
             writer
@@ -1567,7 +1598,7 @@ mod tests {
             assert_eq!(read.len(), 4, "{:?}: element count", dt);
             for i in 0..4 {
                 assert_eq!(
-                    arr.data.get_as_f64(i),
+                    arr.data().get_as_f64(i),
                     read.get_as_f64(i),
                     "{:?}: element {} must round-trip",
                     dt,

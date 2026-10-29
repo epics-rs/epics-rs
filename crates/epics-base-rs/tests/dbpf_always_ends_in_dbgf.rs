@@ -19,7 +19,7 @@
 //! `ERROR <file> line <n>: cannot parse 'notanumber' as Double` and returned
 //! before the read-back; and the read-back itself was an inline copy of only
 //! `dbgf`'s successful half, so a put whose read then failed printed nothing.
-//! Measured against `~/work/epics-base/bin/linux-x86_64/softIoc` on the
+//! Measured against `$EPICS_BASE/bin/linux-x86_64/softIoc` on the
 //! fixture below, C printed `DBF_DOUBLE:         1.5` and
 //! `DBF_CHAR:           failed.` for those two.
 //!

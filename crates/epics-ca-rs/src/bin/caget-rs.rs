@@ -944,19 +944,17 @@ async fn main() {
                         snap: Box::new(zero_dbr_snapshot(b, n)),
                     })
                 };
-                match epics_base_rs::runtime::task::timeout(t, ch.get_with_dbr_type(rt, req_count))
-                    .await
-                {
-                    Ok(Ok(snap)) => Ok(GetResult::Specified {
+                match ch.get_with_dbr_type(rt, req_count, t).await {
+                    Ok(snap) => Ok(GetResult::Specified {
                         native,
                         req_type: rt,
                         snap: Box::new(snap),
                     }),
-                    Ok(Err(CaError::Timeout)) | Err(_) => {
+                    Err(CaError::Timeout) => {
                         timed_out = true;
                         on_timeout()
                     }
-                    Ok(Err(e)) => Err(read_error(&e)),
+                    Err(e) => Err(read_error(&e)),
                 }
             } else {
                 // C `caget.c:177-187` readback substitution, in C's
@@ -994,22 +992,17 @@ async fn main() {
                             }
                         })
                     };
-                    match epics_base_rs::runtime::task::timeout(
-                        t,
-                        ch.get_with_dbr_type(rt, req_count),
-                    )
-                    .await
-                    {
-                        Ok(Ok(snap)) => Ok(if want_time {
+                    match ch.get_with_dbr_type(rt, req_count, t).await {
+                        Ok(snap) => Ok(if want_time {
                             GetResult::Time(Box::new(snap))
                         } else {
                             GetResult::Plain(snap.value)
                         }),
-                        Ok(Err(CaError::Timeout)) | Err(_) => {
+                        Err(CaError::Timeout) => {
                             timed_out = true;
                             on_timeout()
                         }
-                        Ok(Err(e)) => Err(read_error(&e)),
+                        Err(e) => Err(read_error(&e)),
                     }
                 } else if want_time {
                     let on_timeout = || {
@@ -1017,18 +1010,16 @@ async fn main() {
                             GetResult::Time(Box::new(zero_dbr_snapshot(b, n)))
                         })
                     };
-                    match epics_base_rs::runtime::task::timeout(
-                        t,
-                        ch.get_with_metadata_count(DbrClass::Time, req_count),
-                    )
-                    .await
+                    match ch
+                        .get_with_metadata_count(DbrClass::Time, req_count, t)
+                        .await
                     {
-                        Ok(Ok(snap)) => Ok(GetResult::Time(Box::new(snap))),
-                        Ok(Err(CaError::Timeout)) | Err(_) => {
+                        Ok(snap) => Ok(GetResult::Time(Box::new(snap))),
+                        Err(CaError::Timeout) => {
                             timed_out = true;
                             on_timeout()
                         }
-                        Ok(Err(e)) => Err(read_error(&e)),
+                        Err(e) => Err(read_error(&e)),
                     }
                 } else {
                     // plain / terse: cheap typed value, no metadata payload.

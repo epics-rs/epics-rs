@@ -67,7 +67,10 @@ async fn first_event(client: &CaClient, name: &str) -> Vec<u8> {
 async fn put_chars(client: &CaClient, name: &str, chars: &[u8]) {
     connect(client, name)
         .await
-        .put(&EpicsValue::CharArray(chars.to_vec().into()))
+        .put_with_timeout(
+            &EpicsValue::CharArray(chars.to_vec().into()),
+            fact_budget::FACT_BUDGET,
+        )
         .await
         .unwrap_or_else(|e| panic!("put {name}: {e:?}"));
 }
@@ -105,7 +108,7 @@ async fn a_dollar_monitor_posts_len_elements() {
     }
     connect(&client, "LE.PROC")
         .await
-        .put(&EpicsValue::UChar(1))
+        .put_with_timeout(&EpicsValue::UChar(1), fact_budget::FACT_BUDGET)
         .await
         .expect("process LE");
     assert_eq!(first_event(&client, "LE.VAL$").await, b"hello");

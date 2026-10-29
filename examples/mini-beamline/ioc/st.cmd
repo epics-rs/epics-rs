@@ -43,11 +43,11 @@ epicsEnvSet("DOT_N_PER_I_PER_S","200.0")
 miniBeamlineConfig()
 
 # Load motors
-dbLoadRecords("$(MOTOR)/motor.template", "P=$(PREFIX),M=ph:mtr,PORT=ph_mtr")
-dbLoadRecords("$(MOTOR)/motor.template", "P=$(PREFIX),M=edge:mtr,PORT=edge_mtr")
-dbLoadRecords("$(MOTOR)/motor.template", "P=$(PREFIX),M=slit:mtr,PORT=slit_mtr")
-dbLoadRecords("$(MOTOR)/motor.template", "P=$(PREFIX),M=dot:mtrx,PORT=dot_mtrx,VELO=500,ACCL=0.1,HLM=500,LLM=-500")
-dbLoadRecords("$(MOTOR)/motor.template", "P=$(PREFIX),M=dot:mtry,PORT=dot_mtry,VELO=500,ACCL=0.1,HLM=500,LLM=-500")
+dbLoadRecords("$(MOTOR)/ioc/motor.template", "P=$(PREFIX),M=ph:mtr,PORT=ph_mtr")
+dbLoadRecords("$(MOTOR)/ioc/motor.template", "P=$(PREFIX),M=edge:mtr,PORT=edge_mtr")
+dbLoadRecords("$(MOTOR)/ioc/motor.template", "P=$(PREFIX),M=slit:mtr,PORT=slit_mtr")
+dbLoadRecords("$(MOTOR)/ioc/motor.template", "P=$(PREFIX),M=dot:mtrx,PORT=dot_mtrx,VELO=500,ACCL=0.1,HLM=500,LLM=-500")
+dbLoadRecords("$(MOTOR)/ioc/motor.template", "P=$(PREFIX),M=dot:mtry,PORT=dot_mtry,VELO=500,ACCL=0.1,HLM=500,LLM=-500")
 
 # Load DCM motors and sequencer database.
 # VELO/ACCL are set so coordinated moves (KohzuSpeedCtrl=Enable) complete in
@@ -57,14 +57,14 @@ dbLoadRecords("$(MOTOR)/motor.template", "P=$(PREFIX),M=dot:mtry,PORT=dot_mtry,V
 # at the motor.template default VELO it dominates the coordinated time and drags
 # Theta down to a crawl (~0.04 deg/s) — the move looks frozen. Give Z the
 # highest velocity so its travel time, not Theta's, sets a sane move duration.
-dbLoadRecords("$(MOTOR)/motor.template", "P=$(PREFIX),M=dcm:theta,PORT=dcm_theta,VELO=5,ACCL=0.2")
+dbLoadRecords("$(MOTOR)/ioc/motor.template", "P=$(PREFIX),M=dcm:theta,PORT=dcm_theta,VELO=5,ACCL=0.2")
 # Y/Z soft limits are widened for the full energy range (5-20 keV needs Z up
 # to ~200mm) through motor.template's HLM/LLM macros, which land in DHLM/DLLM
 # at dbLoadRecords time. They cannot be dbpf'd here: st.cmd runs before
 # iocInit, and dbpf refuses a record whose lock set is not built yet
 # (C dbTest.c:408-411, "dbpf only works after iocInit").
-dbLoadRecords("$(MOTOR)/motor.template", "P=$(PREFIX),M=dcm:y,PORT=dcm_y,VELO=10,ACCL=0.2,HLM=250,LLM=-250")
-dbLoadRecords("$(MOTOR)/motor.template", "P=$(PREFIX),M=dcm:z,PORT=dcm_z,VELO=50,ACCL=0.2,HLM=250,LLM=-250")
+dbLoadRecords("$(MOTOR)/ioc/motor.template", "P=$(PREFIX),M=dcm:y,PORT=dcm_y,VELO=10,ACCL=0.2,HLM=250,LLM=-250")
+dbLoadRecords("$(MOTOR)/ioc/motor.template", "P=$(PREFIX),M=dcm:z,PORT=dcm_z,VELO=50,ACCL=0.2,HLM=250,LLM=-250")
 dbLoadRecords("$(OPTICS)/db/kohzuSeq.db", "P=$(PREFIX),M_THETA=dcm:theta,M_Y=dcm:y,M_Z=dcm:z,yOffHi=50,yOffLo=-50")
 
 # Load beam current

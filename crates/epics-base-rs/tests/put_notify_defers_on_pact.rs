@@ -214,7 +214,7 @@ async fn deferred_put_is_replayed_and_completes_after_it() {
     // The device round-trip finishes: C `dbNotifyCompletion` runs here.
     f.db.complete_async_record("ASY").await.unwrap();
 
-    epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(5), rx)
+    epics_base_rs::runtime::task::timeout(fact_budget::FACT_BUDGET, rx)
         .await
         .expect("the put-notify callback must fire after the restarted put")
         .expect("the completion sender must not be dropped");
@@ -445,7 +445,7 @@ async fn deleting_a_record_releases_its_queued_put_notifies() {
     assert!(f.db.remove_record("ASY").await, "ASY must exist to remove");
 
     for (rx, which) in [(first, "first"), (second, "second")] {
-        let woken = epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(5), rx)
+        let woken = epics_base_rs::runtime::task::timeout(fact_budget::FACT_BUDGET, rx)
             .await
             .unwrap_or_else(|_| {
                 panic!("the {which} queued put-notify leaked: its client is still waiting")
@@ -487,7 +487,7 @@ async fn owned_async() -> (
 
 /// Await `rx`, failing rather than hanging; `true` when the completion fired.
 async fn ended(rx: epics_base_rs::runtime::sync::oneshot::Receiver<()>, site: &str) -> bool {
-    epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(5), rx)
+    epics_base_rs::runtime::task::timeout(fact_budget::FACT_BUDGET, rx)
         .await
         .unwrap_or_else(|_| panic!("{site}: the put-notify never ended"))
         .is_ok()
@@ -607,7 +607,7 @@ async fn completion_racing_deletion_ends_the_put_notify_once() {
 
 /// Await a deferred put's callback, failing the test rather than hanging.
 async fn expect_callback(rx: epics_base_rs::runtime::sync::oneshot::Receiver<()>, site: &str) {
-    epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(5), rx)
+    epics_base_rs::runtime::task::timeout(fact_budget::FACT_BUDGET, rx)
         .await
         .unwrap_or_else(|_| panic!("the put parked on the PACT window {site} released was never replayed — its callback never fired"))
         .expect("the completion sender must not be dropped");
@@ -756,7 +756,8 @@ async fn sdly_input_record() -> PvDatabase {
 
 /// Wait for the queued replay (C's restart callback) to land its value.
 async fn await_replayed_value(db: &PvDatabase, name: &str, want: f64) {
-    for _ in 0..500 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if let Ok(EpicsValue::Double(v)) = db.get_pv(name)
             && (v - want).abs() < 1e-10
         {
@@ -952,7 +953,7 @@ async fn an_unwritten_notify_waits_and_passes_the_record_on() {
 
     f.db.complete_async_record("ASY").await.unwrap();
 
-    let timeout = std::time::Duration::from_secs(5);
+    let timeout = fact_budget::FACT_BUDGET;
     epics_base_rs::runtime::task::timeout(timeout, wait)
         .await
         .expect("the wait answers after the cycle")
@@ -987,7 +988,7 @@ async fn a_queued_process_notify_skips_a_record_no_longer_passive() {
 
     f.db.complete_async_record("ASY").await.unwrap();
 
-    let timeout = std::time::Duration::from_secs(5);
+    let timeout = fact_budget::FACT_BUDGET;
     epics_base_rs::runtime::task::timeout(timeout, process)
         .await
         .expect("the process notify answers")

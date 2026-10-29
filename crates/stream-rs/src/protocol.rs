@@ -781,7 +781,7 @@ impl Protocol {
                     }
                     b'x' => {
                         // hex numbers (max 2 digits after x)
-                        let Some((v, k)) = c_sscanf_hex(source.plus(1), 2) else {
+                        let Some((v, k)) = c_sscanf_hex(source.plus(1)) else {
                             stream_error_at(
                                 self.line,
                                 self.filename.bytes(),

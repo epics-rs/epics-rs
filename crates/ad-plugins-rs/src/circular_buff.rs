@@ -577,9 +577,8 @@ impl NDPluginProcess for CircularBuffProcessor {
         .or(InterfaceMask::GENERIC_POINTER);
     const INTERRUPT_MASK: InterfaceMask = Self::INTERFACE_MASK;
 
-    /// C `NDPluginCircularBuff::writeInt32` drops the base class status
-    /// (`status = (asynStatus) callParamCallbacks();`, NDPluginCircularBuff.cpp:303): a refused NDPluginDriver write keeps
-    /// its clamp and succeeds.
+    /// C `NDPluginCircularBuff::writeInt32` drops the base refusal (NDPluginCircularBuff.cpp:303); not copied.
+    /// A kept refusal carries the errorMessage C's `if (status)` sets (:305-308).
     fn validate_int32(
         &self,
         reason: usize,
@@ -604,7 +603,15 @@ impl NDPluginProcess for CircularBuffProcessor {
             Some(i) => out.set_octet(i, 0, s),
             None => out,
         };
-        let out = WriteOutcome::from(verdict.succeed());
+        let out = WriteOutcome::from(match verdict {
+            WriteVerdict::Refuse { keep, .. } => WriteVerdict::Refuse {
+                keep,
+                message: format!(
+                    "NDPluginCircularBuff:writeInt32: status=3, function={reason}, value={value}"
+                ),
+            },
+            accepted => accepted,
+        });
         let p = &self.params;
         if Some(reason) == p.control {
             if value == 1 {
@@ -665,7 +672,8 @@ impl NDPluginProcess for CircularBuffProcessor {
     }
     /// C `NDPluginCircularBuff::writeOctet(NDCircBuffTriggerCalc)` stores "0"
     /// for an empty expression and fails the write with postfix's -1 for a bad
-    /// one (NDPluginCircularBuff.cpp:337-349, :362).
+    /// one (NDPluginCircularBuff.cpp:337-349, :362). NDPluginDriver's failure
+    /// carries the same errorMessage.
     fn validate_octet(
         &self,
         reason: usize,
@@ -676,7 +684,16 @@ impl NDPluginProcess for CircularBuffProcessor {
     ) -> ad_core_rs::plugin::runtime::WriteOutcome<String> {
         use ad_core_rs::plugin::runtime::WriteVerdict;
         if Some(reason) != self.params.trigger_calc {
-            return verdict.into();
+            return match verdict {
+                WriteVerdict::Refuse { keep, .. } => WriteVerdict::Refuse {
+                    keep,
+                    message: format!(
+                        "NDPluginCircularBuff:writeOctet: status=3, function={reason}, value={value}"
+                    ),
+                },
+                accepted => accepted,
+            }
+            .into();
         }
         if value.is_empty() {
             return WriteVerdict::Accept("0".to_string()).into();
@@ -927,32 +944,35 @@ impl NDPluginProcess for CircularBuffProcessor {
 mod tests {
     use super::*;
 
-    /// `status = (asynStatus) callParamCallbacks();` (NDPluginCircularBuff.cpp:303).
+    /// NDPluginDriver's FilePath refusal fails the write under this
+    /// plugin's errorMessage.
     #[test]
-    fn a_refused_base_write_succeeds_as_c_write_int32_does() {
-        use ad_core_rs::plugin::runtime::WriteVerdict;
-        let proc = CircularBuffProcessor::new(2, 1, TriggerCondition::default(), 100);
-        let mut base = asyn_rs::port::PortDriverBase::new(
-            "T",
-            1,
-            Default::default(),
-            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+    fn a_refused_file_path_write_fails() {
+        let (message, function, value) = crate::test_util::refused_file_path_write(
+            "CIRC_BUFF_PATH",
+            CircularBuffProcessor::new(2, 1, TriggerCondition::default(), 100),
         );
-        let clamp = WriteVerdict::Refuse {
-            keep: 1,
-            message: String::new(),
-        };
         assert_eq!(
-            proc.validate_int32(
-                0,
-                0,
-                98,
-                clamp,
-                &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base)
+            message,
+            format!(
+                "NDPluginCircularBuff:writeOctet: status=3, function={function}, value={value}"
             )
-            .verdict,
-            WriteVerdict::Accept(1)
+        );
+    }
+
+    /// NDPluginCircularBuff.cpp:303 drops the base refusal; a CircularBuff port
+    /// returns it.
+    #[test]
+    fn a_refused_base_write_fails() {
+        let (message, function, value) = crate::test_util::refused_base_write(
+            "CIRC_BUFF_REFUSED",
+            CircularBuffProcessor::new(2, 1, TriggerCondition::default(), 100),
+        );
+        assert_eq!(
+            message,
+            format!(
+                "NDPluginCircularBuff:writeInt32: status=3, function={function}, value={value}"
+            )
         );
     }
 
@@ -966,8 +986,8 @@ mod tests {
             "CB_INIT",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         let mut proc = CircularBuffProcessor::new(100, 100, TriggerCondition::default(), 10);
         proc.register_params(&mut base).unwrap();
@@ -1002,8 +1022,8 @@ mod tests {
             "CB_INIT2",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         let mut proc = CircularBuffProcessor::new(5, 7, TriggerCondition::default(), 10);
         proc.register_params(&mut base).unwrap();
@@ -1566,8 +1586,8 @@ mod tests {
             "T",
             1,
             Default::default(),
-            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+            asyn_rs::port::InterfaceMask::NONE,
+            asyn_rs::port::InterfaceMask::NONE,
         );
         proc.register_params(&mut base).unwrap();
         (proc, base)
@@ -1992,8 +2012,8 @@ mod tests {
                 "T",
                 1,
                 Default::default(),
-                asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-                asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+                asyn_rs::port::InterfaceMask::NONE,
+                asyn_rs::port::InterfaceMask::NONE,
             );
             p.validate_int32(
                 20,

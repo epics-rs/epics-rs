@@ -1,6 +1,6 @@
 //! `xiahsc.st`, compiled by snc-rs from `build.rs` and run on
 //! `epics-seq-rs`. Its escaped C is three `#include`s, the
-//! `validateResponse` prototype and definition (`:203`, `:976-1008`), here
+//! `validateResponse` prototype and definition (`:203`, `:984-1016`), here
 //! in Rust under its C name, and the `communications error` `sprintf` in
 //! `idle` (`:621`).
 
@@ -13,7 +13,7 @@ macro_rules! seqg_escaped {
     (r#"#include <string.h>"#) => {};
     (r#"#include <epicsThread.h>"#) => {};
     (r#"int validateResponse(char *out, char *in);"#) => {};
-    // `:976-1008`, below in Rust.
+    // `:984-1016`, below in Rust.
     (r#"int validateResponse(char *out, char *in) { int return_val; int k=1; if (strlen(in) == 0) { return_val = 0; } else { while (out[k] != ' ') { if (out[k] != in[k]) { return_val = 0; break; } else { return_val = 1; k += 1; } } } return return_val; }"#) => {};
     ($env:ident, r#"sprintf (pVar->scratch, "communications error: %d", pVar->s_sevr);"#) => {{
         let v = $env.var();
@@ -27,7 +27,7 @@ macro_rules! seqg_escaped {
 
 epics_seq_rs::include_program!("xiahsc");
 
-/// `validateResponse` (`xiahsc.st:976-1008`): the command's ID, its bytes
+/// `validateResponse` (`xiahsc.st:984-1016`): the command's ID, its bytes
 /// from the second to the first space, against the reply's bytes at the
 /// same offsets, a byte past the reply's end reading as its terminator.
 #[allow(non_snake_case)]

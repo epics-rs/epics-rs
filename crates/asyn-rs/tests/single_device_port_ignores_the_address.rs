@@ -38,8 +38,8 @@ async fn an_io_intr_record_at_any_address_follows_list_0() {
         "SDANYADDR",
         1,
         PortFlags::default(),
-        InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_INTERRUPTS,
+        InterfaceMask::INT32 | InterfaceMask::DRV_USER,
+        InterfaceMask::INT32,
     );
     base.create_param("I32", ParamType::Int32).unwrap();
     let (runtime, _actor) =

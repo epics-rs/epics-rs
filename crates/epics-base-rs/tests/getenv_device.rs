@@ -238,13 +238,13 @@ record(lsi, "GETENV_AMSG_LSI") {
 }
 
 /// softIoc R7.0.10 after one process of each: a set variable leaves UDF 0 and
-/// an lsi LEN of `strlen` ("/home/stevek" → 12), an unset one UDF 1 and LEN 1
+/// an lsi LEN of `strlen` ("/opt/epics" → 10), an unset one UDF 1 and LEN 1
 /// (devEnviron.c:56-66, :109-117). Before the process both read UDF 1.
 #[epics_macros_rs::epics_test]
 async fn getenv_udf_and_len_match_softioc() {
     // SAFETY: nextest isolates each test in its own process (see module doc).
     unsafe {
-        std::env::set_var("GETENV_E2E_UDF_SET", "/home/stevek");
+        std::env::set_var("GETENV_E2E_UDF_SET", "/opt/epics");
         std::env::remove_var("GETENV_E2E_UDF_UNSET");
     }
 
@@ -265,7 +265,7 @@ record(lsi, "LU") { field(DTYP, "getenv") field(INP, "@GETENV_E2E_UDF_UNSET") }
 
     for (name, udf, len) in [
         ("SI", 0, None),
-        ("LI", 0, Some(12)),
+        ("LI", 0, Some(10)),
         ("SU", 1, None),
         ("LU", 1, Some(1)),
     ] {

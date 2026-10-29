@@ -270,7 +270,7 @@ impl Value {
             match &dst_desc {
                 FieldDesc::Scalar(t) => {
                     if let PvField::Scalar(sv) = src_field {
-                        if let Some(coerced) = coerce_scalar(sv, *t) {
+                        if let Some(coerced) = coerce_scalar(sv, *t, ScalarCopy::In) {
                             let _ = self.write_scalar(&path, coerced);
                         }
                     }
@@ -286,7 +286,7 @@ impl Value {
                     // than returning Ok after dropping the array.
                     let converted = elems
                         .iter()
-                        .map(|e| coerce_scalar(e, *t))
+                        .map(|e| coerce_scalar(e, *t, ScalarCopy::In))
                         .collect::<Option<Vec<_>>>()
                         .ok_or_else(|| ValueError::NoConvert {
                             path: path.clone(),
@@ -871,7 +871,9 @@ fn parse_path(path: &str) -> Result<Vec<PathSeg>, ValueError> {
             rest = r2;
         } else if let Some(r) = rest.strip_prefix('[') {
             let end = r.find(']').ok_or_else(nofield)?;
-            let idx: usize = r[..end].parse().map_err(|_| nofield())?;
+            // pvxs `parseTo<uint64_t>` (`data.cpp:932`).
+            let idx = crate::pvdata::convert::parse_to_u64(&r[..end]).map_err(|_| nofield())?;
+            let idx = usize::try_from(idx).map_err(|_| nofield())?;
             segs.push(PathSeg::Index(idx));
             rest = &r[end + 1..];
         } else {
@@ -1111,12 +1113,29 @@ fn walk_leaf_paths(desc: &FieldDesc, prefix: &str) -> Vec<String> {
     out
 }
 
+/// Which way a scalar crosses a pvxs `Value`: `In` is `copyIn`, a store into
+/// a field (`set`, `assign`, a put); `Out` is `copyOut`, a read of one
+/// (`get_as`, pvxs `as<T>()`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ScalarCopy {
+    In,
+    Out,
+}
+
 /// Coerce one scalar value into another scalar type. Returns `None`
 /// for unsupported pairs. Currently covers numeric↔numeric, numeric↔string,
 /// string↔string, and bool↔bool.
-fn coerce_scalar(sv: &ScalarValue, target: ScalarType) -> Option<ScalarValue> {
+pub(crate) fn coerce_scalar(
+    sv: &ScalarValue,
+    target: ScalarType,
+    side: ScalarCopy,
+) -> Option<ScalarValue> {
     use ScalarValue::*;
     let as_i64: Option<i64> = match sv {
+        // The same parse on both sides (`data.cpp:442-463`, `:525`).
+        String(s) => {
+            return crate::pvdata::convert::scalar_from_str(target, &s.as_str_lossy()).ok();
+        }
         Boolean(b) => Some(if *b { 1 } else { 0 }),
         Byte(x) => Some(*x as i64),
         Short(x) => Some(*x as i64),
@@ -1131,7 +1150,6 @@ fn coerce_scalar(sv: &ScalarValue, target: ScalarType) -> Option<ScalarValue> {
         // overflows rather than saturating. See `pvdata::cpp_cast`.
         Float(x) => Some(crate::pvdata::cpp_cast::double_to_i64(*x as f64)),
         Double(x) => Some(crate::pvdata::cpp_cast::double_to_i64(*x)),
-        String(s) => s.as_str_lossy().parse::<i64>().ok(),
     };
     // pvxs dispatches on the STORE's signedness (`data.cpp:551` vs `:565`):
     // an unsigned leaf casts the double to `uint64_t`, not to `int64_t`. The
@@ -1146,7 +1164,9 @@ fn coerce_scalar(sv: &ScalarValue, target: ScalarType) -> Option<ScalarValue> {
     let as_f64: Option<f64> = match sv {
         Float(x) => Some(*x as f64),
         Double(x) => Some(*x),
-        String(s) => s.as_str_lossy().parse::<f64>().ok(),
+        // `double(src)` of the uint64 itself (`data.cpp:405`): through
+        // int64, past `i64::MAX` it goes negative.
+        ULong(x) => Some(*x as f64),
         _ => as_i64.map(|i| i as f64),
     };
     let as_string: std::string::String = match sv {
@@ -1165,7 +1185,15 @@ fn coerce_scalar(sv: &ScalarValue, target: ScalarType) -> Option<ScalarValue> {
         String(s) => s.as_str_lossy().into_owned(),
     };
     Some(match target {
-        ScalarType::Boolean => Boolean(as_i64? != 0),
+        // pvxs `copyIn` into a bool takes a bool or an integer; a real has no
+        // arm (`data.cpp:579-593`). `copyOut` casts it, `bool(src)`
+        // (`data.cpp:408`).
+        ScalarType::Boolean => Boolean(match sv {
+            Float(_) | Double(_) if side == ScalarCopy::In => return None,
+            Float(x) => *x != 0.0,
+            Double(x) => *x != 0.0,
+            _ => as_i64? != 0,
+        }),
         ScalarType::Byte => Byte(as_i64? as i8),
         ScalarType::Short => Short(as_i64? as i16),
         ScalarType::Int => Int(as_i64? as i32),
@@ -1210,7 +1238,7 @@ macro_rules! impl_from_scalar_int {
                     "u64" => ScalarType::ULong,
                     _ => return Err(()),
                 };
-                let coerced = coerce_scalar(&sv, target).ok_or(())?;
+                let coerced = coerce_scalar(&sv, target, ScalarCopy::Out).ok_or(())?;
                 match coerced {
                     ScalarValue::Byte(x) => Ok(x as $t),
                     ScalarValue::Short(x) => Ok(x as $t),
@@ -1231,7 +1259,7 @@ impl_from_scalar_int!(i8, i16, i32, i64, u8, u16, u32, u64);
 
 impl FromScalarValue for f32 {
     fn from_scalar(sv: ScalarValue) -> Result<Self, ()> {
-        let coerced = coerce_scalar(&sv, ScalarType::Float).ok_or(())?;
+        let coerced = coerce_scalar(&sv, ScalarType::Float, ScalarCopy::Out).ok_or(())?;
         if let ScalarValue::Float(f) = coerced {
             Ok(f)
         } else {
@@ -1242,7 +1270,7 @@ impl FromScalarValue for f32 {
 
 impl FromScalarValue for f64 {
     fn from_scalar(sv: ScalarValue) -> Result<Self, ()> {
-        let coerced = coerce_scalar(&sv, ScalarType::Double).ok_or(())?;
+        let coerced = coerce_scalar(&sv, ScalarType::Double, ScalarCopy::Out).ok_or(())?;
         if let ScalarValue::Double(f) = coerced {
             Ok(f)
         } else {
@@ -1253,7 +1281,7 @@ impl FromScalarValue for f64 {
 
 impl FromScalarValue for bool {
     fn from_scalar(sv: ScalarValue) -> Result<Self, ()> {
-        let coerced = coerce_scalar(&sv, ScalarType::Boolean).ok_or(())?;
+        let coerced = coerce_scalar(&sv, ScalarType::Boolean, ScalarCopy::Out).ok_or(())?;
         if let ScalarValue::Boolean(b) = coerced {
             Ok(b)
         } else {
@@ -1264,7 +1292,7 @@ impl FromScalarValue for bool {
 
 impl FromScalarValue for String {
     fn from_scalar(sv: ScalarValue) -> Result<Self, ()> {
-        let coerced = coerce_scalar(&sv, ScalarType::String).ok_or(())?;
+        let coerced = coerce_scalar(&sv, ScalarType::String, ScalarCopy::Out).ok_or(())?;
         if let ScalarValue::String(s) = coerced {
             Ok(s.as_str_lossy().into_owned())
         } else {
@@ -1277,7 +1305,7 @@ macro_rules! impl_into_scalar_int {
     ($($t:ty),*) => {
         $(impl IntoScalarValue for $t {
             fn into_scalar(self, target: ScalarType) -> Result<ScalarValue, ()> {
-                coerce_scalar(&ScalarValue::Long(self as i64), target).ok_or(())
+                coerce_scalar(&ScalarValue::from(self), target, ScalarCopy::In).ok_or(())
             }
         })*
     };
@@ -1287,31 +1315,31 @@ impl_into_scalar_int!(i8, i16, i32, i64, u8, u16, u32, u64);
 
 impl IntoScalarValue for f32 {
     fn into_scalar(self, target: ScalarType) -> Result<ScalarValue, ()> {
-        coerce_scalar(&ScalarValue::Float(self), target).ok_or(())
+        coerce_scalar(&ScalarValue::Float(self), target, ScalarCopy::In).ok_or(())
     }
 }
 
 impl IntoScalarValue for f64 {
     fn into_scalar(self, target: ScalarType) -> Result<ScalarValue, ()> {
-        coerce_scalar(&ScalarValue::Double(self), target).ok_or(())
+        coerce_scalar(&ScalarValue::Double(self), target, ScalarCopy::In).ok_or(())
     }
 }
 
 impl IntoScalarValue for bool {
     fn into_scalar(self, target: ScalarType) -> Result<ScalarValue, ()> {
-        coerce_scalar(&ScalarValue::Boolean(self), target).ok_or(())
+        coerce_scalar(&ScalarValue::Boolean(self), target, ScalarCopy::In).ok_or(())
     }
 }
 
 impl IntoScalarValue for &str {
     fn into_scalar(self, target: ScalarType) -> Result<ScalarValue, ()> {
-        coerce_scalar(&ScalarValue::String(self.into()), target).ok_or(())
+        coerce_scalar(&ScalarValue::String(self.into()), target, ScalarCopy::In).ok_or(())
     }
 }
 
 impl IntoScalarValue for String {
     fn into_scalar(self, target: ScalarType) -> Result<ScalarValue, ()> {
-        coerce_scalar(&ScalarValue::String(self.into()), target).ok_or(())
+        coerce_scalar(&ScalarValue::String(self.into()), target, ScalarCopy::In).ok_or(())
     }
 }
 
@@ -1322,13 +1350,88 @@ mod tests {
     /// A real stored into a string field is `SB()<<double` (`data.cpp:602`).
     #[test]
     fn a_real_coerces_to_the_stream_default_text() {
-        let text = |sv| match coerce_scalar(&sv, ScalarType::String) {
+        let text = |sv| match coerce_scalar(&sv, ScalarType::String, ScalarCopy::In) {
             Some(ScalarValue::String(s)) => s.as_str_lossy().into_owned(),
             other => panic!("{other:?}"),
         };
         assert_eq!(text(ScalarValue::Double(1e20)), "1e+20");
         assert_eq!(text(ScalarValue::Double(1.0 / 3.0)), "0.333333");
         assert_eq!(text(ScalarValue::Float(0.1)), "0.1");
+    }
+
+    /// A string read or stored as a number is pvxs `parseTo` on both sides:
+    /// base 0, C whitespace either side, glibc `strtod` with ERANGE refused.
+    #[test]
+    fn a_string_converts_through_parse_to_on_both_sides() {
+        // copyOut (`data.cpp:446-457`).
+        let mut v = Value::create_from(NTScalar::new(ScalarType::String).build());
+        for (s, want) in [("0x10", 16), (" 12\t", 12), ("010", 8)] {
+            v.set("value", s).unwrap();
+            assert_eq!(v.get_as::<i32>("value").unwrap(), want, "{s:?}");
+        }
+        v.set("value", "-1").unwrap();
+        assert_eq!(v.get_as::<u32>("value").unwrap(), u32::MAX);
+        v.set("value", "18446744073709551615").unwrap();
+        assert_eq!(v.get_as::<u64>("value").unwrap(), u64::MAX);
+        v.set("value", "0x1p4").unwrap();
+        assert_eq!(v.get_as::<f64>("value").unwrap(), 16.0);
+        for s in ["1e400", "1e-310"] {
+            v.set("value", s).unwrap();
+            assert!(v.get_as::<f64>("value").is_err(), "{s:?}");
+        }
+        v.set("value", "08").unwrap();
+        assert!(v.get_as::<i64>("value").is_err());
+        // copyIn (`copyInScalar`, `data.cpp:525`).
+        let mut i = Value::create_from(NTScalar::new(ScalarType::Int).build());
+        i.set("value", "0x10").unwrap();
+        assert_eq!(i.get_as::<i32>("value").unwrap(), 16);
+        let mut u = Value::create_from(NTScalar::new(ScalarType::ULong).build());
+        u.set("value", "18446744073709551615").unwrap();
+        assert_eq!(u.get_as::<u64>("value").unwrap(), u64::MAX);
+        let mut d = Value::create_from(NTScalar::new(ScalarType::Double).build());
+        d.set("value", "0x1p4 ").unwrap();
+        assert_eq!(d.get_as::<f64>("value").unwrap(), 16.0);
+        assert!(d.set("value", "1e-310").is_err());
+    }
+
+    /// A uint64 crosses to a double as `double(src)` both ways
+    /// (`copyOutScalar`, `data.cpp:405`; `copyInScalar`), and to a string as
+    /// `SB()<<src`: never through int64, where `u64::MAX` is -1.
+    #[test]
+    fn a_uint64_converts_to_double_and_string_unsigned() {
+        let big = u64::MAX as f64;
+        assert_eq!(
+            coerce_scalar(
+                &ScalarValue::ULong(u64::MAX),
+                ScalarType::Double,
+                ScalarCopy::Out
+            ),
+            Some(ScalarValue::Double(big))
+        );
+        let mut u = Value::create_from(NTScalar::new(ScalarType::ULong).build());
+        u.set("value", u64::MAX).unwrap();
+        assert_eq!(u.get_as::<f64>("value").unwrap(), big);
+        let mut d = Value::create_from(NTScalar::new(ScalarType::Double).build());
+        d.set("value", u64::MAX).unwrap();
+        assert_eq!(d.get_as::<f64>("value").unwrap(), big);
+        let mut s = Value::create_from(NTScalar::new(ScalarType::String).build());
+        s.set("value", u64::MAX).unwrap();
+        assert_eq!(s.get_as::<String>("value").unwrap(), u64::MAX.to_string());
+    }
+
+    /// A real read as a bool is `copyOut`'s `bool(src)` (`data.cpp:408`),
+    /// though `copyIn` will not store one (`data.cpp:579-593`).
+    #[test]
+    fn a_real_reads_as_a_bool_but_is_not_stored_into_one() {
+        let mut v = Value::create_from(NTScalar::new(ScalarType::Double).build());
+        v.set("value", 1.0f64).unwrap();
+        assert!(v.get_as::<bool>("value").unwrap());
+        v.set("value", f64::NAN).unwrap();
+        assert!(v.get_as::<bool>("value").unwrap());
+        v.set("value", 0.0f64).unwrap();
+        assert!(!v.get_as::<bool>("value").unwrap());
+        let mut b = Value::create_from(NTScalar::new(ScalarType::Boolean).build());
+        assert!(b.set("value", 1.0f64).is_err());
     }
     use crate::nt::NTScalar;
 
@@ -1679,6 +1782,9 @@ mod tests {
             PvField::StructureArray(vec![Some(elem)]),
         );
         assert_eq!(v.get_as::<i32>("rows[0].a").unwrap(), 5);
+        // The subscript is `parseTo<uint64_t>` (pvxs `data.cpp:932`).
+        assert_eq!(v.get_as::<i32>("rows[0x0].a").unwrap(), 5);
+        assert_eq!(v.get_as::<i32>("rows[ 0].a").unwrap(), 5);
         // Out-of-range index is not reachable.
         assert!(v.lookup("rows[5].a").is_none());
     }

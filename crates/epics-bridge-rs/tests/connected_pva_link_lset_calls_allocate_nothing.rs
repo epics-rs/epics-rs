@@ -98,6 +98,7 @@ const CONNECTED_CALLS: &[(&str, fn(&dyn LinkSet, LinkRef<'_>))] = &[
     ("link_metadata", |l, n| {
         assert!(l.link_metadata(n).is_some())
     }),
+    ("link_shape", |l, n| assert!(l.link_shape(n).is_some())),
 ];
 
 #[test]
@@ -148,18 +149,15 @@ fn connected_pva_link_lset_calls_allocate_nothing() {
                 // One name per config route: the defaults, a convenience URI
                 // (one naming a `field`, so a clone of it would allocate) and a
                 // structured key.
-                let json = format!(
-                    "pva://{}",
-                    pvajson_identity_key("T:A", &[("Q".to_string(), JlinkValue::Int(7))])
-                );
+                let json = pvajson_identity_key("T:A", &[("Q".to_string(), JlinkValue::Int(7))]);
                 // `T:H` is never processed, so it serves its UDF alarm and
                 // message: the latch and the MS gate run on every read.
                 for name in [
-                    "pva://T:A",
-                    "pva://T:A?sevr=MS&field=value",
-                    "pva://T:A?time=true",
+                    "T:A",
+                    "T:A?sevr=MS&field=value",
+                    "T:A?time=true",
                     json.as_str(),
-                    "pva://T:H?sevr=MS",
+                    "T:H?sevr=MS",
                 ] {
                     let open = OpenLatch::default();
                     let link = LinkRef::new(name.as_bytes(), &open);

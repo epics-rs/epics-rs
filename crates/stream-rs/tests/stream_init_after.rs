@@ -5,7 +5,7 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use epics_base_rs::server::ioc_app::{IocApplication, IocInitDecision};
+use epics_base_rs::server::ioc_app::{IocApplication, IocInitDecision, RunOutcome};
 use parking_lot::Mutex;
 use stream_rs::error::STREAM_ERROR;
 
@@ -28,7 +28,7 @@ async fn run() {
     stream_rs::error::set_stream_error(0);
     let seen = Arc::new(Mutex::new(None));
     let runner_seen = seen.clone();
-    stream_rs::dev::register_app(IocApplication::new())
+    let outcome = stream_rs::dev::register_app(IocApplication::new())
         .port(0)
         .startup_line(&format!("dbLoadRecords(\"{}\")", db.display()))
         .startup_line(&format!(
@@ -36,7 +36,7 @@ async fn run() {
             before_init.display()
         ))
         .before_ioc_init(|| IocInitDecision::run(false))
-        .run(move |_config| async move {
+        .run_outcome(move |_config| async move {
             let report = |name| {
                 let mut out = Vec::new();
                 stream_rs::epics::stream_report_record(name, &mut out);
@@ -50,6 +50,7 @@ async fn run() {
         })
         .await
         .unwrap();
+    assert_eq!(outcome, RunOutcome::Served);
 
     // no record is initialized yet: the command ran and found no stream
     assert_eq!(std::fs::read(&before_init).unwrap(), b"");

@@ -1,0 +1,4 @@
+record(sub,"pvGetSync") {
+    field(SNAM,"subThreadSleep")
+    field(VAL,"1")
+}

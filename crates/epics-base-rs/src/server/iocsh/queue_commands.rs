@@ -655,7 +655,7 @@ mod tests {
         assert!(!failed && err.is_empty(), "before iocInit: {err:?}");
 
         let owner = scan::ScanOwner::start(Arc::clone(&db));
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
         while !scan::periodic_lists_built() {
             assert!(
                 std::time::Instant::now() < deadline,

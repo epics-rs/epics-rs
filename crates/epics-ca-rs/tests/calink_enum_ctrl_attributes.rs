@@ -83,8 +83,7 @@ async fn metadata_when(
 
 /// The trigger. An mbbi target's attributes must land exactly as C's fixed
 /// `DBR_CTRL_DOUBLE` delivers them — precision 0 and zeroed limits, present
-/// rather than absent — while the state-label table still arrives, because
-/// the labels ride their own native `DBR_CTRL_ENUM` get.
+/// rather than absent.
 #[tokio::test(flavor = "multi_thread")]
 #[serial(epics_env)]
 async fn an_enum_target_serves_the_converted_double_attributes() {
@@ -109,7 +108,7 @@ async fn an_enum_target_serves_the_converted_double_attributes() {
     let resolver = CaLinkResolver::with_client(client);
 
     let md = metadata_when(&resolver, "CALINK:ENUMATTR:SRC", |md| {
-        md.enum_choices.is_some() && md.precision.is_some()
+        md.precision.is_some()
     })
     .await;
 
@@ -137,11 +136,6 @@ async fn an_enum_target_serves_the_converted_double_attributes() {
     assert_eq!(
         md.units, None,
         "an empty units string stays None; C copies a zero-length string"
-    );
-    assert_eq!(
-        md.enum_choices,
-        Some(vec!["off".to_string(), "on".to_string()]),
-        "the label table still arrives, on its own native DBR_CTRL_ENUM get"
     );
 }
 

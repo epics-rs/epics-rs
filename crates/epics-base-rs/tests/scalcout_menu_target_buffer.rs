@@ -15,8 +15,8 @@
 //! The port's `DbFieldType` is a DBR wire type with no `Menu`/`Device` variant,
 //! so a switch on it alone caught only STRING and ENUM: a menu target (`PRIO`,
 //! `STAT`, `SEVR`, `DISS`, `ACKT`) — whose index the port stores as a short —
-//! and `DTYP` fell through to the numeric arm and received OVAL. The class is
-//! now settled at target resolution (`OutTarget::puts_as_string`).
+//! and `DTYP` fell through to the numeric arm and received OVAL.
+//! `OutTarget::field_type` now carries the `dbfType`.
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::Record;

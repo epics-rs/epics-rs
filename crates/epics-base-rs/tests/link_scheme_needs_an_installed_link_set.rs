@@ -20,9 +20,8 @@
 //! The port refuses the same field at load when no `pva` link type is
 //! declared (`softioc_undeclared_json_link_type` pins that). This file is the
 //! other fact: a binary that declares `pva` but has installed no `pva` link
-//! set, and `pva://`, which C has no `link()` gate for. Either way the link
-//! used to load clean and, because the lset boundary addresses a
-//! `PvaJson`/`Pva` link by its BARE name, it was dispatched to whatever other
+//! set. The link used to load clean and, because the lset boundary addressed
+//! a `PvaJson`/`Pva` link by its BARE name, it was dispatched to whatever other
 //! lset happened to be registered: with a `ca` link set installed the
 //! measured `{pva:{pv:"SRC"}}` link asked the CA lset for `SRC` (`cached:SRC`,
 //! `open:SRC`) — a pva link silently serviced over Channel Access, with
@@ -47,6 +46,7 @@ use std::sync::Arc;
 /// WRONG scheme's link set" is an assertion and not an inference.
 struct SpyLset {
     scheme: &'static str,
+    connected: bool,
     asked: parking_lot::Mutex<Vec<String>>,
 }
 
@@ -54,6 +54,15 @@ impl SpyLset {
     fn new(scheme: &'static str) -> Arc<Self> {
         Arc::new(Self {
             scheme,
+            connected: true,
+            asked: parking_lot::Mutex::new(Vec::new()),
+        })
+    }
+    /// A link set whose channels never connect, as dbCa's do with no server.
+    fn down(scheme: &'static str) -> Arc<Self> {
+        Arc::new(Self {
+            scheme,
+            connected: false,
             asked: parking_lot::Mutex::new(Vec::new()),
         })
     }
@@ -65,7 +74,7 @@ impl SpyLset {
 #[async_trait::async_trait]
 impl LinkSet for SpyLset {
     fn is_connected(&self, _name: LinkRef<'_>) -> bool {
-        true
+        self.connected
     }
     async fn get_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
         let name = link.name;
@@ -74,7 +83,7 @@ impl LinkSet for SpyLset {
             self.scheme,
             String::from_utf8_lossy(name)
         ));
-        Some(EpicsValue::Long(3))
+        self.connected.then_some(EpicsValue::Long(3))
     }
     fn get_cached_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
         let name = link.name;
@@ -83,7 +92,7 @@ impl LinkSet for SpyLset {
             self.scheme,
             String::from_utf8_lossy(name)
         ));
-        Some(EpicsValue::Long(3))
+        self.connected.then_some(EpicsValue::Long(3))
     }
     async fn connect_link(
         &self,
@@ -102,12 +111,15 @@ impl LinkSet for SpyLset {
 const DB: &str = r#"
 record(longin, "JSON")   { field(INP, "{pva:{pv:\"SRC\"}}") }
 record(longin, "OPTS")   { field(INP, "{pva:{pv:\"SRC\",proc:true}}") }
-record(longin, "PREFIX") { field(INP, "pva://SRC") }
 record(longin, "CALC")   { field(INP, "{calc:{expr:\"1+1\"}}") }
 record(longin, "CONST")  { field(INP, "{const:5}") }
-record(longin, "CAPRE")  { field(INP, "ca://SRC") }
+record(longin, "CAMOD")  { field(INP, "SRC CA") }
 record(longin, "BARE")   { field(INP, "OTHER:PV") }
 record(calc,   "REPARSED") { field(CALC, "A") field(INPA, "{pva:{pv:\"SRC\"}}") }
+record(longin, "PVAURL") { field(INP, "pva://SRC") }
+record(longin, "CAURL")  { field(INP, "ca://SRC") }
+record(calcout, "CO:PVAURL") { field(CALC, "A") field(INPA, "pva://SRC") }
+record(calcout, "CO:CAURL")  { field(CALC, "A") field(INPA, "ca://SRC") }
 "#;
 
 async fn build(lsets: &[(&'static str, Arc<SpyLset>)]) -> Arc<PvDatabase> {
@@ -141,7 +153,7 @@ fn inp(db: &PvDatabase, rec: &str) -> ParsedLink {
 #[epics_macros_rs::epics_test]
 async fn a_pva_link_with_no_pva_link_set_is_refused() {
     let db = build(&[]).await;
-    for rec in ["JSON", "OPTS", "PREFIX"] {
+    for rec in ["JSON", "OPTS"] {
         assert!(
             matches!(inp(&db, rec), ParsedLink::None),
             "{rec}.INP must be refused with no 'pva' link set, got {:?}",
@@ -188,7 +200,6 @@ async fn the_same_links_are_serviced_when_the_link_set_is_installed() {
         inp(&db, "JSON")
     );
     assert!(matches!(inp(&db, "OPTS"), ParsedLink::PvaJson(_)));
-    assert!(matches!(inp(&db, "PREFIX"), ParsedLink::Pva(_)));
 
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     let _ = db.process_record_with_links("JSON", &mut visited).await;
@@ -201,16 +212,16 @@ async fn the_same_links_are_serviced_when_the_link_set_is_installed() {
 }
 
 /// The exemptions, each for its own reason: `calc` and `const` are serviced
-/// in process and need nothing installed; `ca://` and a bare non-local name
-/// both parse to the same `Ca(CaLink)` as the `dbInitLink` fallthrough and
-/// the `X CA` modifier, so refusing them would refuse those — and `ca` has no
-/// `link()` line in base or pvxs to match against in the first place.
+/// in process and need nothing installed; a bare non-local name and the
+/// `X CA` modifier both parse to the `Ca(CaLink)` of the `dbInitLink`
+/// fallthrough, and `ca` has no `link()` line in base or pvxs to match
+/// against in the first place.
 #[epics_macros_rs::epics_test]
 async fn locally_serviced_and_ca_shaped_links_are_not_refused() {
     let db = build(&[]).await;
     assert!(matches!(inp(&db, "CALC"), ParsedLink::Calc(_)));
     assert!(matches!(inp(&db, "CONST"), ParsedLink::Constant(_)));
-    assert!(matches!(inp(&db, "CAPRE"), ParsedLink::Ca(_)));
+    assert!(matches!(inp(&db, "CAMOD"), ParsedLink::Ca(_)));
     assert!(
         matches!(inp(&db, "BARE"), ParsedLink::Ca(_)),
         "a bare non-local name still takes dbInitLink's CA fallthrough"
@@ -220,10 +231,9 @@ async fn locally_serviced_and_ca_shaped_links_are_not_refused() {
 /// The init-time refusal only reaches links that HAVE a parse cache. A calc
 /// record's `INPA` is re-parsed from its raw text every cycle
 /// (`initialize_link_locality` says so, and `record_link_fields` does not
-/// enumerate it), so the scheme has to survive to the link-set boundary as
-/// well: `external_pv_name` returns `pva://…` and
-/// `split_external_link_name` reads it back as the `pva` scheme. Addressed
-/// by its bare name the link is a CA link, and was measured being read from
+/// enumerate it), so the link set has to survive to the boundary as well:
+/// `external_link` addresses it to `LinkSetTarget::Pva`. Addressed by its
+/// bare name alone the link is a CA link, and was measured being read from
 /// the CA link set (`read:SRC`, `A` delivered 9.0).
 #[epics_macros_rs::epics_test]
 async fn a_reparsed_pva_link_is_not_serviced_by_another_schemes_link_set() {
@@ -239,4 +249,82 @@ async fn a_reparsed_pva_link_is_not_serviced_by_another_schemes_link_set() {
         "the CA link set must never be asked about a re-parsed pva link"
     );
     assert_eq!(db.get_pv("REPARSED").unwrap(), EpicsValue::Double(0.0));
+}
+
+/// `dbParseLink` has no URL scheme (`dbStaticLib.c:2280-2356`): `pva://SRC`
+/// and `ca://SRC` are PV names, which `dbInitLink` hands to `dbCaAddLink`
+/// verbatim like any other non-local name. Measured on
+/// `R7.0.10-146-g8f5015b66` `softIoc`, no server answering, after one
+/// process of each record:
+///
+/// ```text
+/// PVAURL     INP : CA_LINK pva://SRC NPP NMS   STAT: LINK  SEVR: INVALID
+/// CAURL      INP : CA_LINK ca://SRC NPP NMS    STAT: LINK  SEVR: INVALID
+/// CO:PVAURL  INPA: CA_LINK pva://SRC NPP NMS   INAV: Ext PV NC  STAT: LINK  SEVR: INVALID
+/// CO:CAURL   INPA: CA_LINK ca://SRC NPP NMS    INAV: Ext PV NC  STAT: LINK  SEVR: INVALID
+/// ```
+#[epics_macros_rs::epics_test]
+async fn a_scheme_spelling_is_a_ca_pv_name() {
+    use epics_base_rs::server::recgbl::alarm_status::LINK_ALARM;
+    use epics_base_rs::server::record::AlarmSeverity;
+
+    let records = [
+        ("PVAURL", "pva://SRC", "field INP"),
+        ("CAURL", "ca://SRC", "field INP"),
+        ("CO:PVAURL", "pva://SRC", "field INPA"),
+        ("CO:CAURL", "ca://SRC", "field INPA"),
+    ];
+    let started = |ca: Arc<SpyLset>| async move {
+        let db = build(&[("ca", ca)]).await;
+        db.ioc_init().await;
+        db.process_cp_links_on_connect().await;
+        db
+    };
+
+    let db = started(SpyLset::down("ca")).await;
+    for (rec, name) in [("PVAURL", "pva://SRC"), ("CAURL", "ca://SRC")] {
+        match inp(&db, rec) {
+            ParsedLink::Ca(link) => assert_eq!(link.pv, name, "{rec}.INP"),
+            other => panic!("{rec}.INP must be a CA link to `{name}`, got {other:?}"),
+        }
+    }
+    for (rec, _, amsg) in records {
+        let mut visited = epics_base_rs::server::database::ProcStack::new();
+        let _ = db.process_record_with_links(rec, &mut visited).await;
+        let alarm = {
+            let inst = db.get_record(rec).unwrap();
+            let inst = inst.read();
+            (
+                inst.common.stat,
+                inst.common.sevr,
+                inst.common.amsg.to_string(),
+            )
+        };
+        assert_eq!(
+            alarm,
+            (LINK_ALARM, AlarmSeverity::Invalid, amsg.to_string()),
+            "{rec}"
+        );
+    }
+    for rec in ["CO:PVAURL", "CO:CAURL"] {
+        assert_eq!(
+            db.get_pv(format!("{rec}.INAV")).unwrap().to_f64(),
+            Some(0.0),
+            "{rec}.INAV is Ext PV NC"
+        );
+    }
+
+    // Connected, the CA link set is read for the name verbatim.
+    let ca = SpyLset::new("ca");
+    let db = started(ca.clone()).await;
+    for (rec, name, _) in records {
+        let mut visited = epics_base_rs::server::database::ProcStack::new();
+        let _ = db.process_record_with_links(rec, &mut visited).await;
+        assert_eq!(db.get_pv(rec).unwrap().to_f64(), Some(3.0), "{rec}");
+        let asked = ca.asked();
+        assert!(
+            asked.contains(&format!("ca:read:{name}")),
+            "{rec}: the CA link set is read for `{name}`, got {asked:?}"
+        );
+    }
 }

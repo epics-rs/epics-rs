@@ -10,7 +10,9 @@
 //! - NDArray copy/clone behavior
 
 use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
-use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
+use ad_core_rs::ndarray::{
+    NDArray, NDDataBuffer, NDDataType, NDDataView, NDDataViewMut, NDDimension,
+};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 
 // ---------------------------------------------------------------------------
@@ -20,45 +22,45 @@ use ad_core_rs::ndarray_pool::NDArrayPool;
 #[test]
 fn create_int8_array() {
     let arr = NDArray::new(vec![NDDimension::new(64)], NDDataType::Int8);
-    assert_eq!(arr.data.data_type(), NDDataType::Int8);
-    assert_eq!(arr.data.len(), 64);
-    assert_eq!(arr.data.total_bytes(), 64);
+    assert_eq!(arr.data().data_type(), NDDataType::Int8);
+    assert_eq!(arr.data().len(), 64);
+    assert_eq!(arr.data().total_bytes(), 64);
     arr.validate().unwrap();
 }
 
 #[test]
 fn create_int16_array() {
     let arr = NDArray::new(vec![NDDimension::new(128)], NDDataType::Int16);
-    assert_eq!(arr.data.data_type(), NDDataType::Int16);
-    assert_eq!(arr.data.len(), 128);
-    assert_eq!(arr.data.total_bytes(), 256);
+    assert_eq!(arr.data().data_type(), NDDataType::Int16);
+    assert_eq!(arr.data().len(), 128);
+    assert_eq!(arr.data().total_bytes(), 256);
     arr.validate().unwrap();
 }
 
 #[test]
 fn create_int32_array() {
     let arr = NDArray::new(vec![NDDimension::new(256)], NDDataType::Int32);
-    assert_eq!(arr.data.data_type(), NDDataType::Int32);
-    assert_eq!(arr.data.len(), 256);
-    assert_eq!(arr.data.total_bytes(), 1024);
+    assert_eq!(arr.data().data_type(), NDDataType::Int32);
+    assert_eq!(arr.data().len(), 256);
+    assert_eq!(arr.data().total_bytes(), 1024);
     arr.validate().unwrap();
 }
 
 #[test]
 fn create_float32_array() {
     let arr = NDArray::new(vec![NDDimension::new(100)], NDDataType::Float32);
-    assert_eq!(arr.data.data_type(), NDDataType::Float32);
-    assert_eq!(arr.data.len(), 100);
-    assert_eq!(arr.data.total_bytes(), 400);
+    assert_eq!(arr.data().data_type(), NDDataType::Float32);
+    assert_eq!(arr.data().len(), 100);
+    assert_eq!(arr.data().total_bytes(), 400);
     arr.validate().unwrap();
 }
 
 #[test]
 fn create_float64_array() {
     let arr = NDArray::new(vec![NDDimension::new(50)], NDDataType::Float64);
-    assert_eq!(arr.data.data_type(), NDDataType::Float64);
-    assert_eq!(arr.data.len(), 50);
-    assert_eq!(arr.data.total_bytes(), 400);
+    assert_eq!(arr.data().data_type(), NDDataType::Float64);
+    assert_eq!(arr.data().len(), 50);
+    assert_eq!(arr.data().total_bytes(), 400);
     arr.validate().unwrap();
 }
 
@@ -71,8 +73,8 @@ fn create_all_unsigned_types() {
         (NDDataType::UInt64, 8),
     ] {
         let arr = NDArray::new(vec![NDDimension::new(10)], dt);
-        assert_eq!(arr.data.data_type(), dt);
-        assert_eq!(arr.data.total_bytes(), 10 * elem_size);
+        assert_eq!(arr.data().data_type(), dt);
+        assert_eq!(arr.data().total_bytes(), 10 * elem_size);
         arr.validate().unwrap();
     }
 }
@@ -160,7 +162,7 @@ fn pool_basic_alloc() {
         .alloc(vec![NDDimension::new(100)], NDDataType::UInt8)
         .unwrap();
     assert_eq!(arr.unique_id, 1);
-    assert_eq!(arr.data.len(), 100);
+    assert_eq!(arr.data().len(), 100);
     assert_eq!(pool.allocated_bytes(), 100);
     assert_eq!(pool.num_alloc_buffers(), 1);
 }
@@ -205,8 +207,8 @@ fn pool_free_list_reuse() {
     // the buffer's original size. Reusing a 100-byte buffer for 80 bytes keeps
     // the tracked data_size at 100; only the live element count is 80.
     assert_eq!(pool.allocated_bytes(), 100);
-    assert_eq!(arr2.data.len(), 80);
-    assert_eq!(arr2.data_size, 100);
+    assert_eq!(arr2.data().len(), 80);
+    assert_eq!(arr2.data_size(), 100);
     // unique_id keeps incrementing even on reuse
     assert_eq!(arr2.unique_id, 2);
 }
@@ -235,7 +237,7 @@ fn pool_free_list_prefers_smallest_sufficient_buffer() {
         .alloc(vec![NDDimension::new(800)], NDDataType::UInt8)
         .unwrap();
     assert_eq!(pool.num_free_buffers(), 2);
-    assert!(reused.data.capacity_bytes() >= 1000);
+    assert!(reused.data().capacity_bytes() >= 1000);
 }
 
 #[test]
@@ -378,15 +380,15 @@ fn buffer_is_empty() {
 #[test]
 fn buffer_direct_vec_access() {
     let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
-    if let NDDataBuffer::U8(ref mut v) = arr.data {
+    if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
         v[0] = 10;
         v[1] = 20;
         v[2] = 30;
         v[3] = 40;
     }
-    assert_eq!(arr.data.get_as_f64(0), Some(10.0));
-    assert_eq!(arr.data.get_as_f64(3), Some(40.0));
-    assert_eq!(arr.data.as_u8_slice(), &[10, 20, 30, 40]);
+    assert_eq!(arr.data().get_as_f64(0), Some(10.0));
+    assert_eq!(arr.data().get_as_f64(3), Some(40.0));
+    assert_eq!(arr.data().as_u8_slice(), &[10, 20, 30, 40]);
 }
 
 // ---------------------------------------------------------------------------
@@ -560,17 +562,17 @@ fn ndarray_clone_is_independent() {
         NDDataType::Float64,
     );
     arr.unique_id = 42;
-    arr.data.set_from_f64(0, 99.0);
+    arr.data_mut().set_from_f64(0, 99.0);
 
     let mut cloned = arr.clone();
     assert_eq!(cloned.unique_id, 42);
-    assert_eq!(cloned.data.get_as_f64(0), Some(99.0));
+    assert_eq!(cloned.data().get_as_f64(0), Some(99.0));
     assert_eq!(cloned.dims.len(), 2);
 
     // Mutating clone does not affect original
-    cloned.data.set_from_f64(0, 0.0);
+    cloned.data_mut().set_from_f64(0, 0.0);
     cloned.unique_id = 100;
-    assert_eq!(arr.data.get_as_f64(0), Some(99.0));
+    assert_eq!(arr.data().get_as_f64(0), Some(99.0));
     assert_eq!(arr.unique_id, 42);
 }
 
@@ -580,7 +582,7 @@ fn pool_alloc_copy_preserves_data_and_unique_id() {
     let mut source = pool
         .alloc(vec![NDDimension::new(4)], NDDataType::UInt8)
         .unwrap();
-    if let NDDataBuffer::U8(ref mut v) = source.data {
+    if let NDDataViewMut::U8(v) = source.data_mut().view_mut() {
         v[0] = 1;
         v[1] = 2;
         v[2] = 3;
@@ -591,7 +593,7 @@ fn pool_alloc_copy_preserves_data_and_unique_id() {
     // C's NDArrayPool::copy carries uniqueId across (NDArrayPool.cpp:283).
     assert_eq!(copy.unique_id, source.unique_id);
     assert_eq!(copy.dims.len(), source.dims.len());
-    if let NDDataBuffer::U8(ref v) = copy.data {
+    if let NDDataView::U8(v) = copy.data().view() {
         assert_eq!(v, &[1, 2, 3, 4]);
     } else {
         panic!("wrong data type in copy");
@@ -628,8 +630,8 @@ fn validate_fails_for_mismatched_buffer() {
         vec![NDDimension::new(10), NDDimension::new(20)],
         NDDataType::UInt8,
     );
-    // Replace buffer with wrong size
-    arr.data = NDDataBuffer::U8(vec![0; 100]);
+    // Shrink the buffer to the wrong size
+    arr.data_mut().resize(100);
     assert!(arr.validate().is_err());
 }
 
@@ -684,8 +686,8 @@ fn pool_reuse_with_different_data_type() {
     let arr2 = pool
         .alloc(vec![NDDimension::new(100)], NDDataType::Float32)
         .unwrap();
-    assert_eq!(arr2.data.data_type(), NDDataType::Float32);
-    assert_eq!(arr2.data.len(), 100);
+    assert_eq!(arr2.data().data_type(), NDDataType::Float32);
+    assert_eq!(arr2.data().len(), 100);
     arr2.validate().unwrap();
 }
 

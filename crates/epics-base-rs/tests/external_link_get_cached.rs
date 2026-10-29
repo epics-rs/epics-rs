@@ -1,4 +1,4 @@
-//! External-link GET parity with C `dbCaGetLink`: a record's `ca://`/`pva://`
+//! External-link GET parity with C `dbCaGetLink`: a record's CA / pva
 //! INP read serves the lset's monitor-fed cache and never opens a channel or
 //! waits on the wire from the record-processing thread.
 //!
@@ -159,7 +159,7 @@ async fn a_cache_miss_stages_the_open_instead_of_opening_inline() {
     )
     .await;
 
-    add_ai_with_inp(&db, "AI_LAZY", "ca://REMOTE:IN").await;
+    add_ai_with_inp(&db, "AI_LAZY", "REMOTE:IN CA").await;
     process(&db, "AI_LAZY").await;
 
     assert_eq!(
@@ -203,7 +203,7 @@ async fn a_warm_cache_is_read_without_opening_or_network() {
     .await;
     db.process_cp_links_on_connect().await;
 
-    add_ai_with_inp(&db, "AI_WARM", "ca://REMOTE:IN").await;
+    add_ai_with_inp(&db, "AI_WARM", "REMOTE:IN CA").await;
     process(&db, "AI_WARM").await; // stages the open
     db.sync_external_link_puts().await; // the owner performs it
 
@@ -240,7 +240,7 @@ async fn a_permanently_cold_link_is_opened_once_not_once_per_scan() {
     db.register_link_set("ca", Arc::new(LazyLset::new(None, &opens, &reads)))
         .await;
 
-    add_ai_with_inp(&db, "AI_COLD", "ca://DEAD:IN").await;
+    add_ai_with_inp(&db, "AI_COLD", "DEAD:IN CA").await;
     for _ in 0..8 {
         process(&db, "AI_COLD").await;
         db.sync_external_link_puts().await;
@@ -269,8 +269,8 @@ async fn distinct_links_are_each_opened_once() {
     )
     .await;
 
-    add_ai_with_inp(&db, "AI_A", "ca://A:IN").await;
-    add_ai_with_inp(&db, "AI_B", "ca://B:IN").await;
+    add_ai_with_inp(&db, "AI_A", "A:IN CA").await;
+    add_ai_with_inp(&db, "AI_B", "B:IN CA").await;
     process(&db, "AI_A").await;
     process(&db, "AI_B").await;
     db.sync_external_link_puts().await;

@@ -2903,8 +2903,8 @@ mod tests {
                     "MB_OCTET_TAGGED",
                     1,
                     PortFlags::default(),
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::OCTET,
+                    InterfaceMask::NONE,
                 ),
                 shared: Arc::clone(&shared),
             },
@@ -2922,7 +2922,9 @@ mod tests {
                         runtime.port_handle().clone(),
                         0,
                         crate::driver::READ_TIMEOUT,
-                    ),
+                        InterfaceType::Octet,
+                    )
+                    .unwrap(),
                     LinkType::Rtu,
                 );
                 std::thread::spawn(move || {
@@ -3001,8 +3003,8 @@ mod tests {
                     "MB_OCTET_SILENT",
                     1,
                     PortFlags::default(),
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::OCTET,
+                    InterfaceMask::NONE,
                 ),
             },
             RuntimeConfig::default(),
@@ -3012,7 +3014,9 @@ mod tests {
             runtime.port_handle().clone(),
             0,
             crate::driver::READ_TIMEOUT,
-        );
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let mut driver = test_driver(
             "MB_SILENT",
             test_config(0, 4),
@@ -3041,7 +3045,9 @@ mod tests {
                     runtime.port_handle().clone(),
                     0,
                     crate::driver::READ_TIMEOUT,
-                ),
+                    InterfaceType::Octet,
+                )
+                .unwrap(),
                 LinkType::Rtu,
             )),
         )
@@ -3094,8 +3100,8 @@ mod tests {
                 "MB_OCTET_STALE",
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             ),
             pending,
             replies: std::collections::VecDeque::from(vec![fresh]),
@@ -3107,7 +3113,9 @@ mod tests {
             runtime.port_handle().clone(),
             0,
             crate::driver::READ_TIMEOUT,
-        );
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let mut transport = SyncIoTransport::new(sync, LinkType::Rtu);
         let mut engine = ModbusEngine::new(test_config(0, 1), LinkType::Rtu)
             .expect("an RTU read config must build");
@@ -3234,8 +3242,8 @@ mod tests {
                     "MB_OCTET_SPLIT",
                     1,
                     PortFlags::default(),
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::OCTET,
+                    InterfaceMask::NONE,
                 ),
                 chunks,
             },
@@ -3251,7 +3259,9 @@ mod tests {
                     runtime.port_handle().clone(),
                     0,
                     crate::driver::READ_TIMEOUT,
-                ),
+                    InterfaceType::Octet,
+                )
+                .unwrap(),
                 LinkType::Tcp,
             )),
         )
@@ -3306,8 +3316,8 @@ mod tests {
                         "MB_OCTET_REFUSING",
                         1,
                         PortFlags::default(),
-                        InterfaceMask::UNMIGRATED_ALL,
-                        InterfaceMask::UNMIGRATED_INTERRUPTS,
+                        InterfaceMask::OCTET,
+                        InterfaceMask::NONE,
                     ),
                     status,
                 },
@@ -3323,7 +3333,9 @@ mod tests {
                         runtime.port_handle().clone(),
                         0,
                         crate::driver::READ_TIMEOUT,
-                    ),
+                        InterfaceType::Octet,
+                    )
+                    .unwrap(),
                     LinkType::Tcp,
                 )),
             )
@@ -3401,8 +3413,8 @@ mod tests {
                     name,
                     1,
                     PortFlags::default(),
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::OCTET,
+                    InterfaceMask::NONE,
                 ),
                 chunks: Arc::new(Mutex::new(chunks.into())),
                 reads: Arc::clone(&reads),
@@ -3425,7 +3437,9 @@ mod tests {
                     runtime.port_handle().clone(),
                     0,
                     crate::driver::READ_TIMEOUT,
-                ),
+                    InterfaceType::Octet,
+                )
+                .unwrap(),
                 LinkType::Tcp,
             )),
         )
@@ -4464,8 +4478,8 @@ mod tests {
                     "OCTET_DUPLINE",
                     1,
                     PortFlags::default(),
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::OCTET,
+                    InterfaceMask::NONE,
                 ),
                 pending: Arc::new(Mutex::new(std::collections::VecDeque::new())),
                 replies: Default::default(),
@@ -4563,9 +4577,10 @@ mod tests {
             )
         };
         if std::env::var_os(CHILD).is_some() {
-            // asynOctetSyncIO checks asynCommon before asynOctet, so a port
-            // missing either fails the first connect (drvModbusAsyn.cpp:294).
-            struct Declared(PortDriverBase, Vec<asyn_rs::interfaces::Capability>);
+            // A port without asynOctet fails the first connect
+            // (drvModbusAsyn.cpp:294); every port has asynCommon
+            // (asynPortDriver.cpp:4015).
+            struct Declared(PortDriverBase);
             impl PortDriver for Declared {
                 fn base(&self) -> &PortDriverBase {
                     &self.0
@@ -4573,44 +4588,26 @@ mod tests {
                 fn base_mut(&mut self) -> &mut PortDriverBase {
                     &mut self.0
                 }
-                fn capabilities(&self) -> Vec<asyn_rs::interfaces::Capability> {
-                    self.1.clone()
-                }
             }
-            use asyn_rs::interfaces::Capability as C;
-            let mut runtimes = Vec::new();
-            for (octet, caps) in [
-                ("OCTET_NO_OCTET", vec![C::Connect, C::Flush, C::Option]),
-                (
-                    "OCTET_NO_COMMON",
-                    vec![C::OctetRead, C::OctetWrite, C::Option],
-                ),
-            ] {
-                let driver = Declared(
-                    PortDriverBase::new(
-                        octet,
-                        1,
-                        PortFlags::default(),
-                        InterfaceMask::UNMIGRATED_ALL,
-                        InterfaceMask::UNMIGRATED_INTERRUPTS,
-                    ),
-                    caps,
-                );
-                let (rt, _jh) = create_port_runtime_unclaimed(driver, RuntimeConfig::default())
-                    .expect("octet runtime must start");
-                asyn_rs::asyn_record::register_port(
-                    octet,
-                    rt.port_handle().clone(),
-                    &asyn_rs::registry::open_owner(),
-                )
-                .expect("the octet port must publish");
-                runtimes.push(rt);
-            }
+            let driver = Declared(PortDriverBase::new(
+                "OCTET_NO_OCTET",
+                1,
+                PortFlags::default(),
+                InterfaceMask::OPTION,
+                InterfaceMask::NONE,
+            ));
+            let (rt, _jh) = create_port_runtime_unclaimed(driver, RuntimeConfig::default())
+                .expect("octet runtime must start");
+            asyn_rs::asyn_record::register_port(
+                "OCTET_NO_OCTET",
+                rt.port_handle().clone(),
+                &asyn_rs::registry::open_owner(),
+            )
+            .expect("the octet port must publish");
             for (port, octet, function) in [
                 ("MB_HALF_FN", "NO_SUCH_OCTET", 99),
                 ("MB_HALF_OCTET", "NO_SUCH_OCTET", 3),
                 ("MB_HALF_NO_OCTET", "OCTET_NO_OCTET", 3),
-                ("MB_HALF_NO_COMMON", "OCTET_NO_COMMON", 3),
             ] {
                 assert!(matches!(
                     configure(port, octet, function, "UINT16"),
@@ -4648,7 +4645,6 @@ mod tests {
             "drvModbusAsyn::drvModbusAsyn port MB_HALF_FN unsupported Modbus function 99",
             "drvModbusAsyn::drvModbusAsyn port MB_HALF_OCTET can't connect to asynOctet on Octet server NO_SUCH_OCTET.",
             "drvModbusAsyn::drvModbusAsyn port MB_HALF_NO_OCTET can't connect to asynOctet on Octet server OCTET_NO_OCTET.",
-            "drvModbusAsyn::drvModbusAsyn port MB_HALF_NO_COMMON can't connect to asynOctet on Octet server OCTET_NO_COMMON.",
         ] {
             assert!(
                 stderr.lines().any(|l| l.ends_with(line)),
@@ -4694,8 +4690,8 @@ mod tests {
                 "OCTET_LATESTART",
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             ),
             pending: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             replies: (0..64).map(|_| reply.clone()).collect(),
@@ -8318,15 +8314,21 @@ mod tests {
 
         // The two failures cost the 1.0 s persistent-error backoff; after it the
         // recovered link must produce successful reads. A dead poller reads 0.
-        tokio::time::sleep(Duration::from_millis(1500)).await;
-        let read_ok = handle
-            .read_int32(read_ok_reason, 0)
-            .await
-            .expect("READ_OK must be readable");
-        assert!(
-            read_ok > 0,
-            "the poller must keep polling after the I/O errors and recover — READ_OK={read_ok}"
-        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let read_ok = handle
+                .read_int32(read_ok_reason, 0)
+                .await
+                .expect("READ_OK must be readable");
+            if read_ok > 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the poller must keep polling after the I/O errors and recover — READ_OK={read_ok}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         assert!(!poller.is_finished(), "the poller task must still be alive");
 
         // Stopping the port is what ends the poller: `handle.is_closed()` is
@@ -8384,6 +8386,15 @@ mod tests {
             fanout_pending,
         ));
 
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while written.lock().unwrap().is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the poller never polled"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // Many poll delays for a poll the gate should hold.
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(written.lock().unwrap().len(), 1, "one poll, then the wait");
         assert!(

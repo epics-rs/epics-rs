@@ -8,7 +8,7 @@
 //! accepted here in silence where the C IOC prints a refusal.
 //!
 //! GROUND TRUTH — the built C `softIoc` (7.0.10.1-DEV,
-//! `/home/stevek/work/epics-base/bin/linux-x86_64/softIoc`) on the `.db` below.
+//! `$EPICS_BASE/bin/linux-x86_64/softIoc`) on the `.db` below.
 //!
 //! C does NOT run this rule at db-load. `dbPutString` on a link field parses
 //! the text and stores it, and nothing more (`dbStaticLib.c:2626-2634`); the

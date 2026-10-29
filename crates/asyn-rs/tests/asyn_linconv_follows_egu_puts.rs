@@ -48,8 +48,8 @@ async fn ioc(port: &str, iface: &str) -> (Arc<PvDatabase>, PortRuntimeHandle) {
         port,
         1,
         PortFlags::default(),
-        InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::INT32 | InterfaceMask::INT64 | InterfaceMask::DRV_USER,
+        InterfaceMask::NONE,
     );
     base.create_param("I32", ParamType::Int32).unwrap();
     base.create_param("I64", ParamType::Int64).unwrap();

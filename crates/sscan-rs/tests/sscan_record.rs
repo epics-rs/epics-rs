@@ -136,6 +136,25 @@ async fn a_one_dimensional_scan_fills_positioner_and_detector_arrays() {
     assert_eq!(f64_of(&db, "S.EXSC"), 0.0);
 }
 
+/// C's `dbGet` of the scan's own dbCommon field reads it through `prec`.
+#[epics_base_rs::epics_test]
+async fn a_detector_on_the_scans_own_dbcommon_field_reads_it() {
+    let db = ioc(r#"record(sscan, "S") {
+  field(PRIO, "HIGH")
+  field(MPTS, "10")
+  field(NPTS, "3")
+  field(P1PV, "M")
+  field(P1SP, "1")
+  field(P1EP, "3")
+  field(D01PV, "S.PRIO")
+}"#)
+    .await;
+    connected(&db, "S", &["P1NV", "D01NV"]).await;
+    start(&db, "S").await;
+    finished(&db, "S").await;
+    assert_eq!(arr(&db, "S.D01DA", 3), [2.0, 2.0, 2.0]);
+}
+
 #[epics_base_rs::epics_test]
 async fn a_second_scan_reports_its_own_data() {
     let db = ioc(ONE_D).await;
@@ -229,6 +248,41 @@ async fn an_operator_abort_stops_the_scan() {
     // endScan's "SCAN Complete" replaces the abort message, as in C.
     assert!(f64_of(&db, "S.CPT") < 10.0);
     assert_eq!(f64_of(&db, "S.EXSC"), 0.0);
+}
+
+/// A db-loaded delay skips `special()`'s rounding and reaches
+/// `callbackRequestDelayed` as written. One past `Duration`'s range never
+/// fires (`duration_from_secs`), so the scan holds at its first point and
+/// still answers an abort.
+async fn an_unrepresentable_delay_holds_the_scan(field: &str, secs: &str) {
+    let scan = ONE_D.replace("}", &format!("  field({field}, \"{secs}\")\n}}"));
+    let db = ioc(&scan).await;
+    connected(&db, "S", &["P1NV", "D01NV", "T1NV"]).await;
+    // The callback pool catches a panic on `cbLow`, so only the hook sees
+    // one. Process-global is safe: nextest runs one process per test.
+    let panics = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = panics.clone();
+    std::panic::set_hook(Box::new(move |info| {
+        sink.lock().unwrap().push(info.to_string());
+    }));
+    start(&db, "S").await;
+    sleep(Duration::from_millis(300)).await;
+    let _ = std::panic::take_hook();
+    assert_eq!(*panics.lock().unwrap(), Vec::<String>::new());
+    assert_eq!(f64_of(&db, "S.CPT"), 0.0, "{field}={secs} never fires");
+    assert_eq!(f64_of(&db, "S.BUSY"), 1.0);
+    put_field(&db, "S", "EXSC", EpicsValue::Short(0)).await;
+    wait_until("S.BUSY", || f64_of(&db, "S.BUSY") == 0.0).await;
+}
+
+#[epics_base_rs::epics_test]
+async fn a_finite_pdly_past_duration_range_holds_the_scan() {
+    an_unrepresentable_delay_holds_the_scan("PDLY", "1e30").await;
+}
+
+#[epics_base_rs::epics_test]
+async fn an_infinite_ddly_holds_the_scan() {
+    an_unrepresentable_delay_holds_the_scan("DDLY", "inf").await;
 }
 
 #[epics_base_rs::epics_test]
@@ -403,6 +457,43 @@ async fn an_rdly_write_posts_rdly_not_pdly() {
         !seen.is_empty() && seen.iter().all(|v| *v == 0.0),
         "{seen:?}"
     );
+}
+
+/// `special()` rounds a delay put through C's `NINT`, whose `(long)` cast
+/// turns NaN or a tick count past `long` into `LONG_MIN`: C serves
+/// `LONG_MIN / ticsPerSecond`, a negative delay the scan treats as none.
+#[epics_base_rs::epics_test]
+async fn an_overflowing_delay_put_is_served_as_cs_long_cast() {
+    let db = ioc(ONE_D).await;
+    let tics = (1.0 / epics_base_rs::runtime::time::thread_sleep_quantum()).round();
+    let served = f64::from((i64::MIN as f64 / tics) as f32);
+    for (field, v) in [("DDLY", f32::INFINITY), ("PDLY", f32::NAN), ("RDLY", 1e30)] {
+        put(&db, &format!("S.{field}"), EpicsValue::Float(v)).await;
+        assert_eq!(f64_of(&db, &format!("S.{field}")), served, "{field}={v}");
+    }
+}
+
+/// C `fabs(p_si * NINT(r_dl))`: `NINT(-inf)` is `LONG_MIN`, so a zero step
+/// gives a zero limit and any readback error ends the scan. An inf limit
+/// would give `0 * inf`, NaN, and no error would ever exceed it.
+#[epics_base_rs::epics_test]
+async fn a_minus_inf_readback_delta_with_a_zero_step_aborts_on_any_error() {
+    let db = ioc(r#"record(sscan, "S") {
+  field(MPTS, "10")
+  field(NPTS, "3")
+  field(P1PV, "M")
+  field(P1SP, "1")
+  field(P1EP, "1")
+  field(R1PV, "M2")
+}"#)
+    .await;
+    connected(&db, "S", &["P1NV", "R1NV"]).await;
+    assert_eq!(f64_of(&db, "S.P1SI"), 0.0);
+    put(&db, "S.R1DL", EpicsValue::Double(f64::NEG_INFINITY)).await;
+    start(&db, "S").await;
+    finished(&db, "S").await;
+    assert_eq!(f64_of(&db, "S.ALRT"), 1.0, "scanErr");
+    assert_eq!(f64_of(&db, "S.CPT"), 0.0, "ended at the first point");
 }
 
 #[epics_base_rs::epics_test]
@@ -605,6 +696,9 @@ record(sscan, "S") {
     assert!(f64_of(&db, "DET") > 0.0);
 }
 
+/// Each scan reads the other while both run: no deadlock, and no read
+/// fails — a failed `dbGet` leaves the detector at its last value, 0 at the
+/// first point.
 #[epics_base_rs::epics_test]
 async fn two_scans_reading_each_other_locally_do_not_deadlock() {
     let db = ioc(r#"record(sscan, "S1") {
@@ -614,6 +708,7 @@ async fn two_scans_reading_each_other_locally_do_not_deadlock() {
   field(P1SP, "0")
   field(P1EP, "1")
   field(D01PV, "S2.CPT")
+  field(D02PV, "S2.MPTS")
 }
 record(sscan, "S2") {
   field(PRIO, "HIGH")
@@ -623,14 +718,19 @@ record(sscan, "S2") {
   field(P1SP, "0")
   field(P1EP, "1")
   field(D01PV, "S1.CPT")
+  field(D02PV, "S1.MPTS")
 }"#)
     .await;
-    connected(&db, "S1", &["P1NV", "D01NV"]).await;
-    connected(&db, "S2", &["P1NV", "D01NV"]).await;
+    connected(&db, "S1", &["P1NV", "D01NV", "D02NV"]).await;
+    connected(&db, "S2", &["P1NV", "D01NV", "D02NV"]).await;
     start(&db, "S1").await;
     start(&db, "S2").await;
     finished(&db, "S1").await;
     finished(&db, "S2").await;
+    for scan in ["S1", "S2"] {
+        let mpts = arr(&db, &format!("{scan}.D02DA"), 2000);
+        assert!(mpts.iter().all(|v| *v == 2000.0), "{scan}.D02DA");
+    }
 }
 
 #[epics_base_rs::epics_test]
@@ -677,11 +777,11 @@ record(sscan, "S") {
   field(ATIME, "0.1")
 }"#;
 
-/// C's array posts name `posBufPtr[i].pBufA`/`pBufB`; `PnCA`'s address is
-/// `p_ca`, which nothing sets, so no post reaches it (sscanRecord.c:545,
-/// :1880, :2213-2219, :5373-5374).
+/// C's array posts name `posBufPtr[i].pBufA`/`pBufB`, and `PnCA`'s address
+/// is `p_ca`, which C never sets (CBUG-AB4, sscanRecord.c:545, :1880,
+/// :2212-2213, :5372-5373). Every post of the buffers reaches `PnCA` here.
 #[epics_base_rs::epics_test]
-async fn no_scan_or_preview_post_reaches_a_positioner_ca() {
+async fn every_scan_and_preview_post_reaches_a_positioner_ca() {
     let db = ioc(POSTED).await;
     connected(&db, "S", &["P1NV", "D01NV", "T1NV"]).await;
     let mut ra = DbSubscription::subscribe(&db, "S.P1RA").await.unwrap();
@@ -691,10 +791,15 @@ async fn no_scan_or_preview_post_reaches_a_positioner_ca() {
     events(&mut ca);
     start(&db, "S").await;
     finished(&db, "S").await;
+    sleep(Duration::from_millis(100)).await;
+    let scanned = events(&mut ra);
+    assert!(scanned > 0);
+    assert_eq!(events(&mut ca), scanned, "P1CA through the scan");
     put_field(&db, "S", "CMND", EpicsValue::Enum(2)).await;
     sleep(Duration::from_millis(100)).await;
-    assert!(events(&mut ra) > 0);
-    assert_eq!(events(&mut ca), 0);
+    let previewed = events(&mut ra);
+    assert!(previewed > 0);
+    assert_eq!(events(&mut ca), previewed, "P1CA through the preview");
 }
 
 /// C's `nullArray` post reaches only detectors without buffers; D01-D04
@@ -726,10 +831,11 @@ async fn the_null_array_post_reaches_only_detectors_without_buffers() {
 }
 
 /// Adding to the previous scan, C reads every array detector into one
-/// shared `dataBuffer`; a failed get (a STRING waveform read as DBR_FLOAT)
-/// leaves the previous detector's read there (sscanRecord.c:3777-3806).
+/// shared `dataBuffer`, and a failed get (a STRING waveform read as
+/// DBR_FLOAT) leaves the previous detector's read there to be summed
+/// (CBUG-AB5, sscanRecord.c:3777-3806). A failed get reads zeros here.
 #[epics_base_rs::epics_test]
-async fn a_failed_array_get_while_adding_keeps_the_shared_buffer() {
+async fn a_failed_array_get_while_adding_adds_nothing() {
     let db = ioc(r#"
 record(waveform, "W1") {
   field(FTVL, "DOUBLE")
@@ -770,7 +876,41 @@ record(sscan, "S") {
         start(&db, "S").await;
         finished(&db, "S").await;
         assert_eq!(arr(&db, "S.D01DA", 4), sum);
-        assert_eq!(arr(&db, "S.D02DA", 4), sum);
+        assert_eq!(arr(&db, "S.D02DA", 4), [0.0; 4]);
+    }
+}
+
+/// The same unchecked get without adding: C reads into the fill buffer, so a
+/// failed get leaves the data it held two scans before (CBUG-AB5,
+/// sscanRecord.c:3777, :3793-3796). A failed get reads zeros here.
+#[epics_base_rs::epics_test]
+async fn a_failed_array_get_reads_zeros_not_an_older_scan() {
+    let db = ioc(r#"
+record(waveform, "WS") {
+  field(FTVL, "STRING")
+  field(NELM, "4")
+}
+record(sscan, "S") {
+  field(MPTS, "4")
+  field(NPTS, "4")
+  field(ACQT, "1D ARRAY")
+  field(D01PV, "WS")
+}"#)
+    .await;
+    let strings = |s: [&str; 4]| {
+        EpicsValue::StringArray(s.map(epics_base_rs::types::PvString::from).to_vec().into())
+    };
+    connected(&db, "S", &["D01NV"]).await;
+    let scans = [
+        (["1", "2", "3", "4"], [1.0, 2.0, 3.0, 4.0]),
+        (["5", "6", "7", "8"], [5.0, 6.0, 7.0, 8.0]),
+        (["abc", "def", "ghi", "jkl"], [0.0; 4]),
+    ];
+    for (text, read) in scans {
+        put(&db, "WS", strings(text)).await;
+        start(&db, "S").await;
+        finished(&db, "S").await;
+        assert_eq!(arr(&db, "S.D01DA", 4), read, "{text:?}");
     }
 }
 

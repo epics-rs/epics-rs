@@ -54,7 +54,7 @@ fn into_ca(e: crate::error::PvaError) -> CaError {
 impl PvaServerBuilder {
     pub fn new() -> Self {
         Self {
-            ioc: ioc_builder::IocBuilder::new(),
+            ioc: super::pvxs_ioc_builder(),
             port: None,
             acf: None,
         }

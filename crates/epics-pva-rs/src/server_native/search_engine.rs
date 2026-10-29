@@ -341,6 +341,18 @@ pub(crate) fn send_from_v4<S: std::os::fd::AsFd>(
     }
 }
 
+/// What a started server answers a SEARCH with: pvxs's search listeners and
+/// `onSearch`, which exist only from `Server::Pvt::start`
+/// (`server.cpp:555-599`). A bound collector reads without one.
+#[derive(Clone)]
+pub(crate) struct SearchReplier {
+    pub(crate) source: DynSource,
+    /// The port advertised for `protocol`.
+    pub(crate) tcp_port: u16,
+    pub(crate) guid: [u8; 12],
+    pub(crate) protocol: &'static str,
+}
+
 /// Process one fully-received UDP datagram: drain it for chained PVA
 /// messages (pvxs `udp_collector.cpp::process_one` L329) and reply to
 /// each SEARCH that matches a hosted PV. Replies route via the NIC
@@ -370,18 +382,17 @@ pub(crate) fn send_from_v4<S: std::os::fd::AsFd>(
 ///   `server.isAny()` since they would route the reply back to the
 ///   forwarder, not the original requester (pvxs warning at
 ///   `udp_collector.cpp:367-371`).
-#[allow(clippy::too_many_arguments)]
+///
+/// `replier` is `None` until the server starts: the forward is still
+/// decided, and nothing is answered.
 pub(crate) async fn process_search_datagram(
-    source: &DynSource,
+    replier: Option<&SearchReplier>,
     forward: bool,
     udp_port: u16,
     frame: &[u8],
     udp_src: SocketAddr,
     reply_iface_ip: Ipv4Addr,
     origin: Origin,
-    tcp_port: u16,
-    guid: [u8; 12],
-    protocol: &'static str,
 ) -> Vec<SearchOutput> {
     let mut out_dgs: Vec<SearchOutput> = Vec::new();
     // After forwarding we return: the group loops the packet back, where it
@@ -396,6 +407,15 @@ pub(crate) async fn process_search_datagram(
             }
         }
     }
+    let Some(SearchReplier {
+        source,
+        tcp_port,
+        guid,
+        protocol,
+    }) = replier
+    else {
+        return out_dgs;
+    };
 
     let mut pos = 0usize;
     while pos + PvaHeader::SIZE <= frame.len() {
@@ -452,9 +472,9 @@ pub(crate) async fn process_search_datagram(
                 // discovery probes.
                 if !matched_cids.is_empty() || req.must_reply {
                     let resp = build_search_response_proto(
-                        guid,
+                        *guid,
                         req.seq,
-                        tcp_port,
+                        *tcp_port,
                         &matched_cids,
                         req.byte_order,
                         protocol,

@@ -725,21 +725,6 @@ fn octet_device_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
     ]
 }
 
-/// `asynReport` body — walks every registered port (or the named one
-/// only) and calls `PortDriver::report(level)`. C asyn's `asynReport`
-/// loops through `pasynManager`'s port list and calls each driver's
-/// `report` interface (`asynManager.c::asynReport`).
-/// A shell `double` seconds argument as a `Duration`. C hands the value to
-/// `epicsEventWaitWithTimeout`, which treats a non-positive timeout as "do not
-/// wait"; NaN cannot be represented at all. Both collapse to zero here.
-fn duration_from_secs(secs: f64) -> Duration {
-    if secs.is_finite() && secs > 0.0 {
-        Duration::from_secs_f64(secs)
-    } else {
-        Duration::ZERO
-    }
-}
-
 /// `portName addr yesNo` — the argument list C gives both `asynEnable` and
 /// `asynAutoConnect` (asynShellCommands.c:944-948, 976-982).
 fn enable_style_args() -> Vec<ArgDesc> {
@@ -1356,10 +1341,14 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
             "asynSetQueueLockPortTimeout portName timeout - least seconds a SyncIO call \
              waits in the port's queue (C default 2.0)",
             move |args: &[ArgValue], ctx: &CommandContext| {
+                // A timer delay, not an event wait: C arms `queueRequest`'s
+                // timer only for a positive value (asynManager.c:1619-1626).
                 match shell_connect_device(&mgr_r, arg_str(args, 0)?.as_deref()) {
-                    Ok(handle) => handle.set_queue_lock_port_timeout(duration_from_secs(
-                        arg_f64(args, 1).unwrap_or(0.0),
-                    )),
+                    Ok(handle) => handle.set_queue_lock_port_timeout(
+                        epics_libcom_rs::runtime::time::duration_from_secs(
+                            arg_f64(args, 1).unwrap_or(0.0),
+                        ),
+                    ),
                     Err(msg) => ctx.println(&msg),
                 }
                 Ok(CommandOutcome::Continue)
@@ -1414,7 +1403,9 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
             "asynWaitConnect portName timeout - block until the port is connected",
             move |args: &[ArgValue], _ctx: &CommandContext| {
                 let port = arg_str(args, 0)?;
-                let timeout = duration_from_secs(arg_f64(args, 1).unwrap_or(0.0));
+                let timeout = epics_libcom_rs::runtime::sync::event_wait_timeout(
+                    arg_f64(args, 1).unwrap_or(0.0),
+                );
                 let Ok(handle) = shell_connect_device(&mgr_r, port.as_deref()) else {
                     // An unbound user's asynPrint goes to the global trace;
                     // printf's "%s" of NULL is glibc's "(null)".
@@ -2699,8 +2690,8 @@ mod tests {
                 name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OPTION,
+                InterfaceMask::NONE,
             );
             base.create_param("VAL", ParamType::Int32).unwrap();
             Self {
@@ -2756,8 +2747,8 @@ mod tests {
                     multi_device: true,
                     ..PortFlags::default()
                 },
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::NONE,
+                InterfaceMask::NONE,
             );
             base.create_param("VAL", ParamType::Int32).unwrap();
             Self {
@@ -2782,8 +2773,8 @@ mod tests {
                     name,
                     1,
                     PortFlags::default(),
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::OCTET,
+                    InterfaceMask::NONE,
                 ),
                 input: input.to_vec(),
                 pos: 0,
@@ -3046,9 +3037,15 @@ mod tests {
         .unwrap();
         let handle = mgr.find_port_handle("qlp_port").unwrap();
         let deadline = |timeout_ms| {
-            SyncIOHandle::from_handle(handle.clone(), 0, Duration::from_millis(timeout_ms))
-                .user(0)
-                .queue_timeout()
+            SyncIOHandle::from_handle(
+                handle.clone(),
+                0,
+                Duration::from_millis(timeout_ms),
+                InterfaceType::Common,
+            )
+            .unwrap()
+            .user(0)
+            .queue_timeout()
         };
         assert_eq!(deadline(200), Some(Duration::from_secs(2)), "C default");
 
@@ -3064,6 +3061,26 @@ mod tests {
             .unwrap();
         assert_eq!(deadline(200), Some(Duration::from_millis(500)));
         assert_eq!(deadline(1000), Some(Duration::from_millis(1000)));
+
+        let set = |secs: f64| {
+            cmds.iter()
+                .find(|c| c.name == "asynSetQueueLockPortTimeout")
+                .unwrap()
+                .handler
+                .call(
+                    &[ArgValue::String("qlp_port".into()), ArgValue::Double(secs)],
+                    &make_ctx(),
+                )
+                .unwrap();
+        };
+        // C arms no timer for a non-positive floor (asynManager.c:1619-1620),
+        // so the user's own timeout is the deadline.
+        set(-1.0);
+        assert_eq!(deadline(200), Some(Duration::from_millis(200)));
+        // A floor past `Duration` is a deadline that never fires, held in the
+        // port's u64 of nanoseconds.
+        set(1e300);
+        assert_eq!(deadline(200), Some(Duration::from_nanos(u64::MAX)));
     }
 
     /// R19-120: `asynShowOption` prints `key=value` for a driver option
@@ -3248,6 +3265,11 @@ mod tests {
             elapsed < Duration::from_secs(1),
             "an already-connected port must not wait ({elapsed:?})"
         );
+
+        // C's event wait caps a timeout at ten years and waits not at all on a
+        // negative one; neither may panic converting the shell's double.
+        assert!(wait("wc_late", 1e300) < Duration::from_secs(1));
+        assert!(wait("wc_never", -1.0) < Duration::from_secs(1));
     }
 
     /// asynWaitConnect prints nothing on the console: a port it cannot connect
@@ -3768,8 +3790,8 @@ mod tests {
                     "eos_port",
                     1,
                     PortFlags::default(),
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::OCTET,
+                    InterfaceMask::NONE,
                 ),
                 rec: rec.clone(),
             },
@@ -3851,8 +3873,8 @@ mod tests {
             name,
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OPTION | InterfaceMask::OCTET,
+            InterfaceMask::NONE,
         )
     }
 
@@ -3897,11 +3919,6 @@ mod tests {
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.base
             }
-            fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
-                InterfaceMask::COMMON
-                    .or(InterfaceMask::OCTET)
-                    .capabilities()
-            }
         }
         let mgr = Arc::new(PortManager::new());
         let owner = crate::registry::open_owner();
@@ -3913,7 +3930,13 @@ mod tests {
         mgr.register_port_unclaimed(opt("opt_off"), &owner).unwrap();
         mgr.register_port_unclaimed(
             NoOptPort {
-                base: shell_test_base("opt_none"),
+                base: PortDriverBase::new(
+                    "opt_none",
+                    1,
+                    PortFlags::default(),
+                    InterfaceMask::OCTET,
+                    InterfaceMask::NONE,
+                ),
             },
             &owner,
         )
@@ -3978,8 +4001,8 @@ mod tests {
                     "eos_refusing",
                     1,
                     PortFlags::default(),
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::OCTET,
+                    InterfaceMask::NONE,
                 ),
             },
             &crate::registry::open_owner(),
@@ -4387,8 +4410,8 @@ mod tests {
                         multi_device: true,
                         ..PortFlags::default()
                     },
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::OCTET,
+                    InterfaceMask::NONE,
                 ),
             },
             &crate::registry::open_owner(),
@@ -4568,8 +4591,8 @@ mod tests {
                     "echo_port",
                     1,
                     PortFlags::default(),
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::OCTET,
+                    InterfaceMask::NONE,
                 ),
                 link: EchoingLink {
                     sizes: sizes.clone(),
@@ -4685,8 +4708,8 @@ mod tests {
                     "delay_port",
                     1,
                     PortFlags::default(),
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::OCTET,
+                    InterfaceMask::NONE,
                 ),
                 link: CountingLink {
                     sizes: sizes.clone(),
@@ -4844,8 +4867,8 @@ mod tests {
                     PORT,
                     1,
                     PortFlags::default(),
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::NONE,
+                    InterfaceMask::NONE,
                 ),
                 reports: reports.clone(),
             },
@@ -4899,8 +4922,8 @@ mod tests {
             name,
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OCTET,
+            InterfaceMask::OCTET,
         );
         base.octet_interrupt_process = true;
         base.install_octet_interpose(Box::new(crate::interpose::eos::EosInterpose::default()));
@@ -5036,8 +5059,8 @@ mod tests {
                         can_block: true,
                         ..PortFlags::default()
                     },
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::OCTET,
+                    InterfaceMask::NONE,
                 ),
             },
             &crate::registry::open_owner(),
@@ -5106,8 +5129,8 @@ mod tests {
                         multi_device: true,
                         ..PortFlags::default()
                     },
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::OCTET,
+                    InterfaceMask::NONE,
                 ),
                 eos: Vec::new(),
             },
@@ -5568,9 +5591,10 @@ mod tests {
                 "---published {}",
                 crate::registry::get_port("busy_srv").is_some()
             );
-            let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let free_addr = free.local_addr().unwrap();
-            drop(free);
+            // Held, not probed and dropped: the number stays the server's
+            // to bind until the connect below reaches it.
+            let free = named_port::HeldPort::tcp();
+            let free_addr = std::net::SocketAddr::from(([127, 0, 0, 1], free.port));
             call_configure(
                 &srv,
                 &[
@@ -5589,9 +5613,10 @@ mod tests {
             );
             // A refused duplicate gives back the socket it bound (C
             // `ttyCleanup`, drvAsynIPServerPort.c:651-652).
-            let spare = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let spare_addr = spare.local_addr().unwrap();
-            drop(spare);
+            // A rebind beside the hold is refused only by a listener left on
+            // the number.
+            let spare = named_port::HeldPort::tcp();
+            let spare_addr = std::net::SocketAddr::from(([127, 0, 0, 1], spare.port));
             call_configure(
                 &srv,
                 &[
@@ -5768,11 +5793,31 @@ mod tests {
 
     /// The FTDI port thread runs on C's 500000-byte stack
     /// (drvAsynFTDIPort.cpp:590), not the Medium class every other driver's 0
-    /// gives. Measured from outside: the stack mapping that holds the parked
-    /// thread's stack pointer.
-    #[cfg(target_os = "linux")]
+    /// gives. Read on the port thread from its own pthread attribute: the
+    /// /proc/self/maps mapping holding its stack pointer is not its stack
+    /// under glibc 2.43, whose MADV_GUARD_INSTALL guards leave adjacent thread
+    /// stacks one mapping. Needs a process of its own, as nextest gives it:
+    /// glibc serves a request from a cached stack up to 4x its size, such as
+    /// another test's freed 1 MiB one.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     #[test]
     fn iocsh_ftdi_port_thread_runs_on_c_s_500000_byte_stack() {
+        use crate::request::{CellBody, PortCalls, Unrun};
+        use std::sync::mpsc;
+
+        struct StackProbe(mpsc::SyncSender<(Option<String>, Option<usize>)>);
+        impl CellBody for StackProbe {
+            fn process(&self, _port: &mut dyn PortCalls) {
+                let thread = std::thread::current().name().map(str::to_owned);
+                let bytes = epics_libcom_rs::runtime::task::current_thread_stack_bytes();
+                self.0.send((thread, bytes)).unwrap();
+            }
+            fn unrun(&self, why: Unrun) {
+                panic!("the stack probe did not run: {why:?}");
+            }
+            fn done(self: Arc<Self>) {}
+        }
+
         let cmd = drv_asyn_ftdi_port_configure_command(PortServices::new());
         let ctx = make_ctx();
         let result = cmd.handler.call(
@@ -5788,45 +5833,23 @@ mod tests {
             &ctx,
         );
         assert!(result.is_ok(), "command failed: {:?}", result.err());
-        let got = parked_thread_stack_bytes("ftdi_stack");
+        let port = crate::registry::get_port("ftdi_stack").unwrap().handle;
+        let (tx, rx) = mpsc::sync_channel(1);
+        let cell = port.new_cell(Arc::new(StackProbe(tx)));
+        // Connect priority: the port never connects (noAutoConnect, no hardware).
+        let user = AsynUser::new(0).with_priority(crate::port::QueuePriority::Connect);
+        port.queue_request(&cell, &user).unwrap();
+        let (thread, got) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            thread.as_deref(),
+            Some("ftdi_stack"),
+            "probe off the port thread"
+        );
+        let got = got.expect("pthread_getattr_np readback");
         assert!(
-            (500_000..500_000 + 64 * 1024).contains(&got),
+            got + 64 > 500_000 && got < 500_000 + 64 * 1024,
             "the FTDI port thread has a {got}-byte stack, C asks for 500000"
         );
-    }
-
-    /// Size of the mapping holding the stack pointer of the thread named
-    /// `name`, read while it is parked in a syscall.
-    #[cfg(target_os = "linux")]
-    fn parked_thread_stack_bytes(name: &str) -> usize {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let tid = std::fs::read_dir("/proc/self/task")
-            .unwrap()
-            .map(|e| e.unwrap().path())
-            .find(|t| std::fs::read_to_string(t.join("comm")).unwrap().trim_end() == name)
-            .expect("the port thread carries the port's name");
-        // `syscall` reads "running" until the thread parks, then ends "sp pc".
-        let sp = loop {
-            let line = std::fs::read_to_string(tid.join("syscall")).unwrap();
-            let fields: Vec<&str> = line.split_whitespace().collect();
-            if fields.len() > 2 {
-                break usize::from_str_radix(&fields[fields.len() - 2][2..], 16).unwrap();
-            }
-            assert!(std::time::Instant::now() < deadline, "{name} never parked");
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        };
-        std::fs::read_to_string("/proc/self/maps")
-            .unwrap()
-            .lines()
-            .find_map(|l| {
-                let (lo, hi) = l.split_whitespace().next()?.split_once('-')?;
-                let (lo, hi) = (
-                    usize::from_str_radix(lo, 16).ok()?,
-                    usize::from_str_radix(hi, 16).ok()?,
-                );
-                (lo..hi).contains(&sp).then_some(hi - lo)
-            })
-            .expect("the stack pointer lies in a mapping")
     }
 
     /// R19-111: `vxi11Configure` exists with C's seven args

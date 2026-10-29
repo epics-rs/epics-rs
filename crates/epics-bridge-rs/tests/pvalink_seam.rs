@@ -1,6 +1,6 @@
 //! The `pva` link set (pvalink) must install at the base
 //! `AfterCaLinkInit` seam via
-//! [`IocApplication::register_link_type`], so a `pva://` link
+//! [`IocApplication::register_link_type`], so a pva link
 //! loaded before iocInit has its link set registered and its CP link
 //! opened (background connect started) while iocInit is still running —
 //! matching pvxs opening pvalink channels at `initHookAfterIocBuilt`
@@ -21,7 +21,7 @@
 // RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the exec-backend
 // suite.
 
-use epics_base_rs::server::ioc_app::IocApplication;
+use epics_base_rs::server::ioc_app::{IocApplication, RunOutcome};
 use serial_test::serial;
 
 #[tokio::test(flavor = "multi_thread")]
@@ -61,19 +61,21 @@ async fn pvalink_installs_at_iocinit_seam() {
     )
     .expect("write seam.db");
     let stcmd_path = dir.path().join("st.cmd");
+    // Without the `iocInit` the script is a custom `main`'s and the runner
+    // below never runs.
     std::fs::write(
         &stcmd_path,
-        format!("dbLoadRecords(\"{}\")\n", db_path.display()),
+        format!("dbLoadRecords(\"{}\")\niocInit\n", db_path.display()),
     )
     .expect("write st.cmd");
 
     // The seam under test: register the pvalink installer at IOC
     // construction. The custom runner below installs no link set, so
     // this is the only path that can register the `pva` scheme.
-    let result = IocApplication::new()
+    let outcome = IocApplication::new()
         .startup_script(stcmd_path.to_str().unwrap())
         .register_link_type("pva", epics_bridge_rs::qsrv::pvalink_link_set_install)
-        .run(|config| async move {
+        .run_outcome(|config| async move {
             // By here iocInit has fired the seam installer (which
             // registered the `pva` lset and pre-opened the CP link).
 
@@ -90,8 +92,9 @@ async fn pvalink_installs_at_iocinit_seam() {
 
             Ok(())
         })
-        .await;
-    result.expect("IOC run returns Ok after the seam assertions");
+        .await
+        .expect("IOC run returns Ok after the seam assertions");
+    assert_eq!(outcome, RunOutcome::Served);
 
     // Best-effort restore so a leaked `PVXS_QSRV_ENABLE=YES` does not
     // surprise a later `epics_env`-group test.

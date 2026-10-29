@@ -89,7 +89,9 @@ async fn rust_client_can_caput_to_softioc() {
         .await
         .expect("connect");
     eprintln!("test: connected, calling put");
-    let put_res = ch.put(&EpicsValue::Long(1234)).await;
+    let put_res = ch
+        .put_with_timeout(&EpicsValue::Long(1234), fact_budget::FACT_BUDGET)
+        .await;
     eprintln!("test: put returned {:?}", put_res);
     put_res.expect("put");
 

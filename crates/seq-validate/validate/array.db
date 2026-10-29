@@ -1,0 +1,4 @@
+record(waveform,"array") {
+    field(FTVL,"USHORT")
+    field(NELM,"5")
+}

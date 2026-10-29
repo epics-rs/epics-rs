@@ -1279,6 +1279,26 @@ impl Record for WaveformRecord {
         )
     }
 
+    /// Each read above lands in `bptr`.
+    fn array_read_destination(&self, link_field: &str) -> Option<EpicsValue> {
+        matches!(link_field, "INP" | "SIOL" | "DOL").then(|| self.val.clone())
+    }
+
+    /// `left` over the head of `bptr`, the rest kept. NORD stays, except
+    /// that waveform's SIOL stores `dbGet`'s clamped count whatever the
+    /// status (`waveformRecord.c:351-357`). subArray's read leaves nothing a
+    /// client sees: `subset()` runs only on success (`devSASoft.c:58-74`).
+    fn land_failed_array_read(&mut self, link_field: &str, left: EpicsValue) {
+        if matches!(self.kind, ArrayKind::SubArray) || !matches!(link_field, "INP" | "SIOL" | "DOL")
+        {
+            return;
+        }
+        if link_field == "SIOL" && matches!(self.kind, ArrayKind::Waveform) {
+            self.nord = left.count() as i32;
+        }
+        self.val.write_head(left);
+    }
+
     /// `FTVL` and `NELM` are fields, so the request above is the instance's.
     fn input_link_answers_fixed_at_type(&self) -> bool {
         false
@@ -1314,6 +1334,10 @@ impl Record for WaveformRecord {
     /// was refused "Invalid element count requested".
     fn dbaddr_capacity(&self, _field: &str) -> Option<u32> {
         Some(self.val_capacity() as u32)
+    }
+
+    fn dbaddr_capacity_inputs(&self) -> Option<&'static [&'static str]> {
+        Some(&[])
     }
 
     /// `aao` is an output record; the rest of the array family read

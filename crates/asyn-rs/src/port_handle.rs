@@ -12,6 +12,7 @@
 // itself, which the backend does not remove.
 
 use epics_libcom_rs::SharedArray;
+use epics_libcom_rs::runtime::time::deadline_from_now;
 
 use crate::param::ParamValue;
 use std::any::Any;
@@ -25,13 +26,14 @@ use tokio::runtime::RuntimeFlavor;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{AsynError, AsynResult, AsynStatus};
-use crate::interfaces::{Capability, InterfaceType};
+use crate::interfaces::{InterfaceMask, InterfaceType};
 use crate::interrupt::InterruptManager;
 use crate::port::QueueGate;
 use crate::port::{DrvUserInfo, DrvUserRequest, PortDriver};
 use crate::port_actor::{ActorId, ActorLink, ActorMessage, Claimed, Lend};
 use crate::request::{
     CancelToken, DriverCall, PortCalls, PortLockCall, RequestOp, RequestResult, SectionCallbacks,
+    SectionScope,
 };
 use crate::trace::TraceManager;
 use crate::user::{AsynUser, QueueDeadline};
@@ -289,12 +291,7 @@ impl<D: PortDriver> DriverHold<D> {
     }
 
     fn enter(port: &PortHandle) -> AsynResult<Holding> {
-        let (holding, ran) = port.lend_request(
-            "hold_driver_blocking",
-            RequestOp::WithDriver(DriverCall::new(|_| {})),
-            AsynUser::default(),
-        )?;
-        ran?;
+        let holding = port.hold("hold_driver_blocking")?;
         port.lend
             .with_driver::<D, _>(|_| ())?
             .ok_or_else(|| port.wrong_driver::<D>())?;
@@ -331,7 +328,7 @@ impl AsyncCompletionHandle {
     pub fn wait_blocking(self, timeout: Duration) -> AsynResult<RequestResult> {
         guard_reentrant(self.actor, &self.port_name, "wait_blocking")?;
         let port_name = self.port_name.clone();
-        block_on_reply_until(self, Instant::now() + timeout).unwrap_or_else(|| {
+        block_on_reply_until(self, deadline_from_now(timeout)).unwrap_or_else(|| {
             Err(AsynError::Status {
                 status: AsynStatus::Timeout,
                 message: format!(
@@ -387,15 +384,14 @@ pub struct PortHandle {
     multi_device: bool,
     max_addr: i32,
     get_address: crate::port::GetAddress,
-    /// The port's interface registry — the driver's own
-    /// [`crate::port::PortDriver::capabilities`] declaration, recorded when the
-    /// port is registered. C's asynManager keeps the same thing as the list of
+    /// The port's interface registry — the driver's
+    /// [`crate::port::PortDriverBase::interface_mask`], taken from the actor's
+    /// link. C's asynManager keeps the same thing as the list of
     /// `registerInterface` calls the driver made, and clients ask for it with
     /// `findInterface` (asynManager.c:1470-1514); asynRecord uses it to fill
     /// OCTETIV / I32IV / UI32IV / F64IV / OPTIONIV / GPIBIV
-    /// (asynRecord.c:1177-1240). Registration-time, not a runtime query: a
-    /// driver cannot gain or lose an interface after `registerInterface`.
-    interfaces: Arc<[Capability]>,
+    /// (asynRecord.c:1177-1240).
+    interfaces: InterfaceMask,
     /// The trace manager the port's driver was bound to
     /// (`PortServices::bind` at `create_port_runtime`) — C's per-port
     /// `tracePvt`, reached through the port. The registry publishes this one
@@ -427,7 +423,7 @@ pub struct WeakPortHandle {
     multi_device: bool,
     max_addr: i32,
     get_address: crate::port::GetAddress,
-    interfaces: Arc<[Capability]>,
+    interfaces: InterfaceMask,
     trace: Arc<TraceManager>,
     sync_lock: crate::port_actor::SyncLock,
     input_eos: crate::port_actor::InputEos,
@@ -458,7 +454,7 @@ impl WeakPortHandle {
             multi_device: self.multi_device,
             max_addr: self.max_addr,
             get_address: self.get_address,
-            interfaces: self.interfaces.clone(),
+            interfaces: self.interfaces,
             trace: self.trace.clone(),
             sync_lock: self.sync_lock.clone(),
             input_eos: self.input_eos.clone(),
@@ -504,9 +500,7 @@ impl PortHandle {
             multi_device: false,
             max_addr: 1,
             get_address: crate::port::port_get_address,
-            interfaces: crate::interfaces::InterfaceMask::UNMIGRATED_ALL
-                .capabilities()
-                .into(),
+            interfaces: actor.interfaces,
             trace,
             sync_lock: actor.sync_lock,
             input_eos: actor.input_eos,
@@ -529,7 +523,7 @@ impl PortHandle {
             multi_device: self.multi_device,
             max_addr: self.max_addr,
             get_address: self.get_address,
-            interfaces: self.interfaces.clone(),
+            interfaces: self.interfaces,
             trace: self.trace.clone(),
             sync_lock: self.sync_lock.clone(),
             input_eos: self.input_eos.clone(),
@@ -553,19 +547,10 @@ impl PortHandle {
         }
     }
 
-    /// Record the driver's declared interface set — see `Self::interfaces`.
-    /// Called by the runtime layer at handle construction, from the driver's own
-    /// [`crate::port::PortDriver::capabilities`].
-    pub fn set_interfaces(&mut self, interfaces: Vec<Capability>) {
-        self.interfaces = interfaces.into();
-    }
-
     /// Does the port implement this interface? The port's `findInterface`
     /// (asynManager.c:1470-1514).
     pub fn has_interface(&self, iface: InterfaceType) -> bool {
-        self.interfaces
-            .iter()
-            .any(|cap| cap.interface_type() == iface)
+        self.interfaces.has(iface)
     }
 
     /// Set whether this port can perform blocking I/O.
@@ -770,8 +755,18 @@ impl PortHandle {
     /// `queueRequest` with no `timeoutUser`. It carries no reply channel and
     /// no cancel token.
     pub fn submit_unanswered(&self, op: RequestOp, user: AsynUser) -> AsynResult<()> {
+        self.submit_unanswered_in(op, user, SectionScope::current())
+    }
+
+    /// [`Self::submit_unanswered`] from a caller in `scope`.
+    fn submit_unanswered_in(
+        &self,
+        op: RequestOp,
+        user: AsynUser,
+        scope: SectionScope,
+    ) -> AsynResult<()> {
         crate::port_actor::queue_request_gate(&self.gate, &op, &user, self.multi_device)?;
-        self.send(ActorMessage::unanswered(op, user))
+        self.send(ActorMessage::unanswered(op, user, scope))
     }
 
     /// The one gate every blocking entry point on this handle passes through.
@@ -857,6 +852,17 @@ impl PortHandle {
         let holding = Holding::enter(&self.lend, self.actor);
         let ran = crate::port_actor::run_lent(&self.lend, claimed);
         Ok((holding, ran.map_err(through)))
+    }
+
+    /// This thread's hold of the port: a request that does nothing, lent.
+    fn hold(&self, what: &str) -> AsynResult<Holding> {
+        let (holding, ran) = self.lend_request(
+            what,
+            RequestOp::WithDriver(DriverCall::new(|_| {})),
+            AsynUser::default(),
+        )?;
+        ran?;
+        Ok(holding)
     }
 
     /// Submit a request and block until completion (for sync callers).
@@ -1391,7 +1397,8 @@ impl PortHandle {
     /// ```
     ///
     /// Delivery to the actor inbox is guaranteed (waits if channel is full).
-    /// The actor processes messages in FIFO order.
+    /// The actor processes messages in FIFO order, but for what runs while a
+    /// [`CallbacksGate`] section holds, as [`Self::set_params_blocking`].
     ///
     /// `addr` names the address list to flush; a batch that writes further
     /// lists gets those flushed too, in the order it first wrote them, so a
@@ -1484,9 +1491,12 @@ impl PortHandle {
     }
 
     /// C `setXxxParam` of each update without the `callParamCallbacks`: the
-    /// values are in the store for any request queued after this one, and
-    /// marked changed until a [`Self::call_param_callbacks_blocking`] on
-    /// their list posts them. Blocks only until the inbox accepts it, as
+    /// values are marked changed until a
+    /// [`Self::call_param_callbacks_blocking`] on their list posts them. A
+    /// request queued after this one finds them stored, but for one in the
+    /// [`CallbacksAfter::scope`] of a section that holds: the sets wait for
+    /// the section's end, as C's writer waits on the lock its thread holds.
+    /// Blocks only until the inbox accepts it, as
     /// [`Self::set_params_and_notify_blocking`].
     pub fn set_params_blocking(
         &self,
@@ -1555,6 +1565,18 @@ impl PortHandle {
         let (call, result) = self.driver_call(f);
         self.submit_blocking(RequestOp::WithDriver(call), AsynUser::default())?;
         self.driver_result::<D, R>(result)
+    }
+
+    /// C `lock()`, `f`, `unlock()` from a thread that is not the port's:
+    /// `f` runs here with the actor lent to this thread, so it may borrow
+    /// from its caller and is neither boxed nor sent. Refuses the port's own
+    /// actor thread like every blocking entry point.
+    pub fn lent_driver_blocking<R>(
+        &self,
+        f: impl FnOnce(&mut dyn PortDriver) -> R,
+    ) -> AsynResult<R> {
+        let _holding = self.hold("lent_driver_blocking")?;
+        self.lend.with_port_driver(f)
     }
 
     /// A driver thread's C `lock()`, held across several steps until the
@@ -2213,19 +2235,30 @@ pub struct CallbacksGate {
     port: PortHandle,
     sections: Arc<crate::request::Sections>,
     /// The next section's number.
-    seq: u64,
+    seq: u32,
 }
 
 impl CallbacksGate {
+    /// An empty `updates` for [`Self::open`]: the one an earlier section
+    /// left once the actor has run it, so a section's sets allocate nothing.
+    pub fn updates(&self) -> Vec<crate::request::ParamSetValue> {
+        self.sections.updates()
+    }
+
     /// Queue the sets ahead of anything the section causes; the callbacks
-    /// fire once the returned [`CallbacksAfter`] ends.
+    /// fire once the returned [`CallbacksAfter`] ends. Until then the port
+    /// runs only requests made in [`CallbacksAfter::scope`]: `within`, the
+    /// caller's, else a new one.
     pub fn open(
         &mut self,
         addr: i32,
         time_stamp: Option<SystemTime>,
         updates: Vec<crate::request::ParamSetValue>,
+        within: SectionScope,
     ) -> AsynResult<CallbacksAfter<'_>> {
-        self.port.enqueue_now(
+        let scope = SectionScope::for_section(within);
+        self.sections.open(scope);
+        self.port.submit_unanswered_in(
             RequestOp::CallParamCallbacks {
                 addr,
                 updates,
@@ -2235,9 +2268,14 @@ impl CallbacksGate {
                     seq: self.seq,
                 }),
             },
-            addr,
+            AsynUser::new(0).with_addr(addr),
+            within,
         )?;
-        Ok(CallbacksAfter { gate: self, addr })
+        Ok(CallbacksAfter {
+            gate: self,
+            addr,
+            scope,
+        })
     }
 }
 
@@ -2247,9 +2285,15 @@ impl CallbacksGate {
 pub struct CallbacksAfter<'a> {
     gate: &'a mut CallbacksGate,
     addr: i32,
+    scope: SectionScope,
 }
 
 impl CallbacksAfter<'_> {
+    /// The scope whose requests the port runs while it holds the callbacks.
+    pub fn scope(&self) -> SectionScope {
+        self.scope
+    }
+
     /// End the section. The callbacks fire on the actor, from this end when
     /// the actor holds them, else as soon as it reaches the sets.
     pub fn end(self) -> AsynResult<()> {
@@ -2259,18 +2303,19 @@ impl CallbacksAfter<'_> {
     fn finish(&mut self) -> AsynResult<()> {
         let gate = &mut *self.gate;
         let seq = gate.seq;
-        gate.seq += 1;
+        gate.seq = seq.wrapping_add(1);
         if !gate.sections.end(seq) {
             return Ok(());
         }
-        gate.port.enqueue_now(
+        gate.port.submit_unanswered_in(
             RequestOp::CallParamCallbacks {
                 addr: self.addr,
                 updates: Vec::new(),
                 time_stamp: None,
                 gate: Some(SectionCallbacks::Held(gate.sections.clone())),
             },
-            self.addr,
+            AsynUser::new(0).with_addr(self.addr),
+            self.scope,
         )
     }
 }
@@ -2312,8 +2357,8 @@ mod tests {
                 "handle_test",
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::INT32 | InterfaceMask::FLOAT64 | InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             );
             base.create_param("VAL", ParamType::Int32).unwrap();
             base.create_param("F64", ParamType::Float64).unwrap();
@@ -2789,8 +2834,8 @@ mod tests {
                 "sync_token",
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::INT32,
+                InterfaceMask::NONE,
             ),
             seen: seen.clone(),
         });
@@ -2947,8 +2992,8 @@ mod tests {
                 "sync_nested",
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::INT32,
+                InterfaceMask::NONE,
             ),
             log: log.clone(),
         });
@@ -3003,8 +3048,8 @@ mod tests {
                 can_block: true,
                 ..PortFlags::default()
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::INT32,
+            InterfaceMask::NONE,
         );
         base.create_param("VAL", ParamType::Int32).unwrap();
         let mut handle = make_handle(Where {
@@ -3081,8 +3126,8 @@ mod tests {
                 multi_device: true,
                 ..PortFlags::default()
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::INT32,
+            InterfaceMask::NONE,
         );
         base.set_addr_enabled(1, false).unwrap();
         let handle = make_handle(Log {
@@ -3147,8 +3192,8 @@ mod tests {
                     can_block: true,
                     ..PortFlags::default()
                 },
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::NONE,
+                InterfaceMask::NONE,
             );
             base.set_auto_connect_addr(1, false);
             base.set_addr_connected(1, false);
@@ -3176,8 +3221,8 @@ mod tests {
                     multi_device: true,
                     ..PortFlags::default()
                 },
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::NONE,
+                InterfaceMask::NONE,
             );
             base.create_param("VAL", ParamType::Int32).unwrap();
             base.set_auto_connect_addr(1, false);
@@ -3207,6 +3252,16 @@ mod tests {
                 device(crate::user::ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED),
             )
             .expect("the reason waives the device refusal below Connect priority");
+    }
+
+    /// `Duration::MAX` is a wait that never expires, not an `Instant` overflow.
+    #[test]
+    fn wait_blocking_takes_duration_max() {
+        let (handle, _reads) = slow_port(Duration::ZERO);
+        let read = handle
+            .try_submit(RequestOp::Int32Read, AsynUser::new(0))
+            .unwrap();
+        assert_eq!(read.wait_blocking(Duration::MAX).unwrap().int_val, Some(7));
     }
 
     /// A synchronous port has no queue to park a request on: one whose port
@@ -3429,8 +3484,8 @@ mod tests {
                         can_block: true,
                         ..PortFlags::default()
                     },
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::INT32,
+                    InterfaceMask::NONE,
                 ),
                 entered: entered_tx,
                 release: std::sync::Mutex::new(release_rx),
@@ -3515,8 +3570,8 @@ mod tests {
                 can_block: true,
                 ..PortFlags::default()
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::INT32,
+            InterfaceMask::NONE,
         );
         // The port comes back on its own retry timer (asynManager.c:3283-3314).
         base.seconds_between_port_connect = Duration::from_millis(20);
@@ -3954,8 +4009,8 @@ mod tests {
                 multi_device: true,
                 ..PortFlags::default()
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.create_param("VAL", ParamType::Int32).unwrap();
         let handle = make_handle(TestDriver { base });
@@ -4002,8 +4057,8 @@ mod tests {
                 multi_device: true,
                 ..PortFlags::default()
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OCTET,
+            InterfaceMask::NONE,
         )));
         handle.set_capabilities(true, 2, crate::port::port_get_address);
         let at = |addr| handle.get_input_eos(&AsynUser::new(0).with_addr(addr));
@@ -4112,8 +4167,8 @@ mod tests {
             "lock_port",
             1,
             flags,
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OCTET,
+            InterfaceMask::NONE,
         );
         let dir = tempfile::tempdir().expect("fixture root");
         let trace_path = dir.path().join("lock_port_trace.txt");
@@ -4191,13 +4246,7 @@ mod tests {
             multi_device: true,
             ..PortFlags::default()
         };
-        let base = PortDriverBase::new(
-            "lpt",
-            2,
-            flags,
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
-        );
+        let base = PortDriverBase::new("lpt", 2, flags, InterfaceMask::NONE, InterfaceMask::NONE);
         let trace = base.trace.clone();
         trace.register_port("lpt", true);
         let dir = tempfile::tempdir().expect("fixture root");
@@ -4350,6 +4399,50 @@ mod tests {
         assert!((handle.read_float64(1, 0).await.unwrap() - 1.23).abs() < 1e-10);
     }
 
+    /// The actor refuses an op on an interface outside the port's mask, so a
+    /// caller that never asked `has_interface` still cannot reach the driver.
+    #[test]
+    fn an_op_outside_the_interface_mask_is_refused() {
+        let handle = make_handle(TestDriver::new());
+        fn refusal<T: std::fmt::Debug>(r: AsynResult<T>) -> String {
+            r.unwrap_err().message().to_string()
+        }
+        let op = |op| handle.submit_blocking(op, AsynUser::new(0));
+        assert_eq!(
+            refusal(op(RequestOp::Int64Read)),
+            "port does not implement interface asynInt64"
+        );
+        assert_eq!(
+            refusal(op(RequestOp::UInt32DigitalWrite { value: 1, mask: 1 })),
+            "asynUInt32Digital interface not supported"
+        );
+        assert_eq!(
+            refusal(op(RequestOp::Float64ArrayRead {
+                buf: SharedArray::default(),
+                max_elements: 4,
+            })),
+            "interface asynFloat64Array is not supported by port"
+        );
+        assert_eq!(
+            refusal(handle.get_option_blocking(AsynUser::new(0), "baud")),
+            "port does not implement interface asynOption"
+        );
+        let syncio = crate::sync_io::SyncIOHandle::from_handle(
+            handle.clone(),
+            0,
+            std::time::Duration::from_secs(1),
+            InterfaceType::Common,
+        )
+        .unwrap();
+        assert_eq!(
+            refusal(syncio.read_enum(0)),
+            "port does not implement interface asynEnum"
+        );
+
+        handle.write_int32_blocking(0, 0, 5).unwrap();
+        assert_eq!(syncio.read_int32(0).unwrap(), 5, "an op in the mask runs");
+    }
+
     #[tokio::test]
     async fn handle_async_octet() {
         let handle = make_handle(TestDriver::new());
@@ -4471,8 +4564,8 @@ mod tests {
             "enbl_prop",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.create_param("VAL", ParamType::Int32).unwrap();
         let exc_mgr = Arc::new(ExceptionManager::new());
@@ -4524,13 +4617,6 @@ mod tests {
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.0
             }
-            fn capabilities(&self) -> Vec<Capability> {
-                vec![
-                    Capability::Gpib,
-                    Capability::OctetRead,
-                    Capability::OctetWrite,
-                ]
-            }
             fn gpib_universal_cmd(&mut self, user: &mut AsynUser, cmd: u8) -> AsynResult<()> {
                 CALLS
                     .lock()
@@ -4553,14 +4639,13 @@ mod tests {
         }
 
         // A GPIB link is multi-device; a single-device port hands -1 (getAddr).
-        let mut handle = make_handle(GpibDrv(PortDriverBase::new(
+        let handle = make_handle(GpibDrv(PortDriverBase::new(
             "gpib_vtable",
             32,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::GPIB | InterfaceMask::OCTET,
+            InterfaceMask::NONE,
         )));
-        handle.set_interfaces(vec![Capability::Gpib]);
         assert!(handle.has_interface(InterfaceType::Gpib), "findInterface");
 
         handle
@@ -4594,7 +4679,7 @@ mod tests {
         let err = handle
             .gpib_universal_cmd_blocking(AsynUser::new(0), 0x14)
             .unwrap_err();
-        assert_eq!(err.message(), "port has no asynGpib interface");
+        assert_eq!(err.message(), "interface asynGpib is not supported by port");
         assert!(handle.gpib_ifc_blocking(AsynUser::new(0)).is_err());
     }
 
@@ -4612,8 +4697,8 @@ mod tests {
             "auct_prop",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.create_param("VAL", ParamType::Int32).unwrap();
         let exc_mgr = Arc::new(ExceptionManager::new());
@@ -4677,8 +4762,8 @@ mod tests {
                 "handle_test",
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::INT32,
+                InterfaceMask::NONE,
             ),
             delay,
             reads: reads.clone(),
@@ -4698,8 +4783,8 @@ mod tests {
                 "handle_test",
                 1,
                 flags,
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::INT32,
+                InterfaceMask::NONE,
             ),
             delay,
             reads: reads.clone(),
@@ -4716,9 +4801,15 @@ mod tests {
     #[test]
     fn a_syncio_call_that_never_ran_reports_as_queue_lock_port() {
         let sync = |handle: &PortHandle| {
-            crate::sync_io::SyncIOHandle::from_handle(handle.clone(), 0, Duration::from_millis(10))
-                .read_int32(0)
-                .expect_err("the call never ran")
+            crate::sync_io::SyncIOHandle::from_handle(
+                handle.clone(),
+                0,
+                Duration::from_millis(10),
+                InterfaceType::Int32,
+            )
+            .unwrap()
+            .read_int32(0)
+            .expect_err("the call never ran")
         };
 
         // Not connected, no autoconnect: queueRequest refuses.
@@ -4726,13 +4817,8 @@ mod tests {
             can_block: true,
             ..PortFlags::default()
         };
-        let mut base = PortDriverBase::new(
-            "qlp",
-            1,
-            flags,
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
-        );
+        let mut base =
+            PortDriverBase::new("qlp", 1, flags, InterfaceMask::INT32, InterfaceMask::NONE);
         base.init_connected(false);
         base.init_auto_connect(false);
         let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -4793,8 +4879,8 @@ mod tests {
             "qlp",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::INT32,
+            InterfaceMask::NONE,
         );
         base.init_connected(false);
         base.init_auto_connect(false);
@@ -4804,8 +4890,13 @@ mod tests {
             delay: Duration::ZERO,
             reads: reads.clone(),
         });
-        let syncio =
-            crate::sync_io::SyncIOHandle::from_handle(handle.clone(), 0, Duration::from_millis(10));
+        let syncio = crate::sync_io::SyncIOHandle::from_handle(
+            handle.clone(),
+            0,
+            Duration::from_millis(10),
+            InterfaceType::Int32,
+        )
+        .unwrap();
         assert_eq!(syncio.read_int32(0).unwrap(), 7);
         assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
 
@@ -4825,8 +4916,13 @@ mod tests {
     fn a_syncio_call_on_a_synchronous_port_has_no_queue_deadline() {
         let (handle, _reads) = slow_port(Duration::from_millis(300));
         handle.set_queue_lock_port_timeout(Duration::from_millis(10));
-        let syncio =
-            crate::sync_io::SyncIOHandle::from_handle(handle.clone(), 0, Duration::from_millis(10));
+        let syncio = crate::sync_io::SyncIOHandle::from_handle(
+            handle.clone(),
+            0,
+            Duration::from_millis(10),
+            InterfaceType::Int32,
+        )
+        .unwrap();
         assert_eq!(syncio.user(0).queue_timeout(), None);
         let jammer = handle.clone();
         let jam = std::thread::spawn(move || {
@@ -4949,7 +5045,14 @@ mod tests {
         });
         std::thread::sleep(Duration::from_millis(50));
         let started = std::time::Instant::now();
-        let read = crate::sync_io::SyncIOHandle::from_handle(handle, 0, user_timeout).read_int32(0);
+        let read = crate::sync_io::SyncIOHandle::from_handle(
+            handle,
+            0,
+            user_timeout,
+            InterfaceType::Int32,
+        )
+        .unwrap()
+        .read_int32(0);
         let waited = started.elapsed();
         jam.join().unwrap();
         (read, waited)
@@ -5141,13 +5244,21 @@ mod tests {
                 buf[..n].copy_from_slice(&a[..n]);
                 Ok(n)
             }
+            fn read_enum(&mut self, user: &AsynUser) -> AsynResult<(usize, Arc<[EnumEntry]>)> {
+                self.base.params.get_enum(user.reason, user.addr)
+            }
         }
         let mut base = PortDriverBase::new(
             "handle_test",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::INT8_ARRAY
+                | InterfaceMask::INT16_ARRAY
+                | InterfaceMask::FLOAT32_ARRAY
+                | InterfaceMask::ENUM
+                | InterfaceMask::INT64
+                | InterfaceMask::INT64_ARRAY,
+            InterfaceMask::NONE,
         );
         // reason 0..=5, in the order pushed below.
         base.create_param("I64", ParamType::Int64).unwrap();
@@ -5331,8 +5442,8 @@ mod tests {
             "gated",
             2,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::INT32,
+            InterfaceMask::NONE,
         );
         let val = base.create_param("VAL", ParamType::Int32).unwrap();
         base.own_interrupts(epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened());
@@ -5360,7 +5471,24 @@ mod tests {
         crate::request::ParamSetValue::new(0, addr, ParamValue::Int32(v))
     }
 
-    /// Hold `handle`'s actor until the returned sender sends.
+    /// A `callParamCallbacks(addr)` that stores nothing.
+    fn bare_post(addr: i32) -> RequestOp {
+        RequestOp::CallParamCallbacks {
+            addr,
+            updates: vec![],
+            time_stamp: None,
+            gate: None,
+        }
+    }
+
+    /// A read by `section`'s own thread, which C's recursive lock lets in.
+    fn read_in(handle: &PortHandle, section: &CallbacksAfter<'_>, addr: i32) -> AsynResult<i32> {
+        let _in = section.scope().enter();
+        handle.read_int32_blocking(0, addr)
+    }
+
+    /// Hold `handle`'s actor, from the caller's scope, until the returned
+    /// sender sends.
     fn hold_actor(
         handle: &PortHandle,
     ) -> (
@@ -5370,7 +5498,9 @@ mod tests {
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
         let busy = handle.clone();
+        let scope = SectionScope::current();
         let hold = std::thread::spawn(move || {
+            let _in = scope.enter();
             busy.with_driver_blocking(move |_: &mut TestDriver| {
                 started_tx.send(()).unwrap();
                 go_rx.recv().unwrap();
@@ -5389,14 +5519,128 @@ mod tests {
         let (handle, posts, _sub) = gated_handle();
         let mut gate = handle.callbacks_gate();
         let section = gate
-            .open(0, None, vec![set_val(1, 11), set_val(0, 10)])
+            .open(
+                0,
+                None,
+                vec![set_val(1, 11), set_val(0, 10)],
+                SectionScope::default(),
+            )
             .unwrap();
-        assert_eq!(handle.read_int32_blocking(0, 0).unwrap(), 10);
-        assert_eq!(handle.read_int32_blocking(0, 1).unwrap(), 11);
+        assert_eq!(read_in(&handle, &section, 0).unwrap(), 10);
+        assert_eq!(read_in(&handle, &section, 1).unwrap(), 11);
         assert!(posts.lock().is_empty(), "posted inside the section");
         section.end().unwrap();
         handle.read_int32_blocking(0, 0).unwrap();
         assert_eq!(*posts.lock(), [(0, 10), (1, 11)]);
+    }
+
+    /// C's lock keeps another thread's `callParamCallbacks` out of a section:
+    /// a bare one, and one carrying sets of its own, wait, sets and all, for
+    /// the section's end.
+    #[test]
+    fn a_post_inside_a_section_leaves_the_sections_sets_to_its_end() {
+        let (handle, posts, _sub) = gated_handle();
+        let mut gate = handle.callbacks_gate();
+        let section = gate
+            .open(0, None, vec![set_val(0, 60)], SectionScope::default())
+            .unwrap();
+        handle
+            .submit_unanswered(bare_post(0), AsynUser::new(0).with_addr(0))
+            .unwrap();
+        handle
+            .submit_unanswered(
+                RequestOp::CallParamCallbacks {
+                    addr: 1,
+                    updates: vec![set_val(1, 61)],
+                    time_stamp: None,
+                    gate: None,
+                },
+                AsynUser::new(0).with_addr(1),
+            )
+            .unwrap();
+        assert_eq!(
+            read_in(&handle, &section, 1).ok(),
+            None,
+            "stored inside the section"
+        );
+        assert!(posts.lock().is_empty(), "posted inside the section");
+        section.end().unwrap();
+        handle.read_int32_blocking(0, 0).unwrap();
+        assert_eq!(*posts.lock(), [(0, 60), (1, 61)]);
+    }
+
+    /// A set the section stores unchanged raised no flag, so its end posts
+    /// nothing for it, and a flag a set ahead of the section left unposted
+    /// waits for the section's end like the section's own.
+    #[test]
+    fn a_section_posts_only_what_is_changed_at_its_end() {
+        let (handle, posts, _sub) = gated_handle();
+        handle
+            .set_params_and_notify_blocking(0, vec![set_val(0, 70)])
+            .unwrap();
+        handle.set_params_blocking(1, vec![set_val(1, 71)]).unwrap();
+        let mut gate = handle.callbacks_gate();
+        let section = gate
+            .open(
+                0,
+                None,
+                vec![set_val(0, 70), set_val(1, 71)],
+                SectionScope::default(),
+            )
+            .unwrap();
+        handle
+            .submit_unanswered(bare_post(1), AsynUser::new(0).with_addr(1))
+            .unwrap();
+        read_in(&handle, &section, 0).unwrap();
+        assert_eq!(*posts.lock(), [(0, 70)]);
+        section.end().unwrap();
+        handle.read_int32_blocking(0, 0).unwrap();
+        assert_eq!(*posts.lock(), [(0, 70), (1, 71)]);
+    }
+
+    /// C's lock keeps a writer out of a section until its
+    /// `callParamCallbacks` has run (NDPluginDriver.cpp:466, :539): a write
+    /// to a param the section stored waits for the section's end, so the
+    /// section's value posts once and the writer's once after it.
+    #[test]
+    fn a_write_inside_a_section_posts_after_the_sections_value() {
+        let (handle, posts, _sub) = gated_handle();
+        let mut gate = handle.callbacks_gate();
+        let section = gate
+            .open(0, None, vec![set_val(0, 90)], SectionScope::default())
+            .unwrap();
+        handle
+            .submit_unanswered(RequestOp::Int32Write { value: 91 }, AsynUser::new(0))
+            .unwrap();
+        // The actor held the write back before it ran this read.
+        assert_eq!(read_in(&handle, &section, 0).unwrap(), 90);
+        assert!(posts.lock().is_empty(), "posted inside the section");
+        section.end().unwrap();
+        handle.read_int32_blocking(0, 0).unwrap();
+        assert_eq!(*posts.lock(), [(0, 90), (0, 91)]);
+    }
+
+    /// C's lock holds another thread's read as it holds its store, in the
+    /// order they were queued: a read behind a store inside a section reads
+    /// the store once the section ends, not the section's value.
+    #[test]
+    fn a_read_behind_a_store_inside_a_section_reads_the_store() {
+        let (handle, _posts, _sub) = gated_handle();
+        let mut gate = handle.callbacks_gate();
+        let section = gate
+            .open(0, None, vec![set_val(0, 90)], SectionScope::default())
+            .unwrap();
+        assert_eq!(read_in(&handle, &section, 0).unwrap(), 90);
+        handle
+            .submit_unanswered(RequestOp::Int32Write { value: 91 }, AsynUser::new(0))
+            .unwrap();
+        let read = handle
+            .try_submit(RequestOp::Int32Read, AsynUser::new(0))
+            .unwrap();
+        assert_eq!(read_in(&handle, &section, 0).unwrap(), 90, "held both");
+        section.end().unwrap();
+        let read = read.wait_blocking(Duration::from_secs(5)).unwrap();
+        assert_eq!(read.int_val, Some(91));
     }
 
     /// A section that ends before the actor reaches the sets leaves the
@@ -5406,10 +5650,15 @@ mod tests {
         let (handle, posts, _sub) = gated_handle();
         let mut gate = handle.callbacks_gate();
         let (go, hold) = hold_actor(&handle);
-        gate.open(0, None, vec![set_val(1, 21), set_val(0, 20)])
-            .unwrap()
-            .end()
-            .unwrap();
+        gate.open(
+            0,
+            None,
+            vec![set_val(1, 21), set_val(0, 20)],
+            SectionScope::default(),
+        )
+        .unwrap()
+        .end()
+        .unwrap();
         go.send(()).unwrap();
         hold.join().unwrap().unwrap();
         handle.read_int32_blocking(0, 0).unwrap();
@@ -5423,14 +5672,16 @@ mod tests {
         let (handle, posts, _sub) = gated_handle();
         let mut gate = handle.callbacks_gate();
         let (go, hold) = hold_actor(&handle);
-        gate.open(0, None, vec![set_val(0, 40)])
+        gate.open(0, None, vec![set_val(0, 40)], SectionScope::default())
             .unwrap()
             .end()
             .unwrap();
-        let second = gate.open(0, None, vec![set_val(0, 41)]).unwrap();
+        let second = gate
+            .open(0, None, vec![set_val(0, 41)], SectionScope::default())
+            .unwrap();
         go.send(()).unwrap();
         hold.join().unwrap().unwrap();
-        handle.read_int32_blocking(0, 0).unwrap();
+        read_in(&handle, &second, 0).unwrap();
         assert_eq!(*posts.lock(), [(0, 40)], "held the first for the second");
         second.end().unwrap();
         handle.read_int32_blocking(0, 0).unwrap();
@@ -5444,16 +5695,82 @@ mod tests {
         let (handle, posts, _sub) = gated_handle();
         let mut gate = handle.callbacks_gate();
         let first = gate
-            .open(0, None, vec![set_val(1, 51), set_val(0, 50)])
+            .open(
+                0,
+                None,
+                vec![set_val(1, 51), set_val(0, 50)],
+                SectionScope::default(),
+            )
             .unwrap();
-        handle.read_int32_blocking(0, 0).unwrap();
+        read_in(&handle, &first, 0).unwrap();
         first.end().unwrap();
-        let second = gate.open(0, None, vec![set_val(0, 52)]).unwrap();
-        handle.read_int32_blocking(0, 0).unwrap();
+        let second = gate
+            .open(0, None, vec![set_val(0, 52)], SectionScope::default())
+            .unwrap();
+        read_in(&handle, &second, 0).unwrap();
         assert_eq!(*posts.lock(), [(0, 50), (1, 51)]);
         second.end().unwrap();
         handle.read_int32_blocking(0, 0).unwrap();
         assert_eq!(*posts.lock(), [(0, 50), (1, 51), (0, 52)]);
+    }
+
+    /// A section in a held one's scope, a blocking consumer's on the same
+    /// port, holds too, inside C's recursive lock: its end leaves the held
+    /// one holding, so another thread's write still waits for that end.
+    #[test]
+    fn a_nested_sections_end_leaves_the_outer_one_holding() {
+        let (handle, posts, _sub) = gated_handle();
+        let mut outer_gate = handle.callbacks_gate();
+        let mut inner_gate = handle.callbacks_gate();
+        let outer = outer_gate
+            .open(0, None, vec![set_val(0, 80)], SectionScope::default())
+            .unwrap();
+        read_in(&handle, &outer, 0).unwrap();
+        let inner = inner_gate
+            .open(1, None, vec![set_val(1, 81)], outer.scope())
+            .unwrap();
+        read_in(&handle, &inner, 1).unwrap();
+        inner.end().unwrap();
+        handle
+            .submit_unanswered(RequestOp::Int32Write { value: 82 }, AsynUser::new(0))
+            .unwrap();
+        assert_eq!(read_in(&handle, &outer, 0).unwrap(), 80, "wrote inside");
+        assert_eq!(*posts.lock(), [(1, 81)]);
+        outer.end().unwrap();
+        handle.read_int32_blocking(0, 0).unwrap();
+        assert_eq!(*posts.lock(), [(1, 81), (0, 80), (0, 82)]);
+    }
+
+    /// A section in a held one's scope that ends before the actor reaches
+    /// its sets holds nothing, and leaves the held one holding.
+    #[test]
+    fn a_section_ended_first_inside_a_held_one_leaves_it_holding() {
+        let (handle, posts, _sub) = gated_handle();
+        let mut outer_gate = handle.callbacks_gate();
+        let mut inner_gate = handle.callbacks_gate();
+        let outer = outer_gate
+            .open(0, None, vec![set_val(0, 80)], SectionScope::default())
+            .unwrap();
+        read_in(&handle, &outer, 0).unwrap();
+        let (go, hold) = {
+            let _in = outer.scope().enter();
+            hold_actor(&handle)
+        };
+        inner_gate
+            .open(1, None, vec![set_val(1, 81)], outer.scope())
+            .unwrap()
+            .end()
+            .unwrap();
+        handle
+            .submit_unanswered(RequestOp::Int32Write { value: 82 }, AsynUser::new(0))
+            .unwrap();
+        go.send(()).unwrap();
+        hold.join().unwrap().unwrap();
+        assert_eq!(read_in(&handle, &outer, 0).unwrap(), 80, "wrote inside");
+        assert_eq!(*posts.lock(), [(1, 81)]);
+        outer.end().unwrap();
+        handle.read_int32_blocking(0, 0).unwrap();
+        assert_eq!(*posts.lock(), [(1, 81), (0, 80), (0, 82)]);
     }
 
     /// A section dropped without its end still ends it.
@@ -5461,8 +5778,10 @@ mod tests {
     fn a_dropped_section_still_fires_the_callbacks() {
         let (handle, posts, _sub) = gated_handle();
         let mut gate = handle.callbacks_gate();
-        let section = gate.open(0, None, vec![set_val(0, 30)]).unwrap();
-        handle.read_int32_blocking(0, 0).unwrap();
+        let section = gate
+            .open(0, None, vec![set_val(0, 30)], SectionScope::default())
+            .unwrap();
+        read_in(&handle, &section, 0).unwrap();
         drop(section);
         handle.read_int32_blocking(0, 0).unwrap();
         assert_eq!(*posts.lock(), [(0, 30)]);
@@ -5589,8 +5908,8 @@ mod tests {
                 name,
                 max_addr,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::NONE,
+                InterfaceMask::NONE,
             ),
             disconnects: disconnects.clone(),
         });

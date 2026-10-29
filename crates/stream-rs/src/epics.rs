@@ -35,9 +35,7 @@ use std::time::Duration;
 
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::runtime::background::{CallbackBody, CallbackCell};
-use epics_base_rs::runtime::task::{
-    CallbackPriority, request_cell, sleep_background, spawn_background,
-};
+use epics_base_rs::runtime::task::{CallbackPriority, request_cell, spawn_background_after};
 use epics_base_rs::server::database::{
     AsyncDbHandle, DbAddr, DeviceDone, DeviceDoneSource, FieldPut, HeldInstance, InitHold,
     ProcessCallback, UnheldLinkPut,
@@ -55,10 +53,10 @@ use epics_base_rs::server::recgbl::{
     AlarmResetResult, EventMask, alarm_condition_string, get_time_stamp, rec_gbl_set_sevr,
 };
 use epics_base_rs::server::record::{
-    AlarmSeverity, CommonFields, EPICS_TIME_EVENT_DEVICE_TIME, HwLink, ParsedLink, Record,
-    ScanType, parse_link_v2,
+    AlarmSeverity, CommonFields, EPICS_TIME_EVENT_DEVICE_TIME, HwLink, OwnFrame, ParsedLink,
+    Record, ScanType, parse_link_v2,
 };
-use epics_base_rs::types::{DbFieldType, EpicsValue, PvString, RecordName, WallTime};
+use epics_base_rs::types::{DbFieldType, DbfCode, EpicsValue, PvString, RecordName, WallTime};
 use epics_libcom_rs::cfmt::CFloat;
 use parking_lot::{Condvar, Mutex};
 
@@ -456,6 +454,12 @@ impl RecordSlot {
                 f(record.as_mut(), common.as_mut())
             },
         })
+    }
+
+    /// The record and the frame its hold lends it; `None` for a borrowed
+    /// record, from which `scanDelete`'s abort formats nothing.
+    fn with_own<R>(&self, f: impl FnOnce(&mut dyn Record, OwnFrame<'_>) -> R) -> Option<R> {
+        self.held(|held| held.with_own(f))
     }
 
     /// The hold, for a `%(record.FIELD)` input's puts and processes; `None`
@@ -1015,10 +1019,7 @@ impl StreamHooks {
 
         // print (U)CHAR arrays as string
         let char_string = format.type_ == STRING_FORMAT
-            && matches!(
-                addr.field_type,
-                Some(DbFieldType::Char | DbFieldType::UChar)
-            );
+            && matches!(addr.field_type, DbfCode::Char | DbfCode::UChar);
         let dbr = match format.type_ {
             _ if char_string => DbFieldType::Char,
             UNSIGNED_FORMAT => DbFieldType::ULong,
@@ -1027,15 +1028,13 @@ impl StreamHooks {
             DOUBLE_FORMAT => DbFieldType::Double,
             _ => DbFieldType::String,
         };
-        let name = [addr.record.as_bytes(), b".", field.as_bytes()].concat();
+        let name = [addr.record.as_bytes(), b".", addr.field_part().as_bytes()].concat();
         let nelem = addr.no_elements as usize;
-        let snap = if own {
-            let own = self.shared.name.as_bytes();
-            self.with_record(|rec, _| db.db_get(&name, dbr, nelem, Some((own, &*rec))))
-                .flatten()
-        } else {
-            db.db_get(&name, dbr, nelem, None)
-        };
+        // The frame for another record's field too: it is how a dbGet that
+        // waits for that record serves the reads owed to this one.
+        let snap = (self.shared.slot)
+            .with_own(|rec, own| db.db_get(&name, dbr, nelem, Some(own.of(&*rec))))
+            .unwrap_or_else(|| db.db_get(&name, dbr, nelem, None));
         let Some(snap) = snap else {
             stream_error(&cmsg!(format!(
                 "{}: dbGet({record}.{field}, {}) failed\n",
@@ -1095,10 +1094,7 @@ impl StreamHooks {
         let record = addr.record.to_str_lossy();
         let field = addr.field.as_str();
         let nelem = addr.no_elements as usize;
-        let char_array = matches!(
-            addr.field_type,
-            Some(DbFieldType::Char | DbFieldType::UChar)
-        );
+        let char_array = matches!(addr.field_type, DbfCode::Char | DbfCode::UChar);
         let init_run = !db.interrupt_accept();
 
         let mut longs = Vec::new();
@@ -1529,8 +1525,8 @@ impl StreamCoreHooks for StreamHooks {
         };
         let shared = Arc::downgrade(&self.shared);
         let prio = CallbackPriority::from_record_prio(self.shared.prio.load(Ordering::Relaxed));
-        drop(spawn_background(prio, async move {
-            sleep_background(Duration::from_millis(timeout_ms)).await;
+        let delay = Duration::from_millis(timeout_ms);
+        drop(spawn_background_after(prio, delay, async move {
             let current = shared
                 .upgrade()
                 .is_some_and(|s| s.timer_start.load(Ordering::Acquire) == start);
@@ -1655,7 +1651,8 @@ impl StreamCoreHooks for StreamHooks {
         let db = self.shared.db.get()?;
         let own = self.shared.name.as_bytes();
         let resolve = |name: &[u8]| {
-            self.with_record(|record, _| db.name_to_dbaddr(name, Some((own, &*record))))
+            (self.shared.slot)
+                .with_own(|record, own| db.name_to_dbaddr(name, Some(own.of(&*record))))
                 .unwrap_or_else(|| db.name_to_dbaddr(name, None))
         };
         if fieldname.contains(&b'.') {

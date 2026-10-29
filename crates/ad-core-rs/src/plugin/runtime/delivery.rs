@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use asyn_rs::port_handle::PortHandle;
+use asyn_rs::request::SectionScope;
 use asyn_rs::trace::TraceMask;
 use parking_lot::Mutex;
 
@@ -20,9 +21,10 @@ use crate::attributes::NDAttributeList;
 use crate::ndarray::NDArray;
 use crate::ndarray_pool::{DriverPool, NDArrayPool, PublishedArray};
 
-use super::super::channel::NDArrayOutput;
+use super::super::channel::{NDArrayOutput, NDArraySender, publish_each};
 use super::super::throttler::Throttler;
-use super::{ArrayCallbacks, CopyArray, OutputSenders, PluginPool, SortBuffer};
+use super::{ArrayCallbacks, CopyArray, Frame, PluginPool, SortBuffer};
+use smallvec::smallvec;
 
 pub(super) struct Delivery {
     /// One output per port address: what C's asynGenericPointer interrupt
@@ -63,6 +65,7 @@ struct State {
 }
 
 /// The counters C's sort path sets.
+#[derive(Clone, Copy)]
 pub(super) struct SortCounters {
     pub disordered_arrays: i32,
     pub dropped_output_arrays: i32,
@@ -105,10 +108,10 @@ impl Delivery {
     /// the copy succeeded (:285-299). Returns what is ready to deliver.
     pub(super) fn end_process(
         &self,
-        arrays: Vec<Arc<NDArray>>,
+        arrays: Frame<Arc<NDArray>>,
         attributes: Option<&NDAttributeList>,
         copy: CopyArray<'_>,
-    ) -> Vec<PublishedArray> {
+    ) -> Frame<PublishedArray> {
         self.end(arrays, attributes, copy, true)
     }
 
@@ -125,19 +128,19 @@ impl Delivery {
     /// [`Self::cache_written`] set in the write.
     pub(super) fn end_written(
         &self,
-        arrays: Vec<Arc<NDArray>>,
+        arrays: Frame<Arc<NDArray>>,
         attributes: Option<&NDAttributeList>,
-    ) -> Vec<PublishedArray> {
+    ) -> Frame<PublishedArray> {
         self.end(arrays, attributes, CopyArray::Never, false)
     }
 
     fn end(
         &self,
-        arrays: Vec<Arc<NDArray>>,
+        arrays: Frame<Arc<NDArray>>,
         attributes: Option<&NDAttributeList>,
         copy: CopyArray<'_>,
         cache: bool,
-    ) -> Vec<PublishedArray> {
+    ) -> Frame<PublishedArray> {
         let callbacks = self.array_callbacks.get();
         let mut state = self.state.lock();
         if cache
@@ -147,7 +150,7 @@ impl Delivery {
             state.last_output_array = Some(Arc::clone(last));
         }
         if !callbacks && !self.std_arrays {
-            return Vec::new();
+            return Frame::new();
         }
         // C copies only past the NDArrayCallbacks return (:274-286); the
         // StdArrays waveform route takes the frame as it is.
@@ -167,20 +170,31 @@ impl Delivery {
         self.array_callbacks.get()
     }
 
-    /// [`Self::end_process`] for one frame NDPluginFile wrote, copied, and
-    /// delivered before this returns (NDPluginFile.cpp:252, :301, :349). A
+    /// [`Self::end_process`] for one frame NDPluginFile wrote, copied with
+    /// `attributes`, for [`Self::deliver`] (NDPluginFile.cpp:252, :301,
+    /// :349).
+    pub(super) fn hand_on(
+        &self,
+        array: &Arc<NDArray>,
+        attributes: Option<&NDAttributeList>,
+    ) -> Frame<PublishedArray> {
+        self.end_process(smallvec![Arc::clone(array)], attributes, CopyArray::Always)
+    }
+
+    /// Deliver what [`Self::hand_on`] made ready before this returns. A
     /// blocking downstream runs it on this thread's behalf meanwhile, as C's
     /// `doCallbacksGenericPointer` runs it inline (NDPluginDriver.cpp:419).
-    pub(super) fn hand_on(&self, array: &Arc<NDArray>, attributes: Option<&NDAttributeList>) {
-        let ready = self.end_process(vec![Arc::clone(array)], attributes, CopyArray::Always);
+    pub(super) fn deliver(&self, ready: Frame<PublishedArray>) {
         if ready.is_empty() || !self.delivers() {
             return;
         }
-        let senders = self.senders(false);
+        let Some(senders) = self.senders(0) else {
+            return;
+        };
+        let scope = SectionScope::current();
         park_on(async {
             for array in &ready {
-                let sends = senders.main.iter().map(|s| s.publish(array.clone()));
-                futures_util::future::join_all(sends).await;
+                publish_each(&senders, array.clone(), scope).await;
             }
         });
     }
@@ -190,12 +204,12 @@ impl Delivery {
     /// `return asynError` (NDPluginDriver.cpp:285-299).
     pub(super) fn publishable(
         &self,
-        arrays: Vec<Arc<NDArray>>,
+        arrays: Frame<Arc<NDArray>>,
         attributes: Option<&NDAttributeList>,
         copy: CopyArray<'_>,
-    ) -> Vec<PublishedArray> {
+    ) -> Frame<PublishedArray> {
         let pool = self.pool.current();
-        let mut published = Vec::with_capacity(arrays.len());
+        let mut published = Frame::new();
         for array in arrays {
             let copied = match copy {
                 CopyArray::IfInput(input) => std::ptr::eq(&*array, input),
@@ -221,7 +235,7 @@ impl Delivery {
     pub(super) fn publishable_addressed(
         &self,
         arrays: Vec<(usize, Arc<NDArray>)>,
-    ) -> Vec<(usize, PublishedArray)> {
+    ) -> Frame<(usize, PublishedArray)> {
         let pool = self.pool.current();
         arrays
             .into_iter()
@@ -242,21 +256,11 @@ impl Delivery {
         self.state.lock().last_output_array.clone()
     }
 
-    /// The downstream senders, cloned so they are used with no lock held;
-    /// every address's only when `addressed`.
-    pub(super) fn senders(&self, addressed: bool) -> OutputSenders {
-        let by_addr = if addressed {
-            self.outputs
-                .iter()
-                .map(|o| o.lock().senders_clone())
-                .collect()
-        } else {
-            Vec::new()
-        };
-        OutputSenders {
-            main: self.outputs[0].lock().senders_clone(),
-            by_addr,
-        }
+    /// The senders registered at `addr` as they stand, used with no lock
+    /// held, as C's `doCallbacksGenericPointer` walks its list
+    /// (asynPortDriver.cpp:3353).
+    pub(super) fn senders(&self, addr: usize) -> Option<Arc<Vec<NDArraySender>>> {
+        Some(self.outputs.get(addr)?.lock().senders())
     }
 
     /// C `throttled(pArray)` for an output that is not an NDArray
@@ -363,8 +367,8 @@ impl State {
     /// array whose uniqueId is contiguous with `prevUniqueId_` is emitted
     /// immediately (B2); only out-of-order arrays enter the sort buffer.
     /// Disordered arrays are counted at emission time in both modes (B4).
-    fn route_output_arrays(&mut self, arrays: Vec<PublishedArray>) -> Vec<PublishedArray> {
-        let mut ready = Vec::new();
+    fn route_output_arrays(&mut self, arrays: Frame<PublishedArray>) -> Frame<PublishedArray> {
+        let mut ready = Frame::new();
         for arr in arrays {
             if !self.throttle_ok(&arr) {
                 continue; // G7: dropped by MaxByteRate throttle
@@ -382,11 +386,11 @@ impl State {
         // After emitting in-order arrays, the sort buffer head may now be
         // contiguous — release any newly-ready run (C++ sortingTask).
         if self.sort_mode != 0 {
-            for (_id, mut bucket) in self
+            for (_id, bucket) in self
                 .sort_buffer
                 .drain_ready(self.sort_time, std::time::Instant::now())
             {
-                ready.append(&mut bucket);
+                ready.extend(bucket);
             }
         }
         ready

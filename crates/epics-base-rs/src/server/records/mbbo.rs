@@ -457,6 +457,10 @@ impl Record for MbboRecord {
         true
     }
 
+    fn dbaddr_capacity_inputs(&self) -> Option<&'static [&'static str]> {
+        Some(&[])
+    }
+
     fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
         crate::server::record::CycleHooks::WRITE_POSTED
     }
@@ -523,6 +527,10 @@ impl Record for MbboRecord {
             self.init_common();
         }
         Ok(())
+    }
+
+    fn special_retypes(&self, put_field: &str) -> bool {
+        crate::server::record::multibit_state_field(put_field)
     }
 
     fn take_cycle_posted_fields(&mut self) -> crate::server::record::CycleMarks {

@@ -458,7 +458,10 @@ impl Record for SubRecord {
     /// DBF_DOUBLE, pvalue)`); `dbGetLink` then delivers nothing for it on
     /// every later process, so a client's `caput REC.A 99` stands.
     fn constant_init_links(&self) -> Vec<crate::server::record::ConstantInitLink> {
-        crate::server::record::seed_input_links(self.multi_input_links())
+        crate::server::record::seed_input_links(
+            self.multi_input_links(),
+            crate::server::record::SeedGuard::LoadLink,
+        )
     }
 
     /// The `INPA..INPL` texts read straight off the record's own array, not

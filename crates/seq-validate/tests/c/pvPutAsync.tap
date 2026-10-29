@@ -1,0 +1,11 @@
+1..10
+ok  1 - pvPut/ASYNC 0: result=0 ()
+ok  2 - pvPut/ASYNC 1: result=-1 ((null))
+ok  3 - pvPut/ASYNC 2: result=-1 ((null))
+ok  4 - pvPut/ASYNC 3: result=-1 ((null))
+ok  5 - pvPut/ASYNC 4: result=-1 ((null))
+ok  6 - pvPut/ASYNC complete
+ok  7 - pvPut/SYNC 0, status=0 ()
+ok  8 - pvPut/SYNC 1, status=0 ()
+ok  9 - pvPut/SYNC 2, status=10 (put completion failure)
+ok 10 - pvPut/SYNC 3, status=0 ()

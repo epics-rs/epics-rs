@@ -1,5 +1,5 @@
 //! orient reads motPut_Auto and motGet_Auto as C's monitored variables,
-//! written as each monitor arrives (orient_st.st:126, :136, no efflag).
+//! written as each monitor arrives (orient_st.st:132, :142, no efflag).
 
 use epics_base_rs::runtime::task;
 use epics_base_rs::server::database::PvDatabase;
@@ -222,7 +222,7 @@ fn reflections() -> Vec<(String, EpicsValue)> {
 
 /// With both matrices good at boot, init waits 10 s in enter_monitor_all
 /// and clears the H..PHI and Mode flags raised meanwhile, so an HKL written
-/// then drives nothing (orient_st.st:568-601).
+/// then drives nothing (orient_st.st:588-621).
 #[epics_base_rs::epics_test]
 async fn going_live_clears_the_hkl_written_during_the_init_delay() {
     let mut preset = good_inputs();
@@ -253,7 +253,7 @@ fn set_rbvs(db: &PvDatabase, rbvs: &[(&str, f64)]) {
 
 /// ss readback's zero clause tests its own unmonitored H/K/L_RBV, which
 /// start at 0, so a value put from outside stands while a matrix is not
-/// good (orient_st.st:181-183, :1196-1199).
+/// good (orient_st.st:187, :193, :199, :1216-1219).
 #[epics_base_rs::epics_test]
 async fn a_bad_matrix_leaves_an_outside_readback_value() {
     let (ioc, _db, _orient) = boot_with(&[(format!("{P}H_RBV"), EpicsValue::Double(1.5))]).await;
@@ -263,7 +263,7 @@ async fn a_bad_matrix_leaves_an_outside_readback_value() {
 }
 
 /// Any of the four readbacks raises motRBV_mon, and a bad live OMTX
-/// zeroes the readbacks (orient_st.st:149-152, :1193-1210).
+/// zeroes the readbacks (orient_st.st:155-158, :1215-1231).
 #[epics_base_rs::epics_test]
 async fn each_readback_converts_and_a_bad_omtx_zeroes_them() {
     let (ioc, db, _orient) = boot().await;
@@ -278,7 +278,7 @@ async fn each_readback_converts_and_a_bad_omtx_zeroes_them() {
 }
 
 /// ss readback is its own state set, so the motor readbacks convert to
-/// H/K/L_RBV through enter_monitor_all's 10 s delay (orient_st.st:1181-1212).
+/// H/K/L_RBV through enter_monitor_all's 10 s delay (orient_st.st:1201-1232).
 #[epics_base_rs::epics_test]
 async fn readbacks_convert_during_the_init_delay() {
     let (ioc, db, _orient) = boot_with(&good_inputs()).await;
@@ -306,7 +306,7 @@ async fn readbacks_convert_during_the_init_delay() {
 }
 
 /// ss stop is its own state set, so stopMotors stops the motors while ss
-/// orient is still retrying a failed init (orient_st.st:1215-1226).
+/// orient is still retrying a failed init (orient_st.st:1235-1248).
 #[epics_base_rs::epics_test]
 async fn stop_motors_stops_them_during_init() {
     let (ioc, db, _orient) = boot_with(&[]).await;
@@ -360,7 +360,7 @@ async fn a_long_motor_name_is_assigned_and_shown_cut() {
     assert!(put_one, "{name}.STOP was not put to 1");
 }
 
-/// Wait out enter_monitor_all's 10 s delay (orient_st.st:593-601).
+/// Wait out enter_monitor_all's 10 s delay (orient_st.st:613-621).
 async fn wait_live(ioc: &PvDatabase) {
     for _ in 0..300 {
         if string_of(ioc, &format!("{P}Msg")).await == "Initialization complete; going live" {
@@ -385,7 +385,7 @@ fn good_inputs() -> Vec<(String, EpicsValue)> {
     preset
 }
 
-/// The sequencer publishes A0_state and OMTX_state (orient_st.st:322-335):
+/// The sequencer publishes A0_state and OMTX_state (orient_st.st:328-341):
 /// both good at init, OMTX failed after a calculation from a zero
 /// secondary reflection.
 #[epics_base_rs::epics_test]
@@ -400,7 +400,7 @@ async fn a0_and_omtx_states_are_published() {
 }
 
 /// orient.db's zero lattice fails calc_A0's check, as C keeps it
-/// (orient_st.st:490-507).
+/// (orient_st.st:511-527).
 #[epics_base_rs::epics_test]
 async fn a_zero_lattice_fails_a0() {
     let mut preset = reflections();
@@ -418,7 +418,7 @@ async fn a_zero_lattice_fails_a0() {
 }
 
 /// Init puts no message of its own before A0 succeeds; C has no
-/// "Orient initialized" (orient_st.st:364-570).
+/// "Orient initialized" (orient_st.st:370-590).
 #[epics_base_rs::epics_test]
 async fn a_failing_init_leaves_msg_empty() {
     let (ioc, _db, _orient) = boot_with(&[]).await;
@@ -429,7 +429,7 @@ async fn a_failing_init_leaves_msg_empty() {
 
 /// Init stays in init/init_wait while OMTX fails, so an HKL write drives
 /// nothing, and retries each second until good reflections arrive
-/// (orient_st.st:364-370, :514-570).
+/// (orient_st.st:370-375, :534-590).
 #[epics_base_rs::epics_test]
 async fn init_retries_omtx_until_the_reflections_are_good() {
     let mut preset = lattice();
@@ -442,9 +442,9 @@ async fn init_retries_omtx_until_the_reflections_are_good() {
     let (ioc, db, _orient) = boot_with(&preset).await;
     wait_for(&ioc, &format!("{P}A0_state"), 1.0).await;
     wait_for(&ioc, &format!("{P}OMTX_state"), 2.0).await;
-    // A failed init OMTX sets motPut_Auto to manual (orient_st.st:555-560).
+    // A failed init OMTX sets motPut_Auto to manual (orient_st.st:575-580).
     wait_for(&ioc, &format!("{P}motPut_Auto"), 0.0).await;
-    assert_eq!(f64_of(&ioc, &format!("{P}Alert")).await, 1.0);
+    wait_for(&ioc, &format!("{P}Alert"), 1.0).await;
     post(&db, &[(format!("{P}motPut_Auto"), EpicsValue::Enum(1))]);
     put(&db, "H", 4.0).await;
     task::sleep(Duration::from_millis(1500)).await;
@@ -498,7 +498,7 @@ async fn wait_for_string(ioc: &PvDatabase, pv: &str, want: &str) {
 /// loadTTH, whose first disable of TTH_event posts the event
 /// (dbAccess.c:582-591), and that newAngles pass's loadH write does the same
 /// to H_event. energy_event's putBusy and each angle or HKL arm raise Busy,
-/// each putAll drops it (orient_st.st:730-760, :1133); H or K written before
+/// each putAll drops it (orient_st.st:750-780, :1153); H or K written before
 /// the third drop is overwritten, or its busy record cleared, by those passes.
 async fn set_energy(ioc: &PvDatabase, db: &PvDatabase, energy: f64) {
     let mut busy = DbSubscription::subscribe(db, format!("{P}Busy"))
@@ -519,7 +519,7 @@ async fn set_energy(ioc: &PvDatabase, db: &PvDatabase, energy: f64) {
 
 /// OMTX_Calc wakes the sequencer, the calculation reads the reflections
 /// as monitored variables, and the command resets to 0
-/// (orient_st.st:169, :222-240, :626-654).
+/// (orient_st.st:175, :228-246, :646-674).
 #[epics_base_rs::epics_test]
 async fn omtx_calc_takes_the_posted_reflections() {
     let (ioc, db, _orient) = boot().await;
@@ -536,7 +536,7 @@ async fn omtx_calc_takes_the_posted_reflections() {
 }
 
 /// A bad OMTX calculation writes motPut_Auto to manual
-/// (orient_st.st:649-653, :957-959).
+/// (orient_st.st:669-673, :977-979).
 #[epics_base_rs::epics_test]
 async fn a_bad_omtx_calc_sets_mot_put_auto_to_manual() {
     let (ioc, db, _orient) = boot().await;
@@ -556,7 +556,7 @@ async fn a_bad_omtx_calc_sets_mot_put_auto_to_manual() {
 /// A live OMTX calculation runs calc_OMTX without init's zero-reflection
 /// gate and puts errAngle on every outcome: from a zero secondary
 /// reflection the matrix is identity and checkOMTX divides by a zero norm
-/// (orient_st.st:626-648, orient.c:279-285, :296-298).
+/// (orient_st.st:646-668, orient.c:279-285, :296-298).
 #[epics_base_rs::epics_test]
 async fn a_live_omtx_calc_puts_err_angle() {
     let (ioc, db, _orient) = boot().await;
@@ -570,7 +570,7 @@ async fn a_live_omtx_calc_puts_err_angle() {
 }
 
 /// ss connections puts each motor's connection state
-/// (orient_st.st:1150-1177).
+/// (orient_st.st:1170-1197).
 #[epics_base_rs::epics_test]
 async fn motor_connections_are_published() {
     let (ioc, _db, _orient) = boot_with(&[]).await;
@@ -597,7 +597,7 @@ async fn a_missing_motor_holds_the_program_at_connect() {
 }
 
 /// A motor without a STOP field holds monitor_all too
-/// (orient_st.st:621-623).
+/// (orient_st.st:641-643).
 #[epics_base_rs::epics_test]
 async fn a_motor_without_stop_holds_monitor_all() {
     let (ioc, _db, _orient) = boot_with_phi(&good_inputs(), "plain").await;
@@ -612,8 +612,8 @@ const CHILD: &str = "ORIENT_ALERT_CHILD";
 /// A bad OMTX calculation after going live alerts in the OMTX_Calc clause
 /// and again in newOMTX, the OMTX_mon its own OMTX puts raise fails the
 /// check and alerts in newOMTX once more, and an HKL write then alerts in
-/// newHKL; each alert sets Alert and prints Msg (orient_st.st:89, :652,
-/// :701-727, :959, :973).
+/// newHKL; each alert sets Alert and prints Msg (orient_st.st:89, :672,
+/// :721-747, :979, :993).
 #[epics_base_rs::epics_test]
 async fn a_live_bad_omtx_calc_alerts() {
     if std::env::var_os(CHILD).is_none() {
@@ -675,7 +675,7 @@ async fn wait_near(ioc: &PvDatabase, pv: &str, want: f64) {
 
 /// orient wakes on K_event, which posts on every process where K (MDEL 0)
 /// posts only a change, so rewriting the standing K drives a hand-moved
-/// motor back (orient_st.st:184, :736-740; C kohzuIoc oracle: tth 10 ->
+/// motor back (orient_st.st:190, :756-760; C kohzuIoc oracle: tth 10 ->
 /// 34.6923).
 #[epics_base_rs::epics_test]
 async fn rewriting_the_standing_k_drives_the_motors_again() {
@@ -697,7 +697,7 @@ async fn rewriting_the_standing_k_drives_the_motors_again() {
 
 /// orient's own motor drive is not taken for an outside move, and the
 /// move's completion clears Busy and waiting4Mot, so motGet_Auto copies a
-/// later outside move (orient_st.st:801-875, :1053).
+/// later outside move (orient_st.st:821-895, :1073).
 #[epics_base_rs::epics_test]
 async fn a_finished_drive_clears_busy_and_lets_mot_get_auto_copy_a_move() {
     let (ioc, db, _orient) = boot_sim().await;
@@ -726,7 +726,7 @@ async fn a_finished_drive_clears_busy_and_lets_mot_get_auto_copy_a_move() {
     // The completion's motGet_Auto copy writes loadH/loadK, the first
     // disabled H_event/K_event pass since the client's, which posts
     // (dbAccess.c:579-593), so orient runs newHKL and raises Busy once more
-    // (orient_st.st:730, :1083): it is idle only after that second drop.
+    // (orient_st.st:750, :1103): it is idle only after that second drop.
     let (mut raised, mut drops) = (false, 0);
     while drops < 2 {
         let v = task::timeout(Duration::from_secs(10), busy_mon.recv_f64())
@@ -745,14 +745,14 @@ async fn a_finished_drive_clears_busy_and_lets_mot_get_auto_copy_a_move() {
 
 /// A K write sets K_busy through K_event; the drive's completion clears
 /// it, and a rewrite that moves no motor clears it in putAll
-/// (orient_st.st:863-875, :1132-1141).
+/// (orient_st.st:883-895, :1152-1161).
 #[epics_base_rs::epics_test]
 async fn put_all_and_the_drive_completion_clear_the_busy_records() {
     let (ioc, db, _orient) = boot_sim().await;
     set_energy(&ioc, &db, 21.657).await;
     post(&db, &[(format!("{P}motPut_Auto"), EpicsValue::Enum(1))]);
     // K_busy is 1 only while the drive runs, which a read can miss, so
-    // take its monitors: C's 0 comes with the drive done (orient_st.st:801-869).
+    // take its monitors: C's 0 comes with the drive done (orient_st.st:821-889).
     let mut k_busy = DbSubscription::subscribe(&db, format!("{P}K_busy"))
         .await
         .unwrap();
@@ -784,7 +784,7 @@ async fn put_all_and_the_drive_completion_clear_the_busy_records() {
 }
 
 /// Energy goes straight to newHKL: OMTX is not recalculated from the
-/// reflections as they now stand (orient_st.st:657-685).
+/// reflections as they now stand (orient_st.st:677-703).
 #[epics_base_rs::epics_test]
 async fn an_energy_change_leaves_the_omtx() {
     let (ioc, db, _orient) = boot().await;
@@ -798,7 +798,7 @@ async fn an_energy_change_leaves_the_omtx() {
 }
 
 /// A lattice edit recalculates A0, and OMTX_Calc stays pending until A0
-/// is good again (orient_st.st:626, :657-685). A cell this large leaves
+/// is good again (orient_st.st:646, :677-703). A cell this large leaves
 /// A0's determinant under invertArray's SMALL.
 #[epics_base_rs::epics_test]
 async fn omtx_calc_waits_for_a_good_a0() {
@@ -821,7 +821,8 @@ async fn omtx_calc_waits_for_a_good_a0() {
 }
 
 /// Init puts the motor names, and newHKL, newAngles and putAll put the
-/// state PVs C's db holds (orient_st.st:414, :990-991, :1082-1094).
+/// state PVs C's db holds (orient_st.st:410-465, :1012-1013, :1043-1045,
+/// :1103-1115).
 #[epics_base_rs::epics_test]
 async fn init_and_new_hkl_put_their_state_pvs() {
     let (ioc, db, _orient) = boot().await;
@@ -843,7 +844,7 @@ async fn init_and_new_hkl_put_their_state_pvs() {
 }
 
 /// A user's A0 element is copied and inverted; a singular A0 fails and
-/// newA0 goes back to monitor_all (orient_st.st:686-699, :943-947).
+/// newA0 goes back to monitor_all (orient_st.st:706-718, :963-967).
 #[epics_base_rs::epics_test]
 async fn a_singular_user_a0_fails() {
     let (ioc, db, _orient) = boot().await;
@@ -854,7 +855,7 @@ async fn a_singular_user_a0_fails() {
 
 /// A user's OMTX element is checked against the secondary reflection of
 /// the last calc_OMTX; one that fails sends newOMTX to manual
-/// (orient_st.st:701-727, :957-959).
+/// (orient_st.st:721-747, :977-979).
 #[epics_base_rs::epics_test]
 async fn a_user_omtx_failing_the_check_sets_mot_put_auto_to_manual() {
     let (ioc, db, _orient) = boot().await;
@@ -871,7 +872,7 @@ async fn a_user_omtx_failing_the_check_sets_mot_put_auto_to_manual() {
 }
 
 /// refGet1 copies H..PHI into the primary reflection, and ref_show resets
-/// the button half a second later (orient_st.st:578-590, :907-910).
+/// the button half a second later (orient_st.st:598-610, :927-930).
 #[epics_base_rs::epics_test]
 async fn ref_get1_copies_the_current_values() {
     let (ioc, db, _orient) = boot().await;
@@ -890,7 +891,7 @@ async fn ref_get1_copies_the_current_values() {
 }
 
 /// refPut2 writes the secondary reflection into H..PHI through the
-/// records themselves (orient_st.st:923-926).
+/// records themselves (orient_st.st:943-946).
 #[epics_base_rs::epics_test]
 async fn ref_put2_writes_the_secondary_reflection() {
     let (ioc, db, _orient) = boot().await;
@@ -899,7 +900,7 @@ async fn ref_put2_writes_the_secondary_reflection() {
     wait_for(&ioc, &format!("{P}refPut2"), 0.0).await;
 }
 
-/// OperAck erases Msg and clears Alert (orient_st.st:929-933).
+/// OperAck erases Msg and clears Alert (orient_st.st:949-953).
 #[epics_base_rs::epics_test]
 async fn oper_ack_clears_msg_and_alert() {
     let (ioc, db, _orient) = boot().await;
@@ -913,8 +914,8 @@ async fn oper_ack_clears_msg_and_alert() {
 }
 
 /// With Debug on, PUTMSG prints Msg and ss orient prints its debug lines;
-/// ss stop's PUTMSG prints too (orient_st.st:88, :483-492, :524, :731,
-/// :1080-1090, :1217).
+/// ss stop's PUTMSG prints too (orient_st.st:88, :505, :513, :545, :751,
+/// :1101-1109, :1238-1240).
 #[epics_base_rs::epics_test]
 async fn debug_prints_msg_and_the_debug_lines() {
     if std::env::var_os(CHILD).is_none() {
@@ -1041,7 +1042,7 @@ async fn a_zero_a_live_fails_a0() {
     assert_eq!(f64_of(&ioc, &format!("{P}A0_11")).await, 1.0);
 }
 
-/// The four RBV connect monitors raise motRBV_mon (orient_st.st:149-152),
+/// The four RBV connect monitors raise motRBV_mon (orient_st.st:155-158),
 /// so once both matrices are good ss readback converts the standing
 /// readbacks without any motor moving.
 #[epics_base_rs::epics_test]

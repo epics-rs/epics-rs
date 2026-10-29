@@ -10,7 +10,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use asyn_rs::interfaces::{Capability, InterfaceMask, octet_transport_capabilities};
+use asyn_rs::interfaces::InterfaceMask;
 use asyn_rs::manager::{PortManager, claim_port_driver};
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::request::{OctetReadOp, RequestOp};
@@ -192,7 +192,6 @@ const WAIT: Duration = Duration::from_secs(5);
 
 struct Dev {
     base: PortDriverBase,
-    caps: Vec<Capability>,
 }
 
 impl PortDriver for Dev {
@@ -202,27 +201,24 @@ impl PortDriver for Dev {
     fn base_mut(&mut self) -> &mut PortDriverBase {
         &mut self.base
     }
-    fn capabilities(&self) -> Vec<Capability> {
-        self.caps.clone()
-    }
 }
 
-fn port(name: &str, caps: Vec<Capability>) -> asyn_rs::port_handle::PortHandle {
-    port_with(name, caps, true)
+fn port(name: &str, interfaces: InterfaceMask) -> asyn_rs::port_handle::PortHandle {
+    port_with(name, interfaces, true)
 }
 
 fn port_with(
     name: &str,
-    caps: Vec<Capability>,
+    interfaces: InterfaceMask,
     can_block: bool,
 ) -> asyn_rs::port_handle::PortHandle {
-    port_interrupting(name, caps, can_block, InterfaceMask::OCTET)
+    port_interrupting(name, interfaces, can_block, InterfaceMask::OCTET)
 }
 
 /// [`port_with`], interrupting on `interrupts`.
 fn port_interrupting(
     name: &str,
-    caps: Vec<Capability>,
+    interfaces: InterfaceMask,
     can_block: bool,
     interrupts: InterfaceMask,
 ) -> asyn_rs::port_handle::PortHandle {
@@ -230,12 +226,12 @@ fn port_interrupting(
         can_block,
         ..PortFlags::default()
     };
-    let base = PortDriverBase::new(name, 1, flags, InterfaceMask::OCTET, interrupts);
+    let base = PortDriverBase::new(name, 1, flags, interfaces, interrupts);
     let manager = PortManager::new();
     manager
         .register_port(
             claim_port_driver(name).unwrap(),
-            Dev { base, caps },
+            Dev { base },
             &asyn_rs::registry::open_owner(),
         )
         .unwrap();
@@ -346,7 +342,7 @@ fn attach(client: &Arc<dyn Client>, portname: &str) -> (Option<bus::BusInterface
 fn attaching_prints_what_c_prints() {
     let _switches = SWITCHES.lock().unwrap_or_else(|e| e.into_inner());
     stream_rs::asyn::register();
-    let handle = port("P", octet_transport_capabilities());
+    let handle = port("P", InterfaceMask::OCTET_TRANSPORT);
     let (client, _locks) = rec("rec");
 
     handle
@@ -374,7 +370,7 @@ fn attaching_prints_what_c_prints() {
 fn a_port_without_octet_is_refused() {
     let _switches = SWITCHES.lock().unwrap_or_else(|e| e.into_inner());
     stream_rs::asyn::register();
-    let _handle = port("NOOCTET", vec![Capability::Int32Read, Capability::Connect]);
+    let _handle = port("NOOCTET", InterfaceMask::INT32);
     let (client, _locks) = rec("rec");
     let (found, lines) = attach(&client, "NOOCTET");
     assert!(found.is_none());
@@ -392,7 +388,7 @@ fn a_port_without_octet_is_refused() {
 fn a_port_without_eos_support_warns_at_connect() {
     let _switches = SWITCHES.lock().unwrap_or_else(|e| e.into_inner());
     stream_rs::asyn::register();
-    let handle = port("P", octet_transport_capabilities());
+    let handle = port("P", InterfaceMask::OCTET_TRANSPORT);
     handle
         .submit_blocking(RequestOp::Connect, AsynUser::new(0))
         .unwrap();
@@ -408,7 +404,7 @@ fn a_port_without_eos_support_warns_at_connect() {
 fn connect_asks_the_eos_while_another_user_owns_the_device() {
     let _switches = SWITCHES.lock().unwrap_or_else(|e| e.into_inner());
     stream_rs::asyn::register();
-    let handle = port("P", octet_transport_capabilities());
+    let handle = port("P", InterfaceMask::OCTET_TRANSPORT);
     handle
         .submit_blocking(RequestOp::Connect, AsynUser::new(0))
         .unwrap();
@@ -446,7 +442,7 @@ fn connect_asks_the_eos_while_another_user_owns_the_device() {
 fn a_lock_holds_the_device_until_unlock() {
     let _switches = SWITCHES.lock().unwrap_or_else(|e| e.into_inner());
     stream_rs::asyn::register();
-    let handle = port("LK", octet_transport_capabilities());
+    let handle = port("LK", InterfaceMask::OCTET_TRANSPORT);
     handle
         .submit_blocking(RequestOp::Connect, AsynUser::new(0))
         .unwrap();
@@ -482,7 +478,7 @@ fn a_lock_holds_the_device_until_unlock() {
 fn an_unlock_without_a_lock_is_refused() {
     let _switches = SWITCHES.lock().unwrap_or_else(|e| e.into_inner());
     stream_rs::asyn::register();
-    let handle = port("NL", octet_transport_capabilities());
+    let handle = port("NL", InterfaceMask::OCTET_TRANSPORT);
     handle
         .submit_blocking(RequestOp::Connect, AsynUser::new(0))
         .unwrap();
@@ -505,7 +501,7 @@ fn an_unlock_without_a_lock_is_refused() {
 fn a_refused_lock_is_reported_once_and_its_end_once() {
     let _switches = SWITCHES.lock().unwrap_or_else(|e| e.into_inner());
     stream_rs::asyn::register();
-    let handle = port("DC", octet_transport_capabilities());
+    let handle = port("DC", InterfaceMask::OCTET_TRANSPORT);
     disconnect_for_good(&handle);
     let (client, locks) = rec("rec");
     let (bus, _) = attach(&client, "DC");
@@ -542,7 +538,7 @@ fn a_refused_lock_is_reported_once_and_its_end_once() {
 fn a_lock_waiting_past_its_timeout_times_out() {
     let _switches = SWITCHES.lock().unwrap_or_else(|e| e.into_inner());
     stream_rs::asyn::register();
-    let handle = port("TO", octet_transport_capabilities());
+    let handle = port("TO", InterfaceMask::OCTET_TRANSPORT);
     handle
         .submit_blocking(RequestOp::Connect, AsynUser::new(0))
         .unwrap();
@@ -582,7 +578,7 @@ fn a_lock_waiting_past_its_timeout_times_out() {
 fn a_refused_lock_leaves_the_interface_idle_for_a_connect() {
     let _switches = SWITCHES.lock().unwrap_or_else(|e| e.into_inner());
     stream_rs::asyn::register();
-    let handle = port("P", octet_transport_capabilities());
+    let handle = port("P", InterfaceMask::OCTET_TRANSPORT);
     disconnect_for_good(&handle);
     let (client, _locks, connects) = rec_connects("rec");
     let (bus, _) = attach(&client, "P");
@@ -608,7 +604,7 @@ fn a_refused_lock_leaves_the_interface_idle_for_a_connect() {
 fn a_connect_does_not_call_back_an_interface_with_io_in_progress() {
     let _switches = SWITCHES.lock().unwrap_or_else(|e| e.into_inner());
     stream_rs::asyn::register();
-    let handle = port("BY", octet_transport_capabilities());
+    let handle = port("BY", InterfaceMask::OCTET_TRANSPORT);
     handle
         .submit_blocking(RequestOp::Connect, AsynUser::new(0))
         .unwrap();
@@ -654,7 +650,7 @@ fn a_connect_does_not_call_back_an_interface_with_io_in_progress() {
 fn stream_reinit_takes_the_port_down_and_up_as_c_does() {
     let _switches = SWITCHES.lock().unwrap_or_else(|e| e.into_inner());
     stream_rs::asyn::register();
-    let handle = port("P", octet_transport_capabilities());
+    let handle = port("P", InterfaceMask::OCTET_TRANSPORT);
     handle
         .submit_blocking(RequestOp::Connect, AsynUser::new(0))
         .unwrap();
@@ -688,7 +684,7 @@ fn stream_reinit_takes_the_port_down_and_up_as_c_does() {
 #[test]
 fn stream_reinit_failures_print_what_c_prints() {
     let _switches = SWITCHES.lock().unwrap_or_else(|e| e.into_inner());
-    let handle = port("P", octet_transport_capabilities());
+    let handle = port("P", InterfaceMask::OCTET_TRANSPORT);
     disconnect_for_good(&handle);
     let mut err = Vec::new();
     let statuses = [None, Some("Z"), Some("P")]
@@ -713,7 +709,7 @@ fn stream_reinit_failures_print_what_c_prints() {
 fn a_synchronous_port_faults_the_lock() {
     let _switches = SWITCHES.lock().unwrap_or_else(|e| e.into_inner());
     stream_rs::asyn::register();
-    let handle = port_with("E", octet_transport_capabilities(), false);
+    let handle = port_with("E", InterfaceMask::OCTET_TRANSPORT, false);
     handle
         .submit_blocking(RequestOp::Connect, AsynUser::new(0))
         .unwrap();
@@ -734,7 +730,7 @@ fn a_synchronous_port_faults_the_lock() {
 fn dropping_an_interface_cancels_its_waiting_lock() {
     let _switches = SWITCHES.lock().unwrap_or_else(|e| e.into_inner());
     stream_rs::asyn::register();
-    let handle = port("CN", octet_transport_capabilities());
+    let handle = port("CN", InterfaceMask::OCTET_TRANSPORT);
     handle
         .submit_blocking(RequestOp::Connect, AsynUser::new(0))
         .unwrap();
@@ -772,7 +768,7 @@ fn dropping_an_interface_cancels_its_waiting_lock() {
 fn dropping_an_interface_that_holds_the_lock_frees_the_port() {
     let _switches = SWITCHES.lock().unwrap_or_else(|e| e.into_inner());
     stream_rs::asyn::register();
-    let handle = port("DH", octet_transport_capabilities());
+    let handle = port("DH", InterfaceMask::OCTET_TRANSPORT);
     handle
         .submit_blocking(RequestOp::Connect, AsynUser::new(0))
         .unwrap();
@@ -969,9 +965,6 @@ impl PortDriver for Script {
     fn base_mut(&mut self) -> &mut PortDriverBase {
         &mut self.base
     }
-    fn capabilities(&self) -> Vec<Capability> {
-        octet_transport_capabilities()
-    }
     fn connect(&mut self, user: &AsynUser) -> asyn_rs::error::AsynResult<()> {
         let mut book = self.book.lock().unwrap();
         book.connects += 1;
@@ -1073,7 +1066,13 @@ fn script_with(
         ..PortFlags::default()
     };
     let book = Arc::new(Mutex::new(Book::default()));
-    let mut base = PortDriverBase::new(name, 1, flags, InterfaceMask::ALL, InterfaceMask::ALL);
+    let mut base = PortDriverBase::new(
+        name,
+        1,
+        flags,
+        InterfaceMask::OCTET_TRANSPORT,
+        InterfaceMask::OCTET,
+    );
     base.octet_interrupt_process = octet_interrupts;
     if eos_layer {
         base.install_octet_interpose(Box::new(EosInterpose::default()));
@@ -1295,7 +1294,7 @@ fn a_write_with_a_protocol_terminator_suspends_asyns() {
 fn a_write_left_queued_times_out() {
     let _switches = SWITCHES.lock().unwrap_or_else(|e| e.into_inner());
     stream_rs::asyn::register();
-    let handle = port("WQ", octet_transport_capabilities());
+    let handle = port("WQ", InterfaceMask::OCTET_TRANSPORT);
     handle
         .submit_blocking(RequestOp::Connect, AsynUser::new(0))
         .unwrap();
@@ -1609,7 +1608,7 @@ fn read_errors_end_the_read() {
 fn a_read_left_queued_faults() {
     let _switches = SWITCHES.lock().unwrap_or_else(|e| e.into_inner());
     stream_rs::asyn::register();
-    let handle = port("RQ", octet_transport_capabilities());
+    let handle = port("RQ", InterfaceMask::OCTET_TRANSPORT);
     handle
         .submit_blocking(RequestOp::Connect, AsynUser::new(0))
         .unwrap();
@@ -1755,10 +1754,10 @@ struct Evented {
     client: Arc<dyn Client>,
 }
 
-/// "rec" attached to a connected port `name` with `caps`, interrupting on
-/// `interrupts`, asked supportsEvent.
-fn evented(name: &str, caps: Vec<Capability>, interrupts: InterfaceMask) -> Evented {
-    let handle = port_interrupting(name, caps, true, interrupts);
+/// "rec" attached to a connected port `name` with `interfaces`, interrupting
+/// on `interrupts`, asked supportsEvent.
+fn evented(name: &str, interfaces: InterfaceMask, interrupts: InterfaceMask) -> Evented {
+    let handle = port_interrupting(name, interfaces, true, interrupts);
     handle
         .submit_blocking(RequestOp::Connect, AsynUser::new(0))
         .unwrap();
@@ -1797,11 +1796,7 @@ use asyn_rs::interfaces::InterfaceType;
 use asyn_rs::interrupt::InterruptValue;
 use asyn_rs::param::ParamValue;
 
-fn int32_caps() -> Vec<Capability> {
-    let mut caps = octet_transport_capabilities();
-    caps.push(Capability::Int32Read);
-    caps
-}
+const INT32_PORT: InterfaceMask = InterfaceMask::OCTET_TRANSPORT.or(InterfaceMask::INT32);
 
 /// supportsEvent registers for the signal on asynInt32 (:343-363), and an
 /// event in the mask ends acceptEvent (:1217-1248).
@@ -1818,7 +1813,7 @@ fn an_event_in_the_mask_is_accepted() {
         ..
     } = evented(
         "EVA",
-        int32_caps(),
+        INT32_PORT,
         InterfaceMask::OCTET | InterfaceMask::INT32,
     );
     assert!(supported);
@@ -1856,7 +1851,7 @@ fn an_early_event_is_kept_for_accept_event() {
         ..
     } = evented(
         "EVE",
-        int32_caps(),
+        INT32_PORT,
         InterfaceMask::OCTET | InterfaceMask::INT32,
     );
     signal(&handle, ParamValue::Int32(4));
@@ -1893,7 +1888,7 @@ fn an_event_not_coming_times_out() {
         ..
     } = evented(
         "EVT",
-        int32_caps(),
+        INT32_PORT,
         InterfaceMask::OCTET | InterfaceMask::INT32,
     );
     assert!(bus.bus().accept_event(4, 50));
@@ -1908,8 +1903,6 @@ fn an_event_not_coming_times_out() {
 fn events_come_on_uint32_digital_without_int32() {
     let _switches = SWITCHES.lock().unwrap_or_else(|e| e.into_inner());
     stream_rs::asyn::register();
-    let mut caps = octet_transport_capabilities();
-    caps.push(Capability::UInt32DigitalRead);
     let Evented {
         supported,
         bus,
@@ -1919,7 +1912,7 @@ fn events_come_on_uint32_digital_without_int32() {
         ..
     } = evented(
         "EVU",
-        caps,
+        InterfaceMask::OCTET_TRANSPORT | InterfaceMask::UINT32_DIGITAL,
         InterfaceMask::OCTET | InterfaceMask::UINT32_DIGITAL,
     );
     assert!(supported);
@@ -1943,7 +1936,7 @@ fn a_port_without_event_interrupts_refuses_events() {
         lines,
         client: _client,
         ..
-    } = evented("EVN", octet_transport_capabilities(), InterfaceMask::OCTET);
+    } = evented("EVN", InterfaceMask::OCTET_TRANSPORT, InterfaceMask::OCTET);
     assert!(!supported);
     assert_eq!(
         lines,
@@ -1954,7 +1947,7 @@ fn a_port_without_event_interrupts_refuses_events() {
         lines,
         client: _client,
         ..
-    } = evented("EVM", int32_caps(), InterfaceMask::OCTET);
+    } = evented("EVM", INT32_PORT, InterfaceMask::OCTET);
     assert!(!supported);
     assert_eq!(
         lines,
@@ -2422,7 +2415,7 @@ fn a_port_without_octet_interrupts_refuses_async_input() {
     stream_rs::asyn::register();
     let handle = port_interrupting(
         "IN",
-        octet_transport_capabilities(),
+        InterfaceMask::OCTET_TRANSPORT,
         true,
         InterfaceMask::NONE,
     );

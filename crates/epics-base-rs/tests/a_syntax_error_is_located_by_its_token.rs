@@ -13,7 +13,7 @@
 //! a line the echo below already prints, where C names the text.
 //!
 //! Every expected byte below was captured from `softIoc` built from
-//! `~/work/epics-base` (`R7.0.10`) loading these exact files, with one known
+//! `$EPICS_BASE` (`R7.0.10`) loading these exact files, with one known
 //! subtraction: C's `in path "."` names its own cwd where this gate names the
 //! directory it wrote the fixture into. C's `WARNING: dbReadCOM: Parser stack
 //! dirty w/o error. 1` follows the three aborts inside a record body.

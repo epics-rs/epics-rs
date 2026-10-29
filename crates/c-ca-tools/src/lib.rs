@@ -141,6 +141,18 @@ impl Drop for ManagedIoc {
     }
 }
 
+/// A spawned child that is killed and reaped on every exit path, a failed
+/// assert's included: a child that serves until killed outlives the test
+/// otherwise.
+pub struct Reaped(pub Child);
+
+impl Drop for Reaped {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 impl ManagedIoc {
     pub fn ca_addr_list(&self) -> String {
         format!("127.0.0.1:{}", self.udp_port)
@@ -330,9 +342,8 @@ mod tests {
     #[ignore = "needs softIoc on PATH (EPICS base); runs in --profile interop"]
     fn a_held_udp_port_spends_the_candidate() {
         require_tool("softIoc");
-        let port = named_port::free_for_tcp_and_udp();
-        let _held = std::net::UdpSocket::bind(("127.0.0.1", port)).expect("hold the UDP port");
+        let held = named_port::HeldPort::closed_udp();
         let db = db_file("record(ai, \"T:AI\") {}\n");
-        assert!(softioc_on(&db, None, port).is_none());
+        assert!(softioc_on(&db, None, held.port).is_none());
     }
 }

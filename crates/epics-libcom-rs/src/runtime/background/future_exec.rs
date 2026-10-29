@@ -99,6 +99,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll, Wake, Waker};
 
 use super::callback_executor::{Callback, CallbackHandle, CallbackPriority, Run, TaskEntry};
+use super::delayed_timer::TimerHandle;
 use crate::runtime::offload::{OffloadJob, OffloadPool};
 
 /// Default band for a general spawned tail. C routes general deferred work
@@ -573,11 +574,54 @@ where
     spawn_task(callbacks, priority, fut).0
 }
 
+/// [`spawn_future`] whose first enqueue waits `delay` on `timer` — C
+/// `callbackRequestDelayed` (`callback.c:404-419`): the timer starts at this
+/// call and the task joins the band's tail when it fires, so the delay runs
+/// from the request, not from when a busy band reaches the task. A zero delay
+/// still goes through the timer, as C's does.
+///
+/// An abort lands at the fire, the task's first chance to be polled.
+pub fn spawn_future_after<F>(
+    callbacks: &CallbackHandle,
+    timer: &TimerHandle,
+    priority: CallbackPriority,
+    delay: std::time::Duration,
+    fut: F,
+) -> JoinFuture<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let (join, task) = new_task(callbacks, priority, fut);
+    // The entry owns the task until it fires, so nothing cancels its key;
+    // a timer already shut down drops it, which cancels the task.
+    let _ = timer.schedule_wake(delay, Box::new(move || task.enqueue()));
+    join
+}
+
 /// [`spawn_future`], also handing back the task itself so a test can inspect
 /// its scheduling. Dropping the extra `Arc` is harmless: the ring entry holds
 /// its own reference (and if the enqueue was rejected, dropping the last
 /// reference is exactly what resolves the handle).
 fn spawn_task<F>(
+    callbacks: &CallbackHandle,
+    priority: CallbackPriority,
+    fut: F,
+) -> (JoinFuture<F::Output>, Arc<Task<F::Output>>)
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let (join, task) = new_task(callbacks, priority, fut);
+    task.enqueue();
+    (join, task)
+}
+
+/// A task already claimed `SCHEDULED` and not yet on its band: the caller's
+/// first enqueue is the spawn. Always inlined, so [`spawn_task`] stays one
+/// body when [`spawn_future_after`] spawns the same future type.
+#[inline(always)]
+fn new_task<F>(
     callbacks: &CallbackHandle,
     priority: CallbackPriority,
     fut: F,
@@ -598,7 +642,6 @@ where
         enqueues: std::sync::atomic::AtomicUsize::new(0),
     });
     *shared.control.task.lock().unwrap() = Some(Arc::downgrade(&task) as Weak<dyn Schedulable>);
-    task.enqueue();
     (JoinFuture { shared }, task)
 }
 

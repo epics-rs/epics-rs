@@ -134,3 +134,14 @@ pub mod dbd_generated;
 mod dsets;
 #[cfg(feature = "epics")]
 pub mod iocsh;
+#[cfg(feature = "epics")]
+pub mod snl;
+
+/// The `registrar(ipSNCServerRegistrar)` line of testIPServerApp's
+/// `testIPServerInclude.dbd`: `ipSNCServer` becomes startable by the shell's
+/// `seq` command, which the registration adds. The app's echo servers are
+/// not ported. Idempotent.
+#[cfg(feature = "epics")]
+pub fn register_test_ip_server_dbd() {
+    snl::ip_snc_server::ipSNCServerRegistrar();
+}

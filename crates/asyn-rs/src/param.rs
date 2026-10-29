@@ -314,6 +314,15 @@ impl FlagList {
     }
 }
 
+/// The list a driver's own `addr` names, to read, set or post at. Its
+/// `-1 → 0` stands in for the `getAddress` (asynPortDriver.cpp:1906-1907) a C
+/// driver calls before it posts: every request on a single-device port
+/// carries -1. A post compares the result raw with each client's resolved
+/// list (`address == addr`, :1848-1852), so one at -2 reaches no client.
+pub fn driver_list(addr: i32) -> i32 {
+    if addr == -1 { 0 } else { addr }
+}
+
 /// Parameter library managing named parameters indexed by integer.
 /// Supports multiple addresses (addr 0..max_addr).
 pub struct ParamList {
@@ -352,7 +361,7 @@ impl ParamList {
     /// [`crate::user::AsynUser`] was refused on exactly the multi-device ports C
     /// serves it on.
     fn validate_addr(&self, addr: i32) -> AsynResult<usize> {
-        let addr = if addr == -1 { 0 } else { addr };
+        let addr = driver_list(addr);
         if addr < 0 || (addr as usize) >= self.max_addr {
             return Err(AsynError::ParamInvalidList(addr));
         }

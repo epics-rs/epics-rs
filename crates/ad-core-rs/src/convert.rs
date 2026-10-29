@@ -23,7 +23,7 @@
 //! [`crate::ndarray_pool::NDArrayPool::convert_type`] instead.
 
 use crate::error::{ADError, ADResult};
-use crate::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
+use crate::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDataViewMut, NDDimension};
 
 /// Accumulator for [`convert_dims_into`]'s binning sum. C `convertDim`
 /// (`NDArrayPool.cpp:465`) does `*pDOut += (dataTypeOut)*pDIn` — each source
@@ -125,10 +125,12 @@ bin_acc!(f64, 0.0, |a, b| a + b, bin2_f64, bin4_f64);
 trait CCast<D: BinAcc>: Copy {
     fn c_cast(self) -> D;
 
-    /// Appends the cast of every element of `src` to `out`.
+    /// `out[i] = src[i]` cast to `D`: `src.len() == out.len()`.
     #[inline]
-    fn cast_extend(src: &[Self], out: &mut Vec<D>) {
-        out.extend(src.iter().map(|&s| s.c_cast()));
+    fn cast_into(src: &[Self], out: &mut [D]) {
+        for (o, &s) in out.iter_mut().zip(src) {
+            *o = s.c_cast();
+        }
     }
 
     /// Adds the cast of `src` into `acc`, `bin` consecutive source elements
@@ -138,11 +140,7 @@ trait CCast<D: BinAcc>: Copy {
     #[inline]
     fn bin_row(src: &[Self], bin: usize, acc: &mut [D]) {
         if D::LANE_BINS.contains(&bin) {
-            bin_row_chunked(src, bin, acc, |c, o| {
-                for (o, &s) in o.iter_mut().zip(c) {
-                    *o = s.c_cast();
-                }
-            });
+            bin_row_chunked(src, bin, acc, Self::cast_into);
         } else {
             bin_row_with(src, bin, acc, CCast::c_cast);
         }
@@ -225,10 +223,8 @@ macro_rules! c_cast_float_to_int {
             }
 
             #[cfg(feature = "simd")]
-            fn cast_extend(src: &[Self], out: &mut Vec<$d>) {
-                let n = out.len();
-                out.resize(n + src.len(), 0);
-                fearless_simd::dispatch!(crate::simd::level(), s => simd_kernels::$kernel(s, src, &mut out[n..]));
+            fn cast_into(src: &[Self], out: &mut [$d]) {
+                fearless_simd::dispatch!(crate::simd::level(), s => simd_kernels::$kernel(s, src, out));
             }
 
             /// Every width goes through the cast chunk, on the vector cast.
@@ -248,7 +244,7 @@ c_cast_float_to_int!(f32 => i8: cast_f32_i8, u8: cast_f32_u8, i16: cast_f32_i16,
 c_cast_float_to_int!(f64 => i8: cast_f64_i8, u8: cast_f64_u8, i16: cast_f64_i16, u16: cast_f64_u16,
     i32: cast_f64_i32, u32: cast_f64_u32, i64: cast_f64_i64, u64: cast_f64_u64);
 
-/// The float to integer [`CCast::cast_extend`]s and the [`BinAcc::bin_native`]
+/// The float to integer [`CCast::cast_into`]s and the [`BinAcc::bin_native`]
 /// bin 2 and bin 4 adds on `fearless_simd` lanes.
 #[cfg(feature = "simd")]
 mod simd_kernels {
@@ -399,38 +395,36 @@ mod simd_kernels {
 }
 
 /// Element-type conversion only — C++ `convertType` (`NDArrayPool.cpp:378`),
-/// into a buffer the caller owns: `out` keeps its element type (that is the
-/// target) and its allocation when it is large enough, so a pooled output
-/// buffer is filled in place as C's `convertType` fills the buffer
-/// `NDArrayPool::alloc` handed it.
+/// into `out`, which keeps its element type (that is the target) and its
+/// allocation when it is large enough, as C's `convertType` fills the
+/// buffer `NDArrayPool::alloc` handed it; a pooled `out` stops at its
+/// charge.
 ///
 /// Every element goes through the C cast (`(dataTypeOut)value`) of
 /// `CCast`: narrowing truncates to the low bits and wraps, it does not
 /// clamp, and a float source truncates toward zero before that, exactly as
 /// [`convert_dims_into`] casts it.
-pub fn convert_type_into(src: &NDArray, out: &mut NDDataBuffer) -> ADResult<()> {
-    if src.data.data_type() == out.data_type() {
-        out.copy_from(&src.data);
-        return Ok(());
+pub(crate) fn convert_buffer_into(src: &NDDataBuffer, out: &mut NDDataBuffer) {
+    if src.data_type() == out.data_type() {
+        out.copy_from(src);
+        return;
     }
 
+    out.resize(src.len());
+    let n = out.len();
     macro_rules! cast_into {
         ($v:expr, $out:expr) => {
-            crate::with_buffer_mut_typed!($out, |o: T| {
-                o.clear();
-                o.reserve($v.len());
-                CCast::<T>::cast_extend($v, o);
-            })
+            crate::with_buffer_mut_typed!($out, |o: T| CCast::<T>::cast_into($v, o))
         };
     }
 
-    crate::with_buffer!(&src.data, |v| cast_into!(v, out));
-    Ok(())
+    crate::with_buffer!(src, |v| cast_into!(&v[..n], out));
 }
 
 /// The C cast `(D)value` of one `f64` to the element type of `data_type`,
-/// in little-endian bytes: the `CCast` [`convert_type_into`] applies to
-/// every element.
+/// in little-endian bytes: the `CCast`
+/// [`NDArrayPool::convert_type`](crate::ndarray_pool::NDArrayPool::convert_type)
+/// applies to every element.
 pub fn c_cast_f64_le(value: f64, data_type: NDDataType) -> Vec<u8> {
     macro_rules! le {
         ($t:ty) => {
@@ -566,7 +560,6 @@ pub fn convert_dims_into(
     let out0 = out_sizes[0];
     let used0 = out0 * bin0;
     let off0 = dims_out[0].offset;
-    let rows = total_out / out0;
     let bin_hi: usize = dims_out[1..].iter().map(|d| d.binning.max(1)).product();
     let mut out_coords = vec![0usize; ndims];
     let mut bases = vec![0usize; bin_hi];
@@ -606,32 +599,20 @@ pub fn convert_dims_into(
     macro_rules! bin_loop {
         ($src_vec:expr, $out:expr, $DstT:ty) => {{
             let src_vec = $src_vec;
-            let out = $out;
-            out.clear();
-            out.reserve(total_out);
-            if bin0 == 1 && bin_hi == 1 {
-                // No binning: each output element is one source element.
-                for row in 0..rows {
-                    row_bases(row, &mut bases);
+            for (row, o) in $out.chunks_exact_mut(out0).enumerate() {
+                row_bases(row, &mut bases);
+                if bin0 == 1 && bin_hi == 1 {
+                    // No binning: each output element is one source element.
                     let base = bases[0];
-                    let start = out.len();
-                    CCast::<$DstT>::cast_extend(&src_vec[base..base + out0], out);
-                    if dims_out[0].reverse {
-                        out[start..].reverse();
+                    CCast::<$DstT>::cast_into(&src_vec[base..base + out0], o);
+                } else {
+                    o.fill(<$DstT as BinAcc>::ZERO);
+                    for &base in &bases {
+                        CCast::<$DstT>::bin_row(&src_vec[base..base + used0], bin0, o);
                     }
                 }
-            } else {
-                let mut acc = vec![<$DstT as BinAcc>::ZERO; out0];
-                for row in 0..rows {
-                    acc.fill(<$DstT as BinAcc>::ZERO);
-                    row_bases(row, &mut bases);
-                    for &base in &bases {
-                        CCast::<$DstT>::bin_row(&src_vec[base..base + used0], bin0, &mut acc);
-                    }
-                    if dims_out[0].reverse {
-                        acc.reverse();
-                    }
-                    out.extend_from_slice(&acc);
+                if dims_out[0].reverse {
+                    o.reverse();
                 }
             }
         }};
@@ -640,22 +621,23 @@ pub fn convert_dims_into(
     // For a given typed source buffer, dispatch on the target type.
     macro_rules! bin_to_target {
         ($src_vec:expr) => {
-            match out {
-                NDDataBuffer::I8(o) => bin_loop!($src_vec, o, i8),
-                NDDataBuffer::U8(o) => bin_loop!($src_vec, o, u8),
-                NDDataBuffer::I16(o) => bin_loop!($src_vec, o, i16),
-                NDDataBuffer::U16(o) => bin_loop!($src_vec, o, u16),
-                NDDataBuffer::I32(o) => bin_loop!($src_vec, o, i32),
-                NDDataBuffer::U32(o) => bin_loop!($src_vec, o, u32),
-                NDDataBuffer::I64(o) => bin_loop!($src_vec, o, i64),
-                NDDataBuffer::U64(o) => bin_loop!($src_vec, o, u64),
-                NDDataBuffer::F32(o) => bin_loop!($src_vec, o, f32),
-                NDDataBuffer::F64(o) => bin_loop!($src_vec, o, f64),
+            match out.view_mut() {
+                NDDataViewMut::I8(o) => bin_loop!($src_vec, o, i8),
+                NDDataViewMut::U8(o) => bin_loop!($src_vec, o, u8),
+                NDDataViewMut::I16(o) => bin_loop!($src_vec, o, i16),
+                NDDataViewMut::U16(o) => bin_loop!($src_vec, o, u16),
+                NDDataViewMut::I32(o) => bin_loop!($src_vec, o, i32),
+                NDDataViewMut::U32(o) => bin_loop!($src_vec, o, u32),
+                NDDataViewMut::I64(o) => bin_loop!($src_vec, o, i64),
+                NDDataViewMut::U64(o) => bin_loop!($src_vec, o, u64),
+                NDDataViewMut::F32(o) => bin_loop!($src_vec, o, f32),
+                NDDataViewMut::F64(o) => bin_loop!($src_vec, o, f64),
             }
         };
     }
 
-    crate::with_buffer!(&src.data, |v| bin_to_target!(v));
+    out.resize(total_out);
+    crate::with_buffer!(src.data(), |v| bin_to_target!(v));
     Ok(())
 }
 
@@ -684,7 +666,7 @@ mod tests {
         let pool = crate::ndarray_pool::NDArrayPool::new(0);
         let mut src = NDArray::with_data(
             vec![NDDimension::new(4)],
-            NDDataBuffer::U8(vec![1, 2, 3, 4]),
+            NDDataBuffer::from_vec::<u8>(vec![1, 2, 3, 4]),
         );
         src.unique_id = 91;
 
@@ -706,7 +688,7 @@ mod tests {
 
     #[test]
     fn convert_type_casts_float_sources_as_convert_dims_does() {
-        use crate::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
+        use crate::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDataView, NDDimension};
         let values = vec![
             300.0f32,
             -1.5,
@@ -717,7 +699,7 @@ mod tests {
         ];
         let src = NDArray::with_data(
             vec![NDDimension::new(values.len())],
-            NDDataBuffer::F32(values),
+            NDDataBuffer::from_vec::<f32>(values),
         );
         let pool = crate::ndarray_pool::NDArrayPool::new(0);
         let typed = pool.convert_type(&src, NDDataType::UInt8).unwrap();
@@ -728,7 +710,9 @@ mod tests {
                 NDDataType::UInt8,
             )
             .unwrap();
-        let (NDDataBuffer::U8(typed), NDDataBuffer::U8(dims)) = (&typed.data, &dims.data) else {
+        let (NDDataView::U8(typed), NDDataView::U8(dims)) =
+            (typed.data().view(), dims.data().view())
+        else {
             panic!("target type not honoured");
         };
         // Infinity saturates the i128 and its low byte is 0xff.
@@ -753,9 +737,9 @@ mod tests {
                     fearless_simd::dispatch!(lvl, s => simd_kernels::$kernel(s, &values, &mut got));
                     assert_eq!(got, want, "{} -> {} at {lvl:?}", stringify!($s), stringify!($d));
                 }
-                let mut got = vec![7 as $d; 3];
-                <$s as CCast<$d>>::cast_extend(&values, &mut got);
-                assert_eq!(got[3..], want[..], "{} -> {}", stringify!($s), stringify!($d));
+                let mut got = vec![7 as $d; values.len()];
+                <$s as CCast<$d>>::cast_into(&values, &mut got);
+                assert_eq!(got, want, "{} -> {}", stringify!($s), stringify!($d));
                 for bin in [1usize, 2, 3, 7, 1024, 1025] {
                     let mut got = vec![1 as $d; values.len() / bin];
                     <$s as CCast<$d>>::bin_row(&values[..got.len() * bin], bin, &mut got);

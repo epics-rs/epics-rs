@@ -60,10 +60,10 @@ record(calc, "T:D") { field(CALC, "VAL+1") }
 
 const SOURCES: &str = r#"
 record(calc, "BARE") { field(CALC, "VAL+1") }
-record(calc, "PVA") { field(CALC, "VAL+1") field(FLNK, "pva://T:A") }
+record(calc, "PVA") { field(CALC, "VAL+1") field(FLNK, {pva:"T:A"}) }
 record(calc, "JSON") { field(CALC, "VAL+1") field(FLNK, {pva:{pv:"T:C", Q:4}}) }
 record(fanout, "FNONE") {}
-record(fanout, "FPVA") { field(LNK1, "pva://T:B") }
+record(fanout, "FPVA") { field(LNK1, {pva:"T:B"}) }
 record(fanout, "FJSON") { field(LNK1, {pva:{pv:"T:D", Q:4}}) }
 "#;
 

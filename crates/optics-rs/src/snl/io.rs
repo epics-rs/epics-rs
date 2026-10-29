@@ -348,7 +348,7 @@ mod tests {
         assert!(absArPhoto(10.0) > 0.0);
     }
 
-    /// The `ArPcntr` clause's detector efficiency (Io.st:258-259) at 10 keV.
+    /// The `ArPcntr` clause's detector efficiency (Io.st:265-266) at 10 keV.
     #[test]
     fn test_ar_pcntr_efficiency() {
         let eff = (1. - (-(4. * CM_PER_INCH) * absArPhoto(10.0)).exp())
@@ -437,8 +437,8 @@ mod tests {
         assert!(ion_abs > 0.0 && ion_abs <= 1.0, "ion_abs = {ion_abs}");
     }
 
-    /// Channels 2-15 select s2..s15 (Io.st:409-423); any other is the
-    /// switch default, `cps = 0` (Io.st:424-426).
+    /// Channels 2-15 select s2..s15 (Io.st:414-428); any other is the
+    /// switch default, `cps = 0` (Io.st:429-431).
     #[test]
     fn test_eval_flux_channel_window_boundaries() {
         let _block = BLOCK.lock().unwrap();

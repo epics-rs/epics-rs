@@ -1012,16 +1012,16 @@ mod tests {
 
     /// C merges lock sets only in `dbDbInitLink`/`dbDbAddLink`, so a link that
     /// resolved to another IOC merges nothing even when the name is local.
-    // RTEMS-EXEC-MODEL-ALLOW(1): the same sync registry read across a ca:// link; the runtime only awaits add_record; passes on the exec backend.
+    // RTEMS-EXEC-MODEL-ALLOW(1): the same sync registry read across a CA link; the runtime only awaits add_record; passes on the exec backend.
     #[tokio::test]
     async fn a_ca_link_does_not_widen_the_lockset() {
         let db = db_with(&["BP:a", "BP:b"]).await;
-        set_flnk(&db, "BP:a", "ca://BP:b");
+        set_flnk(&db, "BP:a", "BP:b CA");
 
         assert_ne!(
             lockset_id(&db, b"BP:a"),
             lockset_id(&db, b"BP:b"),
-            "a ca:// forward link is a dbCa link, not a lock-set merge"
+            "a CA forward link is a dbCa link, not a lock-set merge"
         );
     }
 
@@ -1562,7 +1562,8 @@ mod tests {
     /// how a shell user waits too: the stop happens on the continuation
     /// thread, which the shell has no handle on.
     fn await_stop(table: &BreakpointTable, pred: impl Fn(Option<&str>) -> bool) -> Option<String> {
-        for _ in 0..400 {
+        let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+        while Instant::now() < deadline {
             {
                 let stack = table.lock();
                 let at = stack

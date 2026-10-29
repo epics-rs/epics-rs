@@ -38,6 +38,12 @@
 //! timer entry is armed lazily on the **first poll** — a `Sleep` that is
 //! created and dropped without ever being awaited schedules nothing.
 //!
+//! The first poll never completes. A deadline already lapsed by then arms no
+//! entry: the poll wakes its own task and returns `Pending`, as C's timer
+//! queue still requests a lapsed `callbackRequestDelayed` through the
+//! callback queue. A band task looping on a lapsed wait so goes to the band's
+//! tail every turn instead of holding it.
+//!
 //! A [`Sleep`] **owns** the queue entry it arms: [`TimerHandle::schedule_wake`]
 //! hands back a [`WakeKey`], and [`Sleep`]'s `Drop` both clears the stored waker
 //! and cancels that key. Clearing the waker is what makes the cancel clean — a
@@ -47,11 +53,10 @@
 //! mutex inside it alive for the entire remaining delay.
 //!
 //! That retention is not theoretical. A `select!` arm holding a long-period
-//! `interval` tick re-arms a fresh `Sleep` on every loop iteration and drops it
-//! when another arm wins, so an uncancellable entry accumulates at the loop's
-//! iteration rate for the whole period — for the PVA search engine's 180 s
-//! `BEACON_CLEAN_INTERVAL` tick, every entry since the last tick, released in
-//! one batch every 180 s.
+//! `sleep` arms a fresh `Sleep` on every loop iteration and drops it when
+//! another arm wins, so an uncancellable entry accumulates at the loop's
+//! iteration rate for the whole period — as the PVA search engine's 180 s
+//! `BEACON_CLEAN_INTERVAL` tick did while an interval tick was such a sleep.
 //!
 //! Cancellation is a property of the *wake* path only.
 //! [`TimerHandle::schedule`] — C `callbackRequestDelayed`
@@ -65,6 +70,7 @@ use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use super::delayed_timer::{TimerHandle, WakeKey};
+use crate::runtime::task::Period;
 
 /// Shared between a [`Sleep`] and its armed timer callback.
 struct SleepState {
@@ -99,8 +105,8 @@ pub fn sleep(timer: &TimerHandle, dur: Duration) -> Sleep {
 }
 
 /// A future completing at `deadline` — mirrors `tokio::time::sleep_until`. A
-/// deadline already in the past makes the future ready on its first poll
-/// without arming a timer entry.
+/// deadline already in the past arms no timer entry; the first poll still
+/// yields once.
 pub fn sleep_until(timer: &TimerHandle, deadline: Instant) -> Sleep {
     Sleep {
         deadline,
@@ -111,6 +117,24 @@ pub fn sleep_until(timer: &TimerHandle, deadline: Instant) -> Sleep {
         })),
         armed: false,
         entry: None,
+    }
+}
+
+impl Sleep {
+    /// Re-arm for `deadline` in place — `tokio::time::Sleep::reset`. The held
+    /// entry is given back and the cell replaced, not cleared: a callback the
+    /// timer thread already dequeued still holds the old cell and would
+    /// otherwise mark the new deadline fired.
+    pub(crate) fn reset(&mut self, deadline: Instant) {
+        if let Some(key) = self.entry.take() {
+            self.timer.cancel_wake(key);
+        }
+        self.state = Arc::new(Mutex::new(SleepState {
+            fired: false,
+            waker: None,
+        }));
+        self.deadline = deadline;
+        self.armed = false;
     }
 }
 
@@ -127,11 +151,18 @@ impl Future for Sleep {
             if st.fired {
                 return Poll::Ready(());
             }
-            // Deadline already reached (past-deadline construction, or the
-            // clock crossed it before the timer callback landed): complete now.
             if Instant::now() >= this.deadline {
                 st.fired = true;
-                return Poll::Ready(());
+                // A later poll is the clock crossing the deadline before the
+                // timer callback landed. A first one yields: see the module
+                // docs.
+                if this.armed {
+                    return Poll::Ready(());
+                }
+                this.armed = true;
+                drop(st);
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
             }
             st.waker = Some(cx.waker().clone());
         }
@@ -173,29 +204,33 @@ impl Drop for Sleep {
     }
 }
 
-/// A periodic ticker over the delayed-callback timer — the RTEMS backend for
-/// [`crate::runtime::task::interval`]. Mirrors `tokio::time::Interval` with its
+/// A periodic ticker over the delayed-callback timer — the backend for
+/// [`crate::runtime::task::interval_background`]. Mirrors `tokio::time::Interval` with its
 /// default `MissedTickBehavior::Burst`: the first tick is immediate and tick
 /// deadlines are anchored at construction (`start + period`, `start + 2·period`,
 /// …), so an overdue tick fires immediately and successive overdue ticks burst
 /// back-to-back until the schedule is caught up.
 pub struct TimerInterval {
-    timer: TimerHandle,
     period: Duration,
     /// Next tick deadline, anchored at construction so catch-up is Burst.
     next: Instant,
     /// The first tick completes immediately (tokio parity).
     first: bool,
+    /// Held across ticks and re-armed in place, so a `tick()` dropped by a
+    /// losing `select!` arm leaves it armed and the next `tick()` arms nothing.
+    delay: Sleep,
 }
 
 /// Build a periodic ticker firing every `period`, backed by `timer` — the
 /// runtime-free mirror of `tokio::time::interval`.
-pub fn interval(timer: &TimerHandle, period: Duration) -> TimerInterval {
+pub fn interval(timer: &TimerHandle, period: Period) -> TimerInterval {
+    let period = period.get();
+    let next = crate::runtime::time::deadline_from_now(period);
     TimerInterval {
-        timer: timer.clone(),
         period,
-        next: crate::runtime::time::deadline_from_now(period),
+        next,
         first: true,
+        delay: sleep_until(timer, next),
     }
 }
 
@@ -204,14 +239,20 @@ impl TimerInterval {
     /// tick waits until its (construction-anchored) deadline, with Burst
     /// catch-up when the caller has fallen behind.
     pub async fn tick(&mut self) {
+        std::future::poll_fn(|cx| self.poll_tick(cx)).await
+    }
+
+    fn poll_tick(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         if self.first {
             self.first = false;
-            return;
+            return Poll::Ready(());
         }
-        sleep_until(&self.timer, self.next).await;
+        std::task::ready!(Pin::new(&mut self.delay).poll(cx));
         // Advance by a whole period from the previous deadline (not from now),
         // so overdue deadlines stay in the past and the next tick bursts.
         self.next = crate::runtime::time::deadline_after(self.next, self.period);
+        self.delay.reset(self.next);
+        Poll::Ready(())
     }
 }
 
@@ -259,7 +300,7 @@ mod tests {
         drop(s);
         // The ticker anchors its first deadline the same way, and
         // advances it with the same owner.
-        let mut every = interval(&timer.handle(), Duration::MAX);
+        let mut every = interval(&timer.handle(), Period::new(Duration::MAX).unwrap());
         every.next = crate::runtime::time::deadline_after(every.next, every.period);
         assert_eq!(count.load(Ordering::SeqCst), 0);
     }
@@ -280,20 +321,25 @@ mod tests {
         );
     }
 
+    /// A lapsed deadline yields once through the task's own wake, and arms
+    /// nothing.
     #[test]
-    fn sleep_until_past_deadline_is_immediately_ready() {
+    fn sleep_until_past_deadline_yields_once_then_is_ready() {
         let pool = CallbackPool::new();
         let timer = DelayedTimer::new(pool.handle());
+        let h = timer.handle();
         let past = Instant::now() - Duration::from_secs(1);
 
         let count = Arc::new(AtomicUsize::new(0));
         let waker = Waker::from(Arc::new(CountWaker(Arc::clone(&count))));
         let mut cx = Context::from_waker(&waker);
 
-        let mut s = Box::pin(sleep_until(&timer.handle(), past));
+        let mut s = Box::pin(sleep_until(&h, past));
+        assert!(s.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(h.scheduled_count(), 0);
         assert!(s.as_mut().poll(&mut cx).is_ready());
-        // Nothing was armed, so nothing ever wakes the waker.
-        assert_eq!(count.load(Ordering::SeqCst), 0);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -361,10 +407,11 @@ mod tests {
     }
 
     /// The interval case the leak was actually measured through: each `tick()`
-    /// that loses a `select!` race drops mid-await, and every one of those must
-    /// leave the queue as it found it.
+    /// that loses a `select!` race drops mid-await, and none of those may add
+    /// an entry, arm a timer or move the deadline; the ticker's own entry goes
+    /// with the ticker.
     #[test]
-    fn abandoned_interval_ticks_leave_no_entries() {
+    fn abandoned_interval_ticks_add_no_entries() {
         let pool = CallbackPool::new();
         let timer = DelayedTimer::new(pool.handle());
         let h = timer.handle();
@@ -372,7 +419,8 @@ mod tests {
         let waker = Waker::from(Arc::new(CountWaker(Arc::new(AtomicUsize::new(0)))));
         let mut cx = Context::from_waker(&waker);
 
-        let mut iv = interval(&h, Duration::from_secs(180));
+        let mut iv = interval(&h, Period::new(Duration::from_secs(180)).unwrap());
+        let due = iv.next;
         // The first tick is immediate and arms nothing; the rest are 180 s out.
         let mut first = Box::pin(iv.tick());
         assert!(first.as_mut().poll(&mut cx).is_ready());
@@ -385,9 +433,13 @@ mod tests {
         }
         assert_eq!(
             h.scheduled_count(),
-            0,
-            "abandoned interval ticks accumulate one queue entry each per period"
+            1,
+            "one entry, held by the ticker across abandoned ticks"
         );
+        assert_eq!(h.scheduled_total(), 1, "armed once, not once per poll");
+        assert_eq!((iv.next, iv.delay.deadline), (due, due), "the tick moved");
+        drop(iv);
+        assert_eq!(h.scheduled_count(), 0);
     }
 
     #[test]
@@ -425,7 +477,7 @@ mod tests {
         let start = Instant::now();
         drive(
             async move {
-                let mut iv = interval(&th, period);
+                let mut iv = interval(&th, Period::new(period).unwrap());
                 iv.tick().await; // first tick: immediate
                 let after_first = start.elapsed();
                 assert!(
@@ -435,9 +487,9 @@ mod tests {
                 iv.tick().await; // ~1 period in
                 iv.tick().await; // ~2 periods in
             },
-            || false,
+            || start.elapsed() > T,
         )
-        .unwrap();
+        .expect("two ticks took more than T");
         assert!(
             start.elapsed() >= 2 * period,
             "two periodic ticks should take at least two periods, took {:?}",
@@ -455,7 +507,7 @@ mod tests {
         let th = timer.handle();
         drive(
             async move {
-                let mut iv = interval(&th, period);
+                let mut iv = interval(&th, Period::new(period).unwrap());
                 iv.tick().await; // immediate; deadlines land at 30/60/90/120ms
                 // Stall well past four deadlines.
                 sleep(&th, Duration::from_millis(140)).await;

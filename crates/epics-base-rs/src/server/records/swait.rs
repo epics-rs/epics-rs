@@ -44,7 +44,7 @@ enum Cb {
     Input,
 }
 
-/// Link events in arrival order: queued by a link's task without the
+/// Link events in arrival order: queued by a `recDynLink` thread without the
 /// record's lock, applied under it from a callback worker.
 #[derive(Default)]
 struct Inbox(Mutex<VecDeque<(usize, u64, LinkEvent)>>);
@@ -229,7 +229,7 @@ pub struct SwaitRecord {
     // simulated cycle takes the `else` branch, which runs NEITHER
     // `fetch_values()` NOR `calcPerform()`.
     simulation_active: bool,
-    // The record's name and database, which every link's task is spawned on.
+    // The record's name and database, which every link is added on.
     async_ctx: Option<(crate::types::RecordName, AsyncDbHandle)>,
     /// This cycle's SCAN is I/O Intr.
     io_intr: bool,
@@ -463,9 +463,9 @@ impl SwaitRecord {
         }
     }
 
-    /// The closure link `li`'s task hands its events to: queued, then applied
-    /// under the record's lock from a callback worker, so the link reactor
-    /// never waits on that lock.
+    /// The closure link `li`'s events are handed to: queued, then applied
+    /// under the record's lock from a callback worker, so the `recDynLink`
+    /// threads never wait on that lock.
     fn deliver(&self, li: usize) -> Option<Deliver> {
         let (name, h) = self.async_ctx.clone()?;
         let inbox = self.inbox.clone();
@@ -800,6 +800,12 @@ impl Record for SwaitRecord {
 
     fn record_type(&self) -> &'static str {
         "swait"
+    }
+
+    /// `if (pwait->siml.type == CONSTANT)` and the same test on SIOL
+    /// (`swaitRecord.c:663-670`).
+    fn sim_seed_guard(&self) -> crate::server::record::SeedGuard {
+        crate::server::record::SeedGuard::TypeConstant
     }
 
     /// Record-specific `DBF_MENU` fields, served as `DBR_ENUM` with the

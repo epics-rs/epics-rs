@@ -6,11 +6,11 @@ place, naming the commit or the upstream change that moved them. Nothing has
 been deleted or re-estimated. Every difference still carries a two-line `.db`
 you can paste.
 
-Ground truth: `softIoc` from `/home/stevek/work/epics-base/bin/linux-x86_64`.
+Ground truth: `softIoc` from `$EPICS_BASE/bin/linux-x86_64`.
 Both sides driven by the same C CA tools.
 
-That is no longer the ground truth. `CTools::ioc_bin` defaults to the fat
-`/home/stevek/work/oracle-ioc/bin/linux-x86_64/softIoc` (`e45a697f`), which
+That is no longer the ground truth. `CTools::ioc_bin` is the fat
+`oracle-ioc/bin/linux-x86_64/softIoc` (`e45a697f`, `EPICS_ORACLE_IOC_BIN`), which
 links busy/transform/sseq/acalcout/scalcout/asyn on top of base; `CTools::bin`
 keeps the path above for the CA client tools only. Every figure below was
 produced by the stock binary, so a re-run is not diffing against the same C.
@@ -28,8 +28,8 @@ measured directly on `record(calc, "T:CALC") {}`:
 
 ```sh
 caput -c -t -w 2 T:CALC.INPM 1
-# ~/work/epics-base/bin/linux-x86_64/softIoc   -> 1                       (accepted)
-# ~/work/oracle-ioc/bin/linux-x86_64/softIoc   -> Channel write request failed
+# $EPICS_BASE/bin/linux-x86_64/softIoc   -> 1                       (accepted)
+# $EPICS_ORACLE_IOC_BIN                   -> Channel write request failed
 ```
 
 `EPICS_ORACLE_DBD` changes the denominator only; the IOC binary is
@@ -43,7 +43,7 @@ differ here, and CBUG-F6's allowlist row was retired for that reason.
 
 ## The denominator
 
-Enumerated from `/home/stevek/work/epics-base/dbd/softIoc.dbd` (the expanded
+Enumerated from `$EPICS_BASE/dbd/softIoc.dbd` (the expanded
 dbd — `dbCommon` inlined), not hand-listed.
 
 | | | status |
@@ -53,11 +53,11 @@ dbd — `dbCommon` inlined), not hand-listed.
 | CA-observable fields | **2551** at the run; **2553** today | SUPERSEDED 2026-08-25 — 2553 re-measured, and every count below that says `ran 2551` should read 2553. The run's copy of the file is gone, so the +2 is attributed, not measured: `c9817fa59` (`bi.AFTC`, `bi.AFVL`) is base's only field-adding commit since 2025-10, and `dbd/softIoc.dbd` was rebuilt 2026-08-11 |
 | `DBF_NOACCESS` fields excluded | 594 (raw C pointers; no CA client can reach them) | recomputed 2026-08-23 |
 
-The harness no longer defaults to this file. `CTools::DEFAULT_DBD` is now the fat
-`/home/stevek/work/oracle-ioc/dbd/softIoc.dbd` (`e45a697f`), which enumerates 40
+The harness no longer measures this file. Its dbd is now the fat
+`oracle-ioc/dbd/softIoc.dbd` (`e45a697f`, `EPICS_ORACLE_DBD`), which enumerates 40
 record types and 3388 CA-observable fields (736 `DBF_NOACCESS` excluded) —
-re-measured 2026-08-25, and reported above. A re-run with defaults therefore
-measures a different surface than everything below; set `EPICS_ORACLE_DBD` back
+re-measured 2026-08-25, and reported above. A re-run on the fat dbd therefore
+measures a different surface than everything below; set `EPICS_ORACLE_DBD`
 to the path above to reproduce this one.
 
 ## Coverage

@@ -100,7 +100,9 @@ fn hits(text: &str, needles: &[&str]) -> Vec<String> {
 ///   `self.process()` (ao's IVOA=Set_output_to_IVOV does), and that is the one
 ///   place a record does. The hook is called only from
 ///   `apply_invalid_output_value_and_drain`, so its process is drained there
-///   by construction rather than by a list of records that happen to be safe.
+///   by construction rather than by a list of records that happen to be safe;
+/// * `Record::process_own` is called only from `process_hooked`, so its
+///   default body's `self.process()` is drained there too.
 ///
 /// Each allowance is the body of a function, so a second call elsewhere in the
 /// same file is still a bypass.
@@ -110,11 +112,13 @@ fn no_cycle_path_processes_without_the_drain() {
     const HOOK_CALL: &[&str] = &[".record.apply_invalid_output_value("];
     const SELF_PROCESS: &[&str] = &["self.process()"];
     const CALLER: &[&str] = &["self.process_record()"];
+    const OWN_CALL: &[&str] = &[".process_own("];
 
     let mut bypasses = Vec::new();
     let mut owner_process = Vec::new();
     let mut callers = Vec::new();
     let mut owner_hook = Vec::new();
+    let mut owner_own = Vec::new();
     for (path, text) in production_sources() {
         let tag = |h: String| format!("{path}: {h}");
         let mut rest = text;
@@ -127,6 +131,9 @@ fn no_cycle_path_processes_without_the_drain() {
             for caller in ["process_and_drain", "process_hooked"] {
                 let (bodies, r) = split_out_fns(&rest, caller);
                 callers.extend(bodies.iter().flat_map(|b| hits(b, CALLER)).map(tag));
+                if caller == "process_hooked" {
+                    owner_own.extend(bodies.iter().flat_map(|b| hits(b, OWN_CALL)).map(tag));
+                }
                 rest = r;
             }
             bypasses.extend(hits(&rest, CALLER).into_iter().map(tag));
@@ -134,12 +141,16 @@ fn no_cycle_path_processes_without_the_drain() {
             owner_hook.extend(bodies.iter().flat_map(|b| hits(b, HOOK_CALL)).map(tag));
             rest = r;
         }
-        // The hook's own body: the one place a record calls `self.process()`.
+        // The hooks' own bodies: the places a record calls `self.process()`.
         let (_, rest) = split_out_fns(&rest, "apply_invalid_output_value");
+        let (_, rest) = split_out_fns(&rest, "process_own");
         bypasses.extend(
-            hits(&rest, &[PROCESS, HOOK_CALL, SELF_PROCESS].concat())
-                .into_iter()
-                .map(tag),
+            hits(
+                &rest,
+                &[PROCESS, HOOK_CALL, SELF_PROCESS, OWN_CALL].concat(),
+            )
+            .into_iter()
+            .map(tag),
         );
     }
     assert_eq!(
@@ -153,6 +164,11 @@ fn no_cycle_path_processes_without_the_drain() {
         2,
         "process_and_drain and process_hooked must each call process_record \
          once: {callers:#?}"
+    );
+    assert_eq!(
+        owner_own.len(),
+        1,
+        "process_hooked must call Record::process_own exactly once: {owner_own:#?}"
     );
     assert_eq!(
         owner_hook.len(),

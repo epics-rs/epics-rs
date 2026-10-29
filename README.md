@@ -8,7 +8,7 @@ Just `cargo build`.
 
 - **Channel Access** — client & server (UDP name resolution + TCP circuit, beacons, repeater)
 - **pvAccess** — client & server (search engine, monitor/get/put/RPC, ORIGIN_TAG forwarding)
-- **QSRV bridge** — records as NTScalar/NTEnum/NTNDArray and Group PVs (C++ QSRV JSON compatible), `pva://` / `ca://` database links (pvalink/calink)
+- **QSRV bridge** — records as NTScalar/NTEnum/NTNDArray and Group PVs (C++ QSRV JSON compatible), `{pva:…}` / CA database links (pvalink/calink)
 - **IOC runtime** — 34 base record types, .db loader, link chains, scan scheduling, ACF access security, iocsh, autosave, calc engine
 - **asyn** — actor-based async port driver framework
 - **motor** — 9-phase state machine, coordinate transforms, backlash compensation
@@ -27,7 +27,7 @@ The umbrella crate pulls in what you select by feature:
 
 ```toml
 [dependencies]
-epics-rs = { version = "0.32", features = ["ad"] }
+epics-rs = { version = "0.33", features = ["ad"] }
 ```
 
 ```rust
@@ -53,15 +53,15 @@ use epics_rs::asyn;        // port driver framework
 | `full` | Everything above | no |
 
 `calc`, `autosave`, and `busy` are always available through `epics-base-rs`.
-`sscan-rs`, `epics-stream-rs`, `epics-seq-rs`/`epics-snc-rs`, `mqtt-rs` and
-`epics-modbus-rs` are not surfaced through the umbrella crate — depend on
-them directly when needed.
+`sscan-rs`, `epics-stream-rs`, `epics-seq-rs`,
+`mqtt-rs` and `epics-modbus-rs` are not surfaced through the umbrella crate —
+depend on them directly when needed.
 
 You can also depend on sub-crates directly:
 
 ```toml
-epics-base-rs = "0.32"  # just the IOC runtime
-epics-ca-rs   = "0.32"  # just Channel Access
+epics-base-rs = "0.33"  # just the IOC runtime
+epics-ca-rs   = "0.33"  # just Channel Access
 ```
 
 ## Workspace
@@ -89,8 +89,7 @@ epics-ca-rs   = "0.32"  # just Channel Access
 | `sscan-rs` | synApps sscan R2-12 (sscan and scanparm records, saveData's MDA writer, `scanProg.st`) |
 | `epics-stream-rs` | StreamDevice (imported as `stream_rs`) |
 | `stream-pcre-sys` | C PCRE 8.45, the test oracle for `epics-stream-rs`'s Rust PCRE |
-| `epics-snc-rs` | Sequencer R2-2-9 SNL compiler: `.st` → Rust from `build.rs`, and the `snc-rs` CLI |
-| `epics-seq-rs` | Sequencer R2-2-9 run-time that snc-rs programs run on |
+| `epics-seq-rs` | Sequencer R2-2-9 run-time, and under `snc` its SNL compiler: `.st` → Rust from `build.rs`, and the `snc-rs` CLI |
 | `mqtt-rs` | MQTT broker bridge (FLAT/JSON payloads) |
 | `epics-modbus-rs` | Modbus TCP/RTU/ASCII driver |
 

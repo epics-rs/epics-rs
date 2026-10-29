@@ -75,8 +75,19 @@ async fn a_failed_readback_on_a_scalar_output_is_write_alarm() {
         "RBKERR",
         1,
         PortFlags::default(),
-        InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::INT32
+            | InterfaceMask::UINT32_DIGITAL
+            | InterfaceMask::FLOAT64
+            | InterfaceMask::ENUM
+            | InterfaceMask::INT64
+            | InterfaceMask::OCTET
+            | InterfaceMask::DRV_USER,
+        InterfaceMask::INT32
+            | InterfaceMask::UINT32_DIGITAL
+            | InterfaceMask::FLOAT64
+            | InterfaceMask::OCTET
+            | InterfaceMask::ENUM
+            | InterfaceMask::INT64,
     );
     let reasons: Vec<usize> = PARAMS
         .iter()

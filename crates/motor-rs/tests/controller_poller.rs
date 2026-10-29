@@ -230,10 +230,7 @@ impl AsynMotor for Creeping {
     }
     fn poll(&mut self, _: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         let n = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-        *status = MotorStatus {
-            position: f64::from(n),
-            ..MotorStatus::default()
-        };
+        *status = MotorStatus::default().with_position(f64::from(n));
         Ok(())
     }
 }
@@ -315,11 +312,12 @@ async fn an_axis_s_post_reaches_its_records_before_the_next_axis_polls() {
     }
 }
 
-/// C's poller runs one startup pass, the wakeupPoller before its loop
-/// (asynMotorController.cpp:630); an axis created after the poller started
-/// is first polled on a later pass, not on one of its own.
+/// An axis created after the poller started is polled at its join, after
+/// the controller poll and before its add returns, as C's pass waiting on
+/// the lock CreateAxis holds polls it (asynMotorController.cpp:644-658);
+/// the join polls no other axis.
 #[tokio::test]
-async fn axes_joining_a_running_poller_get_no_pass_of_their_own() {
+async fn an_axis_joining_a_running_poller_is_polled_alone_before_its_add_returns() {
     let log = Log::default();
     let controller_log = log.clone();
     let controller = ControllerBuilder::new()
@@ -352,15 +350,14 @@ async fn axes_joining_a_running_poller_get_no_pass_of_their_own() {
                 .unwrap(),
         );
     }
-    tokio::time::sleep(PERIOD * 4).await;
-    assert_eq!(names(&log), ["C"], "the startup pass alone");
+    assert_eq!(names(&log), ["C", "C", "A0", "C", "A1", "C", "A2"]);
     joined[0]
         .poll_cmd_tx
         .send(PollCommand::Wakeup)
         .await
         .unwrap();
-    until("the woken pass", || names(&log).len() >= 5).await;
-    assert_eq!(names(&log), ["C", "C", "A0", "A1", "A2"]);
+    until("the woken pass", || names(&log).len() >= 11).await;
+    assert_eq!(names(&log)[7..], ["C", "A0", "A1", "A2"]);
     joined[0]
         .poll_cmd_tx
         .send(PollCommand::Shutdown)
@@ -453,7 +450,10 @@ async fn a_move_write_posts_before_the_pass_it_wakes() {
         .unwrap();
     until("the woken pass", || seen.lock().unwrap().len() >= 2).await;
     // m0 once more: every post m1's records had by now.
-    m0.0.poll_cmd_tx.send(PollCommand::ForcePoll).await.unwrap();
+    m0.0.poll_cmd_tx
+        .send(PollCommand::ForcePoll(None))
+        .await
+        .unwrap();
     until("the forced poll", || seen.lock().unwrap().len() >= 3).await;
     m0.0.poll_cmd_tx.send(PollCommand::Shutdown).await.unwrap();
     poller.await.unwrap();
@@ -540,8 +540,10 @@ async fn a_started_poller_is_pending_until_its_startup_pass_ends() {
     poller.await;
 }
 
+/// An add to a running poller returns once the axis is polled: nothing is
+/// left pending for a reader to wait on.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_axis_added_to_a_running_poller_is_pending_until_its_first_poll() {
+async fn an_axis_added_to_a_running_poller_is_polled_when_its_add_returns() {
     let log = Log::default();
     let mut controller = ControllerBuilder::new();
     let axis = |name, addr| {
@@ -576,11 +578,12 @@ async fn an_axis_added_to_a_running_poller_is_pending_until_its_first_poll() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(first.first_polls_pending(), 1);
+    assert_eq!(first.first_polls_pending(), 0);
+    let names = || -> Vec<_> { log.lock().unwrap().iter().map(|(n, _)| *n).collect() };
+    assert_eq!(names(), ["A2", "A0"]);
     poll_cmd_tx.send(PollCommand::Wakeup).await.unwrap();
-    polled(&log, 3);
-    let names: Vec<_> = log.lock().unwrap().iter().map(|(n, _)| *n).collect();
-    assert_eq!(names, ["A2", "A0", "A2"]);
+    polled(&log, 4);
+    assert_eq!(names(), ["A2", "A0", "A0", "A2"]);
     poll_cmd_tx.send(PollCommand::Shutdown).await.unwrap();
     poller.await;
 }
@@ -943,7 +946,7 @@ fn a_port_reads_its_poller_s_first_polls_and_0_before_one_is_named() {
 /// having set HOME.
 #[derive(Default)]
 struct Bailing {
-    polled: bool,
+    polls: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl AsynMotor for Bailing {
@@ -966,7 +969,7 @@ impl AsynMotor for Bailing {
         PollFailure::NONE
     }
     fn poll(&mut self, _: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
-        if !std::mem::replace(&mut self.polled, true) {
+        if self.polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
             *status = MotorStatus::default();
             return Ok(());
         }
@@ -999,8 +1002,10 @@ async fn a_port_write_running_no_axis_method_posts_what_a_bailing_poll_left() {
         motor_rs::devices::register_controller_port(&asyn_rs::registry::open_owner(), PORT, 2, ())
             .unwrap();
     let mut controller = ControllerBuilder::new();
+    let bailing = Bailing::default();
+    let polls = bailing.polls.clone();
     let m = controller.axis(
-        Arc::new(Mutex::new(Bailing::default())),
+        Arc::new(Mutex::new(bailing)),
         TraceUser::Asyn {
             port: PORT.into(),
             addr: 1,
@@ -1016,6 +1021,12 @@ async fn a_port_write_running_no_axis_method_posts_what_a_bailing_poll_left() {
         1,
         "only the startup poll, which the constructor raised, posts"
     );
+    // The third poll starts once the pass of the second, the first to bail,
+    // has left its status; a write before that has nothing to post.
+    until("a bailed pass", || {
+        polls.load(std::sync::atomic::Ordering::SeqCst) >= 3
+    })
+    .await;
     tokio::task::spawn_blocking(move || port.write_int32_blocking(index::POWER_AUTO_ONOFF, 1, 0))
         .await
         .unwrap()

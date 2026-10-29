@@ -54,8 +54,8 @@ fn port(name: &str, can_block: bool, refuse: bool, db: &PvDatabase) -> PortRunti
             can_block,
             ..PortFlags::default()
         },
-        InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_INTERRUPTS,
+        InterfaceMask::OCTET | InterfaceMask::DRV_USER,
+        InterfaceMask::NONE,
     );
     base.create_param("MSG", ParamType::Octet).unwrap();
     let (runtime, _actor) =

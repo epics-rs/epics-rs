@@ -16,12 +16,25 @@
 
 use std::io::{BufRead, BufReader};
 use std::os::unix::process::ExitStatusExt;
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::path::Path;
+use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 /// softIocPVX's last boot line, on stderr.
 const READY: &str = "iocRun: All initialization complete\n";
+
+/// `log` once `child` has printed [`READY`] or exited. No clock: under
+/// load one would run out inside the boot.
+fn console_at_iocrun(child: &mut Child, log: &Path) -> String {
+    loop {
+        let exited = child.try_wait().unwrap().is_some();
+        let output = std::fs::read_to_string(log).unwrap();
+        if exited || output.contains(READY) {
+            return output;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
 
 fn qsrv_rs(group_file: &std::path::Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_qsrv-rs"));
@@ -47,20 +60,14 @@ fn a_malformed_group_file_aborts_with_pvxs_text() {
         .stderr(out)
         .spawn()
         .expect("spawn qsrv-rs");
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
-    let status = loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            break status;
-        }
-        if std::time::Instant::now() > deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("qsrv-rs kept serving a malformed group file");
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    };
+    let output = console_at_iocrun(&mut child, &log);
+    if output.contains(READY) {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("qsrv-rs kept serving a malformed group file: {output}");
+    }
+    let status = child.wait().unwrap();
     assert_eq!(status.signal(), Some(6), "{status:?}");
-    let output = std::fs::read_to_string(&log).unwrap();
     let framing = format!(
         "terminate called after throwing an instance of 'std::runtime_error'\n  \
          what():  Error reading group definition file \"{}\"\n",
@@ -88,14 +95,7 @@ fn a_missing_group_file_says_so_before_iocrun_and_keeps_serving() {
         .spawn()
         .expect("spawn qsrv-rs");
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
-    let output = loop {
-        let output = std::fs::read_to_string(&log).unwrap();
-        if output.contains(READY) || std::time::Instant::now() > deadline {
-            break output;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    };
+    let output = console_at_iocrun(&mut child, &log);
     let alive = child.try_wait().unwrap().is_none();
     let _ = child.kill();
     let _ = child.wait();
@@ -137,14 +137,7 @@ fn refused_groups_print_what_softiocpvx_prints() {
         .spawn()
         .expect("spawn qsrv-rs");
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
-    let output = loop {
-        let output = std::fs::read_to_string(&log).unwrap();
-        if output.contains(READY) || std::time::Instant::now() > deadline {
-            break output;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    };
+    let output = console_at_iocrun(&mut child, &log);
     let _ = child.kill();
     let _ = child.wait();
     let refused: Vec<&str> = output
@@ -191,14 +184,7 @@ fn startup_stderr_is_what_softiocpvx_prints() {
         .expect("spawn qsrv-rs");
 
     let last = READY;
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
-    let output = loop {
-        let output = std::fs::read_to_string(&log).unwrap();
-        if output.contains(last) || std::time::Instant::now() > deadline {
-            break output;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    };
+    let output = console_at_iocrun(&mut child, &log);
     let _ = child.kill();
     let _ = child.wait();
     let end = output.find(last).unwrap_or_else(|| panic!("{output}")) + last.len();
@@ -265,25 +251,21 @@ fn stdout_carries_the_corerelease_banner() {
         .spawn()
         .expect("spawn qsrv-rs");
     let rule = "#".repeat(76);
-    let (tx, rx) = mpsc::channel();
-    let stdout = child.stdout.take().unwrap();
-    let closing = rule.clone();
-    std::thread::spawn(move || {
-        let mut lines = Vec::new();
-        let mut rules = 0;
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            rules += usize::from(line == closing);
-            lines.push(line);
-            if rules == 2 || lines.len() == 8 {
-                break;
-            }
+    // Up to the closing rule, or all there is if qsrv-rs exits short of it.
+    let mut lines = Vec::new();
+    let mut rules = 0;
+    for line in BufReader::new(child.stdout.take().unwrap())
+        .lines()
+        .map_while(Result::ok)
+    {
+        rules += usize::from(line == rule);
+        lines.push(line);
+        if rules == 2 || lines.len() == 8 {
+            break;
         }
-        let _ = tx.send(lines);
-    });
-    let lines = rx.recv_timeout(Duration::from_secs(20));
+    }
     let _ = child.kill();
     let _ = child.wait();
-    let lines = lines.expect("qsrv-rs printed no banner");
     let masked: Vec<String> = lines
         .iter()
         .map(|l| {
@@ -326,14 +308,7 @@ fn qsrv2_info_precedes_iocinit_as_softiocpvx_prints() {
         .stderr(file)
         .spawn()
         .expect("spawn qsrv-rs");
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
-    let output = loop {
-        let output = std::fs::read_to_string(&log).unwrap();
-        if output.contains(READY) || std::time::Instant::now() > deadline {
-            break output;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    };
+    let output = console_at_iocrun(&mut child, &log);
     let _ = child.kill();
     let _ = child.wait();
     let end = output.find(READY).unwrap_or_else(|| panic!("{output}")) + READY.len();
@@ -369,14 +344,11 @@ fn sigterm_prints_nothing_after_iocrun() {
         .stderr(file)
         .spawn()
         .expect("spawn qsrv-rs");
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
-    while !std::fs::read_to_string(&log).unwrap().contains(READY) {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "qsrv-rs never reached iocRun"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    let output = console_at_iocrun(&mut child, &log);
+    assert!(
+        output.contains(READY),
+        "qsrv-rs exited before iocRun: {output}"
+    );
     let killed = Command::new("kill")
         .arg("-TERM")
         .arg(child.id().to_string())

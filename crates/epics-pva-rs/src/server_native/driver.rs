@@ -63,7 +63,7 @@ use std::sync::Arc;
 
 use epics_base_rs::runtime::task::Reactor;
 
-use super::blocking::{BlockingPvaServer, SearchSocket};
+use super::blocking::BlockingPvaServer;
 use super::config::PvaServerConfig;
 use super::peers::PeerRegistry;
 #[cfg(unix)]
@@ -71,7 +71,6 @@ use super::reactor::ReactorPvaServer;
 use super::serv_iface::ServListeners;
 use super::shared_pv::SharedSource;
 use super::source::DynSource;
-use crate::error::PvaResult;
 
 pub use super::beacon::BeaconSender;
 
@@ -100,9 +99,6 @@ pub trait PvaServerDriver: Send + Sync {
 
     /// Run the accept loop on the calling thread until [`shutdown`](Self::shutdown).
     fn serve(&self, reactor: &Reactor);
-
-    /// Run the UDP name-search responder on the calling thread.
-    fn serve_udp_search(&self, socket: SearchSocket) -> PvaResult<()>;
 
     /// Stop the accept loop and end every live connection.
     fn shutdown(&self);
@@ -141,10 +137,6 @@ impl PvaServerDriver for BlockingPvaServer {
 
     fn serve(&self, reactor: &Reactor) {
         BlockingPvaServer::serve(self, reactor)
-    }
-
-    fn serve_udp_search(&self, socket: SearchSocket) -> PvaResult<()> {
-        BlockingPvaServer::serve_udp_search(self, socket)
     }
 
     fn shutdown(&self) {
@@ -188,10 +180,6 @@ impl PvaServerDriver for ReactorPvaServer {
 
     fn serve(&self, reactor: &Reactor) {
         ReactorPvaServer::serve(self, reactor)
-    }
-
-    fn serve_udp_search(&self, socket: SearchSocket) -> PvaResult<()> {
-        ReactorPvaServer::serve_udp_search(self, socket)
     }
 
     fn shutdown(&self) {

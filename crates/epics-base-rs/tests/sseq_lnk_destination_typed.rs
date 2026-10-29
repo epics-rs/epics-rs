@@ -25,7 +25,7 @@ use epics_base_rs::error::CaResult;
 use epics_base_rs::server::database::{
     LinkDbfType, LinkMetadata, LinkPutOp, LinkRef, LinkSet, PvDatabase,
 };
-use epics_base_rs::server::record::{FieldDesc, ProcessOutcome, Record};
+use epics_base_rs::server::record::{FieldDesc, ProcessOutcome, Record, Special};
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::server::records::sseq::SseqRecord;
 use epics_base_rs::server::records::stringin::StringinRecord;
@@ -35,8 +35,8 @@ use epics_base_rs::types::{DbFieldType, EpicsValue};
 /// write delivers — the C `dbNameToAddr` `field_type` / `no_elements` the
 /// sseq switch reads.
 struct TypedProbe {
-    /// VAL's read-back shape, which is what the port's target resolution
-    /// derives the element count from (a scalar → 1, an array → its length).
+    /// VAL's read-back shape: its length is the element count of an
+    /// `SPC_DBADDR` VAL; any other field counts 1.
     readback: EpicsValue,
     fields: &'static [FieldDesc],
     last: Arc<Mutex<Option<EpicsValue>>>,
@@ -69,6 +69,11 @@ impl Record for TypedProbe {
 static STRING_VAL: &[FieldDesc] = &[FieldDesc::new("VAL", DbFieldType::String, false)];
 static DOUBLE_VAL: &[FieldDesc] = &[FieldDesc::new("VAL", DbFieldType::Double, false)];
 static CHAR_VAL: &[FieldDesc] = &[FieldDesc::new("VAL", DbFieldType::Char, false)];
+static CHAR_ARRAY_VAL: &[FieldDesc] = &[FieldDesc {
+    special: Special::DbAddr,
+    declared_special: Special::DbAddr,
+    ..FieldDesc::new("VAL", DbFieldType::Char, false)
+}];
 
 fn probe(
     fields: &'static [FieldDesc],
@@ -124,13 +129,27 @@ async fn kick(db: &PvDatabase, name: &str) {
 /// Poll the probe until it has been written, then return the value. The sseq
 /// machine fires each step in a spawned re-entry, so the kick returns first.
 async fn poll_put(cell: &Arc<Mutex<Option<EpicsValue>>>, label: &str) -> EpicsValue {
-    for _ in 0..400 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if let Some(v) = cell.lock().unwrap().clone() {
             return v;
         }
         epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;
     }
     panic!("{label}: LNK1 was never written");
+}
+
+/// Until `name` leaves PACT: the sequence finishes from a callback, after
+/// the kick returns.
+async fn idle(db: &PvDatabase, name: &str) {
+    let cell = db.get_record(name).unwrap();
+    epics_base_rs::runtime::task::timeout(fact_budget::FACT_BUDGET, async {
+        while cell.read().is_processing() {
+            epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{name} never left PACT"));
 }
 
 /// Settle long enough that a write, had one been issued, would have landed.
@@ -232,7 +251,7 @@ async fn char_array_destination_puts_the_string_bytes() {
     db.add_record(
         "TGT_CHAR",
         Box::new(probe(
-            CHAR_VAL,
+            CHAR_ARRAY_VAL,
             EpicsValue::CharArray(vec![0; 8].into()),
             last.clone(),
         )),
@@ -327,11 +346,12 @@ async fn unresolved_destination_is_not_written_at_all() {
     let mut sseq = SseqRecord::new();
     sseq.put_field("DOL1", EpicsValue::String("SRC_U.VAL".into()))
         .unwrap();
-    sseq.put_field("LNK1", EpicsValue::String("ca://EXT_UNKNOWN".into()))
+    sseq.put_field("LNK1", EpicsValue::String("EXT_UNKNOWN CA".into()))
         .unwrap();
     db.add_record("SSEQ_UN", Box::new(sseq)).await.unwrap();
 
     kick(&db, "SSEQ_UN").await;
+    idle(&db, "SSEQ_UN").await;
     settle().await;
 
     assert_eq!(
@@ -377,16 +397,15 @@ async fn resolved_external_string_destination_takes_the_string_view() {
     sseq.prec = 3;
     sseq.put_field("DOL1", EpicsValue::String("SRC_E.VAL".into()))
         .unwrap();
-    sseq.put_field("LNK1", EpicsValue::String("ca://EXT_STR".into()))
+    sseq.put_field("LNK1", EpicsValue::String("EXT_STR CA".into()))
         .unwrap();
     db.add_record("SSEQ_EX", Box::new(sseq)).await.unwrap();
 
     kick(&db, "SSEQ_EX").await;
-    settle().await;
 
     assert_eq!(
-        *last_put.lock().unwrap(),
-        Some(EpicsValue::String("4.500".into())),
+        poll_put(&last_put, "resolved external string").await,
+        EpicsValue::String("4.500".into()),
         "a connected CA string channel takes DBR_STRING from STRn (PREC=3)"
     );
 }

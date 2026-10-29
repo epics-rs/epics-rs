@@ -2,7 +2,7 @@ use rand::Rng;
 use rand::rngs::StdRng;
 use std::f64::consts::PI;
 
-use ad_core_rs::ndarray::NDDataBuffer;
+use ad_core_rs::ndarray::NDDataViewMut;
 
 use crate::types::{SimMode, SineOperation};
 use ad_core_rs::color_layout::ColorLayout;
@@ -410,10 +410,10 @@ pub fn accumulate_sine<T: PixelCast>(
 /// element type once per frame; the four buffers are the one data type and
 /// length the task allocates them with.
 pub fn compute_frame(
-    raw: &mut NDDataBuffer,
-    background: &mut NDDataBuffer,
-    ramp_buf: &mut NDDataBuffer,
-    peak_buf: &mut NDDataBuffer,
+    raw: NDDataViewMut<'_>,
+    background: NDDataViewMut<'_>,
+    ramp_buf: NDDataViewMut<'_>,
+    peak_buf: NDDataViewMut<'_>,
     sine_state: &mut SineState,
     layout: &ColorLayout,
     sim_mode: SimMode,
@@ -430,10 +430,10 @@ pub fn compute_frame(
         ($($v:ident),+) => {
             match (raw, background, ramp_buf, peak_buf) {
                 $((
-                    NDDataBuffer::$v(raw),
-                    NDDataBuffer::$v(background),
-                    NDDataBuffer::$v(ramp_buf),
-                    NDDataBuffer::$v(peak_buf),
+                    NDDataViewMut::$v(raw),
+                    NDDataViewMut::$v(background),
+                    NDDataViewMut::$v(ramp_buf),
+                    NDDataViewMut::$v(peak_buf),
                 ) => compute_typed(
                     raw, background, ramp_buf, peak_buf, sine_state, layout, sim_mode, gains,
                     peak, sine, offset, noise, use_background, reset, rng,
@@ -495,7 +495,7 @@ fn compute_typed<T: PixelCast>(
 mod tests {
     use super::*;
     use ad_core_rs::driver::ColorMode;
-    use ad_core_rs::ndarray::NDDataBuffer;
+    use ad_core_rs::ndarray::{NDDataBuffer, NDDataView};
     use ad_core_rs::pixel_cast::with_buffer;
     use rand::SeedableRng;
 
@@ -699,10 +699,10 @@ mod tests {
     fn test_offset_noise_mode() {
         let layout = mono_layout(8, 8);
         let n = layout.num_elements();
-        let mut raw = NDDataBuffer::F64(vec![0.0; n]);
-        let mut bg = NDDataBuffer::F64(vec![0.0; n]);
-        let mut ramp = NDDataBuffer::F64(vec![0.0; n]);
-        let mut peak = NDDataBuffer::F64(vec![0.0; n]);
+        let mut raw = NDDataBuffer::from_vec::<f64>(vec![0.0; n]);
+        let mut bg = NDDataBuffer::from_vec::<f64>(vec![0.0; n]);
+        let mut ramp = NDDataBuffer::from_vec::<f64>(vec![0.0; n]);
+        let mut peak = NDDataBuffer::from_vec::<f64>(vec![0.0; n]);
         let mut sine_state = SineState::new();
         let mut rng = StdRng::seed_from_u64(42);
         let gains = default_gains();
@@ -743,10 +743,10 @@ mod tests {
         };
 
         compute_frame(
-            &mut raw,
-            &mut bg,
-            &mut ramp,
-            &mut peak,
+            raw.view_mut(),
+            bg.view_mut(),
+            ramp.view_mut(),
+            peak.view_mut(),
             &mut sine_state,
             &layout,
             SimMode::OffsetNoise,
@@ -760,7 +760,7 @@ mod tests {
             &mut rng,
         );
 
-        if let NDDataBuffer::F64(v) = &raw {
+        if let NDDataView::F64(v) = raw.view() {
             // All values should be between offset and offset+noise
             for &x in v.iter() {
                 assert!(x >= 10.0 && x <= 15.0, "value {} out of range", x);
@@ -850,10 +850,10 @@ mod tests {
                         let use_background = noise != 0.0 || offset != 0.0;
                         for frame in 0..3 {
                             compute_frame(
-                                &mut raw,
-                                &mut bg,
-                                &mut ramp,
-                                &mut peak_buf,
+                                raw.view_mut(),
+                                bg.view_mut(),
+                                ramp.view_mut(),
+                                peak_buf.view_mut(),
                                 &mut sine_state,
                                 &layout,
                                 sim_mode,
@@ -874,12 +874,12 @@ mod tests {
                             // Rounded to 1e-3, far above the ULPs by which
                             // libm sin differs between MSVC and glibc.
                             let rounded = |x: f64| ((x * 1e3).round() as i64).to_le_bytes();
-                            match &raw {
-                                NDDataBuffer::F32(v) => {
+                            match raw.view() {
+                                NDDataView::F32(v) => {
                                     v.iter().for_each(|&x| feed(&rounded(x as f64)))
                                 }
-                                NDDataBuffer::F64(v) => v.iter().for_each(|&x| feed(&rounded(x))),
-                                raw => with_buffer!(raw, |v| {
+                                NDDataView::F64(v) => v.iter().for_each(|&x| feed(&rounded(x))),
+                                _ => with_buffer!(raw, |v| {
                                     v.iter().for_each(|x| feed(&x.to_le_bytes()))
                                 }),
                             }

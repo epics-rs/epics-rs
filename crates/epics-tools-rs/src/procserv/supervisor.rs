@@ -38,6 +38,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::{DateTime, Local};
+use epics_base_rs::runtime::task::{self, Instant, Sleep};
 use tokio::sync::mpsc;
 
 use crate::procserv::child::{ChildEvent, ChildExit, ChildHandle, ChildSpec};
@@ -189,7 +190,10 @@ struct SupervisorState {
 /// emitted by [`SupervisorState::respawn_child`] when it fires (C
 /// processFactory), so nothing else needs carrying here.
 struct PendingRestart {
-    at: tokio::time::Instant,
+    /// The deadline as its own timer, armed once per schedule and polled in
+    /// place by every event-loop pass, so a pass that does not reschedule
+    /// arms none.
+    due: Sleep,
 }
 
 struct ClientEntry {
@@ -420,7 +424,7 @@ impl SupervisorState {
             if self
                 .pending_restart
                 .as_ref()
-                .is_some_and(|p| p.at <= tokio::time::Instant::now())
+                .is_some_and(|p| p.due.deadline() <= Instant::now())
             {
                 self.pending_restart = None;
                 // `respawn_child` emits C's `@@@ Restarting child`
@@ -433,11 +437,6 @@ impl SupervisorState {
                 }
             }
 
-            // Snapshot the pending-restart deadline (Copy) before
-            // borrowing `self.child` mutably below, so the timer arm
-            // borrows only this local — not `self`.
-            let restart_at = self.pending_restart.as_ref().map(|p| p.at);
-
             // Build a future that resolves when the child sends an
             // event — only if there IS a child. When there isn't,
             // we use `pending` so the select arm is always polling
@@ -445,18 +444,6 @@ impl SupervisorState {
             let child_event = async {
                 match self.child.as_mut() {
                     Some(slot) => slot.rx.recv().await,
-                    None => std::future::pending().await,
-                }
-            };
-
-            // Resolves when the crash-loop holdoff elapses; `pending`
-            // (never resolves) when no restart is scheduled. This is the
-            // non-blocking equivalent of C's poll-loop re-checking
-            // `now >= _restartTime` every iteration — input arms above
-            // are still serviced while we wait.
-            let restart_due = async {
-                match restart_at {
-                    Some(at) => tokio::time::sleep_until(at).await,
                     None => std::future::pending().await,
                 }
             };
@@ -503,7 +490,7 @@ impl SupervisorState {
                 //    priority so a keystroke (arm 1) still preempts the
                 //    wakeup; the relaunch itself is not owned here.
                 //    Parks forever when no restart is scheduled.
-                _ = restart_due => {}
+                _ = restart_due(&mut self.pending_restart) => {}
             }
         }
     }
@@ -574,7 +561,7 @@ impl SupervisorState {
                             // C's scan order) from signalling a child that C
                             // has not spawned yet.
                             self.pending_restart = Some(PendingRestart {
-                                at: tokio::time::Instant::now(),
+                                due: Sleep::until(Instant::now()),
                             });
                         }
                         Action::ToggleRestartMode => {
@@ -994,7 +981,7 @@ impl SupervisorState {
             None => self.config.holdoff,
         };
         self.pending_restart = Some(PendingRestart {
-            at: tokio::time::Instant::now() + remaining,
+            due: Sleep::until(task::deadline_from_now(remaining)),
         });
     }
 
@@ -1058,6 +1045,17 @@ impl SupervisorState {
             proc_started: Local::now(),
             startup_dir: ".".to_string(),
         }
+    }
+}
+
+/// Resolves when the crash-loop holdoff elapses; never when no restart is
+/// scheduled. This is the non-blocking equivalent of C's poll-loop
+/// re-checking `now >= _restartTime` every iteration — the event loop's input
+/// arms are still serviced while we wait.
+async fn restart_due(pending: &mut Option<PendingRestart>) {
+    match pending {
+        Some(p) => (&mut p.due).await,
+        None => std::future::pending().await,
     }
 }
 
@@ -1441,6 +1439,26 @@ mod tests {
         );
     }
 
+    /// `--holdoff` takes any u64 of seconds. C reads it through `atoi` into an
+    /// int (procServ.cc:316) and adds it to `time(0)`; a deadline past the
+    /// clock's range must saturate, not panic the supervisor on its first
+    /// restart.
+    #[tokio::test]
+    async fn an_unbounded_holdoff_schedules_without_overflow() {
+        use epics_base_rs::runtime::task::Instant;
+        let mut cfg = min_config();
+        cfg.holdoff = Duration::from_secs(u64::MAX);
+        let mut state = SupervisorState::for_test(cfg);
+        state.schedule_restart(None);
+        let due = state
+            .pending_restart
+            .as_ref()
+            .expect("scheduled")
+            .due
+            .deadline();
+        assert!(due > Instant::now() + Duration::from_secs(365 * 86_400));
+    }
+
     #[tokio::test]
     async fn spawn_retry_gives_up_when_cap_exceeded() {
         let mut cfg = min_config();
@@ -1465,6 +1483,73 @@ mod tests {
         assert!(
             matches!(err, ProcServError::RestartLimitExceeded { .. }),
             "exceeding the cap must surface RestartLimitExceeded, got: {err:?}"
+        );
+    }
+
+    /// A loop pass that does not reschedule the relaunch arms no timer: the
+    /// holdoff sleep is armed once and held across passes. Driven on a thread
+    /// with no runtime, so it lands on the background timer, whose arms are
+    /// counted.
+    #[test]
+    fn a_pass_that_keeps_the_holdoff_arms_no_timer() {
+        use super::PendingRestart;
+        use crate::procserv::client::{ClientId, InboundEvent};
+        use epics_base_rs::runtime::task::{self, Instant, Sleep};
+
+        // Only `for_test`'s SIGHUP registration needs a runtime.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut cfg = min_config();
+        cfg.keys = full_keys();
+        let mut state = {
+            let _entered = rt.enter();
+            SupervisorState::for_test(cfg)
+        };
+        state.sighup = None;
+        let tx = state.inbound_tx.clone();
+        let base = task::background_timer_scheduled_total();
+        let supervisor = std::thread::spawn(move || {
+            task::block_on_sync(async move {
+                state.pending_restart = Some(PendingRestart {
+                    due: Sleep::until(Instant::now() + Duration::from_secs(3600)),
+                });
+                state.event_loop().await
+            })
+            .expect("a plain thread parks")
+        });
+        // The holdoff is armed by the first pass that polls it.
+        let started = std::time::Instant::now();
+        while task::background_timer_scheduled_total() == base {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "holdoff never armed"
+            );
+            std::thread::yield_now();
+        }
+        let before = task::background_timer_scheduled_total();
+        let stranger = ClientId::new();
+        for _ in 0..8 {
+            tx.try_send((stranger, InboundEvent::Disconnected)).unwrap();
+            // Drained, then a moment to park on the holdoff arm again.
+            while tx.capacity() < tx.max_capacity() {
+                std::thread::yield_now();
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        tx.try_send((
+            stranger,
+            InboundEvent::Data {
+                bytes: vec![full_keys().quit.unwrap()],
+            },
+        ))
+        .unwrap();
+        assert_eq!(supervisor.join().unwrap().unwrap(), 0);
+        assert_eq!(
+            task::background_timer_scheduled_total() - before,
+            0,
+            "timers armed by passes that kept the holdoff"
         );
     }
 }

@@ -106,7 +106,7 @@
 // started it yet.
 pub mod audit;
 /// CA links for record INP/OUT fields — resolves ` CA`-modified /
-/// `ca://` record link fields to a live CA client (monitor-backed
+/// CA record link fields to a live CA client (monitor-backed
 /// cache). Mirrors C `dbCa.c` / `dbCaLink`. Compiled whenever the client
 /// is: having `epics-ca-rs` with its default features is enough to
 /// resolve CA links, no separate opt-in.

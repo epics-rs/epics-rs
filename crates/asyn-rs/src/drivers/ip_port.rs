@@ -8,9 +8,9 @@ use std::net::{TcpStream, UdpSocket};
 use std::time::Duration;
 
 use epics_libcom_rs::runtime::socket;
+use epics_libcom_rs::runtime::time::deadline_from_now;
 
 use super::option_parse::{invalid_option_value, parse_yn_option, sscanf_int};
-use super::wait_millis;
 use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::exception::AsynException;
 use crate::interpose::com::{ComInterpose, ComPortOptions};
@@ -307,10 +307,11 @@ const SEND_DONTWAIT: libc::c_int = libc::MSG_DONTWAIT;
 /// (`Ok(false)`).
 ///
 /// `Ok(false)` is C's `asynTimeout`; it does NOT prove `deadline` has passed.
-/// The interval given to `poll` is [`wait_millis`] of the budget still left,
-/// so a sub-millisecond remainder truncates and the wait can end up to 1 ms
-/// early. That is C's own arithmetic — `writePollmsec = (int)(timeout *
-/// 1000.0)` (`drvAsynIPPort.c:662-664`) — and C likewise returns `asynTimeout`
+/// The interval given to `poll` is [`socket::poll_ready`]'s whole
+/// milliseconds of the budget still left, so its sub-millisecond part
+/// truncates and the wait can end up to 1 ms early. That is C's own
+/// arithmetic — `writePollmsec = (int)(timeout * 1000.0)`
+/// (`drvAsynIPPort.c:662-664`) — and C likewise returns `asynTimeout`
 /// straight off `pollstatus == 0` without re-reading any deadline (`:697`).
 /// Reproducing the early edge is deliberate; a caller needing the deadline
 /// held exactly must re-check it, not this trait.
@@ -375,14 +376,6 @@ pub(super) trait SendWithoutParking {
 /// `setNonBlock` there and bounds each transfer by `SO_*TIMEO`.
 pub(super) const OWNED_NONBLOCKING: bool = true;
 
-/// [`wait_millis`] as `poll`'s interval; `None` is its own `-1`.
-fn poll_millis(timeout: Option<Duration>) -> i32 {
-    match timeout {
-        Some(t) => wait_millis(t).min(i32::MAX as u128) as i32,
-        None => -1,
-    }
-}
-
 /// Make the `read`/`recv_from` that follows return within `timeout`.
 ///
 /// The read-side counterpart to [`WaitWritable`], and it moved here for the
@@ -407,7 +400,7 @@ impl<T: socket::Pollable> BoundNextRead for T {
     fn bound_next_read(&self, timeout: Option<Duration>) {
         // `None` is C's negative timeout: `readPollmsec = -1`
         // (drvAsynIPPort.c:794), which is `poll`'s own "no timeout".
-        let _ = socket::poll_ready(self, socket::Readiness::Readable, poll_millis(timeout));
+        let _ = socket::poll_ready(self, socket::Readiness::Readable, timeout);
     }
 }
 
@@ -424,7 +417,7 @@ impl<T: socket::Pollable> WaitWritable for T {
                 }
                 None => None,
             };
-            match socket::poll_ready(self, socket::Readiness::Writable, poll_millis(remaining)) {
+            match socket::poll_ready(self, socket::Readiness::Writable, remaining) {
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
                 outcome => return outcome,
             }
@@ -529,7 +522,7 @@ pub(super) fn write_with_retry(
     while offset < data.len() {
         // `poll == None` is C's negative timeout — an unbounded wait, which
         // only the caller's own budget (`cap`) can cut short.
-        let deadline = match (poll.map(|p| std::time::Instant::now() + p), cap) {
+        let deadline = match (poll.map(deadline_from_now), cap) {
             (Some(pass), Some(cap)) => Some(pass.min(cap)),
             (Some(pass), None) => Some(pass),
             (None, cap) => cap,
@@ -830,7 +823,7 @@ impl IpIoState {
                 // C polls `POLLOUT` before the datagram too — `writeIt` shares
                 // one loop across `SOCK_DGRAM` and `SOCK_STREAM`
                 // (`drvAsynIPPort.c:680-702`).
-                let deadline = poll.map(|p| std::time::Instant::now() + p);
+                let deadline = poll.map(deadline_from_now);
                 match socket.wait_writable(deadline) {
                     Ok(true) => {}
                     Ok(false) => {
@@ -1376,7 +1369,11 @@ pub(crate) fn fill_until_refused(sock: &TcpStream) {
             // A refusal is the pipe being full only once it stays: in-flight
             // bytes reaching the peer, or Darwin's buffer auto-tuning, can
             // open room after it, and the stalled write would then fit.
-            match socket::poll_ready(sock, socket::Readiness::Writable, 50) {
+            match socket::poll_ready(
+                sock,
+                socket::Readiness::Writable,
+                Some(Duration::from_millis(50)),
+            ) {
                 Ok(false) => return,
                 Ok(true) => continue,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -1456,7 +1453,7 @@ fn sock_err_cause(e: &AsynError) -> String {
 /// floor. A positive sub-millisecond timeout passes through verbatim,
 /// which is what the socket-option sites want; the sites that then hand the
 /// budget to `poll` round it up to a whole tick through
-/// [`super::wait_millis`], because truncating it there would turn the wait
+/// [`socket::poll_ready`], because truncating it there would turn the wait
 /// into a non-blocking probe.
 pub(crate) fn socket_poll_timeout(timeout: Option<Duration>) -> Option<Duration> {
     match timeout {
@@ -2381,10 +2378,10 @@ mod tests {
     fn new_configured_no_auto_connect_matches_the_oracle_port_model() {
         let drv = DrvAsynIPPort::new_configured("ORACLEASYN", "localhost:1", true, false).unwrap();
 
-        // (1) Interface set — the exact octet-transport capabilities, no extras.
+        // (1) Interface set — exactly the octet transport's, no extras.
         assert_eq!(
-            drv.capabilities(),
-            crate::interfaces::octet_transport_capabilities()
+            drv.base().interface_mask(),
+            crate::interfaces::InterfaceMask::OCTET_TRANSPORT
         );
 
         // (2) Disconnected, noAutoConnect — nothing arms the reconnect timer,
@@ -3523,7 +3520,7 @@ mod tests {
         // as C's `pollmsec = -1` (DRV-42).
         assert_eq!(socket_poll_timeout(None), None);
         // Positive timeouts pass through verbatim; the whole-millisecond
-        // rounding the poll sites need belongs to `wait_millis`, not here.
+        // rounding the poll sites need belongs to `socket::poll_ready`, not here.
         assert_eq!(
             socket_poll_timeout(Some(Duration::from_micros(500))),
             Some(Duration::from_micros(500))
@@ -3534,34 +3531,51 @@ mod tests {
         );
     }
 
-    /// D5 family: the IP transports reach `poll` through the same
-    /// `Duration` -> milliseconds conversion the serial driver did, and
-    /// truncating a 500 us budget to 0 made the read bound non-blocking — the
-    /// recv that follows then reports asynTimeout without the socket ever
-    /// having been waited on. `poll` waits at least its interval, so the call
-    /// cannot return in the few microseconds the truncated form took.
+    /// The read bound hands `poll_ready` its budget unrounded, so 500 us
+    /// polls 1 ms rather than probing. Unix only: WSAPoll may end a 1 ms wait
+    /// at 386 us (fork run 40470677640).
+    #[cfg(unix)]
     #[test]
-    fn bound_next_read_waits_a_whole_tick_for_a_sub_millisecond_timeout() {
+    fn a_sub_millisecond_read_bound_polls_a_whole_millisecond() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let client = TcpStream::connect(addr).unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let _accepted = listener.accept().unwrap();
 
         let start = std::time::Instant::now();
         client.bound_next_read(Some(Duration::from_micros(500)));
-        let elapsed = start.elapsed();
-
+        let took = start.elapsed();
         assert!(
-            elapsed >= Duration::from_micros(400),
-            "a 500 us read bound must wait, not poll non-blocking: {elapsed:?}"
+            took >= Duration::from_millis(1),
+            "a 500 us read bound must poll, not probe: took {took:?}"
+        );
+    }
+
+    /// The write side of the same rule, on a socket that takes no bytes.
+    #[cfg(unix)]
+    #[test]
+    fn a_sub_millisecond_write_deadline_polls_a_whole_millisecond() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let _accepted = listener.accept().unwrap();
+        fill_until_refused(&client);
+
+        let start = std::time::Instant::now();
+        let ready = client
+            .wait_writable(Some(start + Duration::from_micros(900)))
+            .unwrap();
+        let took = start.elapsed();
+        assert!(!ready, "a filled socket must not turn writable");
+        assert!(
+            took >= Duration::from_millis(1),
+            "a 900 us write deadline must poll, not probe: took {took:?}"
         );
     }
 
     #[test]
     fn zero_timeout_read_polls_without_disconnect() {
         // C drvAsynIPPort.c::readIt: a `timeout == 0` read becomes a 1 ms
-        // poll (line 742) and the disconnect-on-read-timeout teardown is
-        // gated on `timeout > 0` (line 799). So a zero-timeout read of a
+        // poll (:792-793) and the disconnect-on-read-timeout teardown is
+        // gated on `timeout > 0` (:853). So a zero-timeout read of a
         // silent socket must return asynTimeout WITHOUT a hard
         // Duration::ZERO error and WITHOUT tearing the connection down,
         // even with disconnectOnReadTimeout enabled.
@@ -3734,6 +3748,37 @@ mod tests {
             "the retry bound did not hold: {:?}",
             started.elapsed()
         );
+    }
+
+    /// A driver may fill `AsynUser::timeout` with `Duration::MAX`: its poll
+    /// deadline never fires rather than overflowing `Instant`.
+    #[test]
+    fn a_duration_max_poll_writes() {
+        let peer = DribblePeer {
+            chunk: 6,
+            delay: Duration::ZERO,
+        };
+        let n = write_with_retry(&peer, b"abcdef", Some(Duration::MAX), None).unwrap();
+        assert_eq!(n, 6);
+    }
+
+    /// The same for a datagram, whose `POLLOUT` wait builds its own deadline.
+    #[test]
+    fn a_duration_max_timeout_sends_a_datagram() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let server_port = server.local_addr().unwrap().port();
+        let mut drv =
+            DrvAsynIPPort::new("udp_max", &format!("127.0.0.1:{server_port} udp")).unwrap();
+        drv.connect(&AsynUser::default()).unwrap();
+
+        let mut user = AsynUser::new(0).with_timeout(Duration::MAX);
+        assert_eq!(drv.write_octet(&mut user, b"ping").unwrap(), 4);
+        let mut buf = [0u8; 8];
+        let (n, _) = server.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"ping");
     }
 
     /// The caller's own budget still caps the transfer where one exists — the
@@ -4049,6 +4094,21 @@ mod tests {
         assert!(
             took >= Duration::from_millis(950) && took < Duration::from_millis(1400),
             "asynSetAutoConnectTimeout 1 bounds the connect at 1 s, took {took:?}"
+        );
+        assert_eq!(
+            err.message(),
+            format!("Can't connect to {device}: {}", connect_in_progress_text())
+        );
+
+        // Not C's 0 ms connect probe: a sub-millisecond bound polls 1 ms.
+        // WSAPoll may end that 1 ms at 386 us (fork run 40470677640).
+        set_auto_connect_timeout(0.0005);
+        let (_took, err) = attempt();
+        set_auto_connect_timeout(0.5);
+        #[cfg(unix)]
+        assert!(
+            _took >= Duration::from_millis(1),
+            "asynSetAutoConnectTimeout 0.0005 must poll, not probe: took {_took:?}"
         );
         assert_eq!(
             err.message(),
@@ -4408,20 +4468,25 @@ mod tests {
     }
 
     /// C binds a fixed local port with no SO_REUSEADDR (drvAsynIPPort.c:499-509),
-    /// so the client socket carries none.
+    /// so the client socket carries none. No hold can share that bind, so a
+    /// local port taken before the driver binds it is drawn again.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_local_port_bind_sets_no_reuse_address() {
         use std::os::fd::AsRawFd;
         let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let remote = server.local_addr().unwrap().port();
-        let local = std::net::TcpListener::bind("0.0.0.0:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let mut drv = DrvAsynIPPort::new("iptest", &format!("127.0.0.1:{remote}:{local}")).unwrap();
-        let stream = drv.connect_tcp().unwrap();
+        let (stream, local) = named_port::on_a_named_port(|local| {
+            let mut drv =
+                DrvAsynIPPort::new("iptest", &format!("127.0.0.1:{remote}:{local}")).unwrap();
+            match drv.connect_tcp() {
+                Ok(stream) => Some((stream, local)),
+                Err(e) if e.message() == "unable to bind to local port: Address already in use" => {
+                    None
+                }
+                Err(e) => panic!("connect from {local}: {e:?}"),
+            }
+        });
         assert_eq!(stream.local_addr().unwrap().port(), local);
         let mut on: libc::c_int = -1;
         let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;

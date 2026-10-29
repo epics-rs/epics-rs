@@ -3,6 +3,19 @@ use ad_core_rs::ndarray::NDDataType;
 use ad_core_rs::plugin::channel::NDArrayOutput;
 use sim_detector::create_sim_detector;
 
+/// Frames come on the driver's clock, which no fixed sleep bounds: Windows
+/// rounds each 1 ms exposure and period wait up to its ~15.6 ms timer tick.
+fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !cond() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
 #[test]
 fn test_single_mode_one_frame() {
     let rt = create_sim_detector(
@@ -31,14 +44,9 @@ fn test_single_mode_one_frame() {
         .write_int32_blocking(rt.ad_params.acquire, 0, 1)
         .unwrap();
 
-    std::thread::sleep(std::time::Duration::from_millis(500));
-
-    let acquire = handle.read_int32_blocking(rt.ad_params.acquire, 0).unwrap();
-    assert_eq!(acquire, 0);
-    let counter = handle
-        .read_int32_blocking(rt.ad_params.base.array_counter, 0)
-        .unwrap();
-    assert_eq!(counter, 1);
+    let read = |idx| handle.read_int32_blocking(idx, 0).unwrap();
+    wait_until("Single mode to end", || read(rt.ad_params.acquire) == 0);
+    assert_eq!(read(rt.ad_params.base.array_counter), 1);
 }
 
 #[test]
@@ -73,30 +81,26 @@ fn test_mode_switch_during_continuous() {
         .write_int32_blocking(rt.ad_params.acquire, 0, 1)
         .unwrap();
 
-    std::thread::sleep(std::time::Duration::from_millis(30));
+    let counter = || {
+        handle
+            .read_int32_blocking(rt.ad_params.base.array_counter, 0)
+            .unwrap()
+    };
+    wait_until("a LinearRamp frame", || counter() >= 1);
 
     // Switch to Peaks mode
     handle
         .write_int32_blocking(rt.sim_params.sim_mode, 0, 1)
         .unwrap();
 
-    std::thread::sleep(std::time::Duration::from_millis(30));
+    // The frame in flight at the switch may still be a LinearRamp one.
+    let switched = counter();
+    wait_until("a Peaks frame", || counter() >= switched + 2);
 
     // Stop
     handle
         .write_int32_blocking(rt.ad_params.acquire, 0, 0)
         .unwrap();
-
-    std::thread::sleep(std::time::Duration::from_millis(50));
-
-    let counter = handle
-        .read_int32_blocking(rt.ad_params.base.array_counter, 0)
-        .unwrap();
-    assert!(
-        counter >= 2,
-        "should have produced frames across mode switch, got {}",
-        counter
-    );
 }
 
 #[test]
@@ -130,14 +134,10 @@ fn test_rgb1_mode_acquisition() {
         .write_int32_blocking(rt.ad_params.acquire, 0, 1)
         .unwrap();
 
-    std::thread::sleep(std::time::Duration::from_millis(500));
-
-    let counter = handle
-        .read_int32_blocking(rt.ad_params.base.array_counter, 0)
-        .unwrap();
-    assert_eq!(counter, 1);
-    // The frame's ColorMode attribute (simDetector.cpp:171) sizes it as RGB1.
     let read = |idx| handle.read_int32_blocking(idx, 0).unwrap();
+    wait_until("Single mode to end", || read(rt.ad_params.acquire) == 0);
+    assert_eq!(read(rt.ad_params.base.array_counter), 1);
+    // The frame's ColorMode attribute (simDetector.cpp:171) sizes it as RGB1.
     let b = &rt.ad_params.base;
     assert_eq!(
         (

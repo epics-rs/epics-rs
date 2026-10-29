@@ -28,9 +28,9 @@ use std::sync::{Arc, Mutex};
 
 use epics_base_rs::error::CaResult;
 use epics_base_rs::server::database::{LinkMetadata, LinkPutOp, LinkRef, LinkSet, PvDatabase};
-use epics_base_rs::server::record::{FieldDesc, ProcessOutcome, Record};
+use epics_base_rs::server::record::{FieldDesc, ProcessOutcome, Record, Special};
 use epics_base_rs::server::records::acalcout::AcalcoutRecord;
-use epics_base_rs::types::EpicsValue;
+use epics_base_rs::types::{DbFieldType, EpicsValue};
 
 /// OUT-link target whose VAL reads back as a SCALAR (`no_elements == 1`
 /// in C terms). Records the raw value shape each write delivers.
@@ -62,7 +62,8 @@ impl Record for ScalarProbe {
     }
 }
 
-/// OUT-link target whose VAL reads back as an ARRAY (`no_elements > 1`).
+/// OUT-link target whose VAL is an `SPC_DBADDR` array (`no_elements > 1`):
+/// C counts no other field as more than one element.
 struct ArrayProbe {
     last: Arc<Mutex<Option<EpicsValue>>>,
 }
@@ -87,9 +88,15 @@ impl Record for ArrayProbe {
         Ok(())
     }
     fn declared_fields(&self) -> &'static [FieldDesc] {
-        &[]
+        ARRAY_VAL
     }
 }
+
+static ARRAY_VAL: &[FieldDesc] = &[FieldDesc {
+    special: Special::DbAddr,
+    declared_special: Special::DbAddr,
+    ..FieldDesc::new("VAL", DbFieldType::Double, false)
+}];
 
 /// External lset: reports a configurable element count via
 /// `link_metadata` (the `dbCaGetNelements` analogue) and records what
@@ -287,7 +294,7 @@ async fn an_external_array_target_gets_the_array_buffer() {
     )
     .await;
     db.process_cp_links_on_connect().await;
-    db.add_record("AC", Box::new(invalid_ivov_record(1, 3, "ca://EXT")))
+    db.add_record("AC", Box::new(invalid_ivov_record(1, 3, "EXT CA")))
         .await
         .unwrap();
 
@@ -317,7 +324,7 @@ async fn an_unresolved_external_target_defaults_to_the_scalar_buffer() {
     )
     .await;
     db.process_cp_links_on_connect().await;
-    db.add_record("AC", Box::new(invalid_ivov_record(1, 3, "ca://EXT")))
+    db.add_record("AC", Box::new(invalid_ivov_record(1, 3, "EXT CA")))
         .await
         .unwrap();
 

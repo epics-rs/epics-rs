@@ -13,7 +13,7 @@
 //! | `FITMQ(y, mask [,c][,b][,a])` | scalar arguments the caller named| 4-element coeff array |
 //!
 //! Every expectation below is the output of a driver compiled from
-//! `/home/stevek/work/epics-modules/calc/calcApp/src/{aCalcPerform,aCalcPostfix,calcUtil}.c`.
+//! `$EPICS_MODULES/calc/calcApp/src/{aCalcPerform,aCalcPostfix,calcUtil}.c`.
 
 use epics_base_rs::calc::{ArrayInputs, ArrayStackValue, CalcError, acalc};
 

@@ -77,7 +77,7 @@ async fn a_plain_monitor_carries_min_len_one_elements() {
 
     connect(&client, "LW.VAL")
         .await
-        .put(&EpicsValue::String("".into()))
+        .put_with_timeout(&EpicsValue::String("".into()), fact_budget::FACT_BUDGET)
         .await
         .expect("put LW");
 

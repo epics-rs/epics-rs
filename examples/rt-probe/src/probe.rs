@@ -188,10 +188,10 @@ async fn boot_ioc_on(ca_port: u16) -> Result<Ioc, Box<dyn std::error::Error>> {
         std::env::set_var("EPICS_CAS_BEACON_ADDR_LIST", "127.0.0.1");
     }
     let macros = std::collections::HashMap::new();
-    // dbCa, which every C IOC links.
+    // dbCa, which every C IOC links, and pvxs's `lsetPVX`.
     let reactor =
         epics_base_rs::runtime::task::Reactor::current().expect("boot runs on the IOC's reactor");
-    let (db, _autosave) = IocBuilder::new()
+    let (db, _autosave) = epics_pva_rs::server::pvxs_ioc_builder()
         .register_link_type("ca", move |db| {
             epics_ca_rs::calink::calink_link_set_install(db, reactor)
         })
@@ -479,7 +479,8 @@ async fn ca_latency(samples: usize, hogs: usize) -> Result<(), Box<dyn std::erro
     for i in 0..samples {
         let v = (i + 1) as f64;
         let t0 = Instant::now();
-        ch.put(&EpicsValue::Double(v)).await?;
+        ch.put_with_timeout(&EpicsValue::Double(v), Duration::from_secs(30))
+            .await?;
         // Wait for the monitor to deliver exactly this value.
         loop {
             match tokio::time::timeout(Duration::from_secs(2), mon.recv()).await {

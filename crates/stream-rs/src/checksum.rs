@@ -485,7 +485,7 @@ impl StreamFormatConverter for ChecksumConverter {
         let read_byte = |i: usize| -> Result<u32, isize> {
             if fmt.flags & ZERO_FLAG != 0 {
                 // ASCII
-                match c_sscanf_hex(input.ptr((cursor + 2 * i) as isize), 2) {
+                match c_sscanf_hex(input.ptr((cursor + 2 * i) as isize)) {
                     Some((v, _)) => Ok(v),
                     None => {
                         debug!(

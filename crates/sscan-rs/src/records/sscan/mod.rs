@@ -26,7 +26,7 @@ use epics_base_rs::server::database::AsyncDbHandle;
 use epics_base_rs::server::record::dbd_generated::DB_COMMON_FIELDS;
 use epics_base_rs::server::record::{
     CycleHooks, DeclaredFields, EventMask, FieldDesc, FieldIx, FieldMetadataOverride,
-    ProcessContext, ProcessOutcome, Record, ScanType, Special,
+    InitLinkReads, OwnFrame, ProcessContext, ProcessOutcome, Record, ScanType, Special,
 };
 use epics_base_rs::types::{DbFieldType, EpicsValue, PvString, RecordName, WallTime};
 
@@ -1247,7 +1247,7 @@ impl SscanRecord {
         };
         let name = self.name.clone();
         epics_base_rs::runtime::task::spawn_background(self.prio, async move {
-            with_sscan(&h, &name, f);
+            with_sscan(&h, &name, |s, _| f(s));
         });
     }
 
@@ -1265,10 +1265,9 @@ impl SscanRecord {
             return;
         };
         let name = self.name.clone();
-        let wait = std::time::Duration::from_secs_f64(f64::from(secs).max(0.0));
-        epics_base_rs::runtime::task::spawn_background(self.prio, async move {
-            epics_base_rs::runtime::task::sleep_background(wait).await;
-            with_sscan(&h, &name, |s| {
+        let wait = epics_base_rs::runtime::time::duration_from_secs(f64::from(secs));
+        epics_base_rs::runtime::task::spawn_background_after(self.prio, wait, async move {
+            with_sscan(&h, &name, |s, _| {
                 if s.dly_gen == generation {
                     s.delay_callback();
                 }
@@ -1293,10 +1292,14 @@ impl SscanRecord {
 /// C's callbacks reach the record by pointer and do not take its lock
 /// (`sscanRecord.c:2646` leaves `dbScanLock` commented out); the port takes
 /// it, which is safe because no callback here waits on the record's pass.
-pub(crate) fn with_sscan(h: &AsyncDbHandle, name: &str, f: impl FnOnce(&mut SscanRecord)) {
-    h.with_record(name, |r| {
+pub(crate) fn with_sscan(
+    h: &AsyncDbHandle,
+    name: &str,
+    f: impl FnOnce(&mut SscanRecord, OwnFrame<'_>),
+) {
+    h.with_own(name, |r, own| {
         if let Some(s) = r.as_any_mut().and_then(|a| a.downcast_mut::<SscanRecord>()) {
-            f(s);
+            f(s, own);
         }
     });
 }
@@ -1306,30 +1309,29 @@ impl Record for SscanRecord {
         "sscan"
     }
 
+    /// Pass 1 is [`Self::init_record_own`]'s.
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
         if pass == 0 {
             self.init_pass0();
-        } else {
-            self.init_pass1();
         }
         Ok(())
     }
 
-    fn process(&mut self) -> CaResult<ProcessOutcome> {
+    fn init_record_own(&mut self, _reads: &mut InitLinkReads, own: OwnFrame<'_>) -> CaResult<()> {
+        self.init_pass1(own);
+        Ok(())
+    }
+
+    fn process_own(&mut self, own: OwnFrame<'_>) -> CaResult<ProcessOutcome> {
         self.fire_fwd = false;
-        Ok(if self.process_pass() {
+        Ok(if self.process_pass(own) {
             ProcessOutcome::complete()
         } else {
             ProcessOutcome::complete_no_emit()
         })
     }
 
-    fn special(
-        &mut self,
-        field: &str,
-        after: bool,
-        _common: &epics_base_rs::server::record::CommonFields,
-    ) -> CaResult<()> {
+    fn special_own(&mut self, field: &str, after: bool, own: OwnFrame<'_>) -> CaResult<()> {
         let Some(o) = own_index(field) else {
             return Ok(());
         };
@@ -1339,7 +1341,7 @@ impl Record for SscanRecord {
             Special::Mod | Special::Record(_) => {}
             _ => return Ok(()),
         }
-        if self.special_field(o, after) {
+        if self.special_field(own, o, after) {
             Ok(())
         } else {
             Err(CaError::PutDisabled(field.into()))
@@ -1374,6 +1376,10 @@ impl Record for SscanRecord {
         Some(self.mpts.max(0) as u32)
     }
 
+    fn dbaddr_capacity_inputs(&self) -> Option<&'static [&'static str]> {
+        Some(&[])
+    }
+
     fn field_metadata_override(&self, field: &str) -> Option<FieldMetadataOverride> {
         let (units, precision, limits) = self.metadata(own_index(field)?);
         Some(FieldMetadataOverride {
@@ -1389,6 +1395,7 @@ impl Record for SscanRecord {
         CycleHooks::HAND_POSTED
             .union(CycleHooks::STAMP_REQUEST)
             .union(CycleHooks::CONTEXT)
+            .union(CycleHooks::OWN_FRAME)
     }
 
     fn set_process_context(&mut self, ctx: &ProcessContext) {
@@ -1482,7 +1489,7 @@ impl SscanRecord {
     }
 
     /// `init_record` pass 1 (`sscanRecord.c:867-930`).
-    fn init_pass1(&mut self) {
+    fn init_pass1(&mut self, own: OwnFrame<'_>) {
         self.last_scan_end = Instant::now();
         if self.npts > self.mpts {
             self.npts = self.mpts;
@@ -1506,7 +1513,7 @@ impl SscanRecord {
                 self.nv[i] = NO_PV;
             } else if !self.pvn[i].as_bytes().is_empty() {
                 self.nv[i] = PV_NC;
-                self.lookup_pv(i);
+                self.lookup_pv(own, i);
             } else {
                 self.nv[i] = NO_PV;
             }
@@ -1523,11 +1530,8 @@ pub(crate) fn is_blank(s: &PvString) -> bool {
     !b.is_empty() && b.iter().all(|c| c.is_ascii_whitespace())
 }
 
-/// C `NINT`.
-pub(crate) fn nint(x: f64) -> f64 {
-    if x >= 0.0 {
-        (x + 0.5).trunc()
-    } else {
-        (x - 0.5).trunc()
-    }
+/// C `NINT(f) (long)((f)>0 ? (f)+0.5 : (f)-0.5)`. The `(long)` cast maps
+/// NaN and anything past `long` to `LONG_MIN`, which C then serves.
+pub(crate) fn nint(x: f64) -> i64 {
+    epics_base_rs::types::c_cast::f64_to_c_long(if x > 0.0 { x + 0.5 } else { x - 0.5 })
 }

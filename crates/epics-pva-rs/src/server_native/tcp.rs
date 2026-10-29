@@ -28,6 +28,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use epics_base_rs::runtime::task::Period;
 use epics_base_rs::types::RecordName;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -234,7 +235,7 @@ fn ack_at_from(
             // pvxs `else if(ackAny.as(sval))` (`servermon.cpp:560`) — the
             // same string the throwing `as<std::string>()` above already
             // produced. Only a `"N%"` percentage does anything here.
-            match pct.trim().parse::<f64>() {
+            match crate::pvdata::convert::parse_to_f64(pct) {
                 Ok(percent) => {
                     // pvxs `servermon.cpp:563` historically computed
                     // `clamp(percent,0,100) * limit` with NO `/ 100`, so any
@@ -4418,6 +4419,12 @@ pub(super) struct ConnInit {
     pub(super) local_port: u16,
 }
 
+/// The server's ECHO_REQUEST cadence.
+const SERVER_ECHO_PERIOD: Period = Period::from_secs(std::num::NonZeroU64::new(15).unwrap());
+
+/// The read-stall watchdog never ticks faster than this.
+const OP_DEADLINE_TICK_FLOOR: Period = Period::from_millis(std::num::NonZeroU64::new(100).unwrap());
+
 pub(super) async fn handle_connection_io(
     reactor: epics_base_rs::runtime::task::Reactor,
     source: DynSource,
@@ -4609,7 +4616,7 @@ pub(super) async fn handle_connection_io(
     // no tick — so holding the interval across iterations reproduces the
     // task's fixed 15 s cadence exactly, including tokio's default `Burst`
     // catch-up if a long dispatch delays a tick.
-    let mut hb_tick = epics_base_rs::runtime::task::interval(Duration::from_secs(15));
+    let mut hb_tick = epics_base_rs::runtime::task::interval(SERVER_ECHO_PERIOD);
     // `interval` yields its first tick immediately; the task consumed it the
     // same way, so the first beat lands 15 s in.
     hb_tick.tick().await;
@@ -4625,8 +4632,10 @@ pub(super) async fn handle_connection_io(
     // writer has gone and whose peer then wedges mid-frame would never be
     // reclaimed.
     // On `liveness_clock`, as the `last_rx` stamps it compares are.
-    let mut op_deadline_tick = liveness_clock
-        .interval((op_timeout / 2).clamp(Duration::from_millis(100), Duration::from_secs(15)));
+    let mut op_deadline_tick = liveness_clock.interval(Period::at_least(
+        (op_timeout / 2).min(Duration::from_secs(15)),
+        OP_DEADLINE_TICK_FLOOR,
+    ));
     op_deadline_tick.tick().await;
     // Latched when the writer channel closes, so the probe cannot spin
     // against a writer that is gone while the loop unwinds. Peer silence no
@@ -11508,6 +11517,20 @@ mod tests {
             "percentage-form Crit message: {}",
             opts.diagnostics[0].message
         );
+    }
+
+    /// The percentage is `parseTo<double>` (`servermon.cpp:563`), so a hex
+    /// float is a percentage, not a Crit.
+    #[test]
+    fn monitor_ackany_percent_is_parse_to_double() {
+        let req = make_pipeline_request_ack(
+            PvField::Scalar(ScalarValue::Boolean(true)),
+            PvField::Scalar(ScalarValue::Int(16)),
+            PvField::Scalar(ScalarValue::String("0x19%".into())),
+        );
+        let opts = parsed_opts(&req);
+        assert_eq!(opts.ack_at, 4, "25% of 16");
+        assert!(opts.diagnostics.is_empty(), "{:?}", opts.diagnostics);
     }
 
     #[test]

@@ -6,12 +6,28 @@
 
 use std::collections::HashMap;
 
+use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::iocsh::IocShell;
 
 const DB: &str = include_str!("fixtures/softioc/simm_sval.db");
 const CMDS: &str = include_str!("fixtures/softioc/simm_sval.cmds");
 const C_OUT: &str = include_str!("fixtures/softioc/simm_sval.out");
+
+/// Until no record is in PACT, from the shell's own thread.
+fn idle(db: &PvDatabase) {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    for name in db.all_record_names() {
+        let cell = db.get_record(&name).unwrap();
+        while cell.read().is_processing() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{name:?} never left PACT"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+}
 
 #[epics_macros_rs::epics_test]
 async fn simm_reads_siol_into_sval_like_softioc() {
@@ -24,7 +40,7 @@ async fn simm_reads_siol_into_sval_like_softioc() {
     let bridge = epics_base_rs::runtime::task::BlockingBridge::capture();
     // The shell blocks on the runtime, so it runs on a thread of its own.
     let rs = std::thread::spawn(move || {
-        let shell = IocShell::new(db, bridge);
+        let shell = IocShell::new(db.clone(), bridge);
         let out = tempfile::NamedTempFile::new().unwrap();
         // iocsh reads an unquoted `\` as an escape, as C `split()` does.
         let token = out.path().display().to_string().replace('\\', "/");
@@ -32,6 +48,10 @@ async fn simm_reads_siol_into_sval_like_softioc() {
         for line in CMDS.lines() {
             shell.execute_line(format!("{line} > {token}")).unwrap();
             rs.push_str(&std::fs::read_to_string(out.path()).unwrap());
+            if line.starts_with("epicsThreadSleep") {
+                // softIoc's sleep outlasted every SDLY callback in flight.
+                idle(&db);
+            }
         }
         rs
     })

@@ -19,7 +19,7 @@
 //!
 //! The port asked the RECORD for its own fields — `Record::get_field`, which
 //! knows nothing of `dbCommon` — and rendered with Rust's `Display`. Measured
-//! against `~/work/epics-base/bin/linux-x86_64/softIoc` on the fixture below,
+//! against `$EPICS_BASE/bin/linux-x86_64/softIoc` on the fixture below,
 //! that lost every `dbCommon` field to the bare separator (`DESC`, `SCAN`,
 //! `INP`, `EGU`, `PREC`, `FLNK`) and printed an unwritten `waveform.VAL` as
 //! `T:WF, "[]"` where C prints `T:WF, ""`.

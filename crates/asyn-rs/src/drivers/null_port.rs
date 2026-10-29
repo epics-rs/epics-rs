@@ -106,7 +106,7 @@ impl PortDriver for NullOctetPort {
 #[cfg(test)]
 mod tests {
     use super::NullOctetPort;
-    use crate::interfaces::Capability;
+    use crate::interfaces::InterfaceMask;
     use crate::port::PortDriver;
     use crate::user::AsynUser;
 
@@ -143,18 +143,10 @@ mod tests {
     /// octet-transport set — asynCommon + asynOption + asynOctet — which is what
     /// makes the asyn record read OCTETIV=1, OPTIONIV=1, and every other *IV=0.
     #[test]
-    fn capabilities_are_confirmed_octet_transport() {
+    fn interfaces_are_confirmed_octet_transport() {
         let drv = NullOctetPort::new("ORACLEASYN");
-        let caps = drv.capabilities();
-        // asynOctet -> OCTETIV=1.
-        assert!(caps.contains(&Capability::OctetRead));
-        assert!(caps.contains(&Capability::OctetWrite));
-        // asynOption -> OPTIONIV=1.
-        assert!(caps.contains(&Capability::Option));
-        // No asynGpib/Int32/UInt32/Float64 -> GPIBIV=I32IV=UI32IV=F64IV=0.
-        assert!(!caps.contains(&Capability::Gpib));
-        assert!(!caps.contains(&Capability::Int32Read));
-        assert!(!caps.contains(&Capability::UInt32DigitalRead));
-        assert!(!caps.contains(&Capability::Float64Read));
+        // asynOctet -> OCTETIV=1, asynOption -> OPTIONIV=1, and no
+        // asynGpib/Int32/UInt32/Float64 -> GPIBIV=I32IV=UI32IV=F64IV=0.
+        assert_eq!(drv.base().interface_mask(), InterfaceMask::OCTET_TRANSPORT);
     }
 }

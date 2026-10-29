@@ -32,7 +32,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
+use ad_core_rs::ndarray::{
+    NDArray, NDDataBuffer, NDDataType, NDDataView, NDDataViewMut, NDDimension,
+};
 use ad_core_rs::ndarray_pool::{DriverPool, NDArrayPool};
 use ad_core_rs::plugin::runtime::{
     ArrayCallbacks, NDPluginProcess, ParamUpdate, PluginAttributes, PluginPool, ProcessResult,
@@ -98,17 +100,17 @@ impl Params {
 /// `epicsFloat64` before accumulating: `averageStore_[signal] += (epicsFloat64)*pIn`).
 #[inline]
 fn sample_f64(data: &NDDataBuffer, idx: usize) -> f64 {
-    match data {
-        NDDataBuffer::I8(v) => v[idx] as f64,
-        NDDataBuffer::U8(v) => v[idx] as f64,
-        NDDataBuffer::I16(v) => v[idx] as f64,
-        NDDataBuffer::U16(v) => v[idx] as f64,
-        NDDataBuffer::I32(v) => v[idx] as f64,
-        NDDataBuffer::U32(v) => v[idx] as f64,
-        NDDataBuffer::I64(v) => v[idx] as f64,
-        NDDataBuffer::U64(v) => v[idx] as f64,
-        NDDataBuffer::F32(v) => v[idx] as f64,
-        NDDataBuffer::F64(v) => v[idx],
+    match data.view() {
+        NDDataView::I8(v) => v[idx] as f64,
+        NDDataView::U8(v) => v[idx] as f64,
+        NDDataView::I16(v) => v[idx] as f64,
+        NDDataView::U16(v) => v[idx] as f64,
+        NDDataView::I32(v) => v[idx] as f64,
+        NDDataView::U32(v) => v[idx] as f64,
+        NDDataView::I64(v) => v[idx] as f64,
+        NDDataView::U64(v) => v[idx] as f64,
+        NDDataView::F32(v) => v[idx] as f64,
+        NDDataView::F64(v) => v[idx],
     }
 }
 
@@ -332,7 +334,7 @@ impl TimeSeriesState {
     /// that C bug is not copied.
     fn acquire_reset(&mut self) -> Vec<ParamUpdate> {
         if let Some(circular) = &mut self.circular {
-            circular.data.as_u8_slice_mut().fill(0);
+            circular.data_mut().as_u8_slice_mut().fill(0);
         }
         self.restart_average();
         self.time_stamp.iter_mut().for_each(|v| *v = 0.0);
@@ -404,7 +406,7 @@ impl TimeSeriesState {
         };
         let updates = self.time_series_waveforms(circular);
         if array_callbacks.get() {
-            let values = circular.data.to_f64_vec();
+            let values = circular.data().to_f64_vec();
             self.post_time_series_arrays(&values, posts);
         }
         updates
@@ -439,7 +441,7 @@ impl TimeSeriesState {
         let pool = self.pool.current();
         let make = |dims: Vec<NDDimension>, values: &[f64]| -> Option<Arc<NDArray>> {
             let mut arr = pool.pool().alloc(dims, data_type).ok()?;
-            arr.data.fill_from_f64(values);
+            arr.data_mut().fill_from_f64(values);
             arr.unique_id = unique_id;
             arr.time_stamp = time_stamp;
             arr.timestamp = epics_ts;
@@ -460,7 +462,7 @@ impl TimeSeriesState {
     fn time_series_waveforms(&self, circular: &NDArray) -> Vec<ParamUpdate> {
         let at = |index| {
             circular
-                .data
+                .data()
                 .get_as_f64(index)
                 .expect("index inside the circular buffer")
         };
@@ -522,7 +524,7 @@ impl TimeSeriesState {
         if num_signals_in == 0 {
             return updates;
         }
-        let data = &array.data;
+        let data = array.data();
         // C reads `numTimes` time points; 1-D arrays are a single time point.
         let mut num_times = if array.dims.len() == 2 {
             array.dims[1].size
@@ -550,7 +552,7 @@ impl TimeSeriesState {
             for s in 0..self.num_signals {
                 let avg = averaged_value(self.average_store[s], self.num_averaged, self.data_type);
                 circular
-                    .data
+                    .data_mut()
                     .set_from_f64(s * ntp + self.current_time_point, avg);
                 self.average_store[s] = 0.0;
             }
@@ -719,7 +721,7 @@ impl NDPluginProcess for TimeSeriesProcessor {
 
         // C: reallocate when the data type or the input signal count changes.
         let num_signals_in = array.dims[0].size;
-        let dtype = array.data.data_type();
+        let dtype = array.data().data_type();
         if dtype != state.data_type || (num_signals_in as i64) != state.num_signals_in {
             state.data_type = dtype;
             state.num_signals_in = num_signals_in as i64;
@@ -812,7 +814,7 @@ pub(crate) fn time_series_point(
     let mut arr = pool
         .alloc(vec![NDDimension::new(values.len())], NDDataType::Float64)
         .ok()?;
-    if let NDDataBuffer::F64(v) = &mut arr.data {
+    if let NDDataViewMut::F64(v) = arr.data_mut().view_mut() {
         v.copy_from_slice(values);
     }
     arr.unique_id = src.unique_id;
@@ -866,7 +868,10 @@ mod tests {
         };
         write(reason("TS_NUM_POINTS"), 2);
         write(reason("TS_ACQUIRE"), 1);
-        let frame = NDArray::with_data(vec![NDDimension::new(1)], NDDataBuffer::F64(vec![1.0]));
+        let frame = NDArray::with_data(
+            vec![NDDimension::new(1)],
+            NDDataBuffer::from_vec::<f64>(vec![1.0]),
+        );
         publish(&handle, &frame);
         write(reason("TS_READ"), 1);
         publish(&handle, &frame);
@@ -887,8 +892,8 @@ mod tests {
             "T",
             1,
             Default::default(),
-            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+            asyn_rs::port::InterfaceMask::NONE,
+            asyn_rs::port::InterfaceMask::NONE,
         );
         let clamp = WriteVerdict::Refuse {
             keep: 1,
@@ -989,8 +994,8 @@ mod tests {
             "TS_INIT",
             3,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         proc.register_params(&mut base).unwrap();
         let int = |name: &str| base.get_int32_param(base.find_param(name).unwrap(), 0);
@@ -1015,8 +1020,8 @@ mod tests {
             port,
             max_signals + 1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         proc.register_params(&mut base).unwrap();
         proc
@@ -1034,15 +1039,15 @@ mod tests {
         }
         let arr = NDArray::with_data(
             vec![NDDimension::new(2), NDDimension::new(3)],
-            NDDataBuffer::U16(vec![1, 10, 2, 20, 3, 30]),
+            NDDataBuffer::from_vec::<u16>(vec![1, 10, 2, 20, 3, 30]),
         );
         let res = proc.process_array(&Arc::new(arr), &NDArrayPool::new(0));
         (proc, res)
     }
 
     fn u16s(arr: &NDArray) -> Vec<u16> {
-        match &arr.data {
-            NDDataBuffer::U16(v) => v.clone(),
+        match arr.data().view() {
+            NDDataView::U16(v) => v.to_vec(),
             _ => panic!("not UInt16"),
         }
     }
@@ -1085,7 +1090,7 @@ mod tests {
     fn three_points() -> Arc<NDArray> {
         Arc::new(NDArray::with_data(
             vec![NDDimension::new(2), NDDimension::new(3)],
-            NDDataBuffer::U16(vec![1, 10, 2, 20, 3, 30]),
+            NDDataBuffer::from_vec::<u16>(vec![1, 10, 2, 20, 3, 30]),
         ))
     }
 
@@ -1127,8 +1132,8 @@ mod tests {
             "TST_TS_REFUSED_B",
             3,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         let read = proc.state.lock().p.ts_read;
         let out = proc.validate_int32(
@@ -1163,8 +1168,8 @@ mod tests {
             "TST_TS_STOP_B",
             3,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         let (acquire, series) = {
             let st = proc.state.lock();
@@ -1194,8 +1199,8 @@ mod tests {
             "TST_TS_ADDR_B",
             3,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         let acquire = proc.state.lock().p.ts_acquire;
         let out = proc.validate_int32(
@@ -1226,8 +1231,8 @@ mod tests {
             "TST_TS_NPTS_B",
             2,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         let p = proc.state.lock().p.clone();
         proc.state.lock().averaging_time_actual = 1.0;
@@ -1280,8 +1285,8 @@ mod tests {
             "TST_TS_AVG_B",
             2,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         let p = proc.state.lock().p.clone();
         let out = proc.validate_float64(
@@ -1324,8 +1329,8 @@ mod tests {
             "TST_TS_BASE_B",
             2,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         // make_proc numbers the TS params from 0; this is none of them.
         const BASE: usize = 1000;
@@ -1379,7 +1384,7 @@ mod tests {
         // 2 signals, 3 time points, every sample 200. Layout signal-fastest.
         let arr = NDArray::with_data(
             vec![NDDimension::new(2), NDDimension::new(3)],
-            NDDataBuffer::U8(vec![200; 6]),
+            NDDataBuffer::from_vec::<u8>(vec![200; 6]),
         );
         let res = proc.process_array(&Arc::new(arr), &pool);
 
@@ -1392,7 +1397,7 @@ mod tests {
                 .circular
                 .as_ref()
                 .unwrap()
-                .data
+                .data()
                 .get_as_f64(0)
                 .unwrap(),
             200.0
@@ -1403,7 +1408,7 @@ mod tests {
                 .circular
                 .as_ref()
                 .unwrap()
-                .data
+                .data()
                 .get_as_f64(ntp)
                 .unwrap(),
             200.0
@@ -1426,7 +1431,7 @@ mod tests {
         // 1 signal, 3 time points: 10, 20, 30.
         let arr = NDArray::with_data(
             vec![NDDimension::new(1), NDDimension::new(3)],
-            NDDataBuffer::F64(vec![10.0, 20.0, 30.0]),
+            NDDataBuffer::from_vec::<f64>(vec![10.0, 20.0, 30.0]),
         );
         let res = proc.process_array(&Arc::new(arr), &pool);
 
@@ -1449,7 +1454,7 @@ mod tests {
         // 1 signal, 5 time points: 1..=5 into a 3-slot ring.
         let arr = NDArray::with_data(
             vec![NDDimension::new(1), NDDimension::new(5)],
-            NDDataBuffer::F64(vec![1.0, 2.0, 3.0, 4.0, 5.0]),
+            NDDataBuffer::from_vec::<f64>(vec![1.0, 2.0, 3.0, 4.0, 5.0]),
         );
         proc.process_array(&Arc::new(arr), &pool);
 
@@ -1486,7 +1491,7 @@ mod tests {
         // 1-D array of 3 elements => 3 signals, 1 time point.
         let arr = NDArray::with_data(
             vec![NDDimension::new(3)],
-            NDDataBuffer::F64(vec![11.0, 22.0, 33.0]),
+            NDDataBuffer::from_vec::<f64>(vec![11.0, 22.0, 33.0]),
         );
         proc.process_array(&Arc::new(arr), &pool);
 
@@ -1499,7 +1504,7 @@ mod tests {
                 .circular
                 .as_ref()
                 .unwrap()
-                .data
+                .data()
                 .get_as_f64(0)
                 .unwrap(),
             11.0
@@ -1510,7 +1515,7 @@ mod tests {
                 .circular
                 .as_ref()
                 .unwrap()
-                .data
+                .data()
                 .get_as_f64(ntp)
                 .unwrap(),
             22.0
@@ -1521,7 +1526,7 @@ mod tests {
                 .circular
                 .as_ref()
                 .unwrap()
-                .data
+                .data()
                 .get_as_f64(2 * ntp)
                 .unwrap(),
             33.0
@@ -1537,7 +1542,7 @@ mod tests {
         // 4 input signals but max_signals == 2: only the first 2 are kept.
         let arr = NDArray::with_data(
             vec![NDDimension::new(4), NDDimension::new(1)],
-            NDDataBuffer::F64(vec![1.0, 2.0, 3.0, 4.0]),
+            NDDataBuffer::from_vec::<f64>(vec![1.0, 2.0, 3.0, 4.0]),
         );
         proc.process_array(&Arc::new(arr), &pool);
 
@@ -1548,7 +1553,7 @@ mod tests {
                 .circular
                 .as_ref()
                 .unwrap()
-                .data
+                .data()
                 .get_as_f64(0)
                 .unwrap(),
             1.0
@@ -1560,7 +1565,7 @@ mod tests {
                 .circular
                 .as_ref()
                 .unwrap()
-                .data
+                .data()
                 .get_as_f64(ntp)
                 .unwrap(),
             2.0
@@ -1579,7 +1584,7 @@ mod tests {
                 NDDimension::new(2),
                 NDDimension::new(2),
             ],
-            NDDataBuffer::F64(vec![0.0; 8]),
+            NDDataBuffer::from_vec::<f64>(vec![0.0; 8]),
         );
         let stamp = EpicsTimestamp { sec: 7, nsec: 9 };
         arr.timestamp = stamp;
@@ -1639,8 +1644,8 @@ mod tests {
                 &format!("{port}_B"),
                 9,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::NONE,
+                InterfaceMask::NONE,
             );
             let p = proc.state.lock().p.clone();
             let mut rig = Self {
@@ -1673,9 +1678,9 @@ mod tests {
         fn frames(&self, signals: usize, values: &[f64]) {
             for &v in values {
                 let data = if self.int32 {
-                    NDDataBuffer::I32(vec![v as i32; signals])
+                    NDDataBuffer::from_vec::<i32>(vec![v as i32; signals])
                 } else {
-                    NDDataBuffer::F64(vec![v; signals])
+                    NDDataBuffer::from_vec::<f64>(vec![v; signals])
                 };
                 let arr =
                     NDArray::with_data(vec![NDDimension::new(signals), NDDimension::new(1)], data);

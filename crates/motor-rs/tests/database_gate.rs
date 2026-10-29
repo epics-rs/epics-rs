@@ -204,9 +204,8 @@ async fn retry_dispatched_on_callback_pass_reaches_the_driver() {
         }
         fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> Result<(), AsynError> {
             *status = MotorStatus {
-                position: self.position,
                 done: true,
-                ..MotorStatus::default()
+                ..MotorStatus::default().with_position(self.position)
             };
             Ok(())
         }
@@ -387,9 +386,8 @@ async fn a_put_before_the_first_pulse_moves_at_once() {
         }
         fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> Result<(), AsynError> {
             *status = MotorStatus {
-                position: self.position,
                 done: true,
-                ..MotorStatus::default()
+                ..MotorStatus::default().with_position(self.position)
             };
             Ok(())
         }

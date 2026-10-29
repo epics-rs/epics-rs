@@ -49,9 +49,11 @@ state lives behind `CaChannel::wait_connected(timeout)`.
 - `connection_events()` — `broadcast::Receiver<ConnectionEvent>` for
   reactive consumers
 - `info() -> Option<ChannelInfo>` — current snapshot (no IO)
-- `get()`, `get_with_timeout()` — READ_NOTIFY round trip
-- `put()`, `put_with_timeout()`, `put_nowait()` — WRITE_NOTIFY or
-  WRITE
+- `get_with_timeout(timeout)`, `get_callback(dbr_type, count)` — READ_NOTIFY
+  under the caller's bound, or with no deadline (`ca_array_get_callback`)
+- `put_with_timeout(value, timeout)`, `put_callback(value)`,
+  `put_nowait(value)` — WRITE_NOTIFY under the caller's bound, WRITE_NOTIFY
+  with no deadline (`ca_array_put_callback`), or WRITE
 - `subscribe()`, `subscribe_with_deadband(f64)` — EVENT_ADD
 
 Drop semantics: `CaChannel::drop` sends `CoordRequest::DropChannel`,
@@ -91,7 +93,7 @@ A single `tokio::select!` multiplexes three input streams:
 | `MonitorConsumed` | `MonitorHandle::recv` | Decrement per-server outstanding for flow control |
 | `DropChannel` | `CaChannel::drop` | Cancel subs + ClearChannel + remove |
 | `ReadNotify` | `get_with_timeout` | Stash `(ioid → reply_tx)` in `read_waiters` |
-| `WriteNotify` | `put` | Same for `write_waiters` |
+| `WriteNotify` | `put_with_timeout` | Same for `write_waiters` |
 | `Shutdown` | `CaClient::drop`-time helper | Send ClearChannel for all live channels, exit loop |
 | `ForceRescanServer` | beacon monitor | Re-search every `Disconnected`/`Searching` channel; echo-probe live circuits |
 
@@ -380,7 +382,7 @@ let ch = client.create_channel("PV:NAME");
 ch.wait_connected(Duration::from_secs(5)).await?;
 let info = ch.info();                          // current snapshot
 let (typ, val) = ch.get_with_timeout(t).await?;
-ch.put(&EpicsValue::Long(42)).await?;
+ch.put_with_timeout(&EpicsValue::Long(42), t).await?;
 ch.put_nowait(&value).await?;                  // CA_PROTO_WRITE (no ack)
 
 // Subscriptions
@@ -403,7 +405,7 @@ client.caput("PV:NAME", value, timeout).await?; // create+connect+put+drop
 
 ## Common pitfalls
 
-- **Don't call `put` without `wait_connected` first.** `put` checks
+- **Don't put without `wait_connected` first.** A put checks
   `state.is_operational()` and returns `Disconnected` if the channel
   hasn't reached `Connected` yet.
 - **`MonitorHandle` is RAII.** Dropping it sends EVENT_CANCEL; if you

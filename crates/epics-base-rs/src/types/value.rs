@@ -858,6 +858,37 @@ impl EpicsValue {
         }
     }
 
+    /// `head` written over the start of this array with the elements past it
+    /// kept, as C's in-place convert into a record's buffer leaves them; a
+    /// shared buffer is copied first. A `head` of another type, or one the
+    /// array cannot hold, replaces it.
+    pub fn write_head(&mut self, head: Self) {
+        macro_rules! write_head {
+            ($($variant:ident),+) => {
+                match (self, head) {
+                    $((Self::$variant(buf), Self::$variant(head)) if head.len() < buf.len() => {
+                        buf.make_mut()[..head.len()].clone_from_slice(&head[..]);
+                    })+
+                    (buf, head) => *buf = head,
+                }
+            };
+        }
+        write_head!(
+            CharArray,
+            UCharArray,
+            ShortArray,
+            UShortArray,
+            LongArray,
+            ULongArray,
+            Int64Array,
+            UInt64Array,
+            FloatArray,
+            DoubleArray,
+            EnumArray,
+            StringArray
+        );
+    }
+
     /// Extract every element of an array variant as `f64`. Returns
     /// `None` for scalar variants. `CharArray` is not covered here —
     /// its signed-`epicsInt8` conversion is handled separately in

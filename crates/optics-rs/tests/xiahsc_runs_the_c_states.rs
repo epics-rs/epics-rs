@@ -19,6 +19,9 @@ mod hsc1_mock;
 #[path = "hsc1_mock/rig.rs"]
 mod rig;
 
+use std::time::Duration;
+
+use epics_base_rs::runtime::task;
 use hsc1_mock::Hsc1;
 use optics_rs::snl::xiahsc::xiahsc;
 use rig::{Rig, eventually, f64_of, put, quiet, string_of};
@@ -548,5 +551,75 @@ async fn a_disabled_program_ignores_targets_and_reinits_on_enable() {
     seen_n(&rig, BOOT_SEEN.len() * 2).await;
     assert_eq!(after_boot(&rig), BOOT_SEEN);
     assert_eq!(v(&rig, "init"), 0.0);
+    h_axis(&rig, 1.0, 2.0);
+}
+
+/// A locate after the H blades went to `l`, `r`.
+async fn locate_at(rig: &Rig, l: f64, r: f64) {
+    rig.hsc.set("H-1", |m| {
+        m.a = (800.0 + 400.0 * l) as i32;
+        m.b = (800.0 + 400.0 * r) as i32;
+    });
+    put_hsc(rig, "locate", "1").await;
+}
+
+/// A locate's readbacks and targets are its own reading, though the
+/// previous locate's lRB echo lands inside it (C defect,
+/// xiahsc.st:795-799).
+#[epics_base_rs::epics_test]
+async fn a_late_readback_echo_leaves_the_locate_at_its_reading() {
+    let rig = boot(|_| {}).await;
+    // The boot locate's lRB echo is in.
+    task::sleep(Duration::from_millis(5000)).await;
+    locate_at(&rig, 1.5, 2.0).await;
+    assert!(eventually(|| v(&rig, "lRB") == 1.5).await);
+    // Under a 3 s lRB echo delay and a 2 s rRB put delay, the next locate
+    // puts lRB before the 1.5 echo lands and reads it after.
+    task::sleep(Duration::from_millis(1500)).await;
+    locate_at(&rig, 1.25, 2.5).await;
+    assert!(eventually(|| v(&rig, "widthRB") != 3.5).await);
+    quiet().await;
+    h_axis(&rig, 1.25, 2.5);
+}
+
+/// A client's lRB put landing inside a locate is dropped: the targets and
+/// the gap and center readbacks are the locate's reading, where C took the
+/// put (C defect, xiahsc.st:795-799). lRB keeps the put until the next
+/// locate, as in C.
+#[epics_base_rs::epics_test]
+async fn a_readback_put_inside_a_locate_is_dropped() {
+    let rig = boot(|_| {}).await;
+    locate_at(&rig, 1.25, 2.5).await;
+    assert!(eventually(|| v(&rig, "lRB") == 1.25).await);
+    // Under a 2 s rRB put delay, the put lands between the locate's lRB put
+    // and its reads.
+    task::sleep(Duration::from_millis(500)).await;
+    put_hsc(&rig, "lRB", "3").await;
+    assert!(eventually(|| v(&rig, "widthRB") != 3.0).await);
+    quiet().await;
+    for (pv, c) in [
+        ("l", 1.25),
+        ("r", 2.5),
+        ("lRB", 3.0),
+        ("rRB", 2.5),
+        ("width", 3.75),
+        ("h0", 0.625),
+        ("widthRB", 3.75),
+        ("h0RB", 0.625),
+    ] {
+        assert_eq!(v(&rig, pv), c, "{pv}");
+    }
+}
+
+/// A client's lRB put between locates is put back by the next one: the
+/// put guards compare against the monitored readback, as in C.
+#[epics_base_rs::epics_test]
+async fn a_readback_put_between_locates_is_put_back() {
+    let rig = boot(|_| {}).await;
+    put_hsc(&rig, "lRB", "3").await;
+    quiet().await;
+    put_hsc(&rig, "locate", "1").await;
+    assert!(eventually(|| v(&rig, "lRB") == 1.0).await);
+    quiet().await;
     h_axis(&rig, 1.0, 2.0);
 }

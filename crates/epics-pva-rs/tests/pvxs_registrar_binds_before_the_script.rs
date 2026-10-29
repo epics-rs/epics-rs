@@ -10,7 +10,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use epics_base_rs::server::ioc_app::IocApplication;
+use epics_base_rs::server::ioc_app::{IocApplication, RunOutcome};
 use epics_base_rs::server::iocsh::registry::{
     ArgValue, CommandContext, CommandDef, CommandOutcome,
 };
@@ -70,38 +70,40 @@ async fn the_script_sees_the_port_the_registrar_holds() {
             .startup_line("iocInit"),
     );
     let port = seen.clone();
-    app.run(move |mut config| async move {
-        let port: u16 = port
-            .lock()
-            .unwrap()
-            .as_deref()
-            .expect("PVXS_SERVER_PORT is set before the script")
-            .parse()
-            .unwrap();
-        let _held = config
-            .servers
-            .take::<PvxsServer>(PVXS_SERVER)
-            .expect("the registrar hands its server to the runner");
-        // The listener the registrar bound queues the connection although
-        // nothing serves it yet.
-        std::net::TcpStream::connect(("127.0.0.1", port))
-            .expect("the registrar's listener holds the port");
-        assert_eq!(db_servers(), ["Server 'qsrv2'"]);
-        // QSRV2's report is `pvxsr`'s (`qReport`); softIocPVX's `dbsr` prints
-        // the `EPICS_PVAS_*` lines and a `Source:` line per source under it.
-        let handle = epics_pva_rs::server::iocsh::pvxs_report().expect("the bound server");
-        let mut report = vec!["Server state: running".to_string(), "Server 'qsrv2'".into()];
-        report.extend(handle.pvxs_config().lines().map(str::to_string));
-        report.extend(
-            (handle.source_list().into_iter())
-                .map(|(name, prio)| format!("Source: {name} prio={prio} ")),
-        );
-        assert_eq!(dbsr(0), report);
-        epics_base_rs::server::db_server::announce_serving(PVXS_SERVER);
-        Ok(())
-    })
-    .await
-    .expect("the IOC runs");
+    let outcome = app
+        .run_outcome(move |mut config| async move {
+            let port: u16 = port
+                .lock()
+                .unwrap()
+                .as_deref()
+                .expect("PVXS_SERVER_PORT is set before the script")
+                .parse()
+                .unwrap();
+            let _held = config
+                .servers
+                .take::<PvxsServer>(PVXS_SERVER)
+                .expect("the registrar hands its server to the runner");
+            // The listener the registrar bound queues the connection although
+            // nothing serves it yet.
+            std::net::TcpStream::connect(("127.0.0.1", port))
+                .expect("the registrar's listener holds the port");
+            assert_eq!(db_servers(), ["Server 'qsrv2'"]);
+            // QSRV2's report is `pvxsr`'s (`qReport`); softIocPVX's `dbsr` prints
+            // the `EPICS_PVAS_*` lines and a `Source:` line per source under it.
+            let handle = epics_pva_rs::server::iocsh::pvxs_report().expect("the bound server");
+            let mut report = vec!["Server state: running".to_string(), "Server 'qsrv2'".into()];
+            report.extend(handle.pvxs_config().lines().map(str::to_string));
+            report.extend(
+                (handle.source_list().into_iter())
+                    .map(|(name, prio)| format!("Source: {name} prio={prio} ")),
+            );
+            assert_eq!(dbsr(0), report);
+            epics_base_rs::server::db_server::announce_serving(PVXS_SERVER);
+            Ok(())
+        })
+        .await
+        .expect("the IOC runs");
+    assert_eq!(outcome, RunOutcome::Served);
 }
 
 #[epics_macros_rs::epics_test]
@@ -119,22 +121,24 @@ async fn a_held_search_port_leaves_the_ioc_without_pvaccess() {
             .startup_line("readPort")
             .startup_line("iocInit"),
     );
-    app.run(move |mut config| async move {
-        assert_eq!(*seen.lock().unwrap(), None, "no server, no port");
-        assert_eq!(db_servers(), Vec::<String>::new());
-        let server = PvaServer::from_parts(config.db, None, config.acf, None, None)
-            .bound_at_registrar(&mut config.servers);
-        // Serving nothing is pending until the runner ends; a server that
-        // bound for itself here would fail on the held port at once.
-        assert!(
-            epics_base_rs::runtime::task::timeout(Duration::from_millis(300), server.run())
-                .await
-                .is_err(),
-            "the runner tried to serve pvAccess the registrar could not bind"
-        );
-        Ok(())
-    })
-    .await
-    .expect("iocInit and iocRun do not fail on the PVA port");
+    let outcome = app
+        .run_outcome(move |mut config| async move {
+            assert_eq!(*seen.lock().unwrap(), None, "no server, no port");
+            assert_eq!(db_servers(), Vec::<String>::new());
+            let server = PvaServer::from_parts(config.db, None, config.acf, None, None)
+                .bound_at_registrar(&mut config.servers);
+            // Serving nothing is pending until the runner ends; a server that
+            // bound for itself here would fail on the held port at once.
+            assert!(
+                epics_base_rs::runtime::task::timeout(Duration::from_millis(300), server.run())
+                    .await
+                    .is_err(),
+                "the runner tried to serve pvAccess the registrar could not bind"
+            );
+            Ok(())
+        })
+        .await
+        .expect("iocInit and iocRun do not fail on the PVA port");
+    assert_eq!(outcome, RunOutcome::Served);
     drop(held);
 }

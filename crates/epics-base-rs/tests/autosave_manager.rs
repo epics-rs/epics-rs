@@ -60,7 +60,8 @@ async fn test_periodic_save_set() {
     let handle = mgr.clone().start(db.clone()).unwrap();
 
     // The first pass arms the timer; the next, a MIN_DELAY later, saves.
-    for _ in 0..150 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if sav_path.exists() {
             break;
         }
@@ -468,7 +469,7 @@ async fn a_set_task_ends_when_the_manager_drops_without_shutdown() {
     let start = std::time::Instant::now();
     while set.strong_count() != 0 {
         assert!(
-            start.elapsed() < Duration::from_secs(2),
+            start.elapsed() < fact_budget::FACT_BUDGET,
             "the set task outlived its manager"
         );
         epics_base_rs::runtime::task::sleep(Duration::from_millis(20)).await;

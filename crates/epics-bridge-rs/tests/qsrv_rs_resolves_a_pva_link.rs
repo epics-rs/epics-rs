@@ -79,14 +79,14 @@ async fn qsrv_rs_resolves_a_pva_link_as_soft_ioc_pva() {
 }
 
 /// The console qsrv-rs prints when its search port is held is what
-/// `on_a_qsrv_port` retries on: one UDP socket this test owns holds `tcp + 1`.
+/// `on_a_qsrv_port` retries on: a hold this test owns keeps `tcp + 1`.
 #[test]
 fn a_held_search_port_reads_as_a_stolen_one() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("pl.db");
     std::fs::write(&db, "record(ao, \"SRC\") { field(VAL, \"5\") }\n").unwrap();
-    let tcp = named_port::free_tcp_with_udp_successor();
-    let held = std::net::UdpSocket::bind(("0.0.0.0", tcp + 1)).unwrap();
+    let held = named_port::HeldPort::closed_udp();
+    let tcp = held.port - 1;
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_qsrv-rs"))
         .arg("--db-file")
         .arg(&db)

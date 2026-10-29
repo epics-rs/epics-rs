@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
 use ad_core_rs::driver::ad_driver::ADDriverBase;
-use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
+use ad_core_rs::ndarray::{NDArray, NDDataType, NDDataViewMut, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::ASYN_CANBLOCK;
 use ad_core_rs::plugin::runtime::{NDPluginProcess, PluginRuntimeHandle};
@@ -69,8 +69,8 @@ fn test_driver_to_stats_pipeline() {
         1,
         10_000_000,
         ASYN_CANBLOCK,
-        InterfaceMask::UNMIGRATED_SUBCLASS,
-        InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+        InterfaceMask::NONE,
+        InterfaceMask::NONE,
     )
     .unwrap();
     // The ArrayCallbacks record's PINI; the driver leaves it undefined.
@@ -88,7 +88,7 @@ fn test_driver_to_stats_pipeline() {
         )
         .unwrap();
 
-    if let NDDataBuffer::U8(ref mut v) = arr.data {
+    if let NDDataViewMut::U8(v) = arr.fill().data_mut().view_mut() {
         for i in 0..v.len() {
             v[i] = (i % 256) as u8;
         }
@@ -137,8 +137,8 @@ fn test_driver_to_std_arrays_pipeline() {
         1,
         10_000_000,
         ASYN_CANBLOCK,
-        InterfaceMask::UNMIGRATED_SUBCLASS,
-        InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+        InterfaceMask::NONE,
+        InterfaceMask::NONE,
     )
     .unwrap();
     // The ArrayCallbacks record's PINI; the driver leaves it undefined.
@@ -229,8 +229,8 @@ fn test_rewire_ndarray_port_at_runtime() {
     }
     impl NDPluginProcess for TrackingProcessor {
         const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_CANBLOCK;
-        const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
-        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS;
+        const INTERFACE_MASK: InterfaceMask = InterfaceMask::NONE;
+        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::NONE;
         fn process_array(
             &self,
             array: &Arc<ad_core_rs::ndarray::NDArray>,
@@ -399,8 +399,8 @@ fn test_rewire_through_real_roi_plugin() {
     }
     impl NDPluginProcess for TrackingProcessor {
         const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_CANBLOCK;
-        const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
-        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS;
+        const INTERFACE_MASK: InterfaceMask = InterfaceMask::NONE;
+        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::NONE;
         fn process_array(
             &self,
             array: &Arc<ad_core_rs::ndarray::NDArray>,
@@ -539,8 +539,8 @@ fn test_roi_param_change_enables_output() {
     }
     impl NDPluginProcess for TrackingProcessor {
         const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_CANBLOCK;
-        const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
-        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS;
+        const INTERFACE_MASK: InterfaceMask = InterfaceMask::NONE;
+        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::NONE;
         fn process_array(
             &self,
             array: &Arc<ad_core_rs::ndarray::NDArray>,
@@ -634,7 +634,7 @@ fn make_2d_u8(w: usize, h: usize) -> NDArray {
         vec![NDDimension::new(w), NDDimension::new(h)],
         NDDataType::UInt8,
     );
-    if let NDDataBuffer::U8(ref mut v) = arr.data {
+    if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
         for i in 0..v.len() {
             v[i] = (i % 256) as u8;
         }
@@ -801,7 +801,7 @@ fn test_codec_compress_decompress_roundtrip() {
 
     let decompressed = decompress_lz4(&compressed).unwrap();
     assert!(decompressed.codec.is_none());
-    assert_eq!(decompressed.data.as_u8_slice(), arr.data.as_u8_slice());
+    assert_eq!(decompressed.data().as_u8_slice(), arr.data().as_u8_slice());
 }
 
 #[test]
@@ -891,8 +891,8 @@ fn test_std_arrays_leaves_the_array_sizes_unset() {
         1,
         1_000_000,
         ASYN_CANBLOCK,
-        InterfaceMask::UNMIGRATED_SUBCLASS,
-        InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+        InterfaceMask::NONE,
+        InterfaceMask::NONE,
     )
     .unwrap();
     // The ArrayCallbacks record's PINI; the driver leaves it undefined.

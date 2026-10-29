@@ -4,15 +4,14 @@ use epics_base_rs::server::database::AsyncDbHandle;
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::record::{
     CycleHooks, CycleMarks, CyclePostMask, FieldDesc, FieldMetadataOverride, InputLinkRequest,
-    LinkRead, LinkReadAs, LinkType, ProcessAction, ProcessActions, ProcessOutcome, Record,
-    link_field_type,
+    LinkRead, LinkReadAs, ProcessAction, ProcessActions, ProcessOutcome, Record,
+    parse_output_link_v2,
 };
 use epics_base_rs::server::records::link_status::{
-    LINK_EXT_NC, LINK_RECHECK, LinkCheck, LinkCheckSpec, LinkCheckState, LinkRole, LinkRule,
-    LinkStatusGen, classify_link, link_is_external,
+    LINK_EXT_NC, LinkCheck, LinkCheckSpec, LinkCheckState, LinkRole, LinkRule, LinkStatusGen,
+    LinkStatusPosts, link_is_external, post_link_status,
 };
 use epics_base_rs::types::{EpicsValue, PvString};
-use epics_libcom_rs::cfmt::CFloat;
 
 // `menu(throttleSTS)` indices (throttleRecord.dbd) — STS is set only by a
 // real link operation (`valuePut`/`valueSync`), never by the limit block.
@@ -225,50 +224,6 @@ impl Default for ThrottleRecord {
     }
 }
 
-/// Upper bound (exclusive) on the `DLY` field, in seconds.
-///
-/// `process()` converts `self.dly` into a `std::time::Duration` via
-/// `Duration::from_secs_f64`, which panics not only on a non-finite
-/// argument but on any finite value too large for a `Duration` to
-/// represent (≈ `u64::MAX` seconds ≈ 1.8e19, message "value is either
-/// too big or NaN"). A CA put of e.g. `DLY = 1e300` is a perfectly
-/// finite f64 and would otherwise slip past an `is_finite()` guard and
-/// panic the record task.
-///
-/// A throttle delay of 24 hours is already far past any realistic
-/// device-protection interval, so this finite cap is the operational
-/// ceiling for `DLY`. It is also orders of magnitude below the
-/// `Duration` overflow point, so any `self.dly` accepted by the writer
-/// guard is guaranteed safe for `Duration::from_secs_f64`.
-const MAX_DLY: f64 = 86_400.0;
-
-/// Validate a candidate `DLY` value (seconds).
-///
-/// Returns `Ok(())` only for a value that can never make
-/// `Duration::from_secs_f64(self.dly)` panic in `process()`: it must
-/// be finite and at most [`MAX_DLY`]. A negative value is accepted
-/// here — C `special()` clamps it to 0 and `process()` treats any
-/// `dly <= 0.0` as "no delay" without constructing a `Duration` — so
-/// negativity is not a panic hazard. This is the single guard every
-/// writer of `self.dly` must pass through to hold the invariant
-/// "`self.dly` can never make `Duration::from_secs_f64` panic".
-fn validate_dly(v: f64) -> CaResult<()> {
-    if !v.is_finite() {
-        return Err(CaError::InvalidValue(format!(
-            "throttle DLY must be finite, got {}",
-            CFloat(v).g()
-        )));
-    }
-    if v > MAX_DLY {
-        return Err(CaError::InvalidValue(format!(
-            "throttle DLY must not exceed {} seconds, got {}",
-            CFloat(MAX_DLY).g(),
-            CFloat(v).g()
-        )));
-    }
-    Ok(())
-}
-
 /// C `checkLink`'s walk: OUT, then SINP (throttleRecord.c:702-747).
 static THROTTLE_LINK_CHECK: LinkCheckSpec = LinkCheckSpec {
     links: &[("OUT", "OV"), ("SINP", "SIV")],
@@ -285,42 +240,26 @@ impl ThrottleRecord {
     /// 339-374): CONSTANT→`Constant`, a PV on this IOC→`Local PV`,
     /// else→`Ext PV NC`, which `checkLinkCallback` re-reads after `recheck`
     /// (throttleRecord.c:222, :370). C classifies, and posts whatever its
-    /// value, bit 0 OV and bit 1 SIV of `links`: both at init, the put link's
-    /// alone on an OUT/SINP `special()`, which leaves the other status as it
-    /// stands. A no-op when the record is not registered (no handle).
-    fn refresh_link_status(&self, links: u64, recheck: Option<std::time::Duration>) {
-        let Some((name, handle)) = &self.async_ctx else {
-            return;
-        };
-        let name = name.clone();
-        let handle = handle.clone();
-        let classified: Vec<(usize, &'static str, PvString, LinkRole)> = [
-            (0, "OV", self.out.clone(), LinkRole::Output),
-            (1, "SIV", self.sinp.clone(), LinkRole::Input),
-        ]
-        .into_iter()
-        .filter(|&(i, ..)| links & 1 << i != 0)
-        .collect();
-        // Stamp this refresh so a later re-point of the same link (an
-        // OUT/SINP `special()`) supersedes an init-time snapshot that
-        // finishes late.
-        let token = self.link_gen.next_for(links);
-        let sched = handle.clone();
-        // Through the database's `iocInit` owner — see `schedule_record_init`.
-        // The parking key; `name` itself moves into the future below.
-        let init_key = name.clone();
-        sched.schedule_record_init(&init_key, async move {
-            let rule = THROTTLE_LINK_CHECK.rule;
-            let fields = classified
-                .into_iter()
-                .map(|(i, field, link, role)| {
-                    let (status, _) = classify_link(&handle, &link, role, rule);
-                    (i, field.to_string(), EpicsValue::Short(status))
-                })
-                .collect();
-            token.post_each(&handle, &name, fields, THROTTLE_LINK_CHECK.mask);
-            handle.link_check_classified(&name, recheck);
-        });
+    /// value, both at init and the put link's alone on an OUT/SINP
+    /// `special()`, which leaves the other status as it stands. A put's
+    /// status is stored before the put returns: the SYNC arm reads SIV
+    /// (throttleRecord.c:381). A no-op when the record is not registered (no
+    /// handle).
+    fn refresh_link_status(&mut self, posts: LinkStatusPosts) {
+        let stored = post_link_status(
+            self.async_ctx.as_ref(),
+            &self.link_gen,
+            vec![
+                ("OV", self.out.clone(), LinkRole::Output),
+                ("SIV", self.sinp.clone(), LinkRole::Input),
+            ],
+            THROTTLE_LINK_CHECK.rule,
+            THROTTLE_LINK_CHECK.mask,
+            posts,
+        );
+        if let (LinkStatusPosts::Put(field), Some(status)) = (posts, stored) {
+            self.link_status[usize::from(field == "SIV")] = status;
+        }
     }
 
     /// C `valueSync` (throttleRecord.c:616-656) — the single entry to a
@@ -413,8 +352,7 @@ impl ThrottleRecord {
         // and SENT out of ITS result (:565-575), which the port learns in
         // `set_out_link_write_status`; C fires the forward link on the whole
         // non-CONSTANT arm, success or not (:580).
-        let out_type = link_field_type(&self.out);
-        if out_type == LinkType::Constant || out_type == LinkType::Empty {
+        if parse_output_link_v2(&self.out).is_constant_type() {
             self.sts = THROTTLE_STS_ERR;
             self.out_written = false;
             self.value_put_done();
@@ -432,11 +370,10 @@ impl ThrottleRecord {
         // that round trip — with DLY = 0 there is no cooldown, so the next
         // value goes straight out — rather than spawning a timer task per put
         // whose only job is to switch a flag back off.
-        if self.dly > 0.0 {
+        let delay = epics_base_rs::runtime::time::duration_from_secs(self.dly);
+        if !delay.is_zero() {
             self.delay_active = true;
-            actions.push(ProcessAction::ValuePutAfter(
-                std::time::Duration::from_secs_f64(self.dly),
-            ));
+            actions.push(ProcessAction::ValuePutAfter(delay));
         } else {
             self.delay_active = false;
         }
@@ -573,26 +510,14 @@ impl Record for ThrottleRecord {
             // effect at once. `take_special_actions` carries that re-anchor
             // out as a fresh `ValuePutAfter`; minting its token supersedes
             // the pending one, which IS C's `callbackCancelDelayed`.
-            //
-            // `special()` runs after the field write. `put_field("DLY")`
-            // already rejects non-finite and huge-but-finite values via
-            // `validate_dly`, so a CA/db path can never leave `self.dly`
-            // out of range here. The clamp below additionally enforces
-            // the `Duration::from_secs_f64` invariant for any other
-            // writer of `self.dly` (e.g. in-process callers), so every
-            // reader downstream of `special()` is safe.
             "DLY" => {
                 if self.dly < 0.0 {
                     self.dly = 0.0;
                     self.posts |= POST_DLY;
-                } else if validate_dly(self.dly).is_err() {
-                    // Non-finite or >= MAX_DLY: clamp to the operational
-                    // ceiling so `process()` never panics.
-                    self.dly = MAX_DLY;
                 }
                 if self.delay_active {
                     self.special_actions.push(ProcessAction::ValuePutAfter(
-                        std::time::Duration::from_secs_f64(self.dly),
+                        epics_base_rs::runtime::time::duration_from_secs(self.dly),
                     ));
                 }
             }
@@ -621,11 +546,10 @@ impl Record for ThrottleRecord {
             // C `special()` OUT/SINP case (throttleRecord.c:339-374,
             // `SPC_MOD`): re-classify the changed link's validity menu
             // (OV for OUT, SIV for SINP) — CONSTANT→`Constant`, a PV on
-            // this IOC→`Local PV`, else→`Ext PV NC`. The new link string the
-            // put just stored is classified off-thread (needs an async DB
-            // lookup, C `dbNameToAddr`). The other link's status stands.
-            "OUT" => self.refresh_link_status(1, Some(LINK_RECHECK)),
-            "SINP" => self.refresh_link_status(1 << 1, Some(LINK_RECHECK)),
+            // this IOC→`Local PV`, else→`Ext PV NC`. The other link's status
+            // stands.
+            "OUT" => self.refresh_link_status(LinkStatusPosts::Put("OV")),
+            "SINP" => self.refresh_link_status(LinkStatusPosts::Put("SIV")),
             // C `special()` SYNC case (throttleRecord.c:376-389): a put of
             // `SYNC=Process` triggers `valueSync` — read SINP into VAL and
             // post (NO OUT write, NO process) — unless SIV still reads
@@ -728,20 +652,6 @@ impl Record for ThrottleRecord {
             },
             "DLY" => match value {
                 EpicsValue::Double(v) => {
-                    // C `throttleRecord.c` models the delay with
-                    // `Duration::from_secs_f64(self.dly)` in `process()`,
-                    // which panics not only on a non-finite argument but
-                    // on any finite value too large for a `Duration`
-                    // (≈ 1.8e19; message "value is either too big or
-                    // NaN"). C's `special()` DLY handler (lines 392-409)
-                    // only ever anticipated a negative delay; a CA put of
-                    // `+inf`, `NaN`, or a huge-but-finite f64 like `1e300`
-                    // is not a value any real delay can represent. Reject
-                    // it here, at the single writer of `self.dly`, so the
-                    // record task can never panic — `validate_dly` is the
-                    // gate that holds the invariant "`self.dly` can never
-                    // make `Duration::from_secs_f64` panic".
-                    validate_dly(v)?;
                     self.dly = v;
                     Ok(())
                 }
@@ -981,13 +891,14 @@ impl Record for ThrottleRecord {
         &mut self,
         link_field: &'static str,
         value: &EpicsValue,
-        failed: bool,
+        status: epics_base_rs::error::DbResult,
+        _dpvt: &mut epics_base_rs::server::device_support::Dpvt,
     ) -> ProcessActions {
         if link_field != "OUT" {
             return ProcessActions::new();
         }
         let mut actions = Vec::new();
-        if failed {
+        if status.is_err() {
             self.sts = THROTTLE_STS_ERR;
         } else {
             self.sts = THROTTLE_STS_SUC;
@@ -1042,7 +953,7 @@ impl Record for ThrottleRecord {
         // posts the initial status (throttleRecord.c:171-205). This is the
         // framework's init-time async hook (the handle now exists), so
         // classify here — the record's OUT/SINP db fields are already loaded.
-        self.refresh_link_status(0b11, THROTTLE_LINK_CHECK.rule.init_recheck());
+        self.refresh_link_status(LinkStatusPosts::All);
     }
 
     fn put_field_internal(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
@@ -1055,12 +966,12 @@ impl Record for ThrottleRecord {
         // the writable VAL/SYNC the SYNC post also writes, falls through to
         // `put_field`.
         match (name, &value) {
-            ("OV", EpicsValue::Short(v)) => {
-                self.link_status[0] = *v;
+            ("OV", EpicsValue::Enum(v)) => {
+                self.link_status[0] = *v as i16;
                 Ok(())
             }
-            ("SIV", EpicsValue::Short(v)) => {
-                self.link_status[1] = *v;
+            ("SIV", EpicsValue::Enum(v)) => {
+                self.link_status[1] = *v as i16;
                 Ok(())
             }
             ("STS", EpicsValue::Short(v)) => {
@@ -1104,23 +1015,5 @@ mod menu_choice_tests {
         assert_eq!(menu("SIV"), Some(ov));
         assert_eq!(menu("SYNC"), Some(&["Idle", "Process"][..]));
         assert_eq!(menu("VAL"), None);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn validate_dly_names_the_value_as_c_percent_g() {
-        let text = |v| match validate_dly(v) {
-            Err(CaError::InvalidValue(msg)) => msg,
-            other => panic!("{other:?}"),
-        };
-        assert_eq!(text(f64::NAN), "throttle DLY must be finite, got nan");
-        assert_eq!(
-            text(1e20),
-            "throttle DLY must not exceed 86400 seconds, got 1e+20"
-        );
     }
 }

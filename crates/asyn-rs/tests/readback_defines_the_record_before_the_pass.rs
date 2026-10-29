@@ -47,8 +47,8 @@ async fn a_good_readback_defines_an_undefined_output_without_a_udf_alarm() {
         "RBKUDF",
         1,
         PortFlags::default(),
-        InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::INT32 | InterfaceMask::OCTET | InterfaceMask::DRV_USER,
+        InterfaceMask::INT32 | InterfaceMask::OCTET,
     );
     let i32_reason = base.create_param("I32", ParamType::Int32).unwrap();
     let msg_reason = base.create_param("MSG", ParamType::Octet).unwrap();

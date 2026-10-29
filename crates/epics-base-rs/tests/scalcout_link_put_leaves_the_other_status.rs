@@ -58,7 +58,8 @@ async fn an_input_put_leaves_a_connected_input_status() {
         .unwrap();
     let db = ioc.database().clone();
     assert!(ioc.run().await);
-    for _ in 0..400 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if status(&db, "S.INAV") == EXT_OK {
             break;
         }

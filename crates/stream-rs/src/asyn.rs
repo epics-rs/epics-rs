@@ -19,7 +19,7 @@ use asyn_rs::port::QueuePriority;
 use asyn_rs::port_handle::PortHandle;
 use asyn_rs::request::{CellBody, OctetReadOp, PortCalls, RequestCell, RequestOp, Unrun};
 use asyn_rs::user::AsynUser;
-use epics_base_rs::runtime::task::{CallbackPriority, sleep_background, spawn_background};
+use epics_base_rs::runtime::task::{CallbackPriority, spawn_background_after};
 use epics_base_rs::runtime::time::thread_sleep_quantum;
 use epics_libcom_rs::cfmt::CFloat;
 use parking_lot::Mutex;
@@ -801,17 +801,20 @@ impl Inner {
         let started = self.timer.fetch_add(1, Ordering::AcqRel) + 1;
         let me = Arc::downgrade(self);
         let delay = Duration::from_secs_f64(timeout + thread_sleep_quantum() * 0.5);
-        drop(spawn_background(CallbackPriority::Low, async move {
-            sleep_background(delay).await;
-            if let Some(me) = me.upgrade()
-                && me
-                    .timer
-                    .compare_exchange(started, started + 1, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-            {
-                me.timer_expired();
-            }
-        }));
+        drop(spawn_background_after(
+            CallbackPriority::Low,
+            delay,
+            async move {
+                if let Some(me) = me.upgrade()
+                    && me
+                        .timer
+                        .compare_exchange(started, started + 1, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                {
+                    me.timer_expired();
+                }
+            },
+        ));
     }
 
     /// `cancelTimer()`

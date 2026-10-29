@@ -1,12 +1,12 @@
 //! `spawn_blocking` from a callback band, which has no runtime entered, uses
-//! the runtime the program started: `#[epics_main]` and `run_phased` each
-//! adopt theirs. Without that it falls back to the seam's own `blockingRt`.
+//! the runtime the program started: `#[epics_main]` and `IocApplication`'s
+//! `run`s each adopt theirs. Without that it falls back to the seam's own `blockingRt`.
 //! Process-global state, so each test relies on nextest's process per test.
 
 #![cfg(tokio_backend)]
 
 use epics_base_rs::runtime::task::{CallbackPriority, spawn_background, spawn_blocking};
-use epics_base_rs::server::ioc_app::IocApplication;
+use epics_base_rs::server::ioc_app::{IocApplication, RunOutcome};
 
 /// The name of the thread a band's `spawn_blocking` ran on.
 async fn blocking_thread_from_a_band() -> String {
@@ -34,16 +34,17 @@ fn epics_main_adopts_its_runtime() {
 }
 
 #[test]
-fn run_phased_adopts_the_iocs_runtime() {
+fn run_adopts_the_iocs_runtime() {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .thread_name("iocRt")
         .enable_all()
         .build()
         .unwrap();
-    runtime
-        .block_on(IocApplication::new().run_phased(|_config| async move {
+    let outcome = runtime
+        .block_on(IocApplication::new().run_outcome(|_config| async move {
             assert_eq!(blocking_thread_from_a_band().await, "iocRt");
             Ok(())
         }))
         .unwrap();
+    assert_eq!(outcome, RunOutcome::Served);
 }

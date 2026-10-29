@@ -1,4 +1,4 @@
-//! The `ca://` lset must answer link reads on any runtime flavor.
+//! The CA lset must answer link reads on any runtime flavor.
 
 #![cfg(feature = "client-core")]
 

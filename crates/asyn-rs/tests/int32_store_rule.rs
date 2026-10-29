@@ -38,8 +38,8 @@ fn det(name: &str, runs: Arc<AtomicUsize>) -> (PortDriverBase, Params) {
         name,
         1,
         PortFlags::default(),
-        InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_INTERRUPTS,
+        InterfaceMask::INT32,
+        InterfaceMask::NONE,
     );
     let acquire = base.create_param("ACQUIRE", ParamType::Int32).unwrap();
     let busy = base.create_param("ACQUIRE_BUSY", ParamType::Int32).unwrap();
@@ -121,8 +121,8 @@ fn a_failing_rule_does_not_stop_the_store() {
         "RULEFAIL",
         1,
         PortFlags::default(),
-        InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_INTERRUPTS,
+        InterfaceMask::NONE,
+        InterfaceMask::NONE,
     );
     let acquire = base.create_param("ACQUIRE", ParamType::Int32).unwrap();
     base.set_int32_rule(

@@ -10,21 +10,24 @@
 use std::cell::Cell;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering as AtomicOrdering};
 use std::time::{Instant, SystemTime};
 
 use epics_libcom_rs::SharedArray;
+use epics_libcom_rs::runtime::task::block_on_thread_loop;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{AsynError, AsynResult, AsynStatus};
-use crate::interfaces::InterfaceType;
+use crate::interfaces::{InterfaceMask, InterfaceType};
 use crate::interpose::EomReason;
 use crate::interrupt::InterruptValue;
 use crate::param::ParamValue;
 use crate::port::{PortDriver, QueueGate, QueuePriority};
 use crate::request::{
     CancelToken, CellQueue, Claim, OctetRead, PortCalls, RequestCell, RequestOp, RequestResult,
+    SectionScope,
 };
 use crate::user::{AsynUser, ConnectCheck};
 
@@ -210,11 +213,13 @@ impl InputEos {
 }
 
 /// What a [`crate::port_handle::PortHandle`] takes from the actor behind its
-/// channel: the actor's identity, for the re-entrancy guard, and the port's
-/// [`QueueGate`], for C `queueRequest`'s refusals on the queueing thread.
+/// channel: the actor's identity, for the re-entrancy guard, the port's
+/// [`QueueGate`], for C `queueRequest`'s refusals on the queueing thread, and
+/// the interfaces its driver registered.
 #[derive(Clone)]
 pub(crate) struct ActorLink {
     pub(crate) id: ActorId,
+    pub(crate) interfaces: InterfaceMask,
     /// The queue the actor drains [`RequestCell`]s from.
     pub(crate) cells: Arc<CellQueue>,
     pub(crate) gate: QueueGate,
@@ -226,13 +231,15 @@ pub(crate) struct ActorLink {
 
 impl ActorLink {
     /// A link for a handle whose channel has no actor behind it (a test
-    /// fixture): a fresh id no thread publishes, and an open gate.
+    /// fixture): a fresh id no thread publishes, an open gate, and no driver
+    /// whose interfaces it could carry.
     #[cfg(test)]
     pub(crate) fn unowned() -> Self {
         let cells = Arc::new(CellQueue::default());
         cells.close();
         Self {
             id: ActorId::new(),
+            interfaces: InterfaceMask::NONE,
             cells,
             gate: QueueGate::open(),
             devices: crate::port::DeviceTable::detached(),
@@ -390,6 +397,14 @@ impl Lend {
         Ok(f(actor))
     }
 
+    /// The driver as the holder of the port reaches it.
+    pub(crate) fn with_port_driver<R>(
+        &self,
+        f: impl FnOnce(&mut dyn PortDriver) -> R,
+    ) -> AsynResult<R> {
+        self.with(|actor| f(actor.driver.as_mut()))
+    }
+
     /// The driver as the holder of a `lock()` reaches it.
     pub(crate) fn with_driver<D: PortDriver, R>(
         &self,
@@ -480,7 +495,7 @@ pub(crate) fn run_lent(lend: &Lend, claimed: Claimed) -> AsynResult<RequestResul
     let Claimed { op, user, priority } = claimed;
     let mut access = Access::Lent(lend);
     access.with(|actor| actor.lent_gate(&op, &user, priority))??;
-    run_claimed(&mut access, &op, user)
+    run_claimed(&mut access, op, user)
 }
 
 /// A claimed request from the user's linkage to its block settlement — the
@@ -488,10 +503,10 @@ pub(crate) fn run_lent(lend: &Lend, claimed: Claimed) -> AsynResult<RequestResul
 /// actor.
 fn run_claimed(
     access: &mut Access<'_>,
-    op: &RequestOp,
+    op: RequestOp,
     mut user: AsynUser,
 ) -> AsynResult<RequestResult> {
-    let callback = PortActor::c_dispatch(op) != CDispatch::Direct;
+    let callback = PortActor::c_dispatch(&op) != CDispatch::Direct;
     // C runs a callback and a `lockPort` span under `synchronousLock`
     // (asynManager.c:830, :909, :1581, :1800); a direct manager call
     // takes no port lock.
@@ -510,7 +525,15 @@ fn run_claimed(
         actor.link_user(&mut user);
         (callback || matches!(op, RequestOp::LockPort(_))).then(|| actor.sync_lock.hold())
     })?;
-    let result = dispatch(access, &mut user, op);
+    let result = match op {
+        RequestOp::CallParamCallbacks {
+            addr,
+            updates,
+            time_stamp,
+            gate: Some(gate),
+        } => access.with(|actor| actor.post_section(addr, updates, time_stamp, gate))?,
+        op => dispatch(access, &mut user, &op),
+    };
     drop(held);
     if callback {
         access.with(|actor| actor.settle_block(&user))?;
@@ -599,6 +622,9 @@ pub(crate) struct ActorMessage {
     /// Where the message sorts ahead of `seq`. Set only by
     /// [`PortActor::enqueue_message`], which knows the port.
     rank: Rank,
+    /// The scope the caller was in: a held section runs it only if it is
+    /// the section's own.
+    scope: SectionScope,
 }
 
 /// Whom a request answers.
@@ -621,7 +647,13 @@ impl ActorMessage {
         cancel: CancelToken,
         reply: oneshot::Sender<AsynResult<RequestResult>>,
     ) -> Self {
-        Self::answering(op, user, Some(cancel), Reply::Result(reply))
+        Self::answering(
+            op,
+            user,
+            Some(cancel),
+            Reply::Result(reply),
+            SectionScope::current(),
+        )
     }
 
     /// A request whose waiter runs it with the actor lent ([`Lend`]).
@@ -631,16 +663,29 @@ impl ActorMessage {
         cancel: CancelToken,
         reply: oneshot::Sender<AsynResult<Claimed>>,
     ) -> Self {
-        Self::answering(op, user, Some(cancel), Reply::Lend(reply))
+        Self::answering(
+            op,
+            user,
+            Some(cancel),
+            Reply::Lend(reply),
+            SectionScope::current(),
+        )
     }
 
-    /// A request nobody waits on: nothing can cancel it or time it out, so
-    /// it carries neither a reply channel nor a token, and allocates nothing.
-    pub(crate) fn unanswered(op: RequestOp, user: AsynUser) -> Self {
-        Self::answering(op, user, None, Reply::Nobody)
+    /// A request nobody waits on, from `scope`: nothing can cancel it or
+    /// time it out, so it carries neither a reply channel nor a token, and
+    /// allocates nothing.
+    pub(crate) fn unanswered(op: RequestOp, user: AsynUser, scope: SectionScope) -> Self {
+        Self::answering(op, user, None, Reply::Nobody, scope)
     }
 
-    fn answering(op: RequestOp, user: AsynUser, cancel: Option<CancelToken>, reply: Reply) -> Self {
+    fn answering(
+        op: RequestOp,
+        user: AsynUser,
+        cancel: Option<CancelToken>,
+        reply: Reply,
+        scope: SectionScope,
+    ) -> Self {
         let priority = request_priority(&op, &user);
         Self {
             op,
@@ -650,6 +695,7 @@ impl ActorMessage {
             seq: next_seq(),
             priority,
             rank: Rank::Arrival,
+            scope,
         }
     }
 
@@ -669,6 +715,9 @@ impl ActorMessage {
             seq,
             priority: request.priority,
             rank: Rank::Arrival,
+            // Device support queues a cell from its own thread, never a
+            // section's.
+            scope: SectionScope::default(),
             op: RequestOp::Cell(cell),
         }
     }
@@ -745,16 +794,83 @@ impl ActorMessage {
     }
 }
 
-/// Sleep until `deadline`, or never if there is none.
+/// Connect-retry timers the idle wait has armed, and the waits they ended;
+/// process-wide (nextest runs each test in its own process).
+#[cfg(test)]
+static RETRY_TIMERS_ARMED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static RETRY_TIMER_FIRES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Point the idle wait's held connect-retry timer at `deadline`. A timer is
+/// armed only when the deadline moved, and dropped when the retry is
+/// disarmed, so a pass woken by traffic arms none.
+fn retarget(mut timer: Pin<&mut Option<tokio::time::Sleep>>, deadline: Option<Instant>) {
+    let deadline = deadline.map(tokio::time::Instant::from_std);
+    let held = timer.as_ref().as_pin_ref().map(|sleep| sleep.deadline());
+    if held == deadline {
+        return;
+    }
+    match (timer.as_mut().as_pin_mut(), deadline) {
+        (Some(sleep), Some(at)) => sleep.reset(at),
+        (_, deadline) => timer.set(deadline.map(tokio::time::sleep_until)),
+    }
+    #[cfg(test)]
+    if deadline.is_some() {
+        RETRY_TIMERS_ARMED.fetch_add(1, AtomicOrdering::SeqCst);
+    }
+}
+
+/// Sleep on the held retry timer, or never if it is disarmed.
 ///
 /// A disarmed connect timer must not make the `select!` arm ready — otherwise
 /// the actor would spin. `pending()` is the "this arm never completes" form,
 /// leaving the other arms (request / shutdown) to drive the loop exactly as
 /// they did before the timer existed.
-async fn sleep_until_opt(deadline: Option<Instant>) {
-    match deadline {
-        Some(at) => tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await,
+async fn sleep_until_opt(timer: Pin<&mut Option<tokio::time::Sleep>>) {
+    match timer.as_pin_mut() {
+        Some(sleep) => {
+            sleep.await;
+            #[cfg(test)]
+            RETRY_TIMER_FIRES.fetch_add(1, AtomicOrdering::SeqCst);
+        }
         None => std::future::pending().await,
+    }
+}
+
+/// The runtime's shutdown channel as the actor reads it. Only a `()` sent on
+/// it stops the port; its closing (every `PortRuntimeHandle` dropped) only
+/// means no stop can come.
+enum Stop {
+    Listening(mpsc::Receiver<()>),
+    Sent,
+    Unreachable,
+}
+
+impl Stop {
+    /// Whether a stop was sent, so [`PortActor::run_with_shutdown`] can leave.
+    fn sent(&mut self) -> bool {
+        if let Stop::Listening(rx) = self {
+            match rx.try_recv() {
+                Ok(()) => *self = Stop::Sent,
+                Err(mpsc::error::TryRecvError::Disconnected) => *self = Stop::Unreachable,
+                Err(mpsc::error::TryRecvError::Empty) => {}
+            }
+        }
+        matches!(self, Stop::Sent)
+    }
+
+    /// Ready once a stop is sent; never, once none can be.
+    async fn arrived(&mut self) {
+        if let Stop::Listening(rx) = self {
+            let next = match rx.recv().await {
+                Some(()) => Stop::Sent,
+                None => Stop::Unreachable,
+            };
+            *self = next;
+        }
+        if !matches!(self, Stop::Sent) {
+            std::future::pending::<()>().await;
+        }
     }
 }
 
@@ -1090,6 +1206,60 @@ impl Blocks {
     }
 }
 
+/// Whether a caller's section holds its callbacks: the actor stored the sets
+/// of a section still open ([`crate::request::SectionCallbacks::owe`]).
+enum SectionHold {
+    /// None does; the empty buffer the next hold keeps its requests in.
+    Free(Vec<ActorMessage>),
+    /// `holds` sections of `scope` hold theirs, each until its
+    /// [`crate::request::SectionCallbacks::Held`] end. Only `scope`'s
+    /// requests run meanwhile, so a further hold is `scope`'s too; the rest
+    /// ([`PortActor::runs_while_a_section_holds`]) wait in `back`, in the
+    /// heap again at the last end.
+    Held {
+        scope: SectionScope,
+        holds: u32,
+        back: Vec<ActorMessage>,
+    },
+}
+
+impl SectionHold {
+    fn hold(&mut self, scope: SectionScope) {
+        match self {
+            Self::Free(spare) => {
+                let back = std::mem::take(spare);
+                *self = Self::Held {
+                    scope,
+                    holds: 1,
+                    back,
+                };
+            }
+            Self::Held { holds, .. } => *holds += 1,
+        }
+    }
+
+    fn end(&mut self, heap: &mut BinaryHeap<ActorMessage>) {
+        let Self::Held { holds, back, .. } = self else {
+            return;
+        };
+        *holds -= 1;
+        if *holds == 0 {
+            if !back.is_empty() {
+                heap.extend(back.drain(..));
+            }
+            *self = Self::Free(std::mem::take(back));
+        }
+    }
+
+    /// The requests a hold keeps out.
+    fn back(&self) -> &[ActorMessage] {
+        match self {
+            Self::Free(_) => &[],
+            Self::Held { back, .. } => back,
+        }
+    }
+}
+
 /// The actor that exclusively owns a port driver instance.
 pub(crate) struct PortActor {
     id: ActorId,
@@ -1116,6 +1286,8 @@ pub(crate) struct PortActor {
     /// is that "still queued, not yet eligible" half of C's queue list; the heap
     /// is the eligible half (R15-47).
     parked: Vec<ActorMessage>,
+    /// Whether a caller's section holds its callbacks, and what it keeps out.
+    hold: SectionHold,
     /// C `pport->queueStateChange` (asynManager.c:870, 1617): something happened
     /// that could make a parked request eligible, so the queue must be rescanned.
     /// Set by an arriving request and by a request that ran (either can enable a
@@ -1170,10 +1342,15 @@ pub(crate) struct PortActor {
 impl Drop for PortActor {
     fn drop(&mut self) {
         self.cells.close();
+        let held_back = match &mut self.hold {
+            SectionHold::Free(_) => Vec::new(),
+            SectionHold::Held { back, .. } => std::mem::take(back),
+        };
         let queued = std::mem::take(&mut self.heap)
             .into_iter()
             .chain(self.dequeued.take())
             .chain(std::mem::take(&mut self.parked))
+            .chain(held_back)
             .chain(std::mem::take(&mut self.pending_while_blocked));
         for msg in queued {
             if let RequestOp::Cell(_) = msg.op {
@@ -1213,6 +1390,7 @@ impl PortActor {
             dequeued: None,
             pending_while_blocked: Vec::new(),
             parked: Vec::new(),
+            hold: SectionHold::Free(Vec::new()),
             rescan_parked: false,
             connect_failure_reported: false,
             woken: false,
@@ -1231,6 +1409,7 @@ impl PortActor {
     pub(crate) fn link(&self) -> ActorLink {
         ActorLink {
             id: self.id,
+            interfaces: self.driver.base().interface_mask(),
             cells: Arc::clone(&self.cells),
             gate: self.driver.base().queue_gate(),
             devices: self.driver.base().device_table(),
@@ -1351,7 +1530,12 @@ impl PortActor {
     /// shutdown signal — which conflated "the creator dropped its handle" with
     /// "shut this port down" and killed ports that the registry still held a
     /// live `PortHandle` for.
-    pub fn run_with_shutdown(self, mut shutdown_rx: mpsc::Receiver<()>) {
+    ///
+    /// The port is defunct before the stop is sent (see
+    /// `runtime::port::StopRequest`), so no request or connect the actor
+    /// reaches after that gets past its gate; the `stop.sent()` checks below
+    /// only make the actor leave promptly, whatever the traffic.
+    pub fn run_with_shutdown(self, shutdown_rx: mpsc::Receiver<()>) {
         // Publish our identity for the whole life of the actor thread: every
         // `PortDriver` method we dispatch below runs on this thread, so a
         // driver that calls back into its own port through a `PortHandle` can
@@ -1367,13 +1551,11 @@ impl PortActor {
             .unwrap();
         let lend = Arc::clone(&self.lend);
         let mut actor = Box::new(self);
-        let mut actor = rt.block_on(async move {
+        let mut actor = block_on_thread_loop(&rt, async move {
             // The registration connect armed in `new`, ahead of every request.
             actor.registration_pass();
-            // Once every PortRuntimeHandle is gone no explicit shutdown can
-            // ever arrive, so the (now permanently ready) shutdown branch is
-            // disabled rather than spun on.
-            let mut can_be_shut_down = true;
+            let mut stop = Stop::Listening(shutdown_rx);
+            let mut retry = std::pin::pin!(None);
             loop {
                 // Drain all pending messages into the heap
                 actor.drain_channel();
@@ -1388,7 +1570,7 @@ impl PortActor {
                     // Connect-priority request to the port thread,
                     // asynManager.c:3283-3297); here the actor IS the port
                     // thread, so it wakes itself.
-                    let retry_at = actor.driver.base().connect_retry_at;
+                    retarget(retry.as_mut(), actor.driver.base().connect_retry_at);
                     let cells = Arc::clone(&actor.cells);
                     tokio::select! {
                         msg = actor.rx.recv() => {
@@ -1401,22 +1583,20 @@ impl PortActor {
                         // C `queueRequest`'s `epicsEventSignal`
                         // (asynManager.c:1628) for a queued cell.
                         _ = cells.pushed() => {}
-                        signal = shutdown_rx.recv(), if can_be_shut_down => {
-                            match signal {
-                                // Explicit shutdown.
-                                Some(()) => break,
-                                // Every PortRuntimeHandle was dropped. Not a
-                                // shutdown — keep serving whoever still holds
-                                // a PortHandle.
-                                None => can_be_shut_down = false,
-                            }
-                        }
-                        _ = sleep_until_opt(retry_at) => {}
+                        () = stop.arrived() => {}
+                        () = sleep_until_opt(retry.as_mut()) => {}
                     }
                     // Drain any more that arrived
                     actor.drain_channel();
                     actor.rescan_parked();
                     actor.drop_left();
+                }
+
+                // Asked here, not only when idle: a client that borrows the
+                // port back-to-back has queued its next request before the
+                // actor is back, so the queue never empties.
+                if stop.sent() {
+                    break;
                 }
 
                 // Run any due connect retry before servicing the queue: a
@@ -1427,6 +1607,10 @@ impl PortActor {
                 // Process one eligible request from the heap
                 if let Some(handoff) = actor.process_one() {
                     actor = lend.hand_off(actor, handoff).await;
+                }
+
+                if stop.sent() {
+                    break;
                 }
 
                 // C `portThread`'s post-drain auto-connect, run on every wake.
@@ -1597,6 +1781,9 @@ impl PortActor {
             return;
         }
         self.parked.retain(|msg| !msg.is_gone());
+        if let SectionHold::Held { back, .. } = &mut self.hold {
+            back.retain(|msg| !msg.is_gone());
+        }
         self.pending_while_blocked.retain(|msg| !msg.is_gone());
         self.heap.retain(|msg| !msg.is_gone());
         self.woken = true;
@@ -1689,7 +1876,10 @@ impl PortActor {
                 out,
                 "    nDevices {} nQueued {} blocked:{}",
                 base.devices().len(),
-                self.heap.len() + self.pending_while_blocked.len() + self.parked.len(),
+                self.heap.len()
+                    + self.pending_while_blocked.len()
+                    + self.parked.len()
+                    + self.hold.back().len(),
                 yn(self.cells.blocks().lock().any_held())
             );
             // C try-locks the two port mutexes from a *separate* report thread
@@ -1730,14 +1920,12 @@ impl PortActor {
                     let _ = writeln!(out, "        asynOctet");
                 }
             }
-            let mut ifaces: Vec<&'static str> = self
-                .driver
-                .capabilities()
-                .iter()
-                .map(|c| c.interface_type().asyn_name())
+            let mut ifaces: Vec<&'static str> = base
+                .interface_mask()
+                .interfaces()
+                .map(|t| t.asyn_name())
                 .collect();
             ifaces.sort_unstable();
-            ifaces.dedup();
             if !ifaces.is_empty() {
                 let _ = writeln!(out, "    interfaceList");
                 for name in ifaces {
@@ -1924,6 +2112,91 @@ impl PortActor {
         }
     }
 
+    /// Whether `op`, from outside a caller's section that holds its
+    /// callbacks, runs meanwhile. The section's thread holds C's lock from the
+    /// sets to its `callParamCallbacks` (NDPluginDriver.cpp:397-466,
+    /// :525-539), so every other thread's request waits for the section's
+    /// end, reads included, in its order with the stores. What runs is that
+    /// end and what C's manager does without the lock.
+    fn runs_while_a_section_holds(op: &RequestOp) -> bool {
+        match op {
+            RequestOp::CallParamCallbacks { gate, .. } => {
+                matches!(gate, Some(crate::request::SectionCallbacks::Held(_)))
+            }
+
+            RequestOp::SetEnable { .. }
+            | RequestOp::ExceptionDisconnect
+            | RequestOp::ExceptionConnect
+            | RequestOp::SetAutoConnect { .. }
+            | RequestOp::GetEnable
+            | RequestOp::GetAutoConnect
+            | RequestOp::GetConnected
+            | RequestOp::ConnectUser
+            | RequestOp::PushEchoInterpose
+            | RequestOp::PushDelayInterpose { .. }
+            | RequestOp::PushEosInterpose { .. }
+            | RequestOp::PushFlushInterpose { .. }
+            | RequestOp::SetTimeStampSource { .. }
+            | RequestOp::BlockProcess { .. }
+            | RequestOp::UnblockProcess { .. }
+            | RequestOp::ShutdownPort => true,
+
+            RequestOp::DrvUserCreate { .. }
+            | RequestOp::Report { .. }
+            | RequestOp::OctetRead { .. }
+            | RequestOp::OctetReadBinary { .. }
+            | RequestOp::Int32Read
+            | RequestOp::Int64Read
+            | RequestOp::Float64Read
+            | RequestOp::UInt32DigitalRead { .. }
+            | RequestOp::GetBoundsInt32
+            | RequestOp::GetBoundsInt64
+            | RequestOp::EnumRead
+            | RequestOp::Int32ArrayRead { .. }
+            | RequestOp::Float64ArrayRead { .. }
+            | RequestOp::Int8ArrayRead { .. }
+            | RequestOp::Int16ArrayRead { .. }
+            | RequestOp::Int64ArrayRead { .. }
+            | RequestOp::Float32ArrayRead { .. }
+            | RequestOp::GetOption { .. }
+            | RequestOp::GetInputEos
+            | RequestOp::GetOutputEos
+            | RequestOp::SetParams { .. }
+            | RequestOp::WithDriver(_)
+            | RequestOp::WithDriverAfterQueue(_)
+            | RequestOp::LockPort(_)
+            | RequestOp::Cell(_)
+            | RequestOp::CellInline(_)
+            | RequestOp::Connect
+            | RequestOp::Disconnect
+            | RequestOp::ConnectAddr
+            | RequestOp::DisconnectAddr
+            | RequestOp::OctetWrite { .. }
+            | RequestOp::OctetWriteRead { .. }
+            | RequestOp::OctetWriteBinary { .. }
+            | RequestOp::Int32Write { .. }
+            | RequestOp::Int64Write { .. }
+            | RequestOp::Float64Write { .. }
+            | RequestOp::UInt32DigitalWrite { .. }
+            | RequestOp::Flush
+            | RequestOp::NoIo
+            | RequestOp::EnumWrite { .. }
+            | RequestOp::Int32ArrayWrite { .. }
+            | RequestOp::Float64ArrayWrite { .. }
+            | RequestOp::Int8ArrayWrite { .. }
+            | RequestOp::Int16ArrayWrite { .. }
+            | RequestOp::Int64ArrayWrite { .. }
+            | RequestOp::Float32ArrayWrite { .. }
+            | RequestOp::SetOption { .. }
+            | RequestOp::SetInputEos { .. }
+            | RequestOp::SetOutputEos { .. }
+            | RequestOp::GpibUniversalCmd { .. }
+            | RequestOp::GpibAddressedCmd { .. }
+            | RequestOp::GpibIfc
+            | RequestOp::GpibRen { .. } => false,
+        }
+    }
+
     /// The `dpCommon` an `addr` names on THIS port — C `findDpCommon`
     /// through `locateDevice` (asynManager.c:538-545, :576).
     fn dp_key(&self, addr: i32) -> DpKey {
@@ -1945,6 +2218,41 @@ impl PortActor {
             .blocks()
             .lock()
             .admits(msg.user.block_token, self.dp_key(msg.user.addr))
+    }
+
+    /// A [`RequestOp::CallParamCallbacks`] of a caller's section, as
+    /// [`Self::dispatch_io`] runs one, but its `updates` go back to the
+    /// caller once stored, before any callback fires: a caller those
+    /// callbacks release finds them there for its next section.
+    fn post_section(
+        &mut self,
+        addr: i32,
+        updates: Vec<crate::request::ParamSetValue>,
+        time_stamp: Option<SystemTime>,
+        gate: crate::request::SectionCallbacks,
+    ) -> AsynResult<RequestResult> {
+        let base = self.driver.base_mut();
+        if let Some(ts) = time_stamp {
+            base.set_time_stamp(ts);
+        }
+        let mut failed = set_params(base, &updates);
+        let holds = gate.owe(addr, &updates);
+        gate.give_back(updates);
+        match holds {
+            Some(scope) => self.hold.hold(scope),
+            None => {
+                if let Some(e) = gate.fire(base) {
+                    failed.get_or_insert(e);
+                }
+                if let crate::request::SectionCallbacks::Held(_) = gate {
+                    self.hold.end(&mut self.heap);
+                }
+            }
+        }
+        match failed {
+            Some(e) => Err(e),
+            None => Ok(RequestResult::write_ok()),
+        }
     }
 
     /// C `portThread` after a callback (:931-934): the user's counted blocks
@@ -2013,6 +2321,7 @@ impl PortActor {
             .iter()
             .chain(&self.pending_while_blocked)
             .chain(&self.parked)
+            .chain(self.hold.back())
             .any(|msg| msg.user.block_token == Some(token))
     }
 
@@ -2107,6 +2416,13 @@ impl PortActor {
         // own timer here. A deadline, an `AQR` cancel and the dequeue below race
         // through one CAS on the token, and exactly one of them wins.
         if msg.is_gone() {
+            return None;
+        }
+        if let SectionHold::Held { scope, back, .. } = &mut self.hold
+            && msg.scope != *scope
+            && !Self::runs_while_a_section_holds(&msg.op)
+        {
+            back.push(msg);
             return None;
         }
 
@@ -2285,7 +2601,7 @@ impl PortActor {
             }
             reply => reply,
         };
-        let result = run_claimed(&mut Access::Owned(self), &op, user);
+        let result = run_claimed(&mut Access::Owned(self), op, user);
         if let Reply::Result(reply) = reply {
             let _ = reply.send(result);
         }
@@ -2561,6 +2877,16 @@ impl PortActor {
     }
 
     fn dispatch_io(&mut self, user: &mut AsynUser, op: &RequestOp) -> AsynResult<RequestResult> {
+        // rs only: a C caller can hold an interface's methods only through
+        // findInterface, so no C path reaches one the port lacks.
+        if let Some(iface) = op.interface()
+            && !self.driver.base().interface_mask().has(iface)
+        {
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: crate::sync_io::no_interface(iface, iface),
+            });
+        }
         let is_read = matches!(
             op,
             RequestOp::Int32Read
@@ -3038,11 +3364,14 @@ impl PortActor {
                 self.driver.write_float32_array(user, data)?;
                 Ok(RequestResult::write_ok())
             }
+            RequestOp::CallParamCallbacks { gate: Some(_), .. } => {
+                unreachable!("run_claimed posts a section through post_section")
+            }
             RequestOp::CallParamCallbacks {
                 addr,
                 updates,
                 time_stamp,
-                gate,
+                gate: None,
             } => {
                 let base = self.driver.base_mut();
                 if let Some(ts) = time_stamp {
@@ -3072,15 +3401,10 @@ impl PortActor {
                         failed.get_or_insert(e);
                     }
                 };
-                match gate {
-                    Some(gate) => gate.run(*addr, updates, flush),
-                    None => {
-                        flush(*addr);
-                        let mut further = Vec::new();
-                        crate::request::push_further_lists(*addr, updates, &mut further);
-                        further.into_iter().for_each(flush);
-                    }
-                }
+                flush(*addr);
+                let mut further = Vec::new();
+                crate::request::push_further_lists(*addr, updates, &mut further);
+                further.into_iter().for_each(flush);
                 match failed {
                     Some(e) => Err(e),
                     None => Ok(RequestResult::write_ok()),
@@ -3335,8 +3659,13 @@ mod tests {
                 "actor_test",
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::INT32
+                    | InterfaceMask::UINT32_DIGITAL
+                    | InterfaceMask::FLOAT64
+                    | InterfaceMask::OCTET
+                    | InterfaceMask::INT64
+                    | InterfaceMask::DRV_USER,
+                InterfaceMask::NONE,
             );
             base.create_param("VAL", ParamType::Int32).unwrap();
             base.create_param("F64", ParamType::Float64).unwrap();
@@ -3486,8 +3815,8 @@ mod tests {
             "addr_test",
             max_addr,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::INT32,
+            InterfaceMask::NONE,
         );
         base.own_interrupts(InterruptGate::opened());
         let val = base.create_param("VAL", ParamType::Int32).unwrap();
@@ -3791,8 +4120,8 @@ mod tests {
             "eos_test",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OCTET,
+            InterfaceMask::NONE,
         );
         eos_base.install_octet_interpose(Box::new(crate::interpose::eos::EosInterpose::default()));
         let tx = spawn_actor(EosObserver {
@@ -3919,8 +4248,8 @@ mod tests {
                 "flush_test",
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             ),
             flush_calls: flush_calls.clone(),
             write_calls: write_calls.clone(),
@@ -3986,8 +4315,8 @@ mod tests {
                 "eom_test",
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             ),
         };
         let tx = spawn_actor(drv);
@@ -4034,8 +4363,8 @@ mod tests {
                 "takeback_test",
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             ),
         };
         drv.base
@@ -4069,6 +4398,7 @@ mod tests {
                 seq,
                 priority: QueuePriority::Medium,
                 rank: Rank::Band(QueuePriority::Medium),
+                scope: SectionScope::default(),
             }
         };
         let mut heap = BinaryHeap::new();
@@ -4336,6 +4666,7 @@ mod tests {
                 seq,
                 priority,
                 rank: Rank::Band(priority),
+                scope: SectionScope::default(),
             }
         };
         let mut heap = BinaryHeap::new();
@@ -4476,8 +4807,8 @@ mod tests {
             "throttle_test",
             1,
             flags,
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.create_param("VAL", ParamType::Int32).unwrap();
         base.init_connected(false);
@@ -4571,8 +4902,8 @@ mod tests {
             "waived_test",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OPTION | InterfaceMask::INT32,
+            InterfaceMask::NONE,
         );
         base.init_connected(false);
         base.init_auto_connect(true);
@@ -4666,8 +4997,8 @@ mod tests {
             "disconnect_test",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.init_connected(true);
         base.init_auto_connect(true);
@@ -4735,8 +5066,8 @@ mod tests {
             "addr_ac",
             1,
             flags,
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::INT32,
+            InterfaceMask::NONE,
         );
         base.create_param("VAL", ParamType::Int32).unwrap();
         base.params.set_int32(0, 0, 7).unwrap();
@@ -4808,8 +5139,8 @@ mod tests {
                     can_block: true,
                     ..PortFlags::default()
                 },
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::INT32,
+                InterfaceMask::NONE,
             );
             base.create_param("VAL", ParamType::Int32).unwrap();
             base.params.set_int32(0, 1, 7).unwrap();
@@ -4929,8 +5260,8 @@ mod tests {
             "retry_test",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.create_param("VAL", ParamType::Int32).unwrap();
         base.init_auto_connect(true);
@@ -5026,8 +5357,8 @@ mod tests {
                     multi_device: true,
                     ..PortFlags::default()
                 },
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::NONE,
+                InterfaceMask::NONE,
             );
             base.init_auto_connect(true);
             base.set_connected(false);
@@ -5136,8 +5467,8 @@ mod tests {
                 multi_device: true,
                 ..PortFlags::default()
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         services.bind(&mut base);
         let trace = services.trace();
@@ -5230,8 +5561,8 @@ mod tests {
             "no_auto",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.init_auto_connect(false);
         base.init_connected(true);
@@ -5246,8 +5577,8 @@ mod tests {
             "auto",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.init_auto_connect(true);
         base.init_connected(true);
@@ -5269,8 +5600,8 @@ mod tests {
                 can_block,
                 ..PortFlags::default()
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OPTION | InterfaceMask::INT32,
+            InterfaceMask::NONE,
         );
         base.create_param("VAL", ParamType::Int32).unwrap();
         base.params.set_int32(0, 0, 7).unwrap();
@@ -5452,6 +5783,7 @@ mod tests {
         tx.send(ActorMessage::unanswered(
             write,
             AsynUser::new(0).with_addr(1),
+            SectionScope::default(),
         ))
         .unwrap();
         // Device 0's read queues behind the write.
@@ -5550,8 +5882,8 @@ mod tests {
                 can_block: true,
                 ..PortFlags::default()
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OCTET,
+            InterfaceMask::NONE,
         );
         let tx = spawn_actor(InterposeDriver { base });
 
@@ -5637,8 +5969,8 @@ mod tests {
                 "enable_test",
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::NONE,
+                InterfaceMask::NONE,
             );
             base.create_param("VAL", ParamType::Int32).unwrap();
             base.init_connected(false);
@@ -5753,8 +6085,8 @@ mod tests {
             "status_test",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.create_param("VAL", ParamType::Int32).unwrap();
         // Down, enabled, auto-connect, and with no throttle window running
@@ -5811,6 +6143,159 @@ mod tests {
             calls.load(Ordering::SeqCst),
             1,
             "an exception is a port-thread wake and a woken pass does attempt one connect"
+        );
+    }
+
+    /// An auto-connect port whose connect fails `fail_first` times and then
+    /// holds, on the production loop (the one with the connect-retry timer).
+    /// Returns the request sender, the connect attempts and the link state.
+    fn spawn_retrying_port(
+        fail_first: usize,
+        between: Duration,
+    ) -> (
+        mpsc::UnboundedSender<ActorMessage>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        struct Retrying {
+            base: PortDriverBase,
+            calls: Arc<AtomicUsize>,
+            up: Arc<AtomicBool>,
+            fail_first: usize,
+        }
+        impl PortDriver for Retrying {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
+                if self.calls.fetch_add(1, Ordering::SeqCst) < self.fail_first {
+                    return Err(AsynError::Status {
+                        status: AsynStatus::Error,
+                        message: "link down".into(),
+                    });
+                }
+                self.base.set_connected(true);
+                self.up.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let mut base = PortDriverBase::new(
+            "retry_timer",
+            1,
+            PortFlags::default(),
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
+        );
+        base.create_param("VAL", ParamType::Int32).unwrap();
+        base.init_auto_connect(true);
+        base.seconds_between_port_connect = between;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let up = Arc::new(AtomicBool::new(false));
+        let driver = Retrying {
+            base,
+            calls: calls.clone(),
+            up: up.clone(),
+            fail_first,
+        };
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut actor = PortActor::new(Box::new(driver), rx);
+        actor.register();
+        let (_shutdown, shutdown_rx) = mpsc::channel(1);
+        std::thread::spawn(move || actor.run_with_shutdown(shutdown_rx));
+        (tx, calls, up)
+    }
+
+    /// The idle wait holds the connect-retry timer across loop passes: a pass
+    /// woken by a message, with `connect_retry_at` where it was, arms none.
+    #[test]
+    fn a_pass_that_keeps_the_retry_deadline_arms_no_timer() {
+        use std::sync::atomic::Ordering;
+
+        // Registration's failed attempt re-arms once, for the whole test.
+        let (tx, _calls, _up) = spawn_retrying_port(usize::MAX, Duration::from_secs(3600));
+
+        let started = Instant::now();
+        while RETRY_TIMERS_ARMED.load(Ordering::SeqCst) == 0 {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the retry timer never armed"
+            );
+            std::thread::yield_now();
+        }
+        let before = RETRY_TIMERS_ARMED.load(Ordering::SeqCst);
+        // Plain reads: each wakes the actor and leaves the deadline alone. A
+        // reply leaves ahead of its pass's next idle wait, so the ninth one is
+        // what proves the eighth pass waited again.
+        for _ in 0..9 {
+            send_and_wait(&tx, RequestOp::GetConnected, AsynUser::default()).unwrap();
+        }
+        assert_eq!(
+            RETRY_TIMERS_ARMED.load(Ordering::SeqCst) - before,
+            0,
+            "timers armed by passes that kept the retry deadline"
+        );
+    }
+
+    /// A retry that fires and fails moves the deadline, and the spent timer
+    /// is re-armed at it: a wait ends once per due retry, each a connect
+    /// attempt, not on every pass until the next one is due.
+    #[test]
+    fn a_spent_retry_timer_follows_the_moved_deadline() {
+        use std::sync::atomic::Ordering;
+
+        let (_tx, calls, _up) = spawn_retrying_port(usize::MAX, Duration::from_millis(20));
+        // From the second timer retry on, each waited on a deadline the one
+        // before it moved.
+        let started = Instant::now();
+        while calls.load(Ordering::SeqCst) < 4 {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the retry timer stopped"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // Fires first: registration's attempt ended no wait, which covers a
+        // fire whose attempt is still running.
+        let fires = RETRY_TIMER_FIRES.load(Ordering::SeqCst);
+        let attempts = calls.load(Ordering::SeqCst);
+        assert!(
+            fires <= attempts,
+            "{fires} retry-timer wakes for {attempts} connect attempts"
+        );
+    }
+
+    /// A retry that brings the port up disarms the timer, and the spent
+    /// `Sleep` goes with it: a connected idle port's wait never ends on its
+    /// own.
+    #[test]
+    fn a_disarmed_retry_timer_is_dropped() {
+        use std::sync::atomic::Ordering;
+
+        // Registration's attempts fail, so a timer retry brings the link up.
+        let (tx, _calls, up) = spawn_retrying_port(2, Duration::from_millis(20));
+        let started = Instant::now();
+        while !up.load(Ordering::SeqCst) {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the retry never connected"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let fires = RETRY_TIMER_FIRES.load(Ordering::SeqCst);
+        assert!(fires > 0, "the link came up on a timer retry");
+        // Idle, then woken: neither may end a wait on the spent timer.
+        std::thread::sleep(Duration::from_millis(20));
+        send_and_wait(&tx, RequestOp::GetConnected, AsynUser::default()).unwrap();
+        assert_eq!(
+            RETRY_TIMER_FIRES.load(Ordering::SeqCst) - fires,
+            0,
+            "waits ended by a disarmed retry timer"
         );
     }
 
@@ -6058,8 +6543,8 @@ mod tests {
                 multi_device: true,
                 ..PortFlags::default()
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.own_interrupts(epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened());
         let val = base.create_param("VAL", ParamType::Int32).unwrap();
@@ -6121,8 +6606,8 @@ mod tests {
                 multi_device: true,
                 ..PortFlags::default()
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.own_interrupts(epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened());
         let val = base.create_param("VAL", ParamType::Int32).unwrap();
@@ -6182,8 +6667,8 @@ mod tests {
                 multi_device: true,
                 ..PortFlags::default()
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.own_interrupts(epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened());
         let val = base.create_param("VAL", ParamType::Int32).unwrap();
@@ -6227,8 +6712,8 @@ mod tests {
             "stamp_pub",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.own_interrupts(epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened());
         let val = base.create_param("VAL", ParamType::Int32).unwrap();
@@ -6280,8 +6765,8 @@ mod tests {
             "status_pub",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.own_interrupts(epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened());
         let val = base.create_param("VAL", ParamType::Int32).unwrap();
@@ -6359,8 +6844,8 @@ mod tests {
             "batch_array",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.own_interrupts(epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened());
         let val = base.create_param("VAL", ParamType::Int32).unwrap();
@@ -6407,8 +6892,8 @@ mod tests {
                 multi_device: true,
                 ..PortFlags::default()
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.own_interrupts(epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened());
         let val = base.create_param("VAL", ParamType::Int32).unwrap();
@@ -6454,8 +6939,8 @@ mod tests {
             "set_alone",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::INT32,
+            InterfaceMask::NONE,
         );
         base.own_interrupts(epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened());
         let val = base.create_param("VAL", ParamType::Int32).unwrap();
@@ -6601,9 +7086,6 @@ mod tests {
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.0
             }
-            fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
-                crate::interfaces::octet_transport_capabilities()
-            }
         }
 
         let build = || {
@@ -6615,8 +7097,8 @@ mod tests {
                     can_block: true,
                     ..PortFlags::default()
                 },
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OCTET_TRANSPORT,
+                InterfaceMask::OCTET,
             );
             base.init_auto_connect(true);
             base.init_connected(false);
@@ -6754,8 +7236,8 @@ mod tests {
                 "rep",
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::NONE,
+                InterfaceMask::NONE,
             );
             base.init_auto_connect(false);
             base.set_connected(connected);
@@ -6794,8 +7276,8 @@ mod tests {
             "gone",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         shut_down(&mut base);
         let tx = spawn_actor(ReportSpy {
@@ -6837,8 +7319,8 @@ mod tests {
                     multi_device: true,
                     ..PortFlags::default()
                 },
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::NONE,
+                InterfaceMask::NONE,
             );
             base.init_auto_connect(port_auto_connect);
             base.device_state(0);
@@ -6879,10 +7361,10 @@ mod tests {
     /// interrupt clients (:3695-3708).
     #[test]
     fn the_default_driver_block_is_asyn_port_drivers() {
-        use crate::interfaces::{Capability, InterfaceType};
+        use crate::interfaces::InterfaceType;
         use crate::interrupt::InterruptFilter;
 
-        struct Drv(PortDriverBase, Vec<Capability>);
+        struct Drv(PortDriverBase);
         impl PortDriver for Drv {
             fn base(&self) -> &PortDriverBase {
                 &self.0
@@ -6890,29 +7372,26 @@ mod tests {
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.0
             }
-            fn capabilities(&self) -> Vec<Capability> {
-                self.1.clone()
-            }
         }
 
-        let build = |caps: Vec<Capability>| {
+        let build = |interfaces: InterfaceMask| {
             let mut base = PortDriverBase::new(
                 "drv_rep",
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                interfaces,
+                InterfaceMask::INT32,
             );
             base.create_param("VAL", ParamType::Int32).unwrap();
             base.install_octet_interpose(Box::new(crate::interpose::eos::EosInterpose::default()));
-            let mut drv = Drv(base, caps);
+            let mut drv = Drv(base);
             drv.set_input_eos(&AsynUser::default(), b"\r\n").unwrap();
             drv
         };
 
         // No octet interface → no EOS lines. C reads them off
         // `pasynStdInterfaces->octet.pinterface`, which such a port never set.
-        let mut int32_only = build(vec![Capability::Int32Read]);
+        let mut int32_only = build(InterfaceMask::INT32);
         let mut out = String::new();
         int32_only.report(&mut out, 1);
         assert!(out.starts_with("Port: drv_rep\n"), "{out}");
@@ -6948,7 +7427,7 @@ mod tests {
         assert_eq!(out0, "Port: drv_rep\n");
 
         // An octet port reports the terminators it actually has.
-        let mut octet = build(crate::interfaces::octet_transport_capabilities());
+        let mut octet = build(InterfaceMask::OCTET_TRANSPORT);
         let mut out = String::new();
         octet.report(&mut out, 1);
         assert!(
@@ -6957,7 +7436,7 @@ mod tests {
         );
 
         // details >= 3: one line per interrupt client, and none below 3.
-        let mut with_client = build(vec![Capability::Int32Read]);
+        let mut with_client = build(InterfaceMask::INT32);
         let (_sub, _rx) = with_client
             .0
             .interrupts
@@ -7022,8 +7501,8 @@ mod tests {
             "disabled_port",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.init_auto_connect(false);
         base.set_connected(false);
@@ -7494,8 +7973,8 @@ mod tests {
             "serial_actor",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::INT32,
+            InterfaceMask::NONE,
         );
         base.create_param("VAL", ParamType::Int32).unwrap();
         let driver = CountingDriver {
@@ -7603,8 +8082,8 @@ mod tests {
                 "trace_link",
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             )),
             &crate::registry::open_owner(),
         )

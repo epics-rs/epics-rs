@@ -12,10 +12,10 @@
 // Build with the bundled pvxs headers + libpvxs:
 //
 //   c++ -std=c++17 \
-//       -I~/codes/pvxs/include -I~/epics/epics-base/include \
+//       -I$PVXS_HOME/include -I$EPICS_BASE/include \
 //       r20_typed_monitor.cpp \
-//       -L~/codes/pvxs/lib/darwin-aarch64 -lpvxs \
-//       -L~/epics/epics-base/lib/darwin-aarch64 -lCom \
+//       -L$PVXS_HOME/lib/darwin-aarch64 -lpvxs \
+//       -L$EPICS_BASE/lib/darwin-aarch64 -lCom \
 //       -o r20_typed_monitor
 
 #include <pvxs/client.h>

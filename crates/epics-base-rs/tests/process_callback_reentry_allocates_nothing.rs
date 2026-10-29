@@ -8,7 +8,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use epics_base_rs::runtime::task::CallbackPriority;
 use epics_base_rs::server::database::PvDatabase;
@@ -91,7 +91,7 @@ fn val(db: &PvDatabase) -> u64 {
 }
 
 fn wait_val(db: &PvDatabase, want: u64) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
     while val(db) < want {
         assert!(Instant::now() < deadline, "C never reached {want}");
         std::thread::yield_now();

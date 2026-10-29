@@ -1,0 +1,56 @@
+record(motor,"$(P)$(M)")
+{
+	field(DESC,"$(DESC)")
+	field(DTYP,"$(DTYP)")
+	field(DIR,"$(DIR)")
+	field(VELO,"$(VELO)")
+	field(VBAS,"$(VBAS)")
+	field(ACCL,"$(ACCL)")
+	field(ACCU,"$(ACCU=0)")
+	field(BDST,"$(BDST)")
+	field(BVEL,"$(BVEL)")
+	field(BACC,"$(BACC)")
+	field(OUT,"@asyn($(PORT),$(ADDR))")
+	field(MRES,"$(MRES)")
+	field(PREC,"$(PREC)")
+	field(EGU,"$(EGU)")
+	field(DHLM,"$(DHLM)")
+	field(DLLM,"$(DLLM)")
+	field(INIT,"$(INIT)")
+	field(TWV,"1")
+}
+
+# These records make the motor resolution, offset and direction available to the driver
+# which is needed for profile moves and other applications
+
+# Motor direction for this axis
+record(longout,"$(P)$(M)Direction") {
+    field(DESC, "$(M) direction")
+    field(DOL,  "$(P)$(M).DIR CP MS")
+    field(OMSL, "closed_loop")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),$(ADDR))MOTOR_REC_DIRECTION")
+}
+
+
+# Motor offset for this axis
+record(ao,"$(P)$(M)Offset") {
+    field(DESC, "$(M) offset")
+    field(DOL,  "$(P)$(M).OFF CP MS")
+    field(OMSL, "closed_loop")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT),$(ADDR))MOTOR_REC_OFFSET")
+    field(PREC, "$(PREC)")
+}
+
+
+# Motor resolution for this axis
+record(ao,"$(P)$(M)Resolution") {
+    field(DESC, "$(M) resolution")
+    field(DOL,  "$(P)$(M).MRES CP MS")
+    field(OMSL, "closed_loop")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT),$(ADDR))MOTOR_REC_RESOLUTION")
+    field(PREC, "$(PREC)")
+}
+

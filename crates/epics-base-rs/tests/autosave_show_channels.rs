@@ -29,7 +29,8 @@ async fn child_ioc() {
         // Returning ends the IOC, so it waits for the script's last put.
         .run(|config| async move {
             epics_base_rs::server::db_server::announce_serving("probe");
-            for _ in 0..200 {
+            let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+            while std::time::Instant::now() < deadline {
                 if config.db.get_pv("P:DONE").is_ok_and(|v| v.text_g() == "1") {
                     break;
                 }

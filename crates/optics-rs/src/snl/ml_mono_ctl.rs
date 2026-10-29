@@ -37,7 +37,7 @@ macro_rules! seqg_escaped {
     ($env:ident, r#"printf("ml_monoCtl:initSequence:initSeq=0\n");"#) => {
         printf("ml_monoCtl:initSequence:initSeq=0\n", &[])
     };
-    ($env:ident, r#"ml_monoCtl_pmacP = seq_macValueGet(ssId,"P"); ml_monoCtl_pmacM = seq_macValueGet(ssId,"M_THETA"); if (ml_monoCtl_pmacP == 0 || ml_monoCtl_pmacM == 0) { sprintf(thetaMotName,"None"); } else { snprintf(thetaMotName, sizeof(thetaMotName), "%s%s", ml_monoCtl_pmacP, ml_monoCtl_pmacM); } ml_monoCtl_pmacM = seq_macValueGet(ssId,"M_THETA2"); if (ml_monoCtl_pmacP == 0 || ml_monoCtl_pmacM == 0) { sprintf(theta2MotName,"None"); } else { snprintf(theta2MotName, sizeof(theta2MotName), "%s%s", ml_monoCtl_pmacP, ml_monoCtl_pmacM); } ml_monoCtl_pmacM = seq_macValueGet(ssId,"M_Z"); if (ml_monoCtl_pmacP == 0 || ml_monoCtl_pmacM == 0) { sprintf(zMotName,"None"); } else { snprintf(zMotName, sizeof(zMotName), "%s%s", ml_monoCtl_pmacP, ml_monoCtl_pmacM); } ml_monoCtl_pmacM = seq_macValueGet(ssId,"M_Y"); if (ml_monoCtl_pmacP == 0 || ml_monoCtl_pmacM == 0) { sprintf(yMotName,"None"); } else { snprintf(yMotName, sizeof(yMotName), "%s%s", ml_monoCtl_pmacP, ml_monoCtl_pmacM); } ml_monoCtl_pmacY_OFF = seq_macValueGet(ssId,"Y_OFF"); yOffset = atof(ml_monoCtl_pmacY_OFF); if ((yOffset < 1) || (yOffset > 60.)) yOffset = 35.; ml_monoCtl_pmacGEOM = seq_macValueGet(ssId,"GEOM"); geom = 1;"#) => {{
+    ($env:ident, r#"ml_monoCtl_pmacP = seq_macValueGet(ssId,"P"); ml_monoCtl_pmacM = seq_macValueGet(ssId,"M_THETA"); if (ml_monoCtl_pmacP == 0 || ml_monoCtl_pmacM == 0) { sprintf(thetaMotName,"None"); } else { snprintf(thetaMotName, sizeof(thetaMotName), "%s%s", ml_monoCtl_pmacP, ml_monoCtl_pmacM); } ml_monoCtl_pmacM = seq_macValueGet(ssId,"M_THETA2"); if (ml_monoCtl_pmacP == 0 || ml_monoCtl_pmacM == 0) { sprintf(theta2MotName,"None"); } else { snprintf(theta2MotName, sizeof(theta2MotName), "%s%s", ml_monoCtl_pmacP, ml_monoCtl_pmacM); } ml_monoCtl_pmacM = seq_macValueGet(ssId,"M_Z"); if (ml_monoCtl_pmacP == 0 || ml_monoCtl_pmacM == 0) { sprintf(zMotName,"None"); } else { snprintf(zMotName, sizeof(zMotName), "%s%s", ml_monoCtl_pmacP, ml_monoCtl_pmacM); } ml_monoCtl_pmacM = seq_macValueGet(ssId,"M_Y"); if (ml_monoCtl_pmacP == 0 || ml_monoCtl_pmacM == 0) { sprintf(yMotName,"None"); } else { snprintf(yMotName, sizeof(yMotName), "%s%s", ml_monoCtl_pmacP, ml_monoCtl_pmacM); } ml_monoCtl_pmacY_OFF = seq_macValueGet(ssId,"Y_OFF"); yOffsetInit = atof(ml_monoCtl_pmacY_OFF); if ((yOffsetInit < 1) || (yOffsetInit > 60.)) yOffsetInit = 35.; ml_monoCtl_pmacGEOM = seq_macValueGet(ssId,"GEOM"); geom = 1;"#) => {{
         let v = $env.var();
         let p = $env.mac_value_get("P");
         for (name, motor) in [
@@ -47,15 +47,15 @@ macro_rules! seqg_escaped {
             (&v.yMotName, "M_Y"),
         ] {
             let m = $env.mac_value_get(motor);
-            if p.is_none() || m.is_none() {
+            if p.is_null() || m.is_null() {
                 sprintf(name, "None", &[]);
             } else {
                 sprintf(name, "%s%s", &[CArg::from(p.clone()), CArg::from(m)]);
             }
         }
-        v.yOffset.set(atof($env.mac_value_get("Y_OFF")));
-        if v.yOffset.get() < 1.0 || v.yOffset.get() > 60. {
-            v.yOffset.set(35.);
+        v.yOffsetInit.set(atof($env.mac_value_get("Y_OFF")));
+        if v.yOffsetInit.get() < 1.0 || v.yOffsetInit.get() > 60. {
+            v.yOffsetInit.set(35.);
         }
         // C fetches GEOM into ml_monoCtl_pmacGEOM and never reads it.
         v.geom.set(1);

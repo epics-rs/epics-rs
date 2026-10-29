@@ -6469,7 +6469,7 @@ mod priority_circuit_tests {
 #[cfg(all(test, feature = "client", tokio_backend))]
 mod circuit_retirement_tests {
     //! The wedge measured on the RTEMS target (topology-B, an 11-minute
-    //! upstream outage, `~/rtems-bringup/topoB/wedge-fd3-*`): a data circuit's
+    //! upstream outage): a data circuit's
     //! socket was killed by a SLIRP-forged RST after it had sent CREATE_CHAN,
     //! and it was never retired for the whole outage — leaked as a zombie fd
     //! (mode 0140000, peer=none/ENOTCONN) while the name-service circuit

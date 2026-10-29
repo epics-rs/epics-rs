@@ -34,7 +34,6 @@ async fn main() -> CaResult<()> {
     sim_detector::ioc_support::register(&mut ioc);
 
     // Motors (simMotorCreate command + motor.template)
-    epics_base_rs::runtime::env::set_default_path("MOTOR", motor_rs::MOTOR_IOC_DIR);
     let motor_holder = SimMotorHolder::new();
     ioc.register_startup_command(motor_holder.sim_motor_create_command());
     ioc.register_dynamic_device_support(

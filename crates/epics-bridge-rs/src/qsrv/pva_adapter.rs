@@ -13,7 +13,7 @@ use epics_base_rs::types::RecordName;
 use epics_pva_rs::server_native::MonitorStream;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
@@ -838,100 +838,6 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
 // CA + PVA dual-protocol runner for IocApplication
 // ---------------------------------------------------------------------------
 
-/// The pvxs `enable2()` decision: whether QSRV2's iocsh commands register, plus
-/// the startup diagnostics pvxs prints synchronously (iochooks.cpp:401-448).
-struct Qsrv2Decision {
-    enabled: bool,
-    /// Invalid `PVXS_QSRV_ENABLE` value — pvxs prints this to stderr
-    /// immediately (iochooks.cpp:421-426).
-    error: Option<String>,
-    /// The `INFO: PVXS QSRV2 ...` status line pvxs prints to stdout
-    /// (iochooks.cpp:441-443). `None` when the operator explicitly
-    /// disabled QSRV2 (`quiet` — the "shut up, I know what I'm doing" path).
-    info: Option<String>,
-}
-
-/// Pure core of pvxs `enable2()` (iochooks.cpp:401-448), parameterized on
-/// the two environment strings so it is testable without mutating the
-/// process environment.
-///
-/// pvxs gates on `permit && request`. `permit` is false only when QSRV1
-/// (`qsrv.dbd`) is co-linked; the Rust IOC has no QSRV1 coexistence, so
-/// `permit` is always true and only `request` varies. `EPICS_IOC_IGNORE_
-/// SERVERS=qsrv2` and `PVXS_QSRV_ENABLE=NO` disable quietly; `=YES`
-/// enables; any other value keeps the default (enabled) and emits the
-/// error diagnostic. The ignore-servers check takes precedence over
-/// `PVXS_QSRV_ENABLE` (pvxs evaluates it first).
-fn resolve_qsrv2_enable(ignore_servers: Option<&str>, qsrv_enable: Option<&str>) -> Qsrv2Decision {
-    let mut request = true;
-    let mut quiet = false;
-    let mut error = None;
-
-    if ignore_servers.is_some_and(|s| s.contains("qsrv2")) {
-        request = false;
-        quiet = true;
-    } else if qsrv_enable.is_some_and(|s| s.eq_ignore_ascii_case("YES")) {
-        request = true;
-    } else if qsrv_enable.is_some_and(|s| s.eq_ignore_ascii_case("NO")) {
-        request = false;
-        quiet = true;
-    } else if let Some(v) = qsrv_enable {
-        // Unknown value: keep the default (`request` unchanged) and report.
-        error = Some(format!(
-            "ERROR: PVXS_QSRV_ENABLE={v} not YES/NO.  Defaulting to {}.",
-            if request { "YES" } else { "NO" }
-        ));
-    }
-
-    // permit == true, so enable == request.
-    let enabled = request;
-    let info = if quiet {
-        None
-    } else {
-        Some(format!(
-            "INFO: PVXS QSRV2 is loaded, permitted, and {}.",
-            if enabled { "ENABLED" } else { "disabled" }
-        ))
-    };
-    Qsrv2Decision {
-        enabled,
-        error,
-        info,
-    }
-}
-
-/// Process-global QSRV2 enable decision, computed exactly once from the
-/// environment. Pinning it here is the structural single-source-of-truth:
-/// the two consumers that run at different iocInit points — the pvalink
-/// install seam (`pvalink_link_set_install`, fired at `AfterCaLinkInit`)
-/// and the QSRV mount build (`build_qsrv_mount`) — read this one
-/// cell, so they cannot disagree on whether QSRV2 is on. Mirrors pvxs,
-/// where `enable2()` is evaluated once in `pvxsBaseRegistrar` and the
-/// single result gates `single_enable()` / `group_enable()` /
-/// `pvalink_enable()` together (iochooks.cpp:465-496).
-static QSRV2_DECISION: OnceLock<Qsrv2Decision> = OnceLock::new();
-
-/// The single owner of the QSRV2 enable decision. Reads
-/// `EPICS_IOC_IGNORE_SERVERS` / `PVXS_QSRV_ENABLE`, applies the pvxs
-/// `enable2()` rule and prints its diagnostics on the FIRST call only, as
-/// `enable2()` does from `pvxsBaseRegistrar` before the st.cmd runs
-/// (iochooks.cpp:459-462); every later caller reuses the cached
-/// [`Qsrv2Decision`].
-fn qsrv2_decision() -> &'static Qsrv2Decision {
-    QSRV2_DECISION.get_or_init(|| {
-        let ignore = epics_base_rs::runtime::env::get_lossy("EPICS_IOC_IGNORE_SERVERS");
-        let enable = epics_base_rs::runtime::env::get_lossy("PVXS_QSRV_ENABLE");
-        let decision = resolve_qsrv2_enable(ignore.as_deref(), enable.as_deref());
-        if let Some(e) = &decision.error {
-            epics_base_rs::stderr_println!("{e}");
-        }
-        if let Some(i) = &decision.info {
-            println!("{i}");
-        }
-        decision
-    })
-}
-
 // ---------------------------------------------------------------------------
 // The QSRV mount — the one construction path for a served QSRV source
 // ---------------------------------------------------------------------------
@@ -1013,7 +919,7 @@ pub async fn build_qsrv_mount(
     // pvxs `processGroups()` runs whatever `enable2()` decided
     // (iochooks.cpp:354-355); `group_files` are a command line's
     // `dbLoadGroup` lines, which QSRV2 off leaves unregistered.
-    let group_files = if qsrv2_decision().enabled {
+    let group_files = if epics_pva_rs::server::iocsh::qsrv2_enabled() {
         group_files
     } else {
         for _ in group_files {
@@ -1063,38 +969,16 @@ impl QsrvMount {
 }
 
 /// Async link-set installer for
-/// [`epics_base_rs::server::ioc_app::IocApplication::register_link_type`].
-///
-/// Installs the `"pva"` link set (pvalink) on `db` and returns its iocsh
-/// commands. `run_qsrv_ioc_app` registers it for every QSRV route; only a
-/// custom runner registers it itself. It is fired by
-/// `IocApplication::run` at the `AfterCaLinkInit` hook — BEFORE
-/// `setup_cp_links` and before record processing (PINI), so a `pva://`
-/// CP link is opened and its background connect kicked off while iocInit
-/// is still running, matching pvxs opening pvalink channels at
-/// `initHookAfterIocBuilt` (`linkGlobal_t::init`). Installing pvalink in
-/// the Phase-3 protocol runner (where it lived previously) ran after
-/// `setup_cp_links`, so a Passive CP holder's warm no-op'd.
-///
-/// PVA links do NOT participate in `dbCaRun`'s wait, which blocks on CA
-/// links alone; pvxs pvalink never blocks iocInit. A `pva://` link that cannot connect therefore does not
-/// hold up PINI; it connects asynchronously in the background.
-///
-/// pvxs allocates and starts its link machinery whatever `enable2()`
-/// decided (`iochooks.cpp:338-341,367-369`); the decision gates only
-/// `pvalink_enable()`'s registrations (`iochooks.cpp:503-507`). With the
-/// `pvalink` feature off this is an empty no-op installer.
+/// [`epics_base_rs::server::ioc_app::IocApplication::register_link_type`]:
+/// [`epics_pva_rs::pvalink::pvalink_link_set_install`]. `run_qsrv_ioc_app` declares `pva` for every QSRV
+/// route; only a custom runner registers this itself. With the `pvalink`
+/// feature off this is an empty no-op installer.
 pub async fn pvalink_link_set_install(
     db: Arc<epics_base_rs::server::database::PvDatabase>,
 ) -> Vec<epics_base_rs::server::iocsh::registry::CommandDef> {
     #[cfg(feature = "pvalink")]
     {
-        let resolver = crate::pvalink::install_pvalink_resolver(&db).await;
-        let mut commands = crate::pvalink::register_pvalink_commands(resolver.clone());
-        if qsrv2_decision().enabled {
-            commands.extend(crate::pvalink::pvalink_enable_commands(resolver));
-        }
-        commands
+        epics_pva_rs::pvalink::pvalink_link_set_install(db).await
     }
     #[cfg(not(feature = "pvalink"))]
     {
@@ -1141,9 +1025,7 @@ pub async fn run_ca_pva_qsrv_ioc_app(
     app: epics_base_rs::server::ioc_app::IocApplication,
 ) -> epics_base_rs::error::CaResult<()> {
     let app = epics_ca_rs::server::iocsh::register_rsrv_commands(app);
-    let app = epics_pva_rs::server::iocsh::pvxs_base_registrar_with_enable2(app, || {
-        qsrv2_decision();
-    });
+    let app = epics_pva_rs::server::iocsh::pvxs_base_registrar(app);
     // No `group_files`: this IOC's `dbLoadGroup` requests sit on the base
     // startup queue, put there by the iocsh command during st.cmd.
     run_qsrv_ioc_app(app, Vec::new(), serve_ca_pva_qsrv).await
@@ -1168,7 +1050,7 @@ where
     // pvxsBaseRegistrar's point: the decision and its INFO line come before
     // the st.cmd, not at iocInit, and `group_enable()` registers
     // `dbLoadGroup` there (iochooks.cpp:503-507).
-    let app = if qsrv2_decision().enabled {
+    let app = if epics_pva_rs::server::iocsh::qsrv2_enabled() {
         app.register_startup_command(
             epics_base_rs::server::ioc_app::db_load_group_startup_command(),
         )
@@ -1180,13 +1062,12 @@ where
     // Both link sets are installed here, the one place for every QSRV route:
     // at `AfterCaLinkInit`, before link init refuses a scheme with no set.
     // `ca` because softIocPVX links dbCa as every softIoc does.
-    let app = app
-        .register_link_type("ca", {
-            let reactor = epics_base_rs::runtime::task::Reactor::current()
-                .expect("run_qsrv_ioc_app is awaited on the IOC's reactor");
-            move |db| epics_ca_rs::calink::calink_link_set_install(db, reactor)
-        })
-        .register_link_type("pva", pvalink_link_set_install);
+    let app = app.register_link_type("ca", {
+        let reactor = epics_base_rs::runtime::task::Reactor::current()
+            .expect("run_qsrv_ioc_app is awaited on the IOC's reactor");
+        move |db| epics_ca_rs::calink::calink_link_set_install(db, reactor)
+    });
+    let app = epics_pva_rs::pvalink::register_pva_link_app(app);
     let slot = Arc::new(parking_lot::Mutex::new(None::<QsrvMount>));
     let built = slot.clone();
     let app = app.register_after_init_database(move |db, acf| async move {
@@ -1227,16 +1108,16 @@ async fn serve_ca_pva_qsrv(
     // register at the base `AfterCaLinkInit` hook via
     // `IocApplication::register_link_type(...)`:
     //   * `"ca"`  — `calink_link_set_install`, by `run_qsrv_ioc_app`
-    //   * `"pva"` — `pvalink_link_set_install`, by `run_qsrv_ioc_app`
-    // The hook fires BEFORE `setup_cp_links` (which warms Passive `ca://`
+    //   * `"pva"` — `register_pva_link_app`, by `run_qsrv_ioc_app`
+    // The hook fires BEFORE `setup_cp_links` (which warms Passive CA
     // CP holders) and before record processing, so both link sets' CP
     // links are opened while iocInit runs. Installing either set here in
-    // Phase 3 is too late: a Passive `ca://` CP holder's
-    // `resolve_external_pv` warm would no-op, and a `pva://` CP link would
+    // Phase 3 is too late: a Passive CA CP holder's
+    // `resolve_external_pv` warm would no-op, and a pva CP link would
     // open only after record processing began.
     //
     // Only the `"ca"` set's local-target links are then held by `dbCaRun`'s
-    // wait; `pva://` links connect in the background and never block
+    // wait; pva links connect in the background and never block
     // iocInit (pvxs parity — pvalink does not wait at init).
     // The `dbcaxr` / `pvxr` / `dbpvxr` commands those installers
     // return are registered on the process's one command table at the hook
@@ -1250,7 +1131,7 @@ async fn serve_ca_pva_qsrv(
     // throwaway provider. `dbLoadGroup` is a startup command (pvxs only
     // permits it before iocInit), registered by `run_qsrv_ioc_app`.
     shell_commands.extend(super::iocsh::register_qsrv_runtime_commands_if_enabled(
-        qsrv2_decision().enabled,
+        epics_pva_rs::server::iocsh::qsrv2_enabled(),
         store.provider().clone(),
     ));
 
@@ -1365,50 +1246,6 @@ async fn load_qsrv_groups(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── pvxs enable2() decision (resolve_qsrv2_enable) ──
-
-    #[test]
-    fn qsrv2_enable_default_is_on() {
-        let d = resolve_qsrv2_enable(None, None);
-        assert!(d.enabled, "QSRV2 defaults to enabled when no env set");
-        assert!(d.error.is_none());
-        assert!(d.info.as_deref().unwrap().contains("ENABLED"));
-    }
-
-    #[test]
-    fn qsrv2_enable_yes_case_insensitive() {
-        assert!(resolve_qsrv2_enable(None, Some("YES")).enabled);
-        assert!(resolve_qsrv2_enable(None, Some("yes")).enabled);
-    }
-
-    #[test]
-    fn qsrv2_enable_no_disables_quietly() {
-        let d = resolve_qsrv2_enable(None, Some("NO"));
-        assert!(!d.enabled, "PVXS_QSRV_ENABLE=NO disables QSRV2");
-        assert!(d.error.is_none());
-        assert!(d.info.is_none(), "explicit NO is the quiet path");
-    }
-
-    #[test]
-    fn qsrv2_enable_ignore_servers_qsrv2_overrides_yes() {
-        // EPICS_IOC_IGNORE_SERVERS=qsrv2 takes precedence over an explicit
-        // PVXS_QSRV_ENABLE=YES (pvxs checks ignore-servers first).
-        let d = resolve_qsrv2_enable(Some("qsrv1 qsrv2"), Some("YES"));
-        assert!(!d.enabled, "qsrv2 in EPICS_IOC_IGNORE_SERVERS disables");
-        assert!(d.info.is_none(), "ignore-servers disable is quiet");
-    }
-
-    #[test]
-    fn qsrv2_enable_invalid_value_defaults_on_with_error() {
-        let d = resolve_qsrv2_enable(None, Some("maybe"));
-        assert!(d.enabled, "invalid PVXS_QSRV_ENABLE keeps the default (on)");
-        let err = d.error.expect("invalid value must report an error");
-        assert!(err.contains("not YES/NO"));
-        assert!(err.contains("Defaulting to YES"));
-        // pvxs still prints the INFO status line after the inline error.
-        assert!(d.info.as_deref().unwrap().contains("ENABLED"));
-    }
 
     async fn mount() -> (Arc<epics_base_rs::server::database::PvDatabase>, QsrvMount) {
         use epics_base_rs::server::database::PvDatabase;

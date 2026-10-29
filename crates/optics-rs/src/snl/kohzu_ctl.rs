@@ -225,7 +225,7 @@ macro_rules! seqg_escaped {
 
 epics_seq_rs::include_program!("kohzuCtl");
 
-/// `kohzuCtl_calc2dSpacing` (`kohzuCtl.st:1453-1477`), by the name the SNL
+/// `kohzuCtl_calc2dSpacing` (`kohzuCtl.st:1554-1578`), by the name the SNL
 /// code calls, on the `-r` block.
 #[allow(non_snake_case)]
 fn kohzuCtl_calc2dSpacing() -> f64 {
@@ -234,7 +234,7 @@ fn kohzuCtl_calc2dSpacing() -> f64 {
     s.store(&v.opAlert, &v.avg, &v.nint, &v.seqMsg1)
 }
 
-/// initSequence's block (`kohzuCtl.st:537-560`, `kohzuCtl_soft.st:493-516`):
+/// initSequence's block (`kohzuCtl.st:597-620`, `kohzuCtl_soft.st:552-575`):
 /// each motor is `{P}{M_x}`, or "??????" when either macro is undefined,
 /// and geom is 2 only for a GEOM whose first character is '2'.
 pub(crate) fn name_motors<V: ProgramVars>(
@@ -245,7 +245,7 @@ pub(crate) fn name_motors<V: ProgramVars>(
     let p = env.mac_value_get("P");
     for (macro_name, name) in ["M_THETA", "M_Y", "M_Z"].into_iter().zip(names) {
         let m = env.mac_value_get(macro_name);
-        if p.is_none() || m.is_none() {
+        if p.is_null() || m.is_null() {
             strcpy(name, "??????");
         } else {
             sprintf(name, "%s%s", &[CArg::from(p.clone()), CArg::from(m)]);

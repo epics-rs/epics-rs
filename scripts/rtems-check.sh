@@ -171,7 +171,7 @@ CRATES=(epics-libcom-rs epics-base-rs epics-ca-rs epics-pva-rs epics-rtems-boot 
 # than globally: it says out loud that this crate's target configuration is a
 # CHOICE. `qsrv-core,pvalink,calink-core` and not the full `qsrv`: `qsrv` additionally
 # implies `qsrv-bin` machinery this target never runs, but `pvalink` — the
-# pva:// record-link resolver — is now on the target (design stage 4). It pulls
+# pva record-link resolver — is now on the target (design stage 4). It pulls
 # `epics-pva-rs/client`, whose v4 UDP transport compiles for the triple through
 # `SearchUdpSocket` (the ratchet probe below measures zero), and does NOT
 # pull `tls`/`pkcs12` (no `ring`, no `getrandom 0.2`) because the bridge's
@@ -181,7 +181,7 @@ CRATES=(epics-libcom-rs epics-base-rs epics-ca-rs epics-pva-rs epics-rtems-boot 
 # IOC links: it pulls `epics-ca-rs` at `client-core`, the selection below.
 #
 # `epics-ca-rs` selects `client-core` for the same reason, one protocol over:
-# `realtime-ca-ioc` mounts the `ca://` record-link resolver (design stage C5), and
+# `realtime-ca-ioc` mounts the CA record-link resolver (design stage C5), and
 # `calink` drives a live `CaClient`. `client-core`, not `client`: the split is
 # stated in `crates/epics-ca-rs/Cargo.toml` and it is the circuit, the search
 # engine, subscriptions and the resolver WITHOUT the beacon monitor / repeater
@@ -543,7 +543,7 @@ fi
 # ---------------------------------------------------------------------------
 # The CA client had the same RATCHET, and no longer needs one.
 #
-# Stage C5 of the calink staging mounts the `ca://` record-link resolver in
+# Stage C5 of the calink staging mounts the CA record-link resolver in
 # `realtime-ca-ioc`, which needs `epics-ca-rs`'s CLIENT to compile for the
 # target — `calink` drives a live `CaClient`. While that was work in
 # progress the selection was MEASURED rather than built, exactly as the PVA one

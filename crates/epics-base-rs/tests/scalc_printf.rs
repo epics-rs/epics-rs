@@ -55,12 +55,11 @@ fn width_flags_and_precision_are_snprintfs() {
     assert_eq!(pf("PRINTF(\"%+d\", 5)"), "+5");
     assert_eq!(pf("PRINTF(\"% d\", 5)"), " 5");
     assert_eq!(pf("PRINTF(\"%10.3e|\", 1234.5)"), " 1.234e+03|");
-    // The whole perform fails on 1234.5678: the UNTIL pre-scan skips the
+    // C fails the whole perform on 1234.5678: its UNTIL pre-scan skips the
     // byte after the string's NUL (the LITERAL_DOUBLE opcode) and reads the
-    // double's 0x93 byte as an unmatched UNTIL_END (CBUG-O1).
-    for e in ["PRINTF(\"%e\", 1234.5678)", "PRINTF(\"%E\", 1234.5678)"] {
-        assert_eq!(scalc(e, &mut StringInputs::new()), Err(CalcError::Internal));
-    }
+    // double's 0x93 byte as an unmatched UNTIL_END (CBUG-O1, not copied).
+    assert_eq!(pf("PRINTF(\"%e\", 1234.5678)"), "1.234568e+03");
+    assert_eq!(pf("PRINTF(\"%E\", 1234.5678)"), "1.234568E+03");
     assert_eq!(pf("PRINTF(\"%e\", 1234.5)"), "1.234500e+03");
     assert_eq!(pf("PRINTF(\"%E\", 1234.5)"), "1.234500E+03");
     assert_eq!(pf("PRINTF(\"%g\", 0.0001)"), "0.0001");

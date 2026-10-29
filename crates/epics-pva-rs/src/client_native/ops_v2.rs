@@ -295,7 +295,7 @@ fn ack_at_from_request(ack_any: Option<&crate::pvdata::ScalarValue>, queue_size:
             let s = s.as_str_lossy();
             if s.len() > 1
                 && let Some(pct) = s.strip_suffix('%')
-                && let Ok(percent) = pct.trim().parse::<f64>()
+                && let Ok(percent) = convert::parse_to_f64(pct)
                 && percent > 0.0
                 && percent <= 100.0
             {
@@ -504,7 +504,8 @@ pub async fn op_get_raw(
 /// those pre-reads; removing it exposed every bare-`ensure_active`
 /// one-shot site as an unbounded hang.) `pvmonitor*` loops keep
 /// using the bare `ensure_active` because their natural cancel path
-/// is `SubscriptionHandle` drop, not a timeout.
+/// is `SubscriptionHandle` drop, not a timeout; so does
+/// `op_put_begin_unbounded`, which its owner drops at the disconnect.
 pub(crate) async fn ensure_active_with_op_timeout(
     channel: &Arc<Channel>,
     op_timeout: Duration,
@@ -2029,6 +2030,7 @@ where
 /// other op, [`PutOp::commit`] is not (`clientget.cpp:380-404`,
 /// `state==Exec && !autoExec`) — a circuit lost between the phases answers
 /// [`PvaError::Disconnected`] and the caller decides whether to begin again.
+/// `op_put_begin_unbounded`'s op is neither re-queued nor timed.
 ///
 /// Dropping an uncommitted `PutOp` sends DESTROY_REQUEST and releases the
 /// ioid through its `IoidGuard`.
@@ -2042,7 +2044,8 @@ pub struct PutOp {
     order: ByteOrder,
     intro: Arc<FieldDesc>,
     present: Option<(PvField, BitSet)>,
-    op_timeout: Duration,
+    /// `None` for `op_put_begin_unbounded`'s op.
+    op_timeout: Option<Duration>,
 }
 
 impl std::fmt::Debug for PutOp {
@@ -2068,9 +2071,21 @@ pub async fn op_put_begin(
     op_timeout: Duration,
 ) -> PvaResult<PutOp> {
     requeue_on_disconnect(channel, op_timeout, |budget| {
-        op_put_begin_attempt(channel, request, fetch_present, budget)
+        op_put_begin_attempt(channel, request, fetch_present, Some(budget))
     })
     .await
+}
+
+/// [`op_put_begin`] with no deadline and no re-queue, its [`PutOp::commit`]
+/// untimed too: for an owner that ends the put at the channel's disconnect,
+/// the event a re-queue would wait out, as pvxs's pvalink `op_put.reset()`
+/// does (`ioc/pvalink_channel.cpp:367`). pvxs's client puts carry no deadline.
+pub(crate) async fn op_put_begin_unbounded(
+    channel: &Arc<Channel>,
+    request: Option<&crate::pv_request::PvRequestExpr>,
+    fetch_present: bool,
+) -> PvaResult<PutOp> {
+    op_put_begin_attempt(channel, request, fetch_present, None).await
 }
 
 /// One attempt of [`op_put_begin`]; [`requeue_on_disconnect`] runs it again
@@ -2079,9 +2094,12 @@ async fn op_put_begin_attempt(
     channel: &Arc<Channel>,
     request: Option<&crate::pv_request::PvRequestExpr>,
     fetch_present: bool,
-    op_timeout: Duration,
+    op_timeout: Option<Duration>,
 ) -> PvaResult<PutOp> {
-    let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
+    let (server, sid) = match op_timeout {
+        Some(op_timeout) => ensure_active_with_op_timeout(channel, op_timeout).await?,
+        None => channel.ensure_active().await?,
+    };
     let order = server.byte_order();
     let big_endian = matches!(order, ByteOrder::Big);
     let codec = PvaCodec { big_endian };
@@ -2098,7 +2116,7 @@ async fn op_put_begin_attempt(
 
     let init_req = codec.build_put_init(sid, ioid, &pv_req);
     server.send_for_channel(sid, init_req).await?;
-    let init_frame = await_frame(&mut stream, op_timeout).await?;
+    let init_frame = await_frame_within(&mut stream, op_timeout).await?;
     let init = match decode_op_or_reset(&server, &init_frame, None)? {
         OpResponse::Init(i) => i,
         other => {
@@ -2119,7 +2137,7 @@ async fn op_put_begin_attempt(
     let present = if fetch_present {
         let get_oput = codec.build_put_get(sid, ioid);
         server.send_for_channel(sid, get_oput).await?;
-        let snap_frame = await_frame(&mut stream, op_timeout).await?;
+        let snap_frame = await_frame_within(&mut stream, op_timeout).await?;
         match decode_op_or_reset(&server, &snap_frame, Some(&intro))? {
             OpResponse::Data(d) if d.status.is_success() => Some((d.value, d.changed)),
             _ => None,
@@ -2188,7 +2206,7 @@ impl PutOp {
         // the ioid — the same finalizer every abandoned op reaches.
         server.send_for_channel(sid, frame).await?;
 
-        let done_frame = await_frame(&mut stream, op_timeout).await?;
+        let done_frame = await_frame_within(&mut stream, op_timeout).await?;
         let result = match decode_op_or_reset(&server, &done_frame, Some(&intro))? {
             OpResponse::Status(s) => {
                 if s.status.is_success() {
@@ -4324,6 +4342,17 @@ async fn await_frame(
     Ok(frame)
 }
 
+/// [`await_frame`], with no deadline when `op_timeout` is `None`.
+async fn await_frame_within(
+    stream: &mut mpsc::UnboundedReceiver<super::decode::Frame>,
+    op_timeout: Option<Duration>,
+) -> PvaResult<super::decode::Frame> {
+    match op_timeout {
+        Some(op_timeout) => await_frame(stream, op_timeout).await,
+        None => stream.recv().await.ok_or(PvaError::Disconnected),
+    }
+}
+
 /// Outcome of [`recv_monitor_init`].
 enum MonitorInit {
     /// The server's MONITOR INIT reply arrived.
@@ -4485,10 +4514,9 @@ fn value_target_desc(intro: &FieldDesc) -> &FieldDesc {
 /// op after INIT (see [`op_put_inner_build`]).
 fn build_put_value_from_tokens(intro: &FieldDesc, tokens: &[String]) -> PvaResult<PvField> {
     match value_target_desc(intro) {
-        FieldDesc::ScalarArray(_) => {
-            // `build_put_value`'s scalar-array arm splits on commas, so
-            // lower the chosen element set to a comma-separated string.
-            let csv = if tokens.len() == 1 && tokens[0].trim_start().starts_with('[') {
+        FieldDesc::ScalarArray(st) => {
+            // The first character, untrimmed, as pvput.cpp:144 tests it.
+            if tokens.len() == 1 && tokens[0].starts_with('[') {
                 // JSON-array shortcut: `value=[...]`. Strip the outer
                 // brackets; the inner is already comma-separated scalars.
                 let t = tokens[0].trim();
@@ -4496,17 +4524,21 @@ fn build_put_value_from_tokens(intro: &FieldDesc, tokens: &[String]) -> PvaResul
                     .strip_prefix('[')
                     .and_then(|s| s.strip_suffix(']'))
                     .unwrap_or(t);
-                inner.to_string()
-            } else {
-                // Legacy positional: first token is the length, ignored.
-                tokens
-                    .iter()
-                    .skip(1)
-                    .map(String::as_str)
-                    .collect::<Vec<_>>()
-                    .join(",")
-            };
-            build_put_value(intro, &csv)
+                return build_put_value(intro, inner);
+            }
+            // Legacy positional: the first token is the length, ignored, and
+            // each one after it is an element, whole, as pvput.cpp:172-176
+            // hands `bare` to putFrom: `a,b` is one string and ` a` keeps
+            // its space.
+            let items = tokens
+                .iter()
+                .skip(1)
+                .map(|tok| match st {
+                    ScalarType::String => Ok(ScalarValue::String(tok.as_str().into())),
+                    _ => ScalarValue::parse(*st, tok.trim()).map_err(PvaError::InvalidValue),
+                })
+                .collect::<PvaResult<Vec<_>>>()?;
+            Ok(with_value(intro, PvField::ScalarArray(items)))
         }
         FieldDesc::Scalar(_) => {
             if tokens.len() != 1 {
@@ -4518,6 +4550,25 @@ fn build_put_value_from_tokens(intro: &FieldDesc, tokens: &[String]) -> PvaResul
         }
         _ => build_put_value(intro, &tokens.join(" ")),
     }
+}
+
+/// `value` as the prototype's `.value`, every other member at its default,
+/// as [`build_put_value`] places one it parsed; a bare-leaf prototype is
+/// `value` itself.
+fn with_value(intro: &FieldDesc, value: PvField) -> PvField {
+    let FieldDesc::Structure { fields, struct_id } = intro else {
+        return value;
+    };
+    let mut value = Some(value);
+    let mut s = PvStructure::new(struct_id);
+    for (name, child) in fields {
+        let field = if name == "value" { value.take() } else { None };
+        s.fields.push((
+            name.clone(),
+            field.unwrap_or_else(|| default_value_for(child)),
+        ));
+    }
+    PvField::Structure(s)
 }
 
 /// The changed-bitset for a bare `.value` write: the `value` field's
@@ -4576,11 +4627,16 @@ fn resolve_enum_index(token: &str, choices: Option<&[String]>) -> PvaResult<i32>
             return Ok(i as i32);
         }
     }
-    token.trim().parse::<i32>().map_err(|_| {
-        PvaError::InvalidValue(format!(
-            "enum value '{token}' is neither a choice label nor an integer index"
-        ))
-    })
+    // `idxfld->putFrom(bare[0])`: pvData `parseToPOD` into the int32 index,
+    // base 0 and range checked.
+    crate::pvdata::convert::parse_to_i64(token)
+        .ok()
+        .and_then(|n| i32::try_from(n).ok())
+        .ok_or_else(|| {
+            PvaError::InvalidValue(format!(
+                "enum value '{token}' is neither a choice label nor an integer index"
+            ))
+        })
 }
 
 /// Build the `(value, changed-bits)` delta for a bare write to an `enum_t`
@@ -4699,15 +4755,51 @@ fn assign_fields(
             }
             // Typed leaf: assign the original pvData payload directly,
             // bypassing `Display`/`ScalarValue::parse` so a typed array
-            // keeps its element type and byte content (pvxs `linkBuildPut`
-            // `value = tosend`, pvxs/ioc/pvalink_channel.cpp:147-159).
-            PutLeaf::Typed(pv) => {
-                assign_at_path(&mut value, &parts, pv.clone());
-            }
+            // keeps its element type and byte content.
+            PutLeaf::Typed(pv) => match typed_leaf_for(pv, field_desc_at_path(intro, &parts))? {
+                Some(pv) => assign_at_path(&mut value, &parts, pv),
+                None => continue,
+            },
         }
         changed.set(bit);
     }
     Ok((value, changed))
+}
+
+/// The leaf pvxs `linkBuildPut` assigns for a typed `pv` into a field of
+/// shape `desc` (`pvalink_channel.cpp:147-178`): an array field takes the
+/// array, a scalar field its first element, converted as `Value::copyIn`
+/// does (`data.cpp:535-593`). `None` for an empty array into a scalar
+/// field, which pvxs skips.
+fn typed_leaf_for(pv: &PvField, desc: Option<&FieldDesc>) -> PvaResult<Option<PvField>> {
+    let Some(FieldDesc::Scalar(t)) = desc else {
+        return Ok(Some(match (pv, desc) {
+            (PvField::Scalar(sv), Some(FieldDesc::ScalarArray(_))) => {
+                PvField::ScalarArray(vec![sv.clone()])
+            }
+            _ => pv.clone(),
+        }));
+    };
+    let sv = match pv {
+        PvField::Scalar(sv) => sv.clone(),
+        PvField::ScalarArray(items) => match items.first() {
+            Some(sv) => sv.clone(),
+            None => return Ok(None),
+        },
+        PvField::ScalarArrayTyped(arr) => match arr.get(0) {
+            Some(sv) => sv,
+            None => return Ok(None),
+        },
+        _ => return Ok(Some(pv.clone())),
+    };
+    crate::pvdata::coerce_scalar(&sv, *t, crate::pvdata::ScalarCopy::In)
+        .map(|v| Some(PvField::Scalar(v)))
+        .ok_or_else(|| {
+            PvaError::InvalidValue(format!(
+                "Unable to assign {t:?} with {:?}",
+                sv.scalar_type()
+            ))
+        })
 }
 
 /// The descriptor at a dotted field path inside `desc`, or `None` when a
@@ -4732,11 +4824,15 @@ fn field_desc_at_path<'a>(desc: &'a FieldDesc, parts: &[&str]) -> Option<&'a Fie
 /// pvData `PVScalar::putFrom` coercion the JSON parser applies per token
 /// (parseinto.cpp:60-66, `valueAssign` → `castUnsafe`): a JSON number
 /// lands in any numeric type (float→int truncates, like a C++ static
-/// cast), a JSON bool maps to 0/1 for numerics, and a JSON string is
-/// parsed for a numeric/bool target or taken verbatim for a string.
+/// cast), and a JSON bool maps to 0/1 for numerics. A JSON string is
+/// `Value::from(std::string)` (pvxs `json.cpp:375`).
 fn json_scalar_to_value(st: ScalarType, j: &serde_json::Value) -> PvaResult<ScalarValue> {
     use ScalarType as T;
     use serde_json::Value as J;
+    if let J::String(s) = j {
+        return crate::pvdata::convert::scalar_from_str(st, s)
+            .map_err(|e| PvaError::InvalidValue(e.to_string()));
+    }
     // Any JSON scalar as a wide integer (i128 holds every i64/u64 exactly;
     // a float source truncates toward zero, matching `static_cast`).
     let as_int = || -> Option<i128> {
@@ -4747,7 +4843,6 @@ fn json_scalar_to_value(st: ScalarType, j: &serde_json::Value) -> PvaResult<Scal
                 .or_else(|| n.as_u64().map(|v| v as i128))
                 .or_else(|| n.as_f64().map(|f| f as i128)),
             J::Bool(b) => Some(*b as i128),
-            J::String(s) => s.trim().parse::<i128>().ok(),
             _ => None,
         }
     };
@@ -4755,7 +4850,6 @@ fn json_scalar_to_value(st: ScalarType, j: &serde_json::Value) -> PvaResult<Scal
         match j {
             J::Number(n) => n.as_f64(),
             J::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
-            J::String(s) => s.trim().parse::<f64>().ok(),
             _ => None,
         }
     };
@@ -4766,7 +4860,6 @@ fn json_scalar_to_value(st: ScalarType, j: &serde_json::Value) -> PvaResult<Scal
         T::Boolean => match j {
             J::Bool(b) => ScalarValue::Boolean(*b),
             J::Number(n) => ScalarValue::Boolean(n.as_f64().map(|f| f != 0.0).unwrap_or(false)),
-            J::String(s) => ScalarValue::parse(st, s).map_err(PvaError::InvalidValue)?,
             _ => {
                 return Err(PvaError::InvalidValue(format!(
                     "cannot assign JSON {j} to a bool field"
@@ -4784,7 +4877,6 @@ fn json_scalar_to_value(st: ScalarType, j: &serde_json::Value) -> PvaResult<Scal
         T::Float => ScalarValue::Float(as_float().ok_or_else(float_err)? as f32),
         T::Double => ScalarValue::Double(as_float().ok_or_else(float_err)?),
         T::String => match j {
-            J::String(s) => ScalarValue::String(s.clone().into()),
             J::Number(n) => ScalarValue::String(n.to_string().into()),
             J::Bool(b) => ScalarValue::String(b.to_string().into()),
             _ => {
@@ -4977,8 +5069,9 @@ fn build_put_field_pairs(
         let bit = intro.bit_for_path(fname).ok_or_else(|| {
             PvaError::InvalidValue(format!("field path '{fname}' not present in introspection"))
         })?;
-        let trimmed = raw.trim_start();
-        if trimmed.starts_with('[') || trimmed.starts_with('{') {
+        // pvput.cpp:222 tests the untrimmed first character: ` [1]` is a
+        // plain value.
+        if raw.starts_with('[') || raw.starts_with('{') {
             let field_desc = field_desc_at_path(intro, &parts).ok_or_else(|| {
                 PvaError::InvalidValue(format!("field path '{fname}' not present in introspection"))
             })?;
@@ -4988,6 +5081,13 @@ fn build_put_field_pairs(
             // array/leaf bit) — do not also blanket-mark the field bit.
             let fv = parse_json_into_field(field_desc, &json, bit, &mut changed)?;
             assign_at_path(&mut value, &parts, fv);
+        } else if !matches!(
+            field_desc_at_path(intro, &parts),
+            Some(FieldDesc::Scalar(_))
+        ) {
+            // pvput.cpp:233-236: a plain value writes only a scalar field;
+            // any other is reported and left out of the put.
+            epics_libcom_rs::stderr_println!("{fname} : Error: need a scalar field");
         } else {
             let one = build_put_value_for_path(intro, &parts, raw)?;
             let leaf_val = value_at_path(&one, &parts).ok_or_else(|| {
@@ -5076,10 +5176,10 @@ fn build_put_from_args(
     // exposes a `.value` member — a bare-leaf prototype keeps the legacy
     // positional handling in `build_put_value_from_tokens`, where pvput's
     // root is always a structure.
-    if bare.len() == 1
-        && bare[0].trim_start().starts_with('[')
-        && intro.bit_for_path("value").is_some()
-    {
+    //
+    // Both tests read the untrimmed first character, as pvput.cpp's
+    // `bare[0][0]` does: a value led by a space is a plain value.
+    if bare.len() == 1 && bare[0].starts_with('[') && intro.bit_for_path("value").is_some() {
         pairs.push(("value".to_string(), bare.remove(0)));
     }
 
@@ -5087,10 +5187,7 @@ fn build_put_from_args(
     // object into the root structure, marking each assigned leaf
     // (`parseJSON(strm, root, &args.tosend)`). pvput's root is always a
     // structure, so this only applies to a structure prototype.
-    if bare.len() == 1
-        && bare[0].trim_start().starts_with('{')
-        && matches!(intro, FieldDesc::Structure { .. })
-    {
+    if bare.len() == 1 && bare[0].starts_with('{') && matches!(intro, FieldDesc::Structure { .. }) {
         let json = parse_pvput_json(bare[0].trim()).map_err(PvaError::InvalidValue)?;
         let mut changed = BitSet::new();
         let value = parse_json_into_field(intro, &json, 0, &mut changed)?;
@@ -5170,24 +5267,15 @@ fn build_put_value(desc: &FieldDesc, value_str: &str) -> PvaResult<PvField> {
             }
             Ok(PvField::UnionArray(items))
         }
-        FieldDesc::Variant => build_put_variant(value_str),
+        FieldDesc::Variant => Ok(PvField::Variant(Box::new(build_put_variant(value_str)))),
         FieldDesc::VariantArray => {
-            // Comma-separated tokens, each inferred independently.
-            let mut items = Vec::new();
-            for tok in value_str
+            // Comma-separated tokens, each one Any.
+            let items = value_str
                 .split(',')
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-            {
-                match build_put_variant(tok)? {
-                    PvField::Variant(vv) => items.push(Some(*vv)),
-                    other => {
-                        return Err(PvaError::InvalidValue(format!(
-                            "internal: build_put_variant yielded {other:?}"
-                        )));
-                    }
-                }
-            }
+                .map(|tok| Some(build_put_variant(tok)))
+                .collect();
             Ok(PvField::VariantArray(items))
         }
         FieldDesc::StructureArray { struct_id, fields } => {
@@ -5271,33 +5359,14 @@ fn build_put_union(variants: &[(String, FieldDesc)], value_str: &str) -> PvaResu
     )))
 }
 
-/// Build a variant ("any") PUT value. The carried scalar type is
-/// inferred from the textual form — narrowest type wins: `bool` →
-/// `i64` → `f64` → `String`. An empty `value_str` produces the null
-/// variant (no embedded descriptor).
-fn build_put_variant(value_str: &str) -> PvaResult<PvField> {
-    let trimmed = value_str.trim();
-    if trimmed.is_empty() {
-        return Ok(PvField::Variant(Box::new(VariantValue {
-            desc: None,
-            value: PvField::Null,
-        })));
+/// Build a variant ("any") PUT value. pvxs `put.cpp:135` assigns the text
+/// with `fld.from(sv)`, and an Any assigned a string holds that string
+/// (`data.cpp:668-680`), verbatim.
+fn build_put_variant(value_str: &str) -> VariantValue {
+    VariantValue {
+        desc: Some(FieldDesc::Scalar(ScalarType::String)),
+        value: PvField::Scalar(ScalarValue::String(value_str.into())),
     }
-    let (st, sv) = if trimmed.eq_ignore_ascii_case("true") {
-        (ScalarType::Boolean, ScalarValue::Boolean(true))
-    } else if trimmed.eq_ignore_ascii_case("false") {
-        (ScalarType::Boolean, ScalarValue::Boolean(false))
-    } else if let Ok(i) = trimmed.parse::<i64>() {
-        (ScalarType::Long, ScalarValue::Long(i))
-    } else if let Ok(d) = trimmed.parse::<f64>() {
-        (ScalarType::Double, ScalarValue::Double(d))
-    } else {
-        (ScalarType::String, ScalarValue::String(trimmed.into()))
-    };
-    Ok(PvField::Variant(Box::new(VariantValue {
-        desc: Some(FieldDesc::Scalar(st)),
-        value: PvField::Scalar(sv),
-    })))
 }
 
 /// Build one element of a structure array. The token is routed
@@ -5630,6 +5699,51 @@ mod tests {
             assert!(value_array(&v).is_empty());
         }
 
+        fn nt_string_array() -> FieldDesc {
+            FieldDesc::Structure {
+                struct_id: "epics:nt/NTScalarArray:1.0".to_string(),
+                fields: vec![(
+                    "value".to_string(),
+                    FieldDesc::ScalarArray(ScalarType::String),
+                )]
+                .into(),
+            }
+        }
+        fn string_array(v: &PvField) -> Vec<String> {
+            let PvField::Structure(s) = v else {
+                panic!("expected Structure, got {v:?}");
+            };
+            match &s.fields.iter().find(|(n, _)| n == "value").unwrap().1 {
+                PvField::ScalarArray(items) => items.iter().map(|sv| sv.to_string()).collect(),
+                other => panic!("expected ScalarArray .value, got {other:?}"),
+            }
+        }
+
+        /// pvput.cpp:172-176 hands each token to putFrom whole: `pvput SWF
+        /// 2 a,b c` writes `["a,b", "c"]`, and spaces and an empty token
+        /// are elements as given.
+        #[test]
+        fn each_token_is_one_whole_string_element() {
+            let v =
+                build_put_value_from_tokens(&nt_string_array(), &t(&["2", "a,b", "c"])).unwrap();
+            assert_eq!(string_array(&v), ["a,b", "c"]);
+            let v = build_put_value_from_tokens(&nt_string_array(), &t(&["3", " a", "b ", ""]))
+                .unwrap();
+            assert_eq!(string_array(&v), [" a", "b ", ""]);
+        }
+
+        /// A numeric element is one token too: `1,2` and an empty token do
+        /// not parse, as C's `epicsParseDouble` refuses them; spaces around
+        /// a number are skipped as it skips them.
+        #[test]
+        fn a_numeric_token_is_one_element() {
+            build_put_value_from_tokens(&nt_scalar_array(), &t(&["2", "1,2", "3"])).unwrap_err();
+            build_put_value_from_tokens(&nt_scalar_array(), &t(&["1", ""])).unwrap_err();
+            let v =
+                build_put_value_from_tokens(&nt_scalar_array(), &t(&["2", " 1", "2 "])).unwrap();
+            assert_eq!(value_array(&v), vec![1.0, 2.0]);
+        }
+
         /// A scalar `.value` takes exactly one token; more than one is
         /// rejected ("Can't assign multiple values to scalar").
         #[test]
@@ -5701,6 +5815,28 @@ mod tests {
             assert_eq!(scalar_at(&value, &["value"]), &ScalarValue::Double(42.0));
             assert!(changed.get(intro.bit_for_path("value").unwrap()));
             assert!(!changed.get(intro.bit_for_path("alarm.severity").unwrap()));
+        }
+
+        /// pvxs `put.cpp:135` parses the text with `parseTo` at base 0, and a
+        /// bool takes only "true" or "false".
+        #[test]
+        fn bare_token_parses_as_pvxs_put_does() {
+            for (tok, want) in [("010", 8), ("0x10", 16), (" 5", 5)] {
+                let intro = nt(ScalarType::Int);
+                let (value, _) = build_put_from_args(&intro, &t(&[tok]), None).unwrap();
+                assert_eq!(
+                    scalar_at(&value, &["value"]),
+                    &ScalarValue::Int(want),
+                    "{tok:?}"
+                );
+            }
+            for tok in ["1", "0"] {
+                let intro = nt(ScalarType::Boolean);
+                assert!(
+                    build_put_from_args(&intro, &t(&[tok]), None).is_err(),
+                    "{tok:?}"
+                );
+            }
         }
 
         /// THE PVA-08 case: `a=b` where `a` is not a field and `.value`
@@ -5967,6 +6103,62 @@ mod tests {
             );
             assert!(changed.get(intro.bit_for_path("alarm.severity").unwrap()));
         }
+
+        /// A plain (non-JSON) pair writes only a scalar field: pvput.cpp:233-240
+        /// prints "need a scalar field" for any other and leaves it out of the
+        /// put, so `value=10,20` does not write the array and `alarm=5` does
+        /// not reset the alarm structure to its defaults.
+        #[test]
+        fn plain_pair_into_a_non_scalar_field_writes_nothing() {
+            let intro = nt_array(ScalarType::Int);
+            let (_, changed) = build_put_from_args(&intro, &t(&["value=10,20"]), None).unwrap();
+            assert!(changed.is_empty());
+            let intro = nt(ScalarType::Double);
+            let (_, changed) =
+                build_put_from_args(&intro, &t(&["alarm=5", "value=1"]), None).unwrap();
+            assert!(!changed.get(intro.bit_for_path("alarm").unwrap()));
+            assert!(changed.get(intro.bit_for_path("value").unwrap()));
+        }
+
+        /// pvput.cpp tests a value's first character, untrimmed, for `[` and
+        /// `{` (:144, :150, :222). A bare ` [10,20]` is therefore a plain
+        /// array value, whose first token is the dropped length.
+        #[test]
+        fn a_bare_bracket_after_a_space_is_a_plain_array() {
+            let intro = nt_array(ScalarType::Int);
+            let (value, changed) = build_put_from_args(&intro, &t(&[" [10,20]"]), None).unwrap();
+            assert!(array_at(&value, "value").is_empty());
+            assert!(changed.get(intro.bit_for_path("value").unwrap()));
+        }
+
+        /// A bare ` {"value":1}` is a plain scalar value, not JSON top mode,
+        /// and no double.
+        #[test]
+        fn a_bare_brace_after_a_space_is_a_plain_scalar() {
+            let intro = nt(ScalarType::Double);
+            build_put_from_args(&intro, &t(&[r#" {"value":1}"#]), None).unwrap_err();
+        }
+
+        /// `value= [10,20]` is a plain pair, which writes no array.
+        #[test]
+        fn a_pair_bracket_after_a_space_is_a_plain_pair() {
+            let intro = nt_array(ScalarType::Int);
+            let (_, changed) = build_put_from_args(&intro, &t(&["value= [10,20]"]), None).unwrap();
+            assert!(changed.is_empty());
+        }
+
+        /// A JSON string lands through `Value::from(std::string)`
+        /// (pvxs `json.cpp:375`), so it parses at base 0 too.
+        #[test]
+        fn json_string_parses_at_base_zero() {
+            let intro = nt(ScalarType::Double);
+            let (value, _) =
+                build_put_from_args(&intro, &t(&[r#"alarm={"severity":" 0x10"}"#]), None).unwrap();
+            assert_eq!(
+                scalar_at(&value, &["alarm", "severity"]),
+                &ScalarValue::Int(16)
+            );
+        }
     }
 
     /// NTEnum bare-token PUT (`build_put_from_args` plain value mode):
@@ -6048,6 +6240,16 @@ mod tests {
         }
         fn t(args: &[&str]) -> Vec<String> {
             args.iter().map(|s| s.to_string()).collect()
+        }
+        /// `value=1` names the `enum_t` structure, not `value.index`, and
+        /// pvput.cpp:233-240 writes no non-scalar field from a plain value, so
+        /// nothing is sent where a default `enum_t` would zero the index and
+        /// empty the choices.
+        #[test]
+        fn plain_pair_on_the_enum_structure_writes_nothing() {
+            let intro = nt_enum();
+            let (_, changed) = build_put_from_args(&intro, &t(&["value=1"]), None).unwrap();
+            assert!(changed.is_empty());
         }
         fn index_of(v: &PvField) -> i32 {
             match v {
@@ -6158,6 +6360,15 @@ mod tests {
                 matches!(err, PvaError::InvalidValue(ref m) if m.contains("neither a choice label")),
                 "got: {err:?}"
             );
+        }
+
+        /// The integer fallback is `putFrom(bare[0])` (pvput.cpp:200), pvData
+        /// `parseToPOD` at base 0.
+        #[test]
+        fn integer_token_parses_at_base_zero() {
+            let intro = nt_enum();
+            let (value, _) = build_put_from_args(&intro, &t(&["010"]), None).unwrap();
+            assert_eq!(index_of(&value), 8);
         }
 
         /// An integer token still works with no snapshot (the fallback path
@@ -6271,6 +6482,65 @@ mod tests {
                 encode_pv_field_with_bitset(&value, &intro, &changed, 0, order, &mut buf);
                 assert!(!buf.is_empty(), "typed delta encoded empty ({order:?})");
             }
+        }
+
+        /// A typed scalar converts into the leaf's type as pvxs
+        /// `Value::copyIn` does: a real into an int leaf truncates.
+        #[test]
+        fn typed_scalar_leaf_converts_to_the_leaf_type() {
+            let intro = FieldDesc::Structure {
+                struct_id: "epics:nt/NTScalar:1.0".into(),
+                fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Int))].into(),
+            };
+            let assignments = vec![(
+                "value".to_string(),
+                PutLeaf::Typed(PvField::Scalar(ScalarValue::Double(3.7))),
+            )];
+            let (value, _) = build_field_delta(&intro, &assignments).unwrap();
+            assert_eq!(
+                value_at_path(&value, &["value"]),
+                Some(PvField::Scalar(ScalarValue::Int(3)))
+            );
+        }
+
+        /// pvxs `linkBuildPut` writes an array's first element into a
+        /// scalar field and skips an empty one; a scalar into an array
+        /// field is a one-element array. A real into a bool has no
+        /// `copyIn` arm and is refused.
+        #[test]
+        fn typed_leaf_follows_link_build_put_shapes() {
+            let nt = |value: FieldDesc| FieldDesc::Structure {
+                struct_id: "epics:nt/NTScalar:1.0".into(),
+                fields: vec![("value".into(), value)].into(),
+            };
+            let put = |intro: &FieldDesc, pv: PvField| {
+                build_field_delta(intro, &[("value".to_string(), PutLeaf::Typed(pv))])
+            };
+            let int = nt(FieldDesc::Scalar(ScalarType::Int));
+            let arr = PvField::ScalarArrayTyped(crate::pvdata::TypedScalarArray::Double(
+                vec![2.5, 9.0].into(),
+            ));
+            let (value, changed) = put(&int, arr).unwrap();
+            assert_eq!(
+                value_at_path(&value, &["value"]),
+                Some(PvField::Scalar(ScalarValue::Int(2)))
+            );
+            assert!(changed.get(int.bit_for_path("value").unwrap()));
+            let empty = PvField::ScalarArrayTyped(crate::pvdata::TypedScalarArray::Double(
+                Vec::<f64>::new().into(),
+            ));
+            let (_, changed) = put(&int, empty).unwrap();
+            assert!(!changed.get(int.bit_for_path("value").unwrap()));
+
+            let dbl_arr = nt(FieldDesc::ScalarArray(ScalarType::Double));
+            let (value, _) = put(&dbl_arr, PvField::Scalar(ScalarValue::Double(3.7))).unwrap();
+            assert_eq!(
+                value_at_path(&value, &["value"]),
+                Some(PvField::ScalarArray(vec![ScalarValue::Double(3.7)]))
+            );
+
+            let boolean = nt(FieldDesc::Scalar(ScalarType::Boolean));
+            assert!(put(&boolean, PvField::Scalar(ScalarValue::Double(1.0))).is_err());
         }
 
         /// A typed leaf for a path absent from the prototype is rejected,
@@ -6403,38 +6673,29 @@ mod tests {
         assert_round_trips(&desc, &v);
     }
 
+    /// pvxs `put.cpp:135` stores the text with `fld.from(sv)`; an Any
+    /// assigned a string holds a string (`data.cpp:668-680`), verbatim.
     #[test]
-    fn put_variant_infers_scalar_type() {
-        for (input, expect_st, expect_val) in [
-            ("true", ScalarType::Boolean, ScalarValue::Boolean(true)),
-            ("-42", ScalarType::Long, ScalarValue::Long(-42)),
-            ("3.5", ScalarType::Double, ScalarValue::Double(3.5)),
-            (
-                "text",
-                ScalarType::String,
-                ScalarValue::String("text".into()),
-            ),
-        ] {
+    fn put_variant_stores_the_text_as_a_string() {
+        for input in ["true", "-42", "3.5", "text", "010", "0x10", " 5", ""] {
             let v = build_put_value(&FieldDesc::Variant, input).unwrap();
             match &v {
                 PvField::Variant(vv) => {
-                    assert_eq!(vv.desc, Some(FieldDesc::Scalar(expect_st)), "input {input}");
-                    assert_eq!(vv.value, PvField::Scalar(expect_val), "input {input}");
+                    assert_eq!(
+                        vv.desc,
+                        Some(FieldDesc::Scalar(ScalarType::String)),
+                        "input {input:?}"
+                    );
+                    assert_eq!(
+                        vv.value,
+                        PvField::Scalar(ScalarValue::String(input.into())),
+                        "input {input:?}"
+                    );
                 }
                 other => panic!("expected variant, got {other:?}"),
             }
             assert_round_trips(&FieldDesc::Variant, &v);
         }
-    }
-
-    #[test]
-    fn put_variant_empty_is_null() {
-        let v = build_put_value(&FieldDesc::Variant, "").unwrap();
-        match &v {
-            PvField::Variant(vv) => assert!(vv.desc.is_none()),
-            other => panic!("expected variant, got {other:?}"),
-        }
-        assert_round_trips(&FieldDesc::Variant, &v);
     }
 
     #[test]
@@ -6541,18 +6802,17 @@ mod tests {
         let v = build_put_value(&desc, "1, 2.5, hello").unwrap();
         match &v {
             PvField::VariantArray(items) => {
-                assert_eq!(items.len(), 3);
+                let texts: Vec<_> = items
+                    .iter()
+                    .map(|i| {
+                        let i = i.as_ref().unwrap();
+                        assert_eq!(i.desc, Some(FieldDesc::Scalar(ScalarType::String)));
+                        i.value.clone()
+                    })
+                    .collect();
                 assert_eq!(
-                    items[0].as_ref().unwrap().desc,
-                    Some(FieldDesc::Scalar(ScalarType::Long))
-                );
-                assert_eq!(
-                    items[1].as_ref().unwrap().desc,
-                    Some(FieldDesc::Scalar(ScalarType::Double))
-                );
-                assert_eq!(
-                    items[2].as_ref().unwrap().desc,
-                    Some(FieldDesc::Scalar(ScalarType::String))
+                    texts,
+                    ["1", "2.5", "hello"].map(|t| PvField::Scalar(ScalarValue::String(t.into())))
                 );
             }
             other => panic!("expected variant array, got {other:?}"),
@@ -6918,6 +7178,18 @@ mod tests {
             DEFAULT_PIPELINE_SIZE,
         );
         assert_eq!(f.ack_at, 4); // clamp to queue_size
+
+        // The percentage is `parseTo<double>` (clientmon.cpp:801): a hex
+        // float is 25%, so ackAt 2 of 8 rather than the 8/2 fallback.
+        let f = MonitorFlow::from_record_options(
+            &opts(&[
+                ("pipeline", "true"),
+                ("queueSize", "8"),
+                ("ackAny", "0x19%"),
+            ]),
+            DEFAULT_PIPELINE_SIZE,
+        );
+        assert_eq!(f.ack_at, 2);
     }
 
     /// The default (no-custom-request) path is unchanged: the builder

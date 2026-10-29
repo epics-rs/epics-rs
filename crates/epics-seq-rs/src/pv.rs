@@ -13,14 +13,17 @@
 //! [`PvVar::create`], and a get's callback, or a put callback's when the
 //! record's processing ends there, runs before the call returns, so the
 //! caller holds no lock that callback takes. A network channel's request
-//! goes to the channel's task, and its completion runs on the database
-//! reactor, where C's runs on a CA auxiliary thread. A network channel's
-//! monitor events and connection changes come from the reactor too; an
-//! in-process channel's monitor events come from the system's one queue,
-//! in post order, on its `CAC-event` thread. Either kind of monitor event
-//! then passes the [`EventGate`] its monitor-on named. None runs inside a
-//! call, so a caller may hold seq's locks across [`PvVar::monitor_on`], as
-//! C's connection handler holds `sp->lock` across `pvVarMonitorOn`.
+//! goes to the system's one request queue, which issues each in the order
+//! made, whatever its channel, as libca queues each on its circuit when it
+//! is called; its completion runs on the database reactor, where C's runs
+//! on a CA auxiliary thread. A network channel's monitor events and
+//! connection changes come from the reactor too; an in-process channel's
+//! monitor events come from the system's one queue, in post order, each
+//! after the system's puts running on their callers when it is taken, on its
+//! `CAC-event` thread or at an [`EventGate`] point of a state set. None
+//! runs inside a call, so a caller may hold seq's locks across
+//! [`PvVar::monitor_on`], as C's connection handler holds `sp->lock` across
+//! `pvVarMonitorOn`.
 //!
 //! What libca refuses at once (disconnected, no access, too many elements)
 //! is refused here at once, before anything is queued, and returns
@@ -29,9 +32,10 @@
 //! exactly once: by the server, or with `ECA_DISCONN` when the channel
 //! disconnects first, ahead of the connection handler's `false`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock};
 use std::task::{Context, Poll, Waker};
 
@@ -41,8 +45,8 @@ use epics_base_rs::runtime::log::{ErrlogSevEnum, errlog_sev_printf};
 use epics_base_rs::runtime::sync::mpsc;
 use epics_base_rs::runtime::task::TaskHandle;
 use epics_base_rs::server::database::{
-    CaClientContext, ClientChannel, ClientMonitor, Connection, InProcessChannel, InProcessEvents,
-    InProcessSubscription, PutCompletion, PvDatabase,
+    CaClientContext, ClientChannel, ClientSubscription, Connection, InProcessChannel,
+    InProcessEvents, InProcessSubscription, PutCompletion, PvDatabase,
 };
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::snapshot::Snapshot;
@@ -86,7 +90,9 @@ pub struct PvEvent<'a> {
 #[derive(Clone)]
 pub struct PvSystem {
     ctx: CaClientContext,
-    events: InProcessEvents,
+    /// The network channels' request queue, its [`Dispatcher`] started
+    /// with the first network channel.
+    requests: Arc<Mutex<Option<mpsc::UnboundedSender<Request>>>>,
 }
 
 impl PvSystem {
@@ -94,7 +100,7 @@ impl PvSystem {
     pub fn create(db: &PvDatabase) -> PvSystem {
         PvSystem {
             ctx: db.ca_client(),
-            events: InProcessEvents::default(),
+            requests: Arc::default(),
         }
     }
 
@@ -104,10 +110,27 @@ impl PvSystem {
         PvStat::Ok
     }
 
-    /// `pvSysFlush`: send what the calling thread has queued. A request is
-    /// sent when it is issued, so nothing is ever queued.
+    /// `pvSysFlush`: send what the calling thread has queued. The
+    /// `Dispatcher` sends each request as it takes it, so nothing waits
+    /// for a flush.
     pub fn flush(&self) -> PvStat {
         PvStat::Ok
+    }
+
+    /// The network request queue; `None` when the database captured no
+    /// reactor to run its [`Dispatcher`] on.
+    fn requests(&self) -> Option<mpsc::UnboundedSender<Request>> {
+        let mut requests = self.requests.lock();
+        if requests.is_none() {
+            let (tx, rx) = mpsc::unbounded_channel();
+            let dispatcher = Dispatcher {
+                ctx: self.ctx.clone(),
+                chans: HashMap::new(),
+            };
+            self.ctx.spawn(dispatcher.run(rx))?;
+            *requests = Some(tx);
+        }
+        requests.clone()
     }
 
     /// The CA client context underneath.
@@ -115,163 +138,46 @@ impl PvSystem {
         &self.ctx
     }
 
-    /// The in-process monitor events queued now, each through its gate, on
-    /// the calling thread, which holds no lock a monitor callback takes.
+    /// The in-process monitor events queued now, delivered on the calling
+    /// thread, which holds no lock a monitor callback takes.
     pub fn deliver(&self) {
-        self.events.deliver();
+        self.ctx.events().deliver();
     }
 
-    /// A new [`EventGate`] over this system's queue, open until a state set
-    /// runs.
+    /// A new [`EventGate`] over this system's queue.
     pub fn gate(&self) -> Arc<EventGate> {
         Arc::new(EventGate {
-            events: self.events.clone(),
-            state: Mutex::default(),
+            events: self.ctx.events().clone(),
         })
     }
 }
 
-/// The monitor events of one client's vars, held while any of its state
-/// sets runs and let through, in the order they came, at a state set's
-/// delivery point while no other one runs: a block, which takes all of
-/// them and, as it ends, those posted before it ends, the return of a
-/// [`Self::call`], which takes those posted before the call began, or a
-/// [`Self::pass`], which takes what the last call's return did. C's
-/// `CAC-event` delivers on its own CPU within
-/// microseconds, so a post lands by the client's next call or wait, but
-/// never before the put that made it returns; this makes that the rule. A
-/// held event whose monitor is turned off or whose var is destroyed before
-/// it is let through is dropped, as `db_cancel_event` drops a queued one.
+/// The points where a state set's thread takes in the in-process monitor
+/// events queued: its waits. Each event is otherwise delivered by the
+/// thread that takes it, `CAC-event` or the reactor, while state sets run,
+/// as C's `seq_mon_handler` writes the shared buffer on `CAC-event`
+/// (`seq_ca.c:180-303`); under `+s` a state set sees it at its own reads
+/// of that buffer. What is queued when a state set waits has landed when
+/// it goes on, as `CAC-event` delivers within microseconds; a get or a put
+/// is no such point, so a put's own monitor lands after the code that
+/// follows the put, as C's does. Each point is on the state set's thread
+/// holding no lock a monitor callback takes.
 #[derive(Default)]
 pub struct EventGate {
     events: InProcessEvents,
-    state: Mutex<GateState>,
-}
-
-#[derive(Default)]
-struct GateState {
-    /// The state sets running, each with the cut of its last
-    /// [`EventGate::call`] since it last blocked.
-    running: Vec<(usize, Option<u64>)>,
-    /// How many events were ever taken in: the next one's number.
-    taken: u64,
-    held: VecDeque<(u64, Box<dyn FnOnce() + Send>)>,
 }
 
 impl EventGate {
-    /// State set `ss` runs the client's code.
-    pub fn run(&self, ss: usize) {
-        let mut st = self.state.lock();
-        if !st.running.iter().any(|&(r, _)| r == ss) {
-            st.running.push((ss, None));
-        }
-    }
-
-    /// State set `ss` ends.
-    pub fn stop(&self, ss: usize) {
-        self.blocked(ss);
-    }
-
-    /// `wait` as a block point of state set `ss`, which is back as it was
-    /// after. What was posted before `wait` returned is taken in before
-    /// `ss` runs again: `CAC-event` ends its pass over the queue chain
-    /// before a thread one of its entries woke runs, and a later queue's
-    /// entry, posted first, comes after the entry that woke it.
-    pub fn block<R>(&self, ss: usize, wait: impl FnOnce() -> R) -> R {
-        let ran = self.blocked(ss);
+    /// `wait`, a block of a state set.
+    pub fn block<R>(&self, _ss: usize, wait: impl FnOnce() -> R) -> R {
         let r = wait();
-        if ran {
-            self.events.deliver();
-            self.run(ss);
-        }
+        self.events.deliver();
         r
     }
 
-    /// `call`, a request of state set `ss`, whose return is a delivery
-    /// point for the events posted before it began. The caller holds no
-    /// lock a monitor callback takes.
-    pub fn call<R>(&self, ss: usize, call: impl FnOnce() -> R) -> R {
+    /// A wait of a state set that does not block.
+    pub fn pass(&self, _ss: usize) {
         self.events.deliver();
-        let cut = {
-            let mut st = self.state.lock();
-            let cut = st.taken;
-            st.called(ss, cut);
-            cut
-        };
-        let r = call();
-        let mut st = self.state.lock();
-        // Again: a block inside `call` cleared it.
-        st.called(ss, cut);
-        st.let_through(ss, cut);
-        r
-    }
-
-    /// A delivery point of state set `ss` that does not block, a wait that
-    /// finds its event raised or a sleep that returns at once: it lets
-    /// through what the return of its last [`Self::call`] since it last
-    /// blocked did, or, with none, everything taken in. The action's own
-    /// put is too recent for C's `CAC-event` to have landed its monitor, a
-    /// post from before that put is not.
-    pub fn pass(&self, ss: usize) {
-        self.events.deliver();
-        let mut st = self.state.lock();
-        let cut = st
-            .running
-            .iter()
-            .find(|&&(r, _)| r == ss)
-            .and_then(|&(_, c)| c);
-        st.let_through(ss, cut.unwrap_or(u64::MAX));
-    }
-
-    /// `ss` runs no more, and whether it did: the system's queued
-    /// in-process events come in first, and when no state set runs on,
-    /// everything held is delivered here before any runs again. The caller
-    /// holds no lock a monitor callback takes.
-    fn blocked(&self, ss: usize) -> bool {
-        self.events.deliver();
-        let mut st = self.state.lock();
-        let ran = st.running.iter().position(|&(r, _)| r == ss);
-        if let Some(i) = ran {
-            st.running.swap_remove(i);
-        }
-        if st.running.is_empty() {
-            while let Some((_, event)) = st.held.pop_front() {
-                event();
-            }
-        }
-        ran.is_some()
-    }
-
-    /// `call` now, under the gate, when no state set runs; else at a
-    /// delivery point.
-    fn admit(&self, call: impl FnOnce() + Send + 'static) {
-        let mut st = self.state.lock();
-        let n = st.taken;
-        st.taken += 1;
-        if st.running.is_empty() {
-            call();
-        } else {
-            st.held.push_back((n, Box::new(call)));
-        }
-    }
-}
-
-impl GateState {
-    /// `cut` is the cut of state set `ss`'s last call, when it runs.
-    fn called(&mut self, ss: usize, cut: u64) {
-        if let Some((_, last)) = self.running.iter_mut().find(|(r, _)| *r == ss) {
-            *last = Some(cut);
-        }
-    }
-
-    /// The held events numbered below `cut` let through, when no state set
-    /// but `ss` runs.
-    fn let_through(&mut self, ss: usize, cut: u64) {
-        if self.running.iter().all(|&(r, _)| r == ss) {
-            while let Some((_, event)) = self.held.pop_front_if(|(n, _)| *n < cut) {
-                event();
-            }
-        }
     }
 }
 
@@ -400,39 +306,34 @@ type Done = Box<dyn FnOnce(PvEvent<'_>) + Send>;
 type MonitorFn = Arc<dyn Fn(PvEvent<'_>) + Send + Sync>;
 type ConnFn = Arc<dyn Fn(bool) + Send + Sync>;
 
-/// One monitor-on: its `monid`, its request, its callback and the gate its
-/// events pass.
+/// One monitor-on: its `monid`, its request and its callback.
 #[derive(Clone)]
 struct Monitor {
     monid: u64,
     ty: PvType,
     count: u32,
-    gate: Arc<EventGate>,
     event: MonitorFn,
 }
 
 impl Monitor {
-    /// `pvCaMonitorHandler` for one event, once the gate lets it through
-    /// and while this is still the channel's monitor.
-    fn deliver(&self, shared: &Arc<Shared>, snapshot: Snapshot) {
-        let (m, shared) = (self.clone(), shared.clone());
-        self.gate.admit(move || {
-            shared.callback(
-                Some(Eca::Normal),
-                |st| st.monitor == m.monid,
-                || {
-                    (m.event)(PvEvent {
-                        evt: PvEventType::Monitor,
-                        ty: m.ty,
-                        count: event_count(m.count, Some(&snapshot)),
-                        value: Some(&snapshot),
-                        status: PvStat::Ok,
-                        severity: PvSevr::None,
-                        message: Some(Eca::Normal.text()),
-                    })
-                },
-            )
-        });
+    /// `pvCaMonitorHandler` for one event, while this is still the
+    /// channel's monitor.
+    fn deliver(&self, shared: &Shared, snapshot: &Snapshot) {
+        shared.callback(
+            Some(Eca::Normal),
+            |st| st.monitor == self.monid,
+            || {
+                (self.event)(PvEvent {
+                    evt: PvEventType::Monitor,
+                    ty: self.ty,
+                    count: event_count(self.count, Some(snapshot)),
+                    value: Some(snapshot),
+                    status: PvStat::Ok,
+                    severity: PvSevr::None,
+                    message: Some(Eca::Normal.text()),
+                })
+            },
+        )
     }
 }
 
@@ -604,7 +505,23 @@ impl Drop for AbortOnDrop {
     }
 }
 
+/// A network var's request to the [`Dispatcher`], under the var's key.
+type Request = (u64, Cmd);
+
 enum Cmd {
+    /// `ca_create_channel`.
+    Create {
+        name: Arc<str>,
+        shared: Arc<Shared>,
+        conn: ConnFn,
+    },
+    Chan(ChanCmd),
+    /// `ca_clear_channel`.
+    Clear,
+}
+
+/// A request to a created channel.
+enum ChanCmd {
     Get {
         id: u64,
         dbr: u16,
@@ -617,8 +534,6 @@ enum Cmd {
     },
     MonitorOn(Monitor),
     MonitorOff,
-    /// `ca_clear_channel`.
-    Clear,
 }
 
 /// Why [`PvVar::create`] fails: the only way it can.
@@ -634,15 +549,25 @@ pub struct PvVar {
 /// Where a var's requests run.
 enum Link {
     InProcess(InProcess),
-    /// A network channel's requests, run on its task in the order made.
-    Network(mpsc::UnboundedSender<Cmd>),
+    Network(Network),
+}
+
+/// A network var's way to its system's [`Dispatcher`].
+struct Network {
+    key: u64,
+    requests: mpsc::UnboundedSender<Request>,
+}
+
+impl Network {
+    fn send(&self, cmd: Cmd) {
+        let _ = self.requests.send((self.key, cmd));
+    }
 }
 
 /// An in-process channel, whose requests run on the caller's thread.
 struct InProcess {
     chan: InProcessChannel,
     ctx: CaClientContext,
-    events: InProcessEvents,
     monitor: Mutex<Option<InProcessSubscription>>,
 }
 
@@ -656,8 +581,8 @@ impl InProcess {
         let handler = shared.clone();
         let sub = self
             .chan
-            .subscribe(&self.events, type_to_ca(ty), count, mask, move |snapshot| {
-                m.deliver(&handler, snapshot)
+            .subscribe(type_to_ca(ty), count, mask, move |snapshot| {
+                m.deliver(&handler, &snapshot)
             });
         match sub {
             Ok(sub) if shared.state.lock().monitor == monid => drop(slot.replace(sub)),
@@ -705,20 +630,11 @@ impl PvVar {
             let link = Link::InProcess(InProcess {
                 chan,
                 ctx: sys.ctx.clone(),
-                events: sys.events.clone(),
                 monitor: Mutex::new(None),
             });
             return Ok(PvVar { name, shared, link });
         }
-        let (cmds, rx) = mpsc::unbounded_channel();
-        let run = run(
-            sys.ctx.clone(),
-            name.clone(),
-            shared.clone(),
-            Arc::new(conn),
-            rx,
-        );
-        if sys.ctx.spawn(run).is_none() {
+        let Some(requests) = sys.requests() else {
             errlog_sev_printf(
                 ErrlogSevEnum::Major,
                 &format!(
@@ -727,8 +643,18 @@ impl PvVar {
                 ),
             );
             return Err(PvStat::Error);
-        }
-        let link = Link::Network(cmds);
+        };
+        static NEXT_KEY: AtomicU64 = AtomicU64::new(1);
+        let net = Network {
+            key: NEXT_KEY.fetch_add(1, Ordering::Relaxed),
+            requests,
+        };
+        net.send(Cmd::Create {
+            name: name.clone(),
+            shared: shared.clone(),
+            conn: Arc::new(conn),
+        });
+        let link = Link::Network(net);
         Ok(PvVar { name, shared, link })
     }
 
@@ -747,9 +673,7 @@ impl PvVar {
         // `ca_clear_channel`: the channel's monitor goes with it.
         match &self.link {
             Link::InProcess(l) => drop(l.monitor.lock().take()),
-            Link::Network(cmds) => {
-                let _ = cmds.send(Cmd::Clear);
-            }
+            Link::Network(net) => net.send(Cmd::Clear),
         }
         PvStat::Ok
     }
@@ -786,14 +710,20 @@ impl PvVar {
         self.shared.state.lock().monitor != 0
     }
 
-    /// A var whose channel never connects and whose requests go nowhere.
+    /// A network var whose requests go to `requests` under `key`.
     #[cfg(test)]
-    pub(crate) fn unconnected(name: &str) -> PvVar {
+    fn queued(name: &str, key: u64, requests: mpsc::UnboundedSender<Request>) -> PvVar {
         PvVar {
             name: Arc::from(name),
             shared: Arc::new(Shared::new()),
-            link: Link::Network(mpsc::unbounded_channel().0),
+            link: Link::Network(Network { key, requests }),
         }
+    }
+
+    /// A var whose channel never connects and whose requests go nowhere.
+    #[cfg(test)]
+    pub(crate) fn unconnected(name: &str) -> PvVar {
+        PvVar::queued(name, 0, mpsc::unbounded_channel().0)
     }
 
     /// [`Self::unconnected`] on `chan`, whose element count it reports.
@@ -873,9 +803,7 @@ impl PvVar {
         match &self.link {
             // `callReadNotify`: the callback runs before this returns.
             Link::InProcess(l) => self.shared.complete(id, l.chan.get(dbr, count).map(Some)),
-            Link::Network(cmds) => {
-                let _ = cmds.send(Cmd::Get { id, dbr, count });
-            }
+            Link::Network(net) => net.send(Cmd::Chan(ChanCmd::Get { id, dbr, count })),
         }
         PvStat::Ok
     }
@@ -895,9 +823,7 @@ impl PvVar {
                     return self.shared.refuse(Eca::PutFail, PUT_EXPR);
                 }
             }
-            Link::Network(cmds) => {
-                let _ = cmds.send(Cmd::Put { id: None, value });
-            }
+            Link::Network(net) => net.send(Cmd::Chan(ChanCmd::Put { id: None, value })),
         }
         PvStat::Ok
     }
@@ -920,8 +846,11 @@ impl PvVar {
         };
         let value = put_value(value, ty, count);
         match &self.link {
-            Link::InProcess(l) => match l.chan.put_callback(value) {
-                Ok(done) => l.complete_put(&self.shared, id, done),
+            Link::InProcess(l) => match l
+                .chan
+                .put_callback(value, |done| l.complete_put(&self.shared, id, done))
+            {
+                Ok(()) => {}
                 // `ca_array_put_callback` answers a throw at once and never
                 // calls the callback.
                 Err(e) => {
@@ -933,22 +862,18 @@ impl PvVar {
                     return self.shared.refuse(eca, PUT_CALLBACK_EXPR);
                 }
             },
-            Link::Network(cmds) => {
-                let _ = cmds.send(Cmd::Put {
-                    id: Some(id),
-                    value,
-                });
-            }
+            Link::Network(net) => net.send(Cmd::Chan(ChanCmd::Put {
+                id: Some(id),
+                value,
+            })),
         }
         PvStat::Ok
     }
 
     /// `pvVarMonitorOn`: a no-op while a monitor is on. Allowed while
-    /// disconnected; the first event comes after the connect. Each event
-    /// reaches `event` through `gate`.
+    /// disconnected; the first event comes after the connect.
     pub fn monitor_on(
         &self,
-        gate: &Arc<EventGate>,
         ty: PvType,
         count: u32,
         event: impl Fn(PvEvent<'_>) + Send + Sync + 'static,
@@ -971,14 +896,11 @@ impl PvVar {
             monid,
             ty,
             count,
-            gate: gate.clone(),
             event: Arc::new(event),
         };
         match &self.link {
             Link::InProcess(l) => l.monitor_on(&self.shared, m),
-            Link::Network(cmds) => {
-                let _ = cmds.send(Cmd::MonitorOn(m));
-            }
+            Link::Network(net) => net.send(Cmd::Chan(ChanCmd::MonitorOn(m))),
         }
         PvStat::Ok
     }
@@ -991,9 +913,7 @@ impl PvVar {
         if was_on {
             match &self.link {
                 Link::InProcess(l) => drop(l.monitor.lock().take()),
-                Link::Network(cmds) => {
-                    let _ = cmds.send(Cmd::MonitorOff);
-                }
+                Link::Network(net) => net.send(Cmd::Chan(ChanCmd::MonitorOff)),
             }
         }
         PvStat::Ok
@@ -1005,6 +925,9 @@ impl Drop for PvVar {
     /// var may be dropped from anywhere; [`PvVar::destroy`] waits.
     fn drop(&mut self) {
         self.shared.close();
+        if let Link::Network(net) = &self.link {
+            net.send(Cmd::Clear);
+        }
     }
 }
 
@@ -1046,47 +969,83 @@ async fn poll_once<F: Future + Unpin>(fut: &mut F) -> Option<F::Output> {
     .await
 }
 
-/// One channel's lifetime: `ca_create_channel`, then the requests in the
-/// order they were made, until the var is gone.
-async fn run(
+/// A system's network channels and their requests, issued one at a time in
+/// the order they were made, whatever the channel, as libca queues each on
+/// its circuit when it is called: a get made after a put to the same
+/// server reads what the put did.
+struct Dispatcher {
     ctx: CaClientContext,
-    name: Arc<str>,
-    shared: Arc<Shared>,
-    conn: ConnFn,
-    mut rx: mpsc::UnboundedReceiver<Cmd>,
-) {
-    let Some(chan) = ctx.create_network(&name).await else {
-        // A search nobody answers: the channel never connects, so every
-        // request was refused as disconnected; only monitors queue.
-        while rx.recv().await.is_some() {}
-        return;
-    };
-    serve(ctx, chan, shared, conn, rx).await;
+    chans: HashMap<u64, Served>,
 }
 
-/// The requests to `chan` in the order they were made, until the var is
-/// gone.
-async fn serve(
-    ctx: CaClientContext,
+/// A created network channel, the task delivering its connection changes
+/// and its subscription.
+struct Served {
     chan: Arc<dyn ClientChannel>,
     shared: Arc<Shared>,
-    conn: ConnFn,
-    mut rx: mpsc::UnboundedReceiver<Cmd>,
-) {
-    let _ = shared.chan.set(chan.clone());
-    // Held here, not by the connection task: once connected, a local
-    // channel's next connection change never comes and registers no waker,
-    // and the exec backend drops such a task with everything it owns.
-    let _connection = AbortOnDrop(ctx.spawn(connection_task(chan.clone(), shared.clone(), conn)));
-    let mut monitor: Option<AbortOnDrop> = None;
-    while let Some(cmd) = rx.recv().await {
+    _connection: AbortOnDrop,
+    monitor: Option<ClientSubscription>,
+}
+
+impl Dispatcher {
+    async fn run(mut self, mut rx: mpsc::UnboundedReceiver<Request>) {
+        while let Some((key, cmd)) = rx.recv().await {
+            self.handle(key, cmd).await;
+        }
+    }
+
+    /// Issue one request; it is on its way when this returns.
+    async fn handle(&mut self, key: u64, cmd: Cmd) {
         match cmd {
-            Cmd::Get { id, dbr, count } => {
-                if !shared.is_pending(id) {
-                    continue;
+            Cmd::Create { name, shared, conn } => {
+                // A search nobody answers: the channel never connects, so
+                // every request is refused as disconnected; only monitors
+                // queue, and are dropped here.
+                if let Some(chan) = self.ctx.create_network(&name).await {
+                    self.attach(key, chan, shared, conn);
                 }
-                // Sent on the first poll, so a later put cannot overtake it;
-                // the answer is awaited off this task, so it holds up nothing.
+            }
+            Cmd::Chan(cmd) => {
+                if let Some(served) = self.chans.get_mut(&key) {
+                    served.serve(&self.ctx, cmd).await;
+                }
+            }
+            Cmd::Clear => drop(self.chans.remove(&key)),
+        }
+    }
+
+    fn attach(
+        &mut self,
+        key: u64,
+        chan: Arc<dyn ClientChannel>,
+        shared: Arc<Shared>,
+        conn: ConnFn,
+    ) {
+        let _ = shared.chan.set(chan.clone());
+        // Held here, not by the connection task: once connected, a local
+        // channel's next connection change never comes and registers no waker,
+        // and the exec backend drops such a task with everything it owns.
+        let connection = connection_task(chan.clone(), shared.clone(), conn);
+        let served = Served {
+            _connection: AbortOnDrop(self.ctx.spawn(connection)),
+            chan,
+            shared,
+            monitor: None,
+        };
+        self.chans.insert(key, served);
+    }
+}
+
+impl Served {
+    async fn serve(&mut self, ctx: &CaClientContext, cmd: ChanCmd) {
+        let (chan, shared) = (&self.chan, &self.shared);
+        match cmd {
+            ChanCmd::Get { id, dbr, count } => {
+                if !shared.is_pending(id) {
+                    return;
+                }
+                // Sent on the first poll; the answer is awaited off the
+                // dispatcher, so it holds up nothing.
                 let chan = chan.clone();
                 let mut got = Box::pin(async move { chan.get(dbr, count).await });
                 match poll_once(&mut got).await {
@@ -1097,9 +1056,9 @@ async fn serve(
                     }
                 }
             }
-            Cmd::Put { id, value } => {
+            ChanCmd::Put { id, value } => {
                 if id.is_some_and(|id| !shared.is_pending(id)) {
-                    continue;
+                    return;
                 }
                 match (chan.put(value, id.is_some()).await, id) {
                     (Ok(Some(done)), Some(id)) => {
@@ -1122,21 +1081,20 @@ async fn serve(
                     }
                 }
             }
-            Cmd::MonitorOn(m) => {
+            ChanCmd::MonitorOn(m) => {
                 if shared.state.lock().monitor != m.monid {
-                    continue;
+                    return;
                 }
                 let mask = (EventMask::VALUE | EventMask::ALARM).bits();
-                match chan.subscribe(type_to_ca(m.ty), m.count, mask).await {
-                    Ok(sub) => {
-                        let task = monitor_task(sub, shared.clone(), m);
-                        drop(monitor.replace(AbortOnDrop(ctx.spawn(task))));
-                    }
-                    Err(e) => subscribe_refused(&shared, m.monid, &e),
+                let (monid, ty, count) = (m.monid, m.ty, m.count);
+                let handler = shared.clone();
+                let callback = Box::new(move |snapshot: Snapshot| m.deliver(&handler, &snapshot));
+                match chan.subscribe(type_to_ca(ty), count, mask, callback).await {
+                    Ok(sub) => drop(self.monitor.replace(sub)),
+                    Err(e) => subscribe_refused(shared, monid, &e),
                 }
             }
-            Cmd::MonitorOff => drop(monitor.take()),
-            Cmd::Clear => break,
+            ChanCmd::MonitorOff => drop(self.monitor.take()),
         }
     }
 }
@@ -1145,14 +1103,6 @@ async fn serve(
 async fn connection_task(chan: Arc<dyn ClientChannel>, shared: Arc<Shared>, conn: ConnFn) {
     while let Some(state) = chan.next_connection().await {
         shared.connection_change(state == Connection::Connected, &*conn);
-    }
-}
-
-/// `pvCaMonitorHandler`, for each event of monitor `m` while it is the
-/// channel's monitor.
-async fn monitor_task(mut sub: Box<dyn ClientMonitor>, shared: Arc<Shared>, m: Monitor) {
-    while let Some(snapshot) = sub.next().await {
-        m.deliver(&shared, snapshot);
     }
 }
 
@@ -1170,15 +1120,10 @@ mod tests {
 
     use super::*;
 
-    /// A var whose run task is the returned receiver, never connected.
-    fn var() -> (PvVar, mpsc::UnboundedReceiver<Cmd>) {
-        let (cmds, rx) = mpsc::unbounded_channel();
-        let var = PvVar {
-            name: Arc::from("T"),
-            shared: Arc::new(Shared::new()),
-            link: Link::Network(cmds),
-        };
-        (var, rx)
+    /// A var whose dispatcher is the returned receiver, never connected.
+    fn var() -> (PvVar, mpsc::UnboundedReceiver<Request>) {
+        let (requests, rx) = mpsc::unbounded_channel();
+        (PvVar::queued("T", 1, requests), rx)
     }
 
     type Log = Arc<Mutex<Vec<String>>>;
@@ -1302,103 +1247,11 @@ mod tests {
     #[test]
     fn destroy_and_monitor_off_wait_for_a_callback_in_flight() {
         let (var, _rx) = var();
-        assert_eq!(
-            var.monitor_on(&Arc::default(), PvType::TimeDouble, 1, |_| {}),
-            PvStat::Ok
-        );
+        assert_eq!(var.monitor_on(PvType::TimeDouble, 1, |_| {}), PvStat::Ok);
         waits_for_a_running_callback(&var, PvVar::monitor_off);
         assert!(!var.monitor_is_on());
         waits_for_a_running_callback(&var, PvVar::destroy);
         assert!(var.shared.state.lock().closed);
-    }
-
-    fn admitted(gate: &EventGate) -> Arc<AtomicBool> {
-        let landed = Arc::new(AtomicBool::new(false));
-        let flag = Arc::clone(&landed);
-        gate.admit(move || flag.store(true, Ordering::SeqCst));
-        landed
-    }
-
-    /// A block by a state set that is not running lets nothing through
-    /// while another runs, and leaves it not running.
-    #[test]
-    fn a_block_of_a_state_set_not_running_keeps_events_held() {
-        let gate = EventGate::default();
-        gate.run(0);
-        let landed = admitted(&gate);
-        gate.block(1, || ());
-        assert!(!landed.load(Ordering::SeqCst));
-        gate.stop(0);
-        assert!(landed.load(Ordering::SeqCst));
-        gate.block(1, || ());
-        assert!(admitted(&gate).load(Ordering::SeqCst));
-    }
-
-    /// A running state set's block lets held events through during the
-    /// wait, and it runs again after.
-    #[test]
-    fn a_block_lets_events_through_and_runs_again_after() {
-        let gate = EventGate::default();
-        gate.run(0);
-        let landed = admitted(&gate);
-        assert!(gate.block(0, || landed.load(Ordering::SeqCst)));
-        assert!(!admitted(&gate).load(Ordering::SeqCst));
-    }
-
-    /// A call's return lets through what came before it began, not what
-    /// came during it, though that is in before the return: a put's own
-    /// monitor waits for the next delivery point.
-    #[test]
-    fn a_call_delivers_only_what_came_before_it_began() {
-        let gate = EventGate::default();
-        gate.run(0);
-        let before = admitted(&gate);
-        let during = gate.call(0, || admitted(&gate));
-        assert!(before.load(Ordering::SeqCst));
-        assert!(!during.load(Ordering::SeqCst));
-        gate.call(0, || ());
-        assert!(during.load(Ordering::SeqCst));
-    }
-
-    /// A call's return lets nothing through while another state set runs,
-    /// and leaves its own running.
-    #[test]
-    fn a_call_while_another_state_set_runs_keeps_events_held() {
-        let gate = EventGate::default();
-        gate.run(0);
-        gate.run(1);
-        let landed = admitted(&gate);
-        gate.call(0, || ());
-        assert!(!landed.load(Ordering::SeqCst));
-        gate.stop(1);
-        assert!(!landed.load(Ordering::SeqCst));
-        gate.call(0, || ());
-        assert!(landed.load(Ordering::SeqCst));
-        assert!(!admitted(&gate).load(Ordering::SeqCst));
-    }
-
-    /// A pass lets through what the last call's return did, not what came
-    /// during that call, though a block inside the call cleared its cut;
-    /// with no call since a block, it takes everything.
-    #[test]
-    fn a_pass_takes_the_cut_of_the_last_call_since_the_last_block() {
-        let gate = EventGate::default();
-        gate.run(0);
-        let during = gate.call(0, || admitted(&gate));
-        gate.pass(0);
-        assert!(!during.load(Ordering::SeqCst));
-        let after_its_block = gate.call(0, || {
-            gate.block(0, || ());
-            admitted(&gate)
-        });
-        assert!(during.load(Ordering::SeqCst));
-        gate.pass(0);
-        assert!(!after_its_block.load(Ordering::SeqCst));
-        gate.block(0, || ());
-        assert!(after_its_block.load(Ordering::SeqCst));
-        let after = admitted(&gate);
-        gate.pass(0);
-        assert!(after.load(Ordering::SeqCst));
     }
 
     /// ao records `names` at 0, on a reactor that outlives the test.
@@ -1423,6 +1276,195 @@ mod tests {
         rx.recv().unwrap()
     }
 
+    /// A put of `v` to record `name` of `db` by another client.
+    fn post(db: &PvDatabase, name: &str, v: f64) {
+        let other = PvSystem::create(db);
+        let pv = PvVar::create(&other, name, |_| {}).unwrap();
+        let put = pv.put_no_block(PvType::Double, 1, EpicsValue::Double(v));
+        assert_eq!(put, PvStat::Ok);
+    }
+
+    /// A monitor of `pv` counting its events, its first one in.
+    fn counted(sys: &PvSystem, pv: &PvVar) -> Arc<AtomicU32> {
+        let landed = Arc::new(AtomicU32::new(0));
+        let count = landed.clone();
+        pv.monitor_on(PvType::Double, 1, move |_| {
+            count.fetch_add(1, Ordering::SeqCst);
+        });
+        sys.deliver();
+        assert_eq!(landed.load(Ordering::SeqCst), 1, "the first event");
+        landed
+    }
+
+    /// `sys`'s `CAC-event` inside a callback of record `name` of `db` until
+    /// the returned sender sends, with the subscription it is in.
+    fn hold_cac_event(
+        sys: &PvSystem,
+        db: &PvDatabase,
+        name: &str,
+    ) -> (InProcessSubscription, std::sync::mpsc::Sender<()>) {
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let (entered_tx, released) = (Mutex::new(entered_tx), Mutex::new(released));
+        let first = AtomicBool::new(true);
+        let sub = sys
+            .ctx
+            .create_in_process(name)
+            .unwrap()
+            .subscribe(
+                type_to_ca(PvType::Double),
+                1,
+                EventMask::VALUE.bits(),
+                move |_| {
+                    if !first.swap(false, Ordering::SeqCst) {
+                        entered_tx.lock().send(()).unwrap();
+                        let _ = released.lock().recv();
+                    }
+                },
+            )
+            .unwrap();
+        sys.deliver();
+        post(db, name, 1.0);
+        entered.recv().unwrap();
+        (sub, release)
+    }
+
+    /// Until `landed` reaches `n`, or the budget runs out.
+    fn until_landed(landed: &AtomicU32, n: u32) {
+        let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+        while landed.load(Ordering::SeqCst) < n {
+            assert!(std::time::Instant::now() < deadline, "event {n}");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// A put's own monitor does not land at its return: with `CAC-event`
+    /// still in an earlier callback, it waits for `CAC-event`.
+    #[test]
+    fn a_put_returns_before_its_own_monitor_lands() {
+        let db = served(&["g:c", "g:d"]);
+        let sys = PvSystem::create(&db);
+        let d = PvVar::create(&sys, "g:d", |_| {}).unwrap();
+        let landed = counted(&sys, &d);
+        let (_held, release) = hold_cac_event(&sys, &db, "g:c");
+        assert_eq!(
+            d.put_no_block(PvType::Double, 1, EpicsValue::Double(2.0)),
+            PvStat::Ok
+        );
+        assert_eq!(landed.load(Ordering::SeqCst), 1, "at the put's return");
+        release.send(()).unwrap();
+        until_landed(&landed, 2);
+    }
+
+    /// A record whose `process` takes 100 ms, then sets `ended`: a put whose
+    /// FLNK reaches it runs on long after its own record posted.
+    struct Lingering {
+        ended: Arc<AtomicBool>,
+    }
+
+    impl epics_base_rs::server::record::Record for Lingering {
+        fn record_type(&self) -> &'static str {
+            "seq_lingering"
+        }
+        fn process(
+            &mut self,
+        ) -> epics_base_rs::error::CaResult<epics_base_rs::server::record::ProcessOutcome> {
+            std::thread::sleep(Duration::from_millis(100));
+            self.ended.store(true, Ordering::SeqCst);
+            Ok(epics_base_rs::server::record::ProcessOutcome::complete())
+        }
+        fn get_field(&self, name: &str) -> Option<EpicsValue> {
+            (name == "VAL").then_some(EpicsValue::Double(0.0))
+        }
+        fn put_field(&mut self, _: &str, _: EpicsValue) -> epics_base_rs::error::CaResult<()> {
+            Ok(())
+        }
+        fn declared_fields(&self) -> &'static [epics_base_rs::server::record::FieldDesc] {
+            &[]
+        }
+    }
+
+    /// `put` of ao record `g:x`, whose FLNK is a [`Lingering`] record: the
+    /// event `g:x` posts, which `CAC-event` takes at once, reaches its
+    /// callback only once the put has returned, so after the FLNK ended.
+    fn own_event_lands_after_the_put(put: impl FnOnce(&PvVar) -> PvStat) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            epics_base_rs::runtime::task::test_block_on(async move {
+                let db = PvDatabase::new();
+                let ended = Arc::new(AtomicBool::new(false));
+                let lingering = Lingering {
+                    ended: ended.clone(),
+                };
+                db.add_record("g:linger", Box::new(lingering))
+                    .await
+                    .unwrap();
+                db.add_record(
+                    "g:x",
+                    Box::new(epics_base_rs::server::records::ao::AoRecord::new(0.0)),
+                )
+                .await
+                .unwrap();
+                db.put_record_field_from_ca("g:x", "FLNK", EpicsValue::String("g:linger".into()))
+                    .await
+                    .unwrap();
+                db.mark_pini_done();
+                tx.send((db, ended)).unwrap();
+                std::future::pending::<()>().await
+            })
+        });
+        let (db, ended) = rx.recv().unwrap();
+        let sys = PvSystem::create(&db);
+        let x = PvVar::create(&sys, "g:x", |_| {}).unwrap();
+        let landed = Arc::new(AtomicU32::new(0));
+        let after_the_flnk = Arc::new(AtomicBool::new(false));
+        let (count, after) = (landed.clone(), after_the_flnk.clone());
+        x.monitor_on(PvType::Double, 1, move |_| {
+            if count.load(Ordering::SeqCst) == 1 {
+                after.store(ended.load(Ordering::SeqCst), Ordering::SeqCst);
+            }
+            count.fetch_add(1, Ordering::SeqCst);
+        });
+        sys.deliver();
+        assert_eq!(landed.load(Ordering::SeqCst), 1, "the first event");
+        assert_eq!(put(&x), PvStat::Ok);
+        until_landed(&landed, 2);
+        assert!(
+            after_the_flnk.load(Ordering::SeqCst),
+            "landed inside the put"
+        );
+    }
+
+    #[test]
+    fn a_puts_own_event_lands_after_it_returns() {
+        own_event_lands_after_the_put(|x| {
+            x.put_no_block(PvType::Double, 1, EpicsValue::Double(2.0))
+        });
+    }
+
+    #[test]
+    fn a_put_callbacks_own_event_lands_after_it_returns() {
+        own_event_lands_after_the_put(|x| {
+            x.put_callback(PvType::Double, 1, EpicsValue::Double(2.0), |_| {})
+        });
+    }
+
+    /// An event queued for a monitor turned off before it is taken is
+    /// dropped, as `db_cancel_event` drops a queued one.
+    #[test]
+    fn a_queued_event_of_a_monitor_turned_off_is_dropped() {
+        let db = served(&["g:e", "g:f"]);
+        let sys = PvSystem::create(&db);
+        let f = PvVar::create(&sys, "g:f", |_| {}).unwrap();
+        let landed = counted(&sys, &f);
+        let (_held, release) = hold_cac_event(&sys, &db, "g:e");
+        post(&db, "g:f", 2.0);
+        assert_eq!(f.monitor_off(), PvStat::Ok);
+        release.send(()).unwrap();
+        sys.deliver();
+        assert_eq!(landed.load(Ordering::SeqCst), 1);
+    }
+
     /// A post made before a state set's wait returns lands before it runs
     /// again, though `CAC-event` hands it over after the wakeup: here the
     /// callback of the post that wakes the state set holds the pass up
@@ -1431,7 +1473,6 @@ mod tests {
     fn a_block_takes_in_what_was_posted_before_it_returned() {
         let db = served(&["g:a", "g:b"]);
         let sys = PvSystem::create(&db);
-        let gate = sys.gate();
         let posted = Arc::new(AtomicBool::new(false));
         let (wake, woken) = std::sync::mpsc::channel();
         let (wake, first, all_posted) = (Mutex::new(wake), AtomicBool::new(true), posted.clone());
@@ -1440,7 +1481,6 @@ mod tests {
             .create_in_process("g:a")
             .unwrap()
             .subscribe(
-                &sys.events,
                 type_to_ca(PvType::Double),
                 1,
                 EventMask::VALUE.bits(),
@@ -1456,25 +1496,15 @@ mod tests {
             )
             .unwrap();
         let b = PvVar::create(&sys, "g:b", |_| {}).unwrap();
-        let landed = Arc::new(AtomicU32::new(0));
-        let count = landed.clone();
-        b.monitor_on(&gate, PvType::Double, 1, move |_| {
-            count.fetch_add(1, Ordering::SeqCst);
-        });
-        sys.deliver();
-        assert_eq!(landed.load(Ordering::SeqCst), 1, "the first event");
-        gate.run(0);
+        let landed = counted(&sys, &b);
         let poster = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(50));
-            let other = PvSystem::create(&db);
             for name in ["g:a", "g:b"] {
-                let pv = PvVar::create(&other, name, |_| {}).unwrap();
-                let put = pv.put_no_block(PvType::Double, 1, EpicsValue::Double(1.0));
-                assert_eq!(put, PvStat::Ok);
+                post(&db, name, 1.0);
             }
             posted.store(true, Ordering::SeqCst);
         });
-        gate.block(0, || woken.recv().unwrap());
+        sys.gate().block(0, || woken.recv().unwrap());
         assert_eq!(landed.load(Ordering::SeqCst), 2);
         poster.join().unwrap();
     }
@@ -1509,7 +1539,8 @@ mod tests {
             _: u16,
             _: u32,
             _: u16,
-        ) -> Result<Box<dyn ClientMonitor>, String> {
+            _: Box<dyn Fn(Snapshot) + Send + Sync>,
+        ) -> Result<ClientSubscription, String> {
             Err("refused".into())
         }
 
@@ -1542,50 +1573,57 @@ mod tests {
         std::mem::take(&mut *seen.lock())
     }
 
-    /// Run `cmds` against a [`Refusing`] channel, connected.
-    fn serve_refused(var: &PvVar, rx: mpsc::UnboundedReceiver<Cmd>, cmds: Vec<Cmd>) -> Vec<String> {
+    /// Run what `var` queued, then `cmds`, against a [`Refusing`] channel,
+    /// connected.
+    fn serve_refused(
+        var: &PvVar,
+        mut rx: mpsc::UnboundedReceiver<Request>,
+        cmds: Vec<ChanCmd>,
+    ) -> Vec<String> {
         var.shared.state.lock().connected = true;
-        let Link::Network(sender) = &var.link else {
+        let Link::Network(net) = &var.link else {
             unreachable!("var() is a network var")
         };
-        for cmd in cmds.into_iter().chain([Cmd::Clear]) {
-            let _ = sender.send(cmd);
+        for cmd in cmds {
+            net.send(Cmd::Chan(cmd));
         }
         let db = PvDatabase::new();
+        let mut d = Dispatcher {
+            ctx: db.ca_client(),
+            chans: HashMap::new(),
+        };
+        d.attach(
+            net.key,
+            Arc::new(Refusing),
+            var.shared.clone(),
+            Arc::new(|_| {}),
+        );
         logged("refused", || {
-            epics_base_rs::runtime::task::test_block_on(serve(
-                db.ca_client(),
-                Arc::new(Refusing),
-                var.shared.clone(),
-                Arc::new(|_| {}),
-                rx,
-            ))
+            epics_base_rs::runtime::task::test_block_on(async {
+                while let Ok((key, cmd)) = rx.try_recv() {
+                    d.handle(key, cmd).await;
+                }
+            })
         })
     }
 
     #[test]
     fn a_failed_subscribe_leaves_the_monitor_off_for_the_next_monitor_on() {
         let (var, rx) = var();
-        assert_eq!(
-            var.monitor_on(&Arc::default(), PvType::TimeDouble, 1, |_| {}),
-            PvStat::Ok
-        );
+        assert_eq!(var.monitor_on(PvType::TimeDouble, 1, |_| {}), PvStat::Ok);
         assert_eq!(
             serve_refused(&var, rx, Vec::new()),
             [format!("sevr=minor {MONITOR_EXPR}: refused")]
         );
         assert!(!var.monitor_is_on());
-        assert_eq!(
-            var.monitor_on(&Arc::default(), PvType::TimeDouble, 1, |_| {}),
-            PvStat::Ok
-        );
+        assert_eq!(var.monitor_on(PvType::TimeDouble, 1, |_| {}), PvStat::Ok);
         assert!(var.monitor_is_on(), "retried, not a no-op");
     }
 
     #[test]
     fn a_refused_put_logs_the_libca_call() {
         let (var, rx) = var();
-        let put = Cmd::Put {
+        let put = ChanCmd::Put {
             id: None,
             value: EpicsValue::Double(1.0),
         };
@@ -1593,6 +1631,97 @@ mod tests {
             serve_refused(&var, rx, vec![put]),
             ["sevr=minor ca_array_put(typeToCA(type), count, var->chid, value): refused"]
         );
+    }
+
+    /// A channel that logs each get and put as it sends it, a put on its
+    /// second poll.
+    struct Recording {
+        name: &'static str,
+        log: Log,
+    }
+
+    #[async_trait::async_trait]
+    impl ClientChannel for Recording {
+        fn native_type(&self) -> Option<DbFieldType> {
+            Some(DbFieldType::Double)
+        }
+
+        fn element_count(&self) -> Option<u32> {
+            Some(1)
+        }
+
+        fn access(&self) -> (bool, bool) {
+            (true, true)
+        }
+
+        async fn next_connection(&self) -> Option<Connection> {
+            None
+        }
+
+        async fn get(&self, _: u16, _: u32) -> Result<Snapshot, String> {
+            self.log.lock().push(format!("get {}", self.name));
+            std::future::pending().await
+        }
+
+        async fn subscribe(
+            &self,
+            _: u16,
+            _: u32,
+            _: u16,
+            _: Box<dyn Fn(Snapshot) + Send + Sync>,
+        ) -> Result<ClientSubscription, String> {
+            unreachable!()
+        }
+
+        async fn put(
+            &self,
+            _: EpicsValue,
+            _: bool,
+        ) -> Result<Option<epics_base_rs::server::database::PutCompletion>, String> {
+            let mut polled = false;
+            std::future::poll_fn(|cx| {
+                if std::mem::replace(&mut polled, true) {
+                    return Poll::Ready(());
+                }
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            })
+            .await;
+            self.log.lock().push(format!("put {}", self.name));
+            Ok(None)
+        }
+    }
+
+    /// pvGetSync's `pvPut(p, ASYNC)` then `pvGet(x, SYNC)`: the get reads
+    /// the record the put processed only if it leaves after the put.
+    #[test]
+    fn a_request_leaves_after_those_made_before_it_on_other_channels() {
+        let db = PvDatabase::new();
+        let mut d = Dispatcher {
+            ctx: db.ca_client(),
+            chans: HashMap::new(),
+        };
+        let (requests, mut rx) = mpsc::unbounded_channel();
+        let log = Log::default();
+        let [p, x] = [(1, "p"), (2, "x")].map(|(key, name)| {
+            let var = PvVar::queued(name, key, requests.clone());
+            var.shared.state.lock().connected = true;
+            let chan = Arc::new(Recording {
+                name,
+                log: log.clone(),
+            });
+            d.attach(key, chan, var.shared.clone(), Arc::new(|_| {}));
+            var
+        });
+        let put = p.put_callback(PvType::Double, 1, EpicsValue::Double(1.0), |_| {});
+        assert_eq!(put, PvStat::Ok);
+        assert_eq!(x.get_callback(PvType::Double, 1, |_| {}), PvStat::Ok);
+        epics_base_rs::runtime::task::test_block_on(async {
+            while let Ok((key, cmd)) = rx.try_recv() {
+                d.handle(key, cmd).await;
+            }
+        });
+        assert_eq!(*log.lock(), ["put p", "get x"]);
     }
 
     #[test]
@@ -1646,25 +1775,16 @@ mod tests {
     #[test]
     fn monitor_on_while_on_is_a_no_op() {
         let (var, mut rx) = var();
-        assert_eq!(
-            var.monitor_on(&Arc::default(), PvType::TimeDouble, 1, |_| {}),
-            PvStat::Ok
-        );
-        assert_eq!(
-            var.monitor_on(&Arc::default(), PvType::TimeDouble, 1, |_| {}),
-            PvStat::Ok
-        );
+        assert_eq!(var.monitor_on(PvType::TimeDouble, 1, |_| {}), PvStat::Ok);
+        assert_eq!(var.monitor_on(PvType::TimeDouble, 1, |_| {}), PvStat::Ok);
         assert_eq!(var.monitor_off(), PvStat::Ok);
         assert_eq!(var.monitor_off(), PvStat::Ok);
-        assert_eq!(
-            var.monitor_on(&Arc::default(), PvType::TimeDouble, 1, |_| {}),
-            PvStat::Ok
-        );
+        assert_eq!(var.monitor_on(PvType::TimeDouble, 1, |_| {}), PvStat::Ok);
         let mut seen = Vec::new();
-        while let Ok(cmd) = rx.try_recv() {
+        while let Ok((_, cmd)) = rx.try_recv() {
             seen.push(match cmd {
-                Cmd::MonitorOn(m) => format!("on {}", m.monid),
-                Cmd::MonitorOff => "off".to_string(),
+                Cmd::Chan(ChanCmd::MonitorOn(m)) => format!("on {}", m.monid),
+                Cmd::Chan(ChanCmd::MonitorOff) => "off".to_string(),
                 _ => "other".to_string(),
             });
         }
@@ -1700,7 +1820,7 @@ mod tests {
     fn a_request_after_destroy_fails() {
         let (var, mut rx) = var();
         assert_eq!(var.destroy(), PvStat::Ok);
-        assert!(matches!(rx.try_recv(), Ok(Cmd::Clear)));
+        assert!(matches!(rx.try_recv(), Ok((_, Cmd::Clear))));
         let log = Log::default();
         assert_eq!(
             var.get_callback(PvType::TimeDouble, 1, record(&log, "get")),
@@ -1720,10 +1840,7 @@ mod tests {
             var.put_no_block(PvType::Double, 1, EpicsValue::Double(1.0)),
             PvStat::Error
         );
-        assert_eq!(
-            var.monitor_on(&Arc::default(), PvType::TimeDouble, 1, |_| {}),
-            PvStat::Error
-        );
+        assert_eq!(var.monitor_on(PvType::TimeDouble, 1, |_| {}), PvStat::Error);
         // One that passed the checks before the destroy is refused too.
         assert!(matches!(
             var.accept(

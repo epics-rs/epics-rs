@@ -21,9 +21,12 @@ use epics_base_rs::types::EpicsValue;
 
 const CHILD: &str = "PUTF_TRACE_CHILD";
 
-/// A TPRO calcout that stays active for its ODLY after each process.
-const DELAYED: &str =
-    r#"record(calcout, "D") { field(TPRO, "1") field(CALC, "1") field(ODLY, "0.3") }"#;
+/// A TPRO calcout that stays active for its ODLY after each process, and N
+/// counting the cycles it completes.
+const DELAYED: &str = r#"
+record(calcout, "D") { field(TPRO, "1") field(CALC, "1") field(ODLY, "0.3") field(FLNK, "N") }
+record(calc, "N") { field(CALC, "VAL+1") }
+"#;
 
 /// This test run again in a child whose stdout is not captured, and the
 /// lines it printed that contain `what`.
@@ -78,6 +81,26 @@ async fn delayed() -> Arc<PvDatabase> {
         .0
 }
 
+/// Until N has counted `n` cycles of `rec` and `rec` is idle with no RPRO
+/// owed. PACT alone cannot wait out RPRO: the restart clears PACT before the
+/// rerun begins.
+async fn runs(db: &PvDatabase, rec: &str, n: f64) {
+    let cell = db.get_record(rec).unwrap();
+    epics_base_rs::runtime::task::timeout(fact_budget::FACT_BUDGET, async {
+        loop {
+            if db.get_pv("N").unwrap().to_f64().unwrap() >= n {
+                let g = cell.read();
+                if !g.is_processing() && g.common.rpro == 0 {
+                    return;
+                }
+            }
+            epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{rec} never completed {n} cycles"));
+}
+
 /// Long enough for the RPRO reprocess and its ODLY to end.
 async fn settle() {
     epics_base_rs::runtime::task::sleep(Duration::from_millis(1000)).await;
@@ -100,11 +123,11 @@ async fn a_shell_dbpf_to_an_active_record_prints_the_dbputfield_line() {
     }
     let db = delayed().await;
     shell(
-        db,
+        db.clone(),
         &["var dbAccessDebugPUTF 1", "dbpf D.PROC 1", "dbpf D.PROC 1"],
     )
     .await;
-    settle().await;
+    runs(&db, "D", 2.0).await;
 }
 
 #[epics_macros_rs::epics_test]
@@ -120,8 +143,8 @@ async fn with_the_knob_clear_the_rpro_deferral_prints_nothing() {
         return;
     }
     let db = delayed().await;
-    shell(db, &["dbpf D.PROC 1", "dbpf D.PROC 1"]).await;
-    settle().await;
+    shell(db.clone(), &["dbpf D.PROC 1", "dbpf D.PROC 1"]).await;
+    runs(&db, "D", 2.0).await;
 }
 
 /// C's context is `dbCaLink`, the `dbCaTask` thread; the port runs a CP
@@ -141,7 +164,8 @@ async fn a_cp_update_to_an_active_record_prints_the_db_process_line() {
         .db_string(
             r#"
 record(ao, "S") { }
-record(calcout, "T") { field(INPA, "S CP") field(CALC, "A") field(ODLY, "0.3") field(TPRO, "1") }
+record(calcout, "T") { field(INPA, "S CP") field(CALC, "A") field(ODLY, "0.3") field(TPRO, "1") field(FLNK, "N") }
+record(calc, "N") { field(CALC, "VAL+1") }
 "#,
             &HashMap::new(),
         )
@@ -153,8 +177,7 @@ record(calcout, "T") { field(INPA, "S CP") field(CALC, "A") field(ODLY, "0.3") f
     assert!(ioc.run().await);
     let pact = |db: &PvDatabase| db.get_pv("T.PACT").unwrap().to_f64().unwrap();
     // The first event's process ends before the knob goes on.
-    settle().await;
-    assert_eq!(pact(&db), 0.0);
+    runs(&db, "T", 1.0).await;
     shell(db.clone(), &["var dbAccessDebugPUTF 1"]).await;
     db.put_pv_and_post("S", EpicsValue::Double(1.0))
         .await
@@ -166,7 +189,8 @@ record(calcout, "T") { field(INPA, "S CP") field(CALC, "A") field(ODLY, "0.3") f
         .await
         .unwrap();
     db.ca_sync().await;
-    settle().await;
+    // The RPRO rerun, which only S 2's deferral can have owed.
+    runs(&db, "T", 3.0).await;
 }
 
 /// pvxs prints its own line from both the Passive and the Force routes.

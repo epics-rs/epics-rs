@@ -119,7 +119,13 @@ fn an_iocsh_configured_server_port_accepts_a_client() {
     // port that owns the slot can read the bytes. Before the fix this read
     // timed out: the connection was never accepted.
     let child = asyn_rs::asyn_record::get_port(&format!("{name}:0")).unwrap();
-    let io = SyncIOHandle::from_handle(child.handle.clone(), 0, Duration::from_millis(500));
+    let io = SyncIOHandle::from_handle(
+        child.handle.clone(),
+        0,
+        Duration::from_millis(500),
+        asyn_rs::interfaces::InterfaceType::Octet,
+    )
+    .unwrap();
     let mut got: Vec<u8> = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(5);
     while got.is_empty() {

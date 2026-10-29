@@ -1145,25 +1145,8 @@ mod tests {
     }
 
     #[test]
-    fn prologix_registers_the_gpib_port_interfaces() {
-        use crate::interfaces::Capability;
-
+    fn prologix_int32_defaults_name_their_direction() {
         let mut drv = DrvAsynPrologixPort::new("p", "127.0.0.1:1234", false).unwrap();
-        let caps = drv.capabilities();
-        for cap in [
-            Capability::Gpib,
-            Capability::Int32Read,
-            Capability::Int32Write,
-            Capability::OctetRead,
-            Capability::OctetWrite,
-        ] {
-            assert!(caps.contains(&cap), "prologix must declare {cap:?}");
-        }
-        assert!(
-            !caps.contains(&Capability::Option),
-            "drvPrologixGPIB registers no asynOption"
-        );
-
         let mut user = AsynUser::default();
         // CBUG-B10: C's asynInt32Base `readDefault` reported "write is not
         // supported" (a copy-paste from `writeDefault`) until asyn #237

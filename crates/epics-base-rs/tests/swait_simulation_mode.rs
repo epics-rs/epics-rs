@@ -85,7 +85,8 @@ async fn sim_db(siml: &str, simm: i16, sims: i16, siol: &str) -> PvDatabase {
 /// Wait until `rec.f` reads `want` — OUTV connects and the OUT write lands
 /// over CA.
 async fn settle(db: &PvDatabase, rec: &str, f: &str, want: f64) {
-    for _ in 0..400 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if field(db, rec, f).await == want {
             return;
         }

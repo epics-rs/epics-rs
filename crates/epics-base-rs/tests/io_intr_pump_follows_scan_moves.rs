@@ -65,7 +65,8 @@ async fn wake(made: &Made, id: usize) -> usize {
     };
     let before = reads.load(Ordering::Relaxed);
     tx.send(()).await.unwrap();
-    for _ in 0..200 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if reads.load(Ordering::Relaxed) > before {
             break;
         }

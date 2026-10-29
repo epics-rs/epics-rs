@@ -1,5 +1,5 @@
 //! `IocApplication::run`'s boot console against
-//! `~/work/epics-base/bin/linux-x86_64/softIoc -d x.db` on one `ai`, whose
+//! `$EPICS_BASE/bin/linux-x86_64/softIoc -d x.db` on one `ai`, whose
 //! stderr is `Starting iocInit` then `iocRun: All initialization complete`.
 //!
 //! Unix only: what is asserted is the process console.

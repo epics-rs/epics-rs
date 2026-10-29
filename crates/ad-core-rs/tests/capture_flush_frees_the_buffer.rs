@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use ad_core_rs::error::{ADError, ADResult};
 use ad_core_rs::ndarray::{NDArray, NDDataType, NDDimension};
+use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::file_base::{NDFileMode, NDFileOpenMode, NDFileWriter, NDPluginFileBase};
 
 /// Records which frame landed in which file, and fails a chosen write.
@@ -54,7 +55,7 @@ impl NDFileWriter for RecordingWriter {
         Ok(())
     }
 
-    fn read_file(&mut self) -> ADResult<NDArray> {
+    fn read_file(&mut self, _pool: &NDArrayPool) -> ADResult<NDArray> {
         Err(ADError::UnsupportedConversion("not implemented".into()))
     }
 

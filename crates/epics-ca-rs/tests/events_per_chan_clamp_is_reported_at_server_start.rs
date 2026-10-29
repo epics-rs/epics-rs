@@ -11,7 +11,9 @@ use std::process::{Command, Stdio};
 
 /// Boot `softioc-rs` on a one-record st.cmd under `eltc {eltc}` and return
 /// (stdout, stderr). stdin is closed, so the shell exits right after the CA
-/// server is up and its prompt is printed.
+/// server is up and its prompt is printed. The silent cases are silent for a
+/// server that never started too; `casr` prints nothing until one has bound
+/// (`caservertask.c:911-913`), so its header is the start they need.
 fn boot(eltc: u8, events_per_chan: &str) -> (String, String) {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = dir.path().join("a.db");
@@ -20,7 +22,7 @@ fn boot(eltc: u8, events_per_chan: &str) -> (String, String) {
     std::fs::write(
         &st,
         format!(
-            "eltc {eltc}\ndbLoadRecords(\"{}\")\niocInit\n",
+            "eltc {eltc}\ndbLoadRecords(\"{}\")\niocInit\ncasr\n",
             db.display()
         ),
     )
@@ -35,10 +37,15 @@ fn boot(eltc: u8, events_per_chan: &str) -> (String, String) {
         .output()
         .expect("run softioc-rs");
     assert!(out.status.success(), "{out:?}");
-    (
+    let (stdout, stderr) = (
         String::from_utf8_lossy(&out.stdout).into_owned(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
-    )
+    );
+    assert!(
+        stdout.contains("Channel Access Server V4.13\n"),
+        "the CA server never started:\n{stdout}\n{stderr}"
+    );
+    (stdout, stderr)
 }
 
 fn assert_reported_once(events_per_chan: &str, line: &str) {

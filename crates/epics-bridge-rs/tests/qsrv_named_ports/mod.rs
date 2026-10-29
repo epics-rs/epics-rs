@@ -11,7 +11,7 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Run `qsrv-rs --db-file db` plus `args(tcp)` with `env(tcp)` on candidate
 /// ports until `probe(tcp)` returns `Some` — the subject answered on the number it was
@@ -54,11 +54,7 @@ where
                 }
             })
         };
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while !*up.lock().unwrap()
-            && Instant::now() < deadline
-            && child.try_wait().unwrap().is_none()
-        {
+        while !*up.lock().unwrap() && child.try_wait().unwrap().is_none() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         // A child that already exited cannot answer; the probe would only

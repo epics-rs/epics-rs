@@ -840,7 +840,7 @@ async fn observe(sc: &Scenario, general: bool) -> (Vec<String>, String) {
             // The continuation clears PACT and runs the FLNK tail under T's
             // lock set, so a free PACT and then that lock is a finished
             // cycle. A fixed window missed it on a loaded macOS runner.
-            let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let until = std::time::Instant::now() + fact_budget::FACT_BUDGET;
             while db.get_record("T").unwrap().read().is_processing() {
                 assert!(
                     std::time::Instant::now() < until,

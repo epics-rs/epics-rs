@@ -4,7 +4,7 @@
 //! C's `dbNameToAddr` resolves any field the `.dbd` declares, so `RSET` — a
 //! `struct typed_rset *` behind `special(SPC_NOMOD)` (`dbCommon.dbd:216-221`)
 //! — comes back with a full `DBADDR` and every command then just reads it.
-//! Measured on `~/work/epics-base/bin/linux-x86_64/softIoc`
+//! Measured on `$EPICS_BASE/bin/linux-x86_64/softIoc`
 //! (R7.0.10-146-g8f5015b663d764ad75df), `dba T:AI.RSET` prints the descriptor
 //! block and `dbtgf T:AI.RSET` the option block plus thirteen value lines.
 //!

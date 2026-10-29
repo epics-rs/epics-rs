@@ -21,8 +21,6 @@ use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
 #[cfg(feature = "parallel")]
 use crate::par_util;
 use crate::stats::{StatsElem, merge_range};
-#[cfg(feature = "parallel")]
-use rayon::prelude::*;
 
 /// Configuration for a single ROI region. The default is NDPluginROIStat.cpp's
 /// starting ROI: Use 0 (`:557`) and zero geometry.
@@ -499,7 +497,7 @@ impl NDPluginProcess for ROIStatProcessor {
                 .zip(clamped.iter())
                 .map(|(roi, clamp)| match clamp {
                     Some((offset, size)) => Self::compute_roi_stats(
-                        &array.data,
+                        array.data(),
                         ndims,
                         array_size_x,
                         *offset,
@@ -525,23 +523,25 @@ impl NDPluginProcess for ROIStatProcessor {
                 })
                 .sum();
 
-            if par_util::should_parallelize(total_elements) {
-                let data = &array.data;
-                par_util::thread_pool().install(|| {
-                    rois.par_iter()
-                        .zip(clamped.par_iter())
-                        .map(|(roi, clamp)| match clamp {
-                            Some((offset, size)) => Self::compute_roi_stats(
-                                data,
-                                ndims,
-                                array_size_x,
-                                *offset,
-                                *size,
-                                roi.bgd_width,
-                            ),
-                            None => ROIStatResult::default(),
-                        })
-                        .collect()
+            // 15 ps + 38 ps per element byte serially; the split measured
+            // faster from 60 us (u16 860x860 0.89x serial, f64 512x512 0.75x).
+            if par_util::pool_wins(
+                total_elements,
+                15 + 38 * array.data().data_type().element_size(),
+                60,
+                clamped.iter().flatten().count(),
+            ) {
+                let data = array.data();
+                par_util::map_indices(rois.len(), |i| match clamped[i] {
+                    Some((offset, size)) => Self::compute_roi_stats(
+                        data,
+                        ndims,
+                        array_size_x,
+                        offset,
+                        size,
+                        rois[i].bgd_width,
+                    ),
+                    None => ROIStatResult::default(),
                 })
             } else {
                 serial_results()
@@ -801,8 +801,8 @@ mod tests {
             "T",
             1,
             Default::default(),
-            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+            asyn_rs::port::InterfaceMask::NONE,
+            asyn_rs::port::InterfaceMask::NONE,
         );
         let clamp = WriteVerdict::Refuse {
             keep: 1,
@@ -878,8 +878,8 @@ mod tests {
             "RS_TSCB",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         let roi = ROIStatROI {
             enabled: true,
@@ -944,8 +944,8 @@ mod tests {
             "RS_TSTS",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         let roi = ROIStatROI {
             enabled: true,
@@ -1119,8 +1119,8 @@ mod tests {
             "RS_NAME",
             2,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         let mut proc = ROIStatProcessor::new(vec![ROIStatROI::default(); 2], 2048);
         ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base).unwrap();
@@ -1129,14 +1129,14 @@ mod tests {
             assert_eq!(base.get_string_param(proc.params.name, addr).unwrap(), b"");
         }
     }
-    use ad_core_rs::ndarray::{NDDataType, NDDimension};
+    use ad_core_rs::ndarray::{NDDataType, NDDataViewMut, NDDimension};
 
     fn make_2d_array(x: usize, y: usize, fill: impl Fn(usize, usize) -> f64) -> NDArray {
         let mut arr = NDArray::new(
             vec![NDDimension::new(x), NDDimension::new(y)],
             NDDataType::Float64,
         );
-        if let NDDataBuffer::F64(ref mut v) = arr.data {
+        if let NDDataViewMut::F64(v) = arr.data_mut().view_mut() {
             for iy in 0..y {
                 for ix in 0..x {
                     v[iy * x + ix] = fill(ix, iy);
@@ -1443,7 +1443,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             for (i, val) in v.iter_mut().enumerate() {
                 *val = (i + 1) as u8;
             }
@@ -1479,7 +1479,7 @@ mod tests {
 
     fn make_1d_array(n: usize, fill: impl Fn(usize) -> f64) -> NDArray {
         let mut arr = NDArray::new(vec![NDDimension::new(n)], NDDataType::Float64);
-        if let NDDataBuffer::F64(ref mut v) = arr.data {
+        if let NDDataViewMut::F64(v) = arr.data_mut().view_mut() {
             for (i, slot) in v.iter_mut().enumerate() {
                 *slot = fill(i);
             }
@@ -1532,8 +1532,8 @@ mod tests {
             "roistat_adp16",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base).unwrap();
         proc.register_params(&mut base).unwrap();
@@ -1729,56 +1729,56 @@ mod tests {
         check_roi_stats_against_reference(
             "i8",
             |i| (seq(i) % 256) as u8 as i8,
-            NDDataBuffer::I8,
+            NDDataBuffer::from_vec::<i8>,
             |e| e as f64,
         );
         check_roi_stats_against_reference(
             "u8",
             |i| (seq(i) % 256) as u8,
-            NDDataBuffer::U8,
+            NDDataBuffer::from_vec::<u8>,
             |e| e as f64,
         );
         check_roi_stats_against_reference(
             "i16",
             |i| (seq(i) % 65536) as u16 as i16,
-            NDDataBuffer::I16,
+            NDDataBuffer::from_vec::<i16>,
             |e| e as f64,
         );
         check_roi_stats_against_reference(
             "u16",
             |i| (seq(i) % 65536) as u16,
-            NDDataBuffer::U16,
+            NDDataBuffer::from_vec::<u16>,
             |e| e as f64,
         );
         check_roi_stats_against_reference(
             "i32",
             |i| seq(i) as i32 - 500_000,
-            NDDataBuffer::I32,
+            NDDataBuffer::from_vec::<i32>,
             |e| e as f64,
         );
-        check_roi_stats_against_reference("u32", seq, NDDataBuffer::U32, |e| e as f64);
+        check_roi_stats_against_reference("u32", seq, NDDataBuffer::from_vec::<u32>, |e| e as f64);
         check_roi_stats_against_reference(
             "i64",
             |i| seq(i) as i64 - 500_000,
-            NDDataBuffer::I64,
+            NDDataBuffer::from_vec::<i64>,
             |e| e as f64,
         );
         check_roi_stats_against_reference(
             "u64",
             |i| seq(i) as u64,
-            NDDataBuffer::U64,
+            NDDataBuffer::from_vec::<u64>,
             |e| e as f64,
         );
         check_roi_stats_against_reference(
             "f32",
             |i| seq(i) as f32 * 0.37 - 100.0,
-            NDDataBuffer::F32,
+            NDDataBuffer::from_vec::<f32>,
             |e| e as f64,
         );
         check_roi_stats_against_reference(
             "f64",
             |i| seq(i) as f64 * 0.37 - 100.0,
-            NDDataBuffer::F64,
+            NDDataBuffer::from_vec::<f64>,
             |e| e,
         );
     }
@@ -1787,7 +1787,7 @@ mod tests {
     /// reading past it.
     #[test]
     fn roi_stats_of_a_rectangle_past_the_buffer_are_zero() {
-        let data = NDDataBuffer::U8((0..12).collect());
+        let data = NDDataBuffer::from_vec::<u8>((0..12).collect());
         let r = ROIStatProcessor::compute_roi_stats(&data, 2, 4, [2, 1], [3, 2], 0);
         assert_eq!(r.total, 0.0);
         assert_eq!(r.max, 0.0);

@@ -10,12 +10,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use asyn_rs::asyn_record::register_port;
+use asyn_rs::error::AsynResult;
 use asyn_rs::interrupt::{InterruptFilter, InterruptValue};
 use asyn_rs::param::{EnumEntry, ParamType, ParamValue};
 use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::runtime::config::RuntimeConfig;
 use asyn_rs::runtime::port::create_port_runtime_unclaimed;
+use asyn_rs::user::AsynUser;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 
@@ -53,6 +55,9 @@ impl PortDriver for EnumPort {
     fn base_mut(&mut self) -> &mut PortDriverBase {
         &mut self.base
     }
+    fn read_enum(&mut self, user: &AsynUser) -> AsynResult<(usize, Arc<[EnumEntry]>)> {
+        self.base.get_enum_param(user.reason, user.addr)
+    }
 }
 
 fn entry(s: &str, value: i32) -> EnumEntry {
@@ -70,8 +75,8 @@ async fn enum_value_fires_with_a_ring_client_allocate_nothing_on_the_notify_thre
         "enumAlloc",
         1,
         PortFlags::default(),
-        InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_INTERRUPTS,
+        InterfaceMask::ENUM | InterfaceMask::DRV_USER,
+        InterfaceMask::ENUM,
     );
     base.create_param("MODE", ParamType::Enum).unwrap();
     base.set_enum_choices_param(0, 0, vec![entry("OFF", 0), entry("ON", 1)].into())

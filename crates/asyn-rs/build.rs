@@ -110,4 +110,8 @@ fn main() {
     if unix {
         println!("cargo::rustc-cfg=asyn_af_unix");
     }
+
+    // testIPServerApp's SNL program, which needs the IOC.
+    #[cfg(feature = "epics")]
+    epics_seq_rs::snc::build::compile_dir("src/snl");
 }

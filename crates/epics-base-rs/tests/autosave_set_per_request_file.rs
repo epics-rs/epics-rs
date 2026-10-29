@@ -238,7 +238,8 @@ async fn a_method_added_to_a_running_set_starts_its_task() {
 
     let sav = dir.path().join("settings.sav");
     // The trigger's first monitor event, its value at enable, saves.
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if sav.exists() {
             break;
         }
@@ -253,7 +254,8 @@ async fn a_method_added_to_a_running_set_starts_its_task() {
     )
     .await
     .unwrap();
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if sav.exists() {
             break;
         }

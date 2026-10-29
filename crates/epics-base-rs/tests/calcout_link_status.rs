@@ -35,7 +35,8 @@ const CON: i16 = 3;
 /// Poll a DBF_MENU-served-as-DBR_ENUM status field until its numeric value
 /// equals `want`.
 async fn poll_status(db: &PvDatabase, pv: &str, want: i16, label: &str) {
-    for _ in 0..400 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if let Ok(v) = db.get_pv(pv)
             && v.to_f64().map(|f| f as i16) == Some(want)
         {

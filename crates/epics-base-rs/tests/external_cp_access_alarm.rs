@@ -111,12 +111,10 @@ async fn holder_db(lset: Arc<ReadGateLset>) -> PvDatabase {
     {
         let rec = db.get_record("HOLDER").unwrap();
         let mut inst = rec.write();
-        inst.common.text.inp = "ca://UP:PV CP".into();
+        inst.common.text.inp = "UP:PV CP".into();
         inst.install_link_cache(
             "INP",
-            std::sync::Arc::new(epics_base_rs::server::record::parse_link_v2(
-                "ca://UP:PV CP",
-            )),
+            std::sync::Arc::new(epics_base_rs::server::record::parse_link_v2("UP:PV CP")),
         )
         .expect("a common link");
     }

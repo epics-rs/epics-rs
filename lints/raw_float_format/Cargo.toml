@@ -10,11 +10,11 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-dylint_linting = "6.2.0"
+dylint_linting = "6.3.0"
 serde = { version = "1.0", features = ["derive"] }
 
 [dev-dependencies]
-dylint_testing = "6.2.0"
+dylint_testing = "6.3.0"
 
 [package.metadata.rust-analyzer]
 rustc_private = true

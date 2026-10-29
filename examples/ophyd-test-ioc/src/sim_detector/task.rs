@@ -8,7 +8,7 @@ use rand::rngs::StdRng;
 use asyn_rs::port_handle::PortHandle;
 
 use ad_core_rs::driver::{ADStatus, ImageMode};
-use ad_core_rs::ndarray::{NDDataBuffer, NDDataType, NDDimension};
+use ad_core_rs::ndarray::{NDDataType, NDDataViewMut, NDDimension};
 use ad_core_rs::ndarray_pool::{DriverPool, PublishedArray};
 use ad_core_rs::params::ADBaseParams;
 use ad_core_rs::plugin::channel::ArrayPublisher;
@@ -129,7 +129,8 @@ fn compute_image(
     let dims = vec![NDDimension::new(width), NDDimension::new(height)];
     pool.owner().replace_array(0, || {
         let mut frame = pool.alloc(dims, NDDataType::Float64).ok()?;
-        let NDDataBuffer::F64(img) = &mut frame.data else {
+        let mut fill = frame.fill();
+        let NDDataViewMut::F64(img) = fill.data_mut().view_mut() else {
             unreachable!("the frame was allocated as Float64")
         };
         img.copy_from_slice(raw);
@@ -307,7 +308,7 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
 
             // Stamped in place in pArrays[0] (simDetector.cpp:824-825).
             let Ok(frame) = ctx.pool.owner().refill(0, frame, |frame| {
-                frame.unique_id = array_counter;
+                frame.set_unique_id(array_counter);
                 frame.update_time_stamps(stamp);
             }) else {
                 continue;
@@ -344,6 +345,7 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ad_core_rs::ndarray::NDDataView;
 
     fn config(size_x: usize, size_y: usize) -> MovingDotConfigSnapshot {
         MovingDotConfigSnapshot {
@@ -393,8 +395,8 @@ mod tests {
             true,
             &mut StdRng::seed_from_u64(3),
         );
-        let NDDataBuffer::F64(got) = &frame.data else {
-            panic!("{:?}", frame.data.data_type());
+        let NDDataView::F64(got) = frame.data().view() else {
+            panic!("{:?}", frame.data().data_type());
         };
         for y in 0..height {
             for x in 0..width {
@@ -420,7 +422,7 @@ mod tests {
                 &mut raw,
             )
             .unwrap();
-            frame.data.as_u8_slice().as_ptr()
+            frame.data().as_u8_slice().as_ptr()
         };
         let first = image();
         assert_eq!([image(), image()], [first; 2]);

@@ -48,7 +48,8 @@ async fn phase(db: &PvDatabase, we: Vec<f64>, want: f64) -> [f64; 4] {
     db.put_record_field_from_ca_no_notify("WE", "VAL", EpicsValue::DoubleArray(we.into()))
         .await
         .unwrap();
-    for _ in 0..400 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         for rec in ["SW", "SWD"] {
             let mut visited = epics_base_rs::server::database::ProcStack::new();
             let _ = db.process_record_with_links(rec, &mut visited).await;

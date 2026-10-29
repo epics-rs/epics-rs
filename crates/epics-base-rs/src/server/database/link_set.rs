@@ -1,4 +1,4 @@
-//! [`LinkSet`] — pluggable backend for `pva://` / `ca://` link
+//! [`LinkSet`] — pluggable backend for CA / pva link
 //! resolution.
 //!
 //! Mirrors the C EPICS `lset` (link set) abstraction used by libdbCore
@@ -100,20 +100,19 @@ pub enum LinkDbfType {
 /// How an external OUT-link write should be delivered to the lset.
 ///
 /// Mirrors the C dbCore split between a plain link put and a
-/// put-notify-aware put: `dbPutLink` (synchronous, no completion
-/// callback) vs `dbPutLinkAsync` (issued from `dbNotify`, where the
-/// source record's processing is held until the downstream put
-/// completes). pvxs's pvalink lset realises the same split as
+/// completion-aware one: `dbPutLink` (no completion callback) vs
+/// `dbPutLinkAsync` (a `devXxxSoftCallback` record, held PACT until the
+/// downstream put completes) and `dbCaPutLinkCallback` (sseq WAITn).
+/// pvxs's pvalink lset realises the same split as
 /// `pvaPutValue` (plain, `wait=false`) vs `pvaPutValueAsync`
 /// (`wait=true`, which sets `record._options.block` so the PUT
 /// request carries the block option and the source record is parked
 /// in `after_put` until the server acknowledges completion) —
 /// `pvxs/ioc/pvalink_lset.cpp` `putValue` / `putValueAsync`.
 ///
-/// The database selects the op from the write context: a write that
-/// originates inside a put-notify / blocking-put chain (the source
-/// record carries a completion wait-set) uses [`Async`]; a plain
-/// record-processing OUT write uses [`Plain`].
+/// The database selects the op from the writer: those two use [`Async`];
+/// every other OUT write uses [`Plain`], one inside a put-notify chain
+/// included, as C `dbPutLink` is `dbCaPutLink` there (`dbCa.c:627-631`).
 ///
 /// [`Async`]: LinkPutOp::Async
 /// [`Plain`]: LinkPutOp::Plain
@@ -123,9 +122,9 @@ pub enum LinkPutOp {
     /// pvxs `pvaPutValue` (`wait=false`) / C `dbPutLink`.
     #[default]
     Plain,
-    /// Completion-aware put — the originating record is part of a
-    /// put-notify / blocking-put chain. Maps to pvxs `pvaPutValueAsync`
-    /// (`wait=true`, `record._options.block`) / C `dbPutLinkAsync`.
+    /// Completion-aware put — the writer waits for the downstream put.
+    /// Maps to pvxs `pvaPutValueAsync` (`wait=true`,
+    /// `record._options.block`) / C `dbPutLinkAsync`.
     Async,
 }
 
@@ -404,12 +403,36 @@ pub struct LinkMetadata {
     /// `display.description` — carried so a link snapshot is complete;
     /// pvxs exposes it through the same `fld_meta` cache.
     pub description: Option<String>,
-    /// ENUM state labels of the remote channel, when it has any. The label
-    /// table a `DBR_STRING`-requesting reader (stringin/lsi INP, printf
-    /// `%s`) renders a remote enum index through — C `dbCa` keeps a second
-    /// `DBR_STRING` monitor (`pgetString`) for that read; here the labels
-    /// ride the same attribute fetch as the limits (CA: `DBR_CTRL_ENUM`).
-    pub enum_choices: Option<Vec<String>>,
+}
+
+impl LinkMetadata {
+    /// The DBF type and element count of this snapshot.
+    pub fn shape(&self) -> LinkShape {
+        LinkShape {
+            dbf_type: self.dbf_type,
+            element_count: self.element_count,
+        }
+    }
+}
+
+/// [`LinkMetadata::dbf_type`] and [`LinkMetadata::element_count`] alone,
+/// with their meanings: what [`LinkSet::link_shape`] answers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LinkShape {
+    pub dbf_type: Option<LinkDbfType>,
+    pub element_count: Option<i64>,
+}
+
+/// What [`LinkSet::get_cached_enum_string`] answers for a link whose channel
+/// is a `DBR_ENUM`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum EnumString {
+    /// The lset keeps no string form: the read renders the index.
+    NotServed,
+    /// The lset's `DBR_STRING` monitor has not delivered: the read fails.
+    Pending,
+    /// The server's string for the channel's state.
+    Got(crate::types::PvString),
 }
 
 /// Ungated remote alarm snapshot for a link — the remote
@@ -630,6 +653,15 @@ pub trait LinkSet: Send + Sync {
         None
     }
 
+    /// C `dbCaGetLink`'s `DBR_ENUM` → `DBR_STRING` branch (`dbCa.c:436-454`):
+    /// the last value of the link's `DBR_STRING` monitor, which the first
+    /// call adds. Asked once [`Self::get_cached_value`] has answered an
+    /// `EpicsValue::Enum`. MUST NOT perform I/O.
+    fn get_cached_enum_string(&self, link: LinkRef<'_>) -> EnumString {
+        let _ = link;
+        EnumString::NotServed
+    }
+
     /// Whether this lset's `getValue` raised `"<field> Disconn"` on the
     /// reading record when its read of `name` failed, as pvalink's
     /// `pvaGetValue` does on a link that is not valid
@@ -646,7 +678,7 @@ pub trait LinkSet: Send + Sync {
 
     /// C `lset->openLink` (`dbLink.c:194-199`, from `dbJLinkInit`,
     /// `dbJLink.c:459`): where the lset settles what `name` is, asked of a
-    /// link naming this lset's scheme (`pva://`, `{pva:…}`), once per
+    /// link addressed to this lset (a CA name, `{pva:…}`), once per
     /// link at iocInit (`doResolveLinks`, ahead of `init_record` pass 1,
     /// `iocInit.c:576-577`) and once per put of the link, under the put's
     /// hold where `dbPutFieldLink` runs `dbAddLink` (`dbAccess.c:1208`).
@@ -766,8 +798,8 @@ pub trait LinkSet: Send + Sync {
 
     /// Write `value` to `name` with the delivery semantics named by
     /// `op` ([`LinkPutOp::Plain`] for a fire-and-forget put,
-    /// [`LinkPutOp::Async`] for a put that is part of a put-notify /
-    /// blocking-put chain). Returns Err with a human-readable reason
+    /// [`LinkPutOp::Async`] for a put whose writer waits for its
+    /// completion). Returns Err with a human-readable reason
     /// on failure (denied, type-mismatch, no-such-pv, etc.). Default
     /// impl rejects all writes — read-only lsets keep the default.
     ///
@@ -842,9 +874,9 @@ pub trait LinkSet: Send + Sync {
     /// `None` means "do not propagate" — either the upstream has no
     /// alarm, the lset has no cache, or the link's maximize-severity
     /// mode (`NMS`/`MS`/`MSI`) suppresses it. The lset is expected to
-    /// apply that mode gate itself (the `pva://X?sevr=MS` modifier is
-    /// stripped before epics-base-rs sees the link, so only the lset
-    /// retains it). A returned `Some(sev)` is therefore already
+    /// apply that mode gate itself (a `{pva:{pv:"X",sevr:"MS"}}` option
+    /// travels in the link's identity key, which only the lset decodes).
+    /// A returned `Some(sev)` is therefore already
     /// gated and the record processing loop propagates it verbatim
     /// as a maximize-severity contribution. Mirrors pvxs
     /// `pvxs/ioc/pvalink_lset.cpp` `pvaGetAlarm` feeding `recGblSetSevr`.
@@ -929,6 +961,17 @@ pub trait LinkSet: Send + Sync {
     /// untouched on a missing sub-field. Default impl: no metadata.
     fn link_metadata(&self, _link: LinkRef<'_>) -> Option<LinkMetadata> {
         None
+    }
+
+    /// The link's DBF type and element count, C lset `getDBFtype` /
+    /// `getElements` (`dbCa.c:666`, `:633`; pvxs `pvalink_lset.cpp:199-258`):
+    /// known once the link connects, never held for an attribute read
+    /// [`Self::link_metadata`] waits on. A scan cycle asks it, for an OUT
+    /// target's type and an INP's `dbGetNelements`, so it MUST NOT allocate:
+    /// an lset whose metadata snapshot allocates (units, description) or
+    /// lands after the connect overrides the default.
+    fn link_shape(&self, link: LinkRef<'_>) -> Option<LinkShape> {
+        self.link_metadata(link).as_ref().map(LinkMetadata::shape)
     }
 
     /// Enumerate every PV name this lset has *opened* (i.e., is

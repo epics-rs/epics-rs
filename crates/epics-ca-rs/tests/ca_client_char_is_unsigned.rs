@@ -85,9 +85,12 @@ async fn pair() -> (CaClient, CaChannel, CaChannel) {
     }
     // Seed over the wire, so the record holds exactly the bytes a C IOC
     // would: the server's own WRITE path already puts DBR_CHAR unsigned.
-    src.put(&EpicsValue::CharArray(WIRE.to_vec().into()))
-        .await
-        .expect("seed CHAR waveform");
+    src.put_with_timeout(
+        &EpicsValue::CharArray(WIRE.to_vec().into()),
+        fact_budget::FACT_BUDGET,
+    )
+    .await
+    .expect("seed CHAR waveform");
     (client, src, dst)
 }
 
@@ -95,8 +98,15 @@ async fn pair() -> (CaClient, CaChannel, CaChannel) {
 /// `CaChannel::put`'s `convert_to(native_type)` is where the sign
 /// extension used to happen.
 async fn round_trip(dst: &CaChannel, value: &EpicsValue) -> Vec<i32> {
-    dst.put(value).await.expect("put into LONG waveform");
-    match dst.get().await.expect("read back LONG waveform").1 {
+    dst.put_with_timeout(value, fact_budget::FACT_BUDGET)
+        .await
+        .expect("put into LONG waveform");
+    match dst
+        .get_with_timeout(fact_budget::FACT_BUDGET)
+        .await
+        .expect("read back LONG waveform")
+        .1
+    {
         EpicsValue::LongArray(v) => v.to_vec(),
         other => panic!("expected a LONG waveform readback, got {other:?}"),
     }
@@ -106,7 +116,10 @@ async fn round_trip(dst: &CaChannel, value: &EpicsValue) -> Vec<i32> {
 #[serial]
 async fn a_plain_get_of_a_char_waveform_re_puts_unsigned() {
     let (_client, src, dst) = pair().await;
-    let (_, value) = src.get().await.expect("plain get");
+    let (_, value) = src
+        .get_with_timeout(fact_budget::FACT_BUDGET)
+        .await
+        .expect("plain get");
     assert_eq!(
         round_trip(&dst, &value).await.as_slice(),
         UNSIGNED,
@@ -155,7 +168,7 @@ async fn a_monitor_of_a_char_waveform_re_puts_unsigned() {
 async fn a_compound_char_get_re_puts_unsigned() {
     let (_client, src, dst) = pair().await;
     let snap = src
-        .get_with_metadata(DbrClass::Time)
+        .get_with_metadata(DbrClass::Time, fact_budget::FACT_BUDGET)
         .await
         .expect("DBR_TIME_CHAR get");
     assert_eq!(
@@ -172,7 +185,10 @@ async fn caget_still_renders_the_signed_reading() {
     use epics_ca_rs::cli::{CountPrefix, ValueFormat, format_value};
 
     let (_client, src, _dst) = pair().await;
-    let (_, value) = src.get().await.expect("plain get");
+    let (_, value) = src
+        .get_with_timeout(fact_budget::FACT_BUDGET)
+        .await
+        .expect("plain get");
 
     let fmt = ValueFormat::default();
     assert_eq!(

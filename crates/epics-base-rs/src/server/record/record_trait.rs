@@ -3,6 +3,7 @@ use crate::types::c_parse::Converted;
 use crate::types::{DbFieldType, DbfCode, EpicsValue, PvString, Scalar, c_parse};
 
 use super::CommonFields;
+use super::LinkType;
 use super::alarm::{AlarmLimit, AlarmSeverity};
 use super::record_instance::FieldIx;
 use super::scan::ScanType;
@@ -788,6 +789,23 @@ impl FieldDesc {
         self.no_access() && !matches!(self.declared_special, Special::DbAddr)
     }
 
+    /// C `dbEntryToAddr`'s `paddr->field_type` (`dbAccess.c:636-647`): the
+    /// declared `DBF_*` code, or on a `special(SPC_DBADDR)` row the type its
+    /// `cvt_dbaddr` overwrites it with — the `dbfType` itself, not its
+    /// `mapDBFToDBR` collapse, so a menu stays `DBF_MENU`, a link
+    /// `DBF_INLINK`/`OUTLINK`/`FWDLINK` and `TIME` `DBF_NOACCESS`. A
+    /// [`Self::runtime_typed`] row's placeholder is not its answer; the
+    /// record's stored variant is.
+    pub const fn addressed_dbf(&self) -> DbfCode {
+        // C tests `paddr->special` as just copied from `pflddes->special`
+        // (`dbAccess.c:638-641`), the DECLARED code: `lsi.VAL` declares
+        // `SPC_DBADDR` and resolves to `SPC_MOD`, and is `DBF_STRING`.
+        match self.declared_special {
+            Special::DbAddr => self.dbf_type.dbf_code(),
+            _ => self.declared_dbf,
+        }
+    }
+
     /// The width of one element as C's `paddr->field_size` holds it, for a
     /// field served as `served`.
     ///
@@ -808,6 +826,28 @@ impl FieldDesc {
             DbfCode::Long | DbfCode::ULong | DbfCode::Float => 4,
             DbfCode::Double | DbfCode::Int64 | DbfCode::UInt64 => 8,
             _ => self.size,
+        }
+    }
+}
+
+/// The test C puts in front of a constant-link load. The two differ on a
+/// `{const:…}` link, which is a `JSON_LINK` (`dbStaticLib.c:2280-2287`) that
+/// `dbLinkIsConstant` still calls constant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeedGuard {
+    /// An unguarded `recGblInitConstantLink`: `dbLoadLink` runs the link's
+    /// `loadScalar`, so `lnkConst` loads too (`dbLink.c:234-242`).
+    LoadLink,
+    /// `if (plink->type == CONSTANT) recGblInitConstantLink(…)`.
+    TypeConstant,
+}
+
+impl SeedGuard {
+    /// Whether C's guard lets a load from `link` run.
+    pub fn admits(self, link: &crate::server::record::ParsedLink) -> bool {
+        match self {
+            SeedGuard::LoadLink => true,
+            SeedGuard::TypeConstant => link.is_constant_type(),
         }
     }
 }
@@ -841,6 +881,8 @@ pub struct ConstantInitLink {
     /// &n)` seed instead of `recGblInitConstantLink` — aSub's INPA..U
     /// (`aSubRecord.c:128-137`), which load into the FTx buffer by NOx.
     pub array: Option<(crate::types::DbFieldType, usize)>,
+    /// The test C's call site puts in front of the load.
+    pub guard: SeedGuard,
 }
 
 impl ConstantInitLink {
@@ -852,6 +894,7 @@ impl ConstantInitLink {
             clears_udf: false,
             normalize_bool: false,
             array: None,
+            guard: SeedGuard::LoadLink,
         }
     }
 
@@ -863,6 +906,7 @@ impl ConstantInitLink {
             clears_udf: true,
             normalize_bool: false,
             array: None,
+            guard: SeedGuard::LoadLink,
         }
     }
 
@@ -879,6 +923,7 @@ impl ConstantInitLink {
             clears_udf: false,
             normalize_bool: false,
             array: Some((dbr, nreq)),
+            guard: SeedGuard::LoadLink,
         }
     }
 
@@ -891,6 +936,15 @@ impl ConstantInitLink {
             clears_udf: true,
             normalize_bool: true,
             array: None,
+            guard: SeedGuard::LoadLink,
+        }
+    }
+
+    /// The same seed behind C's `if (plink->type == CONSTANT)`.
+    pub const fn type_constant(self) -> Self {
+        Self {
+            guard: SeedGuard::TypeConstant,
+            ..self
         }
     }
 }
@@ -899,11 +953,17 @@ impl ConstantInitLink {
 /// fetches — the `for (i = 0; i < N; i++) recGblInitConstantLink(plink++,
 /// DBF_DOUBLE, pvalue++)` loop of calc / calcout / sub / sel / aSub /
 /// scalcout / acalcout / transform, expressed over the record's own
-/// [`Record::multi_input_links`] table.
-pub fn seed_input_links(pairs: &[(&'static str, &'static str)]) -> Vec<ConstantInitLink> {
+/// [`Record::multi_input_links`] table, each load behind `guard`.
+pub fn seed_input_links(
+    pairs: &[(&'static str, &'static str)],
+    guard: SeedGuard,
+) -> Vec<ConstantInitLink> {
     pairs
         .iter()
-        .map(|(link, value)| ConstantInitLink::new(link, value))
+        .map(|(link, value)| ConstantInitLink {
+            guard,
+            ..ConstantInitLink::new(link, value)
+        })
         .collect()
 }
 
@@ -923,36 +983,28 @@ pub fn seed_input_links(pairs: &[(&'static str, &'static str)]) -> Vec<ConstantI
 /// [`Record::multi_output_buffer`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutTarget {
-    /// Target field's DBF type. `None` = unresolved (disconnected CA link,
-    /// or a name this IOC cannot resolve) — C's `field_type` initializer.
-    pub field_type: Option<DbFieldType>,
+    /// Target field's `dbfType` — C's `field_type`, the code its soft device
+    /// support switches on, so `DBF_MENU`, `DBF_DEVICE`, the link classes and
+    /// `DBF_NOACCESS` each have their own arm. `None` = unresolved
+    /// (disconnected CA link, or a name this IOC cannot resolve) — C's
+    /// `field_type` initializer.
+    pub field_type: Option<DbfCode>,
+    /// C's `dbr_field_type`, what `dbGetLinkDBFtype` reports
+    /// (`dbChannelFinalFieldType`, `dbChannel.c:498`): the DBR type
+    /// [`Self::field_type`] is served as, except at a `$` address, which is
+    /// `DBR_CHAR` while a link keeps its `DBF_xxLINK` (`dbAccess.c:690-695`).
+    pub dbr_field_type: Option<DbFieldType>,
     /// Target field's element capacity — C `no_elements` / `dbCaGetNelements`.
     /// `1` when unresolved, matching C's `n_elements = 1` initializer.
     pub element_count: i64,
-    /// True when C would classify this link as a `CA_LINK`: an explicit
-    /// `ca://`/`pva://` link, or a DB-style name that is not a record of
-    /// this IOC (`dbInitLink` locality). Device support that splits its
-    /// buffer choice on sync-vs-async (`devsCalcoutSoft.c:76`, gated on
-    /// `plink->type == CA_LINK && pscalcout->wait`) reads this.
-    pub is_ca_link: bool,
-    /// True when the target field is one of the seven DBF classes C's soft
-    /// device support puts as `DBR_STRING` — `DBF_STRING`, `DBF_ENUM`,
-    /// `DBF_MENU`, `DBF_DEVICE`, `DBF_INLINK`, `DBF_OUTLINK`, `DBF_FWDLINK`
-    /// (`devsCalcoutSoft.c:83-85`, `:128-130`).
-    ///
-    /// Carried here rather than re-derived from [`Self::field_type`] because
-    /// [`DbFieldType`] is the DBR *wire* type: it has no `Menu` or `Device`
-    /// variant, so a menu target (`PRIO`, `STAT`, `SEVR`, `DISS`, `ACKT`, …)
-    /// or `DTYP` is indistinguishable from a plain numeric/string field by
-    /// type alone. The classification is made once, at resolution, by the
-    /// side that holds the target's field metadata
-    /// (`RecordInstance::field_puts_as_string`); a record's
-    /// [`Record::multi_output_buffer`] just reads the answer.
-    pub puts_as_string: bool,
-    /// C `plink->type == CONSTANT`, the test `tableRecord.c:2321` makes —
-    /// not `dbLinkIsConstant`, which a removed link also answers: its type
-    /// stays `PV_LINK` (`dbDbLink.c:132`) while it has no target.
-    pub constant_type: bool,
+    /// C `plink->type` once `dbInitLink` has run, the value every
+    /// `plink->type == CA_LINK` / `CONSTANT` test in device support reads
+    /// (`devsCalcoutSoft.c:78`, `:113`, `sseqRecord.c:717`,
+    /// `tableRecord.c:2321`): `Ca` for a ` CA` link or a DB-style name
+    /// not served here, `Json` for a PV Access link, `Constant` for a literal
+    /// or an empty link. A removed DB or CA link keeps `PV_LINK`
+    /// (`dbDbLink.c:132`), which is `Other`, not `Constant`.
+    pub link_type: LinkType,
     /// C `dbCaPutLinkCallback`'s gate, `isConnected && hasWriteAccess`
     /// (`dbCa.c:529-532`), read at resolution from the link the record holds.
     /// `true` for a link that never reaches that gate (local, constant, none).
@@ -966,10 +1018,9 @@ impl OutTarget {
     /// class — C's `field_type = 0` matches no `case` and falls to `default:`.
     pub const UNRESOLVED: Self = Self {
         field_type: None,
+        dbr_field_type: None,
         element_count: 1,
-        is_ca_link: false,
-        puts_as_string: false,
-        constant_type: true,
+        link_type: LinkType::Constant,
         put_admitted: true,
     };
 }
@@ -2402,23 +2453,37 @@ pub enum ProcessAction {
     /// has no runtime for. The current cycle's OUT/FLNK/notify proceed
     /// normally.
     ///
-    /// Equivalent to C EPICS `callbackRequestDelayed()` + `scanOnce()`
-    /// (`db/callback.c:410` (`callbackRequestDelayed`), `db/dbScan.c:660`
-    /// (`scanOnce`); epics-base R7.0.10).
+    /// C `callbackRequestProcessCallbackDelayed()` (`db/callback.c:430`), or
+    /// a delayed callback whose function calls `(*prset->process)(prec)`
+    /// under `dbScanLock` (`ProcessCallback`, `:379-387`): the record's own
+    /// `process()` resumed as its async continuation, past `dbProcess`'s PACT
+    /// and disable tests and its TPRO line. A C callback that calls
+    /// `scanOnce` or `dbProcess`, or never processes, is a
+    /// [`Self::DelayedCallbackAfter`].
     ReprocessAfter(std::time::Duration),
 
-    /// C `callbackRequestDelayed()` armed with a handler that mutates the
-    /// record BEFORE it calls `dbProcess` — `boRecord.c::myCallbackFunc`
-    /// (:105-118) and its `busyRecord.c:107-124` twin, the HIGH one-shot.
+    /// C `callbackRequestDelayed()` armed on one of the record's own
+    /// `CALLBACK`s, whose function is [`Record::delayed_callback_fire`]:
+    /// `boRecord.c::myCallbackFunc` (:105-118) and its `busyRecord.c:107-124`
+    /// twin, scaler's update, delay and autocount callbacks
+    /// (`scalerRecord.c:203-239`).
     ///
     /// Distinct from [`Self::ReprocessAfter`], whose timer re-enters
-    /// `process()` unchanged. Here the fire runs
-    /// [`Record::delayed_callback_fire`] under the record gate first, and that
-    /// hook — not `process()` — performs the timer's own mutation. The record
-    /// therefore keeps no "a timer is pending" flag for `process()` to consume,
-    /// so a foreign scan, a caput or a FLNK arriving inside the delay window
-    /// cannot take the one-shot the timer owns.
-    DelayedCallbackAfter(std::time::Duration),
+    /// `process()` unchanged. Here the fire runs the hook under the record
+    /// gate, and its [`DelayedCallbackOutcome`] decides whether a fresh pass
+    /// follows. The record therefore keeps no "a timer is pending" flag for
+    /// `process()` to consume, so a foreign scan, a caput or a FLNK arriving
+    /// inside the delay window cannot take what the timer owns. The
+    /// [`DelayedCallback`] travels with the timer, as C's function pointer
+    /// does with its `CALLBACK`. Arming restarts that callback's timer only;
+    /// the record's other callbacks and its async re-entry stay pending.
+    DelayedCallbackAfter(std::time::Duration, DelayedCallback),
+
+    /// C `epicsTimerCancel` on one of the record's own `CALLBACK`s
+    /// (`scalerRecord.c:645`): a pending [`Self::DelayedCallbackAfter`] timer
+    /// on that callback fires nothing. The record's other callbacks and its
+    /// async re-entry stay pending.
+    CancelDelayedCallback(DelayedCallback),
 
     /// C throttle's `callbackRequestDelayed(&delayFuncCb, ..)`
     /// (`throttleRecord.c:593`), whose handler runs `valuePut` under
@@ -2656,12 +2721,100 @@ impl<'a> Pact<'a> {
     }
 }
 
+/// What a holder lends the code of the record it holds: the record's name,
+/// its dbCommon and its PACT, all of which C's code reaches through `prec`,
+/// and the rest of the instance a `dbGet` of the record reads. Only a holder
+/// makes one, so a view of the record ([`OwnRecord`]) without them cannot be
+/// made.
+#[derive(Clone, Copy)]
+pub struct OwnFrame<'a> {
+    name: &'a [u8],
+    common: &'a CommonFields,
+    pact: &'a std::sync::atomic::AtomicBool,
+    cold: &'a super::record_instance::RecordCold,
+    link_slots: &'a super::record_instance::LinkSlots,
+    dpvt: &'a crate::server::device_support::Dpvt,
+}
+
+impl<'a> OwnFrame<'a> {
+    pub(crate) fn new(
+        name: &'a [u8],
+        common: &'a CommonFields,
+        pact: &'a std::sync::atomic::AtomicBool,
+        cold: &'a super::record_instance::RecordCold,
+        link_slots: &'a super::record_instance::LinkSlots,
+        dpvt: &'a crate::server::device_support::Dpvt,
+    ) -> Self {
+        Self {
+            name,
+            common,
+            pact,
+            cold,
+            link_slots,
+            dpvt,
+        }
+    }
+
+    /// The record's dbCommon.
+    pub fn common(self) -> &'a CommonFields {
+        self.common
+    }
+
+    /// The record this frame is lent for, whose code is `record`.
+    pub fn of(self, record: &'a dyn Record) -> OwnRecord<'a> {
+        OwnRecord {
+            frame: self,
+            record,
+        }
+    }
+}
+
+/// The record a caller of [`crate::server::database::AsyncDbHandle::db_get`]
+/// or [`crate::server::database::AsyncDbHandle::name_to_dbaddr`] is inside:
+/// its code and what its holder lent it ([`OwnFrame::of`]).
+#[derive(Clone, Copy)]
+pub struct OwnRecord<'a> {
+    frame: OwnFrame<'a>,
+    record: &'a dyn Record,
+}
+
+impl<'a> OwnRecord<'a> {
+    pub(crate) fn name(self) -> &'a [u8] {
+        self.frame.name
+    }
+
+    pub(crate) fn record(self) -> &'a dyn Record {
+        self.record
+    }
+
+    pub(crate) fn common(self) -> &'a CommonFields {
+        self.frame.common
+    }
+
+    /// The PACT field, as the record's instance reads it.
+    pub(crate) fn pact(self) -> bool {
+        super::record_instance::pact_field(self.frame.pact, self.frame.cold.cell())
+    }
+
+    pub(crate) fn cold(self) -> &'a super::record_instance::RecordCold {
+        self.frame.cold
+    }
+
+    pub(crate) fn link_slots(self) -> &'a super::record_instance::LinkSlots {
+        self.frame.link_slots
+    }
+
+    pub(crate) fn dpvt(self) -> &'a crate::server::device_support::Dpvt {
+        self.frame.dpvt
+    }
+}
+
 /// Which of the per-cycle hooks a type can answer with something other than
 /// the trait default. C has no such hooks (`dbCommon` is read as a struct
 /// member), so the cycle settles this once, in the plan, and a type that
 /// claims a bit not set here is never asked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CycleHooks(u16);
+pub struct CycleHooks(u32);
 
 impl Default for CycleHooks {
     fn default() -> Self {
@@ -2697,7 +2850,7 @@ impl CycleHooks {
     /// previous TIME. The stamp bit has no constant of its own: only the
     /// tail's owners stamp.
     pub const HAND_POSTED_OWN_STAMP: Self = Self(Self::HAND_POSTED.0 | Self::OWN_STAMP);
-    const OWN_STAMP: u16 = 256;
+    const OWN_STAMP: u32 = 256;
     /// [`Record::gate_after_pre_input_reads`]: outside [`Self::ALL`],
     /// declared by the type whose cycle hangs on a pre-input read.
     pub const PRE_INPUT_GATE: Self = Self(512);
@@ -2725,6 +2878,15 @@ impl CycleHooks {
     /// Outside [`Self::ALL`]: a type declares it. A type that checks later
     /// in `process()` returns [`ProcessAction::CheckLinks`] instead.
     pub const LINK_CHECK: Self = Self(32768);
+    /// [`Record::process_own`], [`Record::special_own`] and
+    /// [`Record::init_record_own`] in place of the calls without a frame: the
+    /// type's code reads its own record through what its holder lends it.
+    /// Outside [`Self::ALL`]: a type declares it.
+    pub const OWN_FRAME: Self = Self(65536);
+    /// [`Record::set_inp_nelements`], ahead of the INP read: outside
+    /// [`Self::ALL`], declared by a type whose C `process()` asks
+    /// `dbGetNelements` of INP before its `dbGetLink` (`compressRecord.c:328`).
+    pub const INP_NELEMENTS: Self = Self(131072);
     /// No hook acts: the stock record.
     pub const NONE: Self = Self(0);
     /// Every per-cycle hook is asked — the default, so a type that never says
@@ -2777,6 +2939,8 @@ const _: () = {
         CycleHooks::STAMP_REQUEST.0,
         CycleHooks::MONITOR_RESET.0,
         CycleHooks::LINK_CHECK.0,
+        CycleHooks::OWN_FRAME.0,
+        CycleHooks::INP_NELEMENTS.0,
     ];
     let mut seen = 0;
     let mut i = 0;
@@ -2855,20 +3019,47 @@ impl<T> IntoIterator for CycleList<T> {
     }
 }
 
+/// Which of a record's `CALLBACK`s a [`ProcessAction::DelayedCallbackAfter`]
+/// timer was armed on, handed back to [`Record::delayed_callback_fire`]. A
+/// record with one callback (bo, busy) arms [`Self::ONLY`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DelayedCallback(u8);
+
+impl DelayedCallback {
+    /// How many callbacks one record can arm: scaler's update, delay and
+    /// autocount (`scalerRecord.c:269-294`) are the most.
+    pub const COUNT: usize = 3;
+    pub const ONLY: Self = Self::new(0);
+
+    /// The record's callback `id`, below [`Self::COUNT`].
+    pub const fn new(id: u8) -> Self {
+        assert!(
+            (id as usize) < Self::COUNT,
+            "DelayedCallback id out of range"
+        );
+        Self(id)
+    }
+
+    pub(crate) const fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
 /// What the [`ProcessAction::DelayedCallbackAfter`] timer does once the
-/// record's [`Record::delayed_callback_fire`] handler has run — the three arms
-/// of C `boRecord.c::myCallbackFunc` (:105-118).
+/// record's [`Record::delayed_callback_fire`] handler has run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DelayedCallbackOutcome {
-    /// C's `else` branch (`boRecord.c:115-117`): the handler made its change,
-    /// so re-enter `process()` now.
+    /// C's `dbProcess` from the callback (`boRecord.c:115-117`): a fresh pass
+    /// now, under the same hold, not the async continuation
+    /// [`ProcessAction::ReprocessAfter`] runs.
     Reprocess,
-    /// C's `if (prec->pact)` branch (`boRecord.c:107-114`): the record is
-    /// mid-async-cycle, so the handler changed nothing and the timer is re-armed
-    /// for this long instead.
+    /// C's `scanOnce` from the callback (`scalerRecord.c:229`, `:239`): a
+    /// fresh pass queued on the scan-once thread, whatever the record's SCAN.
+    ScanOnce,
+    /// The callback re-requests itself: arm the same [`DelayedCallback`] for
+    /// this long (`boRecord.c:107-114`, `scalerRecord.c:590-596`).
     Rearm(std::time::Duration),
-    /// C's `if (prec->pact)` branch with its inner test false: the timer expires
-    /// with nothing left to do, neither mutating nor processing.
+    /// The callback ends without processing the record.
     Drop,
 }
 
@@ -3874,6 +4065,11 @@ pub trait Record: RecordAny + Send + Sync + 'static {
         Ok(ProcessOutcome::complete())
     }
 
+    /// [`Self::process`], for a type that declares [`CycleHooks::OWN_FRAME`].
+    fn process_own(&mut self, _own: OwnFrame<'_>) -> CaResult<ProcessOutcome> {
+        self.process()
+    }
+
     /// Optional: report whether this record's last `process()` call
     /// mutated a metadata-class field (EGU/PREC/HOPR/LOPR/HLM/LLM/
     /// alarm limits / DRVH/DRVL / state strings).
@@ -4492,6 +4688,15 @@ pub trait Record: RecordAny + Send + Sync + 'static {
     /// Default: SVAL's declared type.
     fn siol_load_type(&self) -> Option<crate::types::DbFieldType> {
         crate::server::record::record_instance::declared_field_type_of(self, "SVAL")
+    }
+
+    /// The guard on `init_record`'s SIML → SIMM and SIOL → SVAL loads.
+    ///
+    /// Default: [`SeedGuard::LoadLink`] — `recGblInitSimm`'s `dbLoadLink`
+    /// (`recGbl.c:441-444`) and the base records' unguarded SIOL seed
+    /// (`aiRecord.c:104`).
+    fn sim_seed_guard(&self) -> SeedGuard {
+        SeedGuard::LoadLink
     }
 
     /// The `DTYP="Raw Soft Channel"` INPUT dset — C's four `devXxxSoftRaw.c`
@@ -5427,6 +5632,12 @@ pub trait Record: RecordAny + Send + Sync + 'static {
         Ok(())
     }
 
+    /// [`Self::init_record_with_links`], for a type that declares
+    /// [`CycleHooks::OWN_FRAME`].
+    fn init_record_own(&mut self, reads: &mut InitLinkReads, _own: OwnFrame<'_>) -> CaResult<()> {
+        self.init_record_with_links(reads)
+    }
+
     /// Did `init_record` leave the record PERMANENTLY ACTIVE — C's
     /// `prec->pact = TRUE` inside `init_record`, which is how a record type
     /// disables itself when it cannot possibly process?
@@ -5574,10 +5785,23 @@ pub trait Record: RecordAny + Send + Sync + 'static {
         None
     }
 
+    /// The [`FieldDeclaration::field_list`] fields a put can move a
+    /// [`Self::dbaddr_capacity`] answer by: any store of one (a `dbPut`, a
+    /// device post, a restore) re-reads the record's lock-free channel
+    /// counts, as C's `cvt_dbaddr` counts the record at each create.
+    /// `Some(&[])` is a type whose capacities read only what `init_record`
+    /// fixes; `None`, the default, is a type that has not said, whose every
+    /// store re-reads them.
+    fn dbaddr_capacity_inputs(&self) -> Option<&'static [&'static str]> {
+        None
+    }
+
     /// What C's `cvt_dbaddr` DOES to the record before answering — acalcout
     /// `calloc`s and charges the buffer it hands out (`aCalcoutRecord.c:589-617`).
-    /// Run only when a channel resolves on the `SPC_DBADDR` field `field`
-    /// ([`FieldDeclaration::field_native_count`]), never by a capacity query.
+    /// Run only when a channel or address resolves on the `SPC_DBADDR` field
+    /// `field` ([`FieldDeclaration::field_native_count`]), never by a capacity
+    /// query. Idempotent, as C's is: the database runs it on the field's
+    /// first resolve only.
     fn cvt_dbaddr(&self, _field: &str) {}
 
     /// The `paddr->field_size` this record's `cvt_dbaddr` stores for the
@@ -5717,45 +5941,19 @@ pub trait Record: RecordAny + Send + Sync + 'static {
 
     /// The generation of this record's [`Self::multi_input_links`]: a count
     /// that moves on EVERY write of any of their texts, and on every write
-    /// that can change what [`Self::input_link_request`] or
-    /// [`Self::input_link_failure_is_inert`] answers for any of them. While
-    /// the record answers `g`, a parse validated at `g` is still the parse of
-    /// the text, and those two answers read at `g` are still the answers.
+    /// that can change what [`Self::input_link_request`] answers for any of
+    /// them. While the record answers `g`, a parse validated at `g` is still
+    /// the parse of the text, and the request read at `g` is still the answer.
     /// A type answers `Some` only when all of those fields have ONE writer
     /// that counts, behind private fields — `calc`'s `set_inp_link`, aSub's
     /// `put_field` of `INPx`/`FTx` — and the count is then what C's
     /// `dbPutSpecial` on a `DBF_INLINK` gives `dbDbInitLink`: the moment the
     /// link changed. `None` (the default) validates every parse against the
-    /// text itself, byte for byte, and asks both answers again, on every read.
+    /// text itself, byte for byte, and asks the request again, on every read.
     fn input_links_generation(&self) -> Option<u64> {
         None
     }
 
-    /// Whether a FAILED read of this multi-input link leaves the cycle
-    /// untouched — no `setLinkAlarm`, no [`Self::input_fetch_policy`] gate,
-    /// no value stored.
-    ///
-    /// One record needs it: acalcout guards its ARRAY half with the link's own
-    /// connection status (`aCalcoutRecord.c:1078`)
-    ///
-    /// ```c
-    /// if ((*plinkValid==acalcoutINAV_EXT) || (*plinkValid==acalcoutINAV_LOC))
-    /// ```
-    ///
-    /// so an array link C believes cannot deliver is never read at all, and
-    /// `fetch_values` returns 0 with the calc still running. C moves a link
-    /// between `EXT_NC` and `EXT` from a `dbCaIsLinkConnected` watchdog
-    /// (`aCalcoutRecord.c:1155`, `:1187`); this port has no CA client, so it
-    /// publishes `EXT_NC` for EVERY external link
-    /// ([`crate::server::records::link_status::classify_link`]) and cannot make
-    /// that test at select time. Reading and then discarding the failure is the
-    /// same observable behaviour for every state the port can reach — a link
-    /// that delivers is C's `EXT`/`LOC`, a link that does not is C's `EXT_NC` —
-    /// and, unlike gating on the published `IAAV`, it does not stop reading the
-    /// external array links whose values the resolver really does serve.
-    ///
-    /// The SCALAR half is deliberately NOT inert: its loop (`:1068-1071`) has
-    /// no status test and `return`s at the first failing `dbGetLink`.
     /// The text of a link field as the record stores it, lent rather than
     /// copied.
     ///
@@ -5803,10 +6001,6 @@ pub trait Record: RecordAny + Send + Sync + 'static {
                 _ => None,
             },
         }
-    }
-
-    fn input_link_failure_is_inert(&self, _link_field: &str) -> bool {
-        false
     }
 
     /// C `monitor()`'s deadband operands, read in one question: the value
@@ -6071,6 +6265,11 @@ pub trait Record: RecordAny + Send + Sync + 'static {
         Ok(())
     }
 
+    /// [`Self::special`], for a type that declares [`CycleHooks::OWN_FRAME`].
+    fn special_own(&mut self, field: &str, after: bool, own: OwnFrame<'_>) -> CaResult<()> {
+        self.special(field, after, own.common())
+    }
+
     /// The period of this record's monitor watchdog, or `None` when it has
     /// none — C `histogramRecord.c::wdogInit` (:126-152):
     ///
@@ -6129,15 +6328,19 @@ pub trait Record: RecordAny + Send + Sync + 'static {
     /// ```
     ///
     /// Run under the record gate (C `dbScanLock`) when the timer fires, and
-    /// before any `process()` re-entry. `pact` is the record's PACT at fire
-    /// time, which the record cannot read for itself.
+    /// before any `process()` re-entry. `callback` is the one the timer was
+    /// armed on; `pact` is the record's PACT at fire time, which the record
+    /// cannot read for itself. The [`Self::take_process_posted_fields`] marks
+    /// the hook leaves are posted when it returns.
     ///
     /// This hook is the ONLY place the one-shot's mutation may happen: keeping
     /// it out of `process()` is what stops an unrelated process cycle from
-    /// consuming it. Default: re-enter `process()` and change nothing, so a
-    /// record that emits the action without overriding still behaves as a plain
-    /// [`ProcessAction::ReprocessAfter`].
-    fn delayed_callback_fire(&mut self, _pact: bool) -> DelayedCallbackOutcome {
+    /// consuming it. Default: change nothing and process the record again.
+    fn delayed_callback_fire(
+        &mut self,
+        _callback: DelayedCallback,
+        _pact: bool,
+    ) -> DelayedCallbackOutcome {
         DelayedCallbackOutcome::Reprocess
     }
 
@@ -6407,6 +6610,18 @@ pub trait Record: RecordAny + Send + Sync + 'static {
     /// process path makes, but here it persists because no process cycle
     /// follows. Default: false (no direct special-path alarm write).
     fn special_checks_alarms(&self, _put_field: &str) -> bool {
+        false
+    }
+
+    /// True iff the C `special()` for a put to `put_field` changes the type
+    /// `cvt_dbaddr` gives a [`FieldDesc::runtime_typed`] field: `mbbo`'s
+    /// state fields, which move `sdef` and so VAL's type. The put owner
+    /// (`field_io`) then settles the record's address facts again
+    /// (`RecordCell::settle_addr_facts`). Asked once per
+    /// [`FieldDeclaration::field_list`] field when the record's cell is built, so the
+    /// answer is the field's alone; a field off the list never retypes.
+    /// Default: false.
+    fn special_retypes(&self, _put_field: &str) -> bool {
         false
     }
 
@@ -7228,6 +7443,18 @@ pub trait Record: RecordAny + Send + Sync + 'static {
         let _ = (link_field, target);
     }
 
+    /// C `plink->type` of a link field the framework keeps a parse of, given
+    /// at construction and again after every write of that parse: a put, the
+    /// `iocInit` locality pass that turns a name no record here serves into a
+    /// CA link, a `dbRemoveLink`. A record that branches on the type of a link
+    /// it never reads itself (motor's `dol.type == DB_LINK`) keeps this, since
+    /// its own text cannot say whether the name was found.
+    ///
+    /// Default: no-op.
+    fn set_link_type(&mut self, link_field: &str, link_type: LinkType) {
+        let _ = (link_field, link_type);
+    }
+
     /// The `dbrType` this record's framework-run input read on `link_field`
     /// asks the SOURCE for — the READ twin of [`Self::typed_output_buffer`],
     /// and C's `dbGetLink` second argument. Consulted by every framework
@@ -7254,12 +7481,12 @@ pub trait Record: RecordAny + Send + Sync + 'static {
         InputLinkRequest::As(LinkReadAs::Native)
     }
 
-    /// Whether [`Self::input_link_request`] and
-    /// [`Self::input_link_failure_is_inert`] are settled by the link field
-    /// alone, so the process plan may ask them once for every declared link
-    /// when the record is built. `false` for the two types whose answer reads
-    /// instance state — aSub (`FTA..FTU`) and printf (`FMT`) — which the fetch
-    /// loop then asks per link, per cycle, through the vtable.
+    /// Whether [`Self::input_link_request`] is settled by the link field
+    /// alone, so the process plan may ask it once for every declared link
+    /// when the record is built. `false` for a type whose answer reads
+    /// instance state — aSub (`FTA..FTU`), printf (`FMT`), waveform (`FTVL`,
+    /// `NELM`), acalcout (`IAAV..ILLV`, `NUSE`) — which the fetch loop then
+    /// asks per link, per cycle, through the vtable.
     fn input_link_answers_fixed_at_type(&self) -> bool {
         true
     }
@@ -7276,6 +7503,24 @@ pub trait Record: RecordAny + Send + Sync + 'static {
     ) -> Option<LinkReadAs> {
         let _ = (link_field, source);
         Some(LinkReadAs::Native)
+    }
+
+    /// C's `pdest` of an [`LinkReadAs::Array`] read on `link_field`: the
+    /// buffer as it stands before the read. A read keeps it from the element
+    /// that fails to convert on; CA ignores that status (`dbCa.c:519`), a DB
+    /// link fails with it. `None`, the default, keeps zeros.
+    fn array_read_destination(&self, link_field: &str) -> Option<EpicsValue> {
+        let _ = link_field;
+        None
+    }
+
+    /// A DB link's [`LinkReadAs::Array`] read on `link_field` that failed
+    /// part way: `left` is [`Self::array_read_destination`]'s buffer with the
+    /// elements before the failed one written, which C's in-place `dbGet`
+    /// leaves there whatever the status (`dbAccess.c:1007-1021`). Called once,
+    /// before the failure's LINK alarm.
+    fn land_failed_array_read(&mut self, link_field: &str, left: EpicsValue) {
+        let _ = (link_field, left);
     }
 
     /// Return the name of the output event (`OEVT`) to post this cycle, or
@@ -7386,6 +7631,15 @@ pub trait Record: RecordAny + Send + Sync + 'static {
         Some(ProcessActions::new())
     }
 
+    /// INP's `dbIsLinkConnected && dbGetNelements` — `None` where that test
+    /// fails — told to a type that declares [`CycleHooks::INP_NELEMENTS`]
+    /// after its pre-input actions and before the INP read, whatever that
+    /// read then delivers. `false` refuses the read: the cycle neither reads
+    /// INP nor raises the alarm a failed `dbGetLink` would.
+    fn set_inp_nelements(&mut self, _nelements: Option<i64>) -> bool {
+        true
+    }
+
     /// Called by the framework immediately before `process()` to push a
     /// read-only snapshot of framework-owned [`crate::server::record::CommonFields`] state
     /// ([`ProcessContext`]) that the record's `process()` needs to see.
@@ -7415,16 +7669,10 @@ pub trait Record: RecordAny + Send + Sync + 'static {
     /// [`ProcessAction::ReprocessAfter`] timer firing, or a put-notify
     /// completion — rather than a fresh put / scan / forward-link process.
     ///
-    /// C hands records this distinction for free: `callbackRequestDelayed`
-    /// dispatches to a callback function of the record's own, never to
-    /// `process()`. A port that models the timer with `ReprocessAfter` has
-    /// both events arriving at the same entry point, so a record whose C
-    /// original keeps the two paths separate — throttle's `delayFuncCallback`
-    /// -> `valuePut` versus `process()` -> `enterValue`
-    /// (`throttleRecord.c:518-613`) — cannot route the cycle without knowing
-    /// which one it is. The framework already knows; this hook is what it
-    /// tells the record, so the record never has to infer it from a clock
-    /// reading (which a mid-flight interval change silently falsifies).
+    /// A C callback with a body of its own never arrives here: it is a
+    /// [`ProcessAction::DelayedCallbackAfter`] or
+    /// [`ProcessAction::ValuePutAfter`], whose hook runs instead of
+    /// `process()`.
     ///
     /// `pact` is `prec->pact` at entry, which is what a record whose C
     /// `process()` branches on PACT (calcout's ODLY arm, `calcoutRecord.c:231`)
@@ -7435,9 +7683,11 @@ pub trait Record: RecordAny + Send + Sync + 'static {
     fn set_process_continuation(&mut self, _continuation: bool, _pact: Pact<'_>) {}
 
     /// Called by the framework once for every [`ProcessAction::WriteDbLink`]
-    /// this record emitted, reporting the value it carried and whether the
-    /// put failed — the port's stand-in for the `dbPutLink` return C reads
-    /// inline.
+    /// this record emitted, reporting the value it carried and the put's
+    /// status — the port's stand-in for the `dbPutLink` return C reads
+    /// inline. `dpvt` is the record's, for a device support whose put decides
+    /// it: `devEpidSoftCallback.c:136-145` sets PACT only for a CA trigger
+    /// `dbCaPutLinkCallback` accepted.
     ///
     /// A record whose C original derives a field from that return needs it:
     /// throttle's `STS` is `throttleSTS_SUC` only on success and its `SENT`
@@ -7460,7 +7710,8 @@ pub trait Record: RecordAny + Send + Sync + 'static {
         &mut self,
         _link_field: &'static str,
         _value: &EpicsValue,
-        _failed: bool,
+        _status: crate::error::DbResult,
+        _dpvt: &mut crate::server::device_support::Dpvt,
     ) -> ProcessActions {
         ProcessActions::new()
     }
@@ -9186,7 +9437,9 @@ pub(crate) mod tests {
             "waveform" | "aai" | "aao" | "subArray" => {
                 CycleHooks::PRE_INPUT.union(CycleHooks::INPUT_FETCH)
             }
-            "compress" => CycleHooks::PRE_INPUT.union(CycleHooks::WRITE_POSTED),
+            "compress" => CycleHooks::PRE_INPUT
+                .union(CycleHooks::WRITE_POSTED)
+                .union(CycleHooks::INP_NELEMENTS),
             "acalcout" => CycleHooks::CYCLE_POSTED
                 .union(CycleHooks::WRITE_POSTED)
                 .union(CycleHooks::PROCESS_POSTED)

@@ -22,6 +22,7 @@ use crate::attributes::{NDAttribute, NDAttributeList};
 use crate::error::{ADError, ADResult};
 use crate::finalize::Finalize;
 use crate::ndarray::NDArray;
+use crate::ndarray_pool::NDArrayPool;
 
 /// File write modes matching C++ NDFileMode_t.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,7 +84,9 @@ pub trait NDFileWriter: Send + Sync {
     /// `reserve()` available) so a writer that materialises the file later
     /// can hold it without copying.
     fn write_file(&mut self, array: &Arc<NDArray>) -> ADResult<()>;
-    fn read_file(&mut self) -> ADResult<NDArray>;
+    /// Read the open file into an array from `pool`, the plugin's
+    /// `pNDArrayPool` C `readFile` allocates from (NDFileTIFF.cpp:515).
+    fn read_file(&mut self, pool: &NDArrayPool) -> ADResult<NDArray>;
     fn close_file(&mut self) -> ADResult<()>;
     fn supports_multiple_arrays(&self) -> bool {
         true
@@ -94,10 +97,11 @@ pub trait NDFileWriter: Send + Sync {
     /// C `calculateAttributeChunking`) uses it; the default ignores it.
     fn set_num_capture(&mut self, _n: i32) {}
     /// The plugin's own NDAttributesFile set as C `getAttributes` returns it
-    /// to `openFile`/`writeFile`, evaluated by the processor ahead of the
-    /// call because the evaluation cannot run under the writer lock. A
-    /// writer whose C counterpart never calls `getAttributes` ignores it.
-    fn set_plugin_attributes(&mut self, _attributes: NDAttributeList) {}
+    /// to `openFile`/`writeFile`, evaluated from the callback's view ahead
+    /// of the call. A writer keeps it with `clone_from`, which reuses the
+    /// storage of the set it kept last; one whose C counterpart never calls
+    /// `getAttributes` ignores it.
+    fn set_plugin_attributes(&mut self, _attributes: &NDAttributeList) {}
     /// Whether [`write_file`](NDFileWriter::write_file) has put the frame on
     /// disk by the time it returns.
     ///
@@ -285,10 +289,11 @@ pub(crate) fn read_file_base<W: NDFileWriter + ?Sized>(
     writer: &mut W,
     path: &Path,
     layout: &NDArray,
+    pool: &NDArrayPool,
 ) -> ADResult<NDArray> {
     const BASE: &str = "readFileBase";
     let read = |w: &mut W| {
-        w.read_file().map_err(|e| {
+        w.read_file(pool).map_err(|e| {
             let message = format!("Error  file {}, status={WRITER_ERROR}", path.display());
             base_failure(e.lines(), BASE, message)
         })
@@ -313,6 +318,11 @@ pub(crate) fn read_file_base<W: NDFileWriter + ?Sized>(
 /// `fileMutex` held (NDPluginFile.cpp:62-76, :247-251), so a frame callback
 /// can queue while a file is written. `io` is that window; `base` is the
 /// state the port lock guards, and is never reached from inside `io`.
+/// The status C's writeFileBase ends with once its write is done: `Err`
+/// fails it without touching WriteStatus or WriteMessage, with the line C
+/// prints when its DeleteDriverFile `remove` fails (NDPluginFile.cpp:376-391).
+pub(crate) type Deleted = Result<(), Option<String>>;
+
 pub trait FileIo {
     fn base(&mut self) -> &mut NDPluginFileBase;
     fn io<R>(&mut self, f: impl FnOnce(&mut dyn NDFileWriter) -> R) -> R;
@@ -395,10 +405,11 @@ pub enum FlushStep<'a> {
         /// The frame, when its write ran: C hands it to endProcessCallbacks
         /// (NDPluginFile.cpp:296-301).
         handed_on: Option<&'a Arc<NDArray>>,
-        /// FileNumber, FullFileName and FilePathExists once the frame's file
-        /// was named (asynNDArrayDriver.cpp:203-219, NDPluginFile.cpp:51).
+        /// FileNumber and FilePathExists once the frame's file was named
+        /// (asynNDArrayDriver.cpp:203-219), and FullFileName with the first
+        /// post after it was (NDPluginFile.cpp:51, :280, :321).
         file_number: i32,
-        full_file_name: &'a str,
+        full_file_name: Option<&'a str>,
         file_path_exists: Option<bool>,
     },
 }
@@ -433,6 +444,8 @@ pub struct NDPluginFileBase {
     is_open: bool,
     mode: NDFileMode,
     full_file_name: String,
+    /// `full_file_name` was made by an open and is not posted yet.
+    name_unposted: bool,
     /// `NDFilePathExists` as the last `checkPath` left it; `None` until a
     /// non-empty FilePath is checked (asynNDArrayDriver.cpp:104).
     file_path_exists: Option<bool>,
@@ -477,6 +490,7 @@ impl NDPluginFileBase {
             is_open: false,
             mode: NDFileMode::Single,
             full_file_name: String::new(),
+            name_unposted: false,
             file_path_exists: None,
             init_frame: None,
         }
@@ -602,8 +616,23 @@ impl NDPluginFileBase {
         &self.full_file_name
     }
 
+    /// C clears NDFullFileName as a capture starts (NDPluginFile.cpp:847);
+    /// the capture write posts the empty name itself.
     pub fn clear_full_file_name(&mut self) {
         self.full_file_name.clear();
+        self.name_unposted = false;
+    }
+
+    /// The name an open made that is not posted yet.
+    pub(crate) fn unposted_name(&self) -> Option<&str> {
+        self.name_unposted.then_some(self.full_file_name.as_str())
+    }
+
+    /// The name an open made, once: C sets NDFullFileName only where it
+    /// names a file (NDPluginFile.cpp:52, :157), so it is posted once per
+    /// open, not with every frame written into it.
+    pub(crate) fn post_name(&mut self) -> Option<&str> {
+        std::mem::take(&mut self.name_unposted).then_some(self.full_file_name.as_str())
     }
 
     /// Store a FilePath write. The port's `writeOctet` has just checked it
@@ -633,6 +662,7 @@ impl NDPluginFileBase {
     pub fn open_file_name(&mut self) -> String {
         self.check_path();
         self.full_file_name = self.create_file_name();
+        self.name_unposted = true;
         if self.auto_increment {
             self.file_number += 1;
         }
@@ -669,27 +699,32 @@ impl NDPluginFileBase {
     /// is set, keyed off the `DriverFileName` attribute. C deletes it for
     /// `pArrays[0]` once per successful writeFileBase, in every write mode
     /// (NDPluginFile.cpp:376-391).
-    fn maybe_delete_driver_file(&self, array: &NDArray) {
+    fn delete_driver_file(&self, array: &NDArray) -> Deleted {
         if !self.delete_driver_file {
-            return;
+            return Ok(());
         }
-        // C reads DriverFileName via `getValue(NDAttrString, …)` and only
-        // deletes on `asynSuccess`; a numeric attribute returns `ND_ERROR`, so
-        // no file is removed (the decimal rendering is never used as a path).
-        if let Some(driver_file) = array
-            .attributes
-            .get("DriverFileName")
-            .and_then(|attr| attr.value.as_string_typed())
-        {
-            if !driver_file.is_empty() {
-                let _ = std::fs::remove_file(driver_file);
-            }
+        let Some(attr) = array.attributes.get("DriverFileName") else {
+            return Ok(());
+        };
+        // `getValue(NDAttrString, …)` is ND_ERROR for any other type
+        // (NDAttribute.cpp:353, :357, :386), so no file is removed.
+        let driver_file = attr.value.as_string_typed().ok_or(None)?;
+        if driver_file.is_empty() {
+            return Ok(());
         }
+        // C returns remove()'s -1 as writeFileBase's asynStatus.
+        std::fs::remove_file(driver_file).map_err(|e| {
+            Some(format!(
+                "NDPluginFile::writeFileBase: error deleting file {driver_file}, error={}\n",
+                epics_libcom_rs::runtime::crt_errno::strerror(&e)
+            ))
+        })
     }
 
     /// Process an incoming array according to the current file mode, with
     /// the writer called in place. [`process_array_io`](Self::process_array_io)
     /// is the same step for a caller that has a port lock to release.
+    /// The DeleteDriverFile status goes nowhere: there is no port to print to.
     pub fn process_array(
         &mut self,
         array: Arc<NDArray>,
@@ -699,7 +734,7 @@ impl NDPluginFileBase {
     }
 
     /// [`flush_capture_io`](Self::flush_capture_io) with the writer in place
-    /// and no port to post to.
+    /// and no port to post or print to.
     pub fn flush_capture(&mut self, writer: &mut dyn NDFileWriter, out: &NDArray) -> ADResult<()> {
         Self::flush_capture_io(&mut InPlace { base: self, writer }, out, &mut |_| {})
     }
@@ -727,6 +762,28 @@ impl NDPluginFileBase {
         array: Arc<NDArray>,
         handed_on: &mut dyn FnMut(&Arc<NDArray>),
     ) -> ADResult<()> {
+        Self::process_array_status_io(lock, array, handed_on).0
+    }
+
+    /// [`process_array_io`](Self::process_array_io), and the status C's
+    /// writeFileBase ends with.
+    pub(crate) fn process_array_status_io(
+        lock: &mut impl FileIo,
+        array: Arc<NDArray>,
+        handed_on: &mut dyn FnMut(&Arc<NDArray>),
+    ) -> (ADResult<()>, Deleted) {
+        let result = Self::process_array_inner(lock, array, handed_on);
+        match result {
+            Ok(deleted) => (Ok(()), deleted),
+            Err(e) => (Err(e), Err(None)),
+        }
+    }
+
+    fn process_array_inner(
+        lock: &mut impl FileIo,
+        array: Arc<NDArray>,
+        handed_on: &mut dyn FnMut(&Arc<NDArray>),
+    ) -> ADResult<Deleted> {
         let base = lock.base();
         let num_capture = base.num_capture;
         match base.mode {
@@ -748,7 +805,7 @@ impl NDPluginFileBase {
                         },
                     )
                 })?;
-                lock.base().maybe_delete_driver_file(&array);
+                Ok(lock.base().delete_driver_file(&array))
             }
             NDFileMode::Capture => {
                 // C buffers while NumCaptured < NumCapture and writes once they
@@ -759,16 +816,20 @@ impl NDPluginFileBase {
                     base.num_captured = base.capture_buffer.len();
                 }
                 if base.num_captured as i64 >= i64::from(base.num_capture) {
-                    Self::flush_capture_io(lock, &array, &mut |step| {
-                        if let FlushStep::Frame {
-                            handed_on: Some(frame),
-                            ..
-                        } = step
-                        {
-                            handed_on(frame);
-                        }
-                    })?;
+                    let (flushed, deleted) =
+                        Self::flush_capture_status_io(lock, &array, &mut |step| {
+                            if let FlushStep::Frame {
+                                handed_on: Some(frame),
+                                ..
+                            } = step
+                            {
+                                handed_on(frame);
+                            }
+                        });
+                    flushed?;
+                    return Ok(deleted);
                 }
+                Ok(Ok(()))
             }
             NDFileMode::Stream => {
                 Self::open_stream_io(lock, &array)?;
@@ -787,11 +848,14 @@ impl NDPluginFileBase {
                 handed_on(&array);
                 written?;
                 let base = lock.base();
-                base.maybe_delete_driver_file(&array);
+                let deleted = base.delete_driver_file(&array);
+                // C counts the frame only if writeFileBase's status is clean
+                // (NDPluginFile.cpp:775-777), so a driver file it cannot delete
+                // leaves a written frame uncounted; not copied.
                 base.num_captured += 1;
+                Ok(deleted)
             }
         }
-        Ok(())
     }
 
     /// Flush capture buffer: open file, write all buffered arrays, close.
@@ -820,11 +884,21 @@ impl NDPluginFileBase {
         out: &NDArray,
         posted: &mut dyn FnMut(FlushStep<'_>),
     ) -> ADResult<()> {
+        Self::flush_capture_status_io(lock, out, posted).0
+    }
+
+    /// [`flush_capture_io`](Self::flush_capture_io), and the status C's
+    /// writeFileBase ends with ([`Self::write_capture`]).
+    pub(crate) fn flush_capture_status_io(
+        lock: &mut impl FileIo,
+        out: &NDArray,
+        posted: &mut dyn FnMut(FlushStep<'_>),
+    ) -> (ADResult<()>, Deleted) {
         let (result, status_ok) = Self::write_capture(lock, out, posted);
-        if status_ok {
-            lock.base().maybe_delete_driver_file(out);
+        if !status_ok {
+            return (result, Err(None));
         }
-        result
+        (result, lock.base().delete_driver_file(out))
     }
 
     /// The Capture arm of C `writeFileBase` (NDPluginFile.cpp:268-330): the
@@ -873,7 +947,7 @@ impl NDPluginFileBase {
             |elapsed,
              status: FrameStatus<'_>,
              handed_on: Option<&Arc<NDArray>>,
-             (file_number, name, exists): (i32, &str, Option<bool>)| {
+             (file_number, name, exists): (i32, Option<&str>, Option<bool>)| {
                 left = left.saturating_sub(1);
                 posted(FlushStep::Frame {
                     num_captured: left,
@@ -885,17 +959,15 @@ impl NDPluginFileBase {
                     file_path_exists: exists,
                 });
             };
-        let named = |base: &mut Self| {
-            (
-                base.file_number,
-                base.full_file_name.clone(),
-                base.file_path_exists,
-            )
-        };
+        let named = |base: &mut Self| (base.file_number, base.file_path_exists);
         if lock.io(|w| w.supports_multiple_arrays()) {
             // Multi-array format: open once, write all, close once.
             let (write_path, final_path) = lock.base().write_path(out);
-            let (number, name, exists) = named(lock.base());
+            let (number, exists) = named(lock.base());
+            // Left unposted until a frame's post carries it: the writer's
+            // attributes read it first, and a failed open posts it at the
+            // callback's end.
+            let mut name = lock.base().unposted_name().map(str::to_owned);
             let mut frame_failed = false;
             let written = lock.io(|w| {
                 write_one_file(
@@ -912,11 +984,14 @@ impl NDPluginFileBase {
                             elapsed,
                             failed.map_or(FrameStatus::Untouched, FrameStatus::Failed),
                             frame,
-                            (number, &name, exists),
+                            (number, name.take().as_deref(), exists),
                         )
                     },
                 )
             });
+            if name.is_none() {
+                lock.base().post_name();
+            }
             let ok = written.is_ok();
             return (
                 written.map_err(|e| if frame_failed { e.without_lines() } else { e }),
@@ -928,7 +1003,7 @@ impl NDPluginFileBase {
         for arr in &frames {
             let start = Instant::now();
             let (write_path, final_path) = lock.base().write_path(arr);
-            let (number, name, exists) = named(lock.base());
+            let (number, exists) = named(lock.base());
             let mut ran = false;
             let written = lock.io(|w| {
                 write_one_file(
@@ -949,7 +1024,7 @@ impl NDPluginFileBase {
                 start.elapsed(),
                 status,
                 ran.then_some(arr),
-                (number, &name, exists),
+                (number, lock.base().post_name(), exists),
             );
             last = written;
         }
@@ -1189,7 +1264,7 @@ mod tests {
             self.writes += 1;
             Ok(())
         }
-        fn read_file(&mut self) -> ADResult<NDArray> {
+        fn read_file(&mut self, _pool: &NDArrayPool) -> ADResult<NDArray> {
             Err(crate::error::ADError::UnsupportedConversion(
                 "not implemented".into(),
             ))
@@ -1411,8 +1486,8 @@ mod tests {
         fn write_file(&mut self, a: &Arc<NDArray>) -> ADResult<()> {
             self.0.write_file(a)
         }
-        fn read_file(&mut self) -> ADResult<NDArray> {
-            self.0.read_file()
+        fn read_file(&mut self, pool: &NDArrayPool) -> ADResult<NDArray> {
+            self.0.read_file(pool)
         }
         fn close_file(&mut self) -> ADResult<()> {
             self.0.close_file()

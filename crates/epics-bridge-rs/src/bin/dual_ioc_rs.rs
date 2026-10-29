@@ -22,7 +22,6 @@ use std::process::ExitCode;
 use clap::Parser;
 
 use epics_base_rs::error::CaResult;
-use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
 use epics_ca_rs::server::RsrvServing;
 use epics_pva_rs::server::PvaServer;
@@ -156,8 +155,9 @@ async fn run() -> ExitCode {
     // receive `Arc<PvDatabase>` clones — a caput on the CA side is
     // immediately visible through PVA monitors and vice versa.
     let macros = parse_macros(&args.macros);
-    // The network half of C's dbCa, libca, for names this IOC does not serve.
-    let mut builder = IocBuilder::new().register_link_type("ca", {
+    // The network half of C's dbCa, libca, for names this IOC does not serve,
+    // beside pvxs's `lsetPVX`, as softIocPVA links both.
+    let mut builder = epics_pva_rs::server::pvxs_ioc_builder().register_link_type("ca", {
         let reactor = epics_base_rs::runtime::task::Reactor::current()
             .expect("main runs on the IOC's reactor");
         move |db| epics_ca_rs::calink::calink_link_set_install(db, reactor)

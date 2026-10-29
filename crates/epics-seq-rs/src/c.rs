@@ -6,15 +6,17 @@
 //! array (decayed to a pointer) or `&x` is the place itself (`&seqg_var.x`,
 //! `&seqg_var.a.at(i)`); anything else is its value (`x.get()`), `as _`
 //! when numeric. So a string argument is a [`CSrc`] that may be a
-//! variable, and a destination is a `&impl Place<B>`. A shim copies each
-//! source variable out before it takes another lock, so no call holds two
-//! variables' locks at once, and `strcpy(x, x)` does not deadlock.
+//! variable, and a destination is a [`CDst`], which may also be a `char *`
+//! into one; a character's place (`&seqg_var.s.at(i)`) is that `char *`
+//! for both. A shim copies each source out before it takes the
+//! destination's lock, so no call holds two variables' locks at once, and
+//! `strcpy(x, x)` does not deadlock.
 //!
 //! Where C writes past the end of the destination, the copy stops one
 //! byte short of it and keeps the terminator.
 
 use std::borrow::Cow;
-use std::ffi::{c_char, c_int};
+use std::ffi::{c_char, c_int, c_long};
 use std::io;
 use std::slice;
 use std::sync::Arc;
@@ -26,7 +28,7 @@ use epics_libcom_rs::cfmt::{self, Directive, Length, Spec};
 use crate::prog::seq_find_state_set;
 use crate::seq::SeqThreadId;
 use crate::types::{CharPtr, SeqString};
-use crate::var::{At, Place, SeqVar};
+use crate::var::{Addr, At, Indexed, Place, Ptr, SeqVar, Zeroed};
 
 /// A variadic argument of `printf` / `sprintf`, after C's default argument
 /// promotions.
@@ -50,8 +52,9 @@ macro_rules! carg_from {
 }
 
 carg_from!(
-    i8 => Int as i64, i16 => Int as i64, i32 => Int as i64, i64 => Int as i64,
+    i8 => Int as i64, i16 => Int as i64, i32 => Int as i64, i64 => Int as i64, isize => Int as i64,
     u8 => UInt as u64, u16 => UInt as u64, u32 => UInt as u64, u64 => UInt as u64,
+    usize => UInt as u64,
     f32 => Double as f64, f64 => Double as f64,
 );
 
@@ -76,7 +79,7 @@ impl<'a> From<&'a [u8]> for CArg<'a> {
 
 impl From<CharPtr> for CArg<'_> {
     fn from(v: CharPtr) -> Self {
-        CArg::Str(v.map(|s| Cow::Owned(before_nul(&s).to_vec())))
+        CArg::Str((!v.is_null()).then(|| Cow::Owned(v.to_c_vec())))
     }
 }
 
@@ -90,6 +93,12 @@ impl<B: CSrc> From<&SeqVar<B>> for CArg<'_> {
 impl<B: CSrc, const N: usize, P: Place<[B; N]> + ?Sized> From<&At<'_, P, [B; N]>> for CArg<'_> {
     fn from(v: &At<'_, P, [B; N]>) -> Self {
         CArg::Str(Some(Cow::Owned(v.with_c_bytes(<[u8]>::to_vec))))
+    }
+}
+
+impl<A: Indexed<Elem = c_char> + 'static, P: Addr<A> + ?Sized> From<&At<'_, P, A>> for CArg<'_> {
+    fn from(v: &At<'_, P, A>) -> Self {
+        v.ptr().into()
     }
 }
 
@@ -146,26 +155,29 @@ impl CSrc for Arc<[u8]> {
     }
 }
 
-/// The null pointer panics where C would dereference it.
+/// The buffer runs from the pointer to the end of what it points into,
+/// read under that variable's lock. The null pointer panics where C would
+/// dereference it.
 impl CSrc for CharPtr {
     fn with_c_buffer<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
-        match self {
-            Some(s) => f(s),
-            None => panic!("null pointer passed as a C string"),
-        }
+        assert!(!self.is_null(), "null pointer passed as a C string");
+        self.with_rest(|s| f(char_bytes(s)))
     }
 
     fn is_null(&self) -> bool {
-        self.is_none()
+        CharPtr::is_null(self)
     }
+}
+
+fn char_bytes(s: &[c_char]) -> &[u8] {
+    // SAFETY: `c_char` is `i8` or `u8`, the size and alignment of `u8`, and
+    // every bit pattern is a valid `u8`.
+    unsafe { std::slice::from_raw_parts(s.as_ptr().cast(), s.len()) }
 }
 
 impl<const N: usize> CSrc for [c_char; N] {
     fn with_c_buffer<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
-        // SAFETY: `c_char` is `i8` or `u8`, the same size and alignment as
-        // `u8`, and every bit pattern is a valid `u8`.
-        let bytes = unsafe { std::slice::from_raw_parts(self.as_ptr().cast::<u8>(), N) };
-        f(bytes)
+        f(char_bytes(self))
     }
 }
 
@@ -199,6 +211,13 @@ impl<B: CSrc, const N: usize, P: Place<[B; N]> + ?Sized> CSrc for At<'_, P, [B; 
     }
 }
 
+/// A character's place, `&a[i]` or `&s[i]`, is C's `char *` to it.
+impl<A: Indexed<Elem = c_char> + 'static, P: Addr<A> + ?Sized> CSrc for At<'_, P, A> {
+    fn with_c_buffer<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
+        self.ptr().with_c_buffer(f)
+    }
+}
+
 /// A C character buffer written as a destination.
 pub trait CBuf {
     fn bytes_mut(&mut self) -> &mut [u8];
@@ -212,9 +231,55 @@ impl CBuf for SeqString {
 
 impl<const N: usize> CBuf for [c_char; N] {
     fn bytes_mut(&mut self) -> &mut [u8] {
-        // SAFETY: as in `CSrc for [c_char; N]`; the slice borrows `self`
-        // mutably for its whole life.
-        unsafe { std::slice::from_raw_parts_mut(self.as_mut_ptr().cast::<u8>(), N) }
+        char_bytes_mut(self)
+    }
+}
+
+fn char_bytes_mut(s: &mut [c_char]) -> &mut [u8] {
+    // SAFETY: as in `char_bytes`; the slice borrows `s` mutably for its
+    // whole life.
+    unsafe { std::slice::from_raw_parts_mut(s.as_mut_ptr().cast(), s.len()) }
+}
+
+/// A C string written as a destination: a character buffer variable or
+/// element, or a `char *`, which writes from where it points to the end of
+/// what it points into.
+pub trait CDst {
+    /// Run `f` on the buffer under its variable's lock; `f` must not touch
+    /// another program variable.
+    fn with_c_dst<R>(&self, f: impl FnOnce(&mut [u8]) -> R) -> R;
+}
+
+impl<T: CDst + ?Sized> CDst for &T {
+    fn with_c_dst<R>(&self, f: impl FnOnce(&mut [u8]) -> R) -> R {
+        (**self).with_c_dst(f)
+    }
+}
+
+impl<B: CBuf> CDst for SeqVar<B> {
+    fn with_c_dst<R>(&self, f: impl FnOnce(&mut [u8]) -> R) -> R {
+        self.modify(|b| f(b.bytes_mut()))
+    }
+}
+
+impl<B: CBuf, const N: usize, P: Place<[B; N]> + ?Sized> CDst for At<'_, P, [B; N]> {
+    fn with_c_dst<R>(&self, f: impl FnOnce(&mut [u8]) -> R) -> R {
+        self.modify(|b| f(b.bytes_mut()))
+    }
+}
+
+/// As its [`CSrc`].
+impl<A: Indexed<Elem = c_char> + 'static, P: Addr<A> + ?Sized> CDst for At<'_, P, A> {
+    fn with_c_dst<R>(&self, f: impl FnOnce(&mut [u8]) -> R) -> R {
+        self.ptr().with_c_dst(f)
+    }
+}
+
+/// The null pointer panics where C would write through it.
+impl CDst for CharPtr {
+    fn with_c_dst<R>(&self, f: impl FnOnce(&mut [u8]) -> R) -> R {
+        assert!(!self.is_null(), "null pointer passed as a C destination");
+        self.with_rest_mut(|s| f(char_bytes_mut(s)))
     }
 }
 
@@ -229,17 +294,16 @@ fn put_terminated(buf: &mut [u8], at: usize, src: &[u8]) {
 }
 
 /// `strcpy`: the bytes after the terminator keep what they held.
-pub fn strcpy<B: CBuf>(dst: &impl Place<B>, src: impl CSrc) {
+pub fn strcpy(dst: impl CDst, src: impl CSrc) {
     let src = src.to_c_vec();
-    dst.modify(|b| put_terminated(b.bytes_mut(), 0, &src))
+    dst.with_c_dst(|b| put_terminated(b, 0, &src))
 }
 
 /// `strncpy`: at most `n` bytes, NUL-padded to `n`, unterminated when
 /// `src` has `n` or more.
-pub fn strncpy<B: CBuf>(dst: &impl Place<B>, src: impl CSrc, n: usize) {
+pub fn strncpy(dst: impl CDst, src: impl CSrc, n: usize) {
     let s = src.to_c_vec();
-    dst.modify(|b| {
-        let buf = b.bytes_mut();
+    dst.with_c_dst(|buf| {
         let n = n.min(buf.len());
         let k = s.len().min(n);
         buf[..k].copy_from_slice(&s[..k]);
@@ -248,10 +312,9 @@ pub fn strncpy<B: CBuf>(dst: &impl Place<B>, src: impl CSrc, n: usize) {
 }
 
 /// `strcat`.
-pub fn strcat<B: CBuf>(dst: &impl Place<B>, src: impl CSrc) {
+pub fn strcat(dst: impl CDst, src: impl CSrc) {
     let src = src.to_c_vec();
-    dst.modify(|b| {
-        let buf = b.bytes_mut();
+    dst.with_c_dst(|buf| {
         let end = before_nul(buf).len();
         put_terminated(buf, end, &src)
     })
@@ -273,6 +336,72 @@ pub fn strcmp(a: impl CSrc, b: impl CSrc) -> c_int {
 /// `strlen`.
 pub fn strlen(s: impl CSrc) -> usize {
     s.with_c_bytes(<[u8]>::len)
+}
+
+/// `epicsStrtok_r`. As C's, it ends the token by writing a NUL over the
+/// delimiter after it, in what `s` points into, and leaves `*lasts` past
+/// that NUL.
+#[allow(non_snake_case)]
+pub fn epicsStrtok_r(
+    s: impl Into<CharPtr>,
+    delim: impl CSrc,
+    lasts: &impl Place<CharPtr>,
+) -> CharPtr {
+    let delim = delim.to_c_vec();
+    let s = s.into();
+    let s = if s.is_null() { lasts.get() } else { s };
+    if s.is_null() {
+        return s;
+    }
+    let token = s.with_c_bytes(|b| {
+        let start = b.iter().take_while(|c| delim.contains(c)).count();
+        let end = b[start..].iter().position(|c| delim.contains(c));
+        (start < b.len()).then(|| (start, end.map(|e| start + e)))
+    });
+    let Some((start, end)) = token else {
+        lasts.set(CharPtr::default());
+        return CharPtr::default();
+    };
+    lasts.set(match end {
+        Some(e) => {
+            let d = s.offset(e as isize);
+            d.set(0);
+            d.offset(1)
+        }
+        None => CharPtr::default(),
+    });
+    s.offset(start as isize)
+}
+
+/// `malloc`, as the `T *` the result is stored in: `bytes / sizeof(T)`
+/// elements, zeroed where C's are indeterminate. The memory lives while a
+/// pointer into it does, so SNL code has no `free` to call.
+pub fn malloc<T: Zeroed + Send + 'static>(bytes: usize) -> Ptr<T> {
+    Ptr::alloc(bytes / std::mem::size_of::<T>().max(1))
+}
+
+/// `strchr`: a pointer into `s` at its first `c`, at its terminator for 0.
+pub fn strchr(s: impl Into<CharPtr>, c: c_int) -> CharPtr {
+    let s = s.into();
+    // C converts `c` to `char`.
+    let c = c as u8;
+    let at = s.with_c_bytes(|b| match c {
+        0 => Some(b.len()),
+        c => b.iter().position(|&x| x == c),
+    });
+    at.map_or_else(CharPtr::default, |i| s.offset(i as isize))
+}
+
+/// `strstr`: a pointer into `s` at the first `needle`, `s` itself for an
+/// empty one.
+pub fn strstr(s: impl Into<CharPtr>, needle: impl CSrc) -> CharPtr {
+    let needle = needle.to_c_vec();
+    let s = s.into();
+    let at = s.with_c_bytes(|b| match needle.len() {
+        0 => Some(0),
+        n => b.windows(n).position(|w| w == needle),
+    });
+    at.map_or_else(CharPtr::default, |i| s.offset(i as isize))
 }
 
 impl CArg<'_> {
@@ -422,8 +551,11 @@ fn format(fmt: &[u8], args: &[CArg<'_>], errno: &io::Error) -> (Vec<u8>, c_int) 
 /// the variable.
 pub fn tail(s: impl CSrc, n: isize) -> CharPtr {
     let n = usize::try_from(n).ok();
-    let rest = s.with_c_buffer(|b| n.and_then(|n| b.get(n..)).map(|r| Arc::from(before_nul(r))));
-    Some(rest.expect("string offset outside the buffer"))
+    let rest = s.with_c_buffer(|b| {
+        n.and_then(|n| b.get(n..))
+            .map(|r| CharPtr::from_bytes(before_nul(r)))
+    });
+    rest.expect("string offset outside the buffer")
 }
 
 /// C's `s[n]` of a C string: byte `n` of the buffer, read as `tail` reads.
@@ -444,28 +576,32 @@ pub fn printf(fmt: impl CSrc, args: &[CArg<'_>]) -> c_int {
 
 /// `sprintf`, bounded by the destination; the length returned is C's, the
 /// text's whole length.
-pub fn sprintf<B: CBuf>(dst: &impl Place<B>, fmt: impl CSrc, args: &[CArg<'_>]) -> c_int {
+pub fn sprintf(dst: impl CDst, fmt: impl CSrc, args: &[CArg<'_>]) -> c_int {
     let errno = io::Error::last_os_error();
     let (text, len) = format(&fmt.to_c_vec(), args, &errno);
-    dst.modify(|b| put_terminated(b.bytes_mut(), 0, &text));
+    dst.with_c_dst(|b| put_terminated(b, 0, &text));
     len
 }
 
-/// A value `sscanf` converted, at the width of its C type.
-pub enum Scanned<'a> {
-    Int(i64),
-    UInt(u64),
-    Double(f64),
-    /// `%s` and `%[`, which the store terminates.
-    Str(&'a [u8]),
-    /// `%c`, stored without a terminator.
-    Chars(&'a [u8]),
+/// `epicsSnprintf`, C99's `snprintf`: at most `size - 1` bytes and the
+/// terminator, nothing for a `size` of 0, and bounded by the destination
+/// as `sprintf` is; the length returned is the whole text's.
+#[allow(non_snake_case)]
+pub fn epicsSnprintf(dst: impl CDst, size: usize, fmt: impl CSrc, args: &[CArg<'_>]) -> c_int {
+    let errno = io::Error::last_os_error();
+    let (text, len) = format(&fmt.to_c_vec(), args, &errno);
+    if let Some(room) = size.checked_sub(1) {
+        dst.with_c_dst(|b| put_terminated(b, 0, &text[..text.len().min(room)]));
+    }
+    len
 }
 
-/// A variable type `sscanf` stores into. A number converts to it; a string
-/// goes to a string, bounded by it, and `%c`'s bytes to a string or, the
-/// first of them, to a number. Any other pairing leaves the variable as it
-/// was, where C writes the value's bytes over it.
+use epics_libcom_rs::runtime::scanf::{self, ScanNum};
+pub use epics_libcom_rs::runtime::scanf::{ScanTarget, Scanned};
+
+/// A variable type `sscanf` stores into: a conversion writes its own type's
+/// bytes over the variable's, whatever the variable's type, and those past
+/// its end are dropped where C writes on.
 pub trait ScanStore {
     fn store(&mut self, value: Scanned<'_>);
 }
@@ -474,13 +610,7 @@ macro_rules! scan_store_num {
     ($($t:ty),*) => {
         $(impl ScanStore for $t {
             fn store(&mut self, value: Scanned<'_>) {
-                *self = match value {
-                    Scanned::Int(v) => v as $t,
-                    Scanned::UInt(v) => v as $t,
-                    Scanned::Double(v) => v as $t,
-                    Scanned::Chars(b) => b[0] as $t,
-                    Scanned::Str(_) => return,
-                };
+                *self = self.stored(&value);
             }
         })*
     };
@@ -488,32 +618,16 @@ macro_rules! scan_store_num {
 
 scan_store_num!(i8, u8, i16, u16, i32, u32, i64, u64, f32, f64);
 
-fn scan_store_bytes(buf: &mut [u8], value: Scanned<'_>) {
-    match value {
-        Scanned::Str(b) => put_terminated(buf, 0, b),
-        Scanned::Chars(b) => {
-            let n = b.len().min(buf.len());
-            buf[..n].copy_from_slice(&b[..n]);
-        }
-        _ => {}
-    }
-}
-
 impl ScanStore for SeqString {
     fn store(&mut self, value: Scanned<'_>) {
-        scan_store_bytes(self.bytes_mut(), value)
+        value.write_over(self.bytes_mut())
     }
 }
 
 impl<const N: usize> ScanStore for [c_char; N] {
     fn store(&mut self, value: Scanned<'_>) {
-        scan_store_bytes(self.bytes_mut(), value)
+        value.write_over(self.bytes_mut())
     }
-}
-
-/// An `sscanf` destination: C's pointer argument.
-pub trait ScanTarget {
-    fn store(&self, value: Scanned<'_>);
 }
 
 impl<T: ScanStore> ScanTarget for SeqVar<T> {
@@ -528,495 +642,10 @@ impl<T: ScanStore, const N: usize, P: Place<[T; N]> + ?Sized> ScanTarget for At<
     }
 }
 
-/// glibc's `inchar` and `ungetc` over a string; `None` is `EOF`.
-struct Input<'a> {
-    b: &'a [u8],
-    at: usize,
-}
-
-impl Input<'_> {
-    fn inchar(&mut self) -> Option<u8> {
-        let c = self.b.get(self.at).copied();
-        self.at += usize::from(c.is_some());
-        c
-    }
-
-    fn ungetc(&mut self, c: Option<u8>) {
-        self.at -= usize::from(c.is_some());
-    }
-
-    fn skip_space(&mut self) {
-        let mut c = self.inchar();
-        while c.is_some_and(is_space) {
-            c = self.inchar();
-        }
-        self.ungetc(c);
-    }
-}
-
-fn is_space(c: u8) -> bool {
-    stdlib::c_isspace(c as char)
-}
-
-fn lower(c: Option<u8>) -> Option<u8> {
-    c.map(|c| c.to_ascii_lowercase())
-}
-
-/// How a conversion ended short.
-enum Stop {
-    /// glibc's `input_error`: the input ended where a character was needed.
-    Input,
-    /// glibc's `conv_error`: the input or the format did not match.
-    Conv,
-}
-
-/// The `[sign][0[x]]digits` an integer conversion reads, as glibc's
-/// `vfscanf` collects them for `strtol`; `base` 0 is `%i`'s.
-fn scan_int(
-    r: &mut Input<'_>,
-    width: &mut i64,
-    mut base: u32,
-    pointer: bool,
-) -> Result<(Vec<u8>, u32), Stop> {
-    let mut buf = Vec::new();
-    let dec = |w: &mut i64| *w -= i64::from(*w > 0);
-    let mut c = r.inchar();
-    if c.is_none() {
-        return Err(Stop::Input);
-    }
-    if let Some(sign @ (b'-' | b'+')) = c {
-        buf.push(sign);
-        dec(width);
-        c = r.inchar();
-    }
-    if *width != 0 && c == Some(b'0') {
-        dec(width);
-        buf.push(b'0');
-        c = r.inchar();
-        if *width != 0 && lower(c) == Some(b'x') {
-            if base == 0 {
-                base = 16;
-            }
-            if base == 16 {
-                dec(width);
-                c = r.inchar();
-            }
-        } else if base == 0 {
-            base = 8;
-        }
-    }
-    if base == 0 {
-        base = 10;
-    }
-    while let Some(d) = c.filter(|_| *width != 0) {
-        let digit = if base == 16 {
-            d.is_ascii_hexdigit()
-        } else {
-            d.is_ascii_digit() && u32::from(d - b'0') < base
-        };
-        if !digit {
-            break;
-        }
-        buf.push(d);
-        dec(width);
-        c = r.inchar();
-    }
-    if buf.is_empty() || buf == b"+" || buf == b"-" {
-        // `%p` reads "(nil)" as 0.
-        if pointer
-            && buf.is_empty()
-            && (*width < 0 || *width >= 5)
-            && c == Some(b'(')
-            && b"nil)".iter().all(|&want| {
-                c = r.inchar();
-                lower(c) == Some(want)
-            })
-        {
-            buf.push(b'0');
-        } else {
-            r.ungetc(c);
-            return Err(Stop::Conv);
-        }
-    } else {
-        r.ungetc(c);
-    }
-    Ok((buf, base))
-}
-
-/// `c` and then each letter of `word` into `buf`, as glibc reads `nan` and
-/// `inf`: a letter that differs is a conversion error.
-fn spell(
-    r: &mut Input<'_>,
-    c: &mut Option<u8>,
-    buf: &mut Vec<u8>,
-    width: &mut i64,
-    word: &[u8],
-) -> Result<(), Stop> {
-    for &want in word {
-        buf.push(c.unwrap());
-        if *width == 0 {
-            return Err(Stop::Conv);
-        }
-        *c = r.inchar();
-        if lower(*c) != Some(want) {
-            return Err(Stop::Conv);
-        }
-        *width -= i64::from(*width > 0);
-    }
-    buf.push(c.unwrap());
-    Ok(())
-}
-
-/// The text a float conversion reads, as glibc's `vfscanf` collects it for
-/// `strtod`: a sign, then `nan`, `inf[inity]`, or a decimal or `0x` hex
-/// number in the C locale.
-fn scan_float(r: &mut Input<'_>, width: &mut i64) -> Result<Vec<u8>, Stop> {
-    let mut buf = Vec::new();
-    let dec = |w: &mut i64| *w -= i64::from(*w > 0);
-    let mut c = r.inchar();
-    dec(width);
-    if c.is_none() {
-        return Err(Stop::Input);
-    }
-    let mut got_sign = false;
-    if let Some(sign @ (b'-' | b'+')) = c {
-        got_sign = true;
-        buf.push(sign);
-        if *width == 0 {
-            return Err(Stop::Conv);
-        }
-        c = r.inchar();
-        if c.is_none() {
-            return Err(Stop::Conv);
-        }
-        dec(width);
-    }
-    if lower(c) == Some(b'n') {
-        spell(r, &mut c, &mut buf, width, b"an")?;
-        return Ok(buf);
-    }
-    if lower(c) == Some(b'i') {
-        spell(r, &mut c, &mut buf, width, b"nf")?;
-        if *width != 0 {
-            c = r.inchar();
-            if lower(c) == Some(b'i') {
-                dec(width);
-                spell(r, &mut c, &mut buf, width, b"nity")?;
-            } else {
-                r.ungetc(c);
-            }
-        }
-        return Ok(buf);
-    }
-    let mut exp_char = b'e';
-    let (mut hex, mut got_digit, mut got_dot, mut got_e) = (false, false, false, false);
-    if *width != 0 && c == Some(b'0') {
-        buf.push(b'0');
-        c = r.inchar();
-        dec(width);
-        if *width != 0 && lower(c) == Some(b'x') {
-            buf.push(c.unwrap());
-            hex = true;
-            exp_char = b'p';
-            c = r.inchar();
-            dec(width);
-        } else {
-            got_digit = true;
-        }
-    }
-    loop {
-        match c {
-            Some(d) if d.is_ascii_digit() || !got_e && hex && d.is_ascii_hexdigit() => {
-                buf.push(d);
-                got_digit = true;
-            }
-            Some(s @ (b'-' | b'+')) if got_e && buf.last() == Some(&exp_char) => buf.push(s),
-            Some(e) if got_digit && !got_e && e.to_ascii_lowercase() == exp_char => {
-                buf.push(exp_char);
-                got_e = true;
-                got_dot = true;
-            }
-            Some(b'.') if !got_dot => {
-                buf.push(b'.');
-                got_dot = true;
-            }
-            _ => {
-                r.ungetc(c);
-                break;
-            }
-        }
-        if *width == 0 {
-            break;
-        }
-        c = r.inchar();
-        if c.is_none() {
-            break;
-        }
-        dec(width);
-    }
-    if buf.len() == usize::from(got_sign) || hex && buf.len() == 2 + usize::from(got_sign) {
-        return Err(Stop::Conv);
-    }
-    Ok(buf)
-}
-
-/// The `[...]` set at `fmt[*f..]`, `*f` left past its `]`: the bytes in it
-/// and whether it is `^` negated.
-fn scan_set(fmt: &[u8], f: &mut usize) -> Option<([bool; 256], bool)> {
-    let not_in = fmt.get(*f) == Some(&b'^');
-    *f += usize::from(not_in);
-    let mut set = [false; 256];
-    if let Some(&c @ (b']' | b'-')) = fmt.get(*f) {
-        set[c as usize] = true;
-        *f += 1;
-    }
-    loop {
-        let fc = *fmt.get(*f)?;
-        *f += 1;
-        match fmt.get(*f) {
-            _ if fc == b']' => return Some((set, not_in)),
-            Some(&to) if fc == b'-' && to != b']' && fmt[*f - 2] <= to => {
-                for c in fmt[*f - 2]..to {
-                    set[c as usize] = true;
-                }
-            }
-            _ => set[fc as usize] = true,
-        }
-    }
-}
-
-/// C's cast of a signed conversion's `long` to its type.
-fn narrow_int(v: i64, length: Length) -> i64 {
-    match length {
-        Length::None => v as i32 as i64,
-        Length::H => v as i16 as i64,
-        Length::Hh => v as i8 as i64,
-        _ => v,
-    }
-}
-
-/// glibc's `vfscanf` (`__isoc99_sscanf`) reading `input`; the number of
-/// conversions stored, or -1 when the input ends before the first.
-fn scan(input: &[u8], fmt: &[u8], out: &[&dyn ScanTarget]) -> c_int {
-    let mut r = Input { b: input, at: 0 };
-    let mut targets = out.iter();
-    let mut done: c_int = 0;
-    let mut skip_space = false;
-    let mut f = 0;
-    let stopped = |stop: Stop, done: c_int| match stop {
-        Stop::Input if done == 0 => -1,
-        _ => done,
-    };
-    while let Some(&fc) = fmt.get(f) {
-        f += 1;
-        if fc != b'%' {
-            if is_space(fc) {
-                skip_space = true;
-                continue;
-            }
-            let Some(mut c) = r.inchar() else {
-                return stopped(Stop::Input, done);
-            };
-            if skip_space {
-                while is_space(c) {
-                    let Some(next) = r.inchar() else {
-                        return stopped(Stop::Input, done);
-                    };
-                    c = next;
-                }
-                skip_space = false;
-            }
-            if c != fc {
-                r.ungetc(Some(c));
-                return done;
-            }
-            continue;
-        }
-        let mut suppress = false;
-        while let Some(&flag @ (b'*' | b'\'' | b'I')) = fmt.get(f) {
-            suppress |= flag == b'*';
-            f += 1;
-        }
-        let mut width = 0i64;
-        while let Some(d) = fmt.get(f).filter(|d| d.is_ascii_digit()) {
-            width = width.saturating_mul(10).saturating_add(i64::from(d - b'0'));
-            f += 1;
-        }
-        if width == 0 {
-            width = -1;
-        }
-        let twice = |c| fmt.get(f + 1) == Some(&c);
-        let length;
-        (length, f) = match fmt.get(f) {
-            Some(b'h') if twice(b'h') => (Length::Hh, f + 2),
-            Some(b'h') => (Length::H, f + 1),
-            Some(b'l') if twice(b'l') => (Length::Ll, f + 2),
-            Some(b'l') => (Length::L, f + 1),
-            Some(b'q' | b'L') => (Length::Ll, f + 1),
-            Some(b'j' | b'z' | b't') => (Length::J, f + 1),
-            _ => (Length::None, f),
-        };
-        let Some(&conv) = fmt.get(f) else {
-            return done;
-        };
-        f += 1;
-        if skip_space || !matches!(conv, b'[' | b'c' | b'n') {
-            r.skip_space();
-            skip_space = false;
-        }
-        let wide = matches!(length, Length::L | Length::Ll | Length::J);
-        let value: Result<Option<Scanned<'_>>, Stop> = (|| match conv {
-            b'%' => match r.inchar() {
-                None => Err(Stop::Input),
-                Some(b'%') => Ok(None),
-                c => {
-                    r.ungetc(c);
-                    Err(Stop::Conv)
-                }
-            },
-            b'n' => Ok(Some(Scanned::Int(narrow_int(r.at as i64, length)))),
-            b'c' if !wide => {
-                let start = r.at;
-                r.inchar().ok_or(Stop::Input)?;
-                let mut width = if width < 0 { 1 } else { width };
-                loop {
-                    width -= 1;
-                    if width <= 0 || r.inchar().is_none() {
-                        break;
-                    }
-                }
-                Ok(Some(Scanned::Chars(&input[start..r.at])))
-            }
-            b's' if !wide => {
-                let start = r.at;
-                let mut c = r.inchar();
-                if c.is_none() {
-                    return Err(Stop::Input);
-                }
-                while let Some(ch) = c {
-                    if is_space(ch) {
-                        r.ungetc(c);
-                        break;
-                    }
-                    if width > 0 {
-                        width -= 1;
-                        if width == 0 {
-                            break;
-                        }
-                    }
-                    c = r.inchar();
-                }
-                Ok(Some(Scanned::Str(&input[start..r.at])))
-            }
-            b'[' if !wide => {
-                let (set, not_in) = scan_set(fmt, &mut f).ok_or(Stop::Conv)?;
-                let start = r.at;
-                let mut c = r.inchar();
-                if c.is_none() {
-                    return Err(Stop::Input);
-                }
-                let mut width = if width < 0 {
-                    i64::from(c_int::MAX)
-                } else {
-                    width
-                };
-                while let Some(ch) = c {
-                    if set[ch as usize] == not_in {
-                        r.ungetc(c);
-                        break;
-                    }
-                    width -= 1;
-                    if width <= 0 {
-                        break;
-                    }
-                    c = r.inchar();
-                }
-                if r.at == start {
-                    return Err(Stop::Conv);
-                }
-                Ok(Some(Scanned::Str(&input[start..r.at])))
-            }
-            b'd' | b'i' | b'o' | b'u' | b'x' | b'X' | b'p' => {
-                let base = match conv {
-                    b'd' | b'u' => 10,
-                    b'i' => 0,
-                    b'o' => 8,
-                    _ => 16,
-                };
-                let (buf, base) = scan_int(&mut r, &mut width, base, conv == b'p')?;
-                let length = if conv == b'p' { Length::L } else { length };
-                Ok(Some(if matches!(conv, b'd' | b'i') {
-                    let (v, n) = match length {
-                        Length::Ll | Length::J => stdlib::strtoll(&buf, base),
-                        _ => {
-                            let (v, n) = stdlib::strtol(&buf, base);
-                            (i128::from(v) as i64, n)
-                        }
-                    };
-                    if n == 0 {
-                        return Err(Stop::Conv);
-                    }
-                    Scanned::Int(narrow_int(v, length))
-                } else {
-                    let (v, n) = match length {
-                        Length::Ll | Length::J => stdlib::strtoull(&buf, base),
-                        _ => {
-                            let (v, n) = stdlib::strtoul(&buf, base);
-                            (u128::from(v) as u64, n)
-                        }
-                    };
-                    if n == 0 {
-                        return Err(Stop::Conv);
-                    }
-                    Scanned::UInt(match length {
-                        Length::None => v as u32 as u64,
-                        Length::H => v as u16 as u64,
-                        Length::Hh => v as u8 as u64,
-                        _ => v,
-                    })
-                }))
-            }
-            b'e' | b'E' | b'f' | b'F' | b'g' | b'G' | b'a' | b'A' => {
-                let buf = scan_float(&mut r, &mut width)?;
-                let d = stdlib::strtod(&buf);
-                if d.len == 0 {
-                    return Err(Stop::Conv);
-                }
-                Ok(Some(Scanned::Double(match length {
-                    // `strtof` rounds the decimal once; a hex float rounds
-                    // to a double first, the same below 54 significant bits.
-                    Length::None => std::str::from_utf8(&buf[..d.len])
-                        .ok()
-                        .and_then(|t| t.parse::<f32>().ok())
-                        .unwrap_or(d.value as f32) as f64,
-                    _ => d.value,
-                })))
-            }
-            _ => Err(Stop::Conv),
-        })();
-        match value {
-            Err(stop) => return stopped(stop, done),
-            Ok(Some(v)) if !suppress => {
-                let Some(target) = targets.next() else {
-                    return done;
-                };
-                target.store(v);
-                done += c_int::from(conv != b'n');
-            }
-            Ok(_) => {}
-        }
-    }
-    done
-}
-
-/// `sscanf` as glibc's C99 one reads a string: the number of conversions
-/// stored, -1 when the input ends before the first.
-///
-/// The destinations take the values in turn, each as [`ScanStore`] converts
-/// it. A conversion with no destination left, `%m` allocation, positional
-/// `%n$`, and a wide `%lc`, `%ls` or `%l[` end the scan as a mismatch does.
+/// glibc's `sscanf` ([`scanf::sscanf`]), each destination taking its value
+/// as [`ScanStore`] converts it.
 pub fn sscanf(src: impl CSrc, fmt: impl CSrc, out: &[&dyn ScanTarget]) -> c_int {
-    scan(&src.to_c_vec(), &fmt.to_c_vec(), out)
+    scanf::sscanf(src.to_c_vec(), fmt.to_c_vec(), out)
 }
 
 /// `atof`: the longest prefix `strtod` takes, 0 if none.
@@ -1027,6 +656,11 @@ pub fn atof(s: impl CSrc) -> f64 {
 /// `atoi`: glibc's `(int) strtol(s, NULL, 10)`.
 pub fn atoi(s: impl CSrc) -> c_int {
     s.with_c_bytes(|b| stdlib::atoi(b))
+}
+
+/// `atol`: glibc's `strtol(s, NULL, 10)`.
+pub fn atol(s: impl CSrc) -> c_long {
+    s.with_c_bytes(|b| stdlib::strtol(b, 10).0)
 }
 
 /// `epicsThreadSleep`; `secs` in seconds. A state set's sleep is a block
@@ -1070,10 +704,40 @@ pub fn pow(x: f64, y: f64) -> f64 {
     x.powf(y)
 }
 
+/// C's truth test of a value whose type only its expression knows (a
+/// foreign call's result): `v != 0`. The argument fixes `T`, which a bare
+/// `v != Default::default()` leaves to inference, and a second
+/// `PartialEq` impl for the type anywhere in the crate graph (serde_json's
+/// for `i32`) makes that ambiguous.
+pub fn truth<T: Default + PartialEq>(v: T) -> bool {
+    v != T::default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::var::Zeroed;
+
+    /// Zero is false, anything else true, `-0.0` and NaN as C compares
+    /// them; and it type-checks beside another `PartialEq` impl for `i32`.
+    #[test]
+    fn truth_is_c_s_test_against_zero() {
+        struct Other;
+        impl PartialEq<Other> for i32 {
+            fn eq(&self, _: &Other) -> bool {
+                false
+            }
+        }
+        let call = |v: c_int| v;
+        assert!(!truth(call(0)));
+        assert!(truth(call(-3)));
+        assert!(!truth(0.0f64));
+        assert!(!truth(-0.0f64));
+        assert!(truth(f64::NAN));
+        assert!(truth(0.5f32));
+        assert!(!truth(0u16));
+        assert!(truth(true));
+    }
 
     fn text<const N: usize>(v: &SeqVar<[c_char; N]>) -> Vec<u8> {
         v.to_c_vec()
@@ -1086,6 +750,129 @@ mod tests {
         strcpy(&v, "xy");
         let raw = v.get().map(|c| c as u8);
         assert_eq!(&raw, b"xy\0def\0\0");
+    }
+
+    #[test]
+    fn a_char_pointer_writes_from_where_it_points_to_its_variable_s_end() {
+        let v = <SeqVar<[c_char; 8]>>::zeroed();
+        strcpy(&v, "abcdef");
+        strcpy(v.at(2).ptr(), "XY");
+        assert_eq!(&v.get().map(|c| c as u8), b"abXY\0f\0\0");
+        assert_eq!(sprintf(v.at(6).ptr(), "%d", &[123.into()]), 3);
+        assert_eq!(&v.get().map(|c| c as u8), b"abXY\0f1\0");
+        strcat(v.at(0).ptr(), "Z");
+        strncpy(v.at(5).ptr(), "q", 3);
+        assert_eq!(&v.get().map(|c| c as u8), b"abXYZq\0\0");
+    }
+
+    /// EnsembleTrajectoryScan.st:396, MM4005_trajectoryScan.st:417:
+    /// `&a[i]` passed with no prototype is the element's place,
+    /// `&seqg_var.a.at(i)`.
+    #[test]
+    fn a_character_s_place_is_a_char_pointer_to_it() {
+        let v = <SeqVar<[c_char; 8]>>::zeroed();
+        strcpy(&v, "ab");
+        assert_eq!(sprintf(v.at(2), "%d", &[45.into()]), 2);
+        assert_eq!(atoi(v.at(1)), 0);
+        assert_eq!(atoi(v.at(2)), 45);
+        let s = <SeqVar<SeqString>>::zeroed();
+        strcpy(&s, "xyz");
+        strcpy(s.at(1), "Q");
+        assert_eq!(s.to_c_vec(), b"xQ");
+        assert_eq!(strcmp(s.at(0), "xQ"), 0);
+        sprintf(&v, "<%s>", &[(&s.at(1)).into()]);
+        assert_eq!(text(&v), b"<Q>");
+    }
+
+    #[test]
+    fn a_source_inside_the_destination_is_read_first() {
+        let v = <SeqVar<[c_char; 8]>>::zeroed();
+        strcpy(&v, "abc");
+        strcat(v.at(0).ptr(), &v);
+        assert_eq!(text(&v), b"abcabc");
+    }
+
+    #[test]
+    #[should_panic(expected = "null pointer passed as a C destination")]
+    fn a_null_destination_panics() {
+        strcpy(CharPtr::default(), "x");
+    }
+
+    #[test]
+    #[should_panic(expected = "write through a pointer to a string literal")]
+    fn a_literal_destination_panics() {
+        strcpy(CharPtr::from("ab"), "x");
+    }
+
+    /// MM4005_trajectoryScan.st:495-502: tokens of `stringIn`, which
+    /// `p` points into.
+    #[test]
+    fn epics_strtok_r_cuts_its_string_in_place() {
+        let string_in = <SeqVar<[c_char; 32]>>::zeroed();
+        strcpy(&string_in, ",15TQ,,1TH2.7,1TP2.65");
+        let tok_save = <SeqVar<CharPtr>>::zeroed();
+        let p = epicsStrtok_r(&string_in, ",", &tok_save);
+        assert_eq!(p, string_in.at(1).ptr());
+        assert_eq!(p.to_c_vec(), b"15TQ");
+        assert_eq!(text(&string_in), b",15TQ");
+        assert_eq!(tok_save.get(), string_in.at(6).ptr());
+        let p = epicsStrtok_r(CharPtr::default(), ",", &tok_save);
+        assert_eq!(atof(p.offset(3)), 2.7);
+        let p = epicsStrtok_r(CharPtr::default(), ",", &tok_save);
+        assert_eq!(p.to_c_vec(), b"1TP2.65");
+        assert!(tok_save.get().is_null());
+        assert!(epicsStrtok_r(CharPtr::default(), ",", &tok_save).is_null());
+        // only delimiters left: no token, and `*lasts` is cleared
+        strcpy(&string_in, "a,,");
+        assert_eq!(epicsStrtok_r(&string_in, ",", &tok_save).to_c_vec(), b"a");
+        assert!(!tok_save.get().is_null());
+        assert!(epicsStrtok_r(CharPtr::default(), ",", &tok_save).is_null());
+        assert!(tok_save.get().is_null());
+    }
+
+    /// XPS_trajectoryScan.st:163-165: `axisName[i] = malloc(NAME_LEN);`
+    /// then `sprintf(axisName[i], "%s.%s", ...)`.
+    #[test]
+    fn malloc_is_a_zeroed_run_its_pointers_share() {
+        let axis_name = <SeqVar<[CharPtr; 2]>>::zeroed();
+        axis_name.at(1).set(malloc(64));
+        let n = sprintf(axis_name.at(1).get(), "%s.%s", &["G1".into(), "P1".into()]);
+        assert_eq!(n, 5);
+        assert_eq!(axis_name.get()[1].to_c_vec(), b"G1.P1");
+        assert!(axis_name.at(0).get().is_null());
+        let d: Ptr<f64> = malloc(3 * 8);
+        d.offset(2).set(1.5);
+        assert_eq!((d.get(), d.offset(2).get()), (0.0, 1.5));
+    }
+
+    #[test]
+    #[should_panic(expected = "pointer past its object")]
+    fn past_a_malloc_panics() {
+        malloc::<i32>(8).offset(2).get();
+    }
+
+    /// editSseq.st:159-161: `s = strchr(recordName, '.'); *s = '\0';`.
+    #[test]
+    fn strchr_points_into_its_string() {
+        let v = <SeqVar<SeqString>>::zeroed();
+        strcpy(&v, "rec.VAL");
+        let s = strchr(&v, '.' as c_int);
+        assert_eq!(s, v.at(3).ptr());
+        s.set(0);
+        assert_eq!(v.get().as_bytes(), b"rec");
+        assert!(strchr(&v, '/' as c_int).is_null());
+        assert_eq!(strchr(&v, 0), v.at(3).ptr());
+        assert_eq!(strchr("a/b", '/' as c_int).to_c_vec(), b"/b");
+    }
+
+    #[test]
+    fn strstr_points_into_its_string() {
+        let w = <SeqVar<[SeqString; 2]>>::zeroed();
+        strcpy(w.at(1), "x:m1.VAL");
+        assert_eq!(strstr(&w.at(1), "m1"), w.at(1).at(2).ptr());
+        assert_eq!(strstr(&w.at(1), ""), w.at(1).at(0).ptr());
+        assert!(strstr(&w.at(1), "m2").is_null());
+        assert!(strstr(&w.at(0), "m1").is_null());
     }
 
     #[test]
@@ -1129,8 +916,8 @@ mod tests {
         strcpy(&w, "m1");
         strcat(&w, &w);
         assert_eq!(w.to_c_vec(), b"m1m1");
-        strcpy(&v.at(0), &w);
-        strcpy(&v.at(1), v.at(0));
+        strcpy(v.at(0), &w);
+        strcpy(v.at(1), v.at(0));
         assert_eq!(strcmp(v.at(1), &w), 0);
         assert_eq!(strlen(v.at(1)), 4);
         let CArg::Str(Some(s)) = CArg::from(&v.at(1)) else {
@@ -1228,16 +1015,31 @@ mod tests {
     }
 
     #[test]
+    fn epics_snprintf_keeps_size_less_one_and_returns_the_whole_length() {
+        // EnsembleTrajectoryScan.st:418 epicsSnprintf(buildMessage, MSGSIZE, ...)
+        let v = <SeqVar<[c_char; 8]>>::zeroed();
+        assert_eq!(epicsSnprintf(&v, 4, "m%d at %d", &[1.into(), 23.into()]), 8);
+        assert_eq!(text(&v), b"m1 ");
+        strcpy(&v, "keep");
+        assert_eq!(epicsSnprintf(&v, 0, "x", &[]), 1);
+        assert_eq!(text(&v), b"keep");
+        assert_eq!(epicsSnprintf(&v, 1, "x", &[]), 1);
+        assert_eq!(text(&v), b"");
+        assert_eq!(epicsSnprintf(&v, 40, "%s", &["abcdefghij".into()]), 10);
+        assert_eq!(text(&v), b"abcdefg");
+    }
+
+    #[test]
     fn sprintf_stops_at_the_destination_and_returns_the_whole_length() {
         let v = <SeqVar<[c_char; 4]>>::zeroed();
         assert_eq!(sprintf(&v, "%d", &[12345.into()]), 5);
         assert_eq!(text(&v), b"123");
         let w = <SeqVar<[SeqString; 2]>>::zeroed();
-        strcpy(&w.at(0), "m1");
-        let n = sprintf(&w.at(1), "%s.%s", &[(&w.at(0)).into(), "RBV".into()]);
+        strcpy(w.at(0), "m1");
+        let n = sprintf(w.at(1), "%s.%s", &[(&w.at(0)).into(), "RBV".into()]);
         assert_eq!((n, w.at(1).to_c_vec()), (6, b"m1.RBV".to_vec()));
         // The format and the arguments are read before the destination.
-        assert_eq!(sprintf(&w.at(0), w.at(0), &[]), 2);
+        assert_eq!(sprintf(w.at(0), w.at(0), &[]), 2);
         assert_eq!(w.at(0).to_c_vec(), b"m1");
         assert_eq!(sprintf(&v, "ab%", &[]), -1);
         assert_eq!(text(&v), b"ab");
@@ -1272,13 +1074,11 @@ mod tests {
     }
 
     /// A destination of the comparison with glibc.
-    #[cfg(all(unix, target_env = "gnu"))]
     trait Checked {
         fn target(&self) -> &dyn ScanTarget;
         fn bytes(&self) -> Vec<u8>;
     }
 
-    #[cfg(all(unix, target_env = "gnu"))]
     impl<T: ScanStore + Copy> Checked for SeqVar<T> {
         fn target(&self) -> &dyn ScanTarget {
             self
@@ -1292,7 +1092,7 @@ mod tests {
         }
     }
 
-    /// `scan` against glibc's `sscanf` into zeroed destinations of the
+    /// `sscanf` against glibc's `sscanf` into zeroed destinations of the
     /// types given, compared byte for byte.
     #[cfg(all(unix, target_env = "gnu"))]
     macro_rules! same_as_glibc_scan {
@@ -1306,7 +1106,7 @@ mod tests {
             let c_n = unsafe { __isoc99_sscanf(ci.as_ptr(), cf.as_ptr(), p[0], p[1], p[2], p[3]) };
             let vars: Vec<Box<dyn Checked>> = vec![$(Box::new(<SeqVar<$t>>::zeroed())),*];
             let targets: Vec<&dyn ScanTarget> = vars.iter().map(|v| v.target()).collect();
-            let n = scan(input.as_bytes(), fmt.as_bytes(), &targets);
+            let n = scanf::sscanf(input, fmt, &targets);
             assert_eq!(n, c_n, "{input:?} {fmt:?}");
             for (i, v) in vars.iter().enumerate() {
                 let b = v.bytes();
@@ -1342,20 +1142,30 @@ mod tests {
             "99999999999",
             "1e5",
         ] {
-            same_as_glibc_scan!(input, "%i", i32);
-            same_as_glibc_scan!(input, "%x%n", u32, i32);
+            // Pinned in `sscanf_follows_c11_where_older_glibc_did_not`.
+            if !matches!(input, "0x" | "0xg") {
+                same_as_glibc_scan!(input, "%i", i32);
+                same_as_glibc_scan!(input, "%x%n", u32, i32);
+            }
             same_as_glibc_scan!(input, "%2d%n", i32, i32);
             same_as_glibc_scan!(input, "%o", u32);
         }
         same_as_glibc_scan!("12345", "%2d%3d", i32, i32);
         same_as_glibc_scan!("-5", "%1d%d", i32, i32);
-        same_as_glibc_scan!("0x1f", "%2x%n", u32, i32);
         same_as_glibc_scan!("0x1f", "%3x", u32);
         same_as_glibc_scan!("300 70000 -1", "%hhd %hd %hu", i8, i16, u16);
         same_as_glibc_scan!("-1 9223372036854775807", "%ld %lld", c_long, i64);
         same_as_glibc_scan!("-1 4294967296", "%lu %llx", c_ulong, u64);
         same_as_glibc_scan!("(nil) (NIL) 0x1234 (ni", "%p %p %p %p", u64, u64, u64, u64);
         same_as_glibc_scan!("(nil)", "%4p", u64);
+        // A conversion stores its own width, whatever the variable's type.
+        same_as_glibc_scan!("200 -1 1ff", "%hhd %hhi %hhx", i16, i32, u16);
+        same_as_glibc_scan!("-1 70000", "%hd %hu", i32, i64);
+        same_as_glibc_scan!("-1 -1", "%d %u", i64, f64);
+        same_as_glibc_scan!("1.5 2.5", "%f %lf", f64, i32);
+        same_as_glibc_scan!("ab 7", "%s %d", i32, S);
+        same_as_glibc_scan!("abcdef", "%s", [c_char; 4]);
+        same_as_glibc_scan!("xyz", "%2c", i32);
         // Floats.
         for input in [
             "1.5",
@@ -1368,9 +1178,6 @@ mod tests {
             "info",
             "nan",
             "nax",
-            "1e",
-            "1e+",
-            "1e+x",
             ".5",
             "-.",
             ".",
@@ -1387,7 +1194,10 @@ mod tests {
         ] {
             same_as_glibc_scan!(input, "%f%n", f32, i32);
             same_as_glibc_scan!(input, "%lf%n", f64, i32);
-            same_as_glibc_scan!(input, "%3le%n", f64, i32);
+            // Pinned in `sscanf_follows_c11_where_older_glibc_did_not`.
+            if !matches!(input, "-2e3" | "7e-46") {
+                same_as_glibc_scan!(input, "%3le%n", f64, i32);
+            }
         }
         same_as_glibc_scan!("1.5 2", "%a %lA", f32, f64);
         // Strings, characters and sets.
@@ -1399,6 +1209,27 @@ mod tests {
         same_as_glibc_scan!("abc", "%[0-9]", S);
         same_as_glibc_scan!("abc", "%2[a-z]%c", S, c_char);
         same_as_glibc_scan!("abc", "%[a-z", S);
+        // Wide characters in the C locale.
+        type W = [c_char; 32];
+        same_as_glibc_scan!("abc", "%lc", i32);
+        same_as_glibc_scan!(" a", "%lc", i32);
+        same_as_glibc_scan!("abc", "%3lc", W);
+        same_as_glibc_scan!(" ab cd", "%ls%n", W, i32);
+        same_as_glibc_scan!("abcdef", "%3ls %S", W, W);
+        same_as_glibc_scan!("ab", "%C%Lc", i32, i32);
+        same_as_glibc_scan!(" a  b", "%C%S", i32, W);
+        same_as_glibc_scan!("abc1", "%l[a-z]%n", W, i32);
+        same_as_glibc_scan!("1", "%l[a-z]", W);
+        same_as_glibc_scan!("abc", "%2l[a-z]", W);
+        same_as_glibc_scan!("", "%lc", i32);
+        same_as_glibc_scan!("", "%ls", W);
+        same_as_glibc_scan!("abc", "%*ls%n", i32);
+        same_as_glibc_scan!("ab", "%hlc", i32);
+        same_as_glibc_scan!("\u{e9}", "%lc", i32);
+        same_as_glibc_scan!("a\u{e9}", "%2lc", W);
+        same_as_glibc_scan!("a\u{e9}b", "%ls", W);
+        same_as_glibc_scan!("a\u{e9}b,", "%l[^,]%n", W, i32);
+        same_as_glibc_scan!("\u{e9}a", "%l[^a]", W);
         // Literals, whitespace, `%%`, `%n` and the end of input.
         same_as_glibc_scan!("a  %  b", "a %% %c%n", c_char, i32);
         same_as_glibc_scan!("a b", "a%c", c_char);
@@ -1412,6 +1243,151 @@ mod tests {
         same_as_glibc_scan!("5", "%d%", i32);
         same_as_glibc_scan!("5 6", "%*d %d %2$d", i32, i32);
         same_as_glibc_scan!("ab", "%b", S);
+    }
+
+    /// `sscanf` into zeroed destinations of the types given, against the
+    /// values given.
+    macro_rules! scans_as {
+        ($input:expr, $fmt:expr, $n:expr $(, $t:ty = $want:expr)* $(,)?) => {{
+            let (input, fmt): (&str, &str) = ($input, $fmt);
+            let vars: Vec<Box<dyn Checked>> = vec![$(Box::new(<SeqVar<$t>>::zeroed())),*];
+            let wants: Vec<Box<dyn Checked>> = vec![$(Box::new(<SeqVar<$t>>::new($want))),*];
+            let targets: Vec<&dyn ScanTarget> = vars.iter().map(|v| v.target()).collect();
+            let n = scanf::sscanf(input, fmt, &targets);
+            assert_eq!(n, $n, "{input:?} {fmt:?}");
+            for (i, (v, want)) in vars.iter().zip(&wants).enumerate() {
+                assert_eq!(v.bytes(), want.bytes(), "{input:?} {fmt:?} destination {i}");
+            }
+        }};
+    }
+
+    /// The C11 7.21.6.2p10 matching failures glibc 2.42 adopted (BZ #12701)
+    /// and the NaN `(n-char-sequence)` 2.41 reads (BZ #30647), as glibc 2.43
+    /// scans them; a host with an older glibc scans them otherwise, so
+    /// `sscanf_matches_glibc` leaves them out.
+    #[test]
+    fn sscanf_follows_c11_where_older_glibc_did_not() {
+        type S = [c_char; 16];
+        let s = |b: &[u8]| {
+            let mut a: S = [0; 16];
+            a.iter_mut().zip(b).for_each(|(a, &b)| *a = b as c_char);
+            a
+        };
+        // A `0x` with no digit after it.
+        for (input, fmt) in [
+            ("0x", "%i%n"),
+            ("0x", "%x%n"),
+            ("0X", "%X%n"),
+            ("-0x", "%i%n"),
+            ("+0x", "%x%n"),
+            ("0xg", "%i%n"),
+            ("0xg", "%x%n"),
+            ("0xg", "%p%n"),
+            ("0x", "%p%n"),
+            ("0x1f", "%2x%n"),
+            ("0x1f", "%2i%n"),
+            ("-0x1", "%3i%n"),
+        ] {
+            scans_as!(input, fmt, 0, u64 = 0, i32 = 0);
+        }
+        scans_as!("0x(nil)", "%p%n", 1, u64 = 0, i32 = 7);
+        // No digit in the significand or after the exponent character.
+        for input in ["1e", "1e+", "1e+x"] {
+            scans_as!(input, "%f%n", 0, f32 = 0.0, i32 = 0);
+            scans_as!(input, "%lf%n", 0, f64 = 0.0, i32 = 0);
+            scans_as!(input, "%3le%n", 0, f64 = 0.0, i32 = 0);
+        }
+        for (input, fmt) in [
+            ("-2e3", "%3le%n"),
+            ("7e-46", "%3le%n"),
+            ("0x5", "%2f%n"),
+            ("-0x5", "%3f%n"),
+            ("0x.", "%lf%n"),
+            ("0x.p1", "%lf%n"),
+            ("-0x.", "%lf%n"),
+            ("0x1p", "%lf%n"),
+            ("0x1p+", "%lf%n"),
+            ("0x1p-x", "%lf%n"),
+            ("1.e", "%lf%n"),
+            ("1e5", "%2lf%n"),
+            ("1e+5", "%3lf%n"),
+            ("0e", "%lf%n"),
+            ("0x0p", "%lf%n"),
+            ("1E", "%lf%n"),
+            ("1e-", "%f%n"),
+        ] {
+            scans_as!(input, fmt, 0, f64 = 0.0, i32 = 0);
+        }
+        // `nan(n-char-sequence)`, the sequence `strtod`'s payload.
+        for (input, fmt) in [
+            ("nan(", "%lf%n"),
+            ("nan(1-2)", "%lf%n"),
+            ("nan(12)", "%4lf%n"),
+            ("nan(12)", "%5lf%n"),
+            ("nan(12)", "%6lf%n"),
+        ] {
+            scans_as!(input, fmt, 0, f64 = 0.0, i32 = 0);
+        }
+        for (input, fmt, bits, end) in [
+            ("nan()", "%lf%n", 0x7ff8_0000_0000_0000, 5),
+            ("nan(12)", "%lf%n", 0x7ff8_0000_0000_000c, 7),
+            ("nan(a_B9)", "%lf%n", 0x7ff8_0000_0000_0000, 9),
+            ("nan(12)", "%7lf%n", 0x7ff8_0000_0000_000c, 7),
+            ("-nan(5)", "%lf%n", 0xfff8_0000_0000_0005, 7),
+            ("nan(0x7b)", "%lf%n", 0x7ff8_0000_0000_007b, 9),
+            (
+                "nan(99999999999999999999999)",
+                "%lf%n",
+                0x7fff_ffff_ffff_ffff,
+                28,
+            ),
+            ("nan(12)x", "%lf%n", 0x7ff8_0000_0000_000c, 7),
+        ] {
+            scans_as!(input, fmt, 1, f64 = f64::from_bits(bits), i32 = end);
+        }
+        scans_as!(
+            "NAN(7)",
+            "%f%n",
+            1,
+            f32 = f32::from_bits(0x7fc0_0007),
+            i32 = 6
+        );
+        // `%c` short of its width stores what it read and fails the input.
+        scans_as!("ab", "%3c%n", -1, S = s(b"ab"), i32 = 0);
+        scans_as!("ab", "%*3c%n", -1, i32 = 0);
+        scans_as!(
+            "x ab",
+            "%c %3c%n",
+            1,
+            c_char = b'x' as c_char,
+            S = s(b"ab"),
+            i32 = 0
+        );
+        scans_as!("a", "%2c%n", -1, S = s(b"a"), i32 = 0);
+    }
+
+    /// EPICS builds with `-D_GNU_SOURCE`, under which glibc 2.43's `sscanf`
+    /// is `__isoc23_sscanf`: `%b` and a `0b` prefix read base 2.
+    #[test]
+    fn sscanf_reads_c23_binary_like_glibc_with_gnu_source() {
+        use std::ffi::c_long;
+        for (input, fmt, n, v, end) in [
+            ("0b11", "%li%n", 1, 3, 4),
+            ("-0b11", "%li%n", 1, -3, 5),
+            ("0b2", "%li%n", 0, 0, 0),
+            ("0b", "%li%n", 0, 0, 0),
+            ("0b1", "%3i%n", 1, 1, 3),
+            ("0b1", "%2i%n", 0, 0, 0),
+            ("0b1", "%ld%n", 1, 0, 1),
+            ("0b1", "%lx%n", 1, 0xb1, 3),
+            ("-101", "%lb%n", 1, -5, 4),
+            ("0B101", "%lb%n", 1, 5, 5),
+            ("0x1", "%lb%n", 1, 0, 1),
+            ("0b1", "%1b%n", 1, 0, 1),
+            ("2", "%lb%n", 0, 0, 0),
+        ] {
+            scans_as!(input, fmt, n, c_long = v, i32 = end);
+        }
     }
 
     #[test]
@@ -1432,31 +1408,55 @@ mod tests {
     }
 
     #[test]
-    fn scan_stores_convert_to_the_variable() {
+    fn a_conversion_writes_its_bytes_over_the_variable() {
         let n = <SeqVar<[i16; 2]>>::zeroed();
-        n.at(1).store(Scanned::Int(70000));
-        n.at(0).store(Scanned::Chars(b"AB"));
-        assert_eq!(n.get(), [65, 4464]);
-        n.at(0).store(Scanned::Str(b"9"));
-        assert_eq!(n.get()[0], 65);
+        assert_eq!(sscanf("70000 AB", "%d %2c", &[&n.at(1), &n.at(0)]), 2);
+        let low = |v: i32| i16::from_ne_bytes([v.to_ne_bytes()[0], v.to_ne_bytes()[1]]);
+        assert_eq!(n.get(), [i16::from_ne_bytes(*b"AB"), low(70000)]);
+        assert_eq!(sscanf("9", "%s", &[&n.at(0)]), 1);
+        assert_eq!(n.get()[0], i16::from_ne_bytes(*b"9\0"));
         let x = <SeqVar<f32>>::zeroed();
-        x.store(Scanned::Double(0.1));
+        assert_eq!(sscanf("0.1", "%f", &[&x]), 1);
         assert_eq!(x.get(), 0.1f32);
         let s = <SeqVar<[c_char; 4]>>::zeroed();
-        s.store(Scanned::Str(b"abcdef"));
-        assert_eq!(text(&s), b"abc");
-        s.store(Scanned::Chars(b"xy"));
-        assert_eq!(text(&s), b"xyc");
-        s.store(Scanned::UInt(7));
-        assert_eq!(text(&s), b"xyc");
+        assert_eq!(sscanf("abcdef", "%s", &[&s]), 1);
+        assert_eq!(text(&s), b"abcd");
+        assert_eq!(sscanf("xy", "%2c", &[&s]), 1);
+        assert_eq!(text(&s), b"xycd");
+        assert_eq!(sscanf("7", "%d", &[&s]), 1);
+        assert_eq!(text(&s), b"\x07");
         let t = <SeqVar<[SeqString; 2]>>::zeroed();
-        t.at(1).store(Scanned::Str(b"m1"));
+        assert_eq!(sscanf("m1", "%s", &[&t.at(1)]), 1);
         assert_eq!(t.at(1).to_c_vec(), b"m1");
+    }
+
+    /// array.st:46 `testDiag("a4ps[%d]=%p", i, a4ps[i])`.
+    #[test]
+    fn a_pointer_prints_its_address_with_p() {
+        let v = <SeqVar<[c_char; 24]>>::zeroed();
+        sprintf(&v, "%p", &[Ptr::<i32>::default().addr().into()]);
+        assert_eq!(text(&v), b"(nil)");
+        let x = SeqVar::new(1i32);
+        sprintf(&v, "%p", &[x.ptr().addr().into()]);
+        assert_eq!(text(&v), format!("{:#x}", x.ptr().addr()).as_bytes());
+    }
+
+    /// EnsembleTrajectoryScan.st:963 `atol(&reply[1])`.
+    #[test]
+    fn atol_is_strtol() {
+        assert_eq!(atol(" -42abc"), -42);
+        assert_eq!(atol("x1"), 0);
+        assert_eq!(
+            atol("2147483648"),
+            c_long::try_from(2147483648_i64).unwrap_or(c_long::MAX)
+        );
+        let v = <SeqVar<[c_char; 8]>>::zeroed();
+        strcpy(&v, "#12");
+        assert_eq!(atol(v.at(1)), 12);
     }
 
     #[test]
     fn atoi_is_strtol_cut_to_int() {
-        use std::ffi::c_long;
         assert_eq!(atoi(" -42abc"), -42);
         assert_eq!(atoi("x1"), 0);
         // A 64-bit `long` wraps when cut to int; a 32-bit one saturates.
@@ -1478,7 +1478,7 @@ mod tests {
         assert_eq!(atof("-inf"), f64::NEG_INFINITY);
         assert_eq!(atof("e5"), 0.0);
         let v = <SeqVar<[SeqString; 2]>>::zeroed();
-        strcpy(&v.at(1), "R-2.25");
+        strcpy(v.at(1), "R-2.25");
         assert_eq!(atof(&b"R-2.25"[1..]), -2.25);
         assert_eq!(atof(v.at(1)), 0.0);
     }
@@ -1498,7 +1498,7 @@ mod tests {
     #[test]
     fn a_string_element_of_an_array_is_a_destination() {
         let v = <SeqVar<[SeqString; 3]>>::zeroed();
-        strcpy(&v.at(2), "Al");
+        strcpy(v.at(2), "Al");
         assert_eq!(v.get()[2].as_bytes(), b"Al");
     }
 
@@ -1507,14 +1507,14 @@ mod tests {
         let v = <SeqVar<SeqString>>::zeroed();
         strcpy(&v, "abcdef");
         strcpy(&v, "xy");
-        let t = |n| tail(&v, n).unwrap().to_vec();
+        let t = |n| tail(&v, n).to_c_vec();
         assert_eq!(t(1), b"y");
         assert_eq!(t(2), b"");
         // past the terminator, what the longer copy left
         assert_eq!(t(3), b"def");
         assert_eq!(t(40), b"");
-        assert_eq!(&*tail("abc", 3).unwrap(), b"");
-        assert_eq!(&*tail(Some(Arc::from(&b"a\0bc"[..])), 2).unwrap(), b"bc");
+        assert_eq!(tail("abc", 3).to_c_vec(), b"");
+        assert_eq!(tail(CharPtr::from_bytes(b"a\0bc"), 2).to_c_vec(), b"bc");
     }
 
     #[test]
@@ -1525,10 +1525,10 @@ mod tests {
         strcpy(&v, "xy");
         assert_eq!(char_at(&v, 3), b'd' as c_char);
         assert_eq!(char_at(&v, 2), 0);
-        // snc-rs reads s+1+2 as tail(&s, 1 + 2), and s+1+6 as C does
-        assert_eq!(&*tail(&v, 1 + 2).unwrap(), b"def");
+        // C's s+1+2 reads on past the terminator at s+1, as s+3 does
+        assert_eq!(tail(&v, 1 + 2).to_c_vec(), b"def");
         strcpy(&v, "abcdef");
-        assert_eq!(&*tail(&v, 1 + 6).unwrap(), b"");
+        assert_eq!(tail(&v, 1 + 6).to_c_vec(), b"");
         // the terminator a literal or a copy has after its bytes
         assert_eq!(char_at("abc", 3), 0);
         assert_eq!(char_at(tail("abc", 1), 2), 0);
@@ -1554,8 +1554,8 @@ mod tests {
 
     #[test]
     fn only_a_null_char_ptr_is_null_through_every_forward() {
-        let null: CharPtr = None;
-        let set: CharPtr = Some(Arc::from(&b""[..]));
+        let null = CharPtr::default();
+        let set = CharPtr::from_bytes(b"");
         assert!(null.is_null());
         assert!(!set.is_null());
         assert!(<&CharPtr as CSrc>::is_null(&&null));

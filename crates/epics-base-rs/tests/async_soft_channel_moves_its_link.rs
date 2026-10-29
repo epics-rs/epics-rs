@@ -8,7 +8,7 @@
 //! with any alarm or diagnostic.
 //!
 //! GROUND TRUTH — the built C `softIoc` (7.0.10.1-DEV,
-//! `/home/stevek/work/epics-base/bin/linux-x86_64/softIoc`), same `.db` as
+//! `$EPICS_BASE/bin/linux-x86_64/softIoc`), same `.db` as
 //! below, each record processed once by `dbpf <rec>.PROC 1`:
 //!
 //! ```text
@@ -106,7 +106,7 @@ async fn an_async_soft_input_reads_its_inp_link() {
     // The reading lands in the completion's pass, which clears PACT.
     for name in ["A:AI", "A:LI"] {
         let rec = db.get_record(name).unwrap();
-        let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let until = std::time::Instant::now() + fact_budget::FACT_BUDGET;
         while rec.read().is_processing() {
             assert!(std::time::Instant::now() < until, "{name} never completed");
             epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(5)).await;

@@ -239,10 +239,15 @@ fn test_sscanf_narrows_through_the_output_object() {
         eval_str(r#"SSCANF("70000", "%hd")"#),
         StackValue::Double(4464.0)
     );
-    // `%lx` still parses HEX digits: 0x4294967295.
+    // `%lx` still parses HEX digits: 0x4294967295, which `strtoul` saturates
+    // at `ULONG_MAX` where `long` is 32 bits.
     assert_eq!(
         eval_str(r#"SSCANF("4294967295", "%lx")"#),
-        StackValue::Double(285960729237.0)
+        StackValue::Double(if std::ffi::c_ulong::BITS == 64 {
+            285960729237.0
+        } else {
+            4294967295.0
+        })
     );
 }
 
@@ -297,6 +302,32 @@ fn test_sscanf_rejects_a_second_live_conversion() {
     assert_eq!(
         eval_str(r#"SSCANF("%42", "%%%d")"#),
         StackValue::Double(42.0)
+    );
+}
+
+/// The conversions are glibc 2.43's under `_GNU_SOURCE`: `%i` takes `0b`, a
+/// bare prefix or exponent is a mismatch, and an out-of-range number is
+/// `strtol`'s. Through the greedy `%%` skip `"%d %% %i"` hands its one object
+/// to `%d`, and C alarms only when `%i` converts too, into a pointer it was
+/// never given.
+#[test]
+fn test_sscanf_matches_glibc_with_gnu_source() {
+    let mut inputs = StringInputs::new();
+    assert_eq!(
+        eval_str(r#"SSCANF("1 x", "%d %% %i")"#),
+        StackValue::Double(1.0)
+    );
+    assert!(scalc(r#"SSCANF("1 % 2", "%d %% %i")"#, &mut inputs).is_err());
+    assert_eq!(eval_str(r#"SSCANF("0b11", "%i")"#), StackValue::Double(3.0));
+    assert!(scalc(r#"SSCANF("0x", "%x")"#, &mut inputs).is_err());
+    assert!(scalc(r#"SSCANF("1e", "%f")"#, &mut inputs).is_err());
+    assert_eq!(
+        eval_str(r#"SSCANF("18446744073709551616", "%lu")"#),
+        StackValue::Double(std::ffi::c_ulong::MAX as f64)
+    );
+    assert_eq!(
+        eval_str(r#"SSCANF("99999999999999999999", "%d")"#),
+        StackValue::Double(std::ffi::c_long::MAX as i32 as f64)
     );
 }
 

@@ -636,65 +636,21 @@ struct UntilSlot {
 }
 
 impl UntilScratch {
-    /// C's pre-scan walks the program byte by byte and skips only past
-    /// `LITERAL_DOUBLE`/`LITERAL_INT`/`LITERAL_STRING`, so a vararg count
-    /// byte of 1 or 2 is skipped as a literal and an sCalc string literal
-    /// skips one byte more (CBUG-O1, reproduced). Where that walk would read
-    /// past the end of the program, C's read is out of bounds (ASan
-    /// heap-buffer-overflow at `sCalcPerform.c:340` for `MAX(A)`, `"ab"`);
-    /// there, deliberate deviation, the scan decodes whole opcodes instead
-    /// (CBUG-O2).
+    /// `sCalcPerform.c:339-378` / `aCalcPerform.c:356-394`, stepping with
+    /// [`decode`]. C steps by byte value and skips only literals, so it reads
+    /// the count byte after `MAX`/`MIN`/`FINITE`/`ISNAN` and the bytes of a
+    /// literal as opcodes, misses or invents an UNTIL/UNTIL_END and fails a
+    /// valid program with -1 (CBUG-O1), or reads past the postfix (CBUG-O2).
+    /// Neither is copied.
     pub(crate) fn scan(t: &Table, kind: ExprKind, code: &[u8]) -> Result<Self, CalcError> {
-        match Self::scan_bytes(t, code)? {
-            Some(me) => Ok(me),
-            None => Self::scan_opcodes(t, kind, code),
-        }
-    }
-
-    fn new() -> Self {
-        UntilScratch {
+        let mut me = UntilScratch {
             slots: [UntilSlot {
                 until: 0,
                 end: None,
                 depth: 0,
             }; MAX_UNTILS],
             n: 0,
-        }
-    }
-
-    /// `sCalcPerform.c:339-378` / `aCalcPerform.c:356-394` as written;
-    /// `None` where C would read past `code`.
-    fn scan_bytes(t: &Table, code: &[u8]) -> Result<Option<Self>, CalcError> {
-        let mut me = Self::new();
-        let mut post = 0;
-        loop {
-            let Some(&b) = code.get(post) else {
-                return Ok(None);
-            };
-            match t.slots[b as usize] {
-                _ if b == END => return Ok(Some(me)),
-                Slot::LitDouble => post += 8,
-                Slot::LitInt => post += 4,
-                Slot::LitString => {
-                    post += 1;
-                    let Some(len) = code
-                        .get(post..)
-                        .and_then(|r| r.iter().position(|&c| c == 0))
-                    else {
-                        return Ok(None);
-                    };
-                    post += len + 1;
-                }
-                Slot::Op(Opcode::Control(ControlOp::Until)) => me.open(post)?,
-                Slot::Op(Opcode::Control(ControlOp::UntilEnd)) => me.close(post)?,
-                _ => {}
-            }
-            post += 1;
-        }
-    }
-
-    fn scan_opcodes(t: &Table, kind: ExprKind, code: &[u8]) -> Result<Self, CalcError> {
-        let mut me = Self::new();
+        };
         let mut pc = body_start(kind, code);
         loop {
             let (op, next) = decode(t, code, pc)?;

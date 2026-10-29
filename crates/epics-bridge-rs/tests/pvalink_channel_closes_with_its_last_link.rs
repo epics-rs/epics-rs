@@ -19,15 +19,15 @@ record(ai, "H") { field(INP, {pva:{pv:"T:OLD"}}) }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_put_moving_the_last_link_off_a_channel_closes_it() {
-    let port = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let closed = named_port::HeldPort::closed_tcp();
     // SAFETY: before the IOC builds its PVA client; nothing else in this
-    // test binary touches the environment. Nothing listens on `port`.
+    // test binary touches the environment. Nothing listens on `closed.port`,
+    // and the hold keeps a stranger from binding it until the test ends.
     unsafe {
-        std::env::set_var("EPICS_PVA_NAME_SERVERS", format!("127.0.0.1:{port}"));
+        std::env::set_var(
+            "EPICS_PVA_NAME_SERVERS",
+            format!("127.0.0.1:{}", closed.port),
+        );
         std::env::set_var("EPICS_PVA_ADDR_LIST", "");
         std::env::set_var("EPICS_PVA_AUTO_ADDR_LIST", "NO");
     }

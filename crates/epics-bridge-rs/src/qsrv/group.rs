@@ -11,6 +11,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use epics_base_rs::server::database::char_view::ChannelAddr;
 use epics_base_rs::server::database::db_access::{DbAttachment, SubscriptionActivation};
 use epics_base_rs::server::database::{PutSplit, PvDatabase};
 use epics_base_rs::server::pv::{MonitorEvent, SubscribeRefused};
@@ -38,61 +39,42 @@ pub(crate) struct FieldNameComponent {
     index: Option<u32>,
 }
 
-/// Parse a field path like `"a.b[0].c"` into components, enforcing the pvxs
-/// `FieldName` constructor grammar (`ioc/fieldname.cpp:29-67`).
+/// Parse a field path like `"a.b[0].c"` into components, accepting exactly
+/// the member names a pvxs 1.5.3 group builds.
 ///
-/// This is the single source of truth for the group field-name grammar. pvxs
-/// splits the path on `.` with `std::getline` and **throws** — aborting that
-/// group's build — on a malformed path; the throw set is byte-faithful to
-/// `getline`/`strtol`:
-///   - empty input → no components (pvxs skips the split; no throw);
-///   - an empty leading or interior component (`.a`, `a..b`, `.`) is an error;
-///     a single terminal empty from a trailing `.` (`a.`) is dropped at EOF
-///     (`getline` fails on a zero-length extraction at end-of-stream) and is
-///     NOT an error;
-///   - a component is array-indexed only when it ENDS with `]`, in which case
-///     it must contain a `[` and a non-negative decimal subscript (`a[x]`,
-///     `a[1x]` are errors: the subscript is not a clean integer). A component
-///     with no trailing `]` (`a[`) is a plain literal name, bracket included.
+/// This is the single source of truth for the group field-name grammar. pvxs's
+/// `FieldName` constructor (`ioc/fieldname.cpp:29-67`) splits on `.` with
+/// `std::getline` and reads a subscript with `strtol`, but that leniency never
+/// reaches a group: `Field::fullName` is the `FieldName::to_string()`
+/// rendering (`field.cpp:31`, `fieldname.cpp:87-106`), and group creation finds
+/// each member with `Group::operator[]`, which compares `fullName` to the
+/// configured name (`group.cpp:103-109`, called at
+/// `groupconfigprocessor.cpp:543`, `:576`). A name that renders differently
+/// fails with "field not found in group" and the group is not created
+/// (`:462-465`). The grammar is therefore:
+///   - empty input → no components;
+///   - an empty component is an error: `.a`, `a..b`, `.`, and a trailing `.`,
+///     which `getline` drops so `a.` renders as `a`;
+///   - a component is array-indexed only when it ends with `]`; it must
+///     contain a `[`, and the subscript must be canonical decimal (`0`, or no
+///     leading zero) and at most 4294967294. `a[x]` throws in `FieldName`;
+///     `a[ 5]`, `a[+5]`, `a[05]`, `a[-0]`, `a[]` and `a[1]]` render as
+///     `a[5]`, `a[0]` or `a[1]`; 4294967295 is pvxs's no-subscript index
+///     (`fieldnamecomponent.h:62-64`) and renders as `a`; and `a[-1]` or
+///     `a[4294967296]` wraps in the `uint32_t` index. A component with no
+///     trailing `]` (`a[`) is a plain name, bracket included.
 ///
 /// The infallible [`parse_field_path`] wraps this for navigating names already
 /// validated at group-build time; `group_config::validate_field_name` calls it
 /// to reject a malformed member (a per-group skip, matching pvxs's per-group
-/// `try` at `groupconfigprocessor.cpp:431-446`).
-///
-/// Divergence note: this subscript grammar is intentionally STRICTER than pvxs
-/// and rejects three degenerate forms that pvxs's `strtol`
-/// (`fieldname.cpp:48-53`) accepts — we deliberately do NOT replicate the
-/// `strtol` accidents:
-///   - an empty subscript `a[]` — `strtol("]")` performs no conversion, returns
-///     0, and leaves `endScan` on the `]`, so pvxs silently reads it as element
-///     0; `"".parse::<u32>()` errors here;
-///   - a whitespace/sign-padded subscript `a[ 5]` — `strtol` skips leading
-///     whitespace and an optional sign and reads 5; `" 5".parse::<u32>()`
-///     errors here;
-///   - a negative or `u32`-overflowing subscript (`a[-1]`, `a[99999999999]`) —
-///     `strtol` accepts it and only fails later at navigation.
-///
-/// Group array indices are non-negative and bounded, so none of these could
-/// navigate to a real element; rejecting them at build is stricter-but-safe and
-/// never touches a real config. All three are build-time-only divergences.
+/// `try` at `groupconfigprocessor.cpp:431-465`).
 pub(crate) fn parse_field_path_checked(path: &str) -> Result<Vec<FieldNameComponent>, String> {
     if path.is_empty() {
         return Ok(Vec::new());
     }
 
-    // Replicate `while (getline(splitter, part, '.'))`: the terminal empty
-    // produced by a single trailing '.' is dropped at EOF and never reaches
-    // the empty-component check; every other empty is an error.
-    let raw: Vec<&str> = path.split('.').collect();
-    let count = if path.ends_with('.') {
-        raw.len() - 1
-    } else {
-        raw.len()
-    };
-
-    let mut components = Vec::with_capacity(count);
-    for part in &raw[..count] {
+    let mut components = Vec::new();
+    for part in path.split('.') {
         if part.is_empty() {
             return Err(format!("Empty field component in: {path}"));
         }
@@ -102,9 +84,14 @@ pub(crate) fn parse_field_path_checked(path: &str) -> Result<Vec<FieldNameCompon
             let open = part
                 .rfind('[')
                 .ok_or_else(|| format!("Invalid field array sub-script in : {path}"))?;
-            let index: u32 = part[open + 1..]
-                .parse()
-                .map_err(|_| format!("Invalid field array sub-script in : {path}"))?;
+            let digits = &part[open + 1..];
+            let canonical = digits.bytes().all(|b| b.is_ascii_digit())
+                && (digits == "0" || !digits.starts_with('0'));
+            let index = digits
+                .parse::<u32>()
+                .ok()
+                .filter(|&i| canonical && i != u32::MAX)
+                .ok_or_else(|| format!("Invalid field array sub-script in : {path}"))?;
             components.push(FieldNameComponent {
                 name: part[..open].to_string(),
                 index: Some(index),
@@ -596,6 +583,15 @@ fn member_slot(fields: &mut Vec<(String, FieldDesc)>, name: &str) -> usize {
 // Atomic multi-record locking (pvxs DBManyLocker equivalent)
 // ---------------------------------------------------------------------------
 
+/// Each member record's cell and the read guard the atomic path holds on it.
+type GuardMap<'a> = HashMap<
+    &'a [u8],
+    (
+        &'a epics_base_rs::server::record::RecordCell,
+        &'a epics_base_rs::server::record::RecordInstance,
+    ),
+>;
+
 /// Collect the records backing a group's members, in sorted order to prevent
 /// deadlocks. Corresponds to C++ QSRV `DBManyLocker` (dbmanylocker.h). The
 /// caller acquires the per-record read guards synchronously from these handles:
@@ -927,14 +923,20 @@ impl GroupChannel {
             // out of its write guard for this window, so this acquisition is
             // uncontended and deadlock-free; the guards are consumed synchronously
             // by `read_member_locked` below and never held across an await.
-            let guards: Vec<(&[u8], epics_base_rs::server::record::RecordRef<'_>)> = member_guards
+            let guards: Vec<(
+                &[u8],
+                &epics_base_rs::server::record::RecordCell,
+                epics_base_rs::server::record::RecordRef<'_>,
+            )> = member_guards
                 .iter()
-                .map(|(name, rec)| (&name[..], rec.read()))
+                .map(|(name, rec)| (&name[..], &**rec, rec.read()))
                 .collect();
             // Build a name→guard lookup so each member resolves
             // against the already-held guard for its backing record.
-            let guard_map: HashMap<&[u8], &epics_base_rs::server::record::RecordInstance> =
-                guards.iter().map(|(name, g)| (*name, &**g)).collect();
+            let guard_map: GuardMap<'_> = guards
+                .iter()
+                .map(|(name, cell, g)| (*name, (*cell, &**g)))
+                .collect();
             for (idx, member) in self.def.channels.iter().enumerate() {
                 // Only `proc` places no value field. A `+type:"structure"`
                 // member emits an empty struct branch (resolved by
@@ -1029,8 +1031,17 @@ impl GroupChannel {
         let backing = self.db.resolve_link_backed_metadata(&rec);
         let backing = epics_base_rs::server::database::LinkBacking::resolved(&backing);
 
+        let addr = member.addr(&self.db, &rec);
         let instance = rec.read();
-        Self::decode_member(member, record_name, field_name, &instance, backing, log)
+        Self::decode_member(
+            member,
+            record_name,
+            field_name,
+            addr,
+            &instance,
+            backing,
+            log,
+        )
     }
 
     /// Read a single member's value against a record instance that the
@@ -1040,7 +1051,7 @@ impl GroupChannel {
     fn read_member_locked(
         &self,
         member: &MemberChannel,
-        guard_map: &HashMap<&[u8], &epics_base_rs::server::record::RecordInstance>,
+        guard_map: &GuardMap<'_>,
         backings: &HashMap<
             &[u8],
             std::collections::HashMap<String, epics_base_rs::server::database::LinkMetadata>,
@@ -1053,7 +1064,7 @@ impl GroupChannel {
 
         let (record_name, field_name) = member.names();
 
-        let instance = *guard_map.get(record_name).ok_or_else(|| {
+        let (cell, instance) = *guard_map.get(record_name).ok_or_else(|| {
             BridgeError::RecordNotFound(String::from_utf8_lossy(record_name).into_owned())
         })?;
         // Resolved by the caller before it took any member guard — the atomic
@@ -1063,7 +1074,16 @@ impl GroupChannel {
             .get(record_name)
             .map(epics_base_rs::server::database::LinkBacking::resolved)
             .unwrap_or_else(epics_base_rs::server::database::LinkBacking::none);
-        Self::decode_member(member, record_name, field_name, instance, backing, log)
+        let addr = member.addr(&self.db, cell);
+        Self::decode_member(
+            member,
+            record_name,
+            field_name,
+            addr,
+            instance,
+            backing,
+            log,
+        )
     }
 
     /// Decode one member's value from an already-borrowed record
@@ -1080,43 +1100,40 @@ impl GroupChannel {
         member: &MemberChannel,
         record_name: &[u8],
         field_name: &str,
+        addr: Option<ChannelAddr>,
         instance: &epics_base_rs::server::record::RecordInstance,
         backing: epics_base_rs::server::database::LinkBacking<'_>,
         log: Option<&MonitorEvent>,
     ) -> BridgeResult<PvField> {
+        let not_found = || BridgeError::FieldNotFound {
+            record: String::from_utf8_lossy(record_name).into_owned(),
+            field: field_name.to_string(),
+        };
+        let (addr, view) = addr
+            .and_then(|addr| Some((addr, member.view_in(&addr)?)))
+            .ok_or_else(not_found)?;
         match member.def.mapping {
             FieldMapping::Scalar => {
-                let not_found = || BridgeError::FieldNotFound {
-                    record: String::from_utf8_lossy(record_name).into_owned(),
-                    field: field_name.to_string(),
-                };
-                let view = member.view_in(instance).ok_or_else(not_found)?;
                 let mut snapshot = member
                     .snapshot_in(instance, view, backing)
                     .ok_or_else(not_found)?;
                 if let Some(log) = log {
-                    member.write_log_over(&mut snapshot, log, instance, view);
+                    member.write_log_over(&mut snapshot, log, view);
                 }
-                // Derive the NT shape from the configured field's resolved
-                // value (record → common → virtual), not from the owning
-                // record type: a `REC.SCAN` member is NTEnum and a
-                // `BI.DESC` member is NTScalar string regardless of the
-                // record's type. `snapshot.value` IS the resolved field
-                // value and `snapshot_for_field` already populated common
-                // enum choices (e.g. `.SCAN`). Matches the single-record
-                // path and pvxs's per-channel `getChannelValueType`
-                // (groupconfigprocessor.cpp:960-974).
-                let nt_type = member.nt_type_in(instance, Some(&snapshot.value), view);
+                // Derive the NT shape from the configured field's address
+                // (record → common → virtual), not from the owning record
+                // type: a `REC.SCAN` member is NTEnum and a `BI.DESC` member
+                // is NTScalar string regardless of the record's type.
+                // Matches the single-record path and pvxs's per-channel
+                // `getChannelValueType` (groupconfigprocessor.cpp:960-974).
+                let nt_type = member.nt_type_in(&addr, view);
                 Ok(PvField::Structure(pvif::snapshot_to_pv_structure(
-                    &snapshot, nt_type,
+                    &snapshot,
+                    nt_type,
+                    instance.qtime_nsec_mask(),
                 )))
             }
             FieldMapping::Plain => {
-                let not_found = || BridgeError::FieldNotFound {
-                    record: String::from_utf8_lossy(record_name).into_owned(),
-                    field: field_name.to_string(),
-                };
-                let view = member.view_in(instance).ok_or_else(not_found)?;
                 let value = log
                     .and_then(|log| member.log_value(log, view))
                     .or_else(|| member.read_with(instance, view))
@@ -1127,7 +1144,7 @@ impl GroupChannel {
                 // long-string member shipped `ScalarArray(bytes)` under a
                 // `Scalar(Byte)` descriptor).
                 Ok(pvif::BareLeaf::of_channel(
-                    instance,
+                    &addr,
                     &member.field,
                     Some(&value),
                     value.db_field_type(),
@@ -1137,19 +1154,12 @@ impl GroupChannel {
                 .value(&value))
             }
             FieldMapping::Meta => {
-                let snapshot = member
-                    .view_in(instance)
-                    .and_then(|view| {
-                        let mut snapshot = member.snapshot_in(instance, view, backing)?;
-                        if let Some(log) = log {
-                            member.write_log_over(&mut snapshot, log, instance, view);
-                        }
-                        Some(snapshot)
-                    })
-                    .ok_or_else(|| BridgeError::FieldNotFound {
-                        record: String::from_utf8_lossy(record_name).into_owned(),
-                        field: field_name.to_string(),
-                    })?;
+                let mut snapshot = member
+                    .snapshot_in(instance, view, backing)
+                    .ok_or_else(not_found)?;
+                if let Some(log) = log {
+                    member.write_log_over(&mut snapshot, log, view);
+                }
                 // Same unnamed enclosing structure the descriptor
                 // advertises (see `meta_desc`), so the two cannot drift.
                 let mut meta = PvStructure::new("");
@@ -1159,21 +1169,19 @@ impl GroupChannel {
                 ));
                 meta.fields.push((
                     "timeStamp".into(),
-                    PvField::Structure(build_timestamp_from_snapshot(&snapshot)),
+                    PvField::Structure(pvif::build_timestamp(
+                        snapshot.timestamp,
+                        snapshot.user_tag,
+                        instance.qtime_nsec_mask(),
+                    )),
                 ));
                 Ok(PvField::Structure(meta))
             }
             FieldMapping::Any => {
-                let value = member
-                    .view_in(instance)
-                    .and_then(|view| {
-                        log.and_then(|log| member.log_value(log, view))
-                            .or_else(|| member.read_with(instance, view))
-                    })
-                    .ok_or_else(|| BridgeError::FieldNotFound {
-                        record: String::from_utf8_lossy(record_name).into_owned(),
-                        field: field_name.to_string(),
-                    })?;
+                let value = log
+                    .and_then(|log| member.log_value(log, view))
+                    .or_else(|| member.read_with(instance, view))
+                    .ok_or_else(not_found)?;
                 // pvxs serves `+type:"any"` as a PVA `any` slot whose
                 // payload carries the concrete DB field type: `IOCSource::
                 // get` allocates `anyType.cloneEmpty()` and writes the
@@ -1187,13 +1195,9 @@ impl GroupChannel {
                 // asked of the classifier rather than read off the stored
                 // variant — a one-element array field's `any` payload is a
                 // scalar, exactly as its plain and scalar members are.
-                let pv = pvif::BareLeaf::any_payload_of_channel(
-                    instance,
-                    &member.field,
-                    &value,
-                    &member.value_filters,
-                )
-                .value(&value);
+                let pv =
+                    pvif::BareLeaf::any_payload_of_channel(&addr, &value, &member.value_filters)
+                        .value(&value);
                 let desc = pv.wire_descriptor();
                 Ok(PvField::Variant(Box::new(VariantValue { desc, value: pv })))
             }
@@ -1205,15 +1209,12 @@ impl GroupChannel {
     /// Introspect a group scalar member's NT shape and DBF type from the
     /// configured channel's final field — the same final-field metadata
     /// the single-record path uses ([`super::channel::BridgeChannel::new`]),
-    /// not the owning record type. The value is taken through
-    /// `client_field_value` — the stored value projected onto the field's
-    /// DECLARED type — which is the same call the GET path above serializes,
-    /// so the descriptor cannot drift from the bytes that follow it:
-    /// `REC.SCAN` advertises NTEnum, `REC.DESC` advertises NTScalar
-    /// string, and `BI.DESC` stays a string member on an enum record.
-    /// pvxs builds scalar group member descriptors from
+    /// not the owning record type: `REC.SCAN` advertises NTEnum, `REC.DESC`
+    /// advertises NTScalar string, and `BI.DESC` stays a string member on an
+    /// enum record. pvxs builds scalar group member descriptors from
     /// `getTypeDefForChannel`/`getChannelValueType` on the field-specific
-    /// dbChannel (groupconfigprocessor.cpp:867-974), not the record type.
+    /// dbChannel (groupconfigprocessor.cpp:867-974) without locking the
+    /// record, so this reads only the address's settled facts.
     async fn introspect_member(
         &self,
         member: &MemberChannel,
@@ -1224,23 +1225,18 @@ impl GroupChannel {
             BridgeError::RecordNotFound(String::from_utf8_lossy(record_name).into_owned())
         })?;
 
-        let instance = rec.read();
         // A member whose `$` is refused never passes group creation.
-        let view = member
-            .view_in(&instance)
+        let (addr, view) = member
+            .addr(&self.db, &rec)
+            .and_then(|addr| Some((addr, member.view_in(&addr)?)))
             .ok_or_else(|| BridgeError::FieldNotFound {
                 record: String::from_utf8_lossy(record_name).into_owned(),
                 field: member.field.clone(),
             })?;
-        let resolved = member.value_with(&instance, view);
-        let nt_type = member.nt_type_in(&instance, resolved.as_ref(), view);
-        let value_dbf = member.value_filters.final_field_type(
-            resolved
-                .as_ref()
-                .map(|v| v.db_field_type())
-                .or_else(|| instance.declared_field_type(&member.field))
-                .unwrap_or(DbFieldType::Double),
-        );
+        let nt_type = member.nt_type_in(&addr, view);
+        let value_dbf = member
+            .value_filters
+            .final_field_type(view.served_type(&addr));
 
         Ok((nt_type, dbf_to_scalar_type(value_dbf)))
     }
@@ -1248,20 +1244,14 @@ impl GroupChannel {
     /// Look up a member's DBF field type for the PUT conversion target —
     /// pvxs converts the incoming leaf to `dbChannelFinalFieldType`, the
     /// field's DECLARED type, so this must be the type the descriptor
-    /// advertised, not the variant the record happens to store. Taken
-    /// through the same `client_field_value` projection as the descriptor
-    /// path above; `declared_field_type` covers the fields that carry no
-    /// value at all, and `Double` only when the record/field is unknown.
+    /// advertised, not the variant the record happens to store: the same
+    /// [`View::served_type`](pvif::View::served_type) the descriptor path above takes, and `Double`
+    /// only when the record/field is unknown.
     fn member_dbf_type(&self, member: &MemberChannel) -> DbFieldType {
-        let rec = match self.db.get_record(&member.record) {
-            Some(r) => r,
-            None => return DbFieldType::Double,
-        };
-        let instance = rec.read();
-        member
-            .value_in(&instance)
-            .map(|v| v.db_field_type())
-            .or_else(|| instance.declared_field_type(&member.field))
+        self.db
+            .get_record(&member.record)
+            .and_then(|rec| member.addr(&self.db, &rec))
+            .and_then(|addr| Some(member.view_in(&addr)?.served_type(&addr)))
             .unwrap_or(DbFieldType::Double)
     }
 
@@ -1351,14 +1341,10 @@ impl GroupChannel {
     /// string (`dbChannelFinalFieldType == DBR_CHAR && value is String`,
     /// iocsource.cpp:603-604).
     fn member_is_char_array(&self, member: &MemberChannel) -> bool {
-        let Some(rec) = self.db.get_record(&member.record) else {
-            return false;
-        };
-        let instance = rec.read();
-        matches!(
-            instance.channel_field_value(&member.field, false),
-            Some(epics_base_rs::types::EpicsValue::CharArray(_))
-        )
+        self.db
+            .get_record(&member.record)
+            .and_then(|rec| member.addr(&self.db, &rec))
+            .is_some_and(|addr| addr.value_type() == DbFieldType::Char)
     }
 
     /// Convert an incoming PvField to an EpicsValue typed against the
@@ -2672,7 +2658,8 @@ impl super::provider::PvaMonitor for GroupMonitor {
             let dollar = self
                 .db
                 .get_record(&member.record)
-                .and_then(|rec| member.view_in(&rec.read()))
+                .and_then(|rec| member.addr(&self.db, &rec))
+                .and_then(|addr| member.view_in(&addr))
                 .and_then(pvif::View::dollar);
             match self.pump.attach(
                 &self.db,
@@ -2925,40 +2912,6 @@ fn build_alarm_from_snapshot(snapshot: &epics_base_rs::server::snapshot::Snapsho
     alarm
 }
 
-/// Build a `timeStamp` PvStructure directly from the record snapshot.
-///
-/// The nanosecond / userTag split for `info(Q:time:tag, "nsec:lsb:N")`
-/// is applied once, when the member's snapshot is read
-/// (`MemberChannel::snapshot_in` via `apply_nsec_mask`), so
-/// `snapshot.timestamp` already carries the masked nanoseconds and
-/// `snapshot.user_tag` already carries the split bits / `common.utag`.
-/// The group encoder therefore serves them verbatim and must not remask
-/// — pvxs derives the same split from the record's `Q:time:tag`
-/// (`ioc/typeutils.cpp:79-87`, `ioc/iocsource.cpp:240-248`), never from
-/// group JSON.
-fn build_timestamp_from_snapshot(
-    snapshot: &epics_base_rs::server::snapshot::Snapshot,
-) -> PvStructure {
-    use epics_pva_rs::pvdata::ScalarValue;
-
-    let mut ts = PvStructure::new("time_t");
-    let dur = snapshot.timestamp.since_unix_epoch();
-    let (secs, nanos) = (dur.as_secs() as i64, dur.subsec_nanos() as i32);
-    ts.fields.push((
-        "secondsPastEpoch".into(),
-        PvField::Scalar(ScalarValue::Long(secs)),
-    ));
-    ts.fields.push((
-        "nanoseconds".into(),
-        PvField::Scalar(ScalarValue::Int(nanos)),
-    ));
-    ts.fields.push((
-        "userTag".into(),
-        PvField::Scalar(ScalarValue::Int(snapshot.user_tag)),
-    ));
-    ts
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3007,15 +2960,12 @@ mod tests {
         assert!(pv.get_field("x").is_some());
     }
 
-    /// a group `meta` timeStamp serves the record snapshot's userTag and
-    /// nanoseconds verbatim. The `Q:time:tag` nsec-LSB split is applied
-    /// once, by the member read (`MemberChannel::snapshot_in`
-    /// `apply_nsec_mask`), so the group encoder must not remask —
-    /// pvxs derives the split from the record, never from group JSON
-    /// (`ioc/iocsource.cpp:240-248`). `Snapshot.user_tag` defaults to the
-    /// record's `common.utag` (pvxs `iocsource.cpp:245`); the bit-31 tag
-    /// pins that the snapshot's i32 userTag passes through unchanged and
-    /// nanoseconds are not stripped by any group-level mask.
+    /// a group `meta` timeStamp of a record without `Q:time:tag` serves the
+    /// record snapshot's userTag and nanoseconds verbatim: the split mask is
+    /// the record's, never group JSON's (`ioc/iocsource.cpp:240-248`).
+    /// `Snapshot.user_tag` defaults to the record's `common.utag` (pvxs
+    /// `iocsource.cpp:245`); the bit-31 tag pins that the snapshot's i32
+    /// userTag passes through unchanged and nanoseconds are not stripped.
     #[test]
     fn group_timestamp_serves_record_snapshot_verbatim() {
         use epics_base_rs::server::snapshot::Snapshot;
@@ -3038,7 +2988,7 @@ mod tests {
         );
         snap.user_tag = 0x9000_0000u32 as i32;
 
-        let ts = build_timestamp_from_snapshot(&snap);
+        let ts = pvif::build_timestamp(snap.timestamp, snap.user_tag, 0);
         // userTag is the snapshot's (record) utag, not 0 and not remasked.
         assert_eq!(
             int_field(&ts, "userTag"),
@@ -3967,8 +3917,8 @@ mod tests {
 
     /// An empty leading or interior component is an error (pvxs `getline`
     /// yields an empty part → `throw "Empty field component"`,
-    /// fieldname.cpp:35-36). A single trailing '.' is dropped at EOF and is
-    /// NOT an error.
+    /// fieldname.cpp:35-36). So is a trailing '.': `getline` drops it, so
+    /// `a.` renders as `a` and pvxs's group lookup by rendered name fails.
     #[test]
     fn parse_field_path_checked_empty_component() {
         assert!(parse_field_path_checked(".a").is_err(), "leading dot");
@@ -3982,39 +3932,40 @@ mod tests {
             "interior empty before trailing"
         );
 
-        // Trailing dot: `getline` fails the zero-length final extraction at
-        // EOF, so `a.` is just `a` — no error (fieldname.cpp getline loop).
-        let comps = parse_field_path_checked("a.").expect("trailing dot is dropped, not an error");
-        assert_eq!(comps.len(), 1);
-        assert_eq!(comps[0].name, "a");
+        assert!(parse_field_path_checked("a.").is_err(), "trailing dot");
+        assert!(parse_field_path_checked("a.b.").is_err(), "trailing dot");
     }
 
-    /// A component ending in ']' must carry a '[' and a non-negative decimal
-    /// subscript. NOTE: `value[]` and `value[-1]` are rejected here
-    /// INTENTIONALLY stricter than pvxs — its `strtol` (fieldname.cpp:48-53)
-    /// reads `value[]` as element 0 and accepts a negative/overflow index,
-    /// failing only later at navigation. We reject at build (see the divergence
-    /// note on `parse_field_path_checked`); this test pins the stricter Rust
-    /// behavior, it is NOT asserting a pvxs match. A non-']'-terminated
-    /// component is a literal name.
+    /// A component ending in ']' must carry a '[' and a canonical decimal
+    /// subscript of at most 4294967294: every other spelling pvxs's `strtol`
+    /// takes renders differently, and pvxs's group lookup by rendered name
+    /// then fails. A non-']'-terminated component is a literal name.
     #[test]
     fn parse_field_path_checked_bad_subscript() {
-        assert!(
-            parse_field_path_checked("value[x]").is_err(),
-            "non-integer subscript"
-        );
-        assert!(
-            parse_field_path_checked("value[]").is_err(),
-            "empty subscript — stricter than pvxs, which reads it as element 0"
-        );
-        assert!(
-            parse_field_path_checked("value[1x]").is_err(),
-            "trailing garbage"
-        );
-        assert!(
-            parse_field_path_checked("value[-1]").is_err(),
-            "negative subscript — stricter than pvxs, which strtol-accepts then fails at nav"
-        );
+        for bad in [
+            "value[x]",
+            "value[1x]",
+            "value[+5]",
+            "value[05]",
+            "value[ 5]",
+            "value[-0]",
+            "value[]",
+            "value[-1]",
+            "value[1]]",
+            "value[4294967295]",
+            "value[4294967296]",
+        ] {
+            assert!(parse_field_path_checked(bad).is_err(), "{bad}");
+        }
+        for (good, index) in [
+            ("value[0]", 0),
+            ("value[5]", 5),
+            ("value[4294967294]", u32::MAX - 1),
+        ] {
+            let comps = parse_field_path_checked(good).expect(good);
+            assert_eq!(comps[0].name, "value");
+            assert_eq!(comps[0].index, Some(index), "{good}");
+        }
 
         // `value[` does not end with ']' → pvxs keeps it as a literal field
         // name (bracket included), no throw. The old parser renamed it to
@@ -6414,6 +6365,35 @@ record(calcout, "T") { field(ODLY, "0.5") field(CALC, "1") }
             assert!(
                 t.common.putf,
                 "processTarget copied H's PUTF (atomic={atomic})"
+            );
+        }
+    }
+
+    /// A group PUT converts to `dbChannelFinalFieldType`, which for a record
+    /// attribute is `dbGetAttributePart`'s `DBF_STRING`
+    /// (`dbStaticLib.c:1268-1271`).
+    #[epics_base_rs::epics_test]
+    async fn an_attribute_member_puts_as_a_string() {
+        let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+            .db_string("record(ai, \"X\") {}\n", &std::collections::HashMap::new())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        db.ioc_init().await;
+        let def = crate::qsrv::group_config::parse_group_config(
+            r#"{"G:x": {"s": {"+channel": "X.RTYP", "+type": "scalar"}, "p": {"+channel": "X.VERS", "+type": "plain"}}}"#,
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
+        let group = GroupChannel::new(db, def);
+        for m in group.def.channels.iter() {
+            assert_eq!(
+                group.member_dbf_type(m),
+                DbFieldType::String,
+                "{:?}",
+                m.names()
             );
         }
     }

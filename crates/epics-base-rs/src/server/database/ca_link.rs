@@ -11,9 +11,9 @@
 //! link that never connects, as a C link whose search nobody answers.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
 use arc_swap::ArcSwapOption;
@@ -23,20 +23,19 @@ use super::channel_io::{self, ChannelTarget, DbAccessChannel};
 use super::dbr_delivery::{DeliveryStage, prepare_read, with_live_options};
 use super::filters::FilterChain;
 use super::link_set::{
-    DynLinkSet, LinkDbfType, LinkDiagnostics, LinkMetadata, LinkPutDone, LinkPutOp, LinkRef,
-    LinkSerial, LinkSet, PutAdmission,
+    DynLinkSet, EnumString, LinkDbfType, LinkDiagnostics, LinkMetadata, LinkPutDone, LinkPutOp,
+    LinkRef, LinkSerial, LinkSet, LinkShape, PutAdmission,
 };
 use super::{CaLinkInit, ExternalCpProcess, LinkHolder, PvDatabase, PvDatabaseInner};
+use crate::runtime::sync::oneshot;
 use crate::runtime::task::TaskHandle;
-use crate::server::event_queue::{
-    AttachId, DeliveryContext, EvQue, EventReader, EventUser, no_context,
-};
+use crate::server::event_queue::{CircuitEvent, DeliveryContext, EventReader, EventUser};
 use crate::server::pv::{MonitorEvent, PutStarted, SubscribeRefused, WriteContext, WriteEnd};
-use crate::server::record::ProcessCompletion;
-use crate::server::snapshot::Snapshot;
+use crate::server::record::{ProcessCompletion, RecordCell};
+use crate::server::snapshot::{AlarmInfo, Snapshot};
 use crate::types::{
-    DBR_CTRL_DOUBLE, DbFieldType, EpicsValue, RecordName, dbr_buffer_size, decode_dbr,
-    encode_dbr_into, native_type_for_dbr,
+    DBR_CTRL_DOUBLE, DBR_TIME_STRING, DbFieldType, EpicsValue, PvString, RecordName, WallTime,
+    dbr_buffer_size, decode_dbr, encode_dbr_into, native_type_for_dbr,
 };
 
 /// dbCa's monitor mask, `ca_add_array_event`'s `DBE_VALUE | DBE_ALARM`
@@ -48,10 +47,6 @@ pub const CA_LINK_EVENT_MASK: u16 =
 /// gives up — `dbPutNotifyBlocker::initiatePutNotify`'s 30 s
 /// (`dbPutNotifyBlocker.cpp:146-149`).
 const PUT_NOTIFY_BLOCK_TIMEOUT: Duration = Duration::from_secs(30);
-
-fn strip_ca_scheme(name: &[u8]) -> &[u8] {
-    name.strip_prefix(b"ca://").unwrap_or(name)
-}
 
 /// Where `ca_create_channel` sent a link.
 enum Route {
@@ -74,6 +69,15 @@ pub(crate) struct CaLinks {
     /// so until then every link, local or network, reads as unconnected
     /// (`dbCa.c:459`), whatever its channel has already delivered.
     ca_run: Arc<super::processing::CaRunGate>,
+    /// The local links' actions, `dbCaTask`'s work list.
+    actions: Arc<LinkActions>,
+    /// The serviced actions whose rest still waits, in the order they were
+    /// serviced; only the `dbCaLink` thread touches it.
+    owed: parking_lot::Mutex<VecDeque<Owed>>,
+    /// The local links' monitors' one event user, and its event task,
+    /// started with the first local link.
+    events: Arc<LocalEvents>,
+    consumer: OnceLock<AbortOnDrop>,
 }
 
 impl CaLinks {
@@ -82,11 +86,21 @@ impl CaLinks {
         ca_run: Arc<super::processing::CaRunGate>,
     ) -> Self {
         Self {
+            actions: Arc::new(LinkActions {
+                queue: parking_lot::Mutex::new(VecDeque::new()),
+                db: db.clone(),
+            }),
+            owed: parking_lot::Mutex::new(VecDeque::new()),
             db,
             routes: RwLock::new(HashMap::new()),
             network: RwLock::new(None),
             isolated: AtomicBool::new(false),
             ca_run,
+            events: Arc::new(LocalEvents {
+                user: EventUser::new(),
+                delivery: parking_lot::Mutex::new(()),
+            }),
+            consumer: OnceLock::new(),
         }
     }
 
@@ -106,10 +120,14 @@ impl CaLinks {
         *self.network.write() = None;
     }
 
-    /// Whether a `ca` link to `name` has anything to connect to: a name
-    /// this database serves, or any name once a network half is registered.
-    pub(crate) fn addresses(&self, name: &[u8]) -> bool {
-        self.network.read().is_some() || self.has_name(strip_ca_scheme(name))
+    /// Whether `link` has anything to connect to: a name this database
+    /// serves, or any name once a network half is registered. An opened link
+    /// answers from its route, as a scan cycle's put gate asks it.
+    pub(crate) fn addresses(&self, link: LinkRef<'_>) -> bool {
+        self.network.read().is_some()
+            || self
+                .settled_local(link)
+                .unwrap_or_else(|| self.has_name(link.name))
     }
 
     /// Whether `link` is a local link — C's `dbCaPutAsync` to one completes
@@ -129,12 +147,10 @@ impl CaLinks {
     /// database does not serve is decided here, once, as C decides it once
     /// per link.
     fn serves(&self, link: LinkRef<'_>) -> bool {
-        match self.routes.read().get(&link.serial()) {
-            Some((_, Route::Local(_))) => return true,
-            Some((_, Route::Network)) => return false,
-            None => {}
+        if let Some(local) = self.settled_local(link) {
+            return local;
         }
-        let name = strip_ca_scheme(link.name);
+        let name = link.name;
         if self.has_name(name) {
             return true;
         }
@@ -145,6 +161,14 @@ impl CaLinks {
                 .or_insert_with(|| (name.into(), Route::Network));
         }
         false
+    }
+
+    /// Whether the route `link`'s open settled is local; `None` before it.
+    fn settled_local(&self, link: LinkRef<'_>) -> Option<bool> {
+        self.routes
+            .read()
+            .get(&link.serial())
+            .map(|(_, route)| matches!(route, Route::Local(_)))
     }
 
     fn network(&self) -> Option<DynLinkSet> {
@@ -205,8 +229,7 @@ impl CaLinks {
         let db = PvDatabase {
             inner: self.db.upgrade()?,
         };
-        let name = strip_ca_scheme(link.name);
-        let channel = LocalChannel::create(&db, name).await;
+        let channel = LocalChannel::create(&db, link.name).await;
         // The link starts as its route is published, under this lock: two
         // first opens of one link start one channel, the loser's drops
         // unstarted, and so does an open the link's removal overtook.
@@ -218,10 +241,14 @@ impl CaLinks {
             std::collections::hash_map::Entry::Occupied(won) => &won.into_mut().1,
             std::collections::hash_map::Entry::Vacant(route) => {
                 let opened = match channel {
-                    Some(channel) => Route::Local(Arc::new(LocalLink::open(&db, channel, link)?)),
+                    Some(channel) => {
+                        let local = LocalLink::open(&db, channel, link, &self.actions)?;
+                        self.start_events(&db);
+                        Route::Local(local)
+                    }
                     None => Route::Network,
                 };
-                &route.insert((name.into(), opened)).1
+                &route.insert((link.name.into(), opened)).1
             }
         };
         match route {
@@ -235,17 +262,134 @@ impl CaLinks {
     /// after the call are not waited for, so a CP cycle does not hold it.
     /// Only after `dbCaRun`, as C's worker is paused before it.
     pub(crate) async fn sync(&self) {
-        let marks: Vec<(Arc<LocalLink>, u64)> = self
+        let links: Vec<Arc<LocalLink>> = self
             .routes
             .read()
             .values()
             .filter_map(|(_, route)| match route {
-                Route::Local(link) => Some((link.clone(), link.state.mark())),
+                Route::Local(link) => Some(link.clone()),
                 Route::Network => None,
             })
             .collect();
-        for (link, mark) in marks {
+        let marks: Vec<u64> = {
+            let _taking = self.events.delivery.lock();
+            links.iter().map(|link| link.mark()).collect()
+        };
+        for (link, mark) in links.iter().zip(marks) {
             link.state.until_consumed(mark).await;
+        }
+    }
+
+    /// `dbCaTask`'s `CA_CONNECT` open (`dbCa.c:1205-1223`) of a link to a
+    /// name this database serves, made on the `dbCaLink` thread so local
+    /// links join the work list in the order they were added. `Err` hands
+    /// `init` back for a link it does not serve.
+    pub(super) async fn connect_served(
+        &self,
+        link: LinkRef<'_>,
+        init: Option<CaLinkInit>,
+    ) -> Result<(), Option<CaLinkInit>> {
+        if !self.has_name(link.name) {
+            return Err(init);
+        }
+        let Some(local) = self.open(link).await else {
+            return Err(init);
+        };
+        if let Some(init) = init {
+            local.state.process.adopt_init(init);
+        }
+        Ok(())
+    }
+
+    /// `dbCaTask`'s pass over the local links' work list
+    /// (`dbCa.c:1174-1331`), on the `dbCaLink` thread once `dbCaRun` has
+    /// run: each action in the order it was added.
+    ///
+    /// A record field's monitor takes its slot on the source's monitor list
+    /// as its action is serviced. Its `db_event_enable` and first event,
+    /// which C makes in the same action (`dbSubscriptionIO.cpp:47-53`), and
+    /// a connect's attribute get before them, are made at once unless the
+    /// action waits ([`Wait`]) or an earlier one on its record still does;
+    /// then the action is owed, and [`Self::settle`] makes its rest, in
+    /// slot order on each record, as the waits end. Only this thread does
+    /// either, so a record's links have their first events in slot order.
+    pub(super) fn service_actions(&self) {
+        let Some(inner) = self.db.upgrade() else {
+            return;
+        };
+        let db = PvDatabase { inner };
+        let waker = std::task::Waker::from(self.actions.clone());
+        let mut cx = std::task::Context::from_waker(&waker);
+        let mut owed = self.owed.lock();
+        let mut held = Self::settle(&mut owed, &db, &mut cx);
+        loop {
+            let next = self.actions.queue.lock().pop_front();
+            let Some((action, link)) = next else {
+                return;
+            };
+            let Some(link) = link.upgrade() else {
+                continue;
+            };
+            let next = match action {
+                Action::Connect => link.connect(&db, &self.events, &self.ca_run),
+                Action::MonitorNative => link.monitor(
+                    &db,
+                    &self.events,
+                    Feed::Native(parking_lot::Mutex::new(None)),
+                ),
+                Action::MonitorString => link.monitor(&db, &self.events, Feed::String),
+            };
+            let Some(mut next) = next else {
+                continue;
+            };
+            let record = Arc::as_ptr(&next.record);
+            if next.wait.is_over(&db, &next.record, &mut cx) && !held.contains(&record) {
+                next.finish(&db, &link);
+                continue;
+            }
+            if next.wait.holds() {
+                held.insert(record);
+            }
+            owed.push_back(next);
+        }
+    }
+
+    /// The rest of each owed action whose wait is over, in the order the
+    /// actions were serviced on each record; returns the records whose
+    /// later actions are held. One still waiting holds the later ones on
+    /// its record. One still owed edge sweeps holds none, as its wait has
+    /// no bound and `dbCaRun` may be waiting for a later one; it joins its
+    /// record's order when its sweeps clear and it asks its turn. A wait's
+    /// progress wakes this thread ([`LinkActions`]).
+    fn settle(
+        owed: &mut VecDeque<Owed>,
+        db: &PvDatabase,
+        cx: &mut std::task::Context<'_>,
+    ) -> HashSet<*const RecordCell> {
+        let mut held = HashSet::new();
+        owed.retain_mut(|owed| {
+            let Some(link) = owed.link.upgrade() else {
+                return false;
+            };
+            let record = Arc::as_ptr(&owed.record);
+            if owed.wait.is_over(db, &owed.record, cx) && !held.contains(&record) {
+                owed.finish(db, &link);
+                return false;
+            }
+            if owed.wait.holds() {
+                held.insert(record);
+            }
+            true
+        });
+        held
+    }
+
+    /// `db_start_events` for the database's one `dbContext`, with its first
+    /// local link.
+    fn start_events(&self, db: &PvDatabase) {
+        if let Some(bridge) = db.inner.link_puts.network() {
+            self.consumer
+                .get_or_init(|| AbortOnDrop(bridge.spawn(deliver_events(self.events.clone()))));
         }
     }
 }
@@ -277,6 +421,13 @@ impl LinkSet for CaLinks {
     fn get_cached_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
         self.answer(link, LocalLink::read, |n| Some(n.get_cached_value(link)))
             .flatten()
+    }
+
+    fn get_cached_enum_string(&self, link: LinkRef<'_>) -> EnumString {
+        self.answer(link, LocalLink::enum_string, |n| {
+            Some(n.get_cached_enum_string(link))
+        })
+        .unwrap_or(EnumString::Pending)
     }
 
     fn get_failure_disconn(&self, link: LinkRef<'_>) -> bool {
@@ -372,7 +523,7 @@ impl LinkSet for CaLinks {
         value: EpicsValue,
         op: LinkPutOp,
     ) -> (LinkPutDone, Result<(), String>) {
-        let name = strip_ca_scheme(link.name);
+        let name = link.name;
         let unconnected = || {
             Err(format!(
                 "CA link {} not connected",
@@ -405,11 +556,7 @@ impl LinkSet for CaLinks {
     fn alarm_severity(&self, link: LinkRef<'_>) -> Option<i32> {
         self.answer(
             link,
-            |local| {
-                local
-                    .with_value(|s| s.alarm.severity as i32)
-                    .filter(|&s| s > 0)
-            },
+            |local| local.stamp().map(|s| s.severity as i32).filter(|&s| s > 0),
             |n| Some(n.alarm_severity(link)),
         )
         .flatten()
@@ -418,7 +565,7 @@ impl LinkSet for CaLinks {
     fn alarm_status(&self, link: LinkRef<'_>) -> Option<i32> {
         self.answer(
             link,
-            |local| local.with_value(|s| s.alarm.status as i32),
+            |local| local.stamp().map(|s| s.status as i32),
             |n| Some(n.alarm_status(link)),
         )
         .flatten()
@@ -434,8 +581,8 @@ impl LinkSet for CaLinks {
         self.answer(
             link,
             |local| {
-                local.with_value(|s| {
-                    let t = s.timestamp.since_unix_epoch();
+                local.stamp().map(|s| {
+                    let t = s.time.since_unix_epoch();
                     (t.as_secs() as i64, t.subsec_nanos() as i32, 0)
                 })
             },
@@ -449,6 +596,15 @@ impl LinkSet for CaLinks {
             link,
             |local| local.state.meta.get().cloned(),
             |n| Some(n.link_metadata(link)),
+        )
+        .flatten()
+    }
+
+    fn link_shape(&self, link: LinkRef<'_>) -> Option<LinkShape> {
+        self.answer(
+            link,
+            |local| local.state.meta.get().map(LinkMetadata::shape),
+            |n| Some(n.link_shape(link)),
         )
         .flatten()
     }
@@ -482,64 +638,55 @@ impl LinkSet for CaLinks {
     }
 }
 
-/// What a local link's monitor task shares with the link: C `caLink`'s
+/// The alarm and time of one event.
+#[derive(Clone, Copy)]
+struct LinkStamp {
+    status: u16,
+    severity: u16,
+    time: WallTime,
+}
+
+impl LinkStamp {
+    fn of(alarm: &AlarmInfo, time: WallTime) -> Self {
+        Self {
+            status: alarm.status,
+            severity: alarm.severity,
+            time,
+        }
+    }
+}
+
+/// What a local link's monitors share with the link: C `caLink`'s
 /// cached value and its `CA_DBPROCESS` request.
 struct LocalState {
     cache: ArcSwapOption<Snapshot>,
+    /// C `pca->stat`, `sevr` and `timeStamp`: every event of either monitor
+    /// overwrites them (`dbCa.c:1001-1003`), and `getAlarm` /
+    /// `getTimeStamp` serve the last (`dbCa.c:672-693`).
+    stamp: ArcSwapOption<LinkStamp>,
     process: ExternalCpProcess,
-    /// Held while an event is taken off the queue, handed to `process` and
-    /// counted, so [`Self::mark`] never sees one taken but not counted.
-    delivery: parking_lot::Mutex<()>,
-    /// Events taken off the queue.
+    /// Events delivered, counted under [`LocalEvents::delivery`].
     taken: AtomicU64,
-    /// The monitor has ended: no queued event will be taken.
-    ended: AtomicBool,
-    /// The monitor's queue slot, read for its `npend`; set when the link
-    /// subscribes.
-    queue: std::sync::OnceLock<(std::pin::Pin<Arc<EvQue>>, AttachId)>,
+    /// C `pgetString`: the `DBR_STRING` monitor's last value.
+    string: ArcSwapOption<PvString>,
+    /// C `pvlOptInpString`: a read asked for the `DBR_STRING` monitor.
+    input_string: AtomicBool,
     /// `CA_GET_ATTRIBUTES`, answered once at the connect: a local channel
     /// connects once.
-    meta: std::sync::OnceLock<LinkMetadata>,
+    meta: OnceLock<LinkMetadata>,
     /// The link is a `DBF_INLINK`, monitored from its connect.
     inlink: bool,
     /// C `pvlOptInpNative`: set at the open for a `DBF_INLINK`, else by the
-    /// first read, whose `CA_MONITOR_NATIVE` [`Self::input_wanted`] carries.
+    /// first read, which adds `CA_MONITOR_NATIVE`.
     input_native: AtomicBool,
-    input_wanted: crate::runtime::sync::Notify,
 }
 
 impl LocalState {
-    /// `dbCaGetLink` marking the link a native input (`dbCa.c:455-457`).
-    fn note_read(&self) {
-        if !self.input_native.swap(true, Ordering::Relaxed) {
-            self.input_wanted.notify_one();
-        }
-    }
-
-    async fn until_input_native(&self) {
-        if !self.input_native.load(Ordering::Relaxed) {
-            self.input_wanted.notified().await;
-        }
-    }
-
-    /// The `dbCaSync` mark: the count `taken` reaches once every event
-    /// queued now has been taken.
-    fn mark(&self) -> u64 {
-        let _taking = self.delivery.lock();
-        let pending = self
-            .queue
-            .get()
-            .map_or(0, |(queue, id)| queue.npend(*id) as u64);
-        self.taken.load(Ordering::SeqCst) + pending
-    }
-
     /// Wait until the events up to `mark` are taken, then until the worker
     /// has served every request made by then.
     async fn until_consumed(&self, mark: u64) {
         self.process
-            .until_settled(|| {
-                self.taken.load(Ordering::SeqCst) >= mark || self.ended.load(Ordering::SeqCst)
-            })
+            .until_settled(|| self.taken.load(Ordering::SeqCst) >= mark)
             .await;
         let requested = self.process.request_mark();
         self.process
@@ -548,11 +695,56 @@ impl LocalState {
     }
 }
 
+/// A local link's action on `dbCaTask`'s work list (`dbCa.c:1205-1313`).
+enum Action {
+    /// `CA_CONNECT`: `connectionCallback`'s attribute get and, for a
+    /// `DBF_INLINK`, its `CA_MONITOR_NATIVE` (`dbCa.c:909-928`).
+    Connect,
+    /// `CA_MONITOR_NATIVE` added by a link's first read.
+    MonitorNative,
+    /// `CA_MONITOR_STRING`.
+    MonitorString,
+}
+
+/// C dbCa's `workList` for local links: serviced on the `dbCaLink` thread
+/// ([`CaLinks::service_actions`]), in the order the actions were added.
+struct LinkActions {
+    queue: parking_lot::Mutex<VecDeque<(Action, Weak<LocalLink>)>>,
+    db: Weak<PvDatabaseInner>,
+}
+
+impl LinkActions {
+    /// C `addAction`: queue `action` and wake `dbCaTask`.
+    fn add(&self, action: Action, link: Weak<LocalLink>) {
+        self.queue.lock().push_back((action, link));
+        self.wake_owner();
+    }
+
+    fn wake_owner(&self) {
+        if let Some(inner) = self.db.upgrade() {
+            inner.link_puts.wake();
+        }
+    }
+}
+
+/// An owed action's wait progressed: `dbCaTask` settles what it owes.
+impl std::task::Wake for LinkActions {
+    fn wake(self: Arc<Self>) {
+        self.wake_owner();
+    }
+}
+
 /// One CA link served from this database: C `caLink` over a `dbChannelIO`.
 struct LocalLink {
     state: Arc<LocalState>,
-    channel: Arc<LocalChannel>,
-    _monitor: AbortOnDrop,
+    channel: LocalChannel,
+    /// This link, as its actions name it.
+    me: Weak<LocalLink>,
+    actions: Arc<LinkActions>,
+    /// C `evidNative` and `evidString`: the monitors' subscriptions on
+    /// [`LocalEvents`].
+    native: OnceLock<EventReader>,
+    string: OnceLock<EventReader>,
     _process: super::CpWorker,
 }
 
@@ -566,24 +758,26 @@ impl Drop for AbortOnDrop {
 }
 
 impl LocalLink {
-    /// A link to `channel`, connected ([`subscribe`]) once `dbCaRun` has
-    /// released it. `None` when the database captured no reactor to run the
-    /// link on.
-    fn open(db: &PvDatabase, channel: LocalChannel, link: LinkRef<'_>) -> Option<Self> {
-        let bridge = db.inner.link_puts.network()?;
+    /// A link to `channel`, its `CA_CONNECT` added to `actions`. `None`
+    /// when the database captured no reactor to run the link on.
+    fn open(
+        db: &PvDatabase,
+        channel: LocalChannel,
+        link: LinkRef<'_>,
+        actions: &Arc<LinkActions>,
+    ) -> Option<Arc<Self>> {
+        db.inner.link_puts.network()?;
         let state = Arc::new(LocalState {
             cache: ArcSwapOption::empty(),
+            stamp: ArcSwapOption::empty(),
             process: ExternalCpProcess::awaiting_first_event(link),
-            delivery: parking_lot::Mutex::new(()),
             taken: AtomicU64::new(0),
-            ended: AtomicBool::new(false),
-            queue: std::sync::OnceLock::new(),
-            meta: std::sync::OnceLock::new(),
+            string: ArcSwapOption::empty(),
+            input_string: AtomicBool::new(false),
+            meta: OnceLock::new(),
             inlink: link.is_input(),
             input_native: AtomicBool::new(link.is_input()),
-            input_wanted: crate::runtime::sync::Notify::new(),
         });
-        let channel = Arc::new(channel);
         let weak = Arc::downgrade(&db.inner);
         let worker = state.clone();
         let process = db.spawn_cp_worker(async move {
@@ -592,17 +786,191 @@ impl LocalLink {
                 .run_worker(|| weak.upgrade().map(|inner| PvDatabase { inner }))
                 .await
         });
-        let monitor = bridge.spawn(subscribe(
-            db.inner.ca_run.clone(),
-            channel.clone(),
-            state.clone(),
-        ));
-        Some(Self {
+        let local = Arc::new_cyclic(|me| Self {
             state,
             channel,
-            _monitor: AbortOnDrop(monitor),
+            me: me.clone(),
+            actions: actions.clone(),
+            native: OnceLock::new(),
+            string: OnceLock::new(),
             _process: process,
+        });
+        actions.add(Action::Connect, Arc::downgrade(&local));
+        Some(local)
+    }
+
+    /// `dbCaTask`'s `CA_CONNECT` for a local link (`dbCa.c:1205-1223`):
+    /// the attribute get `connectionCallback` adds, then, for a
+    /// `DBF_INLINK`, the native `DBR_TIME` monitor (`dbCa.c:1290-1294`),
+    /// whose first event is the channel's value now (`dbSubscriptionIO`).
+    /// Any other link owes `testInitReady(pca,
+    /// DBCA_CALLBACK_INIT_WAIT_NATIVE)` (`dbCa.c` at `ef4829829`) and is
+    /// monitored from its first read (`dbCa.c:484-487`).
+    ///
+    /// On a record field the monitor takes its slot now and
+    /// [`CaLinks::service_actions`] makes the rest. An I/O Intr source is read as a
+    /// turn on its own pump, behind every interrupt queued to it before; a
+    /// `DBF_INLINK` CP/CPP link's, first behind the edge sweeps its device
+    /// still owes it, while its holder's CP processes wait for that event.
+    fn connect(
+        &self,
+        db: &PvDatabase,
+        events: &LocalEvents,
+        ca_run: &Arc<super::processing::CaRunGate>,
+    ) -> Option<Owed> {
+        #[cfg(test)]
+        tests::run_hook(&tests::BEFORE_CONNECT, &self.state);
+        let mut first = self.state.inlink.then_some(FirstEvent::InitReady);
+        let ChannelTarget::RecordField { record, field } = &self.channel.chan.target else {
+            self.get_attributes();
+            let Some(first) = first else {
+                self.state.process.request_init_ready();
+                return None;
+            };
+            return self.monitor(
+                db,
+                events,
+                Feed::Native(parking_lot::Mutex::new(Some(first))),
+            );
+        };
+        let sweeps = (self.state.inlink && self.state.process.processes_holder())
+            .then(|| super::io_intr_turn::owed_sweeps(record))
+            .flatten();
+        let wait = match sweeps {
+            // `dbCaRun` waits for this first event, and every CP process
+            // for all of them; C reads the source at once, so a silent
+            // device must hold neither. Only its holder's CP processes wait
+            // for it, while they are still held.
+            Some(sweeps) => {
+                if let Some(late) = ca_run.late_link(&self.state.process) {
+                    first = Some(FirstEvent::Late(late));
+                }
+                Wait::Sweeps(Box::pin(async move { sweeps.cleared().await }))
+            }
+            None => db.ask_io_intr_turn(record).map_or(Wait::Over, Wait::Turn),
+        };
+        let first = first.map(|first| {
+            let feed = Feed::Native(parking_lot::Mutex::new(Some(first)));
+            self.reserve(record, field, events, feed)
+        });
+        Some(Owed {
+            link: self.me.clone(),
+            record: record.clone(),
+            field: field.clone(),
+            wait,
+            connect: true,
+            first,
         })
+    }
+
+    /// `CA_GET_ATTRIBUTES`' get (`dbCa.c:1274-1282`).
+    fn get_attributes(&self) {
+        let native = self.channel.native_type();
+        let attrs = (native != DbFieldType::String)
+            .then(|| self.channel.read(DBR_CTRL_DOUBLE, 1))
+            .flatten();
+        let _ = self.state.meta.set(LinkMetadata::from_ca_attributes(
+            Some(native),
+            Some(self.channel.element_count()),
+            attrs.as_ref(),
+        ));
+    }
+
+    /// `CA_MONITOR_NATIVE` or `CA_MONITOR_STRING` (`dbCa.c:1283-1313`):
+    /// `dbSubscriptionIO`'s `db_add_event` and first event on the shared
+    /// event user. On a record field the first event is owed, as
+    /// [`Self::connect`]'s.
+    fn monitor(&self, db: &PvDatabase, events: &LocalEvents, feed: Feed) -> Option<Owed> {
+        if let ChannelTarget::RecordField { record, field } = &self.channel.chan.target {
+            return Some(Owed {
+                link: self.me.clone(),
+                record: record.clone(),
+                field: field.clone(),
+                wait: Wait::Over,
+                connect: false,
+                first: Some(self.reserve(record, field, events, feed)),
+            });
+        }
+        let (monitor, pre_chain, slot) = self.link_monitor(feed);
+        let context: DeliveryContext = monitor.clone();
+        match self
+            .channel
+            .add_event(db, &events.user, CA_LINK_EVENT_MASK, &context, pre_chain)
+        {
+            Ok(reader) => {
+                let _ = self.slot(slot).set(reader);
+            }
+            Err(e) => {
+                tracing::debug!("local CA link subscribe refused: {e:?}");
+                monitor.refused();
+            }
+        }
+        None
+    }
+
+    /// [`Self::monitor`]'s `db_add_event` on a record field, its slot taken
+    /// without its first event; `Err` is the refused monitor.
+    fn reserve(
+        &self,
+        record: &Arc<RecordCell>,
+        field: &str,
+        events: &LocalEvents,
+        feed: Feed,
+    ) -> Result<Slot, Arc<LinkMonitor>> {
+        let (monitor, pre_chain, slot) = self.link_monitor(feed);
+        let context: DeliveryContext = monitor.clone();
+        match channel_io::add_event_disabled(
+            record,
+            field,
+            &events.user,
+            self.channel.chan.native_type,
+            CA_LINK_EVENT_MASK,
+            &context,
+            pre_chain,
+        ) {
+            Ok(reader) => {
+                let _ = self.slot(slot).set(reader);
+                Ok(slot)
+            }
+            Err(e) => {
+                tracing::debug!("local CA link subscribe refused: {e:?}");
+                Err(monitor)
+            }
+        }
+    }
+
+    /// `feed`'s monitor, its pre chain, and which of the link's two
+    /// subscriptions it is.
+    fn link_monitor(&self, feed: Feed) -> (Arc<LinkMonitor>, FilterChain, Slot) {
+        let (dbr_type, slot) = match feed {
+            Feed::Native(_) => (self.channel.native_type().time_dbr_type(), Slot::Native),
+            Feed::String => (DBR_TIME_STRING, Slot::String),
+        };
+        let (pre_chain, notify) = self.channel.state_notify(dbr_type);
+        let monitor = Arc::new(LinkMonitor {
+            state: self.state.clone(),
+            notify,
+            feed,
+        });
+        (monitor, pre_chain, slot)
+    }
+
+    fn slot(&self, slot: Slot) -> &OnceLock<EventReader> {
+        match slot {
+            Slot::Native => &self.native,
+            Slot::String => &self.string,
+        }
+    }
+
+    /// The `dbCaSync` mark: the count `taken` reaches once every event
+    /// queued now has been taken. Read under [`LocalEvents::delivery`].
+    fn mark(&self) -> u64 {
+        let pending: u64 = [&self.native, &self.string]
+            .into_iter()
+            .filter_map(OnceLock::get)
+            .map(|reader| reader.npend() as u64)
+            .sum();
+        self.state.taken.load(Ordering::SeqCst) + pending
     }
 
     /// C `isConnected`: a local channel connects at once
@@ -621,6 +989,10 @@ impl LocalLink {
         self.state.cache.load().as_deref().map(f)
     }
 
+    fn stamp(&self) -> Option<LinkStamp> {
+        self.state.stamp.load().as_deref().copied()
+    }
+
     /// `dbCaGetLink` (`dbCa.c:419-506`), which marks a connected link a
     /// native input before the empty-cache bail. The cache is read first:
     /// C queues `CA_MONITOR_NATIVE` only after this read's unlock, so the
@@ -630,8 +1002,33 @@ impl LocalLink {
             return None;
         }
         let value = self.with_value(|s| s.value.clone());
-        self.state.note_read();
+        if !self.state.input_native.swap(true, Ordering::Relaxed) {
+            self.actions.add(Action::MonitorNative, self.me.clone());
+        }
         value
+    }
+
+    /// `dbCaGetLink`'s `DBR_ENUM` → `DBR_STRING` branch (`dbCa.c:436-454`):
+    /// the `DBR_STRING` monitor's last value, the monitor added by the first
+    /// read that asks.
+    fn enum_string(&self) -> EnumString {
+        if self.channel.native_type() != DbFieldType::Enum {
+            return EnumString::NotServed;
+        }
+        if !self.is_connected() {
+            return EnumString::Pending;
+        }
+        let got = self.state.string.load_full();
+        self.monitor_string();
+        got.map_or(EnumString::Pending, |s| EnumString::Got((*s).clone()))
+    }
+
+    /// C `pvlOptInpString` with its `CA_MONITOR_STRING`
+    /// (`dbCa.c:1301-1313`), added once.
+    fn monitor_string(&self) {
+        if !self.state.input_string.swap(true, Ordering::Relaxed) {
+            self.actions.add(Action::MonitorString, self.me.clone());
+        }
     }
 
     /// `dbCaPutLinkCallback` converts to the channel's native type and
@@ -671,92 +1068,101 @@ impl LocalLink {
             write_access: true,
             n_disconnect: 0,
             input_native: self.state.input_native.load(Ordering::Relaxed),
-            input_string: false,
+            input_string: self.state.input_string.load(Ordering::Relaxed),
             output_native: false,
             output_string: false,
         }
     }
 }
 
-/// `dbCaTask`'s `CA_GET_ATTRIBUTES` and `CA_MONITOR_NATIVE` for a local
-/// link (`dbCa.c:1209-1236`), serviced only once `dbCaRun` has run: the
-/// attribute gets `connectionCallback` schedules, then the native
-/// `DBR_TIME` monitor (`dbCa.c:1225-1229`), whose first event is the
-/// channel's value now (`dbSubscriptionIO`). An I/O Intr source is read as
-/// a turn on its own pump, behind every interrupt queued to it before; a
-/// `DBF_INLINK` CP/CPP link's, first behind the edge sweeps its device
-/// still owes it, while its holder's CP processes wait for that event.
-/// Only a native input is monitored (`dbCa.c:865-867`): a `DBF_INLINK`
-/// from here, any other link from its first read.
-async fn subscribe(
-    ca_run: Arc<super::processing::CaRunGate>,
-    channel: Arc<LocalChannel>,
-    state: Arc<LocalState>,
-) {
-    ca_run.reached().await;
-    let mut first = state.inlink.then_some(FirstEvent::InitReady);
-    if let ChannelTarget::RecordField { record, .. } = &channel.chan.target
-        && state.inlink
-        && state.process.processes_holder()
-        && let Some(sweeps) = super::io_intr_turn::owed_sweeps(record)
-    {
-        // `dbCaRun` waits for this first event, and every CP process for
-        // all of them; C reads the source at once, so a silent device must
-        // hold neither. Only its holder's CP processes wait for it, while
-        // they are still held.
-        if let Some(late) = ca_run.late_link(&state.process) {
-            first = Some(FirstEvent::Late(late));
+/// The rest of a serviced action on a record field, which C makes in the
+/// action and [`CaLinks::service_actions`] once `wait` is over: a connect's
+/// attribute get, then the monitor's `db_event_enable` and first event.
+struct Owed {
+    link: Weak<LocalLink>,
+    record: Arc<RecordCell>,
+    field: Arc<str>,
+    wait: Wait,
+    /// A `CA_CONNECT`'s: the attribute get comes first.
+    connect: bool,
+    /// The monitor whose slot is taken, `Err` if refused; `None` for a
+    /// connect without one, which owes its init ready.
+    first: Option<Result<Slot, Arc<LinkMonitor>>>,
+}
+
+impl Owed {
+    fn finish(&self, db: &PvDatabase, link: &LocalLink) {
+        #[cfg(test)]
+        tests::run_hook(&tests::BEFORE_ENABLE, &link.state);
+        if self.connect {
+            link.get_attributes();
         }
-        sweeps.cleared().await;
-    }
-    let Some(db) = channel.db() else { return };
-    if let ChannelTarget::RecordField { record, .. } = &channel.chan.target {
-        db.io_intr_turn(record).await;
-    }
-    let native = channel.native_type();
-    let attrs = (native != DbFieldType::String)
-        .then(|| channel.read(DBR_CTRL_DOUBLE, 1))
-        .flatten();
-    let labels = (native == DbFieldType::Enum)
-        .then(|| channel.read(native.ctrl_dbr_type(), 1))
-        .flatten();
-    let _ = state.meta.set(LinkMetadata::from_ca_attributes(
-        Some(native),
-        Some(channel.element_count()),
-        attrs.as_ref(),
-        labels.as_ref(),
-    ));
-    let db = if state.inlink {
-        db
-    } else {
-        // `connectionCallback`'s `testInitReady(pca,
-        // DBCA_CALLBACK_INIT_WAIT_NATIVE)` (`dbCa.c` at `ef4829829`).
-        drop(db);
-        state.process.request_init_ready();
-        state.until_input_native().await;
-        let Some(db) = channel.db() else { return };
-        db
-    };
-    match channel.subscribe(&db, native.time_dbr_type(), CA_LINK_EVENT_MASK) {
-        Ok(monitor) => {
-            drop(db);
-            let _ = state
-                .queue
-                .set((monitor.reader.queue(), monitor.reader.id()));
-            run_monitor(monitor, state, first).await;
-        }
-        // `dbCaTask`'s `ca_add_array_event` failure (`dbCa.c:1230-1233`):
-        // the link stays without a value. Its init wait is released, where
-        // C's `dbCaRun` would wait for it forever.
-        Err(e) => {
-            tracing::debug!("local CA link subscribe refused: {e:?}");
-            if let Some(FirstEvent::InitReady) = first {
-                state.process.request_init_ready();
+        match &self.first {
+            None => link.state.process.request_init_ready(),
+            Some(Ok(slot)) => {
+                if let Some(reader) = link.slot(*slot).get() {
+                    channel_io::enable_event(db, &self.record, &self.field, reader.id());
+                }
             }
-            state.ended.store(true, Ordering::SeqCst);
-            state.process.notify_settled();
+            Some(Err(monitor)) => monitor.refused(),
         }
     }
+}
+
+/// What an [`Owed`] waits for before it reads an I/O Intr source, which C
+/// does not have.
+enum Wait {
+    /// The edge sweeps the source's device still owes, then its turn.
+    Sweeps(std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>),
+    /// The source's pump's turn.
+    Turn(oneshot::Receiver<()>),
+    Over,
+}
+
+impl Wait {
+    /// Poll the wait on `cx`, asking `record`'s turn once its sweeps clear.
+    fn is_over(
+        &mut self,
+        db: &PvDatabase,
+        record: &Arc<RecordCell>,
+        cx: &mut std::task::Context<'_>,
+    ) -> bool {
+        if let Wait::Sweeps(cleared) = self {
+            if cleared.as_mut().poll(cx).is_pending() {
+                return false;
+            }
+            *self = db.ask_io_intr_turn(record).map_or(Wait::Over, Wait::Turn);
+        }
+        if let Wait::Turn(turn) = self {
+            if std::pin::Pin::new(turn).poll(cx).is_pending() {
+                return false;
+            }
+            *self = Wait::Over;
+        }
+        true
+    }
+
+    /// Whether it holds the later owed actions on its record.
+    fn holds(&self) -> bool {
+        !matches!(self, Wait::Sweeps(_))
+    }
+}
+
+/// Which of a local link's two subscriptions.
+#[derive(Clone, Copy)]
+enum Slot {
+    /// `evidNative`.
+    Native,
+    /// `evidString`.
+    String,
+}
+
+/// Which of dbCa's two monitors a local link's events come from.
+enum Feed {
+    /// `evidNative`, with what its first event owes besides its process.
+    Native(parking_lot::Mutex<Option<FirstEvent>>),
+    /// `evidString`.
+    String,
 }
 
 /// What a local link's first event owes besides its process.
@@ -767,48 +1173,132 @@ enum FirstEvent {
     Late(super::processing::LateLink),
 }
 
-/// C `dbContext`'s event task handing each `dbSubscriptionIO` event to
-/// dbCa's `eventCallback`: refresh the cache, then add `CA_DBPROCESS`
-/// (`dbCa.c:891`, `:958-962`); after the first, what `first` owes.
-async fn run_monitor(
-    mut monitor: LocalMonitor,
-    state: Arc<LocalState>,
-    mut first: Option<FirstEvent>,
-) {
-    // Each event is taken and handed on under `delivery`, never across a
-    // suspension.
-    while std::future::poll_fn(|cx| {
-        let _taking = state.delivery.lock();
-        let event = match monitor.reader.poll_recv(cx) {
-            std::task::Poll::Pending => return std::task::Poll::Pending,
-            std::task::Poll::Ready(None) => return std::task::Poll::Ready(false),
-            std::task::Poll::Ready(Some(event)) => event,
-        };
-        // dbCa's native monitor is of count 0 (`dbCa.c:1290-1293`).
-        match monitor.state_notify(event, 0) {
-            Some(snapshot) => {
-                state.cache.store(Some(Arc::new(snapshot)));
-                state.process.request();
+/// The event user of the database's one `dbContext`
+/// (`dbContext.cpp:59-66`), which every local link's monitors share: its
+/// one event task hands their events to dbCa in the order they were
+/// posted, and a source's monitors in the order they were added.
+struct LocalEvents {
+    user: EventUser,
+    /// Held while an event is taken off the queue, handed on and counted,
+    /// so a [`CaLinks::sync`] mark never sees one taken but not counted.
+    delivery: parking_lot::Mutex<()>,
+}
+
+/// C `event_task` for [`LocalEvents`] (`dbEvent.c:1056-1061`): each event
+/// is taken and handed on under `delivery`, never across a suspension.
+async fn deliver_events(events: Arc<LocalEvents>) {
+    loop {
+        std::future::poll_fn(|cx| {
+            let _taking = events.delivery.lock();
+            match std::task::ready!(events.user.poll_next(cx)) {
+                CircuitEvent::Event { context, event, .. } => {
+                    if let Some(monitor) = context.downcast_ref::<LinkMonitor>() {
+                        monitor.deliver(event);
+                    }
+                }
+                CircuitEvent::Ended(id) => {
+                    if let Some(context) = events.user.context(id)
+                        && let Some(monitor) = context.downcast_ref::<LinkMonitor>()
+                    {
+                        monitor.end();
+                    }
+                }
             }
-            // `callStateNotify`'s `ECA_GETFAIL`: dbCa keeps the last value.
-            None => tracing::debug!("local CA link event not deliverable, keeping last value"),
-        }
-        match first.take() {
-            Some(FirstEvent::InitReady) => state.process.request_init_ready(),
-            Some(FirstEvent::Late(late)) => drop(late),
-            None => {}
+            std::task::Poll::Ready(())
+        })
+        .await;
+    }
+}
+
+/// One of a local link's monitors: its subscription's delivery context.
+struct LinkMonitor {
+    state: Arc<LocalState>,
+    notify: StateNotify,
+    feed: Feed,
+}
+
+impl LinkMonitor {
+    /// dbCa's `eventCallback`: refresh the cache, then add `CA_DBPROCESS`
+    /// (`dbCa.c:940`, `:1005-1012`); after a native monitor's first, what it
+    /// owes.
+    fn deliver(&self, event: MonitorEvent) {
+        let state = &self.state;
+        match &self.feed {
+            Feed::Native(first) => {
+                // dbCa's native monitor is of count 0 (`dbCa.c:1290-1293`).
+                match self.notify.state_notify(event, 0) {
+                    Some(snapshot) => {
+                        // A native ENUM event scans only while no string
+                        // monitor exists (`dbCa.c:932-933`).
+                        let scan = !(matches!(snapshot.value, EpicsValue::Enum(_))
+                            && state.input_string.load(Ordering::Relaxed));
+                        // The stamp first, so a read that sees this value
+                        // sees its stamp.
+                        state.stamp.store(Some(Arc::new(LinkStamp::of(
+                            &snapshot.alarm,
+                            snapshot.timestamp,
+                        ))));
+                        state.cache.store(Some(Arc::new(snapshot)));
+                        if scan {
+                            #[cfg(test)]
+                            tests::run_hook(&tests::BEFORE_REQUEST, state);
+                            state.process.request();
+                        }
+                    }
+                    // `callStateNotify`'s `ECA_GETFAIL`: dbCa keeps the last value.
+                    None => {
+                        tracing::debug!("local CA link event not deliverable, keeping last value")
+                    }
+                }
+                match first.lock().take() {
+                    Some(FirstEvent::InitReady) => state.process.request_init_ready(),
+                    Some(FirstEvent::Late(late)) => drop(late),
+                    None => {}
+                }
+            }
+            // `CA_MONITOR_STRING` asks for one element (`dbCa.c:1239`).
+            Feed::String => match self.notify.state_notify(event, 1) {
+                Some(Snapshot {
+                    value: EpicsValue::String(s),
+                    alarm,
+                    timestamp,
+                    ..
+                }) => {
+                    state
+                        .stamp
+                        .store(Some(Arc::new(LinkStamp::of(&alarm, timestamp))));
+                    state.string.store(Some(Arc::new(s)));
+                    state.process.request();
+                }
+                _ => tracing::debug!("local CA link string event not deliverable, keeping last"),
+            },
         }
         state.taken.fetch_add(1, Ordering::SeqCst);
         state.process.notify_settled();
-        std::task::Poll::Ready(true)
-    })
-    .await
-    {}
-    if let Some(FirstEvent::InitReady) = first {
-        state.process.monitor_ended();
     }
-    state.ended.store(true, Ordering::SeqCst);
-    state.process.notify_settled();
+
+    /// The monitor's source is gone and its events are delivered: a first
+    /// event still owed never comes.
+    fn end(&self) {
+        if let Feed::Native(first) = &self.feed
+            && let Some(FirstEvent::InitReady) = first.lock().take()
+        {
+            self.state.process.monitor_ended();
+        }
+        self.state.process.notify_settled();
+    }
+
+    /// `dbCaTask`'s `ca_add_array_event` failure (`dbCa.c:1295-1299`): the
+    /// link stays without a value. A native monitor's init wait is
+    /// released, where C's `dbCaRun` would wait for it forever.
+    fn refused(&self) {
+        if let Feed::Native(first) = &self.feed
+            && let Some(FirstEvent::InitReady) = first.lock().take()
+        {
+            self.state.process.request_init_ready();
+        }
+        self.state.process.notify_settled();
+    }
 }
 
 /// C `dbChannelIO`: an open database channel plus the put-notify blocker
@@ -868,25 +1358,6 @@ impl LocalChannel {
         let mut buf = Vec::new();
         encode_dbr_into(&mut buf, dbr_type, &snapshot).ok()?;
         decode_counted(dbr_type, buf, snapshot.value.count(), count)
-    }
-
-    /// `dbSubscriptionIO` (`dbSubscriptionIO.cpp:38-56`): `db_add_event`
-    /// with `mask`, then `db_post_single_event`. Each link owns its event
-    /// context, where C's `dbContext` shares one.
-    pub(super) fn subscribe(
-        &self,
-        db: &PvDatabase,
-        dbr_type: u16,
-        mask: u16,
-    ) -> Result<LocalMonitor, SubscribeRefused> {
-        let (pre_chain, notify) = self.state_notify(dbr_type);
-        let user = EventUser::new();
-        let reader = self.add_event(db, &user, mask, no_context(), pre_chain)?;
-        Ok(LocalMonitor {
-            _user: user,
-            reader,
-            notify,
-        })
     }
 
     /// A `dbr_type` subscription's `callStateNotify`, and the pre chain its
@@ -1085,23 +1556,6 @@ impl Issued {
     }
 }
 
-/// C `dbSubscriptionIO`: one installed event plus what `callStateNotify`
-/// needs to hand each one over as a DBR value. Dropping it cancels the
-/// event (`db_cancel_event`).
-pub(super) struct LocalMonitor {
-    /// The event context the reader's queue belongs to.
-    _user: EventUser,
-    pub(super) reader: EventReader,
-    notify: StateNotify,
-}
-
-impl LocalMonitor {
-    /// [`StateNotify::state_notify`].
-    pub(super) fn state_notify(&self, event: MonitorEvent, count: u32) -> Option<Snapshot> {
-        self.notify.state_notify(event, count)
-    }
-}
-
 /// What `callStateNotify` needs to hand a subscription's event over as a
 /// DBR value.
 pub(super) struct StateNotify {
@@ -1164,18 +1618,14 @@ impl From<DbFieldType> for LinkDbfType {
 
 impl LinkMetadata {
     /// dbCa's attribute cache from a channel's native type and count plus
-    /// two gets: `attrs`, the fixed `DBR_CTRL_DOUBLE` get
-    /// `getAttribEventCallback` caches (`dbCa.c:1042-1091`, issued for any
-    /// non-string channel, `:878-880`), the only source of limits,
-    /// precision and units; and `labels`, an enum channel's native
-    /// `DBR_CTRL_ENUM`, the only source of the choice table (C renders a
-    /// remote enum through a second `DBR_STRING` monitor instead). Alarm
+    /// `attrs`, the fixed `DBR_CTRL_DOUBLE` get `getAttribEventCallback`
+    /// caches (`dbCa.c:1042-1091`, issued for any non-string channel,
+    /// `:878-880`), the only source of limits, precision and units. Alarm
     /// limits are `(lolo, lo, hi, hihi)`, C `getAlarmLimits` (`dbCa.c:729`).
     pub fn from_ca_attributes(
         dbf: Option<DbFieldType>,
         element_count: Option<u32>,
         attrs: Option<&Snapshot>,
-        labels: Option<&Snapshot>,
     ) -> Self {
         let mut md = Self {
             dbf_type: dbf.map(LinkDbfType::from),
@@ -1203,16 +1653,6 @@ impl LinkMetadata {
                 md.control_limits = Some((c.lower_ctrl_limit, c.upper_ctrl_limit));
             }
         }
-        if let Some(e) = labels.and_then(|s| s.enums.as_ref())
-            && !e.strings.is_empty()
-        {
-            md.enum_choices = Some(
-                e.strings
-                    .iter()
-                    .map(|s| s.as_str_lossy().into_owned())
-                    .collect(),
-            );
-        }
         md
     }
 }
@@ -1220,6 +1660,22 @@ impl LinkMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A test's hook into a local link's connect or event.
+    pub(super) type Hook = Arc<dyn Fn(&LocalState) + Send + Sync>;
+    /// Run as a link's `CA_CONNECT` is serviced.
+    pub(super) static BEFORE_CONNECT: std::sync::Mutex<Option<Hook>> = std::sync::Mutex::new(None);
+    /// Run as a native event adds the link's `CA_DBPROCESS`.
+    pub(super) static BEFORE_REQUEST: std::sync::Mutex<Option<Hook>> = std::sync::Mutex::new(None);
+    /// Run as an owed action is finished.
+    pub(super) static BEFORE_ENABLE: std::sync::Mutex<Option<Hook>> = std::sync::Mutex::new(None);
+
+    pub(super) fn run_hook(hook: &std::sync::Mutex<Option<Hook>>, state: &LocalState) {
+        let hook = hook.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook(state);
+        }
+    }
 
     /// Build a CTRL [`Snapshot`] carrying display + control metadata,
     /// the shape `get_with_metadata(DbrClass::Ctrl)` returns for a
@@ -1258,8 +1714,7 @@ mod tests {
     #[test]
     fn ca_attributes_numeric_maps_all_fields() {
         let snap = ctrl_snapshot();
-        let md =
-            LinkMetadata::from_ca_attributes(Some(DbFieldType::Double), Some(1), Some(&snap), None);
+        let md = LinkMetadata::from_ca_attributes(Some(DbFieldType::Double), Some(1), Some(&snap));
         assert_eq!(md.dbf_type, Some(LinkDbfType::Double));
         assert_eq!(md.element_count, Some(1));
         assert_eq!(md.graphic_limits, Some((-50.0, 100.0)));
@@ -1277,7 +1732,7 @@ mod tests {
     /// record keeps its local default.
     #[test]
     fn ca_attributes_string_pv_has_no_limits() {
-        let md = LinkMetadata::from_ca_attributes(Some(DbFieldType::String), Some(1), None, None);
+        let md = LinkMetadata::from_ca_attributes(Some(DbFieldType::String), Some(1), None);
         assert_eq!(md.dbf_type, Some(LinkDbfType::String));
         assert_eq!(md.element_count, Some(1));
         assert_eq!(md.graphic_limits, None);
@@ -1287,32 +1742,10 @@ mod tests {
         assert_eq!(md.units, None);
     }
 
-    /// an enum channel's `DBR_CTRL_ENUM` reply carries the state-label
-    /// table; it lands in `enum_choices` so a `DBR_STRING`-requesting
-    /// reader (stringin/lsi INP, printf `%s`) can render the remote index
-    /// as its label — C `dbCa`'s `pgetString` monitor equivalent. An empty
-    /// table stays `None` (nothing to render through).
+    /// an enum target's fixed `DBR_CTRL_DOUBLE` reply carries its
+    /// precision and limits, zero as C's are.
     #[test]
-    fn ca_attributes_enum_ctrl_carries_the_choices() {
-        use crate::server::snapshot::EnumInfo;
-        let mut snap = Snapshot::new(EpicsValue::Enum(1), 0, 0, std::time::SystemTime::UNIX_EPOCH);
-        snap.enums = Some(EnumInfo::new(vec!["off".into(), "on".into()]));
-        let md =
-            LinkMetadata::from_ca_attributes(Some(DbFieldType::Enum), Some(1), None, Some(&snap));
-        assert_eq!(md.dbf_type, Some(LinkDbfType::Enum));
-        assert_eq!(
-            md.enum_choices,
-            Some(vec!["off".to_string(), "on".to_string()])
-        );
-
-        let empty = Snapshot::new(EpicsValue::Enum(0), 0, 0, std::time::SystemTime::UNIX_EPOCH);
-        let md =
-            LinkMetadata::from_ca_attributes(Some(DbFieldType::Enum), Some(1), None, Some(&empty));
-        assert_eq!(md.enum_choices, None);
-
-        // The two replies compose: the fixed DBR_CTRL_DOUBLE attribute get
-        // carries an enum target's precision/units/limits (all zero, as C's
-        // does) while the native DBR_CTRL_ENUM get carries the labels.
+    fn ca_attributes_enum_target_takes_the_double_attributes() {
         use crate::server::snapshot::DisplayInfo;
         let mut attrs = Snapshot::new(
             EpicsValue::Double(1.0),
@@ -1321,18 +1754,10 @@ mod tests {
             std::time::SystemTime::UNIX_EPOCH,
         );
         attrs.display = Some(DisplayInfo::default());
-        let md = LinkMetadata::from_ca_attributes(
-            Some(DbFieldType::Enum),
-            Some(1),
-            Some(&attrs),
-            Some(&snap),
-        );
+        let md = LinkMetadata::from_ca_attributes(Some(DbFieldType::Enum), Some(1), Some(&attrs));
+        assert_eq!(md.dbf_type, Some(LinkDbfType::Enum));
         assert_eq!(md.precision, Some(0));
         assert_eq!(md.graphic_limits, Some((0.0, 0.0)));
-        assert_eq!(
-            md.enum_choices,
-            Some(vec!["off".to_string(), "on".to_string()])
-        );
     }
 
     /// when the channel info fetch failed (`None` dbf /
@@ -1340,7 +1765,7 @@ mod tests {
     /// link reports "no metadata yet" rather than fabricating zeros.
     #[test]
     fn ca_attributes_no_info_no_ctrl_is_all_none() {
-        let md = LinkMetadata::from_ca_attributes(None, None, None, None);
+        let md = LinkMetadata::from_ca_attributes(None, None, None);
         assert_eq!(md, LinkMetadata::default());
     }
 
@@ -1360,8 +1785,7 @@ mod tests {
             precision: 0,
             ..Default::default()
         });
-        let md =
-            LinkMetadata::from_ca_attributes(Some(DbFieldType::Double), Some(1), Some(&snap), None);
+        let md = LinkMetadata::from_ca_attributes(Some(DbFieldType::Double), Some(1), Some(&snap));
         assert_eq!(md.units, None);
         assert_eq!(md.precision, Some(0));
     }
@@ -1458,7 +1882,7 @@ record(ao, "OUT") { field(OUT, "SRC CA") }
         );
 
         assert_eq!(db.inner.ca_links.get_cached_value(out), None);
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
         while db.inner.ca_links.get_cached_value(out).is_none() {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -1522,7 +1946,7 @@ record(ao, "OUT") { field(OUT, "SRC CA") }
                 crate::runtime::task::block_on_sync(open).unwrap();
             }
         });
-        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        entered.recv_timeout(fact_budget::FACT_BUDGET).unwrap();
         let (held_tx, held) = std::sync::mpsc::channel();
         let (release, release_rx) = std::sync::mpsc::channel::<()>();
         let holder = std::thread::spawn({
@@ -1547,7 +1971,7 @@ record(ao, "OUT") { field(OUT, "SRC CA") }
         }
         release.send(()).unwrap();
         holder.join().unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
         while monitors() == 0 {
             assert!(std::time::Instant::now() < deadline, "the open subscribes");
             crate::runtime::task::sleep(Duration::from_millis(5)).await;
@@ -1556,8 +1980,294 @@ record(ao, "OUT") { field(OUT, "SRC CA") }
         assert_eq!(monitors(), 1);
     }
 
+    /// `H1` and `H2`, both CP on `SRC` in that order, after iocInit's
+    /// link opens and before `dbCaRun`, with their links.
+    #[cfg(tokio_backend)]
+    async fn two_cp_holders() -> (Arc<PvDatabase>, Arc<LocalLink>, Arc<LocalLink>) {
+        let db = crate::server::ioc_builder::IocBuilder::new()
+            .db_string(
+                r#"
+record(ao, "SRC") {}
+record(calc, "H1") { field(INPA, "SRC CP") field(CALC, "A") }
+record(calc, "H2") { field(INPA, "SRC CP") field(CALC, "A") }
+"#,
+                &HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap()
+            .0;
+        db.initialize_link_locality().await;
+        db.setup_cp_links().await;
+        db.setup_external_link_opens().await;
+        db.inner.link_puts.sync().await;
+        let link = |holder: &str| {
+            let (_, _, link) = db
+                .record_link_fields(holder)
+                .into_iter()
+                .find(|(f, _, _)| f == "INPA")
+                .unwrap();
+            let link = link.external().unwrap();
+            db.inner
+                .ca_links
+                .local(LinkRef::new(link.name, link.open))
+                .expect("a local link")
+        };
+        let (h1, h2) = (link("H1"), link("H2"));
+        (db, h1, h2)
+    }
+
+    /// Hold the calling thread until `done`, for at most a fifth of a
+    /// second: long enough for any other thread to overtake.
+    #[cfg(tokio_backend)]
+    fn hold_until(done: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_millis(200);
+        while !done() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// C `dbCaTask` services the links' `CA_CONNECT`s on one thread in the
+    /// order they were added (`dbCa.c:156-157`, `:1180`), so a source's monitor
+    /// list holds its CP links' monitors in that order: H1's connect held
+    /// is not overtaken by H2's.
+    #[cfg(tokio_backend)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_sources_link_monitors_attach_in_link_order() {
+        let (db, h1, h2) = two_cp_holders().await;
+        let src = db.get_record("SRC").unwrap();
+        *BEFORE_CONNECT.lock().unwrap() = Some(Arc::new({
+            let (h1, src) = (h1.state.clone(), src.clone());
+            move |state: &LocalState| {
+                if std::ptr::eq(state, &*h1) {
+                    hold_until(|| src.read().subscriber_count("VAL") > 0);
+                }
+            }
+        }));
+        db.process_cp_links_on_connect().await;
+        *BEFORE_CONNECT.lock().unwrap() = None;
+        let attached: Vec<_> = src
+            .read()
+            .subscribers_of("VAL")
+            .map(|sub| sub.id())
+            .collect();
+        let id = |link: &LocalLink| link.native.get().expect("monitored").id();
+        assert_eq!(attached, [id(&h1), id(&h2)]);
+    }
+
+    /// C's one `dbContext` event task hands a source's events to its links
+    /// in monitor list order (`dbEvent.c:1056-1061`), so their
+    /// `CA_DBPROCESS` requests are made in that order: H1's event held is
+    /// not overtaken by H2's.
+    #[cfg(tokio_backend)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_sources_events_request_in_link_order() {
+        let (db, h1, h2) = two_cp_holders().await;
+        db.process_cp_links_on_connect().await;
+        db.ca_sync().await;
+        let requested = h2.state.process.request_mark();
+        let log = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        *BEFORE_REQUEST.lock().unwrap() = Some(Arc::new({
+            let (h1, h2, log) = (h1.state.clone(), h2.state.clone(), log.clone());
+            move |state: &LocalState| {
+                if std::ptr::eq(state, &*h1) {
+                    hold_until(|| h2.process.request_mark() > requested);
+                    log.lock().push("H1");
+                } else if std::ptr::eq(state, &*h2) {
+                    log.lock().push("H2");
+                }
+            }
+        }));
+        db.put_pv_and_post("SRC", EpicsValue::Double(1.0))
+            .await
+            .unwrap();
+        db.ca_sync().await;
+        *BEFORE_REQUEST.lock().unwrap() = None;
+        assert_eq!(*log.lock(), ["H1", "H2"]);
+    }
+
+    /// C makes a connect's `db_add_event` and first event in one action
+    /// (`dbCa.c:1283-1300`, `dbSubscriptionIO.cpp:47-53`). A connect that
+    /// waits for its I/O Intr source's turn still takes its slot at its
+    /// action, ahead of a monitor `X` added while it waits, and H1's first
+    /// event, held, is not overtaken by H2's.
+    #[cfg(tokio_backend)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn waiting_connects_take_slots_and_first_events_in_link_order() {
+        use crate::server::device_support::{DeviceReadOutcome, DeviceSupport, DeviceUdf};
+        use crate::server::record::{DbLinkType, DevSup, Dset, Record};
+        static PULSE: DevSup = DevSup {
+            name: "devAiPulse",
+            choice: "Pulse",
+            link_type: DbLinkType::InstIo,
+            dset: Dset::new(6, &[2, 3, 4], false),
+        };
+        struct Pulse(Option<crate::runtime::sync::mpsc::Receiver<()>>);
+        impl DeviceSupport for Pulse {
+            fn dtyp(&self) -> &str {
+                "Pulse"
+            }
+            fn io_intr_receiver(&mut self) -> Option<crate::runtime::sync::mpsc::Receiver<()>> {
+                self.0.take()
+            }
+            fn read(&mut self, _r: &mut dyn Record) -> crate::error::CaResult<DeviceReadOutcome> {
+                Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
+            }
+            fn write(&mut self, _r: &mut dyn Record) -> crate::error::CaResult<()> {
+                Ok(())
+            }
+        }
+        let (_pulse, intr) = crate::runtime::sync::mpsc::channel(4);
+        let device = std::sync::Mutex::new(Some(Pulse(Some(intr))));
+        let db = crate::server::ioc_builder::IocBuilder::new()
+            .register_device_support("ai", &PULSE, move || {
+                Box::new(device.lock().unwrap().take().expect("one Pulse record"))
+            })
+            .db_string(
+                r#"
+record(ai, "SRC") { field(DTYP, "Pulse") field(INP, "@x") field(SCAN, "I/O Intr") }
+record(calc, "H1") { field(INPA, "SRC CP") field(CALC, "A") }
+record(calc, "H2") { field(INPA, "SRC CP") field(CALC, "A") }
+"#,
+                &HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap()
+            .0;
+        db.scan_control().run();
+        db.initialize_link_locality().await;
+        db.setup_cp_links().await;
+        db.setup_external_link_opens().await;
+        db.inner.link_puts.sync().await;
+        let link = |holder: &str| {
+            let (_, _, link) = db
+                .record_link_fields(holder)
+                .into_iter()
+                .find(|(f, _, _)| f == "INPA")
+                .unwrap();
+            let link = link.external().unwrap();
+            db.inner
+                .ca_links
+                .local(LinkRef::new(link.name, link.open))
+                .expect("a local link")
+        };
+        let (h1, h2) = (link("H1"), link("H2"));
+        let src = db.get_record("SRC").unwrap();
+        assert!(db.ask_io_intr_turn(&src).is_some(), "SRC has a pump");
+        let requested = h2.state.process.request_mark();
+        let h2_connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let x = Arc::new(parking_lot::Mutex::new(None));
+        let log = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        *BEFORE_CONNECT.lock().unwrap() = Some(Arc::new({
+            let (h2, h2_connected) = (h2.state.clone(), h2_connected.clone());
+            move |state: &LocalState| {
+                if std::ptr::eq(state, &*h2) {
+                    h2_connected.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        }));
+        *BEFORE_ENABLE.lock().unwrap() = Some(Arc::new({
+            let (h1, h2, src, x) = (h1.state.clone(), h2.state.clone(), src.clone(), x.clone());
+            move |state: &LocalState| {
+                let mut x = x.lock();
+                if x.is_none() && h2_connected.load(std::sync::atomic::Ordering::SeqCst) {
+                    let added = src.write().add_subscriber("VAL", 0, DbFieldType::Double, 1);
+                    *x = Some(added.expect("X is added"));
+                }
+                drop(x);
+                if std::ptr::eq(state, &*h1) {
+                    hold_until(|| h2.process.request_mark() > requested);
+                }
+            }
+        }));
+        *BEFORE_REQUEST.lock().unwrap() = Some(Arc::new({
+            let (h1, h2, log) = (h1.state.clone(), h2.state.clone(), log.clone());
+            move |state: &LocalState| {
+                if std::ptr::eq(state, &*h1) {
+                    log.lock().push("H1");
+                } else if std::ptr::eq(state, &*h2) {
+                    log.lock().push("H2");
+                }
+            }
+        }));
+        db.process_cp_links_on_connect().await;
+        db.ca_sync().await;
+        *BEFORE_CONNECT.lock().unwrap() = None;
+        *BEFORE_ENABLE.lock().unwrap() = None;
+        *BEFORE_REQUEST.lock().unwrap() = None;
+        let attached: Vec<_> = src
+            .read()
+            .subscribers_of("VAL")
+            .map(|sub| sub.id())
+            .collect();
+        let id = |link: &LocalLink| link.native.get().expect("monitored").id();
+        let x = x.lock().as_ref().expect("X is added").id();
+        assert_eq!(attached, [id(&h1), id(&h2), x], "slots H1 H2 X");
+        assert_eq!(*log.lock(), ["H1", "H2"], "first events");
+    }
+
+    /// An owed action still waiting for its source's turn holds the later
+    /// actions on that source, owed or new, even ones with nothing to wait
+    /// for; one still owed edge sweeps holds none.
+    #[cfg(tokio_backend)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_owed_action_waiting_its_turn_holds_its_sources_later_ones() {
+        let (db, h1, h2) = two_cp_holders().await;
+        let src = db.get_record("SRC").unwrap();
+        let log = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        *BEFORE_ENABLE.lock().unwrap() = Some(Arc::new({
+            let (h1, h2, log) = (h1.state.clone(), h2.state.clone(), log.clone());
+            move |state: &LocalState| {
+                if std::ptr::eq(state, &*h1) {
+                    log.lock().push("H1");
+                } else if std::ptr::eq(state, &*h2) {
+                    log.lock().push("H2");
+                }
+            }
+        }));
+        let owed = |link: &Arc<LocalLink>, wait| Owed {
+            link: Arc::downgrade(link),
+            record: src.clone(),
+            field: "VAL".into(),
+            wait,
+            connect: false,
+            first: None,
+        };
+        // Before `dbCaRun` the work list holds H1's and H2's connects, which
+        // wait for nothing on a passive source.
+        let links = &db.inner.ca_links;
+        let (answer, turn) = oneshot::channel();
+        links.owed.lock().push_back(owed(&h1, Wait::Turn(turn)));
+        links.service_actions();
+        links.service_actions();
+        let held = std::mem::take(&mut *log.lock());
+        answer.send(()).unwrap();
+        links.service_actions();
+        let answered = std::mem::take(&mut *log.lock());
+        let left = links.owed.lock().len();
+
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let sweeps = Wait::Sweeps(Box::pin(std::future::pending()));
+        let mut queue = VecDeque::from([owed(&h1, sweeps), owed(&h2, Wait::Over)]);
+        CaLinks::settle(&mut queue, &db, &mut cx);
+        *BEFORE_ENABLE.lock().unwrap() = None;
+        assert_eq!(
+            (held, answered, left),
+            (vec![], vec!["H1", "H1", "H2"], 0),
+            "held by the turn, then in order"
+        );
+        assert_eq!(
+            (log.lock().clone(), queue.len()),
+            (vec!["H2"], 1),
+            "sweeps hold none"
+        );
+    }
+
     async fn until(done: impl Fn() -> bool, what: &str) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
         while !done() {
             assert!(
                 std::time::Instant::now() < deadline,

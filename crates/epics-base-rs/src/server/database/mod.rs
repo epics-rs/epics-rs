@@ -24,8 +24,9 @@ pub(crate) mod scan_index;
 mod snapshot;
 mod subroutine_context;
 
+pub use crate::server::record::OwnRecord;
 pub use ca_client::{
-    CaClientContext, CaClientService, ClientChannel, ClientFuture, ClientMonitor, Connection,
+    CaClientContext, CaClientService, ClientChannel, ClientFuture, ClientSubscription, Connection,
     InProcessChannel, InProcessEvents, InProcessSubscription, PutCompletion,
 };
 pub use ca_link::CA_LINK_EVENT_MASK;
@@ -38,9 +39,10 @@ pub(crate) use field_io::{
 pub use link_put_queue::CpWorker;
 pub(crate) use link_put_queue::{LinkId, LinkInstall};
 pub use link_set::{
-    DynLinkSet, LinkBacking, LinkDbfType, LinkDiagnostics, LinkForward, LinkForwardRefused,
-    LinkHolder, LinkMetadata, LinkOpen, LinkPutDone, LinkPutOp, LinkRef, LinkSerial, LinkSet,
-    LinkSetRegistry, PutAdmission, RemoteAlarm, link_put_convert, report_put_not_issued,
+    DynLinkSet, EnumString, LinkBacking, LinkDbfType, LinkDiagnostics, LinkForward,
+    LinkForwardRefused, LinkHolder, LinkMetadata, LinkOpen, LinkPutDone, LinkPutOp, LinkRef,
+    LinkSerial, LinkSet, LinkSetRegistry, LinkShape, PutAdmission, RemoteAlarm, link_put_convert,
+    report_put_not_issued,
 };
 #[cfg(test)]
 pub(crate) use links::ExternalDone;
@@ -53,11 +55,55 @@ pub use processing::{
     FieldPut, HeldInstance, InitHold, InputLinkTexts, PostItem, PostRule, ProcStack,
     ProcessCallback, TokenWatch, hop_floor,
 };
-pub(crate) use processing::{NotifiedRead, ReadPolicy, seed_record_constants};
+pub(crate) use processing::{
+    DelayedCallbackTimers, NotifiedRead, ReadPolicy, seed_record_constants,
+};
 #[cfg(feature = "test-hooks")]
 pub use record_lock::fresh_hold_hook;
+
+/// Test-only: run a closure on this thread between a removal's destroy and
+/// its wake-up, where whatever the destroy woke runs before any server is
+/// told to sweep. A test holds that window open by blocking in the closure.
+#[cfg(feature = "test-hooks")]
+pub mod destroy_signal_hook {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Box<dyn FnMut()>>> = const { RefCell::new(None) };
+    }
+
+    /// Disarms the hook when dropped.
+    pub struct Armed(());
+
+    impl Drop for Armed {
+        fn drop(&mut self) {
+            HOOK.with(|h| h.borrow_mut().take());
+        }
+    }
+
+    /// Run `f` on this thread after each destroy, before its wake-up.
+    pub fn arm(f: impl FnMut() + 'static) -> Armed {
+        HOOK.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+        Armed(())
+    }
+
+    pub(super) fn fire() {
+        // Taken out for the call, so a removal inside `f` does not re-enter.
+        let Some(mut f) = HOOK.with(|h| h.borrow_mut().take()) else {
+            return;
+        };
+        f();
+        HOOK.with(|h| {
+            let mut h = h.borrow_mut();
+            if h.is_none() {
+                *h = Some(f);
+            }
+        });
+    }
+}
 pub(crate) use record_lock::{
-    CycleHints, FrameGate, InFrame, InitPass, LockRecord, SetGuard, owe_callback, owe_cvt,
+    CycleHints, FrameGate, InFrame, InitPass, LockRecord, OwedRead, ReadWait, SetGuard,
+    owe_callback, owe_cvt, owe_read,
 };
 pub use record_lock::{
     LockSetInfo, LockSetReport, ManyRecordWriteGuard, RecordWriteGuard, in_sync_driver_wait,
@@ -160,6 +206,20 @@ impl<'a> DbNameParts<'a> {
             field: std::str::from_utf8(&rest[..len]).unwrap_or_default(),
             tail: &rest[len..],
         }
+    }
+
+    /// The field `dbFindFieldPart` looks up, `VAL` when none is given.
+    pub fn field_or_val(&self) -> &'a str {
+        if self.field.is_empty() {
+            "VAL"
+        } else {
+            self.field
+        }
+    }
+
+    /// The one modifier read is `$` (`dbAccess.c:682`).
+    pub fn char_view(&self) -> bool {
+        self.tail.first() == Some(&b'$')
     }
 }
 
@@ -744,9 +804,6 @@ struct PvDatabaseInner {
     /// simple PV spelled `REC.FLD` shadows that field, so a cached link
     /// address must not outlive one appearing.
     simple_pvs_revision: std::sync::atomic::AtomicU64,
-    /// [`AsyncDbHandle::db_get`]'s last fresh read of each name it was asked
-    /// for: what it serves while that record's lock set is held elsewhere.
-    db_get_last: parking_lot::Mutex<HashMap<Box<[u8]>, crate::server::snapshot::Snapshot>>,
     /// Wake-up for servers holding channels on this database: something was
     /// removed, re-check what you serve. Carries no name — the receiver
     /// tests the target it already holds
@@ -930,8 +987,8 @@ struct PvDatabaseInner {
     /// reader can see `true` with no table (and find nothing to do) but never
     /// `false` with a live table.
     debugging: std::sync::atomic::AtomicBool,
-    /// Per-scheme link sets — pluggable backends for `pva://` /
-    /// `ca://` link resolution, the only route `resolve_external_pv` takes.
+    /// Per-scheme link sets — pluggable backends for `pva` / `ca` link
+    /// resolution, the only route `resolve_external_pv` takes.
     /// Mirrors the C-EPICS lset abstraction.
     ///
     /// Read-modify-write cell (`register_link_set` inserts one scheme into
@@ -946,10 +1003,12 @@ struct PvDatabaseInner {
     ca_links: Arc<ca_link::CaLinks>,
     /// Pending external OUT-link writes — the `dbCa` `workList` analogue.
     /// Record processing stages a write here and returns; the queue's single
-    /// owner task performs the `ca://`/`pva://` network write off the
+    /// owner task performs the `ca`/`pva` network write off the
     /// record's advisory write gate, exactly as `dbCaTask` does
     /// (`dbCa.c:1093-1260`). See [`link_put_queue`].
     link_puts: Arc<link_put_queue::LinkPutQueue>,
+    /// `recDynInp` and `recDynOut`, made by the first `recDynLink` add.
+    rec_dyn_links: std::sync::OnceLock<Arc<crate::server::rec_dyn_link::RecDynLinks>>,
     /// True once the ScanScheduler has been started for this DB.
     /// Prevents duplicate scan tasks when multiple protocol servers (CA + PVA)
     /// both try to start scanning on the same DB.
@@ -1550,7 +1609,6 @@ impl PvDatabase {
                         crate::runtime::sync::CMutex::PvdBucket,
                     ),
                     simple_pvs_revision: std::sync::atomic::AtomicU64::new(0),
-                    db_get_last: parking_lot::Mutex::new(HashMap::new()),
                     pv_destroyed_tx: tokio::sync::broadcast::channel(16).0,
                     breakpoints: ArcSwapOption::empty(),
                     debugging: std::sync::atomic::AtomicBool::new(false),
@@ -1559,6 +1617,7 @@ impl PvDatabase {
                     link_sets: SnapshotCell::new(link_sets),
                     ca_links,
                     link_puts: Arc::new(link_put_queue::LinkPutQueue::default()),
+                    rec_dyn_links: std::sync::OnceLock::new(),
                     records: RecursiveReadLock::new(HashMap::new()),
                     record_table: record_table::RecordTable::default(),
                     scan_index: scan_index::ScanIndex::new(),
@@ -2209,10 +2268,11 @@ impl PvDatabase {
         out
     }
 
-    /// Resolve an external PV name through the one lset its scheme names:
-    /// `pva` for `pva://`, `ca` for `ca://` and a bare name. No other lset
-    /// is asked — C picks one lset per link and never searches across them
-    /// (`dbLink.c:107-130`).
+    /// Resolve an external PV name through the one lset the link is
+    /// addressed to
+    /// ([`ExternalRef::lset`](crate::server::record::ExternalRef::lset)). No
+    /// other lset is asked — C picks one lset per link and never searches
+    /// across them (`dbLink.c:107-130`).
     ///
     /// # Cached read, then a staged open — C `dbCaGetLink`
     ///
@@ -2234,7 +2294,6 @@ impl PvDatabase {
         &self,
         link: crate::server::record::ExternalRef<'_>,
     ) -> Option<EpicsValue> {
-        // Try lsets first: the scheme's one lset, `ca` for a bare name.
         let (scheme, lref) = Self::external_link_ref(link);
         if let Some(v) =
             link_put_queue::find_lset(&self.inner, scheme, |lset| lset.get_cached_value(lref))
@@ -2245,37 +2304,18 @@ impl PvDatabase {
         None
     }
 
-    /// Split an external link's boundary name
-    /// ([`crate::server::record::ParsedLink::external_pv_name`]) into the
-    /// scheme of its one lset plus the name that lset is addressed with.
-    ///
-    /// Single owner of the `ca://` / `pva://` prefix convention: the
-    /// cache-miss stage in `resolve_external_pv` and the iocInit
-    /// open pass ([`PvDatabase::setup_external_link_opens`]) must derive
-    /// the same [`link_put_queue::Channel`] from the same link, or the
-    /// queue's once-per-link open would fire twice under two spellings.
-    fn split_external_link_name(name: &[u8]) -> (&'static str, &[u8]) {
-        if let Some(rest) = name.strip_prefix(b"pva://") {
-            ("pva", rest)
-        } else {
-            ("ca", name.strip_prefix(b"ca://").unwrap_or(name))
-        }
-    }
-
-    /// `link` as the one lset its scheme names addresses it
-    /// ([`Self::split_external_link_name`]).
+    /// `link` as the one lset it is addressed to addresses it.
     pub(crate) fn external_link_ref(
         link: crate::server::record::ExternalRef<'_>,
     ) -> (&'static str, LinkRef<'_>) {
-        let (scheme, body) = Self::split_external_link_name(link.name);
-        (scheme, LinkRef::new(body, link.open))
+        (link.lset.scheme(), LinkRef::new(link.name, link.open))
     }
 
-    /// Whether `scheme`'s lset can take a link to `body`: the `ca` set only
-    /// for a name it can connect ([`ca_link::CaLinks::addresses`]).
-    pub(crate) fn link_addressable(&self, scheme: &str, body: &[u8]) -> bool {
+    /// Whether `scheme`'s lset can take `link`: the `ca` set only for a
+    /// name it can connect ([`ca_link::CaLinks::addresses`]).
+    pub(crate) fn link_addressable(&self, scheme: &str, link: LinkRef<'_>) -> bool {
         match scheme {
-            "ca" => self.inner.ca_links.addresses(body),
+            "ca" => self.inner.ca_links.addresses(link),
             s => self.inner.link_sets.load().get_ref(s).is_some(),
         }
     }
@@ -2285,11 +2325,9 @@ impl PvDatabase {
     /// reached the wire — C's `pca->nNoWrite`, which `dbcar` prints beside
     /// the link (`dbCaTest.c:111-116`).
     ///
-    /// `link_name` is the link string as a record carries it, with or
-    /// without a `ca://` / `pva://` prefix; it is split by
-    /// `Self::split_external_link_name`, the same owner of that convention
-    /// the write path stages under, so the two cannot key the counter
-    /// differently. C keeps the count per `caLink`, i.e. per link field, and
+    /// `link_name` is a CA link's PV name as the record carries it: `dbcar`
+    /// reports CA links alone. C keeps the count per `caLink`, i.e. per link
+    /// field, and
     /// so does the queue: two records whose OUT links name one PV have two
     /// counters.
     pub fn external_link_puts_coalesced_for(
@@ -2301,10 +2339,12 @@ impl PvDatabase {
         let Some(rec) = self.get_record(record) else {
             return 0;
         };
-        let (scheme, body) = Self::split_external_link_name(link_name.as_ref());
-        self.inner
-            .link_puts
-            .coalesced_for(rec.index(), field, scheme, body)
+        self.inner.link_puts.coalesced_for(
+            rec.index(),
+            field,
+            crate::server::record::LinkSetTarget::Ca.scheme(),
+            link_name.as_ref(),
+        )
     }
 
     /// C `dbCaLinkInit` (`dbCa.c:322-346`), which `iocBuild` calls before it
@@ -2376,8 +2416,8 @@ impl PvDatabase {
         if link.open.is_set() || link.open.is_removed() {
             return false;
         }
-        let (scheme, body) = Self::split_external_link_name(link.name);
-        if !self.link_addressable(scheme, body) {
+        let (scheme, body) = (link.lset.scheme(), link.name);
+        if !self.link_addressable(scheme, LinkRef::new(body, link.open)) {
             return false;
         }
         // Nothing is staged that no owner can perform. A database built with
@@ -2585,6 +2625,8 @@ impl PvDatabase {
     /// Fire the wake-up. A send error means no server is attached, which is
     /// the normal state for a bare in-process database.
     fn signal_destroyed(&self) {
+        #[cfg(feature = "test-hooks")]
+        destroy_signal_hook::fire();
         let _ = self.inner.pv_destroyed_tx.send(());
     }
 
@@ -2660,7 +2702,8 @@ impl PvDatabase {
     /// half-built database cannot be classified against because the code that
     /// would do it has not been polled. Before any load, and once `iocInit` has
     /// run, it is spawned at once — which is what a runtime `special()` link
-    /// re-point needs.
+    /// re-point needs — except a new record's first, which `add_record` runs
+    /// before it returns, as `iocInit` does a loaded record's.
     ///
     /// # `record` is what the init classifies, and it must exist first
     ///
@@ -2703,37 +2746,52 @@ impl PvDatabase {
         self.dispatch_record_init(Box::pin(init));
     }
 
+    /// Whether a classification made now reads the database
+    /// [`Self::dispatch_record_init`] would spawn it against, rather than one
+    /// still loading, whose classifications it queues for `iocInit`.
+    pub(crate) fn classifies_links_at_once(&self) -> bool {
+        matches!(
+            *self.inner.init_phase.lock().unwrap(),
+            DbInitPhase::Unloaded | DbInitPhase::Running
+        )
+    }
+
     /// Queue or spawn an init whose record is known to be registered.
     fn dispatch_record_init(&self, init: RecordInit) {
-        let mut phase = self.inner.init_phase.lock().unwrap();
-        match &mut *phase {
-            DbInitPhase::Loading(queued) | DbInitPhase::Initialising(queued) => queued.push(init),
-            DbInitPhase::Unloaded | DbInitPhase::Running => {
-                drop(phase);
-                // Middle band, not the record's PRIO: C runs `init_record`
-                // inline on the `iocInit` thread (`dbInitRecord`,
-                // dbAccess.c), never on a callback queue, so there is no
-                // per-record band for record init to inherit.
-                crate::runtime::task::spawn_background(
-                    crate::runtime::task::CallbackPriority::Medium,
-                    init,
-                );
-            }
+        if let Some(init) = self.queue_record_init(init) {
+            // Middle band, not the record's PRIO: C runs `init_record`
+            // inline on the `iocInit` thread (`dbInitRecord`,
+            // dbAccess.c), never on a callback queue, so there is no
+            // per-record band for record init to inherit.
+            crate::runtime::task::spawn_background(
+                crate::runtime::task::CallbackPriority::Medium,
+                init,
+            );
         }
     }
 
-    /// Release every init parked for `record` — called by the one site that
-    /// registers the name, immediately after the insert that makes it real.
-    fn release_record_inits(&self, record: &[u8]) {
-        let parked = self
-            .inner
+    /// Queue `init` for `iocInit` while one is owed; hand it back, to run
+    /// now, on a complete database.
+    fn queue_record_init(&self, init: RecordInit) -> Option<RecordInit> {
+        let mut phase = self.inner.init_phase.lock().unwrap();
+        match &mut *phase {
+            DbInitPhase::Loading(queued) | DbInitPhase::Initialising(queued) => {
+                queued.push(init);
+                None
+            }
+            DbInitPhase::Unloaded | DbInitPhase::Running => Some(init),
+        }
+    }
+
+    /// Take every init parked for `record` — by the one site that registers
+    /// the name, immediately after the insert that makes it real.
+    fn take_record_inits(&self, record: &[u8]) -> Vec<RecordInit> {
+        self.inner
             .record_init_waiting
             .lock()
             .unwrap()
-            .remove(record);
-        for init in parked.into_iter().flatten() {
-            self.dispatch_record_init(init);
-        }
+            .remove(record)
+            .unwrap_or_default()
     }
 
     /// The `iocInit` barrier: end the LOAD phase and run every classification
@@ -2966,7 +3024,9 @@ impl PvDatabase {
                 Some(link) => inst.put_link_field(link, value),
                 None => inst.put_declared_field(field, value),
             };
-            let _ = inst.record.special(field, true, &inst.common);
+            let _ = inst.special(field, true);
+            // A link's `special()` never retypes; the counts may still move.
+            inst.recount_after_store(field);
             put
         };
         debug_assert!(put.is_ok(), "{field} is a link field with no writer");
@@ -3043,13 +3103,12 @@ impl PvDatabase {
         visited: &mut std::collections::HashSet<RecordName>,
         policy: ReadPolicy<'_>,
     ) -> Option<crate::server::snapshot::Snapshot> {
-        if let Some(own) = policy.own(record)
-            && !string_view
-        {
+        if let Some(own) = policy.own(record) {
             return crate::server::record::record_instance::own_field_snapshot(
                 own,
                 record.rdes().meta,
                 field,
+                string_view,
             );
         }
         // 1. Under a short read lock: is this field link-backed at all, and if
@@ -3431,9 +3490,12 @@ impl PvDatabase {
         // The record is reachable from this line on, so anything its
         // `set_async_context` parked above may now run. This is the only
         // release site because this is the only site that registers the name.
-        self.release_record_inits(&name);
+        let inits = self.take_record_inits(&name);
 
         if defer {
+            for init in inits {
+                self.dispatch_record_init(init);
+            }
             // The dset binding, init passes, scan-index insert and the
             // `recGblInitSimm`/`wdogInit` tail are all owed to `ioc_init`. The
             // record carries that debt itself (`RecordCell::init_owed`), so the
@@ -3461,6 +3523,15 @@ impl PvDatabase {
         if self.ioc_is_running() {
             self.open_record_links(&rec_arc);
             self.init_record_forwards(&rec_arc);
+        }
+        // The `init_record` tail: with no barrier to finish it, the record's
+        // link statuses are final when this returns, as they are when
+        // `iocInit` returns for a loaded one. acalcout's first process reads
+        // INAA..INLL by them (`aCalcoutRecord.c:1078`).
+        for init in inits {
+            if let Some(init) = self.queue_record_init(init) {
+                init.await;
+            }
         }
         Ok(())
     }
@@ -4027,16 +4098,79 @@ impl PvDatabase {
         filters::spells_a_field(field)
             && match addr.desc {
                 Some(d) => rec.takes_string_view(d),
-                None if addr.declared => false,
                 // `dbGetAttributePart`'s descriptor is a `DBF_STRING`.
-                None => self.has_record_type_attribute(rec.rdes().record_type, field),
+                None => self.attribute_field_type(rec, field).is_some(),
             }
     }
 
     /// `dbNameToAddr`'s field half for `rec`: a declared name, else an
     /// attribute (`dbGetAttributePart`), both compared as written.
     pub(crate) fn names_field(&self, rec: &RecordCell, field: &str) -> bool {
-        rec.declares_name(field) || self.has_record_type_attribute(rec.rdes().record_type, field)
+        rec.declares_name(field) || self.attribute_field_type(rec, field).is_some()
+    }
+
+    /// `dbNameToAddr`'s `field_type` where `dbFindFieldPart` misses and
+    /// `dbGetAttributePart` finds a record attribute (`dbAccess.c:673-675`):
+    /// `dbEntryToAddr` copies `dbPutRecordAttribute`'s `DBF_STRING`
+    /// descriptor, one element (`dbAccess.c:636-639`, `dbStaticLib.c:1268-1271`).
+    pub(crate) fn attribute_field_type(
+        &self,
+        rec: &RecordCell,
+        field: &str,
+    ) -> Option<crate::types::DbfCode> {
+        (!rec.declares_name(field) && self.has_record_type_attribute(rec.rdes().record_type, field))
+            .then_some(crate::types::DbfCode::String)
+    }
+
+    /// `getAttrValue`'s text of the attribute [`Self::attribute_field_type`]
+    /// finds (`dbAccess.c:950-953`).
+    pub(crate) fn attribute(&self, rec: &RecordCell, field: &str) -> Option<String> {
+        self.attribute_field_type(rec, field)?;
+        self.record_type_attribute(rec.rdes().record_type, field)
+    }
+
+    /// [`RecordCell::addressed_field_type`], a record attribute included.
+    pub(crate) fn addressed_field_type(
+        &self,
+        rec: &RecordCell,
+        field: &str,
+        own: Option<&dyn Record>,
+    ) -> Option<crate::types::DbfCode> {
+        rec.addressed_field_type(field, own)
+            .or_else(|| self.attribute_field_type(rec, field))
+    }
+
+    /// [`RecordCell::no_elements`], a record attribute's one element included.
+    pub(crate) fn no_elements(&self, rec: &RecordCell, field: &str) -> Option<u32> {
+        rec.no_elements(field)
+            .or_else(|| self.attribute_field_type(rec, field).map(|_| 1))
+    }
+
+    /// [`RecordCell::resolve_addr`], a record attribute's one element
+    /// included: its `special` is `SPC_ATTRIBUTE`, so no `cvt_dbaddr` runs.
+    pub(crate) fn resolve_addr(&self, rec: &Arc<RecordCell>, field: &str) -> Option<u32> {
+        rec.resolve_addr(field)
+            .or_else(|| self.attribute_field_type(rec, field).map(|_| 1))
+    }
+
+    /// `dbNameToAddr`'s `$` branch (`dbAccess.c:681-701`) on the address
+    /// [`Self::addressed_field_type`] gives `field`: its `field_type` and
+    /// `no_elements` then. A `DBF_STRING`, an attribute among them, becomes
+    /// `field_size` `DBF_CHAR`s (`:686-690`); a link keeps its type with
+    /// `PVLINK_STRINGSZ` (`dbDefs.h:79`) elements (`:692-696`); any other
+    /// field is `S_dbLib_fieldNotFound` (`:698-700`), `None`.
+    pub(crate) fn char_addressed(
+        &self,
+        rec: &RecordCell,
+        field: &str,
+        own: Option<&dyn Record>,
+    ) -> Option<(crate::types::DbfCode, u32)> {
+        let addr = char_view::CharAddr::of(self, rec, field)?;
+        let field_type = match addr.source {
+            char_view::CharSource::Link => self.addressed_field_type(rec, field, own)?,
+            _ => crate::types::DbfCode::Char,
+        };
+        Some((field_type, addr.no_elements as u32))
     }
 
     /// Synchronous existence check without resolver, taking no record lock:
@@ -4089,10 +4223,12 @@ impl PvDatabase {
         self.inner.simple_pvs.lock().get(name).cloned()
     }
 
-    /// `dbChannelCreate`'s existence half, which also judges the `$`
-    /// modifier against the field (`dbChannel.c:486-503`); the search side,
-    /// `dbChannelTest`, does not.
-    pub(crate) fn channel_create_found(&self, name: &[u8]) -> bool {
+    /// `dbChannelCreate`'s address half: `pvNameLookup` finds the field as
+    /// written and `dbEntryToAddr` runs its `cvt_dbaddr` (`dbChannel.c:460-478`)
+    /// before the `$` modifier is judged against it (`:486-503`), so a
+    /// create the `$` or the filter then refuses has charged it too. The
+    /// search side, `dbChannelTest`, runs neither.
+    pub(crate) fn resolve_channel_create(&self, name: &[u8]) -> bool {
         // A filtered channel (`REC.{"dbnd":{"d":0.5}}`) resolves to its
         // underlying PV, as in `find_entry_no_resolve`.
         let record_path = filters::split_channel_name(name).record_path;
@@ -4107,11 +4243,17 @@ impl PvDatabase {
             return false;
         };
         let Some(field) = explicit_field else {
+            self.resolve_addr(&rec, "VAL");
             return true;
         };
-        match field.strip_suffix('$') {
+        let core = field.strip_suffix('$');
+        let found = self.names_field(&rec, core.unwrap_or(field));
+        if found {
+            self.resolve_addr(&rec, core.unwrap_or(field));
+        }
+        match core {
             Some(core) => self.channel_field_found(&rec, core, true),
-            None => self.names_field(&rec, field),
+            None => found,
         }
     }
 
@@ -4867,7 +5009,7 @@ mod tests {
                 answer_tx.send(answers).unwrap();
             })
         };
-        let answers = answer_rx.recv_timeout(std::time::Duration::from_secs(2));
+        let answers = answer_rx.recv_timeout(fact_budget::FACT_BUDGET);
         release_tx.send(()).unwrap();
         holder.join().unwrap();
         asker.join().unwrap();
@@ -5458,10 +5600,10 @@ mod tests {
         // could hang because T1 holds simple_pvs.write and waits
         // for records.read while T2 holds records.write and waits
         // for simple_pvs.read.
-        let r1 = crate::runtime::task::timeout(std::time::Duration::from_secs(2), h1)
+        let r1 = crate::runtime::task::timeout(fact_budget::FACT_BUDGET, h1)
             .await
             .expect("add_pv must not block on add_record");
-        let r2 = crate::runtime::task::timeout(std::time::Duration::from_secs(2), h2)
+        let r2 = crate::runtime::task::timeout(fact_budget::FACT_BUDGET, h2)
             .await
             .expect("add_record must not block on add_pv");
         let r1 = r1.unwrap();
@@ -5647,7 +5789,7 @@ mod tests {
         use crate::server::records::ai::AiRecord;
 
         let db = PvDatabase::new();
-        // A `pva` link set has to be installed for a `pva://` link to survive
+        // A `pva` link set has to be installed for a pva link to survive
         // `db_init_link_locality`, which refuses a link whose scheme nothing
         // can service. This test is about the ENUMERATION reaching
         // `common.text.inp`, so it installs the lset the link names rather than
@@ -5667,7 +5809,7 @@ mod tests {
         // exact storage a `field_list()` String scan cannot reach.
         {
             let rec = db.get_record("AI").unwrap();
-            rec.write().common.text.inp = "pva://mini:current?proc=CP".into();
+            rec.write().common.text.inp = r#"{pva:"mini:current?proc=CP"}"#.into();
         }
 
         let links = db.record_link_fields("AI");
@@ -5675,10 +5817,10 @@ mod tests {
             .iter()
             .find(|(f, _, _)| f == "INP")
             .unwrap_or_else(|| panic!("INP link must be surfaced, got {links:?}"));
-        assert_eq!(inp.1, "pva://mini:current?proc=CP");
+        assert_eq!(inp.1, r#"{pva:"mini:current?proc=CP"}"#);
         assert!(
             matches!(inp.2, ParsedLink::Pva(_)),
-            "a pva:// INP must parse to ParsedLink::Pva, got {:?}",
+            "a pva INP must parse to ParsedLink::Pva, got {:?}",
             inp.2
         );
     }
@@ -5713,7 +5855,7 @@ mod tests {
         let db = PvDatabase::new();
         db.ioc_init().await;
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
         while !table().contains("dbCaLink") {
             assert!(
                 std::time::Instant::now() < deadline,

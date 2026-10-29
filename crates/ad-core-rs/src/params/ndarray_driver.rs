@@ -211,8 +211,8 @@ mod tests {
             "test",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         let (params, _) = NDArrayDriverParams::create(&mut base).unwrap();
         assert!(base.find_param("ARRAY_COUNTER").is_some());
@@ -232,8 +232,8 @@ mod tests {
             "test",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         let _ = NDArrayDriverParams::create(&mut base).unwrap();
         // Should have created ~50 params
@@ -248,8 +248,8 @@ mod tests {
             "order",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         let _ = NDArrayDriverParams::create(&mut base).unwrap();
         let c = [

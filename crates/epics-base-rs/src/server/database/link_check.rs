@@ -5,59 +5,67 @@
 use std::time::Duration;
 
 use super::PvDatabase;
-use crate::server::record::RecordInstance;
+use crate::server::record::{DbLinkType, RecordInstance};
 use crate::server::records::link_status::{
     DBF_UNKNOWN, LINK_CON, LINK_EXT_NC, LINK_EXT_OK, LINK_LOC, LINK_RECHECK, dbf_static_code,
     link_is_external,
 };
 
 impl PvDatabase {
-    /// C `checkLinks` on the record `instance` holds: every link its rule
-    /// visits whose status reads `Ext PV` takes its `dbIsLinkConnected` (and
-    /// its `dbGetLinkDBFtype`, for a record keeping one), and a status that
-    /// moved posts — a `Local PV` one too under `repost_local`. Returns whether it scheduled
-    /// `checkLinksCallback` — an `Ext PV NC` remains and none was pending.
+    /// C `checkLinks` on the record `instance` holds, by each link's type
+    /// after `dbInitLink`: every CA link its rule visits takes its
+    /// `dbIsLinkConnected` (and its `dbGetLinkDBFtype`, for a record keeping
+    /// one), which moves an `Ext PV` status, and a status that moved posts —
+    /// every DB link's `Local PV` too under `repost_local`. Returns whether it
+    /// scheduled `checkLinksCallback` — a visited CA link is down and none was
+    /// pending.
     pub(crate) fn check_links(&self, instance: &mut RecordInstance) -> bool {
         let Some(check) = instance.record.link_check() else {
             return false;
         };
         let spec = check.spec;
         let typed = !check.field_types.is_empty();
-        let due = check
+        let external = check
             .statuses
             .iter()
             .enumerate()
             .filter(|(_, s)| link_is_external(**s))
-            .fold(0u64, |due, (i, _)| due | 1 << i);
-        let (mut visited, mut connected) = (0u64, 0u64);
+            .fold(0u64, |ext, (i, _)| ext | 1 << i);
+        let (mut db_links, mut visited, mut connected) = (0u64, 0u64, 0u64);
         let mut types = Vec::new();
         for (i, &(link, _)) in spec.links.iter().enumerate() {
-            if due & 1 << i == 0 {
-                continue;
-            }
             let Some(parsed) = instance.stored_link(link) else {
                 continue;
             };
-            if spec.rule.visits(parsed) {
-                visited |= 1 << i;
-                if self.link_connected(parsed) {
-                    connected |= 1 << i;
-                }
-                if typed {
-                    let ft = self.external_link_dbf_type(parsed);
-                    types.push((i, ft.map_or(DBF_UNKNOWN, dbf_static_code)));
-                }
+            if parsed.link_type_after_init() == DbLinkType::DbLink {
+                db_links |= 1 << i;
+            }
+            // sseq reads every named link's `dbGetLinkDBFtype`
+            // (sseqRecord.c:884, :941), so a CA link `special()` called
+            // `Local PV` too; the calcs ask only an `Ext PV` one.
+            if !spec.rule.visits(parsed) || !typed && external & 1 << i == 0 {
+                continue;
+            }
+            visited |= 1 << i;
+            if self.link_connected(parsed) {
+                connected |= 1 << i;
+            }
+            if typed {
+                let ft = self.external_link_dbf_type(parsed);
+                types.push((i, ft.map_or(DBF_UNKNOWN, dbf_static_code)));
             }
         }
         let Some(mut check) = instance.record.link_check() else {
             return false;
         };
+        let local = if spec.repost_local { db_links } else { 0 };
         let mut moved = 0u64;
         for (i, status) in check.statuses.iter_mut().enumerate() {
-            if visited & 1 << i == 0 {
+            let now = if local & 1 << i != 0 {
+                LINK_LOC
+            } else if visited & external & 1 << i == 0 {
                 continue;
-            }
-            let now = if connected & 1 << i != 0 {
+            } else if connected & 1 << i != 0 {
                 LINK_EXT_OK
             } else {
                 LINK_EXT_NC
@@ -78,23 +86,13 @@ impl PvDatabase {
         for (i, ft) in types {
             check.field_types[i] = ft;
         }
-        let local = if spec.repost_local {
-            check
-                .statuses
-                .iter()
-                .enumerate()
-                .filter(|(_, s)| **s == LINK_LOC)
-                .fold(0u64, |local, (i, _)| local | 1 << i)
-        } else {
-            0
-        };
         check.state.ca_links = visited != 0;
         let arm = visited & !connected != 0 && !check.state.scheduled;
         check.state.scheduled |= arm;
         let tail = check
             .tail
             .as_deref_mut()
-            .map(|tail| (tail.pass(check.statuses), tail.fields()));
+            .map(|tail| (tail.pass(db_links), tail.fields()));
         for (i, &(_, status)) in spec.links.iter().enumerate() {
             if (moved | local) & 1 << i != 0 {
                 instance.notify_field(status, spec.mask);
@@ -129,24 +127,25 @@ impl PvDatabase {
     fn arm_link_check(&self, name: &[u8], delay: Duration) {
         let db = self.clone();
         let name = crate::types::RecordName::from(name);
-        crate::runtime::task::spawn_background(
+        crate::runtime::task::spawn_background_after(
             crate::runtime::task::CallbackPriority::Low,
+            delay,
             async move {
-                let mut delay = delay;
                 loop {
-                    crate::runtime::task::sleep_background(delay).await;
-                    let Some(rec) = db.get_record_no_resolve(&name) else {
-                        return;
-                    };
-                    let mut instance = rec.write();
-                    let Some(check) = instance.record.link_check() else {
-                        return;
-                    };
-                    check.state.scheduled = false;
-                    if !db.check_links(&mut instance) {
-                        return;
+                    {
+                        let Some(rec) = db.get_record_no_resolve(&name) else {
+                            return;
+                        };
+                        let mut instance = rec.write();
+                        let Some(check) = instance.record.link_check() else {
+                            return;
+                        };
+                        check.state.scheduled = false;
+                        if !db.check_links(&mut instance) {
+                            return;
+                        }
                     }
-                    delay = LINK_RECHECK;
+                    crate::runtime::task::sleep_background(LINK_RECHECK).await;
                 }
             },
         );

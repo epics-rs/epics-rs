@@ -112,29 +112,39 @@ fn named_boot_stderr(bin: &str, args: &[&std::ffi::OsStr], dir: &std::path::Path
     named_port::on_a_named_port(|port| boot_stderr_on(bin, args, dir, port))
 }
 
-/// [`named_boot_stderr`] with the first candidate held by this test through
-/// `hold`, and the number of attempts it took.
+/// [`named_boot_stderr`] with the first candidate the number this test keeps
+/// through `hold`, and the number of attempts it took.
 fn boot_past_a_held_port<H>(
     bin: &str,
     args: &[&std::ffi::OsStr],
     dir: &std::path::Path,
-    hold: impl Fn(u16) -> std::io::Result<H>,
+    hold: impl FnOnce() -> (H, u16),
 ) -> (usize, String) {
+    let (_held, port) = hold();
+    let mut first = Some(port);
+    let pick = || {
+        first
+            .take()
+            .unwrap_or_else(named_port::free_for_tcp_and_udp)
+    };
     let mut attempts = 0;
-    let stderr = named_port::on_a_named_port(|port| {
+    let stderr = named_port::on_a_named_port_from(pick, |port| {
         attempts += 1;
-        let _held = (attempts == 1).then(|| hold(port).expect("hold the first candidate"));
         boot_stderr_on(bin, args, dir, port)
     });
     (attempts, stderr)
 }
 
-fn hold_udp(port: u16) -> std::io::Result<std::net::UdpSocket> {
-    std::net::UdpSocket::bind(("127.0.0.1", port))
+fn hold_udp() -> (named_port::HeldPort, u16) {
+    let held = named_port::HeldPort::closed_udp();
+    let port = held.port;
+    (held, port)
 }
 
-fn hold_tcp(port: u16) -> std::io::Result<std::net::TcpListener> {
-    std::net::TcpListener::bind(("127.0.0.1", port))
+fn hold_tcp() -> (std::net::TcpListener, u16) {
+    let held = std::net::TcpListener::bind("127.0.0.1:0").expect("hold a TCP port");
+    let port = held.local_addr().expect("read the held port").port();
+    (held, port)
 }
 
 /// The retry path end to end on `bin`: whichever socket `hold` takes, the IOC
@@ -142,7 +152,7 @@ fn hold_tcp(port: u16) -> std::io::Result<std::net::TcpListener> {
 fn retries_past_a_held_port<H>(
     bin: &str,
     args: impl Fn(&std::path::Path) -> Vec<std::ffi::OsString>,
-    hold: impl Fn(u16) -> std::io::Result<H>,
+    hold: impl FnOnce() -> (H, u16),
 ) {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("x.db");

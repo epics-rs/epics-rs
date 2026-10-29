@@ -14,7 +14,7 @@ use crate::server::database::filters::{ChannelCreateError, FilterChain};
 use crate::server::database::{PvDatabase, PvEntry};
 use crate::server::event_queue::{DeliveryContext, EventReader, EventUser};
 use crate::server::pv::{ProcessVariable, PutStarted, PvWrite, SubscribeRefused};
-use crate::server::record::{FieldDeclaration, RecordCell};
+use crate::server::record::RecordCell;
 use crate::server::record::{ProcessCompletion, PutRefused};
 use crate::types::{DbFieldType, EpicsValue};
 
@@ -240,96 +240,18 @@ pub async fn channel_create(
             if !crate::server::database::filters::spells_a_field(spelled) {
                 return Err(CreateRefusal::Refused);
             }
-            let instance = rec.read();
-            // `client_field_value` = resolve_field (3-level
-            // priority) with a DBF_MENU field promoted to its
-            // DBR_ENUM form, so the channel's announced native
-            // type matches the GET/MONITOR data
-            // (`value.dbr_type()` below).
-            let value = instance.client_field_value(&field);
-            match value {
-                Some(v) => {
-                    // `$` — C `dbNameToAddr` (dbAccess.c:682-701)
-                    // re-types a string or link field as a
-                    // DBR_CHAR array and refuses every other type
-                    // (S_dbLib_fieldNotFound, CREATE_CH_FAIL). The
-                    // shared owner answers both, with C's
-                    // `no_elements` (lsi/lso/printf SIZV, a link's
-                    // PVLINK_STRINGSZ).
-                    let dollar = if long_string {
-                        match crate::server::database::char_view::char_view(&instance, &field) {
-                            Some(view) => Some((
-                                view.no_elements as u32,
-                                view.nul_at_count(),
-                                crate::server::database::char_view::DollarView::of(
-                                    &instance,
-                                    &field,
-                                    &channel.chain,
-                                )
-                                .expect("char_view answered this field"),
-                            )),
-                            None => {
-                                return Err(CreateRefusal::Refused);
-                            }
-                        }
-                    } else {
-                        None
-                    };
-                    let (dbr_type_val, element_count, mode) =
-                        if let Some((no_elements, nul_at_count, view)) = dollar {
-                            (
-                                DbFieldType::Char,
-                                no_elements,
-                                LongStringMode::DollarChar {
-                                    no_elements,
-                                    nul_at_count,
-                                    view,
-                                },
-                            )
-                        } else if let Some(route) =
-                            crate::server::database::char_view::read_route(&instance, &field)
-                                .and_then(|source| source.text_route())
-                        {
-                            (v.dbr_type(), 1, LongStringMode::Text(route))
-                        } else if instance.record.field_is_long_string(&field) {
-                            // Long-string *record* field (lsi/lso VAL &
-                            // OVAL, printf VAL). C `cvt_dbaddr` presents
-                            // it as a scalar `DBF_STRING` with
-                            // `no_elements = 1` (lsiRecord.c:141-143,
-                            // lsoRecord.c:183-185, printfRecord.c:415-417);
-                            // the full long value is reachable only via
-                            // the `$` modifier (handled above). The record
-                            // stores the value as a CHAR-array carrier, so
-                            // every delivery path decodes it to a scalar
-                            // string with `apply_native_long_string`.
-                            (DbFieldType::String, 1u32, LongStringMode::NativeString)
-                        } else if let Some(native) = instance.record.field_native_count(&field) {
-                            // C `cvt_dbaddr` fixes a channel's no_elements at
-                            // the field's buffer capacity, distinct from the
-                            // current value length `get_array_info` reports
-                            // (waveform VAL→NELM serving NORD; asyn BOUT→OMAX /
-                            // BINP→IMAX serving the transferred byte count). The
-                            // client sizes its buffer to the capacity even
-                            // though a GET returns fewer elements.
-                            (v.dbr_type(), native, LongStringMode::Plain)
-                        } else {
-                            (v.dbr_type(), v.count() as u32, LongStringMode::Plain)
-                        };
-                    (
-                        dbr_type_val,
-                        element_count,
-                        ChannelTarget::RecordField {
-                            record: rec.clone(),
-                            field: field.as_str().into(),
-                        },
-                        mode,
-                    )
-                }
-                None => {
-                    // Field not found — send CREATE_CH_FAIL
-                    return Err(CreateRefusal::Refused);
-                }
-            }
+            let (dbr_type_val, element_count, mode) =
+                record_channel_shape(db, &rec, &field, long_string, &channel.chain)
+                    .ok_or(CreateRefusal::Refused)?;
+            (
+                dbr_type_val,
+                element_count,
+                ChannelTarget::RecordField {
+                    record: rec.clone(),
+                    field: field.as_str().into(),
+                },
+                mode,
+            )
         }
     };
 
@@ -355,6 +277,66 @@ pub async fn channel_create(
         field_element_count,
         long_string_mode,
     })
+}
+
+/// The native type, element count and long-string mode of a channel on
+/// `rec`'s `field`, addressed as `dbChannelCreate` addresses it
+/// (`dbChannel.c:470-505`): from the declaration and what the record settled
+/// at load, init and each retyping `special`. C takes no lock here, so a held
+/// record neither parks the create nor deadlocks a creator holding the set
+/// its holder waits for. `None` is CREATE_CH_FAIL.
+fn record_channel_shape(
+    db: &PvDatabase,
+    rec: &Arc<RecordCell>,
+    field: &str,
+    long_string: bool,
+    chain: &FilterChain,
+) -> Option<(DbFieldType, u32, LongStringMode)> {
+    use crate::server::database::char_view::{CharAddr, DollarView, TextRoute};
+    // `$` re-types a string or link field as a `DBR_CHAR` array and refuses
+    // every other type (`dbAccess.c:682-701`).
+    if long_string {
+        let addr = CharAddr::of(db, rec, field)?;
+        let no_elements = addr.no_elements as u32;
+        let mode = LongStringMode::DollarChar {
+            no_elements,
+            nul_at_count: addr.nul_at_count(),
+            view: DollarView::of_addr(addr, rec.form_string(), field, chain),
+        };
+        return Some((DbFieldType::Char, no_elements, mode));
+    }
+    let desc = crate::server::record::record_instance::field_desc_in(rec.rdes().fields, field);
+    let Some(desc) = desc else {
+        // `dbGetAttributePart`'s `DBF_STRING`, which `dbGet` reads as text.
+        return db.attribute_field_type(rec, field).map(|_| {
+            (
+                DbFieldType::String,
+                1,
+                LongStringMode::Text(TextRoute::Attribute),
+            )
+        });
+    };
+    if desc.unreadable() {
+        return None;
+    }
+    if crate::types::link_class_of(desc).is_some() {
+        return Some((
+            DbFieldType::String,
+            1,
+            LongStringMode::Text(TextRoute::Link),
+        ));
+    }
+    if desc.long_string {
+        // `cvt_dbaddr` makes it a scalar `DBF_STRING` (lsiRecord.c:141-143,
+        // lsoRecord.c:183-185, printfRecord.c:415-417); only `$` reaches the
+        // whole buffer.
+        return Some((DbFieldType::String, 1, LongStringMode::NativeString));
+    }
+    let served = rec.addressed_field_type(field, None)?.served_type()?;
+    let count = rec.no_elements(field)?;
+    let dbr_type =
+        DbFieldType::from_u16(served.ca_wire_type()).expect("ca_wire_type is a CA DBF code");
+    Some((dbr_type, count, LongStringMode::Plain))
 }
 
 /// Read a record-field snapshot under the record's `dbScanLock` analogue — the
@@ -624,6 +606,42 @@ pub fn post_single_event(
     }
 }
 
+/// [`add_event`]'s attach without its first event, for a record `field`
+/// subscriber of client id 0 (a link's): it takes now the place on the
+/// record's monitor list C's `db_event_enable` gives it
+/// (`dbEvent.c:508-517`), and no post until [`enable_event`].
+pub(crate) fn add_event_disabled(
+    record: &Arc<RecordCell>,
+    field: &str,
+    user: &EventUser,
+    native_type: DbFieldType,
+    mask: u16,
+    context: &DeliveryContext,
+    pre_chain: FilterChain,
+) -> Result<EventReader, SubscribeRefused> {
+    let mut instance = record.write();
+    let rx = instance.add_subscriber_on(user, field, 0, native_type, mask, context)?;
+    for filt in pre_chain {
+        instance.attach_filter_to_last_subscriber(field, filt);
+    }
+    instance.set_subscriber_active(rx.id(), false);
+    Ok(rx)
+}
+
+/// C `db_event_enable` and `db_post_single_event` for the
+/// [`add_event_disabled`] subscriber holding slot `id`, in one scan-lock
+/// hold as [`add_event`]'s.
+pub(crate) fn enable_event(
+    db: &PvDatabase,
+    record: &Arc<RecordCell>,
+    field: &str,
+    id: crate::server::event_queue::AttachId,
+) {
+    let _scan_lock = db.lock_instance(record);
+    record.read().set_subscriber_active(id, true);
+    post_single_event(db, record, field, id);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -681,5 +699,182 @@ mod tests {
         }
         assert!(!seen.is_empty());
         assert!(seen.iter().all(|v| *v == Some(2.0)), "{seen:?}");
+    }
+
+    /// One record of every base type, the array ones in several element
+    /// types, the long-string ones at several sizes.
+    const EVERY_TYPE: &str = r#"
+record(ai, "ai") {}
+record(ao, "ao") {}
+record(bi, "bi") { field(ZNAM, "z") field(ONAM, "o") }
+record(bo, "bo") {}
+record(stringin, "stringin") { info(Q:form, "String") }
+record(stringout, "stringout") {}
+record(longin, "longin") {}
+record(longout, "longout") {}
+record(int64in, "int64in") {}
+record(int64out, "int64out") {}
+record(lsi, "lsi") { field(SIZV, "100") }
+record(lso, "lso") { field(SIZV, "20") info(Q:form, "String") }
+record(mbbi, "mbbi") { field(ZRST, "zero") }
+record(mbbo, "mbbo") { field(ZRST, "zero") field(ONST, "one") }
+record(mbbo, "mbbo0") {}
+record(mbbiDirect, "mbbiDirect") {}
+record(mbboDirect, "mbboDirect") {}
+record(event, "event") {}
+record(printf, "printf") { field(SIZV, "60") }
+record(waveform, "wfS") { field(FTVL, "STRING") field(NELM, "4") }
+record(waveform, "wfC") { field(FTVL, "CHAR") field(NELM, "16") info(Q:form, "String") }
+record(waveform, "wfUC") { field(FTVL, "UCHAR") field(NELM, "16") }
+record(waveform, "wfD") { field(FTVL, "DOUBLE") field(NELM, "8") }
+record(waveform, "wfI64") { field(FTVL, "INT64") field(NELM, "3") }
+record(waveform, "wfUL") { field(FTVL, "ULONG") field(NELM, "3") }
+record(aai, "aai") { field(FTVL, "STRING") field(NELM, "2") }
+record(aao, "aao") { field(FTVL, "SHORT") field(NELM, "5") }
+record(subArray, "subArray") { field(FTVL, "FLOAT") field(MALM, "10") field(NELM, "4") }
+record(calc, "calc") { field(CALC, "A+1") }
+record(fanout, "fanout") {}
+record(seq, "seq") {}
+record(calcout, "calcout") { field(CALC, "A") }
+record(dfanout, "dfanout") {}
+record(compress, "compress") { field(NSAM, "6") }
+record(histogram, "histogram") { field(NELM, "5") }
+record(sel, "sel") {}
+record(sub, "sub") {}
+record(aSub, "aSub") {
+    field(FTA, "STRING") field(NOA, "4")
+    field(FTB, "CHAR") field(NOB, "10")
+    field(FTVA, "DOUBLE") field(NOVA, "3")
+    field(FTVB, "STRING")
+}
+record(permissive, "permissive") {}
+record(state, "state") {}
+"#;
+
+    /// What the create read under the record's lock before it took none.
+    fn shape_under_lock(
+        instance: &crate::server::record::RecordInstance,
+        field: &str,
+        long_string: bool,
+        chain: &FilterChain,
+    ) -> Option<(DbFieldType, u32, LongStringMode)> {
+        use crate::server::database::char_view::{DollarView, char_view, read_route};
+        use crate::server::record::FieldDeclaration;
+        let v = instance.client_field_value(field)?;
+        if long_string {
+            let view = char_view(instance, field)?;
+            let no_elements = view.no_elements as u32;
+            let mode = LongStringMode::DollarChar {
+                no_elements,
+                nul_at_count: view.nul_at_count(),
+                view: DollarView::of(instance, field, chain)?,
+            };
+            return Some((DbFieldType::Char, no_elements, mode));
+        }
+        if let Some(route) = read_route(instance, field).and_then(|s| s.text_route()) {
+            return Some((v.dbr_type(), 1, LongStringMode::Text(route)));
+        }
+        if instance.record.field_is_long_string(field) {
+            return Some((DbFieldType::String, 1, LongStringMode::NativeString));
+        }
+        if let Some(native) = instance.record.field_native_count(field) {
+            return Some((v.dbr_type(), native, LongStringMode::Plain));
+        }
+        Some((v.dbr_type(), v.count() as u32, LongStringMode::Plain))
+    }
+
+    /// [`record_channel_shape`] answers with no lock what the create read
+    /// under it: every field of every base type, with `$` and without, with a
+    /// filter chain and without.
+    #[epics_macros_rs::epics_test]
+    async fn the_lock_free_shape_is_the_one_read_under_the_lock() {
+        let (db, _) = crate::server::ioc_builder::IocBuilder::new()
+            .db_string(EVERY_TYPE, &std::collections::HashMap::new())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        db.ioc_init().await;
+        let arr = crate::server::database::filters::db_channel_create(
+            &db,
+            br#"ai.VAL{"arr":{"s":1,"e":2}}"#,
+        )
+        .unwrap()
+        .chain;
+        let chains = [FilterChain::default(), arr];
+        let names = EVERY_TYPE
+            .lines()
+            .filter(|l| l.starts_with("record("))
+            .filter_map(|l| l.split('"').nth(1))
+            .collect::<Vec<_>>();
+        let mut differ = Vec::new();
+        for name in names {
+            let cell = db.get_record(name).unwrap();
+            let fields = cell
+                .rdes()
+                .fields
+                .iter()
+                .chain(crate::server::record::dbd_generated::DB_COMMON_FIELDS)
+                .map(|f| f.name)
+                .chain(["RTYP", "NOPE"]);
+            for field in fields {
+                for long_string in [false, true] {
+                    for chain in &chains {
+                        let free = record_channel_shape(&db, &cell, field, long_string, chain);
+                        let held = shape_under_lock(&cell.read(), field, long_string, chain);
+                        if free != held {
+                            let dollar = if long_string { "$" } else { "" };
+                            differ.push(format!("{name}.{field}{dollar}: {free:?} != {held:?}"));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(differ.is_empty(), "{}", differ.join("\n"));
+    }
+
+    /// `PvDatabase::parsed_link_target_field_type` answers with no lock what
+    /// it read under the target's lock: every field of every base type.
+    #[epics_macros_rs::epics_test]
+    async fn the_lock_free_link_target_type_is_the_one_read_under_the_lock() {
+        let (db, _) = crate::server::ioc_builder::IocBuilder::new()
+            .db_string(EVERY_TYPE, &std::collections::HashMap::new())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        db.ioc_init().await;
+        let names = EVERY_TYPE
+            .lines()
+            .filter(|l| l.starts_with("record("))
+            .filter_map(|l| l.split('"').nth(1))
+            .collect::<Vec<_>>();
+        let mut differ = Vec::new();
+        for name in names {
+            let cell = db.get_record(name).unwrap();
+            let fields = cell
+                .rdes()
+                .fields
+                .iter()
+                .chain(crate::server::record::dbd_generated::DB_COMMON_FIELDS)
+                .map(|f| f.name)
+                .chain(["RTYP", "NOPE"]);
+            for field in fields {
+                let link =
+                    crate::server::record::parse_link_v2(format!("{name}.{field}").as_bytes());
+                let free = db.parsed_link_target_field_type(&link);
+                let inst = cell.read();
+                let held = crate::server::record::record_instance::addressed_field_type_of(
+                    inst.record.as_ref(),
+                    field,
+                )
+                .or_else(|| inst.attribute(field).map(|_| crate::types::DbfCode::String));
+                drop(inst);
+                if free != held {
+                    differ.push(format!("{name}.{field}: {free:?} != {held:?}"));
+                }
+            }
+        }
+        assert!(differ.is_empty(), "{}", differ.join("\n"));
     }
 }

@@ -4,7 +4,7 @@ use epics_base_rs::error::{CaResult, DbStatus};
 use epics_base_rs::server::device_support::{DeviceReadOutcome, DeviceSupport, DeviceUdf};
 use epics_base_rs::server::record::Record;
 
-use crate::records::epid::EpidRecord;
+use crate::records::epid::{Course, EpidRecord};
 
 /// `do_pid`'s `return(1)` for a pass inside MDT (`devEpidSoft.c:125`).
 const SUB_MDT: DbStatus = match DbStatus::new(1) {
@@ -57,14 +57,26 @@ impl EpidSoftDeviceSupport {
         // A CONSTANT `INP` link is a literal value, not a PV to read —
         // there is nothing to feed back on, so PID is skipped and the
         // record is flagged SOFT/INVALID. The framework `check_alarms`
-        // hook raises the severity from this flag.
-        if epics_base_rs::server::record::link_field_type(&epid.inp)
-            == epics_base_rs::server::record::LinkType::Constant
-        {
+        // hook raises the severity from this flag. C's CONSTANT includes
+        // an empty INP (`dbStaticLib.c:2346-2349`).
+        if epics_base_rs::server::record::parse_link_v2(&epid.inp).is_constant_type() {
             epid.inp_constant = true;
             return;
         }
         epid.inp_constant = false;
+        // The input stage's TRIG put and INP read, which C makes here.
+        match epid.course.take() {
+            Some(Course::TrigFailed(status)) => {
+                epid.link_failed = true;
+                epid.pid_status = Err(status);
+                return;
+            }
+            Some(Course::InpFailed) => {
+                epid.link_failed = true;
+                return;
+            }
+            _ => {}
+        }
 
         // Previous controlled value: CVLP, maintained by
         // `EpidRecord::update_monitors()` (`epid.rs` — `self.cvlp = self.cval`).

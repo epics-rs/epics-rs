@@ -75,7 +75,8 @@ async fn complete(db: &PvDatabase, pending: &Pending) {
         .join()
         .unwrap();
     // The re-entered pass either queues again or ends the cycle.
-    for _ in 0..400 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if pending.lock().unwrap().is_some() || !db.get_record("AI").unwrap().read().is_processing()
         {
             return;

@@ -196,7 +196,7 @@ filter = 'package(ad-plugins-rs) and test(file_magick::)'
 test-group = 'ndarray_io'
 
 [[profile.default.overrides]]
-filter = 'binary(stability) | binary(tls) | binary(typed_nt) | binary(service_framework) | binary(pva_gateway) | binary(set_byte_order_renegotiate) | binary(heartbeat_echo) | binary(run_pva_ioc_env_ports)'
+filter = 'binary(stability) | binary(tls) | binary(typed_nt) | binary(service_framework) | binary(pva_gateway) | binary(set_byte_order_renegotiate) | binary(heartbeat_echo) | binary(run_pva_ioc_env_ports) | binary(qsrv2_decision)'
 test-group = 'pva_listener'
 
 # Serialised IOC spawners. These four are the group's original membership
@@ -286,6 +286,11 @@ test-group = 'ca_softioc'
 #                                        time at host load 4-8; the same
 #                                        `qsrv_named_ports` helper, which
 #                                        retries a lost port.
+#   binary(dual_ioc_rs_resolves_a_pva_link)
+#                                      — 0 failures in 20 runs, 2 at a
+#                                        time at host load 1-4; a taken
+#                                        port is retried on the next
+#                                        `named_port` candidate.
 #   binary(softioc_ioc_init_starts_scanning)
 #   binary(softioc_prompt_ioc_init_starts_the_ca_server)
 #                                      — 0 failures in 20 runs, 5 at a
@@ -300,7 +305,7 @@ test-group = 'ca_softioc'
 #                                        would cost wall time and buy
 #                                        nothing.
 [[profile.default.overrides]]
-filter = 'package(epics-oracle-rs) | package(qsrv-ioc) | package(c-ca-tools) | binary(realtime_ca_ioc_boots) | binary(realtime_pva_ioc_boots) | binary(cli_tcp_port_fallback) | binary(cli_monitor_disconnect_stderr) | binary(cli_monitor_separator) | binary(cli_env_double_diagnostics) | binary(softioc_default_is_interactive) | binary(softioc_verbose_brackets_the_script_and_iocinit) | binary(softioc_resolves_a_ca_link) | binary(softioc_db_channel_create_line) | binary(qsrv_rs_group_file) | binary(qsrv_rs_sources) | binary(qsrv_rs_resolves_a_ca_link) | binary(qsrv_rs_resolves_a_pva_link) | binary(interop_pvxs) | binary(softioc_boot_stream_split) | binary(softioc_iocinit_line_precedes_init_record) | binary(softioc_pini_order) | binary(events_per_chan_clamp_is_reported_at_server_start) | binary(softioc_ioc_init_starts_scanning) | binary(softioc_prompt_ioc_init_starts_the_ca_server)'
+filter = 'package(epics-oracle-rs) | package(qsrv-ioc) | package(c-ca-tools) | binary(realtime_ca_ioc_boots) | binary(realtime_pva_ioc_boots) | binary(cli_tcp_port_fallback) | binary(cli_monitor_disconnect_stderr) | binary(cli_monitor_separator) | binary(cli_env_double_diagnostics) | binary(softioc_default_is_interactive) | binary(softioc_verbose_brackets_the_script_and_iocinit) | binary(softioc_resolves_a_ca_link) | binary(softioc_db_channel_create_line) | binary(qsrv_rs_group_file) | binary(qsrv_rs_sources) | binary(qsrv_rs_resolves_a_ca_link) | binary(qsrv_rs_resolves_a_pva_link) | binary(dual_ioc_rs_resolves_a_pva_link) | binary(interop_pvxs) | binary(softioc_boot_stream_split) | binary(softioc_iocinit_line_precedes_init_record) | binary(softioc_pini_order) | binary(events_per_chan_clamp_is_reported_at_server_start) | binary(softioc_ioc_init_starts_scanning) | binary(softioc_prompt_ioc_init_starts_the_ca_server)'
 test-group = 'ioc_unthrottled'
 
 # Capped because nobody has measured them unthrottled.
@@ -308,14 +313,22 @@ test-group = 'ioc_unthrottled'
 filter = 'binary(boot_stderr_matches_softioc) | binary(softioc_a_ca_put_never_waits_on_the_console) | binary(softioc_errlog_reports_lost_messages) | binary(softioc_undeclared_json_link_type) | binary(a_ca_forward_link_processes_the_remote_record) | binary(gw_upstream_unresponsive_window) | binary(softioc_db_path_bytes) | binary(qsrv_rs_db_path_bytes) | binary(st_cmd_boots_through_iocinit) | binary(attributes_file_over_ca) | binary(softioc_asub_init_stderr) | binary(softioc_ioc_init_failure_lines) | binary(softioc_ioc_init_redirect) | binary(softioc_general_time_dtyp) | binary(softioc_dbd_device_line) | binary(cp_process_runs_on_dbcalink)'
 test-group = 'ca_softioc'
 
-# epics-bridge-rs lib tests: two pvalink tests spawn softIocPVX (interop
-# profile only) — 0 failures in 20 runs, 2 at a time at host load 38-193.
-# A lib binary is declared only by `package()`, so this block sits after
-# every block naming a bridge binary and first-match leaves those where
-# they are.
+# epics-pva-rs lib tests: the pvalink tests that spawn softIocPVX (interop
+# profile only) — 0 failures in 20 runs, 2 at a time at host load 38-193,
+# measured when they were epics-bridge-rs lib tests. A lib binary is
+# declared only by `package()`, so this block sits after every block naming
+# a pva-rs binary and first-match leaves those where they are.
 [[profile.default.overrides]]
-filter = 'package(epics-bridge-rs)'
+filter = 'package(epics-pva-rs)'
 test-group = 'ioc_unthrottled'
+
+# 100000 gets and 40000 puts over CA: about a minute unoptimized, where the
+# default 120 s kill sits too close. The kill comes after the harness's own
+# 240 s deadline, so a hang fails with the program's report rather than a
+# bare SIGTERM. Sets no test group, so first-match leaves those alone.
+[[profile.default.overrides]]
+filter = 'package(seq-validate) & (test(=ioc::pv_get_async) | test(=ioc::pv_get_complete))'
+slow-timeout = { period = "60s", terminate-after = 5 }
 
 [test-groups]
 # PVA listener-binding tests serialise process-wide. With max-threads

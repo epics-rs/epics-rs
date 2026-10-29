@@ -32,11 +32,10 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use epics_base_rs::error::CaResult;
 use epics_base_rs::server::database::PvDatabase;
-use epics_base_rs::server::ioc_builder::{BareIoc, IocBuilder};
+use epics_base_rs::server::ioc_builder::BareIoc;
 use epics_base_rs::types::EpicsValue;
 use epics_bridge_rs::qsrv::{BridgeProvider, QsrvMount, QsrvPvStore};
 #[cfg(tokio_backend)]
@@ -147,15 +146,14 @@ async fn parse_and_build(script: &str) -> CaResult<(BareIoc, Option<String>)> {
     macros.insert("QSRV_IOC".into(), env!("CARGO_MANIFEST_DIR").into());
     // A st.cmd goes on past a failed `dbLoadRecords`, unlike `softIoc -d`.
     // softIocPVX's two link sets: dbCa, which every C IOC links, and pvxs's
-    // `lsetPVX`. Without them a bare remote link or a `pva://` one is dead.
+    // `lsetPVX`. Without them a bare remote link or a `{pva:…}` one is dead.
     let reactor =
         epics_base_rs::runtime::task::Reactor::current().expect("main runs on the IOC's reactor");
-    let mut ioc = IocBuilder::new()
+    let mut ioc = epics_pva_rs::server::pvxs_ioc_builder()
         .boot_past_failed_loads()
         .register_link_type("ca", move |db| {
             epics_ca_rs::calink::calink_link_set_install(db, reactor)
-        })
-        .register_link_type("pva", epics_bridge_rs::qsrv::pvalink_link_set_install);
+        });
     let mut group_file: Option<String> = None;
 
     for raw_line in script.lines() {
@@ -197,10 +195,13 @@ async fn parse_and_build(script: &str) -> CaResult<(BareIoc, Option<String>)> {
     Ok((ioc.build_ioc().await?, group_file))
 }
 
+const SIMULATOR_PERIOD: epics_base_rs::runtime::task::Period =
+    epics_base_rs::runtime::task::Period::from_millis(std::num::NonZeroU64::new(500).unwrap());
+
 fn spawn_simulator(reactor: &epics_base_rs::runtime::task::Reactor, db: Arc<PvDatabase>) {
     reactor.spawn(async move {
         let mut tick = 0.0_f64;
-        let mut interval = epics_base_rs::runtime::task::interval(Duration::from_millis(500));
+        let mut interval = epics_base_rs::runtime::task::interval(SIMULATOR_PERIOD);
         loop {
             interval.tick().await;
             tick += 0.1;

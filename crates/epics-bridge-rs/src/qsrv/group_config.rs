@@ -1,7 +1,7 @@
 //! Group PV JSON configuration parser.
 //!
 //! Parses C++ QSRV-compatible group definitions from JSON.
-//! See `~/epics-base/modules/pva2pva/pdbApp/configparse.cpp` for the
+//! See `$EPICS_BASE/modules/pva2pva/pdbApp/configparse.cpp` for the
 //! original C++ parser.
 //!
 //! # JSON format
@@ -730,15 +730,14 @@ fn raw_to_group_def(
     Ok(def)
 }
 
-/// Validate a group member field-name path against the pvxs `FieldName`
-/// constructor grammar (`ioc/fieldname.cpp:29-67`), which **throws** on a
-/// malformed path — an empty leading/interior component (`.a`, `a..b`) or a
-/// bad array subscript (`a[x]`; plus the stricter-than-pvxs `a[]`/`a[-1]` forms
-/// documented in the `parse_field_path_checked` divergence note). pvxs runs
-/// this via `fieldName(def.name)`
-/// (`field.cpp:21`) inside the `createGroups` per-group `try`
-/// (`groupconfigprocessor.cpp:431-446`), so a throw aborts just that group's
-/// build (logged, group not served) while siblings still load. Here the error
+/// Validate a group member field-name path against the names a pvxs group
+/// builds: the `FieldName` constructor (`ioc/fieldname.cpp:29-67`) throws on
+/// an empty component or a bad subscript (`a[x]`), and group creation fails
+/// on any name that differs from its `FieldName::to_string()` rendering
+/// (`a.`, `a[+5]`, `a[]`; see `parse_field_path_checked`). Both run inside
+/// the `createGroups` per-group `try` (`groupconfigprocessor.cpp:431-465`),
+/// so either aborts just that group's build (logged, group not created)
+/// while siblings still load. Here the error
 /// propagates out of `parse_member` → `raw_to_group_def`, whose caller already
 /// implements the same per-group recovery (`tracing::warn!("ignoring invalid
 /// QSRV group")`). The grammar itself lives in one place — the canonical
@@ -2672,22 +2671,30 @@ mod tests {
         );
     }
 
-    /// Q1: a single trailing dot is dropped (pvxs `getline` fails the terminal
-    /// empty extraction at EOF), so a member named `a.` builds field `a` and
-    /// the group loads — it must NOT be rejected as a malformed component.
+    /// Q1: pvxs builds a group only when each member name equals its
+    /// `FieldName::to_string()` rendering (`group.cpp:103-109`, from
+    /// `groupconfigprocessor.cpp:543`, `:576`). A trailing dot, which
+    /// `getline` drops, and every non-canonical subscript fail that lookup,
+    /// so pvxs logs "Error Group not created" for the group and creates
+    /// the rest.
     #[test]
-    fn trailing_dot_member_name_is_accepted() {
+    fn a_member_name_that_renders_differently_skips_its_group() {
         let json = r#"{
-            "GRP:trail": { "a.": { "+channel": "R:a" } }
+            "GRP:trail": { "a.":              { "+channel": "R:a" } },
+            "GRP:plus":  { "a[+5].v":         { "+channel": "R:a" } },
+            "GRP:zero":  { "a[05].v":         { "+channel": "R:a" } },
+            "GRP:max":   { "a[4294967295].v": { "+channel": "R:a" } },
+            "GRP:empty": { "a[].v":           { "+channel": "R:a" } },
+            "GRP:neg":   { "a[-1].v":         { "+channel": "R:a" } },
+            "GRP:junk":  { "a[1]].v":         { "+channel": "R:a" } },
+            "GRP:ok":    { "a[4294967294].v": { "+channel": "R:a" },
+                           "a[0].w":          { "+channel": "R:b" } }
         }"#;
 
         let groups = parse_group_config(json).unwrap();
-        assert_eq!(groups.len(), 1, "trailing dot is not a malformed component");
-        assert_eq!(
-            groups[0].members.len(),
-            1,
-            "the member builds and the group loads"
-        );
+        let names: Vec<&str> = groups.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(names, vec!["GRP:ok"]);
+        assert_eq!(groups[0].members.len(), 2);
     }
 
     // ---- Q2: member-level annotations coerce via as<T>() like group-level ----

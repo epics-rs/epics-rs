@@ -18,7 +18,7 @@
 //!
 //! This port had one flag read straight off [`MacroExpandOptions`], so all three
 //! regions were loud and all three merged their faults. Measured against
-//! `softIoc` built from `~/work/epics-base` (`R7.0.10`) on the file below, with
+//! `softIoc` built from `$EPICS_BASE` (`R7.0.10`) on the file below, with
 //! `P=pval`:
 //!
 //! | line | C stderr | this port, before |

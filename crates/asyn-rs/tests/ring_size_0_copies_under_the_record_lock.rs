@@ -51,8 +51,8 @@ async fn ioc(port: &str, ty: ParamType, record: &str) -> (Arc<PvDatabase>, PortH
         port,
         1,
         PortFlags::default(),
-        InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_INTERRUPTS,
+        InterfaceMask::OCTET | InterfaceMask::INT32_ARRAY | InterfaceMask::DRV_USER,
+        InterfaceMask::OCTET | InterfaceMask::INT32_ARRAY,
     );
     base.create_param("P", ty).unwrap();
     let (runtime, _join) = create_port_runtime_unclaimed(Port { base }, RuntimeConfig::default())

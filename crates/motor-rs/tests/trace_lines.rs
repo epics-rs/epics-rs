@@ -3,12 +3,12 @@
 use std::sync::{Arc, Mutex};
 
 use asyn_rs::error::{AsynError, AsynResult, AsynStatus};
-use asyn_rs::interfaces::motor::{AsynMotor, MotorStatus};
+use asyn_rs::interfaces::motor::{AsynMotor, Model1Motor, MotorStatus};
 use asyn_rs::manager::PortManager;
 use asyn_rs::trace::TraceFile;
 use asyn_rs::user::AsynUser;
 use motor_rs::flags::MotorCommand;
-use motor_rs::poll_loop::execute_commands;
+use motor_rs::poll_loop::{execute_commands, execute_model1_commands};
 use motor_rs::trace::{MotorTrace, TraceUser};
 
 /// An axis whose controller dropped the connection: every write fails the way
@@ -60,6 +60,51 @@ impl AsynMotor for Disconnected {
         refused()?;
         *status = MotorStatus::default();
         Ok(())
+    }
+}
+
+/// The same dropped line on a model-1 card.
+impl Model1Motor for Disconnected {
+    fn set_velocity(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        refused()
+    }
+    fn set_vel_base(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        refused()
+    }
+    fn set_accel(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        refused()
+    }
+    fn move_absolute(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        refused()
+    }
+    fn move_relative(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        refused()
+    }
+    fn move_velocity(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        refused()
+    }
+    fn home(&mut self, _: &AsynUser, _: bool) -> AsynResult<()> {
+        refused()
+    }
+    fn stop(&mut self, _: &AsynUser) -> AsynResult<()> {
+        refused()
+    }
+    fn set_position(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        refused()
+    }
+    fn poll_failure(&self) -> asyn_rs::interfaces::motor::PollFailure {
+        asyn_rs::interfaces::motor::PollFailure::PROBLEM_AND_COMMS_ERROR
+    }
+    fn poll(&mut self, _: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
+        refused()?;
+        *status = MotorStatus::default();
+        Ok(())
+    }
+    fn update_delay(&self) -> std::time::Duration {
+        std::time::Duration::ZERO
+    }
+    fn take_init_status(&mut self) -> MotorStatus {
+        MotorStatus::default()
     }
 }
 
@@ -148,10 +193,9 @@ fn init_reads_the_cached_status_and_a_lost_controller_prints_nothing() {
     state.lock().unwrap().latest_status = Some(StampedStatus {
         seq: 1,
         status: MotorStatus {
-            position: 250.0,
             comms_error: true,
             problem: true,
-            ..MotorStatus::default()
+            ..MotorStatus::default().with_position(250.0)
         },
     });
     let mut rec = motor_rs::MotorRecord::new();
@@ -336,10 +380,7 @@ fn an_init_that_loads_no_position_says_so_under_flow() {
         rec.conv.mres = 0.01;
         rec.conv.rstm = motor_rs::flags::RestoreMode::Never;
         rec.pos.dval = 3.0;
-        rec.initial_readback(&MotorStatus {
-            position: 100.0,
-            ..MotorStatus::default()
-        });
+        rec.initial_readback(&MotorStatus::default().with_position(100.0));
     });
     assert_eq!(
         lines
@@ -362,12 +403,12 @@ fn stop_traced(user: TraceUser) -> Vec<String> {
     let mut lines = traced_by("traceLinesModel1", || {
         let trace = MotorTrace::with_user(user);
         trace.set_record("PIC844:m1");
-        execute_commands(
-            &mut Disconnected,
-            &trace,
-            &[MotorCommand::Stop { acceleration: 1.0 }],
-            &mut |_| {},
-        );
+        let stop = [MotorCommand::Stop { acceleration: 1.0 }];
+        if trace.is_model1() {
+            execute_model1_commands(&mut Disconnected, &trace, &stop, &mut |_| {});
+        } else {
+            execute_commands(&mut Disconnected, &trace, &stop, &mut |_| {});
+        }
     });
     lines.extend(
         std::fs::read_to_string(&path)
@@ -855,6 +896,9 @@ impl motor_rs::controller_port::WriteHook for OwnGain {
 struct OwnGainParams;
 
 impl motor_rs::controller_port::ControllerParams for OwnGainParams {
+    const INTERFACE_MASK: asyn_rs::port::InterfaceMask = asyn_rs::port::InterfaceMask::NONE;
+    const INTERRUPT_MASK: asyn_rs::port::InterfaceMask = asyn_rs::port::InterfaceMask::NONE;
+
     fn write_hook(&self) -> Option<Arc<dyn motor_rs::controller_port::WriteHook>> {
         Some(Arc::new(OwnGain))
     }

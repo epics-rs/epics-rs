@@ -79,12 +79,18 @@ fn puts_past_a_stalled_console(
         let mut done = 0;
         while done < PUTS && Instant::now() < deadline {
             let value = EpicsValue::String(format!("put {done:04} {:-<30}", "").into());
-            match tokio::time::timeout(Duration::from_secs(5), ch.put(&value)).await {
-                Ok(Ok(())) => done += 1,
-                _ => break,
+            match ch.put_with_timeout(&value, Duration::from_secs(5)).await {
+                Ok(()) => done += 1,
+                Err(_) => break,
             }
         }
-        Some((done, ch.get().await.map(|(_, v)| v).ok()))
+        Some((
+            done,
+            ch.get_with_timeout(fact_budget::FACT_BUDGET)
+                .await
+                .map(|(_, v)| v)
+                .ok(),
+        ))
     });
     drop(rt);
     let _ = child.kill();

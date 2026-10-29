@@ -79,7 +79,10 @@ fn a_new_frame_shape_reallocates_from_the_frame_s_pool() {
     assert!(ts.wait_params_applied(std::time::Duration::from_secs(10)));
 
     let driver = DriverPool::standalone(0);
-    let frame = NDArray::with_data(vec![NDDimension::new(2)], NDDataBuffer::I16(vec![1, 2]));
+    let frame = NDArray::with_data(
+        vec![NDDimension::new(2)],
+        NDDataBuffer::from_vec::<i16>(vec![1, 2]),
+    );
     let sender = ts.array_sender().clone();
     let published = driver.alloc_copy(&frame).unwrap();
     std::thread::spawn(move || {

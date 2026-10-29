@@ -24,7 +24,8 @@ use epics_libcom_rs::cfmt::CFloat;
 pub struct SyncIOHandle {
     link: Arc<Link>,
     addr: i32,
-    timeout: Duration,
+    /// `None` is C's negative timeout: wait forever.
+    timeout: Option<Duration>,
 }
 
 /// Where a C SyncIO `connect` left its asynUser.
@@ -42,28 +43,32 @@ enum Link {
 /// C SyncIO `connect`'s `findInterface` checks: `asynCommon`, then the
 /// interface the SyncIO transfers on, each refusal in its C file's words.
 fn missing_interface(handle: &PortHandle, iface: InterfaceType) -> Option<String> {
-    for needed in [InterfaceType::Common, iface] {
-        if handle.has_interface(needed) {
-            continue;
+    [InterfaceType::Common, iface]
+        .into_iter()
+        .find(|&needed| !handle.has_interface(needed))
+        .map(|needed| no_interface(iface, needed))
+}
+
+/// The SyncIO for `iface` refusing a port without `needed`, in its C file's
+/// words.
+pub(crate) fn no_interface(iface: InterfaceType, needed: InterfaceType) -> String {
+    match iface {
+        // asynOctetSyncIO.c:124-137, asynUInt32DigitalSyncIO.c.
+        InterfaceType::Octet | InterfaceType::UInt32Digital => {
+            format!("{needed} interface not supported")
         }
-        let message = match iface {
-            // asynOctetSyncIO.c:124-137, asynUInt32DigitalSyncIO.c.
-            InterfaceType::Octet | InterfaceType::UInt32Digital => {
-                format!("{needed} interface not supported")
-            }
-            // asynInt32SyncIO.c, asynInt64SyncIO.c, asynEnumSyncIO.c,
-            // asynOptionSyncIO.c.
-            InterfaceType::Int32
-            | InterfaceType::Int64
-            | InterfaceType::Enum
-            | InterfaceType::Option => format!("port does not implement interface {needed}"),
-            // asynCommonSyncIO.c:76-80, asynFloat64SyncIO.c, the array and
-            // genericPointer SyncIOs.
-            _ => format!("interface {needed} is not supported by port"),
-        };
-        return Some(message);
+        // asynInt32SyncIO.c, asynInt64SyncIO.c, asynEnumSyncIO.c,
+        // asynOptionSyncIO.c.
+        InterfaceType::Int32
+        | InterfaceType::Int64
+        | InterfaceType::Enum
+        | InterfaceType::Option => {
+            format!("port does not implement interface {needed}")
+        }
+        // asynCommonSyncIO.c:76-80, asynFloat64SyncIO.c, the array and
+        // genericPointer SyncIOs.
+        _ => format!("interface {needed} is not supported by port"),
     }
-    None
 }
 
 /// [`SyncIOHandle::print`] on a user connected to `port`.
@@ -87,18 +92,27 @@ fn refused(message: String) -> AsynError {
 }
 
 impl SyncIOHandle {
-    /// Create from a PortHandle.
-    pub fn from_handle(handle: PortHandle, addr: i32, timeout: Duration) -> Self {
-        Self {
+    /// The `asyn<iface>SyncIO->connect` of a port already found, refused as
+    /// C's `findInterface` checks refuse it; `iface` is
+    /// [`InterfaceType::Common`] for `asynCommonSyncIO`.
+    pub fn from_handle(
+        handle: PortHandle,
+        addr: i32,
+        timeout: Duration,
+        iface: InterfaceType,
+    ) -> AsynResult<Self> {
+        if let Some(message) = missing_interface(&handle, iface) {
+            return Err(refused(message));
+        }
+        Ok(Self {
             link: Arc::new(Link::Port(handle)),
             addr,
-            timeout,
-        }
+            timeout: Some(timeout),
+        })
     }
 
-    /// The `asyn<iface>SyncIO->connect` of a named port via the PortManager
-    /// (actor path); `iface` is [`InterfaceType::Common`] for
-    /// `asynCommonSyncIO`.
+    /// [`from_handle`](Self::from_handle) on a port named in the
+    /// PortManager (actor path).
     pub fn connect(
         manager: &PortManager,
         port_name: &str,
@@ -106,11 +120,7 @@ impl SyncIOHandle {
         timeout: Duration,
         iface: InterfaceType,
     ) -> AsynResult<Self> {
-        let handle = manager.find_port_handle(port_name)?;
-        if let Some(message) = missing_interface(&handle, iface) {
-            return Err(refused(message));
-        }
-        Ok(Self::from_handle(handle, addr, timeout))
+        Self::from_handle(manager.find_port_handle(port_name)?, addr, timeout, iface)
     }
 
     /// C `pasyn<iface>SyncIO->connect` against the global registry; `iface`
@@ -143,7 +153,7 @@ impl SyncIOHandle {
             Self {
                 link: Arc::new(link),
                 addr,
-                timeout,
+                timeout: Some(timeout),
             },
             status,
         )
@@ -198,10 +208,10 @@ impl SyncIOHandle {
         self.user_with(reason, self.timeout)
     }
 
-    fn user_with(&self, reason: usize, timeout: Duration) -> AsynUser {
+    fn user_with(&self, reason: usize, timeout: Option<Duration>) -> AsynUser {
         let user = AsynUser::new(reason)
             .with_addr(self.addr)
-            .with_timeout(timeout);
+            .with_timeout_opt(timeout);
         match self.device() {
             Some(handle) => user.locking_port(handle),
             None => user,
@@ -212,6 +222,17 @@ impl SyncIOHandle {
     /// (asynOctetSyncIO.c:187, :213, :245, asynInt32SyncIO.c:139): every call
     /// through the copy passes it, and `self` keeps its own.
     pub fn with_timeout(&self, timeout: Duration) -> Self {
+        self.with_timeout_opt(Some(timeout))
+    }
+
+    /// [`Self::with_timeout`] with C's negative `timeout`: a read that waits
+    /// as long as the device takes, as `pasynOctetSyncIO->read(..., -1.0, ...)`
+    /// does.
+    pub fn waiting_forever(&self) -> Self {
+        self.with_timeout_opt(None)
+    }
+
+    fn with_timeout_opt(&self, timeout: Option<Duration>) -> Self {
         Self {
             link: Arc::clone(&self.link),
             addr: self.addr,
@@ -224,7 +245,7 @@ impl SyncIOHandle {
     /// value — accessor exists primarily for asyn upstream issue #220
     /// regression coverage (`pasynOctetSyncIO->read` mutated the
     /// caller's `pasynUser->timeout`; we cannot, by construction).
-    pub fn timeout(&self) -> Duration {
+    pub fn timeout(&self) -> Option<Duration> {
         self.timeout
     }
 
@@ -394,7 +415,7 @@ impl SyncIOHandle {
     /// C `pasynOctetSyncIO->flush` (asynOctetSyncIO.c:278-299), which passes
     /// 1 s whatever the user's timeout.
     pub fn flush(&self, reason: usize) -> AsynResult<()> {
-        let user = self.user_with(reason, Duration::from_secs(1));
+        let user = self.user_with(reason, Some(Duration::from_secs(1)));
         self.transfer(user, RequestOp::Flush, |_| {
             self.device_line(reason, format_args!("asynOctetSyncIO flush\n"));
         })?;
@@ -441,7 +462,11 @@ impl SyncIOHandle {
             _ => self.port()?,
         };
         let (addr, timeout) = (self.addr, self.timeout);
-        let user = move || AsynUser::new(reason).with_addr(addr).with_timeout(timeout);
+        let user = move || {
+            AsynUser::new(reason)
+                .with_addr(addr)
+                .with_timeout_opt(timeout)
+        };
         let trace = handle.trace().clone();
         let port = handle.port_name().to_owned();
         handle.lock_port_blocking(user(), move |calls| {
@@ -615,8 +640,13 @@ mod tests {
                 name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::INT32
+                    | InterfaceMask::UINT32_DIGITAL
+                    | InterfaceMask::FLOAT64
+                    | InterfaceMask::OCTET
+                    | InterfaceMask::INT64
+                    | InterfaceMask::DRV_USER,
+                InterfaceMask::NONE,
             );
             base.create_param("INT_VAL", ParamType::Int32).unwrap();
             base.create_param("FLOAT_VAL", ParamType::Float64).unwrap();
@@ -644,8 +674,13 @@ mod tests {
         let (handle, _jh) =
             create_port_runtime_unclaimed(TestPort::new(), RuntimeConfig::default())
                 .expect("the port runtime thread must start");
-        let sio =
-            SyncIOHandle::from_handle(handle.port_handle().clone(), 0, Duration::from_secs(1));
+        let sio = SyncIOHandle::from_handle(
+            handle.port_handle().clone(),
+            0,
+            Duration::from_secs(1),
+            InterfaceType::Common,
+        )
+        .unwrap();
         (sio, handle)
     }
 
@@ -684,6 +719,44 @@ mod tests {
         let (sio, _rt) = make_sync_io();
         sio.write_int64(6, i64::MIN).unwrap();
         assert_eq!(sio.read_int64(6).unwrap(), i64::MIN);
+    }
+
+    /// C SyncIO `connect` refuses a port without its interface
+    /// (asynOctetSyncIO.c:133-137, asynInt64SyncIO.c,
+    /// asynFloat64ArraySyncIO.c:80-84), so a user built on a held handle is
+    /// refused there too, not first at its transfer.
+    #[test]
+    fn a_handle_without_the_interface_is_refused_at_connect() {
+        let base = PortDriverBase::new(
+            "sync_masked",
+            1,
+            PortFlags::default(),
+            InterfaceMask::OCTET,
+            InterfaceMask::NONE,
+        );
+        let (rt, _jh) = create_port_runtime_unclaimed(TestPort { base }, RuntimeConfig::default())
+            .expect("the port runtime thread must start");
+        let connect = |iface| {
+            SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1), iface)
+        };
+        let refusal = |iface| match connect(iface) {
+            Err(AsynError::Status { message, .. }) => message,
+            Err(e) => panic!("{iface}: {e:?}"),
+            Ok(_) => panic!("{iface} connected"),
+        };
+        assert_eq!(
+            refusal(InterfaceType::Int64),
+            "port does not implement interface asynInt64"
+        );
+        assert_eq!(
+            refusal(InterfaceType::UInt32Digital),
+            "asynUInt32Digital interface not supported"
+        );
+        assert_eq!(
+            refusal(InterfaceType::Float64Array),
+            "interface asynFloat64Array is not supported by port"
+        );
+        assert!(connect(InterfaceType::Octet).is_ok());
     }
 
     /// C `asynOctetSyncIO::writeRead` (`asynOctetSyncIO.c:231-276`) is one
@@ -734,23 +807,30 @@ mod tests {
                 "wr_seq",
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             ),
             seq: Arc::clone(&seq),
         };
         let (rt, _jh) = create_port_runtime_unclaimed(drv, RuntimeConfig::default())
             .expect("the port runtime thread must start");
-        let sio = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+        let sio = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            Duration::from_secs(1),
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let (reply, status) = sio.write_read(0, b"CMD", 16).into_parts();
         status.expect("the exchange must run");
         assert_eq!(reply, b"RSP".to_vec());
         assert_eq!(*seq.lock().unwrap(), vec!["flush", "write", "read"]);
     }
 
-    /// C SyncIO takes its timeout on every call, and `flush` its own 1 s
-    /// (asynOctetSyncIO.c:187, :213, :245, :285): the driver sees that call's
-    /// timeout, on the caller's thread under queueLockPort.
+    /// C SyncIO takes its timeout on every call, a negative one waiting
+    /// forever, and `flush` its own 1 s (asynOctetSyncIO.c:187, :213, :245,
+    /// :285): the driver sees that call's timeout, on the caller's thread under
+    /// queueLockPort.
     #[test]
     fn a_per_call_timeout_reaches_the_driver_on_the_caller() {
         use std::sync::{Arc, Mutex};
@@ -792,19 +872,26 @@ mod tests {
                     can_block: true,
                     ..PortFlags::default()
                 },
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             ),
             seen: Arc::clone(&seen),
         };
         let (rt, _jh) = create_port_runtime_unclaimed(drv, RuntimeConfig::default())
             .expect("the port runtime thread must start");
-        let sio = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(3));
+        let sio = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            Duration::from_secs(3),
+            InterfaceType::Octet,
+        )
+        .unwrap();
         sio.with_timeout(Duration::from_secs(7))
             .write_octet(0, b"x")
             .unwrap();
         sio.flush(0).unwrap();
         sio.write_octet(0, b"y").unwrap();
+        sio.waiting_forever().write_octet(0, b"z").unwrap();
 
         let caller = std::thread::current().name().map(str::to_owned);
         let secs = |s| Some(Duration::from_secs(s));
@@ -813,7 +900,8 @@ mod tests {
             [
                 ("write", secs(7), caller.clone()),
                 ("flush", secs(1), caller.clone()),
-                ("write", secs(3), caller),
+                ("write", secs(3), caller.clone()),
+                ("write", None, caller),
             ]
         );
     }
@@ -828,7 +916,13 @@ mod tests {
         rt.port_handle()
             .trace()
             .set_trace_mask(Some(name), TraceMask::IO_DEVICE);
-        let sio = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+        let sio = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            Duration::from_secs(1),
+            InterfaceType::Common,
+        )
+        .unwrap();
         (sio, rt, path)
     }
 
@@ -913,8 +1007,8 @@ mod tests {
             "sync_arrays",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::INT32_ARRAY,
+            InterfaceMask::NONE,
         );
         let port = ArrayPort {
             base,
@@ -992,9 +1086,6 @@ mod tests {
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.0
             }
-            fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
-                crate::interfaces::octet_transport_capabilities()
-            }
         }
 
         let (rt, _jh) = create_port_runtime_unclaimed(
@@ -1002,13 +1093,19 @@ mod tests {
                 "syncnodrvuser",
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OCTET_TRANSPORT,
+                InterfaceMask::OCTET,
             )),
             RuntimeConfig::default(),
         )
         .expect("the port runtime thread must start");
-        let sio = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+        let sio = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            Duration::from_secs(1),
+            InterfaceType::Octet,
+        )
+        .unwrap();
 
         assert_eq!(sio.drv_user_create("ANYTHING").unwrap(), 0);
 
@@ -1033,8 +1130,8 @@ mod tests {
                 multi_device: true,
                 ..PortFlags::default()
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::DRV_USER,
+            InterfaceMask::NONE,
         );
         base.create_param("V", ParamType::Int32).unwrap();
         let (rt, _jh) = create_port_runtime_unclaimed(TestPort { base }, RuntimeConfig::default())
@@ -1051,7 +1148,13 @@ mod tests {
             ))),
         );
         let at = |addr| {
-            SyncIOHandle::from_handle(rt.port_handle().clone(), addr, Duration::from_secs(1))
+            SyncIOHandle::from_handle(
+                rt.port_handle().clone(),
+                addr,
+                Duration::from_secs(1),
+                InterfaceType::Common,
+            )
+            .unwrap()
         };
 
         assert_eq!(at(1).drv_user_create("V").unwrap(), 0);
@@ -1156,9 +1259,9 @@ mod tests {
         assert_eq!(live.read_int32(0).unwrap(), 7);
     }
 
-    /// A published port declaring exactly `caps`.
-    fn port_with(name: &str, caps: Vec<crate::interfaces::Capability>) {
-        struct Declared(PortDriverBase, Vec<crate::interfaces::Capability>);
+    /// A published port registering exactly `interfaces`.
+    fn port_with(name: &str, interfaces: InterfaceMask) {
+        struct Declared(PortDriverBase);
         impl PortDriver for Declared {
             fn base(&self) -> &PortDriverBase {
                 &self.0
@@ -1166,20 +1269,17 @@ mod tests {
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.0
             }
-            fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
-                self.1.clone()
-            }
         }
         let mut base = PortDriverBase::new(
             name,
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            interfaces,
+            InterfaceMask::NONE,
         );
         base.create_param("V", ParamType::Int32).unwrap();
         PortManager::new()
-            .register_port_unclaimed(Declared(base, caps), &crate::registry::open_owner())
+            .register_port_unclaimed(Declared(base), &crate::registry::open_owner())
             .unwrap();
     }
 
@@ -1193,29 +1293,10 @@ mod tests {
         }
     }
 
-    /// asynOctetSyncIO.c:124-130: a port without asynCommon refuses the
-    /// connect, and the user it hands back transfers nothing.
-    #[test]
-    fn an_octet_connect_to_a_port_without_asyn_common_is_refused() {
-        use crate::interfaces::Capability::*;
-        port_with("sync_no_common", vec![OctetRead, OctetWrite]);
-        let (sio, status) = SyncIOHandle::connect_port(
-            "sync_no_common",
-            0,
-            Duration::from_secs(1),
-            InterfaceType::Octet,
-        );
-        let refused = "asynCommon interface not supported";
-        assert_eq!(refusal(status.unwrap_err()), refused);
-        assert_eq!(refusal(sio.write_octet(0, b"x").unwrap_err()), refused);
-        assert_eq!(refusal(sio.port().err().unwrap()), refused);
-    }
-
     /// asynOctetSyncIO.c:131-137: asynCommon present, asynOctet missing.
     #[test]
     fn an_octet_connect_to_a_port_without_asyn_octet_is_refused() {
-        use crate::interfaces::Capability::*;
-        port_with("sync_no_octet", vec![Int32Read, Int32Write, Connect]);
+        port_with("sync_no_octet", InterfaceMask::INT32);
         let (sio, status) = SyncIOHandle::connect_port(
             "sync_no_octet",
             0,
@@ -1230,22 +1311,10 @@ mod tests {
         );
     }
 
-    /// asynCommonSyncIO.c:76-80 checks asynCommon alone, in its own words.
+    /// asynCommonSyncIO.c:76-80 checks asynCommon alone.
     #[test]
     fn a_common_connect_needs_only_asyn_common() {
-        use crate::interfaces::Capability::*;
-        port_with("sync_common_absent", vec![OctetRead, OctetWrite]);
-        let (_, status) = SyncIOHandle::connect_port(
-            "sync_common_absent",
-            0,
-            Duration::from_secs(1),
-            InterfaceType::Common,
-        );
-        assert_eq!(
-            refusal(status.unwrap_err()),
-            "interface asynCommon is not supported by port"
-        );
-        port_with("sync_common_only", vec![Connect]);
+        port_with("sync_common_only", InterfaceMask::NONE);
         let (_, status) = SyncIOHandle::connect_port(
             "sync_common_only",
             0,
@@ -1259,10 +1328,7 @@ mod tests {
     /// asynInt32SyncIO.c, asynFloat64SyncIO.c, asynUInt32DigitalSyncIO.c.
     #[test]
     fn each_syncio_refuses_its_missing_interface_in_its_own_words() {
-        port_with(
-            "sync_transport_only",
-            crate::interfaces::octet_transport_capabilities(),
-        );
+        port_with("sync_transport_only", InterfaceMask::OCTET_TRANSPORT);
         for (iface, refused) in [
             (
                 InterfaceType::Int32,
@@ -1347,8 +1413,13 @@ mod tests {
             RuntimeConfig::default(),
         )
         .expect("the port runtime thread must start");
-        let sio =
-            SyncIOHandle::from_handle(handle.port_handle().clone(), 0, Duration::from_secs(1));
+        let sio = SyncIOHandle::from_handle(
+            handle.port_handle().clone(),
+            0,
+            Duration::from_secs(1),
+            InterfaceType::Common,
+        )
+        .unwrap();
         let trace = handle.port_handle().trace();
         trace.set_trace_info_mask(Some("sync_print_source"), TraceInfoMask::SOURCE);
         let dir = tempfile::tempdir().expect("fixture root");
@@ -1408,8 +1479,13 @@ mod tests {
     fn eos_calls_run_under_lock_port_as_asyn_octet_sync_io_does() {
         let dir = tempfile::tempdir().expect("fixture root");
         let (handle, path) = eos_port("sync_eos", dir.path());
-        let sio =
-            SyncIOHandle::from_handle(handle.port_handle().clone(), 0, Duration::from_secs(1));
+        let sio = SyncIOHandle::from_handle(
+            handle.port_handle().clone(),
+            0,
+            Duration::from_secs(1),
+            InterfaceType::Octet,
+        )
+        .unwrap();
         handle
             .port_handle()
             .submit_blocking(RequestOp::SetEnable { yes: false }, AsynUser::default())
@@ -1449,8 +1525,13 @@ mod tests {
     fn eos_calls_on_a_shut_down_port_return_lock_port_s_refusal() {
         let dir = tempfile::tempdir().expect("fixture root");
         let (handle, _) = eos_port("sync_eos_shut", dir.path());
-        let sio =
-            SyncIOHandle::from_handle(handle.port_handle().clone(), 0, Duration::from_secs(1));
+        let sio = SyncIOHandle::from_handle(
+            handle.port_handle().clone(),
+            0,
+            Duration::from_secs(1),
+            InterfaceType::Octet,
+        )
+        .unwrap();
         sio.set_input_eos(0, b"\n").unwrap();
         handle
             .port_handle()
@@ -1587,14 +1668,19 @@ mod tests {
                 "syncpartial",
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             )),
             RuntimeConfig::default(),
         )
         .expect("the port runtime thread must start");
-        let sio =
-            SyncIOHandle::from_handle(handle.port_handle().clone(), 0, Duration::from_secs(1));
+        let sio = SyncIOHandle::from_handle(
+            handle.port_handle().clone(),
+            0,
+            Duration::from_secs(1),
+            InterfaceType::Octet,
+        )
+        .unwrap();
 
         let (data, status) = sio.read_octet(0, 32).into_parts();
         assert_eq!(

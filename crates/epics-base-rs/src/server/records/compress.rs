@@ -83,24 +83,14 @@ pub struct CompressRecord {
     cycle_emitted: bool,
     /// `INPN` — C `prec->inpn`, `DBF_LONG special(SPC_NOMOD)`
     /// (compressRecord.dbd.pod:503-506), "Number of elements in Working
-    /// Buffer": the INP source's element count from the previous INP-driven
-    /// ingest, and the trigger for C's WPTR reallocation — when it changes
-    /// between cycles C frees the working buffer and `reset()`s
-    /// (compressRecord.c:334-340).
-    ///
-    /// KNOWN DIVERGENCE in the value served. C latches
-    /// `dbGetNelements(&prec->inp, &nelements)` — the source's element
-    /// CAPACITY — before the read; the port latches the length the framework's
-    /// `ReadDbLink` actually delivered. For a `waveform` source with NELM=3 and
-    /// NORD=1, softIoc reads `CMP2.INPN = 3` where the port reads 1. Closing it
-    /// needs the source capacity plumbed through `ReadDbLink`, which no other
-    /// record needs; the reset trigger itself is unaffected in practice (a
-    /// source's capacity and its delivered length both change exactly when the
-    /// source array is re-shaped).
+    /// Buffer": INP's `dbGetNelements` — the source field's `no_elements`
+    /// (a compress's NSAM, a subArray's MALM), not what a read delivers —
+    /// latched by [`Record::set_inp_nelements`] ahead of the read.
     inpn: usize,
-    /// C's `prec->wptr != NULL`: an INP ingest latched INPN. A `.db` INPN does
-    /// not allocate the working buffer, so it is not this.
-    wptr_held: bool,
+    /// C's `prec->wptr`: `Some` once a cycle latched INPN, the `dbCalloc` of
+    /// INPN doubles that [`Record::set_inp_nelements`] made, holding what the
+    /// reads since wrote. A `.db` INPN does not allocate it.
+    wptr: Option<Vec<f64>>,
     /// The posts of the `monitor()` an SPC_RESET `special()` ran, a bit per
     /// `RESET_POSTS` entry, until the put drains them.
     reset_posts: u64,
@@ -140,7 +130,7 @@ impl Default for CompressRecord {
             cycle_ingested: false,
             cycle_emitted: false,
             inpn: 0,
-            wptr_held: false,
+            wptr: None,
             reset_posts: 0,
             nuse_moved: false,
         }
@@ -593,10 +583,9 @@ impl Record for CompressRecord {
             PREC => prec, EGU => egu, OFF, NUSE, OUSE, INPN, CVB, INX;
         spill: INP, BPTR, SPTR, WPTR);
 
-    /// C allocates `wptr` with the first `inpn` latch and never frees it
-    /// (compressRecord.c:334-339).
+    /// C allocates `wptr` with the first `inpn` latch (compressRecord.c:334-339).
     fn held_pointer(&self, field: &str) -> Option<usize> {
-        (field == "WPTR" && self.wptr_held).then(|| std::ptr::from_ref(&self.inpn) as usize)
+        (field == "WPTR" && self.wptr.is_some()).then(|| std::ptr::from_ref(&self.inpn) as usize)
     }
 
     fn acts_before_process(&self) -> bool {
@@ -606,6 +595,7 @@ impl Record for CompressRecord {
     fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
         crate::server::record::CycleHooks::PRE_INPUT
             .union(crate::server::record::CycleHooks::WRITE_POSTED)
+            .union(crate::server::record::CycleHooks::INP_NELEMENTS)
     }
 
     fn has_array_monitor_post(&self) -> bool {
@@ -627,6 +617,12 @@ impl Record for CompressRecord {
             },
             _ => LinkReadAs::Native,
         })
+    }
+
+    /// INP lands in `wptr`.
+    fn array_read_destination(&self, link_field: &str) -> Option<EpicsValue> {
+        let wptr = self.wptr.as_deref().filter(|_| link_field == "INP")?;
+        Some(EpicsValue::DoubleArray(wptr.into()))
     }
 
     /// `compressRecord.c:342-366`: a failed `dbGetLink` on INP raises
@@ -1036,6 +1032,10 @@ impl Record for CompressRecord {
         Some(self.nsam.max(0) as u32)
     }
 
+    fn dbaddr_capacity_inputs(&self) -> Option<&'static [&'static str]> {
+        Some(&[])
+    }
+
     fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
         match field {
             "ALG" => Some(COMPRESS_ALG_CHOICES),
@@ -1096,30 +1096,46 @@ impl Record for CompressRecord {
         crate::server::record::ProcessActions::new()
     }
 
+    /// C `compressRecord.c:328-340`: a count the test refuses reads nothing
+    /// and leaves WPTR and INPN alone; a changed count frees WPTR and
+    /// `reset()`s, the first one, with no WPTR yet, only latches. A CA put to
+    /// VAL never reaches here and never resets.
+    fn set_inp_nelements(&mut self, nelements: Option<i64>) -> bool {
+        let Some(n) = nelements.filter(|n| *n > 0).map(|n| n as usize) else {
+            return false;
+        };
+        if self.wptr.is_none() || n != self.inpn {
+            if self.wptr.is_some() {
+                self.reset();
+            }
+            self.wptr = Some(vec![0.0; n]);
+            self.inpn = n;
+        }
+        true
+    }
+
     /// The framework's soft-input stage delivering this cycle's INP value —
     /// C's `dbGetLink(&prec->inp, DBF_DOUBLE, prec->wptr, 0, &nelements)`
     /// inside `process()` (:341).
-    ///
-    /// It is the ONLY INP-driven ingest, so it owns INPN and C's element-count
-    /// reset (:334-340): a changed count frees WPTR and `reset()`s, and the
-    /// first read, with no WPTR yet, only latches. A scalar source latches 1. A
-    /// CA put to VAL is `put_array_info`, never reaches here, and never resets.
     ///
     /// The read is `DBF_DOUBLE`, so a `Double`/`DoubleArray` carrier is already
     /// in the ingest's type and goes straight into the ring; only another
     /// carrier needs the converter, which asks `get_field("VAL")` its shape.
     fn set_val(&mut self, value: EpicsValue) -> CaResult<()> {
-        let nelements = value.count() as usize;
-        if nelements > 0 {
-            if self.wptr_held && nelements != self.inpn {
-                self.reset();
-            }
-            self.inpn = nelements;
-            self.wptr_held = true;
-        }
         match value {
-            EpicsValue::DoubleArray(arr) => self.push_array(&arr),
-            EpicsValue::Double(v) => self.push_value(v),
+            EpicsValue::DoubleArray(arr) => {
+                if let Some(wptr) = &mut self.wptr {
+                    let n = arr.len().min(wptr.len());
+                    wptr[..n].copy_from_slice(&arr[..n]);
+                }
+                self.push_array(&arr)
+            }
+            EpicsValue::Double(v) => {
+                if let Some(head) = self.wptr.as_mut().and_then(|w| w.first_mut()) {
+                    *head = v;
+                }
+                self.push_value(v)
+            }
             other => return self.put_field_internal("VAL", other),
         }
         Ok(())
@@ -1240,14 +1256,18 @@ mod pbuf_tests {
         let mut rec = CompressRecord::new(4, 3); // NSAM=4, ALG=3 (Average)
         rec.n = 2; // average over 2 cycles
 
-        // `set_val` is the INP-driven ingest; only it may reset on a count change.
-        let inp = |v: &[f64]| EpicsValue::DoubleArray(v.to_vec().into());
+        // The cycle's order: the source's count, then the read it sized.
+        let mut cycle = |v: &[f64]| {
+            rec.set_inp_nelements(Some(v.len() as i64));
+            rec.set_val(EpicsValue::DoubleArray(v.to_vec().into()))
+                .unwrap();
+        };
         // Cycle 1: length 4, mid-window (inx 0 -> 1, no emit).
-        rec.set_val(inp(&[10.0, 20.0, 30.0, 40.0])).unwrap();
+        cycle(&[10.0, 20.0, 30.0, 40.0]);
         // Cycle 2: length CHANGES to 2 -> reset + restart (inx 0 -> 1, no emit).
-        rec.set_val(inp(&[2.0, 2.0])).unwrap();
+        cycle(&[2.0, 2.0]);
         // Cycle 3: length 2 again -> inx 1 -> 2 -> emit mean([2,2],[4,4])=[3,3].
-        rec.set_val(inp(&[4.0, 4.0])).unwrap();
+        cycle(&[4.0, 4.0]);
 
         // Clean restart: the average is the mean of the two post-resize
         // 2-element waveforms, NOT a blend with the stale length-4 cycle-1 data
@@ -1258,6 +1278,26 @@ mod pbuf_tests {
              not a blend with the stale length-4 partial sum"
         );
         assert_eq!(rec.val[1], 3.0, "element 1 must be mean(2,4)=3");
+    }
+
+    /// C `compressRecord.c:334-341`: a count change `dbCalloc`s INPN zeros
+    /// for WPTR, and a read writes its elements over the head, leaving the
+    /// tail. A failed CA read lands over that buffer.
+    #[test]
+    fn wptr_is_inpn_zeros_each_read_writes_over() {
+        let mut rec = CompressRecord::new(4, 4);
+        let mut cycle = |count: i64, v: &[f64]| {
+            rec.set_inp_nelements(Some(count));
+            rec.set_val(EpicsValue::DoubleArray(v.to_vec().into()))
+                .unwrap();
+            match rec.array_read_destination("INP") {
+                Some(EpicsValue::DoubleArray(a)) => a.to_vec(),
+                other => panic!("WPTR is {other:?}"),
+            }
+        };
+        assert_eq!(cycle(3, &[1.0, 2.0, 3.0]), [1.0, 2.0, 3.0]);
+        assert_eq!(cycle(3, &[4.0]), [4.0, 2.0, 3.0]);
+        assert_eq!(cycle(2, &[5.0]), [5.0, 0.0]);
     }
 
     /// C `get_array_info` (compressRecord.c:409-431) returns

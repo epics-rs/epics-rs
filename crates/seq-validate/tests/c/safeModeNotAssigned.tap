@@ -1,0 +1,21 @@
+1..20
+ok  1 - ss1: v=0==0=i
+ok  2 - ss2: v=0==0
+ok  3 - ss1: v=1==1=i
+ok  4 - ss2: v=0==0
+ok  5 - ss1: v=2==2=i
+ok  6 - ss2: v=0==0
+ok  7 - ss1: v=3==3=i
+ok  8 - ss2: v=0==0
+ok  9 - ss1: v=4==4=i
+ok 10 - ss2: v=0==0
+ok 11 - ss1: v=5==5=i
+ok 12 - ss2: v=0==0
+ok 13 - ss1: v=6==6=i
+ok 14 - ss2: v=0==0
+ok 15 - ss1: v=7==7=i
+ok 16 - ss2: v=0==0
+ok 17 - ss1: v=8==8=i
+ok 18 - ss2: v=0==0
+ok 19 - ss1: v=9==9=i
+ok 20 - ss2: v=0==0

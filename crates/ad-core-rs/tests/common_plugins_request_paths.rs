@@ -1,9 +1,8 @@
 //! An AD IOC's auto_settings.req names `commonPlugin_settings.req`, which C
 //! finds through the request paths EXAMPLE_commonPlugins.cmd sets
 //! (`$(ADCORE)/iocBoot` for the deployed copy, `$(ADCORE)/db` for the
-//! plugin files it includes, :165-168), plus the `$(CALC)` path the IOC's
-//! own saveRestore.cmd adds for NDStats' sseq_settings.req (quadEM
-//! saveRestore.cmd:4).
+//! plugin files it includes, :165-168). NDStats' sseq_settings.req is on
+//! `$(CALC)/db`, which C's file leaves commented (:211) and ours sets.
 #![cfg(feature = "ioc")]
 
 use std::path::{Path, PathBuf};
@@ -15,16 +14,23 @@ use epics_base_rs::server::ioc_app::IocApplication;
 use epics_base_rs::server::autosave::macros::MacroContext;
 use epics_base_rs::server::autosave::request::load_request_file_with_search_paths;
 
-/// The `set_requestfile_path` directories commonPlugins.cmd sets that
-/// ad-core-rs owns, in order.
+/// The `set_requestfile_path` directories commonPlugins.cmd sets, in order,
+/// each `$(NAME)` as the IOC defines it.
 fn request_paths() -> Vec<PathBuf> {
     let dir = Path::new(ad_core_rs::AD_CORE_DIR);
     let text = std::fs::read_to_string(dir.join("iocBoot/commonPlugins.cmd")).unwrap();
     text.lines()
         .filter_map(|l| l.trim().strip_prefix("set_requestfile_path(\""))
         .filter_map(|l| l.split('"').next())
-        .filter_map(|p| p.strip_prefix("$(ADCORE)"))
-        .map(|p| dir.join(p.trim_start_matches('/')))
+        .map(
+            |p| match p.strip_prefix("$(").and_then(|p| p.split_once(')')) {
+                Some(("ADCORE", rest)) => dir.join(rest.trim_start_matches('/')),
+                Some((name, rest)) => {
+                    PathBuf::from(std::env::var(name).unwrap()).join(rest.trim_start_matches('/'))
+                }
+                None => PathBuf::from(p),
+            },
+        )
         .collect()
 }
 
@@ -39,8 +45,7 @@ async fn common_plugin_settings_resolves_through_common_plugins_paths() {
     unsafe { std::env::remove_var("CALC") };
     let _app =
         IocApplication::new().autosave_startup(Arc::new(Mutex::new(AutosaveStartupConfig::new())));
-    let mut paths = request_paths();
-    paths.push(PathBuf::from(std::env::var("CALC").unwrap()).join("db"));
+    let paths = request_paths();
     let macros = MacroContext::from_map([("P".to_string(), "13SIM1:".to_string())].into());
     let list = load_request_file_with_search_paths("commonPlugin_settings.req", &paths, &macros)
         .await
@@ -64,8 +69,7 @@ async fn examples_common_plugins_settings_opens_every_include() {
     unsafe { std::env::remove_var("CALC") };
     let _app =
         IocApplication::new().autosave_startup(Arc::new(Mutex::new(AutosaveStartupConfig::new())));
-    let mut paths = request_paths();
-    paths.push(PathBuf::from(std::env::var("CALC").unwrap()).join("db"));
+    let paths = request_paths();
     let macros = MacroContext::from_map([("P".to_string(), "13SIM1:".to_string())].into());
     let list = load_request_file_with_search_paths("commonPlugins_settings.req", &paths, &macros)
         .await

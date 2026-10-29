@@ -14,7 +14,7 @@ use epics_base_rs::server::device_support::{
     DeviceAlarm, DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf, PropertyPost,
 };
 use epics_base_rs::server::device_support::{IoIntrAction, ReadStart, WriteStart};
-use epics_base_rs::server::record::{CommonFields, DevSup, Record, ScanType};
+use epics_base_rs::server::record::{CommonFields, DevSup, OwnFrame, OwnRecord, Record, ScanType};
 use epics_base_rs::types::EpicsValue;
 use epics_base_rs::types::c_parse::{long_to_int, strtol_errno, strtoul_errno, ulong_to_uint};
 use epics_libcom_rs::cfmt::CFloat;
@@ -1115,6 +1115,21 @@ impl AsynDeviceSupport {
         }
     }
 
+    /// C `initCommon`'s `findInterface` for the record's interface: a port
+    /// that never registered it refuses the record (devAsynInt32.c:279-284).
+    fn find_interface(&self) -> Result<(), DeviceInitOutcome> {
+        match self.iface {
+            Some(iface) if !self.handle.has_interface(iface) => {
+                self.dset.report(
+                    &self.record_name,
+                    &LinkRefusal::Interface(iface.asyn_name()),
+                );
+                Err(self.dset.bad())
+            }
+            _ => Ok(()),
+        }
+    }
+
     fn request_user(&self, priority: QueuePriority) -> AsynUser {
         AsynUser::new(self.reason)
             .with_addr(self.addr)
@@ -2196,9 +2211,9 @@ struct WriteReadSource {
 
 impl WriteReadSource {
     /// The command bytes up to the translated string's NUL, or `None` for a
-    /// failed `dbGet`. `held` is the record the caller holds.
-    fn command(&self, held: Option<(&[u8], &dyn Record)>) -> Option<Vec<u8>> {
-        let raw = self.db.get()?.get_dbr_string(&self.pv, held)?;
+    /// failed `dbGet`. `own` is the record the caller holds.
+    fn command(&self, own: Option<OwnRecord<'_>>) -> Option<Vec<u8>> {
+        let raw = self.db.get()?.get_dbr_string(&self.pv, own)?;
         let mut cmd = crate::asyn_record::translate_escape(&raw.as_str_lossy());
         if let Some(nul) = cmd.iter().position(|&b| b == 0) {
             cmd.truncate(nul);
@@ -2207,11 +2222,11 @@ impl WriteReadSource {
     }
 
     /// Put the command into `op`'s write buffer; `false` is a failed `dbGet`.
-    fn fill(&self, op: &mut RequestOp, held: Option<(&[u8], &dyn Record)>) -> bool {
+    fn fill(&self, op: &mut RequestOp, own: Option<OwnRecord<'_>>) -> bool {
         let RequestOp::OctetWriteRead { data, .. } = op else {
             return true;
         };
-        let Some(cmd) = self.command(held) else {
+        let Some(cmd) = self.command(own) else {
             return false;
         };
         data.clear();
@@ -3520,11 +3535,15 @@ impl AsynDeviceSupport {
     }
 
     /// [`Self::submit_traced`] for a read. The callback runs under this
-    /// record's hold, so `asynOctetWriteRead` asks a self-named command record
-    /// through `record`.
-    fn submit_read(&mut self, mut op: RequestOp, record: &dyn Record) -> AsynResult<RequestResult> {
+    /// record's hold, so `asynOctetWriteRead` asks for its command record
+    /// through `own`, the frame the hold lent.
+    fn submit_read(
+        &mut self,
+        mut op: RequestOp,
+        own: Option<OwnRecord<'_>>,
+    ) -> AsynResult<RequestResult> {
         if let Some(src) = self.device_job.write_read.get() {
-            if !src.fill(&mut op, Some((self.record_name.as_bytes(), record))) {
+            if !src.fill(&mut op, own) {
                 let trace = self.handle.user_trace();
                 let ran = src.failed(Some(&ProcessLine {
                     trace: &trace,
@@ -3830,354 +3849,15 @@ impl AsynDeviceSupport {
             }
         }
     }
-}
 
-impl DeviceSupport for AsynDeviceSupport {
-    fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
-        self.dset = self.bound_dset(record.record_type());
-        self.settle_ring();
-        let ts_buf = match self.dset.check_ftvl(&self.record_name, record) {
-            Ok(buf) => buf,
-            Err(dead) => return Ok(dead),
-        };
-        // busy is the driver-clearable output: the busy module's devBusyAsyn
-        // registers the output interrupt callback UNCONDITIONALLY (`if
-        // (interruptCallback)` with no `asyn:READBACK` info gate,
-        // devBusyAsyn.c:245-260) — that always-on readback is the record's
-        // whole point (driver holds VAL=1, clears to 0 on completion). Forced
-        // here, not info-gated: a C db's busy records carry no info tag.
-        if record.record_type() == "busy" {
-            self.set_asyn_readback(true);
-        }
-        // C `initCommon` (devAsynInt32.c:249-262): `pasynManager->connectDevice`
-        // before `findInterface`/`drvUser->create`, and it is that call which
-        // creates the device on a multi-device port (`locateDevice(..., TRUE)`,
-        // asynManager.c:1349-1352) - so `asynReport` counts an address the
-        // moment a record binds to it. C's failures (:255-259) are a port it
-        // cannot find, and this handle is that port.
-        self.handle.connect_device(self.addr);
-        if self.handle.can_block() {
-            self.request_cell();
-        }
-        // C calls drvUser->create only when the port registered asynDrvUser
-        // **and** the record named a userParam (`if (pasynInterface &&
-        // pPvt->userParam)`, devAsynInt32.c:264-265; the same pair of
-        // conditions in devAsynFloat64.c, devAsynOctet.c, asynOctetSyncIO.c:141).
-        // A byte transport registers no asynDrvUser and has no parameter to
-        // name: the record binds at reason 0 — the port's own reason space —
-        // and that is not a bind failure. Ask the interface registry
-        // (`has_interface`), never a failed `create`.
-        let drv_user = !self.reason_set
-            && self.handle.has_interface(InterfaceType::DrvUser)
-            && !self.drv_info.is_empty();
-        if !self.reason_set {
-            if drv_user {
-                // Pass the record's asyn `addr`: a multi-device driver (e.g. modbus)
-                // rejects an out-of-range offset here at bind time (C `drvUserCreate`
-                // `checkOffset`) instead of alarming on every I/O. Pass the record's
-                // interface (from its DTYP): an on-demand driver must create the
-                // parameter with the type this record will read it as — C
-                // `adsAsynPortDriver::getRecordInfoFromDrvInfo`.
-                let req = DrvUserRequest::new(&self.drv_info, self.addr).with_iface(self.iface);
-                match self.handle.drv_user_create_blocking(&req) {
-                    Ok(info) => {
-                        self.reason = info.reason;
-                        // Per-record octet cap (C `modbusDrvUser_t.len`); applied to
-                        // `octet_max_size` below, after SIZV finalizes the buffer.
-                        self.octet_len_cap = info.max_octet_len;
-                        self.drv_user = info.drv_user;
-                    }
-                    Err(e) => {
-                        // Param not found, or the driver rejected the bind (e.g. an
-                        // out-of-range offset) — this record cannot bind to a param.
-                        // C prints and `goto bad` (devAsynInt32.c:272-276). Leaving
-                        // the record live would let it keep processing against
-                        // reason 0 — a different parameter.
-                        self.reason_set = false;
-                        self.dset.report(
-                            &self.record_name,
-                            &LinkRefusal::DrvUser(drv_user_message(&e)),
-                        );
-                        return Ok(self.dset.bad());
-                    }
-                }
-            }
-            self.reason_set = true;
-        }
-        if let Some(sync_io) = self.dset.sync_io() {
-            if let Err(dead) = self.sync_io_connect(drv_user, sync_io) {
-                return Ok(dead);
-            }
-        }
-
-        // asynOctetCmdResponse misconfiguration: C initCmdBuffer
-        // (devAsynOctet.c:631-637) rejects the command outright — `precord->pact
-        // = 1`, recGblSetSevr(LINK_ALARM, INVALID_ALARM), INIT_ERROR — when, and
-        // ONLY when, the RAW userParam (the pre-escape DRVINFO) is empty:
-        // `strlen(pPvt->userParam) == 0`. The translated byte length (bufLen) is
-        // computed later (:641) and may be 0 for a non-empty DRVINFO that escapes
-        // to a leading NUL — that case is NOT rejected; C does a 0-byte
-        // writeIt+readIt. So gate the reject on the raw DRVINFO, not on the
-        // post-truncation command: a Some(empty) octet_cmd from a leading-NUL
-        // command falls through to a 0-byte OctetWriteRead. octet_cmd is None for
-        // a plain asynOctetRead, so this only fires for a CmdResponse record.
-        if self.octet_cmd.is_some() && self.drv_info.is_empty() {
-            epics_libcom_rs::epics_println!(
-                "{}  devAsynOctet::initCmdBuffer no userParam",
-                self.record_name
-            );
-            return Ok(DeviceInitOutcome::dead_with_alarm(
-                epics_base_rs::server::recgbl::alarm_status::LINK_ALARM,
-                epics_base_rs::server::record::AlarmSeverity::Invalid,
-            ));
-        }
-
-        // C `initDbAddr` (devAsynOctet.c:645-657): the command record must
-        // exist at init, or the record is dead at LINK/INVALID.
-        if let Some(src) = self.device_job.write_read.get() {
-            let held = Some((self.record_name.as_bytes(), &*record as &dyn Record));
-            if !src.db.get().is_some_and(|db| db.has_pv(&src.pv, held)) {
-                epics_libcom_rs::epics_println!(
-                    "{} devAsynOctet::initDbAddr record {} not present",
-                    self.record_name,
-                    src.pv
-                );
-                return Ok(DeviceInitOutcome::dead_with_alarm(
-                    epics_base_rs::server::recgbl::alarm_status::LINK_ALARM,
-                    epics_base_rs::server::record::AlarmSeverity::Invalid,
-                ));
-            }
-        }
-
-        // Read NELM from the record to set max_array_elements for array reads.
-        // NELM is DBF_ULONG (waveform/aai/aao) and DBF_USHORT (histogram); take
-        // the numeric view so no declaration is missed.
-        if let Some(nelm) = record.get_field("NELM").and_then(|v| v.to_f64()) {
-            if nelm > 0.0 {
-                self.max_array_elements = nelm as usize;
-            }
-        }
-
-        // The time-series buffer `check_ftvl` chose, sized to NELM.
-        if let (Some(ts), Some(buf)) = (&self.time_series, ts_buf) {
-            let mut st = ts.inner.lock().unwrap();
-            st.nelm = self.max_array_elements;
-            st.buf = Some(buf);
-        }
-
-        // C devAsynOctet `valSize`. SIZV is DBF_USHORT
-        // (lsiRecord/lsoRecord/printfRecord.dbd.pod).
-        self.octet_val_size = match (record.get_field("SIZV"), record.get_field("NELM")) {
-            (Some(EpicsValue::UShort(sizv)), _) if sizv > 0 => sizv as usize,
-            (_, Some(nelm)) => nelm.to_f64().map_or(0, |n| n as usize),
-            _ => MAX_STRING_SIZE,
-        };
-        self.octet_max_size = self.octet_val_size;
-
-        // Apply the per-record octet cap from `drv_user_create` after SIZV has
-        // finalized the buffer length, mirroring C `getStringLen`: the effective
-        // length is `min(buffer_len, drvUser->len)` (drvModbusAsyn.cpp:2367-2377).
-        // A driver with no cap returns `None`, leaving the buffer length intact.
-        if let Some(cap) = self.octet_len_cap {
-            self.octet_max_size = self.octet_max_size.min(cap);
-        }
-
-        // asynUInt32Digital MASK/SHFT propagation. C devAsynUInt32Digital.c
-        // init* (bi/bo :668/:710, mbbi/mbbo/mbbiDirect/mbboDirect :880,
-        // :924, :1009, :1053) sets, whatever the mask, a 0 one too:
-        //
-        //     pr->mask = pPvt->mask;
-        //     pr->shft = computeShift(pPvt->mask);   /* mbb records only */
-        //
-        // so the record's standard RVAL→VAL conversion shifts the
-        // masked bits down to bit 0. Without this, a link like
-        // `@asynMask(port,0,0xFF00) BITS` reads RVAL with bits 8-15
-        // set but the record's shft stays 0 and VAL ends up
-        // 65280-shaped instead of 0-255. bi/bo have no SHFT, so that put
-        // is refused there.
-        if self.iface_type == "asynUInt32Digital" {
-            let shft = compute_mask_shift(self.mask);
-            let _ = record.put_field("MASK", EpicsValue::Long(self.mask as i32));
-            let _ = record.put_field("SHFT", EpicsValue::Short(shft as i16));
-        }
-
-        // asynInt32 mbbi/mbbo MASK positioning. C devAsynInt32.c initMbbi
-        // (1246-1247) / initMbbo (1290-1291):
-        //
-        //     if (pr->nobt == 0) pr->mask = 0xffffffff;
-        //     pr->mask <<= pr->shft;
-        //
-        // The asynInt32 device support POSITIONS the record's mask so
-        // `rval = value & mask` (processMbbi/processMbbo) selects the field at
-        // bits [SHFT, SHFT+NOBT). Without it, `apply_raw_readback`'s
-        // `raw & mask` strips exactly the SHFT-selected bits (and a NOBT=0
-        // record masks every bit to 0). uint32digital records get their
-        // already-positioned `@asynMask` above instead; only mbbi/mbbo carry
-        // NOBT under asynInt32 (bi/bo/ai/ao/longin have none; mbbiDirect/
-        // mbboDirect are uint32digital-only), so NOBT presence selects them.
-        //
-        // C shifts the record's CURRENT mask, overriding to 0xffffffff only
-        // when NOBT==0. mbbiRecord/mbboRecord init (mbbiRecord.c:129-130) sets
-        // that current mask to a `.db`-loaded MASK, or to `(1<<NOBT)-1` only
-        // when MASK was 0 — so mirroring `current << SHFT` here (rather than
-        // rebuilding `(1<<NOBT)-1`) preserves a `.db`-set custom MASK and
-        // yields 0 for the degenerate NOBT>32 (record mask stays 0), both
-        // exactly C. `wire_device_to_record` (device_support.rs) calls `init`
-        // exactly once per record, like C's once-only `initMbbi`, so the
-        // in-place positioning is never re-applied (no double-shift).
-        if self.iface_type == "asynInt32" {
-            if let Some(EpicsValue::UShort(nobt)) = record.get_field("NOBT") {
-                let shft = match record.get_field("SHFT") {
-                    Some(EpicsValue::UShort(s)) => s as u32,
-                    _ => 0,
-                };
-                let base: u32 = if nobt == 0 {
-                    0xFFFF_FFFF
-                } else {
-                    match record.get_field("MASK") {
-                        Some(EpicsValue::ULong(m)) => m,
-                        _ => 0,
-                    }
-                };
-                let positioned = base.checked_shl(shft).unwrap_or(0);
-                let _ = record.put_field("MASK", EpicsValue::Long(positioned as i32));
-            }
-        }
-
-        // C `initAiAverage` registers its callback after `initCommon` and before
-        // `getBounds` (devAsynInt32.c:866-881).
-        if self.average.is_some() {
-            if let Err(e) = self.subscribe_average() {
-                self.report_register_refusal(Register::Average, &e);
-            }
-        }
-
-        // ai/ao LINEAR ESLO/EOFF wiring.
-        //
-        // C devAsynInt32.c::initAi (line 824-828) / initAo / initAiAverage:
-        //
-        //     if (deviceLow == 0 && deviceHigh == 0) {
-        //         pasynInt32SyncIO->getBounds(..., &deviceLow, &deviceHigh);
-        //     }
-        //     convertAi(pr, 1);   // line 437-454: ESLO/EOFF from EGUF/EGUL+bounds
-        //
-        // The bounds query is only meaningful for asynInt32/asynInt64
-        // (asynFloat64 has no getBounds in C; mbbi/mbbo use the mask
-        // path computed above). The record only applies the result
-        // when LINR != NO_CONVERSION, but C writes ESLO/EOFF
-        // unconditionally and lets record processing decide whether
-        // to honour it.
-        if (self.iface_type == "asynInt32" || self.iface_type == "asynInt64")
-            && record.get_field("ESLO").is_some()
-        {
-            self.init_device_bounds();
-            self.apply_linear_eslo_eoff(record);
-        }
-
-        // Driver enum-string table -> record state fields. C asyn int32/uint32
-        // device support (devAsynInt32.c::initCommon:298-324,
-        // devAsynUInt32Digital.c:255-280) enters this block on
-        // `findInterface(asynEnumType) && maxEnums>0`, after an EnumSyncIO
-        // connect (devAsynInt32.c:300-311); the record family is identified by
-        // the state fields it exposes (ZRST or ZNAM). Inside it only `setEnums`
-        // waits on a successful read: `callbackEnum` registers whether or not
-        // the driver returned a table.
-        let enum_table = EnumRecordShape::of_record(record).filter(|_| {
-            self.dset.connects_enum_sync_io() && self.handle.has_interface(InterfaceType::Enum)
-        });
-        if let Some(shape) = enum_table {
-            if let Err(dead) = self.sync_io_connect(drv_user, "EnumSyncIO") {
-                return Ok(dead);
-            }
-            let user = self.init_user();
-            if let Ok(result) = self.handle.submit_blocking(RequestOp::EnumRead, user) {
-                if let Some(entries) = result.enum_entries {
-                    let entries = clamp_enum_table(&entries);
-                    self.apply_enum_table(record, &entries);
-                    *self.enum_applied.lock() = Some(entries);
-                }
-            }
-            if let Err(e) = self.subscribe_enum(shape) {
-                self.report_register_refusal(Register::Enum, &e);
-            }
-        }
-
-        // C `initCommon` registers the `asyn:READBACK` callback here, after the
-        // enum table and ahead of the initial readback (devAsynInt32.c:325-341,
-        // and the same step in each devAsyn file).
-        if self.asyn_readback && self.average.is_none() && self.time_series.is_none() {
-            if let Err(e) = self.subscribe_input() {
-                self.report_register_refusal(Register::ReadBack, &e);
-            }
-        }
-
-        let mut read_back = false;
-        if self.initial_readback {
-            // devAsynOctet connects its SyncIO only for this read
-            // (devAsynOctet.c:361); the other dsets connected above.
-            if self.dset == Dset::Octet {
-                if let Err(dead) = self.sync_io_connect(drv_user, "octetSyncIO") {
-                    return Ok(dead);
-                }
-            }
-            if let Some(op) = self.read_op(&*record) {
-                let user = self.init_user();
-                if let Ok(mut result) = self.handle.submit_blocking(op, user) {
-                    Int32Mask::apply_to_read(self.int32_mask, &mut result);
-                    // Seed the output record's value only on a successful read,
-                    // mirroring C initAo/initLongout/initMbbo: `if (status ==
-                    // asynSuccess) { pao->rval = value; return INIT_OK; }` with
-                    // `INIT_DO_NOT_CONVERT` the FAILURE fall-through
-                    // (initAo devAsynInt32.c:955-959, initMbbo :1295-1299;
-                    // initLo, which has no RVAL to convert, stores VAL under the
-                    // same guard and returns INIT_OK either way, :1082-1086).
-                    // A failed initial read, a parameter's status included, is
-                    // an `Err` and leaves the .db default.
-                    if let Some(val) = self.result_to_value(&result) {
-                        // ao seeds VAL from the raw readback via its
-                        // `raw -> eng` inverse: C `initAo` sets `rval=value`
-                        // and returns INIT_OK so aoRecord runs the readback
-                        // convert (devAsynInt32.c:947-957). longout/mbbo
-                        // have no such inverse (VAL == raw / state-map) and
-                        // decline the hook (default `false`). An asynFloat64
-                        // ao seeds VAL with the forward ASLO/AOFF scaling
-                        // (C `initAo`, devAsynFloat64.c:628-630) via the
-                        // float64 readback hook.
-                        let seeded = match val {
-                            EpicsValue::Long(raw) => {
-                                let rval = self.dset_rval(&*record, raw);
-                                record.apply_raw_readback(rval)
-                            }
-                            EpicsValue::Double(raw) => record.apply_float64_readback(raw),
-                            _ => false,
-                        };
-                        // The seed lands as every read does, through
-                        // `store_read_value`: a DBF_STRING VAL is C's
-                        // `strcpy` of the reply, cut at the first NUL
-                        // (devAsynOctet.c:373-376).
-                        if !seeded {
-                            self.store_read_value(record, val);
-                        }
-                        read_back = true;
-                    }
-                }
-            }
-        }
-
-        // Mode 1 averaging: snapshot the SVAL decimation count so the first
-        // decimation period uses the configured value before the first process
-        // refreshes it (C reads pai->sval live; devAsynInt32.c:674).
-        if self.is_io_intr_scan() {
-            self.refresh_average_decimation_threshold(record);
-        }
-        Ok(init_status(
-            record.record_type(),
-            &self.iface_type,
-            read_back,
-        ))
-    }
-
-    fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
+    /// The record's read. `own` is the frame its holder lent the read
+    /// ([`DeviceSupport::read_own`]), through which `asynOctetWriteRead` asks
+    /// for its command record.
+    fn read_lent(
+        &mut self,
+        record: &mut dyn Record,
+        own: Option<OwnFrame<'_>>,
+    ) -> CaResult<DeviceReadOutcome> {
         if !self.reason_set {
             return Ok(DeviceReadOutcome::ok());
         }
@@ -4565,7 +4245,7 @@ impl DeviceSupport for AsynDeviceSupport {
             }
             None => self
                 .read_op(&*record)
-                .map(|op| self.submit_read(op, &*record)),
+                .map(|op| self.submit_read(op, own.map(|own| own.of(&*record)))),
         };
         if let Some(ran) = ran {
             match ran {
@@ -4641,6 +4321,379 @@ impl DeviceSupport for AsynDeviceSupport {
         }
         // Whatever the store decided, or the `failed()` this started as.
         Ok(read_outcome)
+    }
+}
+
+impl DeviceSupport for AsynDeviceSupport {
+    fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
+        self.dset = self.bound_dset(record.record_type());
+        self.settle_ring();
+        let ts_buf = match self.dset.check_ftvl(&self.record_name, record) {
+            Ok(buf) => buf,
+            Err(dead) => return Ok(dead),
+        };
+        // busy is the driver-clearable output: the busy module's devBusyAsyn
+        // registers the output interrupt callback UNCONDITIONALLY (`if
+        // (interruptCallback)` with no `asyn:READBACK` info gate,
+        // devBusyAsyn.c:245-260) — that always-on readback is the record's
+        // whole point (driver holds VAL=1, clears to 0 on completion). Forced
+        // here, not info-gated: a C db's busy records carry no info tag.
+        if record.record_type() == "busy" {
+            self.set_asyn_readback(true);
+        }
+        // C `initCommon` (devAsynInt32.c:249-262): `pasynManager->connectDevice`
+        // before `findInterface`/`drvUser->create`, and it is that call which
+        // creates the device on a multi-device port (`locateDevice(..., TRUE)`,
+        // asynManager.c:1349-1352) - so `asynReport` counts an address the
+        // moment a record binds to it. C's failures (:255-259) are a port it
+        // cannot find, and this handle is that port.
+        self.handle.connect_device(self.addr);
+        // devAsynOctet finds asynOctet before its drvUser (devAsynOctet.c:291);
+        // the other dsets after it.
+        if self.dset == Dset::Octet {
+            if let Err(dead) = self.find_interface() {
+                return Ok(dead);
+            }
+        }
+        if self.handle.can_block() {
+            self.request_cell();
+        }
+        // C calls drvUser->create only when the port registered asynDrvUser
+        // **and** the record named a userParam (`if (pasynInterface &&
+        // pPvt->userParam)`, devAsynInt32.c:264-265; the same pair of
+        // conditions in devAsynFloat64.c, devAsynOctet.c, asynOctetSyncIO.c:141).
+        // A byte transport registers no asynDrvUser and has no parameter to
+        // name: the record binds at reason 0 — the port's own reason space —
+        // and that is not a bind failure. Ask the interface registry
+        // (`has_interface`), never a failed `create`.
+        let drv_user = !self.reason_set
+            && self.handle.has_interface(InterfaceType::DrvUser)
+            && !self.drv_info.is_empty();
+        if !self.reason_set {
+            if drv_user {
+                // Pass the record's asyn `addr`: a multi-device driver (e.g. modbus)
+                // rejects an out-of-range offset here at bind time (C `drvUserCreate`
+                // `checkOffset`) instead of alarming on every I/O. Pass the record's
+                // interface (from its DTYP): an on-demand driver must create the
+                // parameter with the type this record will read it as — C
+                // `adsAsynPortDriver::getRecordInfoFromDrvInfo`.
+                let req = DrvUserRequest::new(&self.drv_info, self.addr).with_iface(self.iface);
+                match self.handle.drv_user_create_blocking(&req) {
+                    Ok(info) => {
+                        self.reason = info.reason;
+                        // Per-record octet cap (C `modbusDrvUser_t.len`); applied to
+                        // `octet_max_size` below, after SIZV finalizes the buffer.
+                        self.octet_len_cap = info.max_octet_len;
+                        self.drv_user = info.drv_user;
+                    }
+                    Err(e) => {
+                        // Param not found, or the driver rejected the bind (e.g. an
+                        // out-of-range offset) — this record cannot bind to a param.
+                        // C prints and `goto bad` (devAsynInt32.c:272-276). Leaving
+                        // the record live would let it keep processing against
+                        // reason 0 — a different parameter.
+                        self.reason_set = false;
+                        self.dset.report(
+                            &self.record_name,
+                            &LinkRefusal::DrvUser(drv_user_message(&e)),
+                        );
+                        return Ok(self.dset.bad());
+                    }
+                }
+            }
+            self.reason_set = true;
+        }
+        if self.dset != Dset::Octet {
+            if let Err(dead) = self.find_interface() {
+                return Ok(dead);
+            }
+        }
+        if let Some(sync_io) = self.dset.sync_io() {
+            if let Err(dead) = self.sync_io_connect(drv_user, sync_io) {
+                return Ok(dead);
+            }
+        }
+
+        // asynOctetCmdResponse misconfiguration: C initCmdBuffer
+        // (devAsynOctet.c:631-637) rejects the command outright — `precord->pact
+        // = 1`, recGblSetSevr(LINK_ALARM, INVALID_ALARM), INIT_ERROR — when, and
+        // ONLY when, the RAW userParam (the pre-escape DRVINFO) is empty:
+        // `strlen(pPvt->userParam) == 0`. The translated byte length (bufLen) is
+        // computed later (:641) and may be 0 for a non-empty DRVINFO that escapes
+        // to a leading NUL — that case is NOT rejected; C does a 0-byte
+        // writeIt+readIt. So gate the reject on the raw DRVINFO, not on the
+        // post-truncation command: a Some(empty) octet_cmd from a leading-NUL
+        // command falls through to a 0-byte OctetWriteRead. octet_cmd is None for
+        // a plain asynOctetRead, so this only fires for a CmdResponse record.
+        if self.octet_cmd.is_some() && self.drv_info.is_empty() {
+            epics_libcom_rs::epics_println!(
+                "{}  devAsynOctet::initCmdBuffer no userParam",
+                self.record_name
+            );
+            return Ok(DeviceInitOutcome::dead_with_alarm(
+                epics_base_rs::server::recgbl::alarm_status::LINK_ALARM,
+                epics_base_rs::server::record::AlarmSeverity::Invalid,
+            ));
+        }
+
+        // C `initDbAddr` (devAsynOctet.c:645-657): the command record must
+        // exist at init, or the record is dead at LINK/INVALID.
+        if let Some(src) = self.device_job.write_read.get() {
+            if !src.db.get().is_some_and(|db| db.has_pv(&src.pv)) {
+                epics_libcom_rs::epics_println!(
+                    "{} devAsynOctet::initDbAddr record {} not present",
+                    self.record_name,
+                    src.pv
+                );
+                return Ok(DeviceInitOutcome::dead_with_alarm(
+                    epics_base_rs::server::recgbl::alarm_status::LINK_ALARM,
+                    epics_base_rs::server::record::AlarmSeverity::Invalid,
+                ));
+            }
+        }
+
+        // Read NELM from the record to set max_array_elements for array reads.
+        // NELM is DBF_ULONG (waveform/aai/aao) and DBF_USHORT (histogram); take
+        // the numeric view so no declaration is missed.
+        if let Some(nelm) = record.get_field("NELM").and_then(|v| v.to_f64()) {
+            if nelm > 0.0 {
+                self.max_array_elements = nelm as usize;
+            }
+        }
+
+        // The time-series buffer `check_ftvl` chose, sized to NELM.
+        if let (Some(ts), Some(buf)) = (&self.time_series, ts_buf) {
+            let mut st = ts.inner.lock().unwrap();
+            st.nelm = self.max_array_elements;
+            st.buf = Some(buf);
+        }
+
+        // C devAsynOctet `valSize`. SIZV is DBF_USHORT
+        // (lsiRecord/lsoRecord/printfRecord.dbd.pod).
+        self.octet_val_size = match (record.get_field("SIZV"), record.get_field("NELM")) {
+            (Some(EpicsValue::UShort(sizv)), _) if sizv > 0 => sizv as usize,
+            (_, Some(nelm)) => nelm.to_f64().map_or(0, |n| n as usize),
+            _ => MAX_STRING_SIZE,
+        };
+        self.octet_max_size = self.octet_val_size;
+
+        // Apply the per-record octet cap from `drv_user_create` after SIZV has
+        // finalized the buffer length, mirroring C `getStringLen`: the effective
+        // length is `min(buffer_len, drvUser->len)` (drvModbusAsyn.cpp:2367-2377).
+        // A driver with no cap returns `None`, leaving the buffer length intact.
+        if let Some(cap) = self.octet_len_cap {
+            self.octet_max_size = self.octet_max_size.min(cap);
+        }
+
+        // asynUInt32Digital MASK/SHFT propagation. C devAsynUInt32Digital.c
+        // init* (bi/bo :668/:710, mbbi/mbbo/mbbiDirect/mbboDirect :880,
+        // :924, :1009, :1053) sets, whatever the mask, a 0 one too:
+        //
+        //     pr->mask = pPvt->mask;
+        //     pr->shft = computeShift(pPvt->mask);   /* mbb records only */
+        //
+        // so the record's standard RVAL→VAL conversion shifts the
+        // masked bits down to bit 0. Without this, a link like
+        // `@asynMask(port,0,0xFF00) BITS` reads RVAL with bits 8-15
+        // set but the record's shft stays 0 and VAL ends up
+        // 65280-shaped instead of 0-255. bi/bo have no SHFT, so that put
+        // is refused there.
+        if self.iface_type == "asynUInt32Digital" {
+            let shft = compute_mask_shift(self.mask);
+            let _ = record.put_field("MASK", EpicsValue::Long(self.mask as i32));
+            let _ = record.put_field("SHFT", EpicsValue::Short(shft as i16));
+        }
+
+        // asynInt32 mbbi/mbbo MASK positioning. C devAsynInt32.c initMbbi
+        // (1246-1247) / initMbbo (1290-1291):
+        //
+        //     if (pr->nobt == 0) pr->mask = 0xffffffff;
+        //     pr->mask <<= pr->shft;
+        //
+        // The asynInt32 device support POSITIONS the record's mask so
+        // `rval = value & mask` (processMbbi/processMbbo) selects the field at
+        // bits [SHFT, SHFT+NOBT). Without it, `apply_raw_readback`'s
+        // `raw & mask` strips exactly the SHFT-selected bits (and a NOBT=0
+        // record masks every bit to 0). uint32digital records get their
+        // already-positioned `@asynMask` above instead; only mbbi/mbbo carry
+        // NOBT under asynInt32 (bi/bo/ai/ao/longin have none; mbbiDirect/
+        // mbboDirect are uint32digital-only), so NOBT presence selects them.
+        //
+        // C shifts the record's CURRENT mask, overriding to 0xffffffff only
+        // when NOBT==0. mbbiRecord/mbboRecord init (mbbiRecord.c:129-130) sets
+        // that current mask to a `.db`-loaded MASK, or to `(1<<NOBT)-1` only
+        // when MASK was 0 — so mirroring `current << SHFT` here (rather than
+        // rebuilding `(1<<NOBT)-1`) preserves a `.db`-set custom MASK and
+        // yields 0 for the degenerate NOBT>32 (record mask stays 0), both
+        // exactly C. `wire_device_to_record` (device_support.rs) calls `init`
+        // exactly once per record, like C's once-only `initMbbi`, so the
+        // in-place positioning is never re-applied (no double-shift).
+        if self.iface_type == "asynInt32" {
+            if let Some(EpicsValue::UShort(nobt)) = record.get_field("NOBT") {
+                let shft = match record.get_field("SHFT") {
+                    Some(EpicsValue::UShort(s)) => s as u32,
+                    _ => 0,
+                };
+                let base: u32 = if nobt == 0 {
+                    0xFFFF_FFFF
+                } else {
+                    match record.get_field("MASK") {
+                        Some(EpicsValue::ULong(m)) => m,
+                        _ => 0,
+                    }
+                };
+                let positioned = base.checked_shl(shft).unwrap_or(0);
+                let _ = record.put_field("MASK", EpicsValue::Long(positioned as i32));
+            }
+        }
+
+        // C `initAiAverage` registers its callback after `initCommon` and before
+        // `getBounds` (devAsynInt32.c:866-881).
+        if self.average.is_some() {
+            if let Err(e) = self.subscribe_average() {
+                self.report_register_refusal(Register::Average, &e);
+            }
+        }
+
+        // ai/ao LINEAR ESLO/EOFF wiring.
+        //
+        // C devAsynInt32.c::initAi (line 824-828) / initAo / initAiAverage:
+        //
+        //     if (deviceLow == 0 && deviceHigh == 0) {
+        //         pasynInt32SyncIO->getBounds(..., &deviceLow, &deviceHigh);
+        //     }
+        //     convertAi(pr, 1);   // line 437-454: ESLO/EOFF from EGUF/EGUL+bounds
+        //
+        // The bounds query is only meaningful for asynInt32/asynInt64
+        // (asynFloat64 has no getBounds in C; mbbi/mbbo use the mask
+        // path computed above). The record only applies the result
+        // when LINR != NO_CONVERSION, but C writes ESLO/EOFF
+        // unconditionally and lets record processing decide whether
+        // to honour it.
+        if (self.iface_type == "asynInt32" || self.iface_type == "asynInt64")
+            && record.get_field("ESLO").is_some()
+        {
+            self.init_device_bounds();
+            self.apply_linear_eslo_eoff(record);
+        }
+
+        // Driver enum-string table -> record state fields. C asyn int32/uint32
+        // device support (devAsynInt32.c::initCommon:298-324,
+        // devAsynUInt32Digital.c:255-280) enters this block on
+        // `findInterface(asynEnumType) && maxEnums>0`, after an EnumSyncIO
+        // connect (devAsynInt32.c:300-311); the record family is identified by
+        // the state fields it exposes (ZRST or ZNAM). Inside it only `setEnums`
+        // waits on a successful read: `callbackEnum` registers whether or not
+        // the driver returned a table.
+        let enum_table = EnumRecordShape::of_record(record).filter(|_| {
+            self.dset.connects_enum_sync_io() && self.handle.has_interface(InterfaceType::Enum)
+        });
+        if let Some(shape) = enum_table {
+            if let Err(dead) = self.sync_io_connect(drv_user, "EnumSyncIO") {
+                return Ok(dead);
+            }
+            let user = self.init_user();
+            if let Ok(result) = self.handle.submit_blocking(RequestOp::EnumRead, user) {
+                if let Some(entries) = result.enum_entries {
+                    let entries = clamp_enum_table(&entries);
+                    self.apply_enum_table(record, &entries);
+                    *self.enum_applied.lock() = Some(entries);
+                }
+            }
+            if let Err(e) = self.subscribe_enum(shape) {
+                self.report_register_refusal(Register::Enum, &e);
+            }
+        }
+
+        // C `initCommon` registers the `asyn:READBACK` callback here, after the
+        // enum table and ahead of the initial readback (devAsynInt32.c:325-341,
+        // and the same step in each devAsyn file).
+        if self.asyn_readback && self.average.is_none() && self.time_series.is_none() {
+            if let Err(e) = self.subscribe_input() {
+                self.report_register_refusal(Register::ReadBack, &e);
+            }
+        }
+
+        let mut read_back = false;
+        if self.initial_readback {
+            // devAsynOctet connects its SyncIO only for this read
+            // (devAsynOctet.c:361); the other dsets connected above.
+            if self.dset == Dset::Octet {
+                if let Err(dead) = self.sync_io_connect(drv_user, "octetSyncIO") {
+                    return Ok(dead);
+                }
+            }
+            if let Some(op) = self.read_op(&*record) {
+                let user = self.init_user();
+                if let Ok(mut result) = self.handle.submit_blocking(op, user) {
+                    Int32Mask::apply_to_read(self.int32_mask, &mut result);
+                    // Seed the output record's value only on a successful read,
+                    // mirroring C initAo/initLongout/initMbbo: `if (status ==
+                    // asynSuccess) { pao->rval = value; return INIT_OK; }` with
+                    // `INIT_DO_NOT_CONVERT` the FAILURE fall-through
+                    // (initAo devAsynInt32.c:955-959, initMbbo :1295-1299;
+                    // initLo, which has no RVAL to convert, stores VAL under the
+                    // same guard and returns INIT_OK either way, :1082-1086).
+                    // A failed initial read, a parameter's status included, is
+                    // an `Err` and leaves the .db default.
+                    if let Some(val) = self.result_to_value(&result) {
+                        // ao seeds VAL from the raw readback via its
+                        // `raw -> eng` inverse: C `initAo` sets `rval=value`
+                        // and returns INIT_OK so aoRecord runs the readback
+                        // convert (devAsynInt32.c:947-957). longout/mbbo
+                        // have no such inverse (VAL == raw / state-map) and
+                        // decline the hook (default `false`). An asynFloat64
+                        // ao seeds VAL with the forward ASLO/AOFF scaling
+                        // (C `initAo`, devAsynFloat64.c:628-630) via the
+                        // float64 readback hook.
+                        let seeded = match val {
+                            EpicsValue::Long(raw) => {
+                                let rval = self.dset_rval(&*record, raw);
+                                record.apply_raw_readback(rval)
+                            }
+                            EpicsValue::Double(raw) => record.apply_float64_readback(raw),
+                            _ => false,
+                        };
+                        // The seed lands as every read does, through
+                        // `store_read_value`: a DBF_STRING VAL is C's
+                        // `strcpy` of the reply, cut at the first NUL
+                        // (devAsynOctet.c:373-376).
+                        if !seeded {
+                            self.store_read_value(record, val);
+                        }
+                        read_back = true;
+                    }
+                }
+            }
+        }
+
+        // Mode 1 averaging: snapshot the SVAL decimation count so the first
+        // decimation period uses the configured value before the first process
+        // refreshes it (C reads pai->sval live; devAsynInt32.c:674).
+        if self.is_io_intr_scan() {
+            self.refresh_average_decimation_threshold(record);
+        }
+        Ok(init_status(
+            record.record_type(),
+            &self.iface_type,
+            read_back,
+        ))
+    }
+
+    fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
+        self.read_lent(record, None)
+    }
+
+    fn reads_own(&self) -> bool {
+        self.device_job.write_read.get().is_some()
+    }
+
+    fn read_own(
+        &mut self,
+        record: &mut dyn Record,
+        own: OwnFrame<'_>,
+    ) -> CaResult<DeviceReadOutcome> {
+        self.read_lent(record, Some(own))
     }
 
     fn write(&mut self, record: &mut dyn Record) -> CaResult<()> {
@@ -5353,6 +5406,26 @@ impl Dset {
                 format!("{record} {driver}::initCommon {sync_io}->connect failed {message}"),
                 false,
             ),
+            // A port without the interface leaves `errorMessage` empty, and C
+            // prints it after the space.
+            LinkRefusal::Interface(iface) => match self {
+                Self::Octet => (
+                    format!("{record} {driver}::initCommon interface {iface} not found"),
+                    false,
+                ),
+                Self::Array => (
+                    format!("{driver}::devAsynXXXArray, {record} find {iface} interface failed "),
+                    true,
+                ),
+                Self::TimeSeries(_) => (
+                    format!("{driver}::initCommon, {record} find {iface} interface failed "),
+                    true,
+                ),
+                _ => (
+                    format!("{record} {driver}::initCommon findInterface {iface}Type "),
+                    false,
+                ),
+            },
         }
     }
 
@@ -5384,6 +5457,8 @@ enum LinkRefusal {
     DrvUser(String),
     /// This SyncIO's `connect` failed with this `errorMessage`.
     SyncIo(&'static str, String),
+    /// `findInterface` found no such interface on the port.
+    Interface(&'static str),
 }
 
 /// What `pasynUser->errorMessage` holds after a failed `drvUserCreate`.
@@ -6082,23 +6157,27 @@ mod tests {
     /// `Duration::from_secs_f64` panicked on exactly those, aborting the thread
     /// at record init. The sentinel is now carried, not substituted.
     #[test]
-    fn test_parse_negative_timeout_waits_forever_and_non_finite_is_bounded() {
+    fn test_parse_negative_or_nan_timeout_waits_forever_and_inf_is_capped() {
         // A negative link timeout is C's "wait forever" and reaches the driver
-        // as one (DRV-42); it used to take the bounded default here.
-        for spec in ["@asyn(PORT, 0, -1) DRV", "@asyn(PORT, 0, -0.5) DRV"] {
+        // as one (DRV-42); it used to take the bounded default here. NaN fails
+        // the serial driver's `> 0` and `== 0` tests, so it waits forever too.
+        for spec in [
+            "@asyn(PORT, 0, -1) DRV",
+            "@asyn(PORT, 0, -0.5) DRV",
+            "@asyn(PORT, 0, NaN) DRV",
+        ] {
             let link = parse_asyn_link(spec).expect(spec);
             assert_eq!(link.timeout, None, "{spec}");
             assert_eq!(link.drv_info, "DRV", "{spec}");
         }
-        // The values C itself has no defined behaviour for keep the bounded
-        // fallback.
-        for spec in [
-            "@asyn(PORT, 0, inf) DRV",
-            "@asyn(PORT, 0, NaN) DRV",
-            "@asyn(PORT, 0, 1e30) DRV",
+        // Past ten years C's event wait caps it at ten years.
+        let ten_years = Duration::from_secs(60 * 60 * 24 * 36525 / 10);
+        for (spec, want) in [
+            ("@asyn(PORT, 0, inf) DRV", ten_years),
+            ("@asyn(PORT, 0, 1e30) DRV", ten_years),
         ] {
             let link = parse_asyn_link(spec).expect(spec);
-            assert_eq!(link.timeout, Some(DEFAULT_TIMEOUT), "{spec}");
+            assert_eq!(link.timeout, Some(want), "{spec}");
             assert_eq!(link.drv_info, "DRV", "{spec}");
         }
         // A representable timeout still passes through verbatim.
@@ -6488,6 +6567,170 @@ mod tests {
                 ),
                 "{dtyp}"
             );
+        }
+    }
+
+    /// A port that never registered the record's interface: each dset
+    /// prints C's `findInterface` line and takes its `bad:` arm —
+    /// devAsynOctet before its drvUser (devAsynOctet.c:291-295), the others
+    /// after it (devAsynInt32.c:279-284, devBusyAsyn.c:199-204,
+    /// devAsynUInt32Digital.c:234-239, devAsynFloat64.c:193-198,
+    /// devAsynInt64.c:235-240, devAsynXXXArray.cpp:159-164,
+    /// devAsynXXXTimeSeries.h:108-114). A child, to read its stdout.
+    #[test]
+    fn a_port_without_the_records_interface_refuses_it_at_init() {
+        use epics_base_rs::runtime::log::{errlog_add_listener, errlog_flush};
+        use epics_base_rs::server::ioc_app::DeviceSupportContext;
+        use epics_base_rs::server::records::ai::AiRecord;
+        use epics_base_rs::server::records::busy::BusyRecord;
+        use epics_base_rs::server::records::waveform::WaveformRecord;
+        use epics_base_rs::types::DbFieldType;
+
+        const CHILD: &str = "ASYN_FIND_INTERFACE_LINE_CHILD";
+        const TEST: &str =
+            "adapter::tests::a_port_without_the_records_interface_refuses_it_at_init";
+        let link_alarm = DeviceInitOutcome::dead_with_alarm(
+            epics_base_rs::server::recgbl::alarm_status::LINK_ALARM,
+            epics_base_rs::server::record::AlarmSeverity::Invalid,
+        );
+        // (record type, DTYP, link, printed line, errlog)
+        let cases = [
+            (
+                "ai",
+                "asynInt32",
+                "@asyn(fi_port,0)VAL",
+                "FI:I32 devAsynInt32::initCommon findInterface asynInt32Type ",
+                false,
+            ),
+            (
+                "busy",
+                "asynInt32",
+                "@asyn(fi_port,0)VAL",
+                "FI:BUSY devBusyAsyn::initCommon findInterface asynInt32Type ",
+                false,
+            ),
+            (
+                "bi",
+                "asynUInt32Digital",
+                "@asynMask(fi_port,0,1)VAL",
+                "FI:U32 devAsynUInt32Digital::initCommon findInterface asynUInt32DigitalType ",
+                false,
+            ),
+            (
+                "ai",
+                "asynFloat64",
+                "@asyn(fi_port,0)VAL",
+                "FI:F64 devAsynFloat64::initCommon findInterface asynFloat64Type ",
+                false,
+            ),
+            (
+                "int64in",
+                "asynInt64",
+                "@asyn(fi_port,0)VAL",
+                "FI:I64 devAsynInt64::initCommon findInterface asynInt64Type ",
+                false,
+            ),
+            // drvUser runs first, and refuses a parameter the port lacks.
+            (
+                "int64in",
+                "asynInt64",
+                "@asyn(fi_port,0)NOPE",
+                "FI:I64N devAsynInt64::initCommon drvUserCreate ",
+                false,
+            ),
+            // findInterface runs first: the missing parameter is never asked.
+            (
+                "stringin",
+                "asynOctetRead",
+                "@asyn(fi_port,0)NOPE",
+                "FI:OCT devAsynOctet::initCommon interface asynOctet not found",
+                false,
+            ),
+            (
+                "waveform",
+                "asynInt32ArrayIn",
+                "@asyn(fi_port,0)VAL",
+                "devAsynXXXArray::devAsynXXXArray, FI:ARR find asynInt32Array interface failed ",
+                true,
+            ),
+            (
+                "waveform",
+                "asynInt32TimeSeries",
+                "@asyn(fi_port,0)VAL",
+                "devAsynInt32TimeSeries::initCommon, FI:TS find asynInt32 interface failed ",
+                true,
+            ),
+        ];
+        let name = |line: &'static str| {
+            line.split([' ', ','])
+                .find(|w| w.starts_with("FI:"))
+                .unwrap()
+        };
+        if std::env::var_os(CHILD).is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "{stdout}{stderr}");
+            for (.., line, errlog) in cases {
+                let ours: Vec<_> = stdout
+                    .lines()
+                    .filter(|l| l.contains(&format!("{} ", name(line))))
+                    .collect();
+                let want = if errlog {
+                    format!("errlog: {line}")
+                } else {
+                    line.to_string()
+                };
+                assert_eq!(ours, [want.as_str()], "{stdout}");
+            }
+            return;
+        }
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let actor = PortActor::new(Box::new(TestPort::registering(InterfaceMask::DRV_USER)), rx);
+        let actor_link = actor.link();
+        std::thread::spawn(actor.registered());
+        let handle = PortHandle::new(
+            tx,
+            "fi_port".into(),
+            Arc::new(InterruptManager::new()),
+            actor_link,
+            Arc::new(crate::trace::TraceManager::new()),
+        );
+        crate::asyn_record::register_port("fi_port", handle, &crate::registry::open_owner())
+            .unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = seen.clone();
+        errlog_add_listener(move |m: &str| sink.lock().unwrap().push(m.to_string()));
+        for (record_type, dtyp, inp, line, _) in cases {
+            let ctx = DeviceSupportContext {
+                record_type,
+                dtyp,
+                inp,
+                out: "",
+            };
+            let mut dev = universal_asyn_factory(&ctx).expect("the dset binds");
+            dev.set_record_info(name(line), ScanType::Passive);
+            let (mut rec, want): (Box<dyn Record>, _) = match record_type {
+                "busy" => (Box::new(BusyRecord::new()), link_alarm),
+                "waveform" if dtyp.ends_with("TimeSeries") => (
+                    Box::new(WaveformRecord::new(4, DbFieldType::Long)),
+                    DeviceInitOutcome::dead(),
+                ),
+                "waveform" => (
+                    Box::new(WaveformRecord::new(4, DbFieldType::Long)),
+                    link_alarm,
+                ),
+                _ => (Box::new(AiRecord::default()), link_alarm),
+            };
+            assert_eq!(dev.init(rec.as_mut()).unwrap(), want, "{dtyp}");
+        }
+        errlog_flush();
+        for m in seen.lock().unwrap().iter() {
+            println!("errlog: {}", m.trim_end_matches('\n'));
         }
     }
 
@@ -7091,12 +7334,24 @@ mod tests {
     }
     impl TestPort {
         fn new() -> Self {
+            Self::registering(
+                InterfaceMask::INT32
+                    | InterfaceMask::INT64
+                    | InterfaceMask::UINT32_DIGITAL
+                    | InterfaceMask::FLOAT64
+                    | InterfaceMask::OCTET
+                    | InterfaceMask::ENUM
+                    | InterfaceMask::DRV_USER,
+            )
+        }
+
+        fn registering(interfaces: InterfaceMask) -> Self {
             let mut base = PortDriverBase::new(
                 "test",
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                interfaces,
+                InterfaceMask::NONE,
             );
             base.create_param("VAL", ParamType::Int32).unwrap();
             Self { base }
@@ -7124,8 +7379,8 @@ mod tests {
                 "test_bounds",
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::INT32 | InterfaceMask::DRV_USER,
+                InterfaceMask::NONE,
             );
             base.create_param("VAL", ParamType::Int32).unwrap();
             Self {
@@ -7230,7 +7485,14 @@ mod tests {
     }
 
     fn make_adapter_on(scan: ScanType, interrupts: Arc<InterruptManager>) -> AsynDeviceSupport {
-        let driver = TestPort::new();
+        make_adapter_for(TestPort::new(), scan, interrupts)
+    }
+
+    fn make_adapter_for(
+        driver: TestPort,
+        scan: ScanType,
+        interrupts: Arc<InterruptManager>,
+    ) -> AsynDeviceSupport {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(driver), rx);
         let actor_link = actor.link();
@@ -7279,7 +7541,7 @@ mod tests {
         for (sources, live) in [(InterfaceMask::INT32, true), (InterfaceMask::NONE, false)] {
             let mut ads = make_adapter_on(
                 ScanType::Passive,
-                Arc::new(InterruptManager::with_sources(sources)),
+                Arc::new(InterruptManager::with_masks(InterfaceMask::ALL, sources)),
             );
             ads.set_asyn_readback(true);
             ads.init(&mut BoRecord::new(0)).unwrap();
@@ -9072,14 +9334,20 @@ mod tests {
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.base
             }
+            fn read_enum(
+                &mut self,
+                user: &AsynUser,
+            ) -> AsynResult<(usize, std::sync::Arc<[crate::param::EnumEntry]>)> {
+                self.base.get_enum_param(user.reason, user.addr)
+            }
         }
 
         let mut base = PortDriverBase::new(
             "test_enum",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::ENUM | InterfaceMask::DRV_USER,
+            InterfaceMask::NONE,
         );
         base.create_param("MODE", ParamType::Enum).unwrap();
         base.set_enum_choices_param(0, 0, choices).unwrap();
@@ -9281,18 +9549,17 @@ mod tests {
     /// asynEnum registers nothing.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn enum_registers_without_a_table() {
-        use crate::interfaces::Capability;
         use epics_base_rs::server::records::mbbi::MbbiRecord;
         for (enum_iface, registered) in [(true, true), (false, false)] {
-            let mut ads = make_adapter(ScanType::Passive);
-            if !enum_iface {
-                let caps: Vec<Capability> = InterfaceMask::UNMIGRATED_ALL
-                    .capabilities()
-                    .into_iter()
-                    .filter(|c| c.interface_type() != InterfaceType::Enum)
-                    .collect();
-                ads.handle.set_interfaces(caps);
+            let mut interfaces = InterfaceMask::INT32 | InterfaceMask::DRV_USER;
+            if enum_iface {
+                interfaces = interfaces | InterfaceMask::ENUM;
             }
+            let mut ads = make_adapter_for(
+                TestPort::registering(interfaces),
+                ScanType::Passive,
+                Arc::new(InterruptManager::new()),
+            );
             ads.init(&mut MbbiRecord::new(0)).unwrap();
             assert!(
                 ads.enum_applied.lock().is_none(),
@@ -10489,8 +10756,8 @@ mod tests {
                 "capport",
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OCTET | InterfaceMask::DRV_USER,
+                InterfaceMask::NONE,
             );
             base.create_param("VAL", ParamType::Int32).unwrap();
             let driver = CapPort { base, cap };
@@ -10597,8 +10864,8 @@ mod tests {
             "progport",
             1,
             PortFlags::default(),
-            crate::port::InterfaceMask::UNMIGRATED_ALL,
-            crate::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+            crate::port::InterfaceMask::INT32 | crate::port::InterfaceMask::DRV_USER,
+            crate::port::InterfaceMask::NONE,
         );
         base.create_param("START_", ParamType::Int32).unwrap();
         let driver = ProgPort {
@@ -10657,8 +10924,8 @@ mod tests {
             "tagport",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::INT32 | InterfaceMask::DRV_USER,
+            InterfaceMask::INT32,
         );
         base.create_param("DATA", ParamType::Int32).unwrap();
         let (rt, _jh) =
@@ -10707,9 +10974,6 @@ mod tests {
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.0
             }
-            fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
-                crate::interfaces::octet_transport_capabilities()
-            }
             fn read_octet(
                 &mut self,
                 _user: &AsynUser,
@@ -10729,8 +10993,8 @@ mod tests {
                 "r11_48_dev",
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OCTET_TRANSPORT,
+                InterfaceMask::OCTET,
             )),
             RuntimeConfig::default(),
         )
@@ -10793,8 +11057,8 @@ mod tests {
                     can_block: true,
                     ..PortFlags::default()
                 },
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::FLOAT64 | InterfaceMask::DRV_USER,
+                InterfaceMask::NONE,
             );
             base.create_param("VAL", ParamType::Float64).unwrap();
             let (rt, _jh) =
@@ -10875,8 +11139,8 @@ mod tests {
                     can_block: true,
                     ..PortFlags::default()
                 },
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::FLOAT64 | InterfaceMask::DRV_USER,
+                InterfaceMask::NONE,
             );
             base.create_param("VAL", ParamType::Float64).unwrap();
             let (rt, _jh) =
@@ -10961,8 +11225,8 @@ mod tests {
                     can_block,
                     ..PortFlags::default()
                 },
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::FLOAT64 | InterfaceMask::DRV_USER,
+                InterfaceMask::FLOAT64,
             );
             base.create_param("VAL", ParamType::Float64).unwrap();
             let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -11142,8 +11406,8 @@ mod tests {
                     can_block: true,
                     ..PortFlags::default()
                 },
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::FLOAT64 | InterfaceMask::OCTET | InterfaceMask::INT32_ARRAY,
+                InterfaceMask::NONE,
             );
             let msg = base.create_param("MSG", ParamType::Octet).unwrap();
             let arr = base.create_param("ARR", ParamType::Int32Array).unwrap();
@@ -11305,8 +11569,8 @@ mod tests {
                     "ondemand",
                     1,
                     PortFlags::default(),
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::INT32 | InterfaceMask::FLOAT64 | InterfaceMask::DRV_USER,
+                    InterfaceMask::NONE,
                 ),
                 binds: Arc::clone(&binds),
             };
@@ -11776,8 +12040,8 @@ mod tests {
             "draw",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::INT8_ARRAY | InterfaceMask::INT32_ARRAY | InterfaceMask::DRV_USER,
+            InterfaceMask::NONE,
         );
         base.create_param("VAL", param).unwrap();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -11930,8 +12194,8 @@ mod tests {
             "octparam",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OCTET | InterfaceMask::DRV_USER,
+            InterfaceMask::NONE,
         );
         let fw = base.create_param("FW", ParamType::Octet).unwrap();
         base.params.set_string(fw, 0, text).unwrap();
@@ -12623,8 +12887,8 @@ mod tests {
                     "test_f64",
                     1,
                     PortFlags::default(),
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::DRV_USER,
+                    InterfaceMask::NONE,
                 );
                 base.create_param("VAL", ParamType::Float64).unwrap();
                 Self { base }
@@ -13097,8 +13361,8 @@ mod tests {
                 name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::INT32 | InterfaceMask::OCTET | InterfaceMask::DRV_USER,
+                InterfaceMask::NONE,
             ),
             writes: writes.clone(),
             fail,
@@ -13364,8 +13628,8 @@ mod tests {
                 name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::FLOAT32_ARRAY | InterfaceMask::DRV_USER,
+                InterfaceMask::NONE,
             ),
             writes: writes.clone(),
         };
@@ -13585,8 +13849,8 @@ mod tests {
                 name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             ),
             writes: writes.clone(),
             sequence: sequence.clone(),
@@ -13805,8 +14069,8 @@ mod tests {
                 "octet_partial",
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             ))),
             rx,
         );

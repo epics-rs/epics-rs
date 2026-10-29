@@ -6,7 +6,7 @@
 //! cannot differ between them.
 //!
 //! The port had seven spellings of the test, and measured against
-//! `~/work/epics-base/bin/linux-x86_64/softIoc`
+//! `$EPICS_BASE/bin/linux-x86_64/softIoc`
 //! (R7.0.10-146-g8f5015b663d764ad75df) on the fixture below they disagreed in
 //! three directions at once: `dbpr`/`dbtr` never split off the field, so
 //! `dbpr T:AI.VAL` answered not-found where C printed the record;

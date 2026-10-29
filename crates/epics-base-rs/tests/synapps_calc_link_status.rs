@@ -69,7 +69,8 @@ fn read(db: &Db, pv: &str) -> i16 {
 /// The classification is published by a task scheduled through the database's
 /// `iocInit` owner, so a status is asserted only after it settles.
 async fn poll(db: &Db, pv: &str, want: i16, label: &str) {
-    for _ in 0..400 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if read(db, pv) == want {
             return;
         }

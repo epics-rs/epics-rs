@@ -11,9 +11,10 @@ use std::f64::consts::PI;
 use super::dbd_generated;
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::database::AsyncDbHandle;
+use epics_base_rs::server::recgbl::simm::LinkFetch;
 use epics_base_rs::server::record::{
-    CycleMarks, CyclePostMask, FieldDeclaration, FieldDesc, FieldMetadataOverride,
-    InputLinkRequest, LinkRead, LinkReadAs, OutTarget, ProcessAction, ProcessActions,
+    CycleMarks, CyclePostMask, FieldDeclaration, FieldDesc, FieldMetadataOverride, InitLinkReads,
+    InputLinkRequest, LinkRead, LinkReadAs, LinkType, OutTarget, ProcessAction, ProcessActions,
     ProcessOutcome, Record, ReturnPact, StampPoint,
 };
 use epics_base_rs::types::{EpicsValue, PvString};
@@ -76,6 +77,21 @@ const HI_LIMIT_LINK: [&str; 6] = ["H0XL", "H0YL", "H1YL", "H2XL", "H2YL", "H2ZL"
 const HI_LIMIT_VAL: [&str; 6] = ["H0X", "H0Y", "H1Y", "H2X", "H2Y", "H2Z"];
 const LO_LIMIT_LINK: [&str; 6] = ["L0XL", "L0YL", "L1YL", "L2XL", "L2YL", "L2ZL"];
 const LO_LIMIT_VAL: [&str; 6] = ["L0X", "L0Y", "L1Y", "L2X", "L2Y", "L2Z"];
+
+/// The links C `init_record` pass 1 reads with `dbGetLink(DBR_DOUBLE)`:
+/// `GetReadback`, `ReadEncoders` and `GetMotorLimits` (tableRecord.c:386-401).
+static INIT_LINK_READS: [(&str, LinkReadAs); 24] = {
+    let mut reads = [("", LinkReadAs::Double); 24];
+    let mut i = 0;
+    while i < 6 {
+        reads[i].0 = MOTOR_RBV_LINK[i];
+        reads[6 + i].0 = ENCODER_LINK[i];
+        reads[12 + 2 * i].0 = HI_LIMIT_LINK[i];
+        reads[13 + 2 * i].0 = LO_LIMIT_LINK[i];
+        i += 1;
+    }
+    reads
+};
 
 // ---------------------------------------------------------------------------
 // Enums
@@ -173,7 +189,9 @@ enum LinkKind {
     /// this IOC cannot address at all.
     #[default]
     Constant,
-    /// C `DB_LINK`: a field of a record on this IOC.
+    /// Neither `CONSTANT` nor `CA_LINK`, which `checkLinks` treats alike: a
+    /// `DB_LINK` to a field of a record on this IOC, a PV Access `JSON_LINK`,
+    /// or the `PV_LINK` a removed link keeps.
     Db,
     /// C `CA_LINK` with `dbCaIsLinkConnected() == 1`.
     CaConnected,
@@ -184,17 +202,16 @@ enum LinkKind {
 impl LinkKind {
     /// Read the kind out of the framework's own link resolution
     /// (`PvDatabase::resolve_out_target`), which is the port's single owner of
-    /// this question. `is_ca_link` is C's `dbInitLink` locality test, and
-    /// `field_type` is `Some` only for a target the IOC can address right now
-    /// — so an external link with no cached value is exactly C's
-    /// `dbCaIsLinkConnected() == 0`. Any other link is `Constant` only when
-    /// its type is, as `checkLinks` tests: a removed DB link is `PV_LINK`.
+    /// this question. `link_type` is C's `plink->type`, and `field_type` is
+    /// `Some` only for a target the IOC can address right now — so a
+    /// `CA_LINK` with no cached value is exactly C's
+    /// `dbCaIsLinkConnected() == 0`.
     fn from_target(target: &OutTarget) -> Self {
-        match (target.is_ca_link, target.field_type.is_some()) {
-            (true, true) => LinkKind::CaConnected,
-            (true, false) => LinkKind::CaDisconnected,
-            (false, _) if target.constant_type => LinkKind::Constant,
-            (false, _) => LinkKind::Db,
+        match target.link_type {
+            LinkType::Ca if target.field_type.is_some() => LinkKind::CaConnected,
+            LinkType::Ca => LinkKind::CaDisconnected,
+            LinkType::Constant => LinkKind::Constant,
+            LinkType::Db | LinkType::Json | LinkType::Other => LinkKind::Db,
         }
     }
 }
@@ -2414,12 +2431,11 @@ impl TableRecord {
     /// of `check_links` the framework cannot resolve links for: `init_record`.
     ///
     /// C runs its `init_record` `checkLinks` (tableRecord.c:383) at `iocInit`,
-    /// with `dbInitLink` done and no CA channel connected yet. The port runs
-    /// `init_record` at record CREATION instead, so only records already
-    /// loaded are addressable here; a motor loaded after the table classifies
-    /// `Constant` until the first `process()` resolves it properly. `Constant`
-    /// and `CaDisconnected` are indistinguishable in every arm of C's test, so
-    /// collapsing the unaddressable cases into `Constant` costs nothing.
+    /// with `dbInitLink` done and no CA channel connected yet. A `.db` record's
+    /// `init_record` also waits for `iocInit`, past `db_init_record_links`
+    /// (`drain_deferred_record_inits`), so a motor loaded after the table is a
+    /// DB link here as in C. A JSON link is neither `CONSTANT` nor `CA_LINK`,
+    /// so C counts it usable.
     fn seed_link_kinds(&mut self) {
         let Some((_, handle)) = &self.async_ctx else {
             return;
@@ -2430,13 +2446,86 @@ impl TableRecord {
                     Some(EpicsValue::String(s)) => s.as_str_lossy().into_owned(),
                     _ => String::new(),
                 };
-                self.link_kinds[group][axis] = if handle.link_target_field_type(&link).is_some() {
-                    LinkKind::Db
-                } else {
-                    LinkKind::Constant
+                self.link_kinds[group][axis] = match handle.link_type_after_init(&link) {
+                    // No CA channel is connected yet at `iocInit`.
+                    Some(LinkType::Ca) => LinkKind::CaDisconnected,
+                    Some(LinkType::Constant) | None => LinkKind::Constant,
+                    Some(LinkType::Db | LinkType::Json | LinkType::Other) => LinkKind::Db,
                 };
             }
         }
+    }
+
+    /// C `init_record` pass 1 (tableRecord.c:383-403), with `read` answering
+    /// each `dbGetLink`.
+    fn init_pass1(&mut self, mut read: impl FnMut(&str) -> LinkFetch) {
+        self.seed_link_kinds();
+        self.check_links();
+
+        // GetReadback and ReadEncoders stop at the first failed read
+        // (:1109, :1133); the axes after it keep what they held.
+        let mut r = self.motor_readback();
+        let mut e = self.encoder_motor();
+        for (vals, links, gate) in [
+            (
+                &mut r,
+                &MOTOR_RBV_LINK,
+                self.lnk_stat.map(|s| s.can_rw_drive),
+            ),
+            (
+                &mut e,
+                &ENCODER_LINK,
+                self.lnk_stat.map(|s| s.can_read_position),
+            ),
+        ] {
+            for i in 0..6 {
+                vals[i] = 0.0;
+                if !gate[i] {
+                    continue;
+                }
+                match read(links[i]) {
+                    LinkFetch::Value(v) => vals[i] = v.to_f64().unwrap_or(0.0),
+                    LinkFetch::NoData => {}
+                    LinkFetch::Failed => break,
+                }
+            }
+        }
+        self.set_motor_readback(&r);
+        self.set_encoder_motor(&e);
+
+        let u = self.do_motor_to_user(&r);
+        self.set_user_drive(&u);
+        self.set_user_readback(&u);
+        let eu = self.do_motor_to_user(&e);
+        self.set_encoder_user(&eu);
+
+        let ax0 = self.user_offset();
+        let mut axl = [0.0; 6];
+        for i in 0..6 {
+            axl[i] = u[i] + ax0[i];
+        }
+        self.set_motor_drive(&r);
+        self.set_user_last(&axl);
+
+        // GetMotorLimits zeroes a failed limit and goes on (:1026, :1031).
+        let mut h = self.hi_motor_limit();
+        let mut l = self.lo_motor_limit();
+        for i in 0..6 {
+            if !self.lnk_stat[i].can_read_limits {
+                continue;
+            }
+            for (vals, links) in [(&mut h, &HI_LIMIT_LINK), (&mut l, &LO_LIMIT_LINK)] {
+                match read(links[i]) {
+                    LinkFetch::Value(v) => vals[i] = v.to_f64().unwrap_or(0.0),
+                    LinkFetch::NoData => {}
+                    LinkFetch::Failed => vals[i] = 0.0,
+                }
+            }
+        }
+        self.set_hi_motor_limit(&h);
+        self.set_lo_motor_limit(&l);
+
+        self.do_calc_user_limits();
     }
 
     /// Perform the full user-limit calculation and store results.
@@ -2570,6 +2659,10 @@ impl Record for TableRecord {
     /// `tableRecord.c:594`, after the motor puts and the `:576` return.
     fn stamp_point(&self) -> StampPoint {
         StampPoint::AfterLinkWrites
+    }
+
+    fn dbaddr_capacity_inputs(&self) -> Option<&'static [&'static str]> {
+        Some(&[])
     }
 
     fn set_async_context(&mut self, name: epics_base_rs::types::RecordName, db: AsyncDbHandle) {
@@ -2733,8 +2826,10 @@ impl Record for TableRecord {
         &mut self,
         _link_field: &'static str,
         _value: &EpicsValue,
-        failed: bool,
+        status: epics_base_rs::error::DbResult,
+        _dpvt: &mut epics_base_rs::server::device_support::Dpvt,
     ) -> ProcessActions {
+        let failed = status.is_err();
         let Resume {
             stage: Stage::Move { sv0x, mask },
             at,
@@ -3486,35 +3581,17 @@ impl Record for TableRecord {
             return Ok(());
         }
 
-        // Pass 1: check links, read initial motor values
-        self.seed_link_kinds();
-        self.check_links();
+        // Pass 1 with no link answered, as an unset link reads.
+        self.init_pass1(|_| LinkFetch::NoData);
+        Ok(())
+    }
 
-        // Read motors and set initial user-coordinate values
-        let r = self.motor_readback();
-        let u = self.do_motor_to_user(&r);
-        self.set_user_drive(&u);
-        self.set_user_readback(&u);
+    fn init_link_reads(&self) -> &'static [(&'static str, LinkReadAs)] {
+        &INIT_LINK_READS
+    }
 
-        // Read encoders
-        let e = self.encoder_motor();
-        let eu = self.do_motor_to_user(&e);
-        self.set_encoder_user(&eu);
-
-        // Propagate
-        let ax0 = self.user_offset();
-        let mut m0x = [0.0; 6];
-        let mut axl = [0.0; 6];
-        for i in 0..6 {
-            m0x[i] = r[i];
-            axl[i] = u[i] + ax0[i];
-        }
-        self.set_motor_drive(&m0x);
-        self.set_user_last(&axl);
-
-        // Calculate user limits
-        self.do_calc_user_limits();
-
+    fn init_record_with_links(&mut self, reads: &mut InitLinkReads) -> CaResult<()> {
+        self.init_pass1(|link| reads.get(link));
         Ok(())
     }
 
@@ -4212,7 +4289,11 @@ mod tests {
                 .set_out_link_write_status(
                     link_field,
                     &value.clone(),
-                    fails.contains(&(puts.len() - 1)),
+                    match fails.contains(&(puts.len() - 1)) {
+                        true => Err(epics_base_rs::error::DbStatus::FAILED),
+                        false => Ok(()),
+                    },
+                    &mut epics_base_rs::server::device_support::Dpvt::Null,
                 )
                 .into_vec();
         }

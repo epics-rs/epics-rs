@@ -122,6 +122,54 @@ pub(crate) fn running<P: ad_core_rs::plugin::runtime::NDPluginProcess>(
     start(&asyn_rs::asyn_record::claim_port(port).unwrap(), processor)
 }
 
+/// A NumThreads write over MaxThreads, which NDPluginDriver refuses, through
+/// `processor`'s port: it must fail and leave the clamp as the readback.
+/// Returns the error message, the param written and the value.
+pub(crate) fn refused_base_write<P: ad_core_rs::plugin::runtime::NDPluginProcess>(
+    port: &str,
+    processor: P,
+) -> (String, usize, i32) {
+    let (handle, _rx, _jh) = running(port, processor);
+    let p = &handle.plugin_params;
+    let port = handle.port_runtime().port_handle();
+    let max = port.read_int32_blocking(p.max_threads, 0).unwrap();
+    let refused = port.write_int32_blocking(p.num_threads, 0, max + 1);
+    assert_eq!(port.read_int32_blocking(p.num_threads, 0).unwrap(), max);
+    match refused {
+        Err(asyn_rs::error::AsynError::Status { message, .. }) => (message, p.num_threads, max + 1),
+        other => panic!("NumThreads {} over MaxThreads {max}: {other:?}", max + 1),
+    }
+}
+
+/// A FilePath write that CreateDir 0 leaves missing, which NDPluginDriver
+/// refuses, through `processor`'s port: it must fail with FilePathExists 0.
+/// Returns the error message, the param written and the value.
+pub(crate) fn refused_file_path_write<P: ad_core_rs::plugin::runtime::NDPluginProcess>(
+    port: &str,
+    processor: P,
+) -> (String, usize, String) {
+    let (handle, _rx, _jh) = running(port, processor);
+    let nd = &handle.ndarray_params;
+    let path = std::env::temp_dir()
+        .join(format!("{port}-{}", std::process::id()))
+        .join("a")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let port = handle.port_runtime().port_handle();
+    let refused = port.submit_blocking(
+        asyn_rs::request::RequestOp::OctetWrite {
+            data: path.clone().into_bytes(),
+        },
+        asyn_rs::user::AsynUser::new(nd.file_path),
+    );
+    assert_eq!(port.read_int32_blocking(nd.file_path_exists, 0).unwrap(), 0);
+    match refused {
+        Err(asyn_rs::error::AsynError::Status { message, .. }) => (message, nd.file_path, path),
+        other => panic!("FilePath {path}: {other:?}"),
+    }
+}
+
 /// [`running`], registered with an open `interruptAccept` as after iocInit,
 /// so its posts reach interrupt subscribers.
 pub(crate) fn registered<P: ad_core_rs::plugin::runtime::NDPluginProcess>(
@@ -252,10 +300,8 @@ pub(crate) struct Gated {
 
 impl ad_core_rs::plugin::runtime::NDPluginProcess for Gated {
     const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_CANBLOCK;
-    const INTERFACE_MASK: asyn_rs::port::InterfaceMask =
-        asyn_rs::port::InterfaceMask::UNMIGRATED_SUBCLASS;
-    const INTERRUPT_MASK: asyn_rs::port::InterfaceMask =
-        asyn_rs::port::InterfaceMask::UNMIGRATED_SUBCLASS;
+    const INTERFACE_MASK: asyn_rs::port::InterfaceMask = asyn_rs::port::InterfaceMask::NONE;
+    const INTERRUPT_MASK: asyn_rs::port::InterfaceMask = asyn_rs::port::InterfaceMask::NONE;
     fn process_array(
         &self,
         array: &std::sync::Arc<ad_core_rs::ndarray::NDArray>,
@@ -360,8 +406,8 @@ pub(crate) fn read_file<P: ad_core_rs::plugin::runtime::NDPluginProcess>(
         "FILEREAD",
         1,
         asyn_rs::port::PortFlags::default(),
-        asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-        asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+        asyn_rs::port::InterfaceMask::NONE,
+        asyn_rs::port::InterfaceMask::NONE,
     );
     ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base).unwrap();
     processor.register_params(&mut base).unwrap();
@@ -393,17 +439,22 @@ pub(crate) fn read_file<P: ad_core_rs::plugin::runtime::NDPluginProcess>(
 }
 
 /// C readFileBase's line for a writer whose `openFile` refuses
-/// NDFileModeRead (NDPluginFile.cpp:158-166).
+/// NDFileModeRead (NDPluginFile.cpp:158-166), then writeInt32's for the
+/// status it leaves (:867).
 pub(crate) fn read_refused_lines(
     path: &std::path::Path,
+    base: &asyn_rs::port::PortDriverBase,
 ) -> Vec<(asyn_rs::trace::TraceMask, String)> {
-    vec![(
-        asyn_rs::trace::TraceMask::ERROR,
+    let reason = base.find_param("READ_FILE").unwrap();
+    [
         format!(
             "NDPluginFile::readFileBase Error opening file {}, status=3\n",
             path.display()
         ),
-    )]
+        format!("NDPluginFile::writeInt32 error, status=3 function={reason}, value=1\n"),
+    ]
+    .map(|line| (asyn_rs::trace::TraceMask::ERROR, line))
+    .into()
 }
 
 /// The bits NDPluginFile opens a writer that supports multiple arrays with
@@ -431,9 +482,9 @@ pub(crate) fn read_native(
     let shape = ds.shape();
     let stored = ds.datatype().unwrap();
     macro_rules! read_as {
-        ($($t:ty => $variant:ident),*) => {
+        ($($t:ty),*) => {
             $(if stored == <$t>::hdf5_type() {
-                return NDDataBuffer::$variant(match frames {
+                return NDDataBuffer::from_vec::<$t>(match frames {
                     Some(n) => {
                         let mut counts = shape.clone();
                         counts[0] = n;
@@ -444,7 +495,6 @@ pub(crate) fn read_native(
             })*
         };
     }
-    read_as!(i8 => I8, u8 => U8, i16 => I16, u16 => U16, i32 => I32, u32 => U32,
-        i64 => I64, u64 => U64, f32 => F32, f64 => F64);
+    read_as!(i8, u8, i16, u16, i32, u32, i64, u64, f32, f64);
     panic!("no NDArray type is stored as {stored:?}")
 }

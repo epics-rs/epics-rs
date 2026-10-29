@@ -46,8 +46,11 @@ async fn a_manager_started_twice_saves_its_list_once() {
     let first = mgr.clone().start(db.clone());
     let second = mgr.clone().start(db.clone());
     let set = mgr.sets()[0].0.clone();
-    for _ in 0..150 {
-        if set.stats().save_count.load(Ordering::Relaxed) > 0 {
+    let want = (SrStatus::Warn, ".savB file was bad");
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
+        let status = set.list_status();
+        if (status.code, status.text.as_str()) == want {
             break;
         }
         sleep(Duration::from_millis(20)).await;
@@ -56,10 +59,7 @@ async fn a_manager_started_twice_saves_its_list_once() {
     sleep(Duration::from_millis(300)).await;
     assert_eq!(set.stats().save_count.load(Ordering::Relaxed), 1);
     let status = set.list_status();
-    assert_eq!(
-        (status.code, status.text.as_str()),
-        (SrStatus::Warn, ".savB file was bad")
-    );
+    assert_eq!((status.code, status.text.as_str()), want);
     assert!(!dir.path().join("s.sav0").exists());
     mgr.shutdown();
     drop((first, second));

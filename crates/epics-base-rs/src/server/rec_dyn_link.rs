@@ -1,11 +1,19 @@
 //! `recDynLink.c`: a record's own CA channels, opened by name at runtime.
 //!
-//! C runs two threads (`recDynInp`, `recDynOut`) that drain a message queue
-//! into libca and call the record's callbacks from CA's threads. Here each
-//! link is one task on the database's CA client reactor
-//! ([`CaClientContext::spawn`]); what it learns reaches the record as a
-//! [`LinkEvent`] through the record's [`Deliver`], which takes the record's
-//! lock ([`AsyncDbHandle::with_record`]) and hands the event to
+//! As in C, every link of a database goes through two threads,
+//! `recDynInp` and `recDynOut` (`RecDynLinks`), each draining its own
+//! bounded queue in the order the calls were made: an input's search on the
+//! first; an output's search and every get and put on the second. A name
+//! the database serves is `dbContext`'s channel, whose search connects at
+//! once, so the owner thread itself runs the connect, the metadata read, the
+//! search callback and the monitor add, and every link's monitor events
+//! come from the owners' one event context ([`CaClientContext::events`])
+//! in post order. A name served elsewhere goes to one network dispatcher,
+//! which issues the owners' requests in their order.
+//!
+//! What a link learns reaches the record as a [`LinkEvent`] through the
+//! record's [`Deliver`], which takes the record's lock
+//! ([`AsyncDbHandle::with_record`]) and hands the event to
 //! [`RecDynLink::apply`]. `apply` updates the link the way the C callback
 //! updates `dynLinkPvt` and answers which of the record's callbacks to run.
 //!
@@ -17,26 +25,32 @@
 //! and every add start a new one, and an event of an older lifetime is
 //! dropped, which is what `ca_set_puser(chid, NULL)` does for C.
 
-use std::sync::Arc;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::task::{Context, Poll, Waker};
 
-use epics_base_rs::runtime::task::TaskHandle;
+use epics_base_rs::runtime::task::{
+    StackSizeClass, TaskHandle, ThreadPriority, spawn_dedicated_thread,
+};
 use epics_base_rs::server::database::{
-    AsyncDbHandle, CaClientContext, ClientChannel, ClientMonitor, Connection,
+    AsyncDbHandle, CaClientContext, ClientChannel, ClientSubscription, Connection,
+    InProcessChannel, InProcessSubscription, PutCompletion,
 };
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::snapshot::Snapshot;
 use epics_base_rs::types::{DBR_CTRL_DOUBLE, DBR_TIME_DOUBLE, DBR_TIME_FLOAT};
 use epics_base_rs::types::{DbFieldType, EpicsValue};
-use tokio::sync::mpsc;
 
 /// iocsh `recDynLinkDebug`. Stored for an `st.cmd` that sets it; nothing
 /// here prints by level.
 pub static REC_DYN_LINK_DEBUG: AtomicI32 = AtomicI32::new(0);
-/// iocsh `recDynLinkQsize`, C's message-queue depth. Stored only: commands
-/// go to each link's own task over an unbounded channel, so there is no
-/// queue to size. C's unexported `recDynINPCallPend*` poll knobs have no
-/// counterpart either — no thread here polls.
+/// iocsh `recDynLinkQsize`, the depth of each of a database's two queues,
+/// read when its first link is added (`recDynLinkStartTasks`). C's
+/// unexported `recDynINPCallPend*` poll knobs have no counterpart: no
+/// thread here polls.
 pub static REC_DYN_LINK_QSIZE: AtomicI32 = AtomicI32::new(256);
 
 /// The iocsh variables `sscanSupport.dbd` declares for `recDynLink.c`.
@@ -128,7 +142,7 @@ enum State {
     Connected,
 }
 
-/// What a link's task learned, in the order C's callbacks learn it.
+/// What a link learned, in the order C's callbacks learn it.
 #[derive(Debug)]
 pub enum LinkEvent {
     /// `connectCallback` with `cs_conn`: the `ca_get_callback(DBR_CTRL_DOUBLE)`
@@ -165,14 +179,148 @@ pub struct Values {
     pub severity: u16,
 }
 
-/// How a link's task reaches the record: the record's lock, then
-/// [`RecDynLink::apply`] with the generation the task was started for.
+/// How a link's events reach the record: the record's lock, then
+/// [`RecDynLink::apply`] with the generation the link was added under.
 pub type Deliver = Arc<dyn Fn(u64, LinkEvent) + Send + Sync>;
 
+/// A queued command's work on its link.
 enum Cmd {
+    /// `cmdSearch`.
+    Search,
+    Request(Request),
+}
+
+enum Request {
     Put(EpicsValue),
     PutCallback(EpicsValue),
     GetCallback(u32),
+}
+
+/// `msgQCmd`.
+enum Entry {
+    /// Holds its link until it has run, so a command queued before the
+    /// link's clear runs, on the lifetime it was made under, as C's
+    /// `recDynLinkClear` waits for it; C abandons it after ten quanta.
+    Cmd(Arc<LinkChan>, Cmd),
+    /// `cmdClear`: the record's hold on the link. Its drop is
+    /// `ca_clear_channel`, once no queued command holds the link.
+    Clear(Arc<LinkChan>),
+}
+
+/// C's `recDynInp` and `recDynOut` for one database: the queue each link's
+/// commands go to, and the threads that drain them, started at the first
+/// link's record init, as C's drain waits for `interruptAccept`.
+pub(crate) struct RecDynLinks {
+    inp: SyncSender<Entry>,
+    out: SyncSender<Entry>,
+    /// The queues' far ends, until [`Self::open`] hands them to the threads.
+    idle: Mutex<Option<[Receiver<Entry>; 2]>>,
+    dispatcher: Arc<Dispatcher>,
+}
+
+impl RecDynLinks {
+    pub(crate) fn new(ctx: CaClientContext) -> Self {
+        let depth = REC_DYN_LINK_QSIZE.load(Ordering::Relaxed).max(0) as usize;
+        let (inp, inp_rx) = sync_channel(depth);
+        let (out, out_rx) = sync_channel(depth);
+        Self {
+            inp,
+            out,
+            idle: Mutex::new(Some([inp_rx, out_rx])),
+            dispatcher: Arc::new(Dispatcher {
+                ctx,
+                network: OnceLock::new(),
+            }),
+        }
+    }
+
+    /// Open the queues when `host`'s record init runs, unless they are open.
+    fn open_at(self: &Arc<Self>, host: &LinkHost<'_>) {
+        if self.idle.lock().unwrap().is_none() {
+            return;
+        }
+        let links = self.clone();
+        host.handle
+            .schedule_record_init(host.record, async move { links.open() });
+    }
+
+    fn open(&self) {
+        let Some(queues) = self.idle.lock().unwrap().take() else {
+            return;
+        };
+        for (name, rx) in ["recDynInp", "recDynOut"].into_iter().zip(queues) {
+            let dispatcher = self.dispatcher.clone();
+            let spawned = spawn_dedicated_thread(
+                name.into(),
+                ThreadPriority::Custom(ThreadPriority::CaServerHigh.value() + 3),
+                StackSizeClass::Big,
+                move || {
+                    while let Ok(entry) = rx.recv() {
+                        match entry {
+                            Entry::Cmd(link, cmd) => dispatcher.dispatch(&link, cmd),
+                            Entry::Clear(link) => drop(link),
+                        }
+                    }
+                },
+            );
+            if spawned.is_err() {
+                tracing::error!("recDynLinkStartTasks: taskSpawn Failure");
+            }
+        }
+    }
+
+    fn queue(&self, io: Io) -> &SyncSender<Entry> {
+        match io {
+            Io::Input => &self.inp,
+            Io::Output => &self.out,
+        }
+    }
+}
+
+/// The owners' one client context — `recDynInp`'s `ca_context_create`,
+/// which `recDynOut` attaches to — and its network half.
+struct Dispatcher {
+    ctx: CaClientContext,
+    network: OnceLock<tokio::sync::mpsc::UnboundedSender<(Arc<LinkChan>, Cmd)>>,
+}
+
+/// One lifetime of a link, as the owners see it.
+struct LinkChan {
+    pvname: String,
+    io: Io,
+    ca_type: CaType,
+    scalar: bool,
+    deliver: Arc<dyn Fn(LinkEvent) + Send + Sync>,
+    /// Set by the search, before the record can learn of a connect.
+    route: OnceLock<Route>,
+}
+
+enum Route {
+    Local(Local),
+    /// Set once the network dispatcher has created the channel.
+    Network(OnceLock<Served>),
+}
+
+/// `dbContext`'s channel, and its monitor once added.
+struct Local {
+    chan: InProcessChannel,
+    monitor: OnceLock<InProcessSubscription>,
+}
+
+/// A network channel and the tasks delivering its events.
+struct Served {
+    channel: Arc<dyn ClientChannel>,
+    _connection: AbortOnDrop,
+    /// Shared with `connection_task`, which fills it, and emptied here, so a
+    /// cleared link's monitor ends with it, not when the aborted task is
+    /// next polled.
+    monitor: MonitorSlot,
+}
+
+impl Drop for Served {
+    fn drop(&mut self) {
+        self.monitor.lock().unwrap().take();
+    }
 }
 
 /// `dynLinkPvt`.
@@ -195,7 +343,8 @@ struct Pvt<K> {
     monitor_callback: Option<K>,
     notify_callback: Option<K>,
     user_get_callback: Option<K>,
-    tx: mpsc::UnboundedSender<Cmd>,
+    links: Arc<RecDynLinks>,
+    chan: Arc<LinkChan>,
 }
 
 /// `recDynLink`, generic over the record's callback names `K` — C's
@@ -220,7 +369,7 @@ impl<K> Default for RecDynLink<K> {
     }
 }
 
-/// Where a link's task is started: the record's database and name.
+/// Where a link is added: the record's database and name.
 pub struct LinkHost<'a> {
     pub handle: &'a AsyncDbHandle,
     pub record: &'a [u8],
@@ -239,9 +388,10 @@ pub struct LinkSpec<K> {
 
 impl<K: Copy> RecDynLink<K> {
     /// `recDynLinkAddInput` / `recDynLinkAddOutput`. A blank name is refused
-    /// with -1, as C refuses it; a link already added is cleared first.
-    /// The channel is created when the database is running (C's tasks wait
-    /// for `interruptAccept`).
+    /// with -1, as C refuses it, and so is any name once the database is
+    /// gone; a link already added is cleared first. The search is queued
+    /// now and made once the record's init has run (C's tasks wait for
+    /// `interruptAccept`); a full queue loses it, as C's does.
     pub fn add(
         &mut self,
         host: LinkHost<'_>,
@@ -252,11 +402,31 @@ impl<K: Copy> RecDynLink<K> {
         if pvname.is_empty() {
             return -1;
         }
+        let Some(links) = host.handle.rec_dyn_links() else {
+            return -1;
+        };
         if self.pvt.is_some() {
             self.clear();
         }
         self.generation += 1;
-        let (tx, rx) = mpsc::unbounded_channel();
+        let generation = self.generation;
+        let chan = Arc::new(LinkChan {
+            pvname: pvname.to_owned(),
+            io: spec.io,
+            ca_type: spec.ca_type,
+            scalar: spec.scalar,
+            deliver: Arc::new(move |event| deliver(generation, event)),
+            route: OnceLock::new(),
+        });
+        let search = Entry::Cmd(chan.clone(), Cmd::Search);
+        if links.queue(spec.io).try_send(search).is_err() {
+            let add = match spec.io {
+                Io::Input => "recDynLinkAddInput",
+                Io::Output => "recDynLinkAddOutput",
+            };
+            tracing::error!("{add}: epicsMessageQueueTrySend error");
+        }
+        links.open_at(&host);
         self.pvt = Some(Pvt {
             io: spec.io,
             ca_type: spec.ca_type,
@@ -279,33 +449,28 @@ impl<K: Copy> RecDynLink<K> {
             },
             notify_callback: None,
             user_get_callback: None,
-            tx,
-        });
-        let generation = self.generation;
-        let deliver: Arc<dyn Fn(LinkEvent) + Send + Sync> =
-            Arc::new(move |event| deliver(generation, event));
-        let ctx = host.handle.ca_client();
-        let task = run_link(
-            ctx.clone(),
-            pvname.to_owned(),
-            spec.io,
-            spec.ca_type,
-            spec.scalar,
-            rx,
-            deliver,
-        );
-        host.handle.schedule_record_init(host.record, async move {
-            // Detached: the task ends when this link's sender is dropped.
-            drop(ctx.spawn(task));
+            links,
+            chan,
         });
         0
     }
 
-    /// `recDynLinkClear`.
+    /// `recDynLinkClear`: the record's hold goes on the queue C queues
+    /// `cmdClear` on, so the channel closes on that link's owner, once no
+    /// queued command holds it.
+    ///
+    /// C defect fixed: C stops waiting after ten quanta (`recDynLink.c:339-349`),
+    /// and the owner drops the queued command at `pdynLinkPvt==NULL` (`:852-856`,
+    /// `:956-960`), so a slow owner silently loses a put.
     pub fn clear(&mut self) {
         self.generation += 1;
-        self.pvt = None;
         self.status = 0;
+        let Some(p) = self.pvt.take() else {
+            return;
+        };
+        if p.links.queue(p.io).try_send(Entry::Clear(p.chan)).is_err() {
+            tracing::error!("recDynLinkClear: epicsMessageQueueTrySend error");
+        }
     }
 
     pub fn is_added(&self) -> bool {
@@ -395,7 +560,8 @@ impl<K: Copy> RecDynLink<K> {
         p.user_get_callback = Some(callback);
         *n_request = (*n_request).min(p.nelem as usize);
         p.n_request = *n_request;
-        if p.tx.send(Cmd::GetCallback(*n_request as u32)).is_err() {
+        let get = Request::GetCallback(*n_request as u32);
+        if !p.request(get, "recDynLinkGetCallback") {
             return RINGBUFF_PUT_ERROR;
         }
         0
@@ -432,19 +598,19 @@ impl<K: Copy> RecDynLink<K> {
         // Every sscan put is one element (`rdlSCALAR`, or `nRequest` 1).
         p.n_request = 1;
         let value = p.ca_type.value(value);
-        let cmd = if callback.is_some() {
-            Cmd::PutCallback(value)
+        let put = if callback.is_some() {
+            Request::PutCallback(value)
         } else {
-            Cmd::Put(value)
+            Request::Put(value)
         };
-        if p.tx.send(cmd).is_err() {
+        if !p.request(put, "recDynLinkPut") {
             p.notify_in_progress = false;
             return RINGBUFF_PUT_ERROR;
         }
         0
     }
 
-    /// Apply what the link's task learned and answer the callback C would
+    /// Apply what the link learned and answer the callback C would
     /// call from it. An event of an earlier lifetime of this link answers
     /// nothing.
     pub fn apply(&mut self, generation: u64, event: LinkEvent) -> Option<K> {
@@ -503,6 +669,17 @@ impl<K: Copy> RecDynLink<K> {
 }
 
 impl<K> Pvt<K> {
+    /// Queue `request` for `recDynOut`, where C queues every get and put;
+    /// `false` when the queue is full, reported as `caller` reports it.
+    fn request(&self, request: Request, caller: &str) -> bool {
+        let entry = Entry::Cmd(self.chan.clone(), Cmd::Request(request));
+        let queued = self.links.out.try_send(entry).is_ok();
+        if !queued {
+            tracing::error!("{caller}: epicsMessageQueueTrySend error");
+        }
+        queued
+    }
+
     /// `monitorCallback`'s copy: at most `nRequest` elements into a buffer
     /// that exists once the link has connected.
     fn store(&mut self, values: Values) {
@@ -554,74 +731,224 @@ fn metadata_of(snapshot: &Snapshot) -> Metadata {
     meta
 }
 
-/// One link's lifetime: `ca_create_channel`, then commands until the record
-/// drops the link's sender.
-async fn run_link(
-    ctx: CaClientContext,
-    pvname: String,
-    io: Io,
-    ca_type: CaType,
-    scalar: bool,
-    mut rx: mpsc::UnboundedReceiver<Cmd>,
-    deliver: Arc<dyn Fn(LinkEvent) + Send + Sync>,
-) {
-    let Some(channel) = ctx.create_channel(&pvname).await else {
-        // A search nobody answers: requests are refused at the record by the
-        // never-connected state, so the queue only has to be drained.
-        while rx.recv().await.is_some() {}
-        return;
-    };
-    // The monitor is held here, not by `connection_task`: once connected, a
-    // local channel's next connection change never comes and registers no
-    // waker, and the exec backend drops such a task with everything it owns.
-    let monitor = MonitorSlot::default();
-    let _connection = AbortOnDrop(ctx.spawn(connection_task(
-        ctx.clone(),
-        channel.clone(),
-        io,
-        ca_type,
-        scalar,
-        deliver.clone(),
-        monitor.clone(),
-    )));
-    while let Some(cmd) = rx.recv().await {
-        match cmd {
-            Cmd::Put(value) => {
-                if let Err(e) = channel.put(value, false).await {
-                    tracing::error!("recDynLinkTask pv={pvname} CA Error {e}");
+impl Dispatcher {
+    /// One queued command, on its owner thread.
+    fn dispatch(&self, link: &Arc<LinkChan>, cmd: Cmd) {
+        match (cmd, link.route.get()) {
+            (Cmd::Search, _) => self.search(link),
+            (Cmd::Request(request), Some(Route::Local(local))) => {
+                self.request(link, &local.chan, request)
+            }
+            (cmd @ Cmd::Request(_), Some(Route::Network(_))) => self.forward(link, cmd),
+            // The record makes no request on a link that has not connected.
+            (Cmd::Request(_), None) => {}
+        }
+    }
+
+    /// `cmdSearch`: `ca_create_channel`. A name served here connects inside
+    /// it, so `connectCallback`, `getCallback`, its search callback and
+    /// `ca_add_array_event` all run here, in that order, and the first
+    /// monitor event is queued behind whatever the context already holds.
+    fn search(&self, link: &Arc<LinkChan>) {
+        let Some(chan) = self.ctx.create_in_process(&link.pvname) else {
+            let _ = link.route.set(Route::Network(OnceLock::new()));
+            self.forward(link, Cmd::Search);
+            return;
+        };
+        let route = link.route.get_or_init(|| {
+            Route::Local(Local {
+                chan,
+                monitor: OnceLock::new(),
+            })
+        });
+        let Route::Local(Local { chan, monitor }) = route else {
+            return;
+        };
+        let nelem = chan.element_count();
+        (link.deliver)(LinkEvent::Up {
+            nelem,
+            access: (true, true),
+        });
+        // C's `getCallback` returns on a failed get and leaves the link in
+        // `stateGetting` for good; the link connects with empty metadata
+        // instead.
+        let meta = match chan.get(DBR_CTRL_DOUBLE, 1) {
+            Ok(snapshot) => metadata_of(&snapshot),
+            Err(e) => {
+                tracing::warn!("recDynLink:getCallback: {e}");
+                Metadata::default()
+            }
+        };
+        (link.deliver)(LinkEvent::Ctrl(meta));
+        if link.io == Io::Input {
+            let count = if link.scalar { 1 } else { nelem };
+            let mask = (EventMask::VALUE | EventMask::ALARM).bits();
+            let (ca_type, deliver) = (link.ca_type, link.deliver.clone());
+            let sub = chan.subscribe(ca_type.time_dbr(), count, mask, move |s| {
+                deliver(LinkEvent::Monitor(values_of(ca_type, s)))
+            });
+            match sub {
+                Ok(sub) => drop(monitor.set(sub)),
+                Err(e) => tracing::error!("ca_add_array_event: {e}"),
+            }
+        }
+    }
+
+    /// A get or put on a channel served here, made on this thread as
+    /// `dbContext` makes it on its caller's.
+    fn request(&self, link: &LinkChan, chan: &InProcessChannel, request: Request) {
+        let deliver = &link.deliver;
+        match request {
+            Request::Put(value) => {
+                if let Err(e) = chan.put(value) {
+                    tracing::error!("recDynLinkTask pv={} CA Error {e}", link.pvname);
                 }
             }
-            Cmd::PutCallback(value) => match channel.put(value, true).await {
+            Request::PutCallback(value) => {
+                let issued = chan.put_callback(value, |done| self.complete_put(deliver, done));
+                if let Err(e) = issued {
+                    tracing::error!("recDynLinkTask pv={} CA Error {e}", link.pvname);
+                    deliver(LinkEvent::PutDone(Err(e.to_string())));
+                }
+            }
+            Request::GetCallback(count) => {
+                let got = chan.get(link.ca_type.time_dbr(), count);
+                deliver(LinkEvent::GetDone(got.map(|s| values_of(link.ca_type, s))));
+            }
+        }
+    }
+
+    /// The put callback's completion: here, when the record's processing
+    /// has already ended, as `dbNotify`'s `callDone` runs it inside the put;
+    /// else on the reactor once it does.
+    fn complete_put(
+        &self,
+        deliver: &Arc<dyn Fn(LinkEvent) + Send + Sync>,
+        mut done: PutCompletion,
+    ) {
+        match done.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(result) => deliver(LinkEvent::PutDone(result)),
+            Poll::Pending => {
+                let deliver = deliver.clone();
+                drop(
+                    self.ctx
+                        .spawn(async move { deliver(LinkEvent::PutDone(done.await)) }),
+                );
+            }
+        }
+    }
+
+    /// Hand `cmd` to the network dispatcher, started by the first.
+    fn forward(&self, link: &Arc<LinkChan>, cmd: Cmd) {
+        let network = self.network.get_or_init(|| {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            drop(self.ctx.spawn(network(self.ctx.clone(), rx)));
+            tx
+        });
+        let _ = network.send((link.clone(), cmd));
+    }
+}
+
+/// The owners' commands on network channels, issued one at a time in the
+/// order the owners made them, whatever the channel, as libca queues each
+/// on its circuit when it is called.
+async fn network(
+    ctx: CaClientContext,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<(Arc<LinkChan>, Cmd)>,
+) {
+    while let Some((link, cmd)) = rx.recv().await {
+        let Some(Route::Network(served)) = link.route.get() else {
+            continue;
+        };
+        match cmd {
+            Cmd::Search => {
+                // A search nobody answers: the link never connects, so the
+                // record makes no request on it.
+                let Some(channel) = ctx.create_network(&link.pvname).await else {
+                    continue;
+                };
+                let monitor = MonitorSlot::default();
+                let connection = connection_task(
+                    channel.clone(),
+                    link.io,
+                    link.ca_type,
+                    link.scalar,
+                    link.deliver.clone(),
+                    monitor.clone(),
+                );
+                let _ = served.set(Served {
+                    _connection: AbortOnDrop(ctx.spawn(connection)),
+                    channel,
+                    monitor,
+                });
+            }
+            Cmd::Request(request) => {
+                if let Some(served) = served.get() {
+                    served.request(&ctx, &link, request).await;
+                }
+            }
+        }
+    }
+}
+
+impl Served {
+    /// Issue one request; it is on its way when this returns.
+    async fn request(&self, ctx: &CaClientContext, link: &LinkChan, request: Request) {
+        let (deliver, ca_type) = (&link.deliver, link.ca_type);
+        match request {
+            Request::Put(value) => {
+                if let Err(e) = self.channel.put(value, false).await {
+                    tracing::error!("recDynLinkTask pv={} CA Error {e}", link.pvname);
+                }
+            }
+            Request::PutCallback(value) => match self.channel.put(value, true).await {
                 Ok(Some(done)) => {
                     let deliver = deliver.clone();
                     drop(ctx.spawn(async move { deliver(LinkEvent::PutDone(done.await)) }));
                 }
                 Ok(None) => deliver(LinkEvent::PutDone(Ok(()))),
                 Err(e) => {
-                    tracing::error!("recDynLinkTask pv={pvname} CA Error {e}");
+                    tracing::error!("recDynLinkTask pv={} CA Error {e}", link.pvname);
                     deliver(LinkEvent::PutDone(Err(e)));
                 }
             },
-            Cmd::GetCallback(count) => {
-                let channel = channel.clone();
-                let deliver = deliver.clone();
-                drop(ctx.spawn(async move {
-                    let got = channel.get(ca_type.time_dbr(), count).await;
-                    deliver(LinkEvent::GetDone(got.map(|s| values_of(ca_type, s))));
-                }));
+            Request::GetCallback(count) => {
+                // Polled once in the dispatcher's order; the answer is
+                // awaited off the dispatcher, so it holds up nothing.
+                let channel = self.channel.clone();
+                let mut got = Box::pin(async move { channel.get(ca_type.time_dbr(), count).await });
+                match poll_once(&mut got).await {
+                    Some(got) => deliver(LinkEvent::GetDone(got.map(|s| values_of(ca_type, s)))),
+                    None => {
+                        let deliver = deliver.clone();
+                        drop(ctx.spawn(async move {
+                            let got = got.await;
+                            deliver(LinkEvent::GetDone(got.map(|s| values_of(ca_type, s))))
+                        }));
+                    }
+                }
             }
         }
     }
-    monitor.lock().unwrap().take();
 }
 
-type MonitorSlot = Arc<std::sync::Mutex<Option<AbortOnDrop>>>;
+/// `fut` polled once, with the caller's waker.
+async fn poll_once<F: Future + Unpin>(fut: &mut F) -> Option<F::Output> {
+    std::future::poll_fn(|cx| {
+        Poll::Ready(match Pin::new(&mut *fut).poll(cx) {
+            Poll::Ready(out) => Some(out),
+            Poll::Pending => None,
+        })
+    })
+    .await
+}
+
+type MonitorSlot = Arc<std::sync::Mutex<Option<ClientSubscription>>>;
 
 /// `connectCallback` → `getCallback` → `ca_add_array_event`, for every
 /// connection change. The monitor is added once per link: C adds another on
 /// every reconnect, each delivering the same value.
 async fn connection_task(
-    ctx: CaClientContext,
     channel: Arc<dyn ClientChannel>,
     io: Io,
     ca_type: CaType,
@@ -652,28 +979,19 @@ async fn connection_task(
                 if io == Io::Input && monitor.lock().unwrap().is_none() {
                     let count = if scalar { 1 } else { nelem };
                     let mask = (EventMask::VALUE | EventMask::ALARM).bits();
-                    match channel.subscribe(ca_type.time_dbr(), count, mask).await {
-                        Ok(sub) => {
-                            *monitor.lock().unwrap() = Some(AbortOnDrop(ctx.spawn(monitor_task(
-                                sub,
-                                ca_type,
-                                deliver.clone(),
-                            ))))
-                        }
+                    let deliver = deliver.clone();
+                    let callback = Box::new(move |snapshot| {
+                        deliver(LinkEvent::Monitor(values_of(ca_type, snapshot)))
+                    });
+                    match channel
+                        .subscribe(ca_type.time_dbr(), count, mask, callback)
+                        .await
+                    {
+                        Ok(sub) => *monitor.lock().unwrap() = Some(sub),
                         Err(e) => tracing::error!("ca_add_array_event: {e}"),
                     }
                 }
             }
         }
-    }
-}
-
-async fn monitor_task(
-    mut sub: Box<dyn ClientMonitor>,
-    ca_type: CaType,
-    deliver: Arc<dyn Fn(LinkEvent) + Send + Sync>,
-) {
-    while let Some(snapshot) = sub.next().await {
-        deliver(LinkEvent::Monitor(values_of(ca_type, snapshot)));
     }
 }

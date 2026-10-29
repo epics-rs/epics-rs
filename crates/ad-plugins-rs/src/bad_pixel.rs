@@ -21,7 +21,7 @@ use asyn_rs::port::InterfaceMask;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use ad_core_rs::ndarray::{NDArray, NDDataBuffer};
+use ad_core_rs::ndarray::{NDArray, NDDataMut};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::{NDPluginProcess, ProcessResult};
 use parking_lot::Mutex;
@@ -171,7 +171,7 @@ impl BadPixelProcessor {
     #[allow(clippy::too_many_arguments)]
     fn apply_corrections(
         list: &BadPixelList,
-        data: &mut NDDataBuffer,
+        mut data: NDDataMut<'_>,
         width: usize,
         height: usize,
         offset_x: i64,
@@ -283,7 +283,8 @@ impl NDPluginProcess for BadPixelProcessor {
     const INTERRUPT_MASK: InterfaceMask = Self::INTERFACE_MASK;
 
     /// C `NDPluginBadPixel::writeOctet` reads the file inside the write and
-    /// returns `readBadPixelFile`'s status (NDPluginBadPixel.cpp:319-322).
+    /// returns `readBadPixelFile`'s status (NDPluginBadPixel.cpp:319-322),
+    /// or NDPluginDriver's under its own errorMessage (:334).
     fn validate_octet(
         &self,
         reason: usize,
@@ -293,6 +294,15 @@ impl NDPluginProcess for BadPixelProcessor {
         _params: &asyn_rs::port::PortDriverBase,
     ) -> ad_core_rs::plugin::runtime::WriteOutcome<String> {
         use ad_core_rs::plugin::runtime::{WriteOutcome, WriteVerdict};
+        let verdict = match verdict {
+            WriteVerdict::Refuse { keep, .. } => WriteVerdict::Refuse {
+                keep,
+                message: format!(
+                    "NDPluginBadPixel:writeOctet: status=3, function={reason}, value={value}"
+                ),
+            },
+            accepted => accepted,
+        };
         if Some(reason) != self.file_name_idx || value.is_empty() {
             return verdict.into();
         }
@@ -352,7 +362,7 @@ impl NDPluginProcess for BadPixelProcessor {
         };
         Self::apply_corrections(
             &list,
-            &mut out.data,
+            out.data_mut(),
             width,
             height,
             offset_x,
@@ -387,6 +397,20 @@ impl NDPluginProcess for BadPixelProcessor {
 mod tests {
     use super::*;
 
+    /// NDPluginDriver's FilePath refusal fails the write under this
+    /// plugin's errorMessage.
+    #[test]
+    fn a_refused_file_path_write_fails() {
+        let (message, function, value) = crate::test_util::refused_file_path_write(
+            "BADPIX_PATH",
+            BadPixelProcessor::new(vec![]),
+        );
+        assert_eq!(
+            message,
+            format!("NDPluginBadPixel:writeOctet: status=3, function={function}, value={value}")
+        );
+    }
+
     /// NDPluginBadPixel.cpp:321 `status = this->readBadPixelFile(value);`
     /// and :290 `return asynError;` on a file that does not parse.
     #[test]
@@ -397,8 +421,8 @@ mod tests {
             "T",
             1,
             Default::default(),
-            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+            asyn_rs::port::InterfaceMask::NONE,
+            asyn_rs::port::InterfaceMask::NONE,
         );
         proc.register_params(&mut base).unwrap();
         let file = proc.file_name_idx.unwrap();
@@ -429,14 +453,14 @@ mod tests {
         assert_eq!(out.trace.len(), 1);
         assert_eq!(proc.list.lock().pixels.len(), 1);
     }
-    use ad_core_rs::ndarray::{NDDataType, NDDimension};
+    use ad_core_rs::ndarray::{NDDataType, NDDataView, NDDataViewMut, NDDimension};
 
     fn make_2d_array(x: usize, y: usize, fill: impl Fn(usize, usize) -> f64) -> NDArray {
         let mut arr = NDArray::new(
             vec![NDDimension::new(x), NDDimension::new(y)],
             NDDataType::Float64,
         );
-        if let NDDataBuffer::F64(ref mut v) = arr.data {
+        if let NDDataViewMut::F64(v) = arr.data_mut().view_mut() {
             for iy in 0..y {
                 for ix in 0..x {
                     v[iy * x + ix] = fill(ix, iy);
@@ -447,7 +471,7 @@ mod tests {
     }
 
     fn get_pixel(arr: &NDArray, x: usize, y: usize, width: usize) -> f64 {
-        arr.data.get_as_f64(y * width + x).unwrap()
+        arr.data().get_as_f64(y * width + x).unwrap()
     }
 
     fn set(x: i64, y: i64, value: f64) -> BadPixel {
@@ -502,7 +526,7 @@ mod tests {
             NDAttrSource::Driver,
             NDAttrValue::Int32(NDColorMode::RGB1 as i32),
         ));
-        if let NDDataBuffer::F64(ref mut v) = arr.data {
+        if let NDDataViewMut::F64(v) = arr.data_mut().view_mut() {
             v.iter_mut().for_each(|x| *x = 100.0);
         }
 
@@ -515,9 +539,9 @@ mod tests {
         let result = proc.process_array(&Arc::new(arr), &pool);
         let out = &result.output_arrays[0];
 
-        assert_eq!(out.data.get_as_f64(1), Some(7.0), "corrected element 1");
+        assert_eq!(out.data().get_as_f64(1), Some(7.0), "corrected element 1");
         assert_eq!(
-            out.data.get_as_f64(3),
+            out.data().get_as_f64(3),
             Some(100.0),
             "element 3 must be untouched — that is where the physical-index bug wrote"
         );
@@ -780,7 +804,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             for val in v.iter_mut() {
                 *val = 100;
             }
@@ -817,14 +841,14 @@ mod tests {
         assert_eq!(first.pool_id(), pool.id());
         assert!((get_pixel(&first, 1, 1, 4) - 0.0).abs() < 1e-10);
         assert!((get_pixel(&first, 0, 0, 4) - 100.0).abs() < 1e-10);
-        let NDDataBuffer::F64(v) = &first.data else {
+        let NDDataView::F64(v) = first.data().view() else {
             panic!("expected F64 buffer");
         };
         let ptr = v.as_ptr();
         drop(first);
 
         let second = proc.process_array(&arr, &pool).output_arrays.remove(0);
-        let NDDataBuffer::F64(v) = &second.data else {
+        let NDDataView::F64(v) = second.data().view() else {
             panic!("expected F64 buffer");
         };
         assert_eq!(v.as_ptr(), ptr, "the second frame reuses the freed buffer");

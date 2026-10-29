@@ -82,8 +82,19 @@ fn port(name: &str, db: &PvDatabase) -> PortRuntimeHandle {
             can_block: true,
             ..PortFlags::default()
         },
-        InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_INTERRUPTS,
+        InterfaceMask::INT32
+            | InterfaceMask::UINT32_DIGITAL
+            | InterfaceMask::FLOAT64
+            | InterfaceMask::OCTET
+            | InterfaceMask::ENUM
+            | InterfaceMask::INT64
+            | InterfaceMask::DRV_USER,
+        InterfaceMask::INT32
+            | InterfaceMask::UINT32_DIGITAL
+            | InterfaceMask::FLOAT64
+            | InterfaceMask::OCTET
+            | InterfaceMask::ENUM
+            | InterfaceMask::INT64,
     );
     for (param, ty) in [
         ("I32", ParamType::Int32),

@@ -10,7 +10,7 @@ Matches the Rust xrt-beamline example configuration:
   - Sample: screen at 33 m from source
 
 Usage:
-    /Users/stevek/mamba/envs/xrt/bin/python render_beamline.py
+    python render_beamline.py    # a Python with xrt
 """
 
 import os

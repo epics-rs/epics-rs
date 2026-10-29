@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ffi::{c_long, c_short};
 
 use super::registry::*;
 use crate::calc::engine::string::escaped_from_raw;
@@ -1084,6 +1085,8 @@ fn name_to_addr(ctx: &CommandContext, pname: &[u8]) -> Option<DbAddr> {
                 None => FldDes::Attribute(inst.attribute(field)?),
             }
         };
+        // `dbEntryToAddr`'s `cvt_dbaddr` runs before the `$` is judged.
+        ctx.db().resolve_addr(&rec, field);
         let addr = DbAddr {
             rec,
             record: parts.record.to_vec(),
@@ -1948,7 +1951,7 @@ fn render_dbpr_link(
         crate::server::record::parse_link_field(raw.as_bytes(), ftype),
         ftype,
     );
-    let link_type = parsed.link_type_after_init(raw.as_bytes(), ftype).c_name();
+    let link_type = parsed.link_type_after_init().c_name();
     [link_type.as_bytes(), b" ", rendered].concat()
 }
 
@@ -3642,16 +3645,12 @@ fn cmd_gft() -> CommandDef {
 /// `abc` — leaves the rung out. That asymmetry is the whole reason `pft REC
 /// 12.7` prints seven rows and `pft REC abc` prints one.
 ///
-/// The engine is this workspace's C `sscanf`
-/// ([`crate::calc::engine::scanf::sscanf`]), including the length-modifier
-/// narrowing table, so `%hd` really wraps into a `short` here. Its one output
-/// object is a `f64`, so a `%ld` result above 2^53 loses C's low bits before
-/// the caller truncates it to `dbr_long_t`.
-fn c_scan_int(s: &[u8], fmt: &[u8]) -> Option<i64> {
-    match crate::calc::engine::scanf::sscanf(s, fmt) {
-        Ok(crate::calc::engine::value::StackValue::Double(v)) => Some(v as i64),
-        _ => None,
-    }
+/// The scan is glibc's ([`crate::runtime::scanf::sscanf`]) into C's
+/// `shortvalue` or `longvalue`, so `%hd` wraps into a `short` and `%ld` keeps
+/// every bit of the `long` the caller truncates to `dbr_long_t`.
+fn c_scan<T: crate::runtime::scanf::ScanNum + Default>(s: &[u8], fmt: &[u8]) -> Option<T> {
+    let v = std::cell::Cell::new(T::default());
+    (crate::runtime::scanf::sscanf(s, fmt, &[&v]) == 1).then(|| v.get())
 }
 
 /// Print a C printf STREAM through the shell's line-at-a-time output.
@@ -3687,7 +3686,7 @@ fn print_c_stream(ctx: &CommandContext, stream: &str) {
 /// * every rung after the first is guarded by whether the argument scans as
 ///   that C type, and the integer rungs use `sscanf` while the two float
 ///   rungs use `epicsScanFloat`, so `12.7` takes all seven rungs and `12.7`
-///   with a trailing letter takes five (see [`c_scan_int`]);
+///   with a trailing letter takes five (see [`c_scan`]);
 /// * a channel exporting as `DBR_STRING` or `DBR_ENUM` stops after the first
 ///   rung and does NOT print C's closing blank line, which only the full
 ///   ladder reaches.
@@ -3780,17 +3779,17 @@ fn cmd_pft() -> CommandDef {
                 return Ok(CommandOutcome::Continue);
             }
 
-            if let Some(v) = c_scan_int(value, b"%hd") {
+            if let Some(v) = c_scan::<c_short>(value, b"%hd") {
                 rung(
                     &mut out,
                     &mut chan,
                     DBR_SHORT,
-                    EpicsValue::Short(v as i16),
+                    EpicsValue::Short(v),
                     "\n\t SHORT failed ",
                     "\n\t SHORT GET failed",
                 );
             }
-            if let Some(v) = c_scan_int(value, b"%ld") {
+            if let Some(v) = c_scan::<c_long>(value, b"%ld") {
                 // C puts `&longvalue` as a `dbr_long_t`, i.e. reads the low 32
                 // bits of a 64-bit `long` on this ABI.
                 rung(
@@ -3829,7 +3828,7 @@ fn cmd_pft() -> CommandDef {
                     "\n\t DOUBLE GET failed",
                 );
             }
-            if let Some(v) = c_scan_int(value, b"%hd") {
+            if let Some(v) = c_scan::<c_short>(value, b"%hd") {
                 // `charvalue = (unsigned char) shortvalue`, and `dbr_char_t`
                 // is `epicsUInt8` — the wire's DBR_CHAR is unsigned even
                 // though the DBF_CHAR it shares a name with is not (see
@@ -3838,7 +3837,7 @@ fn cmd_pft() -> CommandDef {
                     &mut out,
                     &mut chan,
                     DBR_CHAR,
-                    EpicsValue::UChar(v as i16 as u8),
+                    EpicsValue::UChar(v as u8),
                     "\n\t CHAR failed ",
                     "\n\t CHAR GET failed",
                 );
@@ -3848,7 +3847,7 @@ fn cmd_pft() -> CommandDef {
                     &mut out,
                     &mut chan,
                     DBR_ENUM,
-                    EpicsValue::Enum(v as i16 as u16),
+                    EpicsValue::Enum(v as u16),
                     "\n\t ENUM failed ",
                     "\n\t ENUM GET failed",
                 );
@@ -6022,7 +6021,7 @@ fn link_field_kind(record_type: &str, field: &str) -> Option<&'static str> {
 /// (`dbLock.c:886-900`).
 ///
 /// Only a link that resolved LOCALLY appears, because C reads
-/// `plink->type != DB_LINK` and skips everything else — a `ca://` target is a
+/// `plink->type != DB_LINK` and skips everything else — a CA target is a
 /// `CA_LINK` and prints nothing here even when the name is local.
 fn dblsr_link_lines(db: &crate::server::database::PvDatabase, record: &[u8]) -> Vec<Vec<u8>> {
     use crate::server::record::ParsedLink;
@@ -9451,7 +9450,8 @@ record(lso, "SOD") { field(SIZV, "128") }
 
         // The event record's post runs on a callback task.
         run_cmd(&ctx, "dbpf", &["EP.PROC", "1"]);
-        for _ in 0..500 {
+        let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+        while std::time::Instant::now() < deadline {
             if headers(&ctx).len() == 4 {
                 break;
             }
@@ -9863,6 +9863,20 @@ record(lso, "SOD") { field(SIZV, "128") }
             out.contains("\nDBR_STS_STRING\t 0  0\tValue: 65\n"),
             "got:\n{out}"
         );
+    }
+
+    /// `pft`'s `%ld` stores into a `long`: a value past 2^53 is exact where
+    /// `long` is 64 bits and saturates at `LONG_MAX` where it is 32.
+    #[test]
+    fn pft_scans_into_c_short_and_long() {
+        assert_eq!(
+            c_scan::<c_long>(b"9007199254740993", b"%ld"),
+            Some(c_long::try_from(9007199254740993i64).unwrap_or(c_long::MAX))
+        );
+        assert_eq!(c_scan::<c_short>(b"70000", b"%hd"), Some(4464));
+        assert_eq!(c_scan::<c_short>(b"-1", b"%hd"), Some(-1));
+        assert_eq!(c_scan::<c_short>(b"0b11", b"%hd"), Some(0));
+        assert_eq!(c_scan::<c_long>(b"abc", b"%ld"), None);
     }
 
     /// C `pft` (`db_test.c:85-186`) on a numeric field.
@@ -11829,8 +11843,8 @@ record(compress, "CMP0") { field(INP, "SRC") field(NSAM, "4") }"#,
 record(waveform, "WD") { field(FTVL, "DOUBLE") }"#,
         )
         .expect("db must load");
-        assert!(db.channel_create_found(b"WS.VAL$"));
-        assert!(!db.channel_create_found(b"WD.VAL$"));
+        assert!(db.resolve_channel_create(b"WS.VAL$"));
+        assert!(!db.resolve_channel_create(b"WD.VAL$"));
     }
 
     /// A device-link put drops the device private, as C `dbPutFieldLink`
@@ -12280,9 +12294,19 @@ record(ai, "AR") { field(DTYP, "Async Soft Channel") field(INP, "S2") }"#,
         ctx.block_on(db.ioc_init());
         ctx.block_on(db.initialize_link_locality());
         let gf = |pv: &str| run_cmd(&ctx, "dbgf", &[pv]).trim_end().to_string();
-        let sleep = |ms| std::thread::sleep(std::time::Duration::from_millis(ms));
         const ONE: &str = "DBF_UCHAR:          1 = 0x1";
         const ZERO: &str = "DBF_UCHAR:          0 = 0x0";
+        // A notify completes from a callback, after the put returned.
+        let idle = |rec: &str| {
+            let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+            while gf(&format!("{rec}.PACT")) != ZERO {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{rec} never left PACT"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
 
         run_cmd(&ctx, "dbpf", &["AS.PROC", "1"]);
         assert_eq!(gf("AS.PACT"), ONE);
@@ -12290,9 +12314,8 @@ record(ai, "AR") { field(DTYP, "Async Soft Channel") field(INP, "S2") }"#,
         assert_eq!(gf("AS.VAL"), "DBF_DOUBLE:         0");
         run_cmd(&ctx, "dbpf", &["AS2.PROC", "1"]);
         run_cmd(&ctx, "dbpf", &["AT.PROC", "1"]);
-        sleep(300);
+        idle("AT");
         assert_eq!(gf("AT.VAL"), "DBF_DOUBLE:         5");
-        assert_eq!(gf("AT.PACT"), ZERO);
         assert_eq!(gf("AT.STAT"), r#"DBF_STRING:         "NO_ALARM""#);
 
         assert_eq!(
@@ -12301,14 +12324,15 @@ record(ai, "AR") { field(DTYP, "Async Soft Channel") field(INP, "S2") }"#,
         );
         assert_eq!(gf("AS.PACT"), ZERO);
         assert_eq!(gf("AS.VAL"), "DBF_DOUBLE:         0");
-        sleep(2500);
+        idle("SQ");
+        idle("AS2");
         assert_eq!(gf("X.VAL"), "DBF_DOUBLE:         3");
-        assert_eq!(gf("SQ.PACT"), ZERO);
+        assert_eq!(gf("AS2.VAL"), "DBF_DOUBLE:         7");
+        // Nothing orders after a cancelled notify: AS keeps a window.
+        std::thread::sleep(std::time::Duration::from_millis(500));
         assert_eq!(gf("AS.VAL"), "DBF_DOUBLE:         0");
         assert_eq!(gf("AS.PACT"), ZERO);
         assert_eq!(gf("AS.STAT"), r#"DBF_STRING:         "UDF""#);
-        assert_eq!(gf("AS2.VAL"), "DBF_DOUBLE:         7");
-        assert_eq!(gf("AS2.PACT"), ZERO);
 
         assert_eq!(
             run_cmd(&ctx, "dbpf", &["AR.INP", "NOPE"]).trim_end(),
@@ -12320,9 +12344,8 @@ record(ai, "AR") { field(DTYP, "Async Soft Channel") field(INP, "S2") }"#,
         assert_eq!(gf("AR.PACT"), ONE);
 
         run_cmd(&ctx, "dbpf", &["AS.PROC", "1"]);
-        sleep(300);
+        idle("AS");
         assert_eq!(gf("AS.VAL"), "DBF_DOUBLE:         5");
-        assert_eq!(gf("AS.PACT"), ZERO);
     }
 
     /// A PN_LINK keeps only its severity bits (`devAiSoftCallback.c:115`):
@@ -12351,7 +12374,15 @@ record(ai, "AC") { field(DTYP, "Async Soft Channel") field(INP, "CNT2 CA") }"#,
                 format!(r#"DBF_STRING:         "{target} NMS""#)
             );
             run_cmd(&ctx, "dbpf", &[&format!("{rec}.PROC"), "1"]);
-            std::thread::sleep(std::time::Duration::from_millis(300));
+            // The notify completes from a callback, after the put returned.
+            let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+            while gf(&format!("{rec}.PACT")) != "DBF_UCHAR:          0 = 0x0" {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{rec} never left PACT"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
             assert_eq!(gf(&format!("{rec}.VAL")), "DBF_DOUBLE:         1", "{rec}");
             assert_eq!(
                 gf(&format!("{target}.VAL")),
@@ -12393,7 +12424,8 @@ record(ai, "AE") { field(DTYP, "Async Soft Channel") field(INP, "EQ.DO1") }"#,
         let sleep = |ms| std::thread::sleep(std::time::Duration::from_millis(ms));
         // The DLY1 windows end on the delay thread's clock, not this one's.
         let settle = |pv: &str, want: &str| {
-            for _ in 0..2000 {
+            let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+            while std::time::Instant::now() < deadline {
                 if gf(pv) == want {
                     return;
                 }
@@ -15410,7 +15442,7 @@ Total 2 records, 2 aliases
     /// in makes them the same thing.
     ///
     /// MEASURED on `softIoc` 7.0.10.1-DEV
-    /// (`/home/stevek/work/epics-base/bin/linux-x86_64/softIoc`) over this
+    /// (`$EPICS_BASE/bin/linux-x86_64/softIoc`) over this
     /// exact `.db`:
     ///
     /// ```text
@@ -15888,5 +15920,37 @@ Total 3 records, 2 aliases
         let (file, console) = shell.file_and_console("dbStateShowAll");
         assert_eq!(file, "");
         assert!(console.ends_with("'tstdout_x' : FALSE\n"), "{console}");
+    }
+
+    /// C `dbgf` resolves with `dbNameToAddr`, whose `dbEntryToAddr` runs
+    /// `cvt_dbaddr`: naming M.AA charges its buffer.
+    #[test]
+    fn dbgf_charges_the_array_it_names() {
+        // RTEMS-EXEC-MODEL-ALLOW(1): the acalcout type is registered through IocBuilder, whose build is async; runs and passes in the exec-backend suite.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let db = rt.block_on(async {
+            crate::server::ioc_builder::IocBuilder::new()
+                .register_record_type("acalcout", || {
+                    Box::new(crate::server::records::acalcout::AcalcoutRecord::new())
+                })
+                .db_string(
+                    r#"record(acalcout, "M") {}"#,
+                    &std::collections::HashMap::new(),
+                )
+                .unwrap()
+                .build()
+                .await
+                .unwrap()
+                .0
+        });
+        let bridge = {
+            let _guard = rt.enter();
+            crate::runtime::task::BlockingBridge::capture()
+        };
+        let ctx = CommandContext::new(db.clone(), bridge);
+        let out = run_cmd(&ctx, "dbgf", &["M.AA"]);
+        let amem = db.get_pv("M.AMEM").unwrap();
+        std::mem::forget(rt);
+        assert_eq!(amem, EpicsValue::Long(8), "dbgf printed {out:?}");
     }
 }

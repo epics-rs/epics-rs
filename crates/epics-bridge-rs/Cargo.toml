@@ -57,7 +57,7 @@ bringup-probes = ["epics-pva-rs?/bringup-probes"]
 # the record benches' x-asub-link.db names, as softIoc loads it from a .so.
 bench-subroutines = []
 # Record ↔ pvAccess channels (C++ QSRV equivalent). Pulls in `pvalink`
-# so a PVA-serving IOC resolves `pva://` record links out of the box —
+# so a PVA-serving IOC resolves pva record links out of the box —
 # symmetric with `calink-core`, the `ca` link set `run_qsrv_ioc_app`
 # installs. pvxs likewise ties pvalink to QSRV2 (`iochooks.cpp:461-496`).
 # The `epics-pva-rs/*` and `epics-ca-rs/client` entries restore what
@@ -176,12 +176,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = tr
 # host-facing feature that pulls this dependency — `qsrv`, `pvalink`,
 # `pva-gateway`, `dual-ioc` — so host builds resolve exactly as before. Only
 # `qsrv-core`, the RTEMS selection, gets the reduced set.
-epics-pva-rs = { path = "../epics-pva-rs", version = "0.32.0", optional = true, default-features = false }
+epics-pva-rs = { path = "../epics-pva-rs", version = "0.33.0", optional = true, default-features = false }
 # `epics-ca-rs` is spelled out for the reason `epics-pva-rs` is above: the
 # target pulls it through `calink-core`, whose selection is `client-core`, and
 # an inherited entry would turn the host-only `client` default on there too.
 # Every host feature that pulls it restores `client`.
-epics-ca-rs = { path = "../epics-ca-rs", version = "0.32.0", optional = true, default-features = false }
+epics-ca-rs = { path = "../epics-ca-rs", version = "0.33.0", optional = true, default-features = false }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { workspace = true, optional = true }
 parking_lot = "0.12"
@@ -274,7 +274,7 @@ required-features = ["dual-gateway-bin"]
 #
 # The gate is `qsrv-core,pvalink` and not the full `qsrv`: `qsrv` additionally
 # pulls `qsrv-bin` host machinery this target never runs, but `pvalink` — the
-# pva:// record-link resolver — is mounted on the target as of design stage 4.
+# pva record-link resolver — is mounted on the target as of design stage 4.
 # `pvalink` pulls `epics-pva-rs/client` (its UDP transport cfg-gated out so it
 # compiles for the triple) without `tls`/`pkcs12`, because the `epics-pva-rs`
 # dependency is `default-features = false`. Both features are `required-features`
@@ -293,7 +293,6 @@ required-features = ["qsrv-core", "pvalink", "calink-core"]
 epics-rtems-boot = { workspace = true }
 
 [dev-dependencies]
-epics-base-rs = { workspace = true, features = ["test-hooks"] }
 # Dev-only and `path`-only, so `cargo package` drops it from the uploaded
 # manifest: the source guards in this crate share one production-slice rule.
 source-guard = { path = "../source-guard" }

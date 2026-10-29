@@ -8,14 +8,14 @@
 
 mod common;
 
-use std::io::{BufRead, BufReader};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use common::{CHILD, Shell, free_port, signal, spawn_ioc};
+use common::{CHILD, Shell, spawn_ioc, stop};
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
 use epics_pva_rs::server_native::{PvaServer, SharedPV, SharedSource};
+use named_port::HeldPort;
 
 /// The child half; a no-op unless the parent set [`CHILD`].
 #[test]
@@ -66,60 +66,53 @@ fn a_refused_pva_link_put_prints_the_pvxs_line() {
     });
 
     let dir = tempfile::tempdir().unwrap();
-    let remote_port = free_port();
-    let mut remote = spawn_ioc(dir.path(), "remote", REMOTE, remote_port, "");
+    let (remote_port, local_port) = (HeldPort::tcp(), HeldPort::tcp());
+    let mut remote = spawn_ioc(dir.path(), "remote", REMOTE, &remote_port, "");
     let mut ioc = spawn_ioc(
         dir.path(),
         "local",
         DB,
-        free_port(),
-        &format!("{} 127.0.0.1:{remote_port}", server.tcp_addr()),
+        &local_port,
+        &format!("{} 127.0.0.1:{}", server.tcp_addr(), remote_port.port),
     );
-    let (tx, lines) = std::sync::mpsc::channel();
-    let stderr = BufReader::new(ioc.stderr.take().unwrap());
-    let reader = std::thread::spawn(move || {
-        for line in stderr.lines().map_while(Result::ok) {
-            if line.contains("link put") {
-                let _ = tx.send(line);
-            }
-        }
-    });
-    let mut sh = Shell {
-        stdin: ioc.stdin.take().unwrap(),
-        dir: dir.path(),
-        tag: "p",
-        n: 0,
+    let stderr = dir.path().join("local.err");
+    // The put lines among the whole lines written so far.
+    let put_lines = || -> Vec<String> {
+        let text = std::fs::read_to_string(&stderr).unwrap_or_default();
+        text[..text.rfind('\n').map_or(0, |i| i + 1)]
+            .lines()
+            .filter(|line| line.contains("link put"))
+            .map(str::to_string)
+            .collect()
     };
-    let mut seen = Vec::new();
-    let mut wait_for = |n: usize| {
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while seen.len() < n && Instant::now() < deadline {
-            if let Ok(line) = lines.recv_timeout(Duration::from_millis(100)) {
-                seen.push(line);
-            }
-        }
-    };
+    let mut sh = Shell::new(&mut ioc, dir.path(), "local");
 
     sh.capture_until("dbjlr O 0", "conn=T");
     sh.line("dbpf O 5");
-    wait_for(1);
+    sh.wait_until(|| !put_lines().is_empty());
     sh.line("dbpf F.PROC 1");
-    wait_for(2);
+    sh.wait_until(|| put_lines().len() >= 2);
 
     sh.capture_until("dbjlr WR 0", "conn=T");
-    signal(&remote, "-STOP");
+    stop(&remote);
     sh.line("dbpf WR 5");
     sh.line("dbpf WRT 6");
     sh.capture_until("dbjlr WR 0", "conn=T Put");
     remote.kill().unwrap();
     let _ = remote.wait();
+    // The disconnect ends the put, pvxs's `op_put.reset()`
+    // (`ioc/pvalink_channel.cpp:369`): no report shows one without the other.
+    let text = sh.capture_when("dbjlr WR 0", |text| text.contains("conn=F"));
+    assert!(
+        text.ends_with("conn=F\n"),
+        "the put outlived the disconnect:\n{text}"
+    );
     sh.capture_until("dbjlr WR 1", "conn=F #disconn=1");
     std::thread::sleep(Duration::from_millis(500));
     sh.line("exit");
     drop(sh);
     let _ = ioc.wait();
-    reader.join().unwrap();
-    seen.extend(lines.try_iter());
+    let seen = put_lines();
 
     assert_eq!(
         refused.load(Ordering::SeqCst),

@@ -43,7 +43,7 @@ use epics_base_rs::types::EpicsValue;
 /// The C `dbCaPutLinkCallback` seam. C issues the put-WITH-completion — the
 /// one a `WAITn` step parks on — only when the link is a `CA_LINK`
 /// (`sseqRecord.c:717/739/763`), so every held put-callback in these tests
-/// arrives over a `ca://` link and lands here.
+/// arrives over a CA link and lands here.
 ///
 /// A [`LinkPutOp::Async`] put (the completion-aware one the sseq's wait path
 /// issues) does not return until the test releases that PV name — the
@@ -233,7 +233,8 @@ async fn kick(db: &PvDatabase, name: &str) {
 
 /// Poll a `DBF_SHORT` status field until it equals `want`.
 async fn poll_short(db: &PvDatabase, pv: &str, want: i16, label: &str) {
-    for _ in 0..400 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if let Ok(EpicsValue::Short(v)) = db.get_pv(pv) {
             if v == want {
                 return;
@@ -252,7 +253,8 @@ async fn poll_short(db: &PvDatabase, pv: &str, want: i16, label: &str) {
 /// `to_f64` so it handles both `Short` (DTn/LTn/WERRn) and `Enum`
 /// (DOLnV/LNKnV) without caring which the field uses.
 async fn poll_i16(db: &PvDatabase, pv: &str, want: i16, label: &str) {
-    for _ in 0..400 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if let Ok(v) = db.get_pv(pv) {
             if v.to_f64().map(|f| f as i16) == Some(want) {
                 return;
@@ -277,7 +279,8 @@ async fn read_i16(db: &PvDatabase, pv: &str) -> i16 {
 
 /// Poll a `DBF_DOUBLE` PV until it equals `want`.
 async fn poll_double(db: &PvDatabase, pv: &str, want: f64, label: &str) {
-    for _ in 0..400 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if let Ok(EpicsValue::Double(v)) = db.get_pv(pv) {
             if (v - want).abs() < 1e-10 {
                 return;
@@ -294,7 +297,8 @@ async fn poll_double(db: &PvDatabase, pv: &str, want: f64, label: &str) {
 /// Wait for a `CountingTarget` to have been processed `want` times — the fact
 /// a dispatch-count assertion needs, as [`poll_double`] is for a target value.
 async fn poll_count(counter: &Arc<AtomicU32>, want: u32, label: &str) {
-    for _ in 0..400 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if counter.load(Ordering::SeqCst) >= want {
             return;
         }
@@ -336,7 +340,7 @@ async fn sseq_waitn_blocks_until_downstream_completes() {
     sseq.selm = 0; // All steps.
     // Step 1: WAIT (put-with-completion) into the held CA target.
     sseq.put_field("DO1", EpicsValue::Double(11.0)).unwrap();
-    sseq.put_field("LNK1", EpicsValue::String("ca://SSEQ_W_HOLD".into()))
+    sseq.put_field("LNK1", EpicsValue::String("SSEQ_W_HOLD CA".into()))
         .unwrap();
     sseq.put_field("WAIT1", EpicsValue::Short(1)).unwrap(); // Wait
     // Step 2: no-wait write into a sync target.
@@ -570,7 +574,7 @@ async fn sseq_second_abort_escapes_hung_wait_callback() {
     let mut sseq = SseqRecord::new();
     sseq.selm = 0;
     sseq.put_field("DO1", EpicsValue::Double(11.0)).unwrap();
-    sseq.put_field("LNK1", EpicsValue::String("ca://SSEQ_HUNG_HOLD".into()))
+    sseq.put_field("LNK1", EpicsValue::String("SSEQ_HUNG_HOLD CA".into()))
         .unwrap();
     sseq.put_field("WAIT1", EpicsValue::Short(1)).unwrap(); // Wait
     db.add_record("SSEQ_HUNG", Box::new(sseq)).await.unwrap();
@@ -811,7 +815,7 @@ async fn sseq_werr_raised_on_local_db_wait_cleared_on_ca_and_constant() {
     // Step 2: WAIT on an EMPTY (constant) link — no put at all → not an error.
     sseq.put_field("WAIT2", EpicsValue::Short(1)).unwrap(); // Wait, LNK2 empty
     // Step 3: WAIT on a CA link — the wait works → not an error.
-    sseq.put_field("LNK3", EpicsValue::String("ca://SSEQ_WE_REMOTE".into()))
+    sseq.put_field("LNK3", EpicsValue::String("SSEQ_WE_REMOTE CA".into()))
         .unwrap();
     sseq.put_field("WAIT3", EpicsValue::Short(1)).unwrap(); // Wait
     // Step 4: control — NoWait on an empty link is not a misconfig.
@@ -930,12 +934,12 @@ async fn sseq_wait_full_barrier_serialises_steps() {
     sseq.selm = 0; // All steps.
     // Step 1: Wait → held CA put-callback (full barrier for every later step).
     sseq.put_field("DO1", EpicsValue::Double(11.0)).unwrap();
-    sseq.put_field("LNK1", EpicsValue::String("ca://SSEQ_FB_HOLD1".into()))
+    sseq.put_field("LNK1", EpicsValue::String("SSEQ_FB_HOLD1 CA".into()))
         .unwrap();
     sseq.put_field("WAIT1", EpicsValue::Short(1)).unwrap(); // Wait
     // Step 2: also Wait → its own held CA put-callback.
     sseq.put_field("DO2", EpicsValue::Double(22.0)).unwrap();
-    sseq.put_field("LNK2", EpicsValue::String("ca://SSEQ_FB_HOLD2".into()))
+    sseq.put_field("LNK2", EpicsValue::String("SSEQ_FB_HOLD2 CA".into()))
         .unwrap();
     sseq.put_field("WAIT2", EpicsValue::Short(1)).unwrap(); // Wait
     db.add_record("SSEQ_FB", Box::new(sseq)).await.unwrap();
@@ -997,15 +1001,15 @@ async fn sseq_after_n_overlaps_then_barriers() {
     sseq.selm = 0; // All steps.
     // After2 = menu index 3 (NoWait=0, Wait=1, After1=2, After2=3).
     sseq.put_field("DO1", EpicsValue::Double(11.0)).unwrap();
-    sseq.put_field("LNK1", EpicsValue::String("ca://SSEQ_OV_HOLD1".into()))
+    sseq.put_field("LNK1", EpicsValue::String("SSEQ_OV_HOLD1 CA".into()))
         .unwrap();
     sseq.put_field("WAIT1", EpicsValue::Short(3)).unwrap(); // After2
     sseq.put_field("DO2", EpicsValue::Double(22.0)).unwrap();
-    sseq.put_field("LNK2", EpicsValue::String("ca://SSEQ_OV_HOLD2".into()))
+    sseq.put_field("LNK2", EpicsValue::String("SSEQ_OV_HOLD2 CA".into()))
         .unwrap();
     sseq.put_field("WAIT2", EpicsValue::Short(3)).unwrap(); // After2
     sseq.put_field("DO3", EpicsValue::Double(33.0)).unwrap();
-    sseq.put_field("LNK3", EpicsValue::String("ca://SSEQ_OV_HOLD3".into()))
+    sseq.put_field("LNK3", EpicsValue::String("SSEQ_OV_HOLD3 CA".into()))
         .unwrap();
     sseq.put_field("WAIT3", EpicsValue::Short(1)).unwrap(); // Wait
     db.add_record("SSEQ_OV", Box::new(sseq)).await.unwrap();
@@ -1077,11 +1081,11 @@ async fn sseq_end_drain_waits_for_all_in_flight() {
     // Two After2 steps; no step at index >= 2 exists, so neither barriers the
     // other → both dispatch and overlap, then the sequence end-drains.
     sseq.put_field("DO1", EpicsValue::Double(11.0)).unwrap();
-    sseq.put_field("LNK1", EpicsValue::String("ca://SSEQ_DR_HOLD1".into()))
+    sseq.put_field("LNK1", EpicsValue::String("SSEQ_DR_HOLD1 CA".into()))
         .unwrap();
     sseq.put_field("WAIT1", EpicsValue::Short(3)).unwrap(); // After2
     sseq.put_field("DO2", EpicsValue::Double(22.0)).unwrap();
-    sseq.put_field("LNK2", EpicsValue::String("ca://SSEQ_DR_HOLD2".into()))
+    sseq.put_field("LNK2", EpicsValue::String("SSEQ_DR_HOLD2 CA".into()))
         .unwrap();
     sseq.put_field("WAIT2", EpicsValue::Short(3)).unwrap(); // After2
     db.add_record("SSEQ_DR", Box::new(sseq)).await.unwrap();
@@ -1135,11 +1139,11 @@ async fn sseq_abort_drains_in_flight_before_finish() {
     let mut sseq = SseqRecord::new();
     sseq.selm = 0; // All steps.
     sseq.put_field("DO1", EpicsValue::Double(11.0)).unwrap();
-    sseq.put_field("LNK1", EpicsValue::String("ca://SSEQ_ABD_HOLD1".into()))
+    sseq.put_field("LNK1", EpicsValue::String("SSEQ_ABD_HOLD1 CA".into()))
         .unwrap();
     sseq.put_field("WAIT1", EpicsValue::Short(3)).unwrap(); // After2
     sseq.put_field("DO2", EpicsValue::Double(22.0)).unwrap();
-    sseq.put_field("LNK2", EpicsValue::String("ca://SSEQ_ABD_HOLD2".into()))
+    sseq.put_field("LNK2", EpicsValue::String("SSEQ_ABD_HOLD2 CA".into()))
         .unwrap();
     sseq.put_field("WAIT2", EpicsValue::Short(3)).unwrap(); // After2
     db.add_record("SSEQ_ABD", Box::new(sseq)).await.unwrap();
@@ -1221,7 +1225,7 @@ async fn sseq_after_n_does_not_block_lower_index_step() {
     sseq.selm = 0; // All steps.
     // Step 1: After2 (gates index >= 2) into the async hold → in flight.
     sseq.put_field("DO1", EpicsValue::Double(11.0)).unwrap();
-    sseq.put_field("LNK1", EpicsValue::String("ca://SSEQ_NB_HOLD1".into()))
+    sseq.put_field("LNK1", EpicsValue::String("SSEQ_NB_HOLD1 CA".into()))
         .unwrap();
     sseq.put_field("WAIT1", EpicsValue::Short(3)).unwrap(); // After2
     // Step 2 (index 1 < 2): NoWait → sync target; After2 imposes no barrier.

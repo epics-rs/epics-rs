@@ -128,7 +128,7 @@ impl EnumSource {
                 let inst = record.read();
                 record
                     .addressed_field_type(field, Some(&*inst.record))
-                    .is_none_or(|t| t == DbFieldType::String)
+                    .is_none_or(|t| t.served_type() == Some(DbFieldType::String))
             }
             LongStringMode::DollarChar { .. } | LongStringMode::Text(_) => false,
         };
@@ -185,8 +185,10 @@ impl DeliveryStage {
             LongStringMode::DollarChar { view, .. } if !post.is_empty() => Some(view),
             _ => None,
         };
+        // The route left once the post chain ran: a log a filter replaced
+        // is converted as the field.
         let route = match long_string_mode {
-            LongStringMode::Text(route) => Some(route),
+            LongStringMode::Text(route) => route.after(&post),
             LongStringMode::DollarChar { view, .. } => view.source().text_route(),
             _ => None,
         };
@@ -534,8 +536,8 @@ pub fn prepare_read(
 ) -> Result<crate::server::snapshot::Snapshot, GetFailed> {
     let (read_chain, post_chain) = chain.split();
     if !read_chain.is_empty() {
-        if let Some(v) = read_chain.apply_to_read_value(snapshot.value.clone()) {
-            snapshot.value = v;
+        if let Some(read) = read_chain.apply_to_read_snapshot(snapshot.clone()) {
+            snapshot = read;
         }
     }
     // convert String → CharArray of exactly 40 elements BEFORE the

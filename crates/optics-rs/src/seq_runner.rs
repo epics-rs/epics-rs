@@ -179,7 +179,7 @@ mod tests {
     }
 
     /// filterDrive's blade count is the `NUM_FILTERS` macro
-    /// (`filterDrive.st:338`), published to `NumFilters` by `start`.
+    /// (`filterDrive.st:342`), published to `NumFilters` by `start`.
     #[epics_base_rs::epics_test]
     async fn filter_drive_takes_its_blade_count_from_num_filters() {
         let db = filter_drive_ioc("F:").await;
@@ -201,7 +201,7 @@ mod tests {
     }
 
     /// A negative count assigns no blade and is published as it is
-    /// (`filterDrive.st:344-367`).
+    /// (`filterDrive.st:359-382`).
     #[epics_base_rs::epics_test]
     async fn filter_drive_publishes_a_negative_num_filters() {
         let db = filter_drive_ioc("N:").await;
@@ -217,13 +217,13 @@ mod tests {
     }
 
     /// initSequence puts the `Y_OFF` macro into the y offset
-    /// (`ml_monoCtl.st:520-530`), and updatePsuedo puts the y motor readback,
+    /// (`ml_monoCtl.st:584-595`), and updatePsuedo puts the y motor readback,
     /// 0 here, once the readback's first monitor sets `yMotRdbk_mon`, as every
-    /// monitor sets its synced flag (`seq_ca.c:328-329`, `ml_monoCtl.st:1218`).
+    /// monitor sets its synced flag (`seq_ca.c:328-329`, `ml_monoCtl.st:1295-1298`).
     /// The two state sets run on their own threads, so either put may be the
-    /// last; C guarantees only that every value put is one of the two.
+    /// last, but each puts its own value, where C could put one twice.
     #[epics_base_rs::epics_test]
-    async fn ml_mono_puts_y_off_or_the_y_readback_into_its_y_offset() {
+    async fn ml_mono_puts_y_off_and_the_y_readback_into_its_y_offset() {
         let db = ml_mono_ioc().await;
         let mut sub = DbSubscription::subscribe(&db, "Y:ml_mono_yOffset")
             .await
@@ -232,14 +232,15 @@ mod tests {
         seq_start("ml_monoCtl", "P=Y:,M_THETA=th,Y_OFF=40", &bridge, &db).unwrap();
         let mut posts = Vec::new();
         for _ in 0..300 {
-            // initSequence's puts end on the y motor's name (`ml_monoCtl.st:536`)
+            // initSequence's puts end on the y motor's name (`ml_monoCtl.st:601`)
             let init_done = db.get_pv("Y:ml_monoYPv").unwrap().text_g() == "Y:m10";
             while let Ok(e) = sub.try_recv_event() {
                 posts.push(e.value().as_value().and_then(|v| v.to_f64()));
             }
             if init_done && posts.contains(&Some(0.0)) {
                 assert!(
-                    posts.iter().all(|&p| p == Some(40.0) || p == Some(0.0)),
+                    posts.contains(&Some(40.0))
+                        && posts.iter().all(|&p| p == Some(40.0) || p == Some(0.0)),
                     "y offset posts {posts:?}"
                 );
                 return;

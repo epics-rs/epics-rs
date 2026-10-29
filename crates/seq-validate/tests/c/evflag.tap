@@ -1,0 +1,67 @@
+1..44
+# write: pvPut(named=0.0)
+ok  1 - write: named=0.0==0.0=anonymous
+# read: pvPut(anonymous=0.0)
+ok  2 - write: named=0.0==0.0=anonymous
+ok  3 - write: named=0.0==0.0=anonymous
+ok  4 - read: named=0.0==0.0=anonymous
+# write: pvPut(named=1.0)
+ok  5 - write: named=1.0==1.0=anonymous
+# read: pvPut(anonymous=1.0)
+ok  6 - write: named=1.0==1.0=anonymous
+ok  7 - write: named=1.0==1.0=anonymous
+ok  8 - read: named=1.0==1.0=anonymous
+# write: pvPut(named=2.0)
+ok  9 - write: named=2.0==2.0=anonymous
+# read: pvPut(anonymous=2.0)
+ok 10 - write: named=2.0==2.0=anonymous
+ok 11 - write: named=2.0==2.0=anonymous
+ok 12 - read: named=2.0==2.0=anonymous
+# write: pvPut(named=3.0)
+ok 13 - write: named=3.0==3.0=anonymous
+# read: pvPut(anonymous=3.0)
+ok 14 - write: named=3.0==3.0=anonymous
+ok 15 - write: named=3.0==3.0=anonymous
+ok 16 - read: named=3.0==3.0=anonymous
+# write: pvPut(named=4.0)
+ok 17 - write: named=4.0==4.0=anonymous
+# read: pvPut(anonymous=4.0)
+ok 18 - write: named=4.0==4.0=anonymous
+ok 19 - write: named=4.0==4.0=anonymous
+ok 20 - read: named=4.0==4.0=anonymous
+# write: pvPut(named=5.0)
+ok 21 - write: named=5.0==5.0=anonymous
+# read: pvPut(anonymous=5.0)
+ok 22 - write: named=5.0==5.0=anonymous
+ok 23 - write: named=5.0==5.0=anonymous
+ok 24 - read: named=5.0==5.0=anonymous
+# write: pvPut(named=6.0)
+ok 25 - write: named=6.0==6.0=anonymous
+# read: pvPut(anonymous=6.0)
+ok 26 - write: named=6.0==6.0=anonymous
+ok 27 - write: named=6.0==6.0=anonymous
+ok 28 - read: named=6.0==6.0=anonymous
+# write: pvPut(named=7.0)
+ok 29 - write: named=7.0==7.0=anonymous
+# read: pvPut(anonymous=7.0)
+ok 30 - write: named=7.0==7.0=anonymous
+ok 31 - write: named=7.0==7.0=anonymous
+ok 32 - read: named=7.0==7.0=anonymous
+# write: pvPut(named=8.0)
+ok 33 - write: named=8.0==8.0=anonymous
+# read: pvPut(anonymous=8.0)
+ok 34 - write: named=8.0==8.0=anonymous
+ok 35 - write: named=8.0==8.0=anonymous
+ok 36 - read: named=8.0==8.0=anonymous
+# write: pvPut(named=9.0)
+ok 37 - write: named=9.0==9.0=anonymous
+# read: pvPut(anonymous=9.0)
+ok 38 - write: named=9.0==9.0=anonymous
+ok 39 - write: named=9.0==9.0=anonymous
+ok 40 - read: named=9.0==9.0=anonymous
+# write: pvPut(named=10.0)
+ok 41 - write: named=10.0==10.0=anonymous
+# read: pvPut(anonymous=10.0)
+ok 42 - write: named=10.0==10.0=anonymous
+ok 43 - write: named=10.0==10.0=anonymous
+ok 44 - read: named=10.0==10.0=anonymous

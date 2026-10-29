@@ -1,0 +1,7 @@
+1..2
+# x=0.000000
+ok  1 - pvGet/SYNC, status=10 (put completion failure)
+# x=0.000000
+# x=0.000000
+ok  2 - pvGet/SYNC, status=0 ()
+# x=3.000000

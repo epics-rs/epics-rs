@@ -10,6 +10,8 @@ use std::sync::{Arc, OnceLock};
 use std::thread::Thread;
 use std::time::Duration;
 
+use asyn_rs::request::SectionScope;
+
 use crate::ndarray::NDArray;
 use crate::ndarray_pool::PublishedArray;
 
@@ -125,6 +127,9 @@ pub struct ArrayMessage {
     /// When Some, the sender awaits this to confirm downstream processing completed.
     /// Fired when ArrayMessage is dropped (i.e., after plugin process_array finishes).
     pub(crate) done_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    /// The sender's scope, for a blocking delivery: C runs that consumer on
+    /// the sender's thread, inside its lock (NDPluginDriver.cpp:332, :436).
+    pub(crate) scope: SectionScope,
 }
 
 impl Drop for ArrayMessage {
@@ -347,6 +352,7 @@ fn try_send_arm(
                 array,
                 counter: Some(counter),
                 done_tx: None,
+                scope: SectionScope::default(),
             });
             admission.depth_moved.notify_one();
             PublishOutcome::Delivered
@@ -422,7 +428,8 @@ impl NDArraySender {
     /// - `blocking_callbacks=1`: reliable `send().await` + awaits downstream
     ///   processing completion (explicit opt-in, never drops).
     pub async fn publish(&self, array: impl Into<PublishedArray>) -> PublishOutcome {
-        self.publish_inner(array.into()).await
+        self.publish_inner(array.into(), SectionScope::current())
+            .await
     }
 
     /// Publish for the scatter reroute path. Mirrors C++ `NDPluginScatter`'s
@@ -436,16 +443,27 @@ impl NDArraySender {
     /// mechanisms, a scatter round following a natural overflow would silence
     /// the last node too.
     pub async fn publish_scatter(&self, array: PublishedArray, is_last: bool) -> PublishOutcome {
+        self.publish_scatter_in(array, is_last, SectionScope::current())
+            .await
+    }
+
+    /// [`Self::publish_scatter`] from a section in `scope`.
+    pub(crate) async fn publish_scatter_in(
+        &self,
+        array: PublishedArray,
+        is_last: bool,
+        scope: SectionScope,
+    ) -> PublishOutcome {
         if is_last {
             self.overflow.disarm();
         } else {
             self.overflow.arm();
         }
-        self.publish_inner(array).await
+        self.publish_inner(array, scope).await
     }
 
-    /// Shared publish body.
-    async fn publish_inner(&self, array: PublishedArray) -> PublishOutcome {
+    /// Shared publish body; a blocking consumer runs in `scope`.
+    async fn publish_inner(&self, array: PublishedArray, scope: SectionScope) -> PublishOutcome {
         if !self.enabled.load(Ordering::Acquire) {
             return PublishOutcome::Disabled;
         }
@@ -486,6 +504,7 @@ impl NDArraySender {
             array,
             counter: None,
             done_tx: Some(done_tx),
+            scope,
         };
         let tx = self.tx.read().clone();
         if tx.send(msg).await.is_err() {
@@ -769,41 +788,51 @@ pub fn ndarray_channel(port_name: &str, queue_size: usize) -> (NDArraySender, ND
     )
 }
 
+/// C `doCallbacksGenericPointer`: each registered plugin in turn, a blocking
+/// one processing the array before the next is called
+/// (asynPortDriver.cpp:3355-3368, NDPluginDriver.cpp:435). A drop is counted
+/// by the receiving plugin, so nothing is returned to count.
+pub(crate) async fn publish_each(
+    senders: &[NDArraySender],
+    array: PublishedArray,
+    scope: SectionScope,
+) {
+    for sender in senders {
+        sender.publish_inner(array.clone(), scope).await;
+    }
+}
+
 /// Fan-out: publishes arrays to multiple downstream receivers.
 pub struct NDArrayOutput {
-    senders: Vec<NDArraySender>,
+    /// Copied on write, so a publish takes it with one reference count and
+    /// walks it with no lock held.
+    senders: Arc<Vec<NDArraySender>>,
 }
 
 impl NDArrayOutput {
     pub fn new() -> Self {
         Self {
-            senders: Vec::new(),
+            senders: Arc::default(),
         }
     }
 
     pub fn add(&mut self, sender: NDArraySender) {
-        self.senders.push(sender);
+        Arc::make_mut(&mut self.senders).push(sender);
     }
 
     pub fn remove(&mut self, port_name: &str) {
-        self.senders.retain(|s| s.port_name != port_name);
+        Arc::make_mut(&mut self.senders).retain(|s| s.port_name != port_name);
     }
 
     /// Remove a sender by port name and return it (if found).
     pub fn take(&mut self, port_name: &str) -> Option<NDArraySender> {
         let idx = self.senders.iter().position(|s| s.port_name == port_name)?;
-        Some(self.senders.swap_remove(idx))
+        Some(Arc::make_mut(&mut self.senders).swap_remove(idx))
     }
 
-    /// Publish an array to all downstream receivers (async, concurrent).
-    ///
-    /// Each sender publishes independently. Returns the per-sender outcomes
-    /// so the caller can count `DroppedArrays` for any downstream whose queue
-    /// was full (C++ `driverCallback` semantics).
-    pub async fn publish(&self, array: impl Into<PublishedArray>) -> Vec<PublishOutcome> {
-        let array = array.into();
-        let futs = self.senders.iter().map(|s| s.publish(array.clone()));
-        futures_util::future::join_all(futs).await
+    /// Publish an array to every downstream receiver in turn.
+    pub async fn publish(&self, array: impl Into<PublishedArray>) {
+        publish_each(&self.senders, array.into(), SectionScope::current()).await
     }
 
     /// Publish an array to a single downstream receiver by index (for scatter/round-robin).
@@ -823,9 +852,9 @@ impl NDArrayOutput {
         self.senders.len()
     }
 
-    /// Clone the senders list (for publishing outside a lock in async context).
-    pub(crate) fn senders_clone(&self) -> Vec<NDArraySender> {
-        self.senders.clone()
+    /// The senders as they stand, for publishing with no lock held.
+    pub(crate) fn senders(&self) -> Arc<Vec<NDArraySender>> {
+        Arc::clone(&self.senders)
     }
 }
 
@@ -833,7 +862,7 @@ impl NDArrayOutput {
 ///
 /// This is the public API for driver acquisition tasks.
 /// Internally it snapshots the sender list, releases the lock, then
-/// publishes to all senders concurrently.
+/// publishes to each sender in turn.
 ///
 /// # Example
 /// ```ignore
@@ -852,17 +881,12 @@ impl ArrayPublisher {
         Self { output }
     }
 
-    /// Publish an array to all downstream plugins (async, concurrent fan-out).
-    ///
-    /// Returns the per-downstream outcomes — a `DroppedQueueFull` entry means
-    /// that downstream plugin's input queue was full and the array was dropped
-    /// (C++ `driverCallback` `trySend`). The driver should count those as
-    /// `DroppedArrays`.
-    pub async fn publish(&self, array: impl Into<PublishedArray>) -> Vec<PublishOutcome> {
-        let array = array.into();
-        let senders = self.output.lock().senders_clone();
-        let futs = senders.iter().map(|s| s.publish(array.clone()));
-        futures_util::future::join_all(futs).await
+    /// Publish an array to every downstream plugin in turn. A plugin whose
+    /// queue is full counts the drop in its own `DroppedArrays`, as C's
+    /// `driverCallback` does (NDPluginDriver.cpp:433-440).
+    pub async fn publish(&self, array: impl Into<PublishedArray>) {
+        let senders = self.output.lock().senders();
+        publish_each(&senders, array.into(), SectionScope::current()).await
     }
 }
 
@@ -882,7 +906,7 @@ mod tests {
     /// An array of a driver no test reads.
     fn make_test_array(id: i32) -> PublishedArray {
         let mut arr = owned_array_mut(&DriverPool::standalone(0));
-        arr.unique_id = id;
+        arr.fill().set_unique_id(id);
         arr.share()
     }
 
@@ -973,16 +997,16 @@ mod tests {
     async fn a_refused_array_never_wakes_the_queued_count_updater() {
         let owner = ArrayOwner::new();
         let pool = DriverPool::for_driver(1_000_000, &owner);
-        owner.queued().set_updater(std::thread::current());
         let (sender, _receiver) = ndarray_channel("TEST", 1);
         sender.publish(owned_array(&pool)).await;
-        std::thread::park_timeout(Duration::ZERO);
+        assert!(owner.queued().take_signal());
 
         let outcome = sender.publish(owned_array(&pool)).await;
         assert_eq!(outcome, PublishOutcome::DroppedQueueFull);
-        let start = std::time::Instant::now();
-        std::thread::park_timeout(Duration::from_millis(200));
-        assert!(start.elapsed() >= Duration::from_millis(200));
+        // The latch is what the updater posts on; a timed park can return
+        // without an unpark, so it cannot show there was none.
+        assert!(!owner.queued().take_signal());
+        assert_eq!(owner.queued().get(), 1);
     }
 
     #[tokio::test]
@@ -1159,6 +1183,7 @@ mod tests {
             array: make_test_array(1),
             counter: Some(counter.clone()),
             done_tx: None,
+            scope: SectionScope::default(),
         };
         assert_eq!(counter.get(), 1);
         drop(msg);

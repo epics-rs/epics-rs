@@ -43,7 +43,8 @@ async fn a_string_read_caps_at_39_and_a_dollar_source_reads_its_whole_text() {
             .await
             .unwrap();
     }
-    for _ in 0..200 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if text(&db, "T") == "abc" {
             break;
         }

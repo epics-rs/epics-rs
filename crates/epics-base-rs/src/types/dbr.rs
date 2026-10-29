@@ -222,6 +222,26 @@ impl DbfCode {
             other => other,
         }
     }
+
+    /// [`Self::dbr_code`] as the [`DbFieldType`] a channel serves, `None`
+    /// for `DBR_NOACCESS`, which no channel serves.
+    pub const fn served_type(self) -> Option<DbFieldType> {
+        Some(match self.dbr_code() {
+            DbfCode::String => DbFieldType::String,
+            DbfCode::Char => DbFieldType::Char,
+            DbfCode::UChar => DbFieldType::UChar,
+            DbfCode::Short => DbFieldType::Short,
+            DbfCode::UShort => DbFieldType::UShort,
+            DbfCode::Long => DbFieldType::Long,
+            DbfCode::ULong => DbFieldType::ULong,
+            DbfCode::Int64 => DbFieldType::Int64,
+            DbfCode::UInt64 => DbFieldType::UInt64,
+            DbfCode::Float => DbFieldType::Float,
+            DbfCode::Double => DbFieldType::Double,
+            DbfCode::Enum => DbFieldType::Enum,
+            _ => return None,
+        })
+    }
 }
 
 impl DbFieldType {
@@ -794,6 +814,37 @@ mod dbf_link_class_tests {
             wrong.len(),
             wrong.join("\n")
         );
+    }
+
+    /// A served type is the `mapDBFToDBR` projection of the addressed
+    /// `dbfType` on every readable field with a fixed type, so a site serving
+    /// [`DbfCode::served_type`] of the address serves what the descriptor does.
+    #[test]
+    fn every_fixed_field_serves_the_projection_of_its_address() {
+        use crate::server::record::dbd_generated::{DB_COMMON_FIELDS, RECORD_TYPES, record_fields};
+        let mut wrong = Vec::new();
+        for rt in RECORD_TYPES {
+            let own = record_fields(rt).unwrap_or(&[]);
+            for d in DB_COMMON_FIELDS.iter().chain(own.iter()) {
+                let fixed = !d.unreadable() && !d.runtime_typed;
+                if fixed && d.addressed_dbf().served_type() != Some(d.dbf_type) {
+                    wrong.push(format!(
+                        "{rt}.{} {:?} {:?}",
+                        d.name,
+                        d.addressed_dbf(),
+                        d.dbf_type
+                    ));
+                }
+                if d.unreadable() && d.addressed_dbf() != DbfCode::NoAccess {
+                    wrong.push(format!(
+                        "{rt}.{} unreadable {:?}",
+                        d.name,
+                        d.addressed_dbf()
+                    ));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
     /// The two shapes the name rule could not express, pinned by name so a

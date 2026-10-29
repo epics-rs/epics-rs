@@ -670,3 +670,46 @@ record(epid, "PID") {
         other => panic!("expected Double, got {other:?}"),
     }
 }
+
+/// `devEpidSoftCallback.c:112-114`: a CONSTANT INP raises SOFT/INVALID and
+/// returns before the TRIG put, so the trigger target is left alone.
+#[tokio::test]
+async fn test_epid_constant_inp_does_not_trigger() {
+    let db_str = r#"
+record(ao, "SRC") {
+    field(VAL, "1.0")
+}
+record(epid, "PID") {
+    field(DTYP, "Async Soft Channel")
+    field(KP, "1.0")
+    field(VAL, "100.0")
+    field(INP, "5")
+    field(TRIG, "SRC PP")
+    field(TVAL, "42.0")
+    field(FBON, "1")
+}
+"#;
+    std_rs::register_std_dbd();
+    let server = CaServerBuilder::new()
+        .port(0)
+        .register_record_type("epid", || Box::new(std_rs::EpidRecord::default()))
+        .register_record_type("ao", || Box::new(AoRecord::default()))
+        .db_string(db_str, &HashMap::new())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let db = server.database().clone();
+    db.put_record_field_from_ca("PID", "PROC", EpicsValue::Short(1))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(server.get("SRC").await.unwrap(), EpicsValue::Double(1.0));
+    assert_eq!(
+        server.get("PID.STAT").await.unwrap().to_f64(),
+        Some(f64::from(
+            epics_base_rs::server::recgbl::alarm_status::SOFT_ALARM
+        ))
+    );
+    assert_eq!(server.get("PID.SEVR").await.unwrap().to_f64(), Some(3.0));
+}

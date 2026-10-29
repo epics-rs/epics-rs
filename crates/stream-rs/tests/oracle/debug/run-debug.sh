@@ -15,7 +15,8 @@
 # "FIELD value" for VAL SEVR STAT UDF PACT PROC, from dbgf. C's
 # scanValue(long&) line ends with a backslash and an n and no line end
 # (StreamCore.cc:1499), which the port does not copy: the line it runs
-# into is split off it, and the two characters dropped.
+# into is split off it, and the two characters dropped. The protocol
+# directory, this one, is written <dir>.
 # Arguments, if any, are the cases to run.
 set -euo pipefail
 : "${STREAM_TOP:?set STREAM_TOP to a built StreamDevice}"
@@ -55,7 +56,7 @@ dbgf rec.PROC
 exit
 EOC
     "$STREAM_TOP/bin/$ARCH/streamApp" "$work/$c.cmd" </dev/null >"$work/$c.out" 2>"$work/$c.err" || true
-    perl -pe 's/ failed\\n(?=\S+ \S+\.cc?:\d+: )/ failed\n/' "$work/$c.err" |
+    HERE=$here perl -pe 's/ failed\\n(?=\S+ \S+\.cc?:\d+: )/ failed\n/; s/\Q$ENV{HERE}\E/<dir>/g' "$work/$c.err" |
     perl -ne 'next unless $on ||= /Stream(Epics|Core)\.cc:\d+: /;
         if ($cont) { print; $cont = 0 if /\)$/; next }
         next if /^\e\[|^iocsh Error: |^iocRun: |^iocInit: |^Starting iocInit|^#|StreamCore::attachBus\(/;

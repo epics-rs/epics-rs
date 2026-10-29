@@ -13,7 +13,6 @@ use std::cell::Cell;
 use std::sync::Arc;
 
 use crate::server::database::{AsyncDbHandle, PostItem, PostRule};
-use crate::server::record::LinkType;
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
 /// Generation gate for spawned async link-status refreshes, one generation
@@ -282,14 +281,14 @@ pub enum LinkRule {
     /// re-check; `process()` does.
     Volatile,
     /// synApps `sCalcoutRecord.c:264`, `aCalcoutRecord.c:219`,
-    /// `transformRecord.c:450`, std `throttleRecord.c:194`: `dbNameToAddr`
-    /// of the PV name — a name this IOC holds is `Local PV` whatever its
-    /// modifier, and `checkLinks` re-reads only the CA links left. An
-    /// `Ext PV NC` re-checks after 1 s from `init_record`, 0.5 s from
-    /// `special()`.
+    /// `transformRecord.c:450`, std `throttleRecord.c:194`, and sseq's
+    /// `special()` (`sseqRecord.c:1006`, `:1051`): `dbNameToAddr` of the PV
+    /// name — a name this IOC holds is `Local PV` whatever its modifier, and
+    /// `checkLinks` re-reads only the CA links left. An `Ext PV NC` re-checks
+    /// after 1 s from `init_record`, 0.5 s from `special()`.
     Locality,
-    /// `sseqRecord.c:208`, `:227`: only a DB link to a local name is
-    /// `Local PV`; a CA link is external.
+    /// sseq's `init_record` (`sseqRecord.c:208`, `:227`): only a DB link to a
+    /// local name is `Local PV`; a CA link is external.
     DbLink,
 }
 
@@ -301,7 +300,7 @@ impl LinkRule {
         match self {
             Self::Volatile => link.external().is_some(),
             Self::Locality | Self::DbLink => {
-                matches!(link, crate::server::record::ParsedLink::Ca(_))
+                link.link_type_after_init() == crate::server::record::DbLinkType::CaLink
             }
         }
     }
@@ -325,8 +324,8 @@ pub struct LinkCheckSpec {
     pub rule: LinkRule,
     /// The record's own `db_post_events` mask for a status.
     pub mask: crate::server::recgbl::EventMask,
-    /// sseq's `checkLinks` re-posts a `Local PV` status every pass
-    /// (`sseqRecord.c:874`, `:910`); the calcs leave one alone.
+    /// sseq's `checkLinks` sets and re-posts `Local PV` on every DB link each
+    /// pass (`sseqRecord.c:874`, `:910`); the calcs leave one alone.
     pub repost_local: bool,
     /// The record's `process()` runs `checkLinks` (`calcoutRecord.c:234`), so
     /// it takes `CycleHooks::LINK_CHECK`; sseq's runs it only from its
@@ -353,12 +352,13 @@ pub struct LinkCheck<'a> {
     pub tail: Option<&'a mut dyn LinkCheckTail>,
 }
 
-/// The rest of a record's `checkLinks` pass once the statuses are read: sseq's
+/// The rest of a record's `checkLinks` pass once the links are read: sseq's
 /// `waitConfigErr` (`sseqRecord.c:912-933`).
 pub trait LinkCheckTail {
-    /// Recompute from the pass's `statuses`; bit `i` set means
-    /// [`Self::fields`]`[i]` moved and posts.
-    fn pass(&mut self, statuses: &[i16]) -> u64;
+    /// Recompute from the links the pass found to be a `DB_LINK`, bit `i` for
+    /// `spec.links[i]`; bit `i` of the result set means [`Self::fields`]`[i]`
+    /// moved and posts.
+    fn pass(&mut self, db_links: u64) -> u64;
     fn fields(&self) -> &'static [&'static str];
 }
 
@@ -385,7 +385,11 @@ pub fn classify_link(
         LinkRole::Output => LinkFieldType::Out,
     };
     let parsed = parse_link_field(link.as_ref(), ftype);
-    if matches!(parsed.link_type(), LinkType::Empty | LinkType::Constant) {
+    // Base calcout asks `dbLinkIsConstant`; synApps and sseq ask
+    // `type == CONSTANT` and send a `{const:…}` JSON link to `dbNameToAddr`
+    // of its `pv_link.pvname`, a union member a JSON link never set. That C
+    // defect is not copied: a constant lset is constant.
+    if crate::server::recgbl::simm::is_constant(&parsed) {
         return (LINK_CON, DBF_UNKNOWN);
     }
     // Base calcout asks the lset (`dbLink.c:220-235`): a hardware link has
@@ -410,7 +414,7 @@ pub fn classify_link(
     // dbCaTask is paused until `dbCaRun` (dbCa.c:1173, iocInit.c:260), and
     // `special()` does not ask. Only `checkLinks` reads the connection.
     match local {
-        Some(ft) => (LINK_LOC, dbf_static_code(ft)),
+        Some(dbf) => (LINK_LOC, dbf as i16),
         None => (LINK_EXT_NC, DBF_UNKNOWN),
     }
 }
@@ -436,6 +440,12 @@ pub fn classify_link(
 /// forward-referenced target classifies LOCAL and the result is final when
 /// `iocInit` returns; spawned at once on a complete database. No-op for a
 /// record with no async context.
+///
+/// A put on a complete database is the exception: C's `special()` sets the
+/// status before the put returns, and acalcout's next `fetch_values` reads
+/// INAA..INLL by it (`aCalcoutRecord.c:1078`). So the put link is classified
+/// here, on the caller's thread under the record's write lock, and its status
+/// returned for the caller to store; the task only posts it. Otherwise `None`.
 /// `mask` is the record's own `db_post_events` mask, and it is a parameter
 /// because the four records that route through here do not agree. The three
 /// calcouts post a bare `DBE_VALUE` — `calcoutRecord.c:404`, `:752`, `:757`;
@@ -457,40 +467,59 @@ pub fn post_link_status(
     rule: LinkRule,
     mask: crate::server::recgbl::EventMask,
     posts: LinkStatusPosts,
-) {
-    let Some((name, handle)) = ctx else {
-        return;
-    };
+) -> Option<i16> {
+    let (name, handle) = ctx?;
     let classified = posts.links(links.iter().map(|&(f, _, _)| f));
     if classified == 0 {
-        return;
+        return None;
     }
     let recheck = match posts {
         LinkStatusPosts::All => rule.init_recheck(),
         LinkStatusPosts::Put(_) => Some(LINK_RECHECK),
     };
-    let name = name.clone();
-    let handle = handle.clone();
     // Stamp before the spawn, on the caller's thread, under the record's
     // write lock (see `LinkStatusGen`).
     let token = generation.next_for(classified);
+    let now = (matches!(posts, LinkStatusPosts::Put(_)) && handle.classifies_links_at_once())
+        .then(|| classify_links(handle, &links, classified, rule));
+    let stored = now.as_ref().and_then(|now| now.first()).map(|&(_, _, s)| s);
+    let name = name.clone();
+    let handle = handle.clone();
     let sched = handle.clone();
     let init_key = name.clone();
     sched.schedule_record_init(&init_key, async move {
-        let fields: Vec<(usize, String, EpicsValue)> = links
+        let (statuses, post) = match now {
+            Some(now) => (now, PostRule::Held),
+            None => (
+                classify_links(&handle, &links, classified, rule),
+                PostRule::Always,
+            ),
+        };
+        let fields = statuses
             .into_iter()
-            .enumerate()
-            .filter(|&(i, _)| classified & 1 << i != 0)
-            .map(|(i, (field, link, role))| {
-                let (status, _ft) = classify_link(&handle, &link, role, rule);
-                (i, field.to_string(), EpicsValue::Enum(status as u16))
-            })
+            .map(|(i, field, status)| (i, field.to_string(), EpicsValue::Enum(status as u16), post))
             .collect();
         #[cfg(test)]
         tests::hold_before_post().await;
-        token.post_each(&handle, &name, fields, mask);
+        token.post_each_ruled(&handle, &name, fields, mask);
         handle.link_check_classified(&name, recheck);
     });
+    stored
+}
+
+/// `(i, field, status)` for each link `i` of `links` at a bit of `classified`.
+fn classify_links(
+    handle: &AsyncDbHandle,
+    links: &[(&'static str, PvString, LinkRole)],
+    classified: u64,
+    rule: LinkRule,
+) -> Vec<(usize, &'static str, i16)> {
+    links
+        .iter()
+        .enumerate()
+        .filter(|&(i, _)| classified & 1 << i != 0)
+        .map(|(i, (field, link, role))| (i, *field, classify_link(handle, link, *role, rule).0))
+        .collect()
 }
 
 /// Which links a link-status refresh classifies; C posts each status it
@@ -535,7 +564,7 @@ mod tests {
 
     use tokio::sync::oneshot;
 
-    use crate::server::database::PvDatabase;
+    use crate::server::database::{ProcStack, PvDatabase};
     use crate::server::recgbl::EventMask;
     use crate::server::records::ai::AiRecord;
     use crate::server::records::scalcout::ScalcoutRecord;
@@ -600,7 +629,7 @@ mod tests {
             let mut guard = rec.write();
             release.send(()).unwrap();
             resumed
-                .recv_timeout(Duration::from_secs(5))
+                .recv_timeout(fact_budget::FACT_BUDGET)
                 .expect("put 1's task resumed");
             // The few instructions from the hold to the post's lock.
             std::thread::sleep(Duration::from_millis(50));
@@ -669,7 +698,13 @@ mod tests {
             sc.put_field(link, EpicsValue::String("SRC".into()))
                 .unwrap();
         }
-        db.add_record("SC", Box::new(sc)).await.unwrap();
+        // `add_record` returns only once init has posted, so the put below
+        // comes from another thread, as a CA client's would.
+        let adder = db.clone();
+        let added = crate::runtime::task::spawn_background(
+            crate::runtime::task::CallbackPriority::Medium,
+            async move { adder.add_record("SC", Box::new(sc)).await.unwrap() },
+        );
         arrived.await.expect("init's task reached its post");
 
         let rec = db.get_record("SC").unwrap();
@@ -685,7 +720,7 @@ mod tests {
             let mut guard = rec.write();
             release.send(()).unwrap();
             resumed
-                .recv_timeout(Duration::from_secs(5))
+                .recv_timeout(fact_budget::FACT_BUDGET)
                 .expect("init's task resumed");
             std::thread::sleep(Duration::from_millis(50));
             guard
@@ -697,6 +732,7 @@ mod tests {
                 .special("INPA", true, &Default::default())
                 .unwrap();
         }
+        added.await.expect("add_record returned");
         crate::runtime::task::sleep(Duration::from_millis(100)).await;
 
         let mut drain = |i: usize| {
@@ -712,5 +748,95 @@ mod tests {
             [drain(0), drain(1), drain(2)],
             [constant.clone(), local, constant]
         );
+    }
+
+    /// C `special()` stores a re-pointed link's status before the put
+    /// returns, and acalcout reads INAA..INLL only while that status is EXT or
+    /// LOC (`aCalcoutRecord.c:1078`). With the put's post still in flight, a
+    /// process right after an INAA put reads the new link.
+    #[epics_macros_rs::epics_test]
+    async fn a_process_right_after_an_array_link_put_reads_it() {
+        use crate::server::record::Record;
+        use crate::server::records::acalcout::AcalcoutRecord;
+        let db = PvDatabase::new();
+        db.add_record("SRC", Box::new(AiRecord::new(3.0)))
+            .await
+            .unwrap();
+        let mut ac = AcalcoutRecord::new();
+        ac.put_field("NELM", EpicsValue::Long(4)).unwrap();
+        db.add_record("AC", Box::new(ac)).await.unwrap();
+        db.ioc_init().await;
+        // AC's init classification must not be the task the hold catches.
+        crate::runtime::task::sleep(Duration::from_millis(100)).await;
+
+        let (arrived_tx, arrived) = oneshot::channel();
+        let (release, release_rx) = oneshot::channel();
+        let (resumed_tx, resumed) = std::sync::mpsc::channel();
+        *HOLD.lock().unwrap() = Some((arrived_tx, release_rx, resumed_tx));
+        let link = EpicsValue::String("SRC".into());
+        let held = db.lock_for_put("AC", "INAA", &link);
+        db.put_record_field_from_ca_already_locked(held, link)
+            .unwrap();
+        arrived.await.expect("the put's task reached its post");
+
+        let rec = db.get_record("AC").unwrap();
+        let read = |f: &str| rec.read().record.get_field(f);
+        assert_eq!(read("IAAV"), Some(EpicsValue::Enum(super::LINK_LOC as u16)));
+        db.process_record_with_links("AC", &mut ProcStack::new())
+            .await
+            .unwrap();
+        let aa = match read("AA") {
+            Some(EpicsValue::DoubleArray(a)) => a.to_vec(),
+            other => panic!("AA is {other:?}"),
+        };
+        assert_eq!(aa.first(), Some(&3.0), "AA is {aa:?}");
+
+        release.send(()).unwrap();
+        resumed
+            .recv_timeout(fact_budget::FACT_BUDGET)
+            .expect("the put's task resumed");
+    }
+
+    /// C `init_record` classifies every link before any process
+    /// (`aCalcoutRecord.c:209-243`). A database built without `iocInit` has
+    /// no barrier but `add_record`, so the first process after it reads
+    /// INAA. The hold is released only once the add has had its chance to
+    /// return.
+    #[epics_macros_rs::epics_test]
+    async fn a_process_right_after_add_record_reads_an_array_link() {
+        use crate::server::record::Record;
+        use crate::server::records::acalcout::AcalcoutRecord;
+        let db = PvDatabase::new();
+        db.add_record("SRC", Box::new(AiRecord::new(3.0)))
+            .await
+            .unwrap();
+        let mut ac = AcalcoutRecord::new();
+        ac.put_field("NELM", EpicsValue::Long(4)).unwrap();
+        ac.put_field("INAA", EpicsValue::String("SRC".into()))
+            .unwrap();
+
+        let (arrived_tx, arrived) = oneshot::channel();
+        let (release, release_rx) = oneshot::channel();
+        let (resumed_tx, _resumed) = std::sync::mpsc::channel();
+        *HOLD.lock().unwrap() = Some((arrived_tx, release_rx, resumed_tx));
+        let add = async {
+            db.add_record("AC", Box::new(ac)).await.unwrap();
+            let rec = db.get_record("AC").unwrap();
+            let read = |f: &str| rec.read().record.get_field(f);
+            assert_eq!(read("IAAV"), Some(EpicsValue::Enum(super::LINK_LOC as u16)));
+            db.process_record_with_links("AC", &mut ProcStack::new())
+                .await
+                .unwrap();
+            let aa = match read("AA") {
+                Some(EpicsValue::DoubleArray(a)) => a.to_vec(),
+                other => panic!("AA is {other:?}"),
+            };
+            assert_eq!(aa.first(), Some(&3.0), "AA is {aa:?}");
+        };
+        let unhold = async {
+            arrived.await.expect("AC's init reached its post");
+            release.send(()).unwrap();
+        };
+        tokio::join!(add, unhold);
     }
 }

@@ -8,6 +8,9 @@ bare { out "%(src).1f"; }
 
 # formatValue: dbGet of the field, a CHAR array printed as one string
 own_egu { out "%(EGU)s"; }
+own_desc { out "%(DESC)s"; }
+# the record's own PACT: before Stream::process sets it, then after
+own_pact { out "%(PACT)d"; out "%(PACT)d"; }
 chars { out "%(w)s"; }
 
 # matchValue: dbPutField into another record, dbPut into this one or in @init
@@ -54,3 +57,7 @@ intr_feed { in "%d %(it.VAL)d"; }
 
 # matchValue's debug line: the field buffer, expanded
 put_double { out "Q7"; in "%(t4.VAL)f"; }
+
+# a `$` address: a string field read and written as its characters
+dollar_out { out "%(sd.DESC$)s"; }
+dollar_in { out "Q8"; in "%(sd2.DESC$)s"; }

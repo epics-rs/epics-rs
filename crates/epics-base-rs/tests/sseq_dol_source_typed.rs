@@ -39,7 +39,8 @@ async fn run_step(db: &PvDatabase, sseq: &str, dst: &str, label: &str) {
     db.process_record_with_links(sseq, &mut visited)
         .await
         .unwrap();
-    for _ in 0..400 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if let Some(rec) = db.get_record(dst) {
             let landed = match rec.read().record.get_field("VAL") {
                 Some(EpicsValue::String(s)) => !s.is_empty(),

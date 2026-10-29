@@ -11,7 +11,7 @@ use asyn_rs::interfaces::motor::{
 };
 use asyn_rs::manager::PortManager;
 use asyn_rs::param::{ParamType, ParamValue};
-use asyn_rs::port::PortDriverBase;
+use asyn_rs::port::{InterfaceMask, PortDriverBase};
 use asyn_rs::registry::open_owner;
 use asyn_rs::trace::TraceFile;
 use asyn_rs::user::AsynUser;
@@ -24,6 +24,9 @@ use motor_rs::trace::TraceUser;
 struct Own;
 
 impl ControllerParams for Own {
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::NONE;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::NONE;
+
     fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
         base.create_param("OWN", ParamType::Int32)?;
         Ok(())

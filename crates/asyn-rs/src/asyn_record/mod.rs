@@ -3875,9 +3875,8 @@ impl AsynRecord {
                 // asynRecord.c:1177-1240 — and records what it found. A pure-octet
                 // transport therefore reads back i32iv/ui32iv/f64iv = 0, and
                 // `performIO` refuses I/O on an interface the port does not have
-                // (:1328-1360). The port's answer is the driver's own
-                // `capabilities()` declaration, taken at registration — see
-                // `PortHandle::has_interface`.
+                // (:1328-1360). The port's answer is the driver's interface
+                // mask — see `PortHandle::has_interface`.
                 let has = |iface| i32::from(entry.handle.has_interface(iface));
                 self.octetiv = has(crate::interfaces::InterfaceType::Octet);
                 self.i32iv = has(crate::interfaces::InterfaceType::Int32);
@@ -4030,9 +4029,8 @@ impl AsynRecord {
     /// wait forever and every driver wait built from it is unbounded (DRV-42).
     /// It used to fall back to the bounded [`crate::user::DEFAULT_TIMEOUT`], so
     /// a record told to wait forever timed out after a second and raised a
-    /// READ/WRITE alarm C never raises. A non-finite or out-of-range TMOT still
-    /// takes that fallback — C's `(int)` cast of such a value is undefined
-    /// behaviour, so there is no C semantics to port.
+    /// READ/WRITE alarm C never raises. A NaN TMOT waits forever as well, and
+    /// one past ten years takes C's event-wait cap.
     ///
     /// The mapping itself belongs to [`crate::user::timeout_from_secs`], the
     /// crate-wide owner of `f64 seconds` → `AsynUser::timeout`; this method only
@@ -5501,6 +5499,10 @@ impl Record for AsynRecord {
         }
     }
 
+    fn dbaddr_capacity_inputs(&self) -> Option<&'static [&'static str]> {
+        Some(&[])
+    }
+
     /// `post_fields_with_mask` writes a posted ERRS back through this path;
     /// it goes straight to `store_errs`, since the default's coercion
     /// would allocate the `ERR_SIZE` buffer `get_field` serves.
@@ -6242,8 +6244,8 @@ mod tests {
                 name,
                 1,
                 flags,
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::NONE,
+                InterfaceMask::NONE,
             )),
             RuntimeConfig::default(),
         )
@@ -6362,8 +6364,13 @@ mod tests {
                 name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OPTION
+                    | InterfaceMask::INT32
+                    | InterfaceMask::UINT32_DIGITAL
+                    | InterfaceMask::FLOAT64
+                    | InterfaceMask::OCTET
+                    | InterfaceMask::DRV_USER,
+                InterfaceMask::NONE,
             );
             base.init_connected(connected);
             base.init_auto_connect(false);
@@ -6494,8 +6501,8 @@ mod tests {
             port_name,
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OPTION | InterfaceMask::OCTET | InterfaceMask::DRV_USER,
+            InterfaceMask::NONE,
         );
         // The port's first parameter — reason 0.
         assert_eq!(
@@ -6621,8 +6628,8 @@ mod tests {
             port_name,
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OPTION,
+            InterfaceMask::NONE,
         );
         // The port is down and nothing will bring it back: C's `autoConnectDevice`
         // is not consulted for a waived request, and must not be needed for one.
@@ -6819,8 +6826,8 @@ mod tests {
                     port_name,
                     1,
                     PortFlags::default(),
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::OPTION | InterfaceMask::OCTET,
+                    InterfaceMask::NONE,
                 ),
                 sets: sets.clone(),
             }),
@@ -6908,8 +6915,8 @@ mod tests {
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OPTION | InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             ))),
             rx,
         );
@@ -6966,8 +6973,8 @@ mod tests {
                     name,
                     1,
                     PortFlags::default(),
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    crate::interfaces::gpib::GPIB_PORT_INTERFACES,
+                    InterfaceMask::NONE,
                 ),
                 calls,
                 poll_byte: None,
@@ -6992,9 +6999,6 @@ mod tests {
         }
         fn base_mut(&mut self) -> &mut PortDriverBase {
             &mut self.base
-        }
-        fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
-            crate::interfaces::gpib::GPIB_PORT_INTERFACES.capabilities()
         }
         fn gpib_universal_cmd(&mut self, _user: &mut AsynUser, cmd: u8) -> AsynResult<()> {
             self.calls.lock().unwrap().universal.push(cmd);
@@ -7146,7 +7150,6 @@ mod tests {
     /// (:821, :825).
     #[test]
     fn a_port_without_asyngpib_refuses_ucmd_and_acmd() {
-        use crate::interfaces::octet_transport_capabilities;
         use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 
         struct OctetTransport(PortDriverBase);
@@ -7157,9 +7160,6 @@ mod tests {
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.0
             }
-            fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
-                octet_transport_capabilities()
-            }
         }
 
         let port_name = "r10_55_no_gpib";
@@ -7168,8 +7168,8 @@ mod tests {
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OCTET_TRANSPORT,
+                InterfaceMask::OCTET,
             )),
             RuntimeConfig::default(),
         )
@@ -7382,8 +7382,8 @@ mod tests {
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OPTION | InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             ))),
             rx,
         );
@@ -7458,8 +7458,8 @@ mod tests {
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OPTION | InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             ))),
             rx,
         );
@@ -7504,8 +7504,8 @@ mod tests {
                     "test_asyn_rec",
                     1,
                     PortFlags::default(),
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::NONE,
+                    InterfaceMask::NONE,
                 ))
             }
         }
@@ -7578,8 +7578,8 @@ mod tests {
                 port_name,
                 2,
                 flags,
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OPTION | InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             ))),
             rx,
         );
@@ -7650,8 +7650,8 @@ mod tests {
                 port_name,
                 4,
                 flags,
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OPTION | InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             ))),
             rx,
         );
@@ -7731,8 +7731,8 @@ mod tests {
                     port_name,
                     max_addr,
                     flags,
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::OPTION | InterfaceMask::OCTET,
+                    InterfaceMask::NONE,
                 ))),
                 rx,
             );
@@ -7949,8 +7949,8 @@ mod tests {
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OPTION | InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             ))),
             rx,
         );
@@ -8012,8 +8012,8 @@ mod tests {
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OPTION | InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             ))),
             rx,
         );
@@ -8102,8 +8102,8 @@ mod tests {
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OPTION | InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             ))),
             rx,
         );
@@ -8212,8 +8212,8 @@ mod tests {
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OPTION | InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             ))),
             rx,
         );
@@ -8314,8 +8314,8 @@ mod tests {
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OPTION | InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             ))),
             rx,
         );
@@ -8499,8 +8499,12 @@ mod tests {
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OPTION
+                    | InterfaceMask::INT32
+                    | InterfaceMask::UINT32_DIGITAL
+                    | InterfaceMask::FLOAT64
+                    | InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             ))),
             rx,
         );
@@ -8602,8 +8606,12 @@ mod tests {
             port_name,
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OPTION
+                | InterfaceMask::INT32
+                | InterfaceMask::UINT32_DIGITAL
+                | InterfaceMask::FLOAT64
+                | InterfaceMask::OCTET,
+            InterfaceMask::NONE,
         );
         let i32p = base.create_param("I32", ParamType::Int32).unwrap();
         let u32p = base.create_param("U32", ParamType::UInt32Digital).unwrap();
@@ -8753,8 +8761,8 @@ mod tests {
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OPTION | InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             ))),
             rx,
         );
@@ -8857,8 +8865,8 @@ mod tests {
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OPTION | InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             ))),
             rx,
         );
@@ -8965,8 +8973,8 @@ mod tests {
                     port_name,
                     1,
                     PortFlags::default(),
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::OPTION | InterfaceMask::OCTET,
+                    InterfaceMask::NONE,
                 ),
                 n: 0,
             }),
@@ -9064,8 +9072,8 @@ mod tests {
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OPTION | InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             ))),
             rx,
         );
@@ -9176,8 +9184,8 @@ mod tests {
                     port_name,
                     1,
                     PortFlags::default(),
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::OPTION | InterfaceMask::OCTET,
+                    InterfaceMask::NONE,
                 ),
                 connects: connects.clone(),
                 disconnects: disconnects.clone(),
@@ -9382,8 +9390,8 @@ mod tests {
                     port_name,
                     1,
                     PortFlags::default(),
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::OPTION | InterfaceMask::OCTET,
+                    InterfaceMask::NONE,
                 ),
                 log: log.clone(),
                 connects: connects.clone(),
@@ -9542,23 +9550,21 @@ mod tests {
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OPTION | InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             ))),
             rx,
         );
         let actor_link = actor.link();
         std::thread::spawn(actor.registered());
         let trace = Arc::new(TraceManager::new());
-        let mut handle = PortHandle::new(
+        let handle = PortHandle::new(
             tx,
             port_name.into(),
             Arc::new(InterruptManager::new()),
             actor_link,
             trace.clone(),
         );
-        // echoDriver's interfaces: asynCommon and asynOctet.
-        handle.set_interfaces(crate::interfaces::octet_transport_capabilities());
         register_port(port_name, handle, &crate::registry::open_owner()).unwrap();
         let path = std::env::temp_dir().join(format!("as15-trace-{}", std::process::id()));
         let file = std::fs::File::create(&path).unwrap();
@@ -9603,7 +9609,6 @@ mod tests {
     /// them: ERRS reads "queueRequest failed" and the fields keep their puts.
     #[test]
     fn a_refused_cycle_leaves_the_callbacks_work_undone() {
-        use crate::interfaces::octet_transport_capabilities;
         use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 
         struct OctetTransport(PortDriverBase);
@@ -9614,9 +9619,6 @@ mod tests {
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.0
             }
-            fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
-                octet_transport_capabilities()
-            }
         }
 
         let port_name = "refused_cycle";
@@ -9625,8 +9627,8 @@ mod tests {
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OCTET_TRANSPORT,
+                InterfaceMask::OCTET,
             )),
             RuntimeConfig::default(),
         )
@@ -9719,8 +9721,13 @@ mod tests {
             port_name,
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OPTION
+                | InterfaceMask::INT32
+                | InterfaceMask::UINT32_DIGITAL
+                | InterfaceMask::FLOAT64
+                | InterfaceMask::OCTET
+                | InterfaceMask::DRV_USER,
+            InterfaceMask::NONE,
         );
         base.set_connected(true);
         base.init_auto_connect(false);
@@ -9877,13 +9884,8 @@ mod tests {
                 can_block: true,
                 ..PortFlags::default()
             };
-            let mut base = PortDriverBase::new(
-                name,
-                1,
-                flags,
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
-            );
+            let mut base =
+                PortDriverBase::new(name, 1, flags, InterfaceMask::INT32, InterfaceMask::NONE);
             base.seconds_between_port_connect = Duration::from_millis(20);
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             let mut actor = PortActor::new(
@@ -10042,7 +10044,9 @@ mod tests {
             port.handle.clone(),
             0,
             Duration::from_millis(200),
-        );
+            crate::interfaces::InterfaceType::Int32,
+        )
+        .unwrap();
         let (got_tx, got) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let started = Instant::now();
@@ -10138,8 +10142,8 @@ mod tests {
                         port_name,
                         1,
                         PortFlags::default(),
-                        InterfaceMask::UNMIGRATED_ALL,
-                        InterfaceMask::UNMIGRATED_INTERRUPTS,
+                        InterfaceMask::OPTION | InterfaceMask::OCTET,
+                        InterfaceMask::NONE,
                     ),
                     accept,
                     fail,
@@ -10274,8 +10278,8 @@ mod tests {
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OPTION | InterfaceMask::INT32 | InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             ))),
             rx,
         );
@@ -10397,8 +10401,8 @@ mod tests {
                     port_name,
                     1,
                     PortFlags::default(),
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::OPTION | InterfaceMask::OCTET,
+                    InterfaceMask::NONE,
                 ),
                 fill,
                 eom,
@@ -10459,15 +10463,15 @@ mod tests {
             "negative TMOT is C's unbounded wait, not a bounded default"
         );
         assert_eq!(plan_timeout(-0.001), None);
-        // The values `Duration` cannot carry keep the bounded fallback. C casts
-        // these with `(int)`, which is undefined behaviour, so there is no C
-        // semantics here.
-        assert_eq!(plan_timeout(f64::NAN), Some(Duration::from_secs(1)));
-        assert_eq!(plan_timeout(f64::INFINITY), Some(Duration::from_secs(1)));
+        // The serial driver's sign test sends -inf and NaN, which fails both
+        // its `> 0` and `== 0` tests, to the unbounded wait; +inf takes C's
+        // ten-year event-wait cap.
+        assert_eq!(plan_timeout(f64::NAN), None);
         assert_eq!(
-            plan_timeout(f64::NEG_INFINITY),
-            Some(Duration::from_secs(1))
+            plan_timeout(f64::INFINITY),
+            Some(Duration::from_secs(60 * 60 * 24 * 36525 / 10))
         );
+        assert_eq!(plan_timeout(f64::NEG_INFINITY), None);
     }
 
     /// R9-46, end to end: the TMOT the operator set is the timeout the driver's
@@ -10515,8 +10519,8 @@ mod tests {
                     port_name,
                     1,
                     PortFlags::default(),
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::OPTION | InterfaceMask::OCTET,
+                    InterfaceMask::NONE,
                 ),
                 seen: seen.clone(),
             }),
@@ -10588,8 +10592,8 @@ mod tests {
                     port_name,
                     1,
                     PortFlags::default(),
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::OPTION | InterfaceMask::OCTET,
+                    InterfaceMask::NONE,
                 ),
                 seen: seen.clone(),
             }),
@@ -10698,8 +10702,8 @@ mod tests {
                     port_name,
                     1,
                     PortFlags::default(),
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::OPTION | InterfaceMask::OCTET,
+                    InterfaceMask::NONE,
                 ),
                 log: log.clone(),
             }),
@@ -11398,8 +11402,8 @@ mod tests {
             "ASYNIO",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::INT32,
+            InterfaceMask::NONE,
         );
         let val = base.create_param("VAL", ParamType::Int32).unwrap();
         base.set_int32_param(val, 0, value).unwrap();
@@ -11555,8 +11559,8 @@ mod tests {
                     "ASYNSPQ",
                     1,
                     PortFlags::default(),
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::OPTION | InterfaceMask::INT32,
+                    InterfaceMask::NONE,
                 ),
                 entered: entered.clone(),
                 release: release.clone(),
@@ -11665,8 +11669,8 @@ mod tests {
             "ASYNAQR",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::INT32,
+            InterfaceMask::NONE,
         );
         base.create_param("VAL", ParamType::Int32).unwrap();
         let driver = BlockingReadDriver {
@@ -11786,8 +11790,8 @@ mod tests {
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OPTION | InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             ))),
             rx,
         );
@@ -11957,8 +11961,8 @@ A.TMSK 1
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OPTION | InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             ))),
             rx,
         );
@@ -12084,7 +12088,6 @@ A.TMSK 1
     async fn special_callbacks_post_after_the_put_as_the_oracle_does() {
         // C `callbackInit`: no build arms the bands for a bare database.
         epics_base_rs::runtime::task::background_init();
-        use crate::interfaces::Capability;
         use crate::interpose::eos::EosInterpose;
         use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
@@ -12137,14 +12140,6 @@ A.CNCT Disconnect
             }
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.0
-            }
-            fn capabilities(&self) -> Vec<Capability> {
-                vec![
-                    Capability::OctetRead,
-                    Capability::OctetWrite,
-                    Capability::Flush,
-                    Capability::Connect,
-                ]
             }
         }
 
@@ -12254,8 +12249,8 @@ A.OEOS
                     can_block: true,
                     ..PortFlags::default()
                 },
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             );
             base.install_octet_interpose(Box::new(EosInterpose::default()));
             base.set_connected(false);
@@ -12379,7 +12374,6 @@ A.OEOS
     async fn special_readback_runs_in_the_same_port_callback() {
         // C `callbackInit`: no build arms the bands for a bare database.
         epics_base_rs::runtime::task::background_init();
-        use crate::interfaces::Capability;
         use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
@@ -12399,9 +12393,6 @@ A.OEOS
             }
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.base
-            }
-            fn capabilities(&self) -> Vec<Capability> {
-                vec![Capability::OctetRead, Capability::OctetWrite]
             }
             fn set_input_eos(&mut self, _user: &AsynUser, eos: &[u8]) -> AsynResult<()> {
                 if eos == b"\r" {
@@ -12430,8 +12421,8 @@ A.OEOS
                 can_block: true,
                 ..PortFlags::default()
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OCTET,
+            InterfaceMask::NONE,
         );
         let driver = Gated {
             base,
@@ -12529,8 +12520,8 @@ A.OEOS
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OPTION | InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             ))),
             rx,
         );
@@ -12687,8 +12678,8 @@ A.OEOS
             port_name,
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OPTION,
+            InterfaceMask::NONE,
         );
         base.init_connected(false);
         base.init_auto_connect(false);
@@ -12800,9 +12791,6 @@ A.OEOS
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.0
             }
-            fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
-                crate::interfaces::octet_transport_capabilities()
-            }
         }
 
         let port_name = "test_errs_post_order";
@@ -12810,8 +12798,8 @@ A.OEOS
             port_name,
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OCTET_TRANSPORT,
+            InterfaceMask::OCTET,
         );
         base.init_connected(false);
         base.init_auto_connect(false);
@@ -12961,9 +12949,6 @@ A.OEOS
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.0
             }
-            fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
-                crate::interfaces::octet_transport_capabilities()
-            }
             fn get_option(
                 &self,
                 _user: &crate::user::AsynUser,
@@ -12984,8 +12969,8 @@ A.OEOS
             port_name,
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OCTET_TRANSPORT,
+            InterfaceMask::OCTET,
         );
         // See `connect_device_reads_the_eos_back_from_the_driver`: an EOS is
         // only settable on a port carrying C's `asynInterposeEos` (R18-71).
@@ -13106,8 +13091,8 @@ A.OEOS
             port_name,
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OPTION | InterfaceMask::OCTET,
+            InterfaceMask::NONE,
         );
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(SteadyDevice(base)), rx);
@@ -13214,8 +13199,8 @@ A.OEOS
             port_name,
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OPTION | InterfaceMask::OCTET,
+            InterfaceMask::NONE,
         );
         base.bind_exception_sink(exceptions.clone());
         let (tx, rx) = mpsc::unbounded_channel();
@@ -13320,8 +13305,8 @@ A.OEOS
             port_name,
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OPTION | InterfaceMask::OCTET,
+            InterfaceMask::NONE,
         );
         base.bind_exception_sink(exceptions.clone());
         let (tx, rx) = mpsc::unbounded_channel();
@@ -13451,8 +13436,8 @@ A.OEOS
             port_name,
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OPTION | InterfaceMask::OCTET,
+            InterfaceMask::NONE,
         );
         base.bind_exception_sink(exceptions.clone());
         let (tx, rx) = mpsc::unbounded_channel();
@@ -13520,8 +13505,8 @@ A.OEOS
             port_name,
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OPTION | InterfaceMask::OCTET,
+            InterfaceMask::NONE,
         );
         base.bind_exception_sink(exceptions.clone());
         let (tx, rx) = mpsc::unbounded_channel();
@@ -13600,8 +13585,8 @@ A.OEOS
             port_name,
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OPTION | InterfaceMask::OCTET,
+            InterfaceMask::NONE,
         );
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(PlainDriver(base)), rx);
@@ -13673,8 +13658,8 @@ A.OEOS
             port_name,
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OPTION | InterfaceMask::OCTET,
+            InterfaceMask::NONE,
         );
         base.bind_exception_sink(exceptions.clone());
         let (tx, rx) = mpsc::unbounded_channel();
@@ -13785,7 +13770,6 @@ A.OEOS
     /// support instead of being refused.
     #[test]
     fn connect_device_reads_the_ports_interface_registry() {
-        use crate::interfaces::octet_transport_capabilities;
         use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
@@ -13800,9 +13784,6 @@ A.OEOS
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.0
             }
-            fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
-                octet_transport_capabilities()
-            }
         }
 
         let port_name = "r9_53_octet_transport";
@@ -13811,8 +13792,8 @@ A.OEOS
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OCTET_TRANSPORT,
+                InterfaceMask::OCTET,
             )),
             RuntimeConfig::default(),
         )
@@ -13868,7 +13849,6 @@ A.OEOS
     /// the driver and the negotiation used a private 2 s.
     #[test]
     fn an_option_put_reaches_the_driver_with_the_records_tmot() {
-        use crate::interfaces::{Capability, octet_transport_capabilities};
         use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
@@ -13884,9 +13864,6 @@ A.OEOS
             }
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.0
-            }
-            fn capabilities(&self) -> Vec<Capability> {
-                octet_transport_capabilities()
             }
             fn set_option(
                 &mut self,
@@ -13905,8 +13882,8 @@ A.OEOS
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OCTET_TRANSPORT,
+                InterfaceMask::OCTET,
             )),
             RuntimeConfig::default(),
         )
@@ -13940,7 +13917,6 @@ A.OEOS
     /// the driver.
     #[test]
     fn option_and_eos_are_refused_on_a_port_that_lacks_the_interface() {
-        use crate::interfaces::Capability;
         use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
@@ -13955,9 +13931,6 @@ A.OEOS
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.0
             }
-            fn capabilities(&self) -> Vec<Capability> {
-                vec![Capability::OctetRead, Capability::OctetWrite]
-            }
         }
 
         let port_name = "r9_53_no_option";
@@ -13966,8 +13939,8 @@ A.OEOS
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OCTET,
+                InterfaceMask::NONE,
             )),
             RuntimeConfig::default(),
         )
@@ -14147,8 +14120,13 @@ A.OEOS
                     port_name,
                     1,
                     PortFlags::default(),
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::OPTION
+                        | InterfaceMask::INT32
+                        | InterfaceMask::UINT32_DIGITAL
+                        | InterfaceMask::FLOAT64
+                        | InterfaceMask::OCTET
+                        | InterfaceMask::DRV_USER,
+                    InterfaceMask::NONE,
                 ),
                 baud_text,
             ),
@@ -14233,9 +14211,6 @@ A.OEOS
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.0
             }
-            fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
-                crate::interfaces::octet_transport_capabilities()
-            }
         }
 
         let (rt, jh) = create_port_runtime_unclaimed(
@@ -14243,8 +14218,8 @@ A.OEOS
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OCTET_TRANSPORT,
+                InterfaceMask::OCTET,
             )),
             RuntimeConfig::default(),
         )
@@ -14281,8 +14256,13 @@ A.OEOS
             port_name,
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OPTION
+                | InterfaceMask::INT32
+                | InterfaceMask::UINT32_DIGITAL
+                | InterfaceMask::FLOAT64
+                | InterfaceMask::OCTET
+                | InterfaceMask::DRV_USER,
+            InterfaceMask::NONE,
         );
         // Reason 0 is taken by a filler param so the resolved reason is non-zero
         // and cannot be confused with the forced-zero case.
@@ -14365,9 +14345,6 @@ A.OEOS
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.0
             }
-            fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
-                crate::interfaces::octet_transport_capabilities()
-            }
         }
 
         for (port_name, connected) in [("w10_d3_eos_up", true), ("w10_d3_eos_down", false)] {
@@ -14375,8 +14352,8 @@ A.OEOS
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OCTET_TRANSPORT,
+                InterfaceMask::OCTET,
             );
             base.init_auto_connect(false);
             base.init_connected(connected);
@@ -14486,7 +14463,6 @@ A.OEOS
     /// blank buffers over the fields (:1997-1998, :2016-2024).
     #[test]
     fn an_eos_put_without_asyn_octet_reads_back_blank() {
-        use crate::interfaces::Capability;
         use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
@@ -14499,17 +14475,14 @@ A.OEOS
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.0
             }
-            fn capabilities(&self) -> Vec<Capability> {
-                vec![Capability::Int32Read, Capability::Int32Write]
-            }
         }
         let port_name = "as10_no_octet";
         let base = PortDriverBase::new(
             port_name,
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::INT32,
+            InterfaceMask::NONE,
         );
         let (rt, jh) =
             create_port_runtime_unclaimed(Int32Only(base), RuntimeConfig::default()).unwrap();
@@ -14573,8 +14546,13 @@ A.OEOS
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OPTION
+                    | InterfaceMask::INT32
+                    | InterfaceMask::UINT32_DIGITAL
+                    | InterfaceMask::FLOAT64
+                    | InterfaceMask::OCTET
+                    | InterfaceMask::DRV_USER,
+                InterfaceMask::NONE,
             );
             base.set_connected(connected);
             base.init_auto_connect(false);
@@ -14689,8 +14667,13 @@ A.OEOS
             port_name,
             1,
             PortFlags::default(),
-            crate::port::InterfaceMask::UNMIGRATED_ALL,
-            crate::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+            crate::port::InterfaceMask::OPTION
+                | crate::port::InterfaceMask::INT32
+                | crate::port::InterfaceMask::UINT32_DIGITAL
+                | crate::port::InterfaceMask::FLOAT64
+                | crate::port::InterfaceMask::OCTET
+                | crate::port::InterfaceMask::DRV_USER,
+            crate::port::InterfaceMask::OCTET,
         );
         base.params
             .create_param("START_", ParamType::Int32)
@@ -14863,8 +14846,16 @@ A.OEOS
                     name,
                     1,
                     PortFlags::default(),
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::OPTION
+                        | InterfaceMask::INT32
+                        | InterfaceMask::UINT32_DIGITAL
+                        | InterfaceMask::FLOAT64
+                        | InterfaceMask::OCTET
+                        | InterfaceMask::DRV_USER,
+                    InterfaceMask::INT32
+                        | InterfaceMask::UINT32_DIGITAL
+                        | InterfaceMask::FLOAT64
+                        | InterfaceMask::OCTET,
                 ),
                 reads: reads.clone(),
             },
@@ -15269,7 +15260,6 @@ A.OEOS
     /// which leaves the record off the scan list (asynRecord.c:625-628).
     #[test]
     fn arming_io_intr_against_a_port_without_the_iface_reports_the_c_text() {
-        use crate::interfaces::octet_transport_capabilities;
         use crate::param::ParamValue;
         use crate::port::PortFlags;
         use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
@@ -15282,9 +15272,6 @@ A.OEOS
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.0
             }
-            fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
-                octet_transport_capabilities()
-            }
         }
 
         let port_name = "r11_46_no_int32";
@@ -15293,8 +15280,8 @@ A.OEOS
                 port_name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OCTET_TRANSPORT,
+                InterfaceMask::OCTET,
             )),
             RuntimeConfig::default(),
         )

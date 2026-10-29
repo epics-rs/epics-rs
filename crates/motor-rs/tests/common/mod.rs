@@ -47,13 +47,12 @@ impl AsynMotor for ExactMotor {
     }
     fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> Result<(), AsynError> {
         *status = MotorStatus {
-            position: self.position,
             done: !self.moving,
             powered: self.powered,
             gain_support: self.gain_support,
             comms_error: self.comms_error,
             direction: self.direction,
-            ..MotorStatus::default()
+            ..MotorStatus::default().with_position(self.position)
         };
         Ok(())
     }

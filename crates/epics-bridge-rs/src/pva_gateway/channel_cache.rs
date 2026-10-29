@@ -31,6 +31,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -39,7 +40,7 @@ use std::time::Duration;
 use parking_lot::RwLock;
 use tokio::sync::{Mutex, Notify, broadcast};
 
-use epics_base_rs::runtime::task::Reactor;
+use epics_base_rs::runtime::task::{Period, Reactor};
 use epics_base_rs::types::RecordName;
 use epics_pva_rs::client::PvaClient;
 use epics_pva_rs::pvdata::{FieldDesc, PvField};
@@ -55,7 +56,7 @@ use super::error::{GwError, GwResult};
 pub const BROADCAST_CAPACITY: usize = 16;
 
 /// Default cache cleanup period — matches p2pApp `cacheClean` 30 s.
-pub const DEFAULT_CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
+pub const DEFAULT_CLEANUP_INTERVAL: Period = Period::from_secs(NonZeroU64::new(30).unwrap());
 
 /// Default ceiling on cached entries. A misbehaving client searching
 /// random PV names would otherwise cause the cache to grow until
@@ -758,7 +759,7 @@ impl ChannelCache {
     /// resulting cache uses [`DEFAULT_MAX_ENTRIES`] for its ceiling;
     /// override via [`Self::with_max_entries`] before publishing the
     /// `Arc` if a larger or smaller cap is needed.
-    pub fn new(reactor: Reactor, client: Arc<PvaClient>, cleanup_interval: Duration) -> Arc<Self> {
+    pub fn new(reactor: Reactor, client: Arc<PvaClient>, cleanup_interval: Period) -> Arc<Self> {
         Self::with_max_entries(reactor, client, cleanup_interval, DEFAULT_MAX_ENTRIES)
     }
 
@@ -766,7 +767,7 @@ impl ChannelCache {
     pub fn with_max_entries(
         reactor: Reactor,
         client: Arc<PvaClient>,
-        cleanup_interval: Duration,
+        cleanup_interval: Period,
         max_entries: usize,
     ) -> Arc<Self> {
         let cache = Arc::new(Self {
@@ -2185,7 +2186,11 @@ mod tests {
     #[tokio::test]
     async fn drop_entry_publishes_removed_name_on_invalidator() {
         let client = Arc::new(PvaClient::builder().build());
-        let cache = ChannelCache::new(crate::test_reactor(), client, Duration::from_secs(60));
+        let cache = ChannelCache::new(
+            crate::test_reactor(),
+            client,
+            Period::new(Duration::from_secs(60)).unwrap(),
+        );
         let inv = ChannelInvalidator::new();
         let mut rx = inv.subscribe();
         cache.set_invalidator(inv.clone());
@@ -2214,7 +2219,11 @@ mod tests {
     #[tokio::test]
     async fn flush_publishes_all_removed_names_in_one_batch() {
         let client = Arc::new(PvaClient::builder().build());
-        let cache = ChannelCache::new(crate::test_reactor(), client, Duration::from_secs(60));
+        let cache = ChannelCache::new(
+            crate::test_reactor(),
+            client,
+            Period::new(Duration::from_secs(60)).unwrap(),
+        );
         let inv = ChannelInvalidator::new();
         let mut rx = inv.subscribe();
         cache.set_invalidator(inv.clone());
@@ -2250,7 +2259,11 @@ mod tests {
     #[tokio::test]
     async fn monitor_variants_count_as_one_channel() {
         let client = Arc::new(PvaClient::builder().build());
-        let cache = ChannelCache::new(crate::test_reactor(), client, Duration::from_secs(60));
+        let cache = ChannelCache::new(
+            crate::test_reactor(),
+            client,
+            Period::new(Duration::from_secs(60)).unwrap(),
+        );
         // Same PV name, three distinct serialized-pvRequest keys.
         cache.insert_test_variant("VAR:PV", Vec::new()).await;
         cache.insert_test_variant("VAR:PV", vec![1, 2, 3]).await;
@@ -2296,7 +2309,11 @@ mod tests {
     #[tokio::test]
     async fn connection_admission_counts_ages_out_and_drops() {
         let client = Arc::new(PvaClient::builder().build());
-        let cache = ChannelCache::new(crate::test_reactor(), client, Duration::from_secs(60));
+        let cache = ChannelCache::new(
+            crate::test_reactor(),
+            client,
+            Period::new(Duration::from_secs(60)).unwrap(),
+        );
 
         cache.insert_test_connection("CONN:PV").await;
         assert_eq!(
@@ -2353,7 +2370,11 @@ mod tests {
     #[tokio::test]
     async fn unwired_cache_drop_and_flush_are_silent() {
         let client = Arc::new(PvaClient::builder().build());
-        let cache = ChannelCache::new(crate::test_reactor(), client, Duration::from_secs(60));
+        let cache = ChannelCache::new(
+            crate::test_reactor(),
+            client,
+            Period::new(Duration::from_secs(60)).unwrap(),
+        );
         cache.insert_test_entry("WM:PV").await;
         assert!(cache.drop_entry("WM:PV").await);
         cache.insert_test_entry("WM:PV2").await;

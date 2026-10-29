@@ -34,7 +34,7 @@ impl SimMotorHolder {
             .unwrap_or_else(|e| e.into_inner())
             .iter()
         {
-            let _ = tx.try_send(crate::poll_loop::PollCommand::ForcePoll);
+            let _ = tx.try_send(crate::poll_loop::PollCommand::ForcePoll(None));
         }
     }
 

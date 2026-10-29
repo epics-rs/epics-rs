@@ -57,8 +57,8 @@ async fn only_an_octet_output_reads_the_initial_readback_tag() {
         "INITRB",
         1,
         PortFlags::default(),
-        InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::INT32 | InterfaceMask::OCTET | InterfaceMask::DRV_USER,
+        InterfaceMask::NONE,
     );
     let i32 = base.create_param("I32", ParamType::Int32).unwrap();
     let f64 = base.create_param("F64", ParamType::Float64).unwrap();

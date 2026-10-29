@@ -98,7 +98,7 @@ async fn idle(db: &PvDatabase, ack: &str, msg1: &str) {
 }
 
 /// Run `posts` once the sequencer has passed waitForCmndEnter's efClears
-/// (hrCtl.st:603-680): OperAck sends it there, and the enter's `opAck = 0` follows them.
+/// (hrCtl.st:606-682): OperAck sends it there, and the enter's `opAck = 0` follows them.
 /// Its puts are queued, so no record lock can hold it inside the enter.
 async fn post_after_enter(db: &PvDatabase, posts: impl FnOnce(&PvDatabase)) {
     idle(db, "H:HR1_OperAckBO", "H:HR1_SeqMsg1SI").await;
@@ -156,7 +156,7 @@ async fn wait_near(ioc: &PvDatabase, pv: &str, want: f64) {
 }
 
 /// A motor soft-limit change, UseSet=Set and UseSet=Use each run C's
-/// phiLimits (hrCtl.st:697-703, :765-783): Set zeroes the drive limits,
+/// phiLimits (hrCtl.st:700-706, :768-786): Set zeroes the drive limits,
 /// Use derives them again from the motor HLM/LLM.
 #[epics_base_rs::epics_test]
 async fn use_set_zeroes_the_drive_limits_and_use_restores_them() {
@@ -169,7 +169,7 @@ async fn use_set_zeroes_the_drive_limits_and_use_restores_them() {
             db.put_record_field_from_ca(rec, field, v).await.unwrap();
         }
     };
-    // phi1Hi = phi1MotHiLim*uR2D + phi1Off + worldOff*uR2D (hrCtl.st:845).
+    // phi1Hi = phi1MotHiLim*uR2D + phi1Off + worldOff*uR2D (hrCtl.st:848).
     let want = 1e6 * UR2D
         + f64_of(&ioc, "H:HR1_phi1OffAO").await
         + f64_of(&ioc, "H:HR1_worldOffAO").await * UR2D;
@@ -226,7 +226,7 @@ async fn set_mode_takes_e_as_its_own_limit_put_clamped_it() {
 }
 
 /// updatePsuedo echoes each motor's VAL and DMOV as it is posted, with no
-/// command pass (hrCtl.st:1511-1533).
+/// command pass (hrCtl.st:1518-1540).
 #[epics_base_rs::epics_test]
 async fn the_cmd_and_dmov_echoes_follow_the_motor_monitors() {
     let (ioc, _scan) = boot().await;
@@ -253,6 +253,85 @@ async fn the_cmd_and_dmov_echoes_follow_the_motor_monitors() {
     }
 }
 
+async fn put_process(ioc: &PvDatabase, pv: &str, v: f64) {
+    optics_rs::db_access::DbChannel::new(ioc, pv)
+        .put_f64_process(v)
+        .await
+        .unwrap();
+}
+
+/// calcMovements' phi1MotDesired for `theta1`, with opMode 0
+/// (hrCtl.st:1184, :1239).
+async fn desired(ioc: &PvDatabase, theta1: f64) -> f64 {
+    let off = f64_of(ioc, "H:HR1_phi1OffAO").await + f64_of(ioc, "H:HR1_worldOffAO").await * UR2D;
+    (theta1 - off) / UR2D
+}
+
+/// Press Put, then find phi1's VAL at the move to `theta1`.
+async fn moves_to(ioc: &PvDatabase, theta1: f64) {
+    put_process(ioc, "H:HR1_PutBO", 1.0).await;
+    moved_to(ioc, theta1).await;
+}
+
+async fn moved_to(ioc: &PvDatabase, theta1: f64) {
+    wait_near(ioc, "H:HR1_PutBO", 0.0).await;
+    let (got, want) = (f64_of(ioc, "H:p1.VAL").await, desired(ioc, theta1).await);
+    assert!((got - want).abs() < 1e-4, "H:p1.VAL: {got}, want {want}");
+}
+
+/// Put goes where its own pass calculated, though the 20 pass's Desired
+/// echo lands inside that pass (C defect, hrCtl.st:337-345).
+#[epics_base_rs::epics_test]
+async fn a_late_desired_echo_leaves_the_move_at_the_put_pass() {
+    let (ioc, _scan) = boot().await;
+    let db = PvDatabase::clone(&ioc);
+    idle(&db, "H:HR1_OperAckBO", "H:HR1_SeqMsg1SI").await;
+    // The boot passes' Desired echoes are in.
+    task::sleep(Duration::from_millis(2500)).await;
+    let t0 = std::time::Instant::now();
+    put_process(&ioc, "H:HR1_Theta1AO", 20.0).await;
+    wait_near(&ioc, "H:HR1_phi1SetAO", desired(&ioc, 20.0).await).await;
+    task::sleep(Duration::from_secs(1).saturating_sub(t0.elapsed())).await;
+    put_process(&ioc, "H:HR1_Theta1AO", 30.0).await;
+    wait_near(&ioc, "H:HR1_phi1SetAO", desired(&ioc, 30.0).await).await;
+    // Under a 2 s echo delay and a 0.8 s put delay, the 20 echo lands
+    // between the Put pass's assignment and its copy, the 30 echo after.
+    task::sleep(Duration::from_millis(2400).saturating_sub(t0.elapsed())).await;
+    moves_to(&ioc, 30.0).await;
+}
+
+/// Put recalculates the Desired values, so an edit before it is not
+/// moved to, in C as here.
+#[epics_base_rs::epics_test]
+async fn a_desired_edit_before_put_is_recalculated() {
+    let (ioc, _scan) = boot().await;
+    let db = PvDatabase::clone(&ioc);
+    idle(&db, "H:HR1_OperAckBO", "H:HR1_SeqMsg1SI").await;
+    put_process(&ioc, "H:HR1_Theta1AO", 20.0).await;
+    wait_near(&ioc, "H:HR1_phi1SetAO", desired(&ioc, 20.0).await).await;
+    put_process(&ioc, "H:HR1_phi1SetAO", desired(&ioc, 25.0).await).await;
+    task::sleep(Duration::from_millis(500)).await;
+    moves_to(&ioc, 20.0).await;
+}
+
+/// A Desired edit landing inside the Put pass is dropped: Put goes where
+/// the pass calculated, where C took the edit (C defect, hrCtl.st:337-345).
+#[epics_base_rs::epics_test]
+async fn a_desired_edit_inside_the_put_pass_is_dropped() {
+    let (ioc, _scan) = boot().await;
+    let db = PvDatabase::clone(&ioc);
+    idle(&db, "H:HR1_OperAckBO", "H:HR1_SeqMsg1SI").await;
+    put_process(&ioc, "H:HR1_Theta1AO", 20.0).await;
+    wait_near(&ioc, "H:HR1_phi1SetAO", desired(&ioc, 20.0).await).await;
+    let edit = desired(&ioc, 25.0).await;
+    put_process(&ioc, "H:HR1_PutBO", 1.0).await;
+    // Under a 1 s put delay, the edit lands between the Put pass's
+    // assignment and its put.
+    task::sleep(Duration::from_millis(500)).await;
+    put_process(&ioc, "H:HR1_phi1SetAO", edit).await;
+    moved_to(&ioc, 20.0).await;
+}
+
 const CHILD: &str = "HR_CTL_DEBUG_CHILD";
 
 /// `test` run again in a child whose stdout is not captured, and the
@@ -277,8 +356,8 @@ fn trace_of(test: &str) -> Vec<String> {
 }
 
 /// With hrCtlDebug set, an opMode change prints C's lines: each state's
-/// entry block and the clauses it takes (hrCtl.st:785-791, :1225-1312,
-/// :599-695).
+/// entry block and the clauses it takes (hrCtl.st:788-794, :1232-1319,
+/// :602-698).
 #[epics_base_rs::epics_test]
 async fn debug_prints_c_lines() {
     if std::env::var_os(CHILD).is_none() {

@@ -69,8 +69,8 @@ fn port(
             can_block,
             ..PortFlags::default()
         },
-        InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_INTERRUPTS,
+        InterfaceMask::OCTET | InterfaceMask::DRV_USER,
+        InterfaceMask::NONE,
     );
     base.create_param("MSG", ParamType::Octet).unwrap();
     let driver = ShortWriter {

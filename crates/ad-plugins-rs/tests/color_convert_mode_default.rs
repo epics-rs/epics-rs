@@ -28,7 +28,7 @@
 
 use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
 use ad_core_rs::color::{NDBayerPattern, NDColorMode};
-use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
+use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::{NDPluginProcess, ProcessResult};
 use ad_plugins_rs::color_convert::{ColorConvertConfig, ColorConvertProcessor};
@@ -44,16 +44,14 @@ fn processor(target: NDColorMode) -> ColorConvertProcessor {
 
 /// `[3, 4, 4]` u8, ascending samples, no ColorMode attribute.
 fn stack_3x4x4() -> NDArray {
-    let mut arr = NDArray::new(
+    NDArray::with_data(
         vec![
             NDDimension::new(3),
             NDDimension::new(4),
             NDDimension::new(4),
         ],
-        NDDataType::UInt8,
-    );
-    arr.data = NDDataBuffer::U8((0..48u8).collect());
-    arr
+        NDDataBuffer::from_vec::<u8>((0..48u8).collect()),
+    )
 }
 
 fn run(proc: &mut ColorConvertProcessor, arr: &NDArray) -> ProcessResult {
@@ -93,8 +91,8 @@ fn r9_80_a_3d_stack_is_forwarded_untouched_not_converted_as_rgb() {
     );
     assert_eq!(out.dims[0].size, 3);
     assert_eq!(
-        out.data.as_u8_slice(),
-        arr.data.as_u8_slice(),
+        out.data().as_u8_slice(),
+        arr.data().as_u8_slice(),
         "and the samples are the input's, not a luminance conversion of them"
     );
     assert!(
@@ -121,8 +119,10 @@ fn r9_80_a_trailing_or_middle_size_3_dimension_is_not_rgb3_or_rgb2() {
             NDDimension::new(4),
         ],
     ] {
-        let mut arr = NDArray::new(dims.clone(), NDDataType::UInt8);
-        arr.data = NDDataBuffer::U8((0..48u8).collect());
+        let arr = NDArray::with_data(
+            dims.clone(),
+            NDDataBuffer::from_vec::<u8>((0..48u8).collect()),
+        );
         let mut proc = processor(NDColorMode::RGB1);
 
         let result = run(&mut proc, &arr);
@@ -139,8 +139,8 @@ fn r9_80_a_trailing_or_middle_size_3_dimension_is_not_rgb3_or_rgb2() {
             "forwarded with its shape intact — no RGB layout shuffle"
         );
         assert_eq!(
-            out.data.as_u8_slice(),
-            arr.data.as_u8_slice(),
+            out.data().as_u8_slice(),
+            arr.data().as_u8_slice(),
             "and its samples intact"
         );
         assert!(
@@ -155,11 +155,10 @@ fn r9_80_a_trailing_or_middle_size_3_dimension_is_not_rgb3_or_rgb2() {
 /// input. The port returned an empty result — the frame vanished from the chain.
 #[test]
 fn r9_80_an_unsupported_target_forwards_the_frame_instead_of_dropping_it() {
-    let mut arr = NDArray::new(
+    let arr = NDArray::with_data(
         vec![NDDimension::new(4), NDDimension::new(4)],
-        NDDataType::UInt8,
+        NDDataBuffer::from_vec::<u8>((0..16u8).collect()),
     );
-    arr.data = NDDataBuffer::U8((0..16u8).collect());
     let mut proc = processor(NDColorMode::Bayer);
 
     let result = run(&mut proc, &arr);
@@ -170,8 +169,8 @@ fn r9_80_an_unsupported_target_forwards_the_frame_instead_of_dropping_it() {
         "Mono -> Bayer has no arm in C; :584 still forwards the array"
     );
     assert_eq!(
-        result.output_arrays[0].data.as_u8_slice(),
-        arr.data.as_u8_slice(),
+        result.output_arrays[0].data().as_u8_slice(),
+        arr.data().as_u8_slice(),
         "unchanged"
     );
 }
@@ -206,11 +205,10 @@ fn r9_80_the_colormode_attribute_still_drives_the_conversion() {
 /// the RGB1 target path (the common, working case) is not what the fix broke.
 #[test]
 fn r9_80_a_2d_mono_frame_still_converts_to_rgb1() {
-    let mut arr = NDArray::new(
+    let arr = NDArray::with_data(
         vec![NDDimension::new(4), NDDimension::new(4)],
-        NDDataType::UInt8,
+        NDDataBuffer::from_vec::<u8>((0..16u8).collect()),
     );
-    arr.data = NDDataBuffer::U8((0..16u8).collect());
     let mut proc = processor(NDColorMode::RGB1);
 
     let result = run(&mut proc, &arr);

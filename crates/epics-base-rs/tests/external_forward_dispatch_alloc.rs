@@ -111,10 +111,10 @@ async fn allocs(db: &PvDatabase, rec: &str) -> usize {
 
 const DB: &str = r#"
 record(calc, "BARE") { field(CALC, "VAL+1") }
-record(calc, "PVA") { field(CALC, "VAL+1") field(FLNK, "pva://T:A") }
+record(calc, "PVA") { field(CALC, "VAL+1") field(FLNK, {pva:"T:A"}) }
 record(calc, "JSON") { field(CALC, "VAL+1") field(FLNK, {pva:{pv:"T:B", Q:4}}) }
 record(fanout, "FNONE") {}
-record(fanout, "FPVA") { field(LNK1, "pva://T:C") }
+record(fanout, "FPVA") { field(LNK1, {pva:"T:C"}) }
 record(fanout, "FJSON") { field(LNK1, {pva:{pv:"T:D", Q:4}}) }
 "#;
 

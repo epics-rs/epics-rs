@@ -124,7 +124,8 @@ async fn process(db: &epics_base_rs::server::database::PvDatabase, rec: &str) {
 /// seq hands its groups to the callback task and returns with `pact` set
 /// (`seqRecord.c:143`), so its reads and alarm land after `process` returns.
 async fn settle(db: &epics_base_rs::server::database::PvDatabase, rec: &str) {
-    for _ in 0..400 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if !db.get_record(rec).unwrap().read().is_processing() {
             return;
         }

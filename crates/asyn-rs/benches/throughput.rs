@@ -23,8 +23,8 @@ impl BenchPort {
             name,
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         base.create_param("INT_VAL", ParamType::Int32).unwrap();
         base.create_param("F64_VAL", ParamType::Float64).unwrap();
@@ -48,7 +48,13 @@ fn make_sync_io(name: &str) -> SyncIOHandle {
     let (handle, _jh) =
         create_port_runtime_unclaimed(BenchPort::new(name), RuntimeConfig::default())
             .expect("the port runtime thread must start");
-    SyncIOHandle::from_handle(handle.port_handle().clone(), 0, Duration::from_secs(1))
+    SyncIOHandle::from_handle(
+        handle.port_handle().clone(),
+        0,
+        Duration::from_secs(1),
+        asyn_rs::interfaces::InterfaceType::Common,
+    )
+    .unwrap()
 }
 
 // -- Benchmarks --

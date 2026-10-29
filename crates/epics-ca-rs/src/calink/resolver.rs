@@ -13,18 +13,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::DbFieldType;
-use crate::client::{CaChannel, CaClient, ConnFold};
-use arc_swap::ArcSwap;
+use crate::client::{CaChannel, CaClient, ConnFold, EnumReadback};
+use arc_swap::{ArcSwap, ArcSwapOption};
 use epics_base_rs::error::CaOp;
 use epics_base_rs::runtime::task;
 use epics_base_rs::server::database::{
-    CaLinkInit, CpWorker, ExternalCpProcess, LinkDiagnostics, LinkHolder, LinkMetadata,
-    LinkPutDone, LinkPutOp, LinkRef, LinkSerial, LinkSet, PutAdmission, PvDatabase,
+    CaLinkInit, CpWorker, EnumString, ExternalCpProcess, LinkDiagnostics, LinkHolder, LinkMetadata,
+    LinkPutDone, LinkPutOp, LinkRef, LinkSerial, LinkSet, LinkShape, PutAdmission, PvDatabase,
     link_put_convert, report_put_not_issued,
 };
-use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
+use epics_base_rs::server::snapshot::Snapshot;
 use epics_base_rs::types::DBR_CTRL_DOUBLE;
-use epics_base_rs::types::{EpicsValue, RecordName};
+use epics_base_rs::types::{EpicsValue, PvString, RecordName, WallTime};
 use parking_lot::RwLock;
 
 use epics_base_rs::server::database::CA_LINK_EVENT_MASK as CALINK_EVENT_MASK;
@@ -41,6 +41,119 @@ use epics_base_rs::server::database::CA_LINK_EVENT_MASK as CALINK_EVENT_MASK;
 struct CachedSnapshot {
     snapshot: Snapshot,
     native_count: u32,
+}
+
+/// C `pca->stat`, `sevr` and `timeStamp`: every event of either monitor
+/// overwrites them (`dbCa.c:1001-1003`), and `getAlarm` / `getTimeStamp`
+/// serve the last (`dbCa.c:672-693`).
+#[derive(Clone, Copy)]
+struct LinkStamp {
+    status: u16,
+    severity: u16,
+    time: WallTime,
+}
+
+impl LinkStamp {
+    fn of(snapshot: &Snapshot) -> Self {
+        Self {
+            status: snapshot.alarm.status,
+            severity: snapshot.alarm.severity,
+            time: snapshot.timestamp,
+        }
+    }
+}
+
+/// C `evidString` with its `pgetString`: the `DBR_STRING` monitor of an
+/// ENUM channel, valid only for the native description it was opened
+/// under. Flag, subscription and value are one generation, so dropping it is
+/// C's whole clear of the three (`dbCa.c:878-903`).
+struct StringMonitor {
+    native: (DbFieldType, u32),
+    value: ArcSwapOption<PvString>,
+    task: std::sync::OnceLock<AbortOnDrop>,
+}
+
+/// What dbCa's two monitors write: `pgetNative`, the string monitor, and
+/// the stamp both overwrite.
+struct LinkEvents {
+    native: ArcSwap<Option<CachedSnapshot>>,
+    /// `Some` is C `pvlOptInpString`.
+    string: parking_lot::Mutex<Option<Arc<StringMonitor>>>,
+    stamp: ArcSwapOption<LinkStamp>,
+}
+
+impl LinkEvents {
+    fn new() -> Self {
+        Self {
+            native: ArcSwap::from_pointee(None),
+            string: parking_lot::Mutex::new(None),
+            stamp: ArcSwapOption::empty(),
+        }
+    }
+
+    fn string_wanted(&self) -> bool {
+        self.string.lock().is_some()
+    }
+
+    /// The string monitor open for `native`, else a new one from `spawn`,
+    /// replacing one opened for another description.
+    fn open_string(
+        &self,
+        native: (DbFieldType, u32),
+        spawn: impl FnOnce(std::sync::Weak<StringMonitor>) -> AbortOnDrop,
+    ) -> Arc<StringMonitor> {
+        let mut slot = self.string.lock();
+        if let Some(open) = slot.as_ref().filter(|m| m.native == native) {
+            return open.clone();
+        }
+        let monitor = Arc::new(StringMonitor {
+            native,
+            value: ArcSwapOption::empty(),
+            task: std::sync::OnceLock::new(),
+        });
+        let _ = monitor.task.set(spawn(Arc::downgrade(&monitor)));
+        let stale = slot.replace(monitor.clone());
+        drop(slot);
+        drop(stale);
+        monitor
+    }
+
+    /// C `connectionCallback`'s size-or-type-change clear, string half
+    /// (`dbCa.c:878-903`): a connect under another description drops the
+    /// string monitor, and the next string read re-adds it.
+    fn drop_stale_string(&self, native: (DbFieldType, u32)) {
+        let mut slot = self.string.lock();
+        let stale = slot
+            .as_ref()
+            .is_some_and(|m| m.native != native)
+            .then(|| slot.take());
+        drop(slot);
+        drop(stale);
+    }
+
+    /// One `DBR_STRING` event of `monitor`, taken only while it is the open
+    /// monitor and the channel still has its description: C clears it in
+    /// the connection callback, ahead of the new connection's events.
+    fn note_string(
+        &self,
+        monitor: &Arc<StringMonitor>,
+        native: Option<(DbFieldType, u32)>,
+        connected: &LinkConnState,
+        snapshot: Snapshot,
+    ) {
+        let slot = self.string.lock();
+        if native != Some(monitor.native) || !slot.as_ref().is_some_and(|m| Arc::ptr_eq(m, monitor))
+        {
+            return;
+        }
+        let stamp = LinkStamp::of(&snapshot);
+        let EpicsValue::String(s) = snapshot.value else {
+            return;
+        };
+        self.stamp.store(Some(Arc::new(stamp)));
+        monitor.value.store(Some(Arc::new(s)));
+        connected.request_process();
+    }
 }
 
 /// True iff a cached snapshot remains servable: the value's CA-wire DBR
@@ -81,7 +194,7 @@ pub struct CaLink {
     /// connected / no value cached) — the C `dbCaGetLink` "not connected"
     /// case. Served only while the cached description still matches the
     /// channel's current native description (see [`Self::with_servable`]).
-    cache: Arc<ArcSwap<Option<CachedSnapshot>>>,
+    events: Arc<LinkEvents>,
     /// Live-connection flag, mirroring `pvalink`'s
     /// `PvaLink::monitor_connected`. The connection-event watcher task
     /// flips this `true` on `ConnectionEvent::Connected` and `false`
@@ -137,9 +250,9 @@ fn channel_native(channel: &CaChannel) -> Option<(DbFieldType, u32)> {
     }
 }
 
-/// The single owner of a `ca://` link's connection-state transition.
+/// The single owner of a CA link's connection-state transition.
 ///
-/// **Invariant.** A `ca://` link's servability flag MUST NOT go from
+/// **Invariant.** A CA link's servability flag MUST NOT go from
 /// connected to disconnected without dispatching that PV's CP/CPP holders.
 /// C `connectionCallback` (`dbCa.c:817-830`) clears `pca->isConnected` and,
 /// in the same critical section, sets `CA_DBPROCESS` for a `pvlOptCP` link
@@ -415,7 +528,7 @@ impl CaLink {
         if !self.connected.is_set() {
             return None;
         }
-        let guard = self.cache.load();
+        let guard = self.events.native.load();
         let cached = guard.as_ref().as_ref()?;
         if !self.cache_matches_channel(cached) {
             return None;
@@ -462,8 +575,9 @@ impl CaLink {
     /// fetch complete (the ATTRIB bit; `fetch_link_metadata` stores
     /// `Some` even when the CTRL get failed, exactly the
     /// action-completed edge `getAttribEventCallback` clears the bit
-    /// on). C's STRING bit has no twin here: this port keeps one native
-    /// monitor and renders strings from it.
+    /// on). C's STRING bit needs no twin: no read can ask for the string
+    /// monitor before the connect (`dbCa.c:430-435` fails first), so the
+    /// bit is clear when the link connects.
     pub fn init_ready(&self) -> bool {
         self.is_connected()
             && (self.monitor.get().is_none() || self.with_servable(|_| ()).is_some())
@@ -527,11 +641,41 @@ impl CaLink {
         self.monitor.get_or_init(|| {
             AbortOnDrop(self.reactor.spawn(run_monitor(
                 self.channel.clone(),
-                self.cache.clone(),
+                self.events.clone(),
                 self.connected.clone(),
                 self.pv_name.clone(),
             )))
         });
+    }
+
+    /// `dbCaGetLink`'s `DBR_ENUM` → `DBR_STRING` branch (`dbCa.c:436-454`),
+    /// behind its `!isConnected || !hasReadAccess` bail (`:430-435`): the
+    /// `DBR_STRING` monitor's last value, the monitor added by the first
+    /// read that asks.
+    fn enum_string(&self) -> EnumString {
+        let native = match channel_native(&self.channel) {
+            Some(native @ (DbFieldType::Enum, _)) => native,
+            Some(_) => return EnumString::NotServed,
+            None => return EnumString::Pending,
+        };
+        if !self.connected.is_set() || !self.connected.has_read_access() {
+            return EnumString::Pending;
+        }
+        // C `pvlOptInpString` with its `CA_MONITOR_STRING`
+        // (`dbCa.c:1236-1248`).
+        let monitor = self.events.open_string(native, |monitor| {
+            AbortOnDrop(self.reactor.spawn(run_string_monitor(
+                self.channel.clone(),
+                self.events.clone(),
+                monitor,
+                self.connected.clone(),
+                self.pv_name.clone(),
+            )))
+        });
+        monitor
+            .value
+            .load_full()
+            .map_or(EnumString::Pending, |s| EnumString::Got((*s).clone()))
     }
 
     /// This link's `dbcar` report state — C reading the `caLink` fields
@@ -556,12 +700,7 @@ impl CaLink {
             write_access: self.connected.has_write_access(),
             n_disconnect: self.connected.disconnect_count(),
             input_native: self.connected.used_input_native(),
-            // C reaches `pvlOptInpString` only for a `DBR_ENUM` channel read
-            // as `DBR_STRING` (`dbCa.c:439-442`). This port keeps one native
-            // monitor per link and renders strings from it — `LinkSet` has no
-            // typed read for the lset to distinguish — so the column is never
-            // set here.
-            input_string: false,
+            input_string: self.events.string_wanted(),
             // Both OUT bits are dead at the pin: `dbCa.c:541` and `:557` are
             // inside `/* Disabled by ANJ ... */`, so C never sets them and
             // `dbcar` always prints these two columns blank.
@@ -574,7 +713,7 @@ impl CaLink {
     /// is not connected. Mirrors C `dbCaGetAlarmLimits` reading the
     /// cached `pca->sevr` — gated on `pca->connected`.
     pub fn alarm_severity(&self) -> Option<i32> {
-        self.with_servable(|s| s.alarm.severity as i32)
+        self.stamp().map(|s| s.severity as i32)
     }
 
     /// Cached alarm *status* code (the EPICS `alarm_status` enum), or
@@ -583,7 +722,7 @@ impl CaLink {
     /// record instead of the generic `LINK_ALARM`. Gated on `connected`
     /// exactly like [`Self::alarm_severity`].
     pub fn alarm_status(&self) -> Option<i32> {
-        self.with_servable(|s| s.alarm.status as i32)
+        self.stamp().map(|s| s.status as i32)
     }
 
     /// Cached timestamp as `(seconds_past_epoch, nanoseconds, userTag)`,
@@ -591,11 +730,19 @@ impl CaLink {
     /// protocol's `DBR_TIME_*` payload carries no user tag, so the tag is
     /// always `0` — only PVA links can adopt a remote `timeStamp.userTag`.
     pub fn time_stamp(&self) -> Option<(i64, i32, u64)> {
-        self.with_servable(|s| {
-            let dur = s.timestamp.since_unix_epoch();
-            Some((dur.as_secs() as i64, dur.subsec_nanos() as i32, 0))
+        self.stamp().map(|s| {
+            let dur = s.time.since_unix_epoch();
+            (dur.as_secs() as i64, dur.subsec_nanos() as i32, 0)
         })
-        .flatten()
+    }
+
+    /// The last event's stamp, behind `pcaGetCheck`'s `isConnected` alone
+    /// (`dbCa.c:650-660`).
+    fn stamp(&self) -> Option<LinkStamp> {
+        if !self.connected.is_set() {
+            return None;
+        }
+        self.events.stamp.load().as_deref().copied()
     }
 
     /// Cached remote metadata (display/control/alarm limits, precision,
@@ -610,6 +757,20 @@ impl CaLink {
             return None;
         }
         self.meta.load().as_ref().clone()
+    }
+
+    /// C `getDBFtype` / `getElements` (`dbCa.c:666`, `:633`): the channel's
+    /// own type and count, set at connect (`dbCa.c:862-864`), not the CTRL
+    /// reply [`Self::link_metadata`] waits on.
+    pub fn link_shape(&self) -> Option<LinkShape> {
+        if !self.connected.is_set() {
+            return None;
+        }
+        let (native, count) = channel_native(&self.channel)?;
+        Some(LinkShape {
+            dbf_type: Some(native.into()),
+            element_count: Some(i64::from(count)),
+        })
     }
 }
 
@@ -629,8 +790,7 @@ pub struct CaLinkResolver {
     /// only created once a link is added). Seeded eagerly by
     /// [`Self::with_client`] when a caller wants to share/pin a client.
     client: Arc<tokio::sync::OnceCell<Arc<CaClient>>>,
-    /// Open links by [`LinkSerial`], each with its bare PV name (`ca://`
-    /// scheme stripped).
+    /// Open links by [`LinkSerial`], each with its PV name.
     links: Arc<RwLock<HashMap<LinkSerial, (RecordName, Arc<CaLink>)>>>,
     /// Database handle the link's processor uses to process external
     /// CP/CPP holder records on each remote change
@@ -720,7 +880,7 @@ impl CaLinkResolver {
             std::collections::hash_map::Entry::Occupied(won) => return Some(won.get().1.clone()),
             std::collections::hash_map::Entry::Vacant(entry) => entry,
         };
-        let pv_name = RecordName::from(strip_ca_scheme(link.name));
+        let pv_name = RecordName::from(link.name);
         let opened = self.start_net(client, pv_name.clone(), link);
         Some(entry.insert((pv_name, opened)).1.clone())
     }
@@ -735,7 +895,7 @@ impl CaLinkResolver {
         // `CA_GET_ATTRIBUTES` and reading `ca_write_access`).
         let (channel, conn_rx) = client.create_channel_with_events(&pv_name, 0);
         let channel = Arc::new(channel);
-        let cache: Arc<ArcSwap<Option<CachedSnapshot>>> = Arc::new(ArcSwap::from_pointee(None));
+        let events = Arc::new(LinkEvents::new());
         let connected = Arc::new(LinkConnState::new(self.db.clone(), link));
         let meta: Arc<ArcSwap<Option<LinkMetadata>>> = Arc::new(ArcSwap::from_pointee(None));
         // Connection-event watcher: keeps `connected` in sync with the
@@ -749,6 +909,7 @@ impl CaLinkResolver {
             conn_rx,
             connected.clone(),
             channel.clone(),
+            events.clone(),
             meta.clone(),
             pv_name.clone(),
         ));
@@ -758,7 +919,7 @@ impl CaLinkResolver {
             .as_ref()
             .map(|db| db.spawn_cp_worker(run_processor(connected.clone())));
         let opened = Arc::new(CaLink {
-            cache,
+            events,
             connected,
             meta,
             channel,
@@ -785,7 +946,7 @@ impl CaLinkResolver {
         pv_name: impl AsRef<[u8]>,
         timeout: std::time::Duration,
     ) -> bool {
-        let name = strip_ca_scheme(pv_name.as_ref());
+        let name = pv_name.as_ref();
         let deadline = epics_base_rs::runtime::time::deadline_from_now(timeout);
         loop {
             let ready = {
@@ -882,7 +1043,7 @@ async fn run_processor(state: Arc<LinkConnState>) {
 /// value, then adds `CA_DBPROCESS` (`dbCa.c:891`, `:958-962`). The cache is
 /// stored first, so the holder's INP read sees the fresh value.
 fn note_monitor_value(
-    cache: &ArcSwap<Option<CachedSnapshot>>,
+    events: &LinkEvents,
     connected: &LinkConnState,
     snapshot: Snapshot,
     native_count: u32,
@@ -891,11 +1052,18 @@ fn note_monitor_value(
     // connected even if the `Connected` lifecycle event has not been observed
     // yet (race-free, mirrors `pvalink`'s callback).
     connected.mark_connected();
-    cache.store(Arc::new(Some(CachedSnapshot {
+    // A native ENUM event scans only while no string monitor exists
+    // (`dbCa.c:932-933`).
+    let scan = !(matches!(snapshot.value, EpicsValue::Enum(_)) && events.string_wanted());
+    // The stamp first, so a read that sees this value sees its stamp.
+    events.stamp.store(Some(Arc::new(LinkStamp::of(&snapshot))));
+    events.native.store(Arc::new(Some(CachedSnapshot {
         snapshot,
         native_count,
     })));
-    connected.request_process();
+    if scan {
+        connected.request_process();
+    }
 }
 
 /// Monitor task: subscribe, then drain the subscription, refresh the cache
@@ -906,7 +1074,7 @@ fn note_monitor_value(
 /// `dbCaGetLink` later serves.
 async fn run_monitor(
     channel: Arc<CaChannel>,
-    cache: Arc<ArcSwap<Option<CachedSnapshot>>>,
+    events: Arc<LinkEvents>,
     connected: Arc<LinkConnState>,
     pv_name: RecordName,
 ) {
@@ -941,7 +1109,7 @@ async fn run_monitor(
                 let native_count = channel
                     .element_count()
                     .unwrap_or_else(|_| snapshot.value.count());
-                note_monitor_value(&cache, &connected, snapshot, native_count);
+                note_monitor_value(&events, &connected, snapshot, native_count);
             }
             // A monitor error event (e.g. a transient server-side
             // problem) leaves the last cached value in place — the
@@ -961,6 +1129,45 @@ async fn run_monitor(
     connected.mark_disconnected();
 }
 
+/// C `dbCaTask`'s `CA_MONITOR_STRING` (`dbCa.c:1236-1248`): one element of
+/// `DBR_TIME_STRING`, each event stored as `pgetString` and processing the
+/// holder (`dbCa.c:927-929`).
+async fn run_string_monitor(
+    channel: Arc<CaChannel>,
+    events: Arc<LinkEvents>,
+    this: std::sync::Weak<StringMonitor>,
+    connected: Arc<LinkConnState>,
+    pv_name: RecordName,
+) {
+    let mut monitor = match channel
+        .subscribe_with_mask_readback_count(
+            0.0,
+            CALINK_EVENT_MASK,
+            EnumReadback::Label,
+            false,
+            Some(1),
+        )
+        .await
+    {
+        Ok(monitor) => monitor,
+        Err(e) => {
+            tracing::debug!(pv = %pv_name, error = %e, "calink: string subscribe failed");
+            return;
+        }
+    };
+    while let Some(event) = monitor.recv().await {
+        match event {
+            Ok(snapshot) => {
+                let Some(this) = this.upgrade() else { return };
+                events.note_string(&this, channel_native(&channel), &connected, snapshot);
+            }
+            Err(e) => {
+                tracing::debug!(pv = %pv_name, error = %e, "calink: string monitor error ignored");
+            }
+        }
+    }
+}
+
 /// Connection-event watcher: keep `connected` in sync with the CA
 /// circuit state. `Connected` flips it `true`; `Disconnected` /
 /// `Unresponsive` flip it `false` so a downstream IOC restart is
@@ -978,6 +1185,7 @@ async fn run_connection_watcher(
     mut conn_rx: epics_base_rs::runtime::sync::broadcast::Receiver<crate::client::ConnectionEvent>,
     connected: Arc<LinkConnState>,
     channel: Arc<CaChannel>,
+    events: Arc<LinkEvents>,
     meta: Arc<ArcSwap<Option<LinkMetadata>>>,
     pv_name: RecordName,
 ) {
@@ -989,6 +1197,9 @@ async fn run_connection_watcher(
             // Detached so a hung CTRL get never stalls the watcher from
             // seeing a later disconnect.
             WatchStep::Refetch => {
+                if let Some(native) = channel_native(&channel) {
+                    events.drop_stale_string(native);
+                }
                 reactor.spawn(fetch_link_metadata(
                     channel.clone(),
                     meta.clone(),
@@ -1061,7 +1272,7 @@ async fn fetch_link_metadata(
         // FALSE and every getter returns -1. Skipping it is that gate.
         None
     } else {
-        match channel.get_with_dbr_type(DBR_CTRL_DOUBLE, 1).await {
+        match async { channel.get_callback(DBR_CTRL_DOUBLE, 1)?.await }.await {
             Ok(snap) => Some(snap),
             Err(e) => {
                 tracing::debug!(
@@ -1073,31 +1284,10 @@ async fn fetch_link_metadata(
             }
         }
     };
-    // The enum state-label table is this port's own cache and has no dbCa
-    // analogue on this path — C renders a remote enum as text through a
-    // second `DBR_STRING` monitor (`pgetString`), not through the attribute
-    // get. It needs the native `DBR_CTRL_ENUM` reply, which the fixed-DOUBLE
-    // get above cannot carry, so it rides its own request.
-    let labels = if dbf == Some(DbFieldType::Enum) {
-        channel
-            .get_with_metadata_count(DbrClass::Ctrl, 1)
-            .await
-            .inspect_err(|e| {
-                tracing::debug!(
-                    pv = %pv_name,
-                    error = %e,
-                    "calink: enum label get failed; serving no choice table"
-                );
-            })
-            .ok()
-    } else {
-        None
-    };
     meta.store(Arc::new(Some(LinkMetadata::from_ca_attributes(
         dbf,
         element_count,
         attrs.as_ref(),
-        labels.as_ref(),
     ))));
 }
 
@@ -1135,6 +1325,11 @@ impl LinkSet for CaLinkResolver {
     fn get_cached_value(&self, link: LinkRef<'_>) -> Option<EpicsValue> {
         let link = self.cached_link(link)?;
         link.read()
+    }
+
+    fn get_cached_enum_string(&self, link: LinkRef<'_>) -> EnumString {
+        self.cached_link(link)
+            .map_or(EnumString::Pending, |l| l.enum_string())
     }
 
     /// C `dbCaAddLink`'s `CA_CONNECT` work (`dbCa.c:1140-1159`): create the
@@ -1231,14 +1426,14 @@ impl LinkSet for CaLinkResolver {
         // `CA_PUT` dispatch). Only `dbCaPutLinkCallback`
         // (`putType = CA_PUT_CALLBACK`) issues `ca_array_put_callback`
         // and parks the originating record until completion. The
-        // database maps a plain record-processing OUT write to
-        // `LinkPutOp::Plain` and a put-notify / blocking-put chain
-        // write to `LinkPutOp::Async`, so the resolver must preserve
+        // database maps a plain OUT write (put-notify chain included) to
+        // `LinkPutOp::Plain` and a `dbPutLinkAsync` / sseq WAITn write
+        // to `LinkPutOp::Async`, so the resolver must preserve
         // the split: routing `Plain` through the fire-and-forget
         // `CA_PROTO_WRITE` (`put_nowait`) keeps a slow or hung remote
         // CA server from stalling normal record processing, while `Async`
-        // keeps the WRITE_NOTIFY completion the put-notify chain needs.
-        let name = strip_ca_scheme(link.name);
+        // keeps the WRITE_NOTIFY completion the writer waits on.
+        let name = link.name;
         let Some(link) = self.open_link(link).await else {
             let reason = format!("CA link {} not open", String::from_utf8_lossy(name));
             return (LinkPutDone::NotIssued, Err(reason));
@@ -1325,6 +1520,10 @@ impl LinkSet for CaLinkResolver {
         self.cached_link(link)?.link_metadata()
     }
 
+    fn link_shape(&self, link: LinkRef<'_>) -> Option<LinkShape> {
+        self.cached_link(link)?.link_shape()
+    }
+
     fn link_names(&self) -> Vec<RecordName> {
         let mut names: Vec<RecordName> =
             self.links.read().values().map(|(n, _)| n.clone()).collect();
@@ -1344,17 +1543,9 @@ impl LinkSet for CaLinkResolver {
     }
 }
 
-/// Strip a leading `ca://` scheme prefix. `epics-base-rs` stores both
-/// the scheme-prefixed and the bare form in `ParsedLink::Ca`
-/// depending on the link syntax (`ca://X` vs the bare ` CA` modifier),
-/// so the resolver normalises to the bare PV name.
-fn strip_ca_scheme(name: &[u8]) -> &[u8] {
-    name.strip_prefix(b"ca://").unwrap_or(name)
-}
-
 /// Install a [`CaLinkResolver`] on `db`, registered under the `"ca"`
 /// lset scheme. After this, a record whose link field resolves to
-/// `ParsedLink::Ca` (a `ca://X` link or a bare ` CA`-modified link)
+/// `ParsedLink::Ca` (a non-local PV name, or one with a ` CA` modifier)
 /// reads through the monitor-backed CA cache via
 /// `PvDatabase::resolve_external_pv`.
 ///
@@ -1383,12 +1574,6 @@ mod tests {
     use super::*;
     use crate::client::ConnectionEvent;
     use source_guard::{Comments, production};
-
-    #[test]
-    fn strip_ca_scheme_handles_both_forms() {
-        assert_eq!(strip_ca_scheme(b"ca://OTHER:PV"), b"OTHER:PV");
-        assert_eq!(strip_ca_scheme(b"OTHER:PV"), b"OTHER:PV");
-    }
 
     /// The CA record-link monitor mask matches C `dbCa`'s
     /// `ca_add_array_event` = `DBE_VALUE | DBE_ALARM` and EXCLUDES
@@ -1592,9 +1777,7 @@ mod tests {
     fn cp_holder() -> (Arc<LinkConnState>, Arc<FlagLset>, PvDatabase) {
         use epics_base_rs::server::records::ai::AiRecord;
         let db_slot = Arc::new(RwLock::new(None));
-        let inp = Arc::new(epics_base_rs::server::record::parse_link_v2(
-            "ca://UP:PV CP",
-        ));
+        let inp = Arc::new(epics_base_rs::server::record::parse_link_v2("UP:PV CP"));
         let ext = inp.external().unwrap();
         let state = Arc::new(LinkConnState::new(
             db_slot.clone(),
@@ -1614,7 +1797,7 @@ mod tests {
             {
                 let rec = db.get_record("HOLDER").unwrap();
                 let mut inst = rec.write();
-                inst.common.text.inp = "ca://UP:PV CP".into();
+                inst.common.text.inp = "UP:PV CP".into();
                 inst.install_link_cache("INP", inp).expect("a common link");
             }
             db.initialize_link_locality().await;
@@ -1660,13 +1843,11 @@ mod tests {
         db.add_record("H", Box::new(AiRecord::new(0.0)))
             .await
             .unwrap();
-        let inp = Arc::new(epics_base_rs::server::record::parse_link_v2(
-            "ca://UP:PV CP",
-        ));
+        let inp = Arc::new(epics_base_rs::server::record::parse_link_v2("UP:PV CP"));
         {
             let rec = db.get_record("H").unwrap();
             let mut inst = rec.write();
-            inst.common.text.inp = "ca://UP:PV CP".into();
+            inst.common.text.inp = "UP:PV CP".into();
             inst.install_link_cache("INP", inp.clone())
                 .expect("a common link");
         }
@@ -1709,13 +1890,11 @@ mod tests {
             .build()
             .await
             .unwrap();
-        let inp = Arc::new(epics_base_rs::server::record::parse_link_v2(
-            "ca://UP:PV CP",
-        ));
+        let inp = Arc::new(epics_base_rs::server::record::parse_link_v2("UP:PV CP"));
         {
             let rec = db.get_record("H").unwrap();
             let mut inst = rec.write();
-            inst.common.text.inp = "ca://UP:PV CP".into();
+            inst.common.text.inp = "UP:PV CP".into();
             inst.install_link_cache("INP", inp.clone())
                 .expect("a common link");
         }
@@ -1775,7 +1954,7 @@ mod tests {
         process_once(&db);
         let one = reads() - base;
         assert!(one > 0);
-        let cache = ArcSwap::from_pointee(None);
+        let events = LinkEvents::new();
         let event = || {
             Snapshot::new(
                 EpicsValue::Double(1.0),
@@ -1786,8 +1965,8 @@ mod tests {
         };
 
         let base = reads();
-        note_monitor_value(&cache, &state, event(), 1);
-        note_monitor_value(&cache, &state, event(), 1);
+        note_monitor_value(&events, &state, event(), 1);
+        note_monitor_value(&events, &state, event(), 1);
         assert_eq!(reads(), base, "the monitor callback processed inline");
         step(&state);
         assert_eq!(reads() - base, one);

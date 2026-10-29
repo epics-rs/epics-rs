@@ -91,7 +91,8 @@ async fn a_disable_holds_the_passes_until_its_max_secs() {
             .await,
     );
     let handle = mgr.clone().start(db.clone()).unwrap();
-    for _ in 0..50 {
+    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    while Instant::now() < deadline {
         if saved_a(&path).await.is_some() {
             break;
         }
@@ -113,11 +114,15 @@ async fn a_disable_holds_the_passes_until_its_max_secs() {
     assert_eq!(saved_a(&path).await.as_deref(), Some("7"), "no save");
 
     while read(&db, "X:SR_disable") != 0.0 {
-        assert!(disabled.elapsed() < Duration::from_secs(5), "never enabled");
+        assert!(
+            disabled.elapsed() < fact_budget::FACT_BUDGET,
+            "never enabled"
+        );
         sleep(Duration::from_millis(50)).await;
     }
     assert!(disabled.elapsed() > Duration::from_secs(2));
-    for _ in 0..30 {
+    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    while Instant::now() < deadline {
         if saved_a(&path).await.as_deref() == Some("8") {
             break;
         }

@@ -117,6 +117,7 @@ aborted via `AbortOnDrop`.
 ```rust
 use std::sync::Arc;
 use std::time::Duration;
+use epics_base_rs::runtime::task::Period;
 use epics_bridge_rs::pva_gateway::{PvaGateway, PvaGatewayConfig};
 use epics_pva_rs::server_native::PvaServerConfig;
 
@@ -128,7 +129,7 @@ let cfg = PvaGatewayConfig {
         udp_port: 5077,
         ..PvaServerConfig::default()
     },
-    cleanup_interval: Duration::from_secs(30),
+    cleanup_interval: Period::new(Duration::from_secs(30)).unwrap(),
     connect_timeout: Duration::from_secs(5),
 };
 let gw = PvaGateway::start(cfg)?;

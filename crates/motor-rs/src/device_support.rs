@@ -3,9 +3,11 @@ use std::time::Duration;
 
 use epics_base_rs::error::CaResult;
 use epics_base_rs::runtime::task::{
-    CallbackPriority, sleep_background, spawn_background, spawn_blocking_background,
+    CallbackPriority, spawn_background_after, spawn_blocking_background,
 };
-use epics_base_rs::server::device_support::{DeviceInitOutcome, DeviceReadOutcome, DeviceSupport};
+use epics_base_rs::server::device_support::{
+    DeviceInitOutcome, DevicePost, DeviceReadOutcome, DeviceSupport,
+};
 use epics_base_rs::server::record::{Record, ScanType};
 use epics_base_rs::types::PvString;
 use tokio::sync::mpsc;
@@ -17,7 +19,7 @@ use asyn_rs::interfaces::motor::{AsynMotor, MotorStatus};
 use crate::device_state::*;
 use crate::flags::MotorCommand;
 use crate::poll_loop::{
-    CommandBatch, MissingAxis, MotorCommandSender, Place, PlaceRef, PollCommand, PollerInbox,
+    CommandBatch, MissingAxis, MotorCommandSender, Place, PlaceRef, PollCommand, PollerInbox, Ran,
     SharedControllerPoll, ToAxis, Written,
 };
 use crate::trace::{MotorTrace, TraceUser};
@@ -150,11 +152,13 @@ impl AxisSlot {
     }
 
     /// Bind one more record: its own mailbox, seeded from the address's
-    /// cache, its own trace, and a place on the subscriber list.
+    /// cache unless motor_init_record_com refused it, its own trace, and a
+    /// place on the subscriber list.
     pub(crate) fn attach(
         self: &Arc<Self>,
         user: TraceUser,
         timeout: Duration,
+        refusal: Option<&'static str>,
     ) -> MotorDeviceSupport {
         let device_state = new_shared_state();
         let (io_intr_tx, io_intr_rx) = mpsc::channel(16);
@@ -169,10 +173,15 @@ impl AxisSlot {
         if let Ok(mut ds) = device_state.lock() {
             ds.set_dset(dset);
         }
-        let record =
-            self.subscribers
-                .attach(device_state.clone(), io_intr_tx.clone(), trace.clone());
-        MotorDeviceSupport::with_link(
+        let (state, io_intr, record_trace) =
+            (device_state.clone(), io_intr_tx.clone(), trace.clone());
+        let record = match refusal {
+            None => self.subscribers.attach(state, io_intr, record_trace),
+            Some(_) => self
+                .subscribers
+                .attach_refused(state, io_intr, record_trace),
+        };
+        let mut support = MotorDeviceSupport::with_link(
             trace,
             timeout,
             AxisLink::Bound {
@@ -181,7 +190,9 @@ impl AxisSlot {
             },
             device_state,
             (io_intr_tx, io_intr_rx),
-        )
+        );
+        support.refusal = refusal;
+        support
     }
 }
 
@@ -192,8 +203,9 @@ impl AxisSlot {
 #[derive(Clone)]
 pub struct MotorAxis {
     user: TraceUser,
-    /// The driver, which a controller-port write calls on the port thread.
-    motor: Arc<Mutex<dyn AsynMotor>>,
+    /// The driver, which a controller-port write calls on the port thread;
+    /// a model-1 axis has no controller port.
+    motor: Option<Arc<Mutex<dyn AsynMotor>>>,
     controller_poll: SharedControllerPoll,
     timeout: Duration,
     poll_cmd_tx: mpsc::Sender<PollCommand>,
@@ -203,8 +215,6 @@ pub struct MotorAxis {
     params: Model2Params,
     report: Option<Arc<dyn AxisReport>>,
     build_trans: Option<Arc<dyn BuildTrans>>,
-    /// The driver's [`asyn_rs::interfaces::motor::AsynMotor::disables_ntm`].
-    disables_ntm: bool,
     /// C `asynMotorAxis::referencingModeMove_`, which
     /// `asynMotorEnableMoveToHome` sets.
     referencing_mode_move: Arc<std::sync::atomic::AtomicI32>,
@@ -225,7 +235,7 @@ impl MotorAxis {
             motor_cmd_tx,
         };
         let slot = AxisSlot::holding(subscribers, senders.clone());
-        Self::handle(user, motor, timeout, senders, Arc::new(slot))
+        Self::handle(user, Some(motor), timeout, senders, Arc::new(slot))
     }
 
     /// The axis of `poll`'s controller at `slot` from now on, posting to the
@@ -233,7 +243,7 @@ impl MotorAxis {
     /// while another controller's axis holds the slot.
     pub(crate) fn placed(
         user: TraceUser,
-        motor: Arc<Mutex<dyn AsynMotor>>,
+        motor: Option<Arc<Mutex<dyn AsynMotor>>>,
         timeout: Duration,
         slot: Arc<AxisSlot>,
         poll: &SharedControllerPoll,
@@ -264,7 +274,7 @@ impl MotorAxis {
 
     fn handle(
         user: TraceUser,
-        motor: Arc<Mutex<dyn AsynMotor>>,
+        motor: Option<Arc<Mutex<dyn AsynMotor>>>,
         timeout: Duration,
         AxisSenders {
             poll_cmd_tx,
@@ -283,7 +293,6 @@ impl MotorAxis {
             params: Model2Params::default(),
             report: None,
             build_trans: None,
-            disables_ntm: false,
             referencing_mode_move: Arc::default(),
         }
     }
@@ -291,11 +300,6 @@ impl MotorAxis {
     /// The controller poll its controller's UPDATE_STATUS write runs.
     pub(crate) fn with_controller_poll(mut self, poll: SharedControllerPoll) -> Self {
         self.controller_poll = poll;
-        self
-    }
-
-    pub(crate) fn disabling_ntm(mut self, disables_ntm: bool) -> Self {
-        self.disables_ntm = disables_ntm;
         self
     }
 
@@ -313,7 +317,6 @@ impl MotorAxis {
             params: self.params.clone(),
             report: self.report.clone(),
             build_trans: self.build_trans.clone(),
-            disables_ntm: self.disables_ntm,
             referencing_mode_move: self.referencing_mode_move.clone(),
         }
     }
@@ -366,8 +369,8 @@ impl MotorAxis {
     }
 
     /// The driver, for a controller-port write on the port thread.
-    pub(crate) fn motor(&self) -> &Arc<Mutex<dyn AsynMotor>> {
-        &self.motor
+    pub(crate) fn motor(&self) -> Option<&Arc<Mutex<dyn AsynMotor>>> {
+        self.motor.as_ref()
     }
 
     /// C `pC->poll()`, which UPDATE_STATUS runs before the axis's.
@@ -404,7 +407,7 @@ impl MotorAxis {
     /// Poll now and post: the drvMotorAsyn stand-in's GET_INFO.
     #[cfg(test)]
     pub(crate) fn force_poll(&self) {
-        let _ = self.poll_cmd_tx.try_send(PollCommand::ForcePoll);
+        let _ = self.poll_cmd_tx.try_send(PollCommand::ForcePoll(None));
     }
 
     /// The queue of its poller's poll requests.
@@ -419,15 +422,25 @@ impl MotorAxis {
 
     /// Bind one more record at the axis's slot (`AxisSlot::attach`).
     pub fn attach(&self) -> MotorDeviceSupport {
-        let mut support = self.slot.attach(self.user.clone(), self.timeout);
-        support.disables_ntm = self.disables_ntm;
+        self.bind(None)
+    }
+
+    /// Bind a model-1 record motor_init_record_com refused because another
+    /// record holds the signal. C keeps it, and its transactions reach the
+    /// motor task as any record's do (motordevCom.cc:244-262).
+    pub(crate) fn attach_in_use(&self) -> MotorDeviceSupport {
+        self.bind(Some(IN_USE))
+    }
+
+    fn bind(&self, refusal: Option<&'static str>) -> MotorDeviceSupport {
+        let mut support = self.slot.attach(self.user.clone(), self.timeout, refusal);
         support.port.build_trans = self.build_trans.clone();
         support
     }
 }
 
-/// What a record's commands reach: the axis at its slot when it sends, or a
-/// drvMotorAsyn port's answer for an axis it never opened.
+/// What a record's commands reach: the axis at its slot when it sends, a
+/// drvMotorAsyn port's answer for an axis it never opened, or nothing.
 #[derive(Clone)]
 enum AxisLink {
     Bound {
@@ -435,6 +448,41 @@ enum AxisLink {
         record: RecordId,
     },
     Missing(MissingAxis),
+    /// A model-1 card that does not exist: `build_trans` builds nothing
+    /// (`if (brdptr == NULL) return(ERROR)`, devESP300.cc:182-184) and
+    /// `motor_end_trans_com` ends every transaction (motordevCom.cc:497-508).
+    NoCard,
+    /// A signal its card lacks: the motor task answers each transaction
+    /// with RA_PROBLEM and zeroed positions, calling the record back and
+    /// never the driver (motordrvCom.cc:491-498). The list holds the record
+    /// alone.
+    NoSignal(AxisSubscribers),
+}
+
+/// `motor_init_record_com`'s refusals (motordevCom.cc:231-247).
+const NO_CARD: &str = "motor_init_record_com(): card does not exist!";
+const NO_SIGNAL: &str = "motor_init_record_com(): signal does not exist!";
+const IN_USE: &str = "motor_init_record_com(): motor already in use!";
+
+/// motordevCom's `MAX_TIMEOUT`, init_record_com's wait for its round's
+/// answer (motordrvCom.h:58).
+const INIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Why a record's requests reach no axis.
+enum Unreached {
+    Missing(MissingAxis),
+    NoCard,
+    NoSignal(AxisSubscribers),
+}
+
+/// What `motor_end_trans_com` did to the record, for the record to apply.
+#[must_use]
+pub(crate) enum EndTrans {
+    /// The transaction went to the driver, which may refuse it.
+    Passed,
+    /// No card: DMOV is set and posted, and RA_PROBLEM set unposted
+    /// (motordevCom.cc:497-508).
+    NoCard,
 }
 
 impl AxisLink {
@@ -480,7 +528,13 @@ pub struct MotorDeviceSupport {
     _timeout: Duration,
     io_intr_rx: Option<mpsc::Receiver<()>>,
     initialized: bool,
+    /// Whether the record's model-1 DTYP sets NTM to NO at init
+    /// ([`crate::devices::register_model1_device_disabling_ntm`]).
     disables_ntm: bool,
+    /// Why `motor_init_record_com` refused the record, which C keeps.
+    refusal: Option<&'static str>,
+    /// The DMOV posts `motor_end_trans_com` made in the last `write`.
+    posts: Vec<DevicePost>,
 }
 
 impl MotorDeviceSupport {
@@ -535,6 +589,8 @@ impl MotorDeviceSupport {
             io_intr_rx: Some(io_intr_rx),
             initialized: false,
             disables_ntm: false,
+            refusal: None,
+            posts: Vec::new(),
         }
     }
 
@@ -543,11 +599,66 @@ impl MotorDeviceSupport {
         &self.port.device_state
     }
 
+    /// A model-1 record whose card does not exist. C keeps it: its init
+    /// fails, and each later transaction ends at `motor_end_trans_com`.
+    pub(crate) fn no_card(device: &'static str, card: i32, signal: i32) -> Self {
+        let device_state = new_shared_state();
+        if let Ok(mut ds) = device_state.lock() {
+            ds.set_dset(MotorDset::MotordevCom);
+        }
+        let user = TraceUser::Model1 {
+            device,
+            card,
+            signal,
+        };
+        let mut support = Self::with_link(
+            Arc::new(MotorTrace::with_user(user)),
+            Duration::ZERO,
+            AxisLink::NoCard,
+            device_state,
+            mpsc::channel(16),
+        );
+        support.refusal = Some(NO_CARD);
+        support
+    }
+
+    /// A model-1 record on a signal its card lacks. C keeps it: its init
+    /// fails, and the motor task answers each later transaction.
+    pub(crate) fn no_signal(device: &'static str, card: i32, signal: i32) -> Self {
+        let device_state = new_shared_state();
+        if let Ok(mut ds) = device_state.lock() {
+            ds.set_dset(MotorDset::MotordevCom);
+        }
+        let trace = Arc::new(MotorTrace::with_user(TraceUser::Model1 {
+            device,
+            card,
+            signal,
+        }));
+        let (io_intr_tx, io_intr_rx) = mpsc::channel(16);
+        let records = AxisSubscribers::new();
+        records.attach_refused(device_state.clone(), io_intr_tx.clone(), trace.clone());
+        let mut support = Self::with_link(
+            trace,
+            Duration::ZERO,
+            AxisLink::NoSignal(records),
+            device_state,
+            (io_intr_tx, io_intr_rx),
+        );
+        support.refusal = Some(NO_SIGNAL);
+        support
+    }
+
+    pub(crate) fn disabling_ntm(mut self, disables_ntm: bool) -> Self {
+        self.disables_ntm = disables_ntm;
+        self
+    }
+
     /// Hand the driver a model-1 record's VME_IO parm, which C devices read
-    /// from `mr->out.value.vmeio.parm` (devMVP2001.cc:262, :361).
+    /// from `mr->out.value.vmeio.parm` (devMVP2001.cc:262, :361). Only the
+    /// record that holds the signal sends one; it is no transaction of C's.
     pub(crate) fn send_out_parm(&self, parm: String) {
-        if !parm.is_empty() {
-            self.port.send(
+        if !parm.is_empty() && self.refusal.is_none() {
+            let _ = self.port.send(
                 vec![MotorCommand::OutParm {
                     parm: PvString::from_bytes(parm),
                 }],
@@ -559,22 +670,6 @@ impl MotorDeviceSupport {
     /// Get the io_intr sender (for poll loop to trigger record re-processing).
     pub fn io_intr_sender(&self) -> mpsc::Sender<()> {
         self.port.io_intr_tx.clone()
-    }
-
-    /// Queue the commands on the poller thread and manage the poll loop.
-    fn execute_actions(&mut self, mut actions: DeviceActions) {
-        let port = &self.port;
-        let commands = std::mem::take(&mut actions.commands);
-        if !commands.is_empty() {
-            port.send(commands, true);
-        }
-
-        if actions.force_poll {
-            port.send_poll(PollCommand::ForcePoll);
-        }
-        if let Some(ref delay) = actions.schedule_delay {
-            port.schedule_delay(delay);
-        }
     }
 }
 
@@ -600,6 +695,12 @@ impl CommandPort {
         self
     }
 
+    /// Whether `build_trans` builds at all: not for a model-1 card that does
+    /// not exist.
+    pub(crate) fn builds(&self) -> bool {
+        !matches!(self.link, AxisLink::NoCard)
+    }
+
     /// C `build_trans` on a soft-limit `command`; a port with no device
     /// verdict builds it.
     pub(crate) fn build_limit(&self, command: &MotorCommand, mres: f64) -> LimitBuild {
@@ -608,6 +709,9 @@ impl CommandPort {
             MotorCommand::SetLowLimit { position } => (false, position),
             _ => return LimitBuild::Built,
         };
+        if !self.builds() {
+            return LimitBuild::Refused(None);
+        }
         match &self.build_trans {
             Some(device) => device.limit(high, raw, mres),
             None => LimitBuild::Built,
@@ -619,18 +723,71 @@ impl CommandPort {
         self.build_trans.as_ref().is_some_and(|d| d.defers(command))
     }
 
+    /// Send the pass's commands one transaction at a time, as its INIT_MSG
+    /// .. SEND_MSG pairs went out, handing each `motor_end_trans_com` to
+    /// `end`; then manage the poll loop.
+    fn execute_actions(&self, mut actions: DeviceActions, mut end: impl FnMut(EndTrans)) {
+        let mut commands = std::mem::take(&mut actions.commands);
+        while !commands.is_empty() {
+            let len = commands
+                .iter()
+                .position(MotorCommand::ends_transaction)
+                .map_or(commands.len(), |at| at + 1);
+            let rest = commands.split_off(len);
+            end(self.send(commands, true));
+            commands = rest;
+        }
+
+        if actions.force_poll {
+            self.force_poll();
+        }
+        if let Some(ref delay) = actions.schedule_delay {
+            self.schedule_delay(delay);
+        }
+    }
+
     /// Queue `commands` on the poller thread, or refuse them as the port
     /// does for a missing axis. Each move-class command is counted pending
     /// first, as C `build_trans` does; a record in COMM_ALARM sends nothing.
     /// `pact` is the record's while it sends: set in process, clear in
     /// init_record and special.
-    pub(crate) fn send(&self, commands: Vec<MotorCommand>, pact: bool) {
+    pub(crate) fn send(&self, commands: Vec<MotorCommand>, pact: bool) -> EndTrans {
+        self.queue(commands, pact, None)
+    }
+
+    /// C init_controller's pasynFloat64SyncIO writes (devMotorAsyn.c:190,
+    /// :223), sent from init_record as [`Self::send`] sends and returning
+    /// once the driver has run them and posted what they set, while a
+    /// poller's thread serves the axis: C's port thread runs them whatever
+    /// the poller does. motordevCom's are only queued (motordevCom.cc:
+    /// 327-343), as are the writes to a poller not yet started, which has
+    /// no thread to run them. Whether they ran.
+    pub(crate) fn send_init(&self, commands: Vec<MotorCommand>) -> bool {
+        let served = !self.trace.is_model1()
+            && !self.trace.is_motor_interface()
+            && match &self.link {
+                AxisLink::Bound { slot, .. } => slot.controller().is_some_and(|c| c.serving()),
+                AxisLink::Missing(_) | AxisLink::NoCard | AxisLink::NoSignal(_) => false,
+            };
+        if !served {
+            // init_record refuses a record with no card or signal before its
+            // writes (motordevCom.cc:231-241), so none ends here.
+            let _ = self.queue(commands, false, None);
+            return false;
+        }
+        let (ran, done) = Ran::new();
+        let _ = self.queue(commands, false, Some(ran));
+        done.recv().is_ok()
+    }
+
+    /// [`Self::send`], telling `ran` once the poller has run the batch.
+    fn queue(&self, commands: Vec<MotorCommand>, pact: bool, ran: Option<Ran>) -> EndTrans {
         let moves = commands.iter().filter(|c| c.is_move()).count();
         if let Ok(mut ds) = self.device_state.lock() {
             let comm_alarm = ds.comm_alarm();
             crate::poll_loop::build_trans_flow(&self.trace, &commands, pact, comm_alarm);
             if comm_alarm {
-                return;
+                return EndTrans::Passed;
             }
             for _ in 0..moves {
                 ds.move_queued();
@@ -640,42 +797,60 @@ impl CommandPort {
             // Fails only once the poller has ended, a state C's port queue
             // cannot be in, so there is no C line to print.
             Ok((axis, record)) => {
-                let _ = axis.motor_cmd_tx.send(
-                    CommandBatch {
-                        trace: self.trace.clone(),
-                        record: Some(record),
-                        commands,
-                    }
-                    .into(),
-                );
-                return;
+                let batch = CommandBatch {
+                    trace: self.trace.clone(),
+                    record: Some(record),
+                    commands,
+                };
+                let _ = axis.motor_cmd_tx.send(match ran {
+                    Some(ran) => ToAxis::Synced(batch, ran),
+                    None => batch.into(),
+                });
+                return EndTrans::Passed;
             }
-            Err(missing) => missing,
+            Err(Unreached::Missing(missing)) => missing,
+            Err(Unreached::NoCard) => return EndTrans::NoCard,
+            Err(Unreached::NoSignal(records)) => {
+                // The motor task's callbackRequest runs on the callback
+                // pool, which waits for the record this pass holds.
+                spawn_blocking_background(CallbackPriority::Medium, move |_| {
+                    let problem = MotorStatus {
+                        problem: true,
+                        ..MotorStatus::default()
+                    };
+                    for pulse in records.post(problem) {
+                        let _ = pulse.try_send(());
+                    }
+                });
+                return EndTrans::Passed;
+            }
         };
         crate::poll_loop::refuse_commands(&self.trace, missing, &commands);
         // asynCallback runs for a refused write as for any other, on the
         // port's thread, which waits for the record this pass holds.
         let moves: Vec<_> = commands.into_iter().filter(|c| c.is_move()).collect();
-        if moves.is_empty() {
-            return;
+        if !moves.is_empty() {
+            let (state, trace) = (self.device_state.clone(), self.trace.clone());
+            spawn_blocking_background(self.prio, move |_| {
+                for command in &moves {
+                    async_callback(&state, trace.record(), command);
+                }
+            });
         }
-        let (state, trace) = (self.device_state.clone(), self.trace.clone());
-        spawn_blocking_background(self.prio, move |_| {
-            for command in &moves {
-                async_callback(&state, trace.record(), command);
-            }
-        });
+        EndTrans::Passed
     }
 
     /// The axis that takes the record's requests now, or why none does.
-    fn axis(&self) -> Result<(AxisSenders, RecordId), MissingAxis> {
+    fn axis(&self) -> Result<(AxisSenders, RecordId), Unreached> {
         match &self.link {
             // Only a model-3 address is ever empty.
             AxisLink::Bound { slot, record } => slot
                 .axis()
                 .map(|axis| (axis, *record))
-                .ok_or(MissingAxis::Controller),
-            AxisLink::Missing(missing) => Err(*missing),
+                .ok_or(Unreached::Missing(MissingAxis::Controller)),
+            AxisLink::Missing(missing) => Err(Unreached::Missing(*missing)),
+            AxisLink::NoCard => Err(Unreached::NoCard),
+            AxisLink::NoSignal(records) => Err(Unreached::NoSignal(records.clone())),
         }
     }
 
@@ -692,16 +867,26 @@ impl CommandPort {
             _ => None,
         };
         let _held = controller.as_ref().map(SharedControllerPoll::hold);
+        self.update_values()
+    }
+
+    /// init_record's `update_values` (motorRecord.cc:690): the status the
+    /// record's callbacks left in `pPvt->status`, read with no driver lock
+    /// (devMotorAsyn.c:438-452).
+    fn update_values(&self) -> CaResult<MotorStatus> {
         let mut ds = self.device_state.lock().map_err(|e| {
             epics_base_rs::error::CaError::InvalidValue(format!("device state lock: {e}"))
         })?;
         Ok(ds.init_status())
     }
 
-    /// Send this record's poll request; a missing axis has no poller.
-    fn send_poll(&self, command: PollCommand) {
-        if let Ok((axis, _)) = self.axis() {
-            let _ = axis.poll_cmd_tx.try_send(command);
+    /// Ask the poller to poll now on this record's behalf; a missing axis,
+    /// card or signal has no poller.
+    fn force_poll(&self) {
+        if let Ok((axis, record)) = self.axis() {
+            let _ = axis
+                .poll_cmd_tx
+                .try_send(PollCommand::ForcePoll(Some(record)));
         }
     }
 
@@ -713,13 +898,48 @@ impl CommandPort {
         let (id, duration) = (delay.id, delay.duration);
         let device_state = self.device_state.clone();
         let io_intr_tx = self.io_intr_tx.clone();
-        spawn_background(self.prio, async move {
-            sleep_background(duration).await;
+        spawn_background_after(self.prio, duration, async move {
             let pulse = device_state.lock().is_ok_and(|mut ds| ds.delay_expired(id));
             if pulse {
                 let _ = io_intr_tx.send(()).await;
             }
         });
+    }
+}
+
+impl MotorDeviceSupport {
+    /// motor_init_record_com's round (motordevCom.cc:315-387): program the
+    /// card, GET_INFO, and wait up to MAX_TIMEOUT for the answer, which
+    /// `motor_init_callback` leaves for init_record's `update_values`.
+    fn init_round(
+        &self,
+        rec: &mut crate::record::MotorRecord,
+        commands: Vec<MotorCommand>,
+    ) -> CaResult<()> {
+        let lock_error =
+            |e| epics_base_rs::error::CaError::InvalidValue(format!("device state lock: {e}"));
+        let answered = self
+            .port
+            .device_state
+            .lock()
+            .map_err(lock_error)?
+            .arm_init_callback();
+        for command in commands.into_iter().chain([MotorCommand::Poll]) {
+            rec.send_init(command);
+        }
+        if answered.recv_timeout(INIT_TIMEOUT).is_err() {
+            epics_base_rs::server::recgbl::rec_gbl_record_error(
+                &epics_base_rs::server::recgbl::DevSupStatus::NoInit.text(),
+                self.port.trace.record(),
+                "dev_NoInit (init_record_com: callback2 timeout",
+            );
+        }
+        self.port
+            .device_state
+            .lock()
+            .map_err(lock_error)?
+            .disarm_init_callback();
+        Ok(())
     }
 }
 
@@ -739,7 +959,24 @@ impl DeviceSupport for MotorDeviceSupport {
             }
         }
 
-        if let Err(missing) = self.port.axis() {
+        if let Some(refusal) = self.refusal {
+            // motor_init_record_com refuses the record before reading it.
+            let name = self.port.trace.record();
+            epics_base_rs::server::recgbl::rec_gbl_record_error(
+                "Illegal field value",
+                name,
+                refusal,
+            );
+            if let Some(rec) = record
+                .as_any_mut()
+                .and_then(|a| a.downcast_mut::<crate::record::MotorRecord>())
+            {
+                crate::record::motor_failed_dset_init(rec, true);
+            }
+            return Err(epics_base_rs::error::CaError::InvalidValue(refusal.into()));
+        }
+
+        if let Err(Unreached::Missing(missing)) = self.port.axis() {
             // C prints the driver's errorMessage with no newline.
             self.port.trace.print(
                 asyn_rs::trace::TraceMask::ERROR,
@@ -753,8 +990,8 @@ impl DeviceSupport for MotorDeviceSupport {
         }
 
         // The RSTM/loadpos(#231)/MRES(#196) restore decision is owned
-        // entirely by `initial_readback` (status_update.rs), whose
-        // `InitPosition` is queued below.
+        // entirely by `restores_position` (status_update.rs), whose
+        // `InitPosition` is sent below.
         //
         // C `devMotorAsyn.c::init_controller` (166-239) reseeds only when
         // `initPos == 1`, decided by the RSTM switch testing the controller's
@@ -773,6 +1010,36 @@ impl DeviceSupport for MotorDeviceSupport {
         // no hardware call, and no failure for a bound axis. An unfilled
         // cache reads as C's calloc-zeroed status.
         let status = self.port.init_status()?;
+
+        // C init_record: the dset's init (devMotorAsyn's init_controller,
+        // motordevCom's motor_init_record_com round), each of its commands a
+        // transaction of its own (motordevCom.cc:327-343), then
+        // update_values (motorRecord.cc:690), which reads what the writes
+        // that ran posted, process_motor_info(initcall) and the drive sync,
+        // all before any process.
+        let mut rec = record
+            .as_any_mut()
+            .and_then(|a| a.downcast_mut::<crate::record::MotorRecord>());
+        let mut loaded = None;
+        if let Some(rec) = rec.as_deref_mut() {
+            if self.port.trace.is_model1() {
+                // Its round's answer, which update_values reads, shows any
+                // position load.
+                if let Some(commands) = rec.init_record_com(&status) {
+                    self.init_round(rec, commands)?;
+                }
+            } else {
+                let (commands, load) = rec.init_controller(&status);
+                loaded = load;
+                for command in commands {
+                    let position = matches!(command, MotorCommand::InitPosition { .. });
+                    if rec.send_init(command) && position {
+                        loaded = None;
+                    }
+                }
+            }
+        }
+        let status = self.port.update_values()?;
         self.port.trace.print(
             asyn_rs::trace::TraceMask::IO_DEVICE,
             self.port.trace.update_status_reason(),
@@ -781,18 +1048,8 @@ impl DeviceSupport for MotorDeviceSupport {
                 self.port.trace.record()
             ),
         );
-
-        // C init_record: the dset's init_controller, then
-        // process_motor_info(initcall) and the drive sync, all before any
-        // process. Each of its commands is a transaction of its own
-        // (motordevCom.cc:327-343).
-        if let Some(rec) = record
-            .as_any_mut()
-            .and_then(|a| a.downcast_mut::<crate::record::MotorRecord>())
-        {
-            for command in rec.initial_readback(&status).commands {
-                rec.send_special(vec![command]);
-            }
+        if let Some(rec) = rec {
+            rec.init_readback(&status, loaded);
         }
 
         // C init_record 717-718 ("Reset limits in case database values
@@ -813,7 +1070,7 @@ impl DeviceSupport for MotorDeviceSupport {
         Ok(DeviceReadOutcome::ok())
     }
 
-    fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {
+    fn write(&mut self, record: &mut dyn Record) -> CaResult<()> {
         // Extract actions atomically from shared state
         let actions = {
             let mut ds = self.port.device_state.lock().map_err(|e| {
@@ -825,8 +1082,25 @@ impl DeviceSupport for MotorDeviceSupport {
             return Ok(());
         };
 
-        self.execute_actions(actions);
+        let mut rec = record
+            .as_any_mut()
+            .and_then(|a| a.downcast_mut::<crate::record::MotorRecord>());
+        let posts = &mut self.posts;
+        self.port.execute_actions(actions, |end| {
+            if let Some(rec) = rec.as_mut() {
+                posts.extend(rec.end_trans(end));
+            }
+        });
         Ok(())
+    }
+
+    /// Only a record with no card posts from `motor_end_trans_com`.
+    fn posts_from_device(&self) -> bool {
+        !self.port.builds()
+    }
+
+    fn take_device_posts(&mut self) -> Vec<DevicePost> {
+        std::mem::take(&mut self.posts)
     }
 
     /// The DTYP that reaches this axis: `asynMotor` for an asyn axis (model 2

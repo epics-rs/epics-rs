@@ -1,0 +1,41 @@
+1..40
+ok  1 - start 1st round...
+ok  2 - msg=Entered low, initialize delay to 0.4 sec.
+ok  3 - msg=low, delay timeout, reenter low
+ok  4 - msg=low, waiting 0.6 secs to iterate
+ok  5 - msg=low, delay timeout, reenter low
+ok  6 - msg=low, waiting 0.8 secs to iterate
+ok  7 - msg=low, delay timeout, reenter low
+ok  8 - msg=low, waiting 1 secs to iterate
+ok  9 - msg=low, delay timeout, reenter low
+ok 10 - msg=low, waiting 1.2 secs to iterate
+ok 11 - msg=low, delay = 1.2, now changing to high
+ok 12 - msg=low, print this on exit of low
+ok 13 - msg=Entered high
+ok 14 - msg=high, delay 0.3 timeout, decr v and re-enter high
+ok 15 - msg=v = 2
+ok 16 - msg=high, delay 0.3 timeout, decr v and re-enter high
+ok 17 - msg=v = 1
+ok 18 - msg=high, delay 0.3 timeout, decr v and re-enter high
+ok 19 - msg=v = 0
+ok 20 - msg=changing to low
+ok 21 - one more time...
+ok 22 - msg=Entered low, initialize delay to 0.4 sec.
+ok 23 - msg=low, delay timeout, reenter low
+ok 24 - msg=low, waiting 0.6 secs to iterate
+ok 25 - msg=low, delay timeout, reenter low
+ok 26 - msg=low, waiting 0.8 secs to iterate
+ok 27 - msg=low, delay timeout, reenter low
+ok 28 - msg=low, waiting 1 secs to iterate
+ok 29 - msg=low, delay timeout, reenter low
+ok 30 - msg=low, waiting 1.2 secs to iterate
+ok 31 - msg=low, delay = 1.2, now changing to high
+ok 32 - msg=low, print this on exit of low
+ok 33 - msg=Entered high
+ok 34 - msg=high, delay 0.3 timeout, decr v and re-enter high
+ok 35 - msg=v = 2
+ok 36 - msg=high, delay 0.3 timeout, decr v and re-enter high
+ok 37 - msg=v = 1
+ok 38 - msg=high, delay 0.3 timeout, decr v and re-enter high
+ok 39 - msg=v = 0
+ok 40 - msg=changing to low

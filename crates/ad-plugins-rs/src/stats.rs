@@ -5,14 +5,13 @@
 // its `build.rs` began deriving `tokio_backend`; nothing here builds a
 // CA server, and the reactor these obtain comes from `#[tokio::test]`
 // itself, which the backend does not remove.
+use std::any::TypeId;
 use std::sync::Arc;
 
 #[cfg(feature = "parallel")]
 use crate::par_util;
-#[cfg(feature = "parallel")]
-use rayon::prelude::*;
 
-use ad_core_rs::ndarray::{NDArray, NDDataBuffer};
+use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataView};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::{
     ArraySource, NDPluginProcess, ParamUpdate, PluginParamSnapshot, PluginRuntimeHandle,
@@ -153,17 +152,17 @@ pub fn compute_stats(
     dims: &[ad_core_rs::ndarray::NDDimension],
     bgd_width: usize,
 ) -> StatsResult {
-    match data {
-        NDDataBuffer::I8(v) => stats_of(v, dims, bgd_width),
-        NDDataBuffer::U8(v) => stats_of(v, dims, bgd_width),
-        NDDataBuffer::I16(v) => stats_of(v, dims, bgd_width),
-        NDDataBuffer::U16(v) => stats_of(v, dims, bgd_width),
-        NDDataBuffer::I32(v) => stats_of(v, dims, bgd_width),
-        NDDataBuffer::U32(v) => stats_of(v, dims, bgd_width),
-        NDDataBuffer::I64(v) => stats_of(v, dims, bgd_width),
-        NDDataBuffer::U64(v) => stats_of(v, dims, bgd_width),
-        NDDataBuffer::F32(v) => stats_of(v, dims, bgd_width),
-        NDDataBuffer::F64(v) => stats_of(v, dims, bgd_width),
+    match data.view() {
+        NDDataView::I8(v) => stats_of(v, dims, bgd_width),
+        NDDataView::U8(v) => stats_of(v, dims, bgd_width),
+        NDDataView::I16(v) => stats_of(v, dims, bgd_width),
+        NDDataView::U16(v) => stats_of(v, dims, bgd_width),
+        NDDataView::I32(v) => stats_of(v, dims, bgd_width),
+        NDDataView::U32(v) => stats_of(v, dims, bgd_width),
+        NDDataView::I64(v) => stats_of(v, dims, bgd_width),
+        NDDataView::U64(v) => stats_of(v, dims, bgd_width),
+        NDDataView::F32(v) => stats_of(v, dims, bgd_width),
+        NDDataView::F64(v) => stats_of(v, dims, bgd_width),
     }
 }
 
@@ -214,7 +213,7 @@ pub(crate) trait StatsElem: Copy + PartialOrd + 'static {
         project_row_pass(row, threshold, col_sum, col_thr)
     }
     /// `Some(n)` when the type has only `n` values, few enough that a
-    /// histogram maps them through a table of slots built once per frame;
+    /// histogram maps them through a table of slots, kept across frames;
     /// `None` for the wider types, which run the bin formula per element.
     const TABLE_LEN: Option<usize> = None;
     /// This value's index into that table, and the value at an index; both
@@ -1016,19 +1015,18 @@ fn stats_of<T: StatsElem + Send + Sync>(
     let n = v.len() as f64;
     let (range, variance);
     #[cfg(feature = "parallel")]
-    if par_util::should_parallelize(v.len()) {
-        range = par_util::thread_pool().install(|| {
-            v.par_chunks(PAR_CHUNK)
-                .map(T::range)
-                .reduce_with(merge_range)
-                .expect("a non-empty slice has at least one chunk")
-        });
+    let split = par_util::Split::new(v.len(), 1, PAR_CHUNK);
+    #[cfg(feature = "parallel")]
+    // Both passes take 190 ps + 25 ps per element byte serially at these
+    // sizes; the split measured faster from 80 us (u16 600x600 0.85x serial,
+    // f64 512x512 0.83x, u8 724x724 0.55x).
+    if par_util::pool_wins(v.len(), 190 + 25 * size_of::<T>(), 80, split.chunks()) {
+        range = (par_util::map_chunks(v, split, T::range).into_iter())
+            .reduce(merge_range)
+            .expect("a non-empty slice has at least one chunk");
         let mean = range.total / n;
-        variance = par_util::thread_pool().install(|| {
-            v.par_chunks(PAR_CHUNK)
-                .map(|c| T::variance(c, mean))
-                .sum::<f64>()
-        });
+        variance =
+            (par_util::map_chunks(v, split, |c| T::variance(c, mean)).into_iter()).sum::<f64>();
     } else {
         range = T::range(v);
         variance = T::variance(v, range.total / n);
@@ -1290,16 +1288,18 @@ fn project_of<T: StatsElem + Sync>(
 ) -> Projection {
     let v = &v[..x_size * y_size];
     #[cfg(feature = "parallel")]
-    if par_util::should_parallelize(v.len()) {
-        let band = (PAR_CHUNK / x_size).max(1) * x_size;
-        return par_util::thread_pool().install(|| {
-            v.par_chunks(band)
-                .map(|band| project_band(band, x_size, threshold))
-                .collect::<Vec<_>>()
-                .into_iter()
-                .reduce(Projection::append)
-                .unwrap_or_else(|| Projection::zeroed(x_size, y_size))
-        });
+    let split = par_util::Split::new(v.len(), x_size, PAR_CHUNK);
+    #[cfg(feature = "parallel")]
+    // At least 280 ps per element serially (i8 at row widths a multiple of
+    // 64; up to 480 elsewhere), but 10 ms apart the split loses below about
+    // 250K elements whatever the type costs (u8 448x448 1.11x serial, f32
+    // 1.16x, u16 480x480 1.03x); 71 us at 280 ps is 504x504, from which
+    // every type measured faster (0.69-0.87x).
+    if par_util::pool_wins(v.len(), 280, 71, split.chunks()) {
+        return (par_util::map_chunks(v, split, |band| project_band(band, x_size, threshold)))
+            .into_iter()
+            .reduce(Projection::append)
+            .unwrap_or_else(|| Projection::zeroed(x_size, y_size));
     }
     project_band(v, x_size, threshold)
 }
@@ -1458,7 +1458,20 @@ pub fn compute_histogram(
     hist_min: f64,
     hist_max: f64,
 ) -> (Vec<f64>, f64, f64, f64) {
-    let counts = ad_core_rs::with_buffer!(data, |v| histogram_of(v, hist_size, hist_min, hist_max));
+    histogram(data, hist_size, hist_min, hist_max, &KeptTable::default())
+}
+
+/// [`compute_histogram`], through the slot table `kept` keeps.
+fn histogram(
+    data: &NDDataBuffer,
+    hist_size: usize,
+    hist_min: f64,
+    hist_max: f64,
+    kept: &KeptTable,
+) -> (Vec<f64>, f64, f64, f64) {
+    let counts = ad_core_rs::with_buffer!(data, |v| histogram_of(
+        v, hist_size, hist_min, hist_max, kept
+    ));
     let histogram: Vec<f64> = counts.bins().iter().map(|&c| c as f64).collect();
 
     // Compute entropy matching C++: -sum(count * ln(count)) / nElements
@@ -1517,7 +1530,60 @@ impl HistCounts {
 /// a table of every value's slot.
 enum SlotMap {
     Formula(Formula),
-    Table(Vec<u32>),
+    Table(Arc<SlotTable>),
+}
+
+/// Every value's slot, for the element type and the HIST_SIZE / HIST_MIN /
+/// HIST_MAX in `key`.
+struct SlotTable {
+    key: TableKey,
+    slots: Vec<u32>,
+}
+
+#[derive(PartialEq)]
+struct TableKey {
+    elem: TypeId,
+    hist_size: usize,
+    // Bits, so a NaN limit still finds its own table.
+    hist_min: u64,
+    hist_max: u64,
+}
+
+/// The slot table kept across frames. A frame gets it only under the key
+/// it was built for; any other key builds its own table, kept in its place.
+#[derive(Default)]
+struct KeptTable {
+    table: Mutex<Option<Arc<SlotTable>>>,
+}
+
+impl KeptTable {
+    fn get<T: StatsElem>(&self, len: usize, hist_size: usize, f: &Formula) -> Arc<SlotTable> {
+        let key = TableKey {
+            elem: TypeId::of::<T>(),
+            hist_size,
+            hist_min: f.hist_min.to_bits(),
+            hist_max: f.hist_max.to_bits(),
+        };
+        if let Some(kept) = &*self.table.lock()
+            && kept.key == key
+        {
+            return Arc::clone(kept);
+        }
+        // Built outside the lock: frames on the other NumThreads threads
+        // are not held while it is.
+        let slots = (0..len)
+            .map(
+                |i| match slot(T::table_value(i), f.hist_min, f.hist_max, f.scale, f.last) {
+                    Slot::Below => hist_size as u32,
+                    Slot::Above => hist_size as u32 + 1,
+                    Slot::Bin(bin) => bin as u32,
+                },
+            )
+            .collect();
+        let table = Arc::new(SlotTable { key, slots });
+        *self.table.lock() = Some(Arc::clone(&table));
+        table
+    }
 }
 
 /// The bin formula's constants for one histogram.
@@ -1548,27 +1614,17 @@ fn formula_count_pass<T: StatsElem>(v: &[T], f: &Formula, slots: &mut [u64]) {
 }
 
 impl SlotMap {
-    fn new<T: StatsElem>(hist_size: usize, hist_min: f64, hist_max: f64) -> Self {
+    fn new<T: StatsElem>(hist_size: usize, hist_min: f64, hist_max: f64, kept: &KeptTable) -> Self {
         let last = hist_size as i64 - 1;
-        let scale = last as f64 / (hist_max - hist_min);
+        let f = Formula {
+            hist_min,
+            hist_max,
+            scale: last as f64 / (hist_max - hist_min),
+            last,
+        };
         match T::TABLE_LEN {
-            Some(len) => Self::Table(
-                (0..len)
-                    .map(
-                        |i| match slot(T::table_value(i), hist_min, hist_max, scale, last) {
-                            Slot::Below => hist_size as u32,
-                            Slot::Above => hist_size as u32 + 1,
-                            Slot::Bin(bin) => bin as u32,
-                        },
-                    )
-                    .collect(),
-            ),
-            None => Self::Formula(Formula {
-                hist_min,
-                hist_max,
-                scale,
-                last,
-            }),
+            Some(len) => Self::Table(kept.get::<T>(len, hist_size, &f)),
+            None => Self::Formula(f),
         }
     }
 
@@ -1577,6 +1633,10 @@ impl SlotMap {
         match self {
             Self::Formula(f) => T::formula_count(v, f, &mut acc.slots),
             Self::Table(table) => {
+                // Cut to the type's own length: every `table_index` is then in
+                // range by type, so the loop's lookups need no check, inlined or not.
+                let table =
+                    &table.slots[..T::TABLE_LEN.expect("only a type with a table builds one")];
                 for &e in v {
                     acc.slots[table[e.table_index()] as usize] += 1;
                 }
@@ -1614,21 +1674,31 @@ fn histogram_of<T: StatsElem + Sync>(
     hist_size: usize,
     hist_min: f64,
     hist_max: f64,
+    kept: &KeptTable,
 ) -> HistCounts {
-    let map = SlotMap::new::<T>(hist_size, hist_min, hist_max);
+    let map = SlotMap::new::<T>(hist_size, hist_min, hist_max, kept);
     #[cfg(feature = "parallel")]
-    if par_util::should_parallelize(v.len()) {
-        return par_util::thread_pool().install(|| {
-            v.par_chunks(PAR_CHUNK)
-                .fold(
-                    || HistCounts::zeroed(hist_size),
-                    |mut acc, chunk| {
-                        map.count(&mut acc, chunk);
-                        acc
-                    },
-                )
-                .reduce(|| HistCounts::zeroed(hist_size), HistCounts::merge)
-        });
+    let split = par_util::Split::new(v.len(), 1, PAR_CHUNK);
+    #[cfg(feature = "parallel")]
+    // At least 500 ps per element serially through the table (u16; u8 870
+    // where values crowd few bins), 1300 through the formula (f32, i32; f64
+    // 2000); the split measured faster from 60 us (u16 362x362 0.95x serial,
+    // u8 0.68x, f64 300x300 0.86x).
+    if par_util::pool_wins(
+        v.len(),
+        if T::TABLE_LEN.is_some() { 500 } else { 1300 },
+        60,
+        split.chunks(),
+    ) {
+        return (par_util::fold_chunks(
+            v,
+            split,
+            || HistCounts::zeroed(hist_size),
+            |acc, chunk| map.count(acc, chunk),
+        ))
+        .into_iter()
+        .reduce(HistCounts::merge)
+        .expect("the caller counts at least one chunk");
     }
     let mut acc = HistCounts::zeroed(hist_size);
     map.count(&mut acc, v);
@@ -1761,6 +1831,7 @@ pub struct StatsProcessor {
     params: NDStatsParams,
     /// Shared cell to export params after register_params is called.
     params_out: Arc<Mutex<NDStatsParams>>,
+    hist_table: KeptTable,
 }
 
 impl StatsProcessor {
@@ -1770,6 +1841,7 @@ impl StatsProcessor {
             config: Mutex::new(StatsConfig::default()),
             params: NDStatsParams::default(),
             params_out: Arc::new(Mutex::new(NDStatsParams::default())),
+            hist_table: KeptTable::default(),
         }
     }
 
@@ -1830,18 +1902,26 @@ impl NDPluginProcess for StatsProcessor {
         2
     }
 
-    /// C `NDPluginStats::writeInt32` drops the base class status
-    /// (`status = (asynStatus) callParamCallbacks();`, NDPluginStats.cpp:700): a refused NDPluginDriver write keeps
-    /// its clamp and succeeds.
+    /// C `NDPluginStats::writeInt32` drops the base refusal (NDPluginStats.cpp:700); not copied.
+    /// A kept refusal carries the errorMessage C's `if (status)` sets (:702-705).
     fn validate_int32(
         &self,
         reason: usize,
         _addr: i32,
-        _value: i32,
+        value: i32,
         verdict: ad_core_rs::plugin::runtime::WriteVerdict<i32>,
         params: &mut ad_core_rs::plugin::runtime::WritePort<'_>,
     ) -> ad_core_rs::plugin::runtime::WriteOutcome<i32> {
-        let verdict = verdict.succeed();
+        use ad_core_rs::plugin::runtime::WriteVerdict;
+        let verdict = match verdict {
+            WriteVerdict::Refuse { keep, .. } => WriteVerdict::Refuse {
+                keep,
+                message: format!(
+                    "NDPluginStats:writeInt32: status=3, function={reason}, value={value}"
+                ),
+            },
+            accepted => accepted,
+        };
         if reason == self.params.hist_size {
             let hist_x = self.hist_x(params, reason, f64::from(verdict.kept()));
             return ad_core_rs::plugin::runtime::WriteOutcome::from(verdict).set_updates(hist_x);
@@ -1869,7 +1949,7 @@ impl NDPluginProcess for StatsProcessor {
         let cfg = *self.config.lock();
 
         let mut result = if cfg.do_compute_statistics {
-            compute_stats(&array.data, &array.dims, cfg.bgd_width)
+            compute_stats(array.data(), &array.dims, cfg.bgd_width)
         } else {
             StatsResult::default()
         };
@@ -1888,7 +1968,7 @@ impl NDPluginProcess for StatsProcessor {
             _ => array.dims[1].size,
         };
         let projection = if ndims <= 2 && (cfg.do_compute_centroid || cfg.do_compute_profiles) {
-            project(&array.data, size_x, size_y, cfg.centroid_threshold)
+            project(array.data(), size_x, size_y, cfg.centroid_threshold)
         } else {
             None
         };
@@ -1906,7 +1986,7 @@ impl NDPluginProcess for StatsProcessor {
                 // calculation independent, and that C defect is not copied.
                 Some(p) => profiles_from(
                     p,
-                    &array.data,
+                    array.data(),
                     centroid.centroid_x,
                     centroid.centroid_y,
                     cfg.cursor_x,
@@ -1940,8 +2020,13 @@ impl NDPluginProcess for StatsProcessor {
 
         // Histogram computation
         if cfg.do_compute_histogram {
-            let (histogram, below, above, entropy) =
-                compute_histogram(&array.data, cfg.hist_size, cfg.hist_min, cfg.hist_max);
+            let (histogram, below, above, entropy) = histogram(
+                array.data(),
+                cfg.hist_size,
+                cfg.hist_min,
+                cfg.hist_max,
+                &self.hist_table,
+            );
             result.histogram = histogram;
             result.hist_below = below;
             result.hist_above = above;
@@ -1954,7 +2039,7 @@ impl NDPluginProcess for StatsProcessor {
         if cfg.do_compute_profiles && projection.is_some() {
             let cx = cfg.cursor_x.min(size_x - 1);
             let cy = cfg.cursor_y.min(size_y - 1);
-            result.cursor_value = array.data.get_as_f64(cy * size_x + cx).unwrap_or(0.0);
+            result.cursor_value = array.data().get_as_f64(cy * size_x + cx).unwrap_or(0.0);
         }
 
         // C sets each group only under its Compute* flag
@@ -2275,35 +2360,17 @@ mod tests {
         assert_eq!(handle.port_runtime().port_handle().max_addr(), 2);
     }
 
-    /// `status = (asynStatus) callParamCallbacks();` (NDPluginStats.cpp:700).
+    /// NDPluginStats.cpp:700 drops the base refusal; a Stats port returns it.
     #[test]
-    fn a_refused_base_write_succeeds_as_c_write_int32_does() {
-        use ad_core_rs::plugin::runtime::WriteVerdict;
-        let proc = StatsProcessor::new();
-        let mut base = asyn_rs::port::PortDriverBase::new(
-            "T",
-            1,
-            Default::default(),
-            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
-        );
-        let clamp = WriteVerdict::Refuse {
-            keep: 1,
-            message: String::new(),
-        };
+    fn a_refused_base_write_fails() {
+        let (message, function, value) =
+            crate::test_util::refused_base_write("STATS_REFUSED", StatsProcessor::new());
         assert_eq!(
-            proc.validate_int32(
-                0,
-                0,
-                98,
-                clamp,
-                &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base)
-            )
-            .verdict,
-            WriteVerdict::Accept(1)
+            message,
+            format!("NDPluginStats:writeInt32: status=3, function={function}, value={value}")
         );
     }
-    use ad_core_rs::ndarray::{NDDataType, NDDimension};
+    use ad_core_rs::ndarray::{NDDataType, NDDataViewMut, NDDimension};
 
     #[test]
     fn test_runtime_leaves_the_controls_to_the_database() {
@@ -2340,8 +2407,10 @@ mod tests {
         use ad_core_rs::plugin::runtime::NDPluginProcess;
 
         let processor = StatsProcessor::new();
-        let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
-        arr.data = NDDataBuffer::U8(vec![1, 2, 3, 4]);
+        let mut arr = NDArray::with_data(
+            vec![NDDimension::new(4)],
+            NDDataBuffer::from_vec::<u8>(vec![1, 2, 3, 4]),
+        );
         arr.unique_id = 42;
         arr.timestamp = ad_core_rs::timestamp::EpicsTimestamp {
             sec: 100,
@@ -2355,7 +2424,7 @@ mod tests {
             panic!("one TS point per frame, got {}", r.addressed.len());
         };
         assert_eq!(*addr, 1);
-        let NDDataBuffer::F64(v) = &ts.data else {
+        let NDDataView::F64(v) = ts.data().view() else {
             panic!("TS point is Float64");
         };
         assert_eq!(v.len(), 23);
@@ -2368,7 +2437,7 @@ mod tests {
     #[test]
     fn test_compute_stats_u8() {
         let dims = vec![NDDimension::new(5)];
-        let data = NDDataBuffer::U8(vec![10, 20, 30, 40, 50]);
+        let data = NDDataBuffer::from_vec::<u8>(vec![10, 20, 30, 40, 50]);
         let stats = compute_stats(&data, &dims, 0);
         assert_eq!(stats.min, 10.0);
         assert_eq!(stats.max, 50.0);
@@ -2380,7 +2449,7 @@ mod tests {
     #[test]
     fn test_compute_stats_sigma() {
         let dims = vec![NDDimension::new(8)];
-        let data = NDDataBuffer::F64(vec![2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0]);
+        let data = NDDataBuffer::from_vec::<f64>(vec![2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0]);
         let stats = compute_stats(&data, &dims, 0);
         assert!((stats.mean - 5.0).abs() < 1e-10);
         assert!((stats.sigma - 2.0).abs() < 1e-10);
@@ -2389,7 +2458,7 @@ mod tests {
     #[test]
     fn test_compute_stats_u16() {
         let dims = vec![NDDimension::new(3)];
-        let data = NDDataBuffer::U16(vec![100, 200, 300]);
+        let data = NDDataBuffer::from_vec::<u16>(vec![100, 200, 300]);
         let stats = compute_stats(&data, &dims, 0);
         assert_eq!(stats.min, 100.0);
         assert_eq!(stats.max, 300.0);
@@ -2399,7 +2468,7 @@ mod tests {
     #[test]
     fn test_compute_stats_f64() {
         let dims = vec![NDDimension::new(3)];
-        let data = NDDataBuffer::F64(vec![1.5, 2.5, 3.5]);
+        let data = NDDataBuffer::from_vec::<f64>(vec![1.5, 2.5, 3.5]);
         let stats = compute_stats(&data, &dims, 0);
         assert!((stats.min - 1.5).abs() < 1e-10);
         assert!((stats.max - 3.5).abs() < 1e-10);
@@ -2409,7 +2478,7 @@ mod tests {
     #[test]
     fn test_compute_stats_single_element() {
         let dims = vec![NDDimension::new(1)];
-        let data = NDDataBuffer::I32(vec![42]);
+        let data = NDDataBuffer::from_vec::<i32>(vec![42]);
         let stats = compute_stats(&data, &dims, 0);
         assert_eq!(stats.min, 42.0);
         assert_eq!(stats.max, 42.0);
@@ -2420,7 +2489,7 @@ mod tests {
 
     #[test]
     fn test_compute_stats_empty() {
-        let data = NDDataBuffer::U8(vec![]);
+        let data = NDDataBuffer::from_vec::<u8>(vec![]);
         let stats = compute_stats(&data, &[], 0);
         assert_eq!(stats.num_elements, 0);
     }
@@ -2429,7 +2498,7 @@ mod tests {
     fn test_compute_stats_min_max_position() {
         let dims = vec![NDDimension::new(4), NDDimension::new(4)];
         // 4x4 array: min at [0], max at [15]
-        let data = NDDataBuffer::U8((1..=16).collect());
+        let data = NDDataBuffer::from_vec::<u8>((1..=16).collect());
         let stats = compute_stats(&data, &dims, 0);
         assert_eq!(stats.min_x, 0); // index 0 -> x=0, y=0
         assert_eq!(stats.min_y, 0);
@@ -2614,46 +2683,56 @@ mod tests {
         check_kernel_against_reference(
             "i8",
             |i| (seq(i) % 256) as u8 as i8,
-            NDDataBuffer::I8,
+            NDDataBuffer::from_vec::<i8>,
             1e-12,
         );
-        check_kernel_against_reference("u8", |i| (seq(i) % 256) as u8, NDDataBuffer::U8, 1e-12);
+        check_kernel_against_reference(
+            "u8",
+            |i| (seq(i) % 256) as u8,
+            NDDataBuffer::from_vec::<u8>,
+            1e-12,
+        );
         check_kernel_against_reference(
             "i16",
             |i| (seq(i) % 65536) as u16 as i16,
-            NDDataBuffer::I16,
+            NDDataBuffer::from_vec::<i16>,
             1e-12,
         );
         check_kernel_against_reference(
             "u16",
             |i| (seq(i) % 65536) as u16,
-            NDDataBuffer::U16,
+            NDDataBuffer::from_vec::<u16>,
             1e-12,
         );
         check_kernel_against_reference(
             "i32",
             |i| seq(i) as i32 - 500_000,
-            NDDataBuffer::I32,
+            NDDataBuffer::from_vec::<i32>,
             1e-12,
         );
-        check_kernel_against_reference("u32", seq, NDDataBuffer::U32, 1e-12);
+        check_kernel_against_reference("u32", seq, NDDataBuffer::from_vec::<u32>, 1e-12);
         check_kernel_against_reference(
             "i64",
             |i| seq(i) as i64 - 500_000,
-            NDDataBuffer::I64,
+            NDDataBuffer::from_vec::<i64>,
             1e-12,
         );
-        check_kernel_against_reference("u64", |i| seq(i) as u64, NDDataBuffer::U64, 1e-12);
+        check_kernel_against_reference(
+            "u64",
+            |i| seq(i) as u64,
+            NDDataBuffer::from_vec::<u64>,
+            1e-12,
+        );
         check_kernel_against_reference(
             "f32",
             |i| seq(i) as f32 * 0.37 - 100.0,
-            NDDataBuffer::F32,
+            NDDataBuffer::from_vec::<f32>,
             1e-9,
         );
         check_kernel_against_reference(
             "f64",
             |i| seq(i) as f64 * 0.37 - 100.0,
-            NDDataBuffer::F64,
+            NDDataBuffer::from_vec::<f64>,
             1e-12,
         );
     }
@@ -2670,7 +2749,7 @@ mod tests {
         v[9] = 60000;
         v[2 * PAR_CHUNK_OR_LARGE + 7] = 60000;
         let dims = vec![NDDimension::new(n)];
-        let s = compute_stats(&NDDataBuffer::U16(v), &dims, 0);
+        let s = compute_stats(&NDDataBuffer::from_vec::<u16>(v), &dims, 0);
         assert_eq!((s.min, s.min_x), (1.0, 5));
         assert_eq!((s.max, s.max_x), (60000.0, 9));
     }
@@ -2685,9 +2764,17 @@ mod tests {
     #[test]
     fn nan_follows_the_strict_compare_rule() {
         let dims = vec![NDDimension::new(4)];
-        let s = compute_stats(&NDDataBuffer::F64(vec![3.0, f64::NAN, 1.0, 5.0]), &dims, 0);
+        let s = compute_stats(
+            &NDDataBuffer::from_vec::<f64>(vec![3.0, f64::NAN, 1.0, 5.0]),
+            &dims,
+            0,
+        );
         assert_eq!((s.min, s.min_x, s.max, s.max_x), (1.0, 2, 5.0, 3));
-        let s = compute_stats(&NDDataBuffer::F64(vec![f64::NAN, 1.0, 5.0]), &dims, 0);
+        let s = compute_stats(
+            &NDDataBuffer::from_vec::<f64>(vec![f64::NAN, 1.0, 5.0]),
+            &dims,
+            0,
+        );
         assert!(s.min.is_nan() && s.max.is_nan());
         assert_eq!((s.min_x, s.max_x), (0, 0));
     }
@@ -2695,7 +2782,7 @@ mod tests {
     #[test]
     fn test_compute_stats_net_no_bgd() {
         let dims = vec![NDDimension::new(4), NDDimension::new(4)];
-        let data = NDDataBuffer::U8((1..=16).collect());
+        let data = NDDataBuffer::from_vec::<u8>((1..=16).collect());
         let stats = compute_stats(&data, &dims, 0);
         // With bgd_width=0, net should equal total
         assert_eq!(stats.net, stats.total);
@@ -2708,7 +2795,7 @@ mod tests {
         let mut pixels = vec![10u16; 16];
         // Put a bright spot at (2,2) = index 10
         pixels[2 * 4 + 2] = 110;
-        let data = NDDataBuffer::U16(pixels);
+        let data = NDDataBuffer::from_vec::<u16>(pixels);
         let stats = compute_stats(&data, &dims, 1);
 
         // With bgd_width=1, all edge pixels (1 pixel from each edge) are used for background.
@@ -2752,7 +2839,7 @@ mod tests {
             pixels[i] = 100;
         }
         let total_expected: f64 = pixels.iter().map(|&p| p as f64).sum();
-        let data = NDDataBuffer::U16(pixels);
+        let data = NDDataBuffer::from_vec::<u16>(pixels);
         let stats = compute_stats(&data, &dims, 1);
 
         // C++ strip sum (bgd_width=1):
@@ -2789,7 +2876,7 @@ mod tests {
     fn test_compute_stats_bgd_1d() {
         // 1-D, 8 elements: [10, 20, 30, 40, 50, 60, 70, 80], bgd_width=2.
         let dims = vec![NDDimension::new(8)];
-        let data = NDDataBuffer::U16(vec![10, 20, 30, 40, 50, 60, 70, 80]);
+        let data = NDDataBuffer::from_vec::<u16>(vec![10, 20, 30, 40, 50, 60, 70, 80]);
         let stats = compute_stats(&data, &dims, 2);
 
         // Single dimension: low strip indices 0,1 -> 10,20;
@@ -2820,7 +2907,7 @@ mod tests {
             NDDimension::new(2),
             NDDimension::new(2),
         ];
-        let data = NDDataBuffer::U8(vec![1u8; 8]);
+        let data = NDDataBuffer::from_vec::<u8>(vec![1u8; 8]);
         let stats = compute_stats(&data, &dims, 1);
         assert!(
             stats.net.abs() < 1e-9,
@@ -2832,7 +2919,7 @@ mod tests {
 
     #[test]
     fn test_centroid_uniform() {
-        let data = NDDataBuffer::U8(vec![1; 16]);
+        let data = NDDataBuffer::from_vec::<u8>(vec![1; 16]);
         let c = compute_centroid(&data, 4, 4, 0.0);
         assert!((c.centroid_x - 1.5).abs() < 1e-10);
         assert!((c.centroid_y - 1.5).abs() < 1e-10);
@@ -2842,7 +2929,7 @@ mod tests {
     fn test_centroid_corner() {
         let mut d = vec![0u8; 16];
         d[0] = 255;
-        let data = NDDataBuffer::U8(d);
+        let data = NDDataBuffer::from_vec::<u8>(d);
         let c = compute_centroid(&data, 4, 4, 0.0);
         assert!((c.centroid_x - 0.0).abs() < 1e-10);
         assert!((c.centroid_y - 0.0).abs() < 1e-10);
@@ -2853,7 +2940,7 @@ mod tests {
         // 4x4 image: background of 5, bright spot of 100 at (2,2)
         let mut pixels = vec![5u8; 16];
         pixels[2 * 4 + 2] = 100;
-        let data = NDDataBuffer::U8(pixels);
+        let data = NDDataBuffer::from_vec::<u8>(pixels);
 
         // With threshold=50, only the bright pixel should be counted
         let c = compute_centroid(&data, 4, 4, 50.0);
@@ -2865,7 +2952,7 @@ mod tests {
     #[test]
     fn test_centroid_higher_moments_symmetric() {
         // Symmetric distribution: skewness should be ~0, eccentricity ~0 for uniform
-        let data = NDDataBuffer::U8(vec![1; 16]);
+        let data = NDDataBuffer::from_vec::<u8>(vec![1; 16]);
         let c = compute_centroid(&data, 4, 4, 0.0);
         // Symmetric -> skewness ~0
         assert!(c.skewness_x.abs() < 1e-10);
@@ -2883,17 +2970,20 @@ mod tests {
         for (name, data) in [
             (
                 "u16",
-                NDDataBuffer::U16((0..n).map(|i| (i % 2) as u16).collect()),
+                NDDataBuffer::from_vec::<u16>((0..n).map(|i| (i % 2) as u16).collect()),
             ),
             (
                 "i32",
-                NDDataBuffer::I32((0..n).map(|i| (i % 2) as i32).collect()),
+                NDDataBuffer::from_vec::<i32>((0..n).map(|i| (i % 2) as i32).collect()),
             ),
             (
                 "i64",
-                NDDataBuffer::I64((0..n).map(|i| (i % 2) as i64).collect()),
+                NDDataBuffer::from_vec::<i64>((0..n).map(|i| (i % 2) as i64).collect()),
             ),
-            ("f64", NDDataBuffer::F64((0..n).map(zeros_ones).collect())),
+            (
+                "f64",
+                NDDataBuffer::from_vec::<f64>((0..n).map(zeros_ones).collect()),
+            ),
         ] {
             // Min = Max = Size = 1: scale 0/0, every pixel below.
             let (hist, below, above, _) = compute_histogram(&data, 1, 1.0, 1.0);
@@ -2906,10 +2996,10 @@ mod tests {
             assert_eq!((hist.len(), below, above), (0, 0.0, n as f64), "{name}");
         }
         // t >= 2^31 is INT_MIN in C, so a far-above pixel counts below.
-        let data = NDDataBuffer::U16(vec![30000; 5]);
+        let data = NDDataBuffer::from_vec::<u16>(vec![30000; 5]);
         let (_, below, above, _) = compute_histogram(&data, 100_000, 0.0, 1.0);
         assert_eq!((below, above), (5.0, 0.0));
-        let data = NDDataBuffer::F64([vec![3e9; 9], vec![f64::NAN; 9]].concat());
+        let data = NDDataBuffer::from_vec::<f64>([vec![3e9; 9], vec![f64::NAN; 9]].concat());
         let (hist, below, above, _) = compute_histogram(&data, 3, 0.0, 1.0);
         assert_eq!((hist, below, above), (vec![0.0; 3], 18.0, 0.0));
     }
@@ -2926,13 +3016,16 @@ mod tests {
         let counted: Vec<_> = [
             (
                 "f32",
-                NDDataBuffer::F32(cycle(n).map(|v| v as f32).collect()),
+                NDDataBuffer::from_vec::<f32>(cycle(n).map(|v| v as f32).collect()),
             ),
-            ("f64", NDDataBuffer::F64(cycle(n).map(f64::from).collect())),
-            ("i32", NDDataBuffer::I32(cycle(n).collect())),
+            (
+                "f64",
+                NDDataBuffer::from_vec::<f64>(cycle(n).map(f64::from).collect()),
+            ),
+            ("i32", NDDataBuffer::from_vec::<i32>(cycle(n).collect())),
             (
                 "u32",
-                NDDataBuffer::U32(cycle(n).map(|v| v as u32).collect()),
+                NDDataBuffer::from_vec::<u32>(cycle(n).map(|v| v as u32).collect()),
             ),
         ]
         .into_iter()
@@ -2948,7 +3041,7 @@ mod tests {
     #[test]
     fn test_histogram_basic() {
         // 10 values: 0..9, hist range [0, 9], 10 bins
-        let data = NDDataBuffer::F64((0..10).map(|x| x as f64).collect());
+        let data = NDDataBuffer::from_vec::<f64>((0..10).map(|x| x as f64).collect());
         let (hist, below, above, entropy) = compute_histogram(&data, 10, 0.0, 9.0);
         assert_eq!(hist.len(), 10);
         assert_eq!(below, 0.0);
@@ -2963,7 +3056,7 @@ mod tests {
 
     #[test]
     fn test_histogram_below_above() {
-        let data = NDDataBuffer::F64(vec![-1.0, 0.5, 1.5, 3.0]);
+        let data = NDDataBuffer::from_vec::<f64>(vec![-1.0, 0.5, 1.5, 3.0]);
         let (hist, below, above, _entropy) = compute_histogram(&data, 2, 0.0, 2.0);
         assert_eq!(below, 1.0); // -1.0 is below
         assert_eq!(above, 1.0); // 3.0 is above
@@ -2971,9 +3064,43 @@ mod tests {
         assert!((total_in_bins - 2.0).abs() < 1e-10); // 0.5 and 1.5
     }
 
+    /// Each step changes one part of the key; the table kept from the step
+    /// before would bin it wrong, or past the slots.
+    #[test]
+    fn a_changed_histogram_key_rebuilds_the_kept_table() {
+        let kept = KeptTable::default();
+        let u16s = NDDataBuffer::from_vec::<u16>((0..80).collect());
+        let i16s = NDDataBuffer::from_vec::<i16>((-40..40).collect());
+        let mut before = None;
+        for (what, data, size, lo, hi) in [
+            ("u16", &u16s, 8, 0.0, 70.0),
+            ("same key", &u16s, 8, 0.0, 70.0),
+            ("HIST_SIZE", &u16s, 4, 0.0, 70.0),
+            ("HIST_MIN", &u16s, 4, 10.0, 70.0),
+            ("HIST_MAX", &u16s, 4, 10.0, 40.0),
+            ("data type", &i16s, 4, 10.0, 40.0),
+            ("data type back", &u16s, 4, 10.0, 40.0),
+        ] {
+            assert_eq!(
+                histogram(data, size, lo, hi, &kept),
+                compute_histogram(data, size, lo, hi),
+                "{what}"
+            );
+            let table = kept
+                .table
+                .lock()
+                .clone()
+                .expect("a u16/i16 frame keeps its table");
+            if what == "same key" {
+                assert!(Arc::ptr_eq(&table, before.as_ref().unwrap()), "{what}");
+            }
+            before = Some(table);
+        }
+    }
+
     #[test]
     fn test_histogram_single_value() {
-        let data = NDDataBuffer::F64(vec![5.0; 100]);
+        let data = NDDataBuffer::from_vec::<f64>(vec![5.0; 100]);
         let (hist, below, above, entropy) = compute_histogram(&data, 10, 0.0, 10.0);
         assert_eq!(below, 0.0);
         assert_eq!(above, 0.0);
@@ -2995,7 +3122,7 @@ mod tests {
                 pixels[iy * 8 + ix] = iy as f64;
             }
         }
-        let data = NDDataBuffer::F64(pixels);
+        let data = NDDataBuffer::from_vec::<f64>(pixels);
 
         let profiles = compute_profiles(
             &data, 8, 8, 0.0, // threshold
@@ -3056,7 +3183,7 @@ mod tests {
                 pixels[iy * 8 + ix] = iy as f64;
             }
         }
-        let data = NDDataBuffer::F64(pixels);
+        let data = NDDataBuffer::from_vec::<f64>(pixels);
 
         let profiles = compute_profiles(
             &data, 8, 8, 0.0,   // threshold
@@ -3096,7 +3223,7 @@ mod tests {
         // 4x4 image: all 1.0 except one bright pixel at (2,1) = 10.0
         let mut pixels = vec![1.0f64; 16];
         pixels[1 * 4 + 2] = 10.0;
-        let data = NDDataBuffer::F64(pixels);
+        let data = NDDataBuffer::from_vec::<f64>(pixels);
 
         let profiles = compute_profiles(
             &data, 4, 4, 5.0, // threshold
@@ -3124,7 +3251,7 @@ mod tests {
         let pool = NDArrayPool::new(1_000_000);
 
         let mut arr = NDArray::new(vec![NDDimension::new(5)], NDDataType::UInt8);
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             v[0] = 10;
             v[1] = 20;
             v[2] = 30;
@@ -3156,8 +3283,8 @@ mod tests {
             "_stats_scratch_",
             1,
             asyn_rs::port::PortFlags::default(),
-            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+            asyn_rs::port::InterfaceMask::NONE,
+            asyn_rs::port::InterfaceMask::NONE,
         );
         let _ = ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base);
         let _ = ad_core_rs::plugin::params::PluginBaseParams::create(&mut base);
@@ -3174,7 +3301,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             for (i, val) in v.iter_mut().enumerate() {
                 *val = (i % 8) as u8;
             }
@@ -3224,8 +3351,8 @@ mod tests {
             "_stats_adp13_",
             1,
             asyn_rs::port::PortFlags::default(),
-            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+            asyn_rs::port::InterfaceMask::NONE,
+            asyn_rs::port::InterfaceMask::NONE,
         );
         let _ = ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base);
         let _ = ad_core_rs::plugin::params::PluginBaseParams::create(&mut base);
@@ -3245,7 +3372,7 @@ mod tests {
             ],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             for (i, val) in v.iter_mut().enumerate() {
                 *val = if i % 4 == 3 { 100 } else { 0 };
             }
@@ -3288,8 +3415,8 @@ mod tests {
             port,
             1,
             asyn_rs::port::PortFlags::default(),
-            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+            asyn_rs::port::InterfaceMask::NONE,
+            asyn_rs::port::InterfaceMask::NONE,
         );
         let _ = ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base);
         let _ = ad_core_rs::plugin::params::PluginBaseParams::create(&mut base);
@@ -3340,7 +3467,7 @@ mod tests {
         }
         let pool = NDArrayPool::new(1_000_000);
         let mut arr = NDArray::new(vec![NDDimension::new(5)], NDDataType::UInt8);
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             v.copy_from_slice(&[0, 10, 10, 0, 0]);
         }
 
@@ -3374,8 +3501,8 @@ mod tests {
             "_stats_drvinfo_",
             1,
             asyn_rs::port::PortFlags::default(),
-            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+            asyn_rs::port::InterfaceMask::NONE,
+            asyn_rs::port::InterfaceMask::NONE,
         );
         let _ = ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base);
         let _ = ad_core_rs::plugin::params::PluginBaseParams::create(&mut base);
@@ -3391,7 +3518,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             for (i, val) in v.iter_mut().enumerate() {
                 *val = i as u8;
             }
@@ -3482,7 +3609,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             for (i, val) in v.iter_mut().enumerate() {
                 *val = i as u8;
             }
@@ -3579,8 +3706,8 @@ mod tests {
             "_stats_histx_write_",
             1,
             asyn_rs::port::PortFlags::default(),
-            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+            asyn_rs::port::InterfaceMask::NONE,
+            asyn_rs::port::InterfaceMask::NONE,
         );
         let _ = ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base);
         let _ = ad_core_rs::plugin::params::PluginBaseParams::create(&mut base);
@@ -3642,8 +3769,8 @@ mod tests {
             "_stats_adp30_",
             1,
             asyn_rs::port::PortFlags::default(),
-            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+            asyn_rs::port::InterfaceMask::NONE,
+            asyn_rs::port::InterfaceMask::NONE,
         );
         let _ = ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base);
         let _ = ad_core_rs::plugin::params::PluginBaseParams::create(&mut base);
@@ -3660,7 +3787,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(2)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             v.copy_from_slice(&[0, 1, 3, 3, 9, 9, 9, 4]);
         }
 
@@ -3707,8 +3834,8 @@ mod tests {
             "_stats_histx_",
             1,
             asyn_rs::port::PortFlags::default(),
-            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
-            asyn_rs::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
+            asyn_rs::port::InterfaceMask::NONE,
+            asyn_rs::port::InterfaceMask::NONE,
         );
         let _ = ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base);
         let _ = ad_core_rs::plugin::params::PluginBaseParams::create(&mut base);
@@ -3774,7 +3901,7 @@ mod tests {
             vec![NDDimension::new(4), NDDimension::new(4)],
             NDDataType::UInt8,
         );
-        if let NDDataBuffer::U8(ref mut v) = arr.data {
+        if let NDDataViewMut::U8(v) = arr.data_mut().view_mut() {
             for (i, val) in v.iter_mut().enumerate() {
                 *val = (i + 1) as u8;
             }
@@ -4003,64 +4130,70 @@ mod tests {
         check_projection_against_reference(
             "i8",
             |i| (seq(i) % 256) as u8 as i8,
-            NDDataBuffer::I8,
+            NDDataBuffer::from_vec::<i8>,
             |e| e as f64,
             1e-9,
         );
         check_projection_against_reference(
             "u8",
             |i| (seq(i) % 256) as u8,
-            NDDataBuffer::U8,
+            NDDataBuffer::from_vec::<u8>,
             |e| e as f64,
             1e-9,
         );
         check_projection_against_reference(
             "i16",
             |i| (seq(i) % 65536) as u16 as i16,
-            NDDataBuffer::I16,
+            NDDataBuffer::from_vec::<i16>,
             |e| e as f64,
             1e-9,
         );
         check_projection_against_reference(
             "u16",
             |i| (seq(i) % 65536) as u16,
-            NDDataBuffer::U16,
+            NDDataBuffer::from_vec::<u16>,
             |e| e as f64,
             1e-9,
         );
         check_projection_against_reference(
             "i32",
             |i| seq(i) as i32 - 500_000,
-            NDDataBuffer::I32,
+            NDDataBuffer::from_vec::<i32>,
             |e| e as f64,
             1e-9,
         );
-        check_projection_against_reference("u32", seq, NDDataBuffer::U32, |e| e as f64, 1e-9);
+        check_projection_against_reference(
+            "u32",
+            seq,
+            NDDataBuffer::from_vec::<u32>,
+            |e| e as f64,
+            1e-9,
+        );
         check_projection_against_reference(
             "i64",
             |i| seq(i) as i64 - 500_000,
-            NDDataBuffer::I64,
+            NDDataBuffer::from_vec::<i64>,
             |e| e as f64,
             1e-9,
         );
         check_projection_against_reference(
             "u64",
             |i| seq(i) as u64,
-            NDDataBuffer::U64,
+            NDDataBuffer::from_vec::<u64>,
             |e| e as f64,
             1e-9,
         );
         check_projection_against_reference(
             "f32",
             |i| seq(i) as f32 * 0.37 - 100.0,
-            NDDataBuffer::F32,
+            NDDataBuffer::from_vec::<f32>,
             |e| e as f64,
             1e-9,
         );
         check_projection_against_reference(
             "f64",
             |i| seq(i) as f64 * 0.37 - 100.0,
-            NDDataBuffer::F64,
+            NDDataBuffer::from_vec::<f64>,
             |e| e,
             1e-9,
         );
@@ -4073,7 +4206,7 @@ mod tests {
     fn projection_leaves_nan_out_of_the_threshold_sums() {
         let mut pixels = vec![2.0f32; 4 * 3];
         pixels[1 * 4 + 2] = f32::NAN;
-        let data = NDDataBuffer::F32(pixels);
+        let data = NDDataBuffer::from_vec::<f32>(pixels);
         let c = compute_centroid(&data, 4, 3, 0.0);
         assert_eq!(c.centroid_total, 22.0);
         assert!((c.centroid_x - 16.0 / 11.0).abs() < 1e-12);
@@ -4172,7 +4305,7 @@ mod tests {
         assert!(want_below > 0.0 && want_above > 0.0 && want.iter().any(|&c| c > 0.0));
 
         let (got, below, above, _) =
-            compute_histogram(&NDDataBuffer::F64(vals.clone()), bins, lo, hi);
+            compute_histogram(&NDDataBuffer::from_vec::<f64>(vals.clone()), bins, lo, hi);
         assert_eq!(
             (got, below, above),
             (want.clone(), want_below, want_above),
@@ -4182,7 +4315,8 @@ mod tests {
         let f32s: Vec<f32> = vals.iter().map(|&v| v as f32).collect();
         let as_f64: Vec<f64> = f32s.iter().map(|&v| v as f64).collect();
         let (want, want_below, want_above) = reference_histogram(&as_f64, bins, lo, hi);
-        let (got, below, above, _) = compute_histogram(&NDDataBuffer::F32(f32s), bins, lo, hi);
+        let (got, below, above, _) =
+            compute_histogram(&NDDataBuffer::from_vec::<f32>(f32s), bins, lo, hi);
         assert_eq!((got, below, above), (want, want_below, want_above), "f32");
 
         let ints: Vec<i32> = vec![i32::MIN, -4, -3, -2, 0, 4, 5, 6, i32::MAX];
@@ -4194,7 +4328,8 @@ mod tests {
             .collect();
         let as_f64: Vec<f64> = ints.iter().map(|&v| v as f64).collect();
         let (want, want_below, want_above) = reference_histogram(&as_f64, bins, lo, hi);
-        let (got, below, above, _) = compute_histogram(&NDDataBuffer::I32(ints), bins, lo, hi);
+        let (got, below, above, _) =
+            compute_histogram(&NDDataBuffer::from_vec::<i32>(ints), bins, lo, hi);
         assert_eq!((got, below, above), (want, want_below, want_above), "i32");
     }
 
@@ -4203,56 +4338,56 @@ mod tests {
         check_histogram_against_reference(
             "i8",
             |i| (seq(i) % 256) as u8 as i8,
-            NDDataBuffer::I8,
+            NDDataBuffer::from_vec::<i8>,
             |e| e as f64,
         );
         check_histogram_against_reference(
             "u8",
             |i| (seq(i) % 256) as u8,
-            NDDataBuffer::U8,
+            NDDataBuffer::from_vec::<u8>,
             |e| e as f64,
         );
         check_histogram_against_reference(
             "i16",
             |i| (seq(i) % 65536) as u16 as i16,
-            NDDataBuffer::I16,
+            NDDataBuffer::from_vec::<i16>,
             |e| e as f64,
         );
         check_histogram_against_reference(
             "u16",
             |i| (seq(i) % 65536) as u16,
-            NDDataBuffer::U16,
+            NDDataBuffer::from_vec::<u16>,
             |e| e as f64,
         );
         check_histogram_against_reference(
             "i32",
             |i| seq(i) as i32 - 500_000,
-            NDDataBuffer::I32,
+            NDDataBuffer::from_vec::<i32>,
             |e| e as f64,
         );
-        check_histogram_against_reference("u32", seq, NDDataBuffer::U32, |e| e as f64);
+        check_histogram_against_reference("u32", seq, NDDataBuffer::from_vec::<u32>, |e| e as f64);
         check_histogram_against_reference(
             "i64",
             |i| seq(i) as i64 - 500_000,
-            NDDataBuffer::I64,
+            NDDataBuffer::from_vec::<i64>,
             |e| e as f64,
         );
         check_histogram_against_reference(
             "u64",
             |i| seq(i) as u64,
-            NDDataBuffer::U64,
+            NDDataBuffer::from_vec::<u64>,
             |e| e as f64,
         );
         check_histogram_against_reference(
             "f32",
             |i| seq(i) as f32 * 0.37 - 100.0,
-            NDDataBuffer::F32,
+            NDDataBuffer::from_vec::<f32>,
             |e| e as f64,
         );
         check_histogram_against_reference(
             "f64",
             |i| seq(i) as f64 * 0.37 - 100.0,
-            NDDataBuffer::F64,
+            NDDataBuffer::from_vec::<f64>,
             |e| e,
         );
     }

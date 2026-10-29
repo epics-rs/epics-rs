@@ -48,7 +48,8 @@ fn text(db: &PvDatabase, pv: &str) -> String {
 /// settle window so a spurious extra post would land before the assert.
 async fn counters(db: &PvDatabase, want: [f64; 4]) {
     let read = || ["C5", "C50", "CF", "CB"].map(|r| num(db, r));
-    for _ in 0..400 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if read() == want {
             break;
         }

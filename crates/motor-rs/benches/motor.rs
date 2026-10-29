@@ -17,11 +17,11 @@ fn bench_motor_move_to_done(c: &mut Criterion) {
             rec.plan_motion(CommandSource::Val);
 
             let status = MotorStatus {
-                position: 10.0,
-                encoder_position: 10.0,
                 done: true,
                 moving: false,
                 ..MotorStatus::default()
+                    .with_position(10.0)
+                    .with_encoder_position(10.0)
             };
             rec.process_motor_info(&status);
             rec.stat.msta = MstaFlags::DONE;

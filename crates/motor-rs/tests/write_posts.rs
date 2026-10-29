@@ -94,10 +94,10 @@ impl AsynMotor for Axis {
     }
     fn poll(&mut self, _: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         *status = MotorStatus {
-            position: 1.0,
-            encoder_position: 1.0,
             done: true,
             ..MotorStatus::default()
+                .with_position(1.0)
+                .with_encoder_position(1.0)
         };
         Ok(())
     }
@@ -227,7 +227,7 @@ fn a_set_position_posts_the_new_position_at_once() {
     let posted = rig
         .write(MotorCommand::SetPosition { position: 4.0 })
         .unwrap();
-    assert_eq!(posted.position, 4.0);
+    assert_eq!(posted.position(), 4.0);
     assert!(posted.done);
 }
 
@@ -242,7 +242,7 @@ fn a_move_on_a_done_axis_posts_done_off_and_a_second_move_posts_nothing() {
     let mut rig = rig(controller(), 1.0);
     let posted = rig.write(move_to(5.0)).unwrap();
     assert!(!posted.done);
-    assert_eq!(posted.position, 1.0);
+    assert_eq!(posted.position(), 1.0);
     assert_eq!(rig.write(move_to(6.0)), None);
 }
 
@@ -296,7 +296,7 @@ fn a_write_that_sets_no_status_field_posts_nothing() {
 fn a_field_the_driver_set_posts_only_when_it_changed() {
     let mut rig = rig(controller(), 2.0);
     let ratio = MotorCommand::SetEncoderRatio { pulses: [2.0, 1.0] };
-    assert_eq!(rig.write(ratio.clone()).unwrap().encoder_position, 2.0);
+    assert_eq!(rig.write(ratio.clone()).unwrap().encoder_position(), 2.0);
     assert_eq!(rig.write(ratio), None);
 }
 
@@ -308,7 +308,7 @@ fn a_controller_write_that_fails_still_posts_what_the_controller_set() {
     let posted = rig
         .write(MotorCommand::SetPosition { position: 4.0 })
         .unwrap();
-    assert_eq!(posted.position, 4.0);
+    assert_eq!(posted.position(), 4.0);
 }
 
 #[test]
@@ -317,7 +317,7 @@ fn a_model2_move_posts_its_direction_and_done_off_once() {
     let posted = rig.write(move_to(5.0)).unwrap();
     assert!(!posted.done);
     assert!(posted.direction);
-    assert_eq!(posted.position, 1.0);
+    assert_eq!(posted.position(), 1.0);
     assert_eq!(rig.write(move_to(6.0)), None);
     assert!(!rig.write(move_to(0.0)).unwrap().direction);
 }
@@ -340,7 +340,7 @@ fn a_model2_set_position_posts_the_new_position() {
     let posted = rig
         .write(MotorCommand::SetPosition { position: 4.0 })
         .unwrap();
-    assert_eq!(posted.position, 4.0);
+    assert_eq!(posted.position(), 4.0);
     assert!(posted.done);
     assert_eq!(rig.write(MotorCommand::SetPosition { position: 4.0 }), None);
 }
@@ -357,7 +357,7 @@ fn a_model2_write_that_fails_posts_nothing() {
 fn a_model2_driver_field_posts_like_a_controllers() {
     let mut rig = rig(model2(), 2.0);
     let ratio = MotorCommand::SetEncoderRatio { pulses: [2.0, 1.0] };
-    assert_eq!(rig.write(ratio.clone()).unwrap().encoder_position, 2.0);
+    assert_eq!(rig.write(ratio.clone()).unwrap().encoder_position(), 2.0);
     assert_eq!(rig.write(ratio), None);
 }
 
@@ -402,7 +402,7 @@ fn a_set_position_processes_its_record_with_the_new_position() {
     rig.write(MotorCommand::SetPosition { position: 4.0 });
     let read = rig.record.passes();
     assert_eq!(read.len(), 1);
-    assert_eq!(read[0].position, 4.0);
+    assert_eq!(read[0].position(), 4.0);
 }
 
 fn high_limit(position: f64) -> MotorCommand {

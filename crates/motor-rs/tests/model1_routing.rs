@@ -75,10 +75,9 @@ impl Model1Motor for Card {
             }
         }
         *status = MotorStatus {
-            position: *position,
             done: self.target.is_none(),
             moving: self.target.is_some(),
-            ..MotorStatus::default()
+            ..MotorStatus::default().with_position(*position)
         };
         Ok(())
     }

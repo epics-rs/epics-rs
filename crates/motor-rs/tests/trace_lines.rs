@@ -193,10 +193,9 @@ fn init_reads_the_cached_status_and_a_lost_controller_prints_nothing() {
     state.lock().unwrap().latest_status = Some(StampedStatus {
         seq: 1,
         status: MotorStatus {
-            position: 250.0,
             comms_error: true,
             problem: true,
-            ..MotorStatus::default()
+            ..MotorStatus::default().with_position(250.0)
         },
     });
     let mut rec = motor_rs::MotorRecord::new();
@@ -381,10 +380,7 @@ fn an_init_that_loads_no_position_says_so_under_flow() {
         rec.conv.mres = 0.01;
         rec.conv.rstm = motor_rs::flags::RestoreMode::Never;
         rec.pos.dval = 3.0;
-        rec.initial_readback(&MotorStatus {
-            position: 100.0,
-            ..MotorStatus::default()
-        });
+        rec.initial_readback(&MotorStatus::default().with_position(100.0));
     });
     assert_eq!(
         lines

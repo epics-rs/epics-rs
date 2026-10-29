@@ -66,10 +66,7 @@ impl Model1Motor for Card {
         if let Some(target) = self.target.take() {
             self.position = target;
         }
-        *status = MotorStatus {
-            position: self.position,
-            ..MotorStatus::default()
-        };
+        *status = MotorStatus::default().with_position(self.position);
         Ok(())
     }
     fn poll_in_motion(

@@ -43,9 +43,8 @@ struct Rig {
 
 fn at(position: f64) -> MotorStatus {
     MotorStatus {
-        position,
         done: true,
-        ..MotorStatus::default()
+        ..MotorStatus::default().with_position(position)
     }
 }
 

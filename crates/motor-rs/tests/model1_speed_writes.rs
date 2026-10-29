@@ -97,11 +97,10 @@ impl Model1Motor for Card {
             self.position = target;
         }
         *status = MotorStatus {
-            position: self.position,
             done: !self.running,
             moving: self.running,
             direction: true,
-            ..MotorStatus::default()
+            ..MotorStatus::default().with_position(self.position)
         };
         Ok(())
     }

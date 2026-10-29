@@ -569,7 +569,7 @@ async fn test_jog_held_through_a_move_strands_until_pressed_again() {
 
 fn read_motor_pos(motor: &Arc<Mutex<dyn AsynMotor>>) -> f64 {
     let mut m = motor.lock().unwrap();
-    polled(&mut *m, &asyn_rs::user::AsynUser::new(0)).position
+    polled(&mut *m, &asyn_rs::user::AsynUser::new(0)).position()
 }
 
 /// R59 regression: device-support `init()` must NOT reseed the controller.
@@ -801,9 +801,8 @@ async fn failed_poll_posts_comms_error_status() {
                 });
             }
             *status = MotorStatus {
-                position: self.position,
                 done: true,
-                ..MotorStatus::default()
+                ..MotorStatus::default().with_position(self.position)
             };
             Ok(())
         }
@@ -891,7 +890,7 @@ async fn failed_poll_posts_comms_error_status() {
         (s.seq, s.status)
     };
     assert!(!healthy.comms_error);
-    assert_eq!(healthy.position, 3.5);
+    assert_eq!(healthy.position(), 3.5);
 
     // Cut the link. The very next poll fails.
     offline.store(true, Ordering::SeqCst);
@@ -922,7 +921,8 @@ async fn failed_poll_posts_comms_error_status() {
         "C sets motorStatusProblem_ alongside motorStatusCommsError_"
     );
     assert_eq!(
-        stamped.status.position, 3.5,
+        stamped.status.position(),
+        3.5,
         "fields the failed poll never wrote keep their last-known value, as C's \
          parameter library does"
     );
@@ -953,10 +953,7 @@ impl AsynMotor for FailingMotor {
                 message: "controller not responding".into(),
             });
         }
-        *status = asyn_rs::interfaces::motor::MotorStatus {
-            position: 3.5,
-            ..Default::default()
-        };
+        *status = asyn_rs::interfaces::motor::MotorStatus::default().with_position(3.5);
         Ok(())
     }
     fn move_absolute(
@@ -1098,7 +1095,7 @@ async fn a_problem_only_failure_keeps_the_last_status() {
     );
     let status = axis.latest().unwrap().status;
     assert!(!status.comms_error);
-    assert_eq!(status.position, 3.5);
+    assert_eq!(status.position(), 3.5);
     axis.shutdown().await;
 }
 
@@ -1158,9 +1155,8 @@ async fn pass0_restored_dval_is_not_a_move_command() {
         }
         fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> Result<(), AsynError> {
             *status = MotorStatus {
-                position: self.position,
                 done: true,
-                ..MotorStatus::default()
+                ..MotorStatus::default().with_position(self.position)
             };
             Ok(())
         }
@@ -1248,7 +1244,8 @@ async fn pass0_restored_dval_is_not_a_move_command() {
     let user = AsynUser::new(0);
     let st = polled(&mut *motor.lock().unwrap(), &user);
     assert_eq!(
-        st.position, 1500.0,
+        st.position(),
+        1500.0,
         "the controller was redefined, not moved"
     );
 }

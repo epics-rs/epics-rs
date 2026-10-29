@@ -47,12 +47,12 @@ fn named_record() -> MotorRecord {
 fn moving(rec: &mut MotorRecord, position: f64, direction: bool) {
     let steps = position / rec.conv.mres;
     rec.process_motor_info(&MotorStatus {
-        position: steps,
-        encoder_position: steps,
         done: false,
         moving: true,
         direction,
-        ..Default::default()
+        ..MotorStatus::default()
+            .with_position(steps)
+            .with_encoder_position(steps)
     });
 }
 

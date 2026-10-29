@@ -48,9 +48,8 @@ impl AsynMotor for Stuck {
             std::thread::sleep(Duration::from_millis(300));
         }
         *status = MotorStatus {
-            position: 7.0,
             moving: true,
-            ..MotorStatus::default()
+            ..MotorStatus::default().with_position(7.0)
         };
         Ok(())
     }

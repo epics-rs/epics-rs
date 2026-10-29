@@ -44,9 +44,8 @@ impl Card {
             calls: Arc::default(),
             init: Some(init),
             reads: Some(MotorStatus {
-                position: 3.0,
                 done: true,
-                ..MotorStatus::default()
+                ..MotorStatus::default().with_position(3.0)
             }),
         }
     }
@@ -208,10 +207,10 @@ fn field(db: &PvDatabase, card: i32, field: &str) -> EpicsValue {
 /// The card at step 14.
 fn at_14() -> MotorStatus {
     MotorStatus {
-        position: 14.0,
-        encoder_position: 14.0,
         done: true,
         ..MotorStatus::default()
+            .with_position(14.0)
+            .with_encoder_position(14.0)
     }
 }
 
@@ -284,9 +283,8 @@ async fn an_autosaved_dval_does_not_overwrite_a_card_away_from_zero() {
 /// RA_DONE.
 fn gains_at_14() -> MotorStatus {
     MotorStatus {
-        position: 14.0,
         gain_support: true,
-        ..MotorStatus::default()
+        ..MotorStatus::default().with_position(14.0)
     }
 }
 
@@ -297,10 +295,7 @@ fn gains_at_14() -> MotorStatus {
 #[tokio::test]
 async fn a_gain_support_card_is_read_again_by_the_init_round() {
     let card = Card {
-        reads: Some(MotorStatus {
-            position: 3.0,
-            ..gains_at_14()
-        }),
+        reads: Some(gains_at_14().with_position(3.0)),
         ..Card::new(gains_at_14())
     };
     let booted = boot_card(4, card, "", true, None).await;

@@ -59,11 +59,11 @@ fn make_record() -> MotorRecord {
 fn complete_move(rec: &mut MotorRecord, target_pos: f64) {
     let steps = target_pos / rec.conv.mres;
     let status = MotorStatus {
-        position: steps,
-        encoder_position: steps,
         done: true,
         moving: false,
-        ..Default::default()
+        ..MotorStatus::default()
+            .with_position(steps)
+            .with_encoder_position(steps)
     };
     rec.process_motor_info(&status);
 }
@@ -72,11 +72,11 @@ fn complete_move(rec: &mut MotorRecord, target_pos: f64) {
 fn motor_moving(rec: &mut MotorRecord, current_pos: f64) {
     let steps = current_pos / rec.conv.mres;
     let status = MotorStatus {
-        position: steps,
-        encoder_position: steps,
         done: false,
         moving: true,
-        ..Default::default()
+        ..MotorStatus::default()
+            .with_position(steps)
+            .with_encoder_position(steps)
     };
     rec.process_motor_info(&status);
 }
@@ -377,12 +377,12 @@ fn home_forward_reverse_marks_homed() {
     // Homing completes standing on the home switch — ATHM is pure
     // switch readback from the poll (C 3755-3762), not a homed latch.
     let status = MotorStatus {
-        position: 0.0,
-        encoder_position: 0.0,
         done: true,
         moving: false,
         home: true,
-        ..Default::default()
+        ..MotorStatus::default()
+            .with_position(0.0)
+            .with_encoder_position(0.0)
     };
     rec.process_motor_info(&status);
     let _effects = rec.check_completion();
@@ -548,11 +548,11 @@ fn startup_syncs_positions_from_driver() {
     let mut rec = make_record();
 
     let status = MotorStatus {
-        position: 25_000.0,
-        encoder_position: 25_000.0,
         done: true,
         moving: false,
-        ..Default::default()
+        ..MotorStatus::default()
+            .with_position(25_000.0)
+            .with_encoder_position(25_000.0)
     };
 
     let effects = rec.initial_readback(&status);
@@ -568,11 +568,11 @@ fn startup_moving_waits_for_the_poller() {
     let mut rec = make_record();
 
     let status = MotorStatus {
-        position: 10.0,
-        encoder_position: 10.0,
         done: false,
         moving: true,
-        ..Default::default()
+        ..MotorStatus::default()
+            .with_position(10.0)
+            .with_encoder_position(10.0)
     };
 
     let effects = rec.initial_readback(&status);
@@ -626,11 +626,11 @@ fn device_init_runs_initial_readback() {
     device_init(
         &mut rec,
         MotorStatus {
-            position: 25_000.0,
-            encoder_position: 25_000.0,
             done: true,
             moving: false,
-            ..Default::default()
+            ..MotorStatus::default()
+                .with_position(25_000.0)
+                .with_encoder_position(25_000.0)
         },
     );
 
@@ -650,12 +650,13 @@ fn device_init_queues_the_rstm_restore_before_the_limits() {
     rec.pos.dval = 5.0; // autosave-restored target
     let commands = device_init(
         &mut rec,
+        // The controller lost its position.
         MotorStatus {
-            position: 0.0, // controller lost its position
-            encoder_position: 0.0,
             done: true,
             moving: false,
-            ..Default::default()
+            ..MotorStatus::default()
+                .with_position(0.0)
+                .with_encoder_position(0.0)
         },
     );
 
@@ -707,11 +708,11 @@ fn startup_closed_loop_omsl_skips_readback_adoption() {
     rec.pos.dval = 7.0;
 
     let status = MotorStatus {
-        position: 25_000.0,
-        encoder_position: 25_000.0,
         done: true,
         moving: false,
-        ..Default::default()
+        ..MotorStatus::default()
+            .with_position(25_000.0)
+            .with_encoder_position(25_000.0)
     };
     let effects = rec.initial_readback(&status);
 
@@ -777,11 +778,11 @@ fn idle_status_at(seq: u64, pos: f64) -> motor_rs::device_state::StampedStatus {
     motor_rs::device_state::StampedStatus {
         seq,
         status: MotorStatus {
-            position: pos / MRES,
-            encoder_position: pos / MRES,
             done: true,
             moving: false,
-            ..Default::default()
+            ..MotorStatus::default()
+                .with_position(pos / MRES)
+                .with_encoder_position(pos / MRES)
         },
     }
 }
@@ -1357,7 +1358,7 @@ fn sim_motor_end_to_end() {
         }
     }
     assert!(status.done);
-    assert_eq!(status.position, 10_000.0);
+    assert_eq!(status.position(), 10_000.0);
 
     rec.process_motor_info(&status);
     let _effects = rec.check_completion();
@@ -2112,11 +2113,11 @@ fn retry_on<D: motor_rs::device_support::BuildTrans + 'static>(
     state.lock().unwrap().latest_status = Some(StampedStatus {
         seq: 2,
         status: MotorStatus {
-            position: 0.2 / MRES,
-            encoder_position: 0.2 / MRES,
             done: false,
             moving: true,
-            ..Default::default()
+            ..MotorStatus::default()
+                .with_position(0.2 / MRES)
+                .with_encoder_position(0.2 / MRES)
         },
     });
     rec.process().unwrap();

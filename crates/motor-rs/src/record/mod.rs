@@ -1484,11 +1484,11 @@ mod tests {
         let mut rec = MotorRecord::new();
         rec.links.dol = "".into(); // unset DOL == CONSTANT
         let status = asyn_rs::interfaces::motor::MotorStatus {
-            position: 0.0,
-            encoder_position: 0.0,
             done: true,
             moving: false,
-            ..Default::default()
+            ..asyn_rs::interfaces::motor::MotorStatus::default()
+                .with_position(0.0)
+                .with_encoder_position(0.0)
         };
         rec.initial_readback(&status);
         let mut udf = CommonFields::default().udf; // dbCommon default
@@ -1569,11 +1569,11 @@ mod tests {
         rec.links.dol = "setpoint_src.VAL".into(); // DB_LINK
         rec.set_link_type("DOL", LinkType::Db);
         let status = asyn_rs::interfaces::motor::MotorStatus {
-            position: 0.0,
-            encoder_position: 0.0,
             done: true,
             moving: false,
-            ..Default::default()
+            ..asyn_rs::interfaces::motor::MotorStatus::default()
+                .with_position(0.0)
+                .with_encoder_position(0.0)
         };
         rec.initial_readback(&status);
         let mut udf = CommonFields::default().udf;
@@ -1639,11 +1639,11 @@ mod tests {
         // Driver reports completion; next process finalizes DMOV false→true.
         rec.set_event(MotorEvent::DeviceUpdate(
             asyn_rs::interfaces::motor::MotorStatus {
-                position: 10.0,
-                encoder_position: 10.0,
                 done: true,
                 moving: false,
-                ..Default::default()
+                ..asyn_rs::interfaces::motor::MotorStatus::default()
+                    .with_position(10.0)
+                    .with_encoder_position(10.0)
             },
         ));
         let _ = rec.process();

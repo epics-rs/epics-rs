@@ -47,9 +47,8 @@ impl AsynMotor for Parked {
     }
     fn poll(&mut self, _: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         *status = MotorStatus {
-            position: 5000.0,
             done: true,
-            ..MotorStatus::default()
+            ..MotorStatus::default().with_position(5000.0)
         };
         Ok(())
     }

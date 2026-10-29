@@ -49,9 +49,8 @@ impl AsynMotor for Arrives {
     fn poll(&mut self, _: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         self.polls += 1;
         *status = MotorStatus {
-            position: if self.polls > 1 { 3.0 } else { 0.0 },
             done: true,
-            ..MotorStatus::default()
+            ..MotorStatus::default().with_position(if self.polls > 1 { 3.0 } else { 0.0 })
         };
         Ok(())
     }

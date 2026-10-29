@@ -37,6 +37,10 @@ pub enum PortSet {
 pub struct PortSets(Vec<PortSet>);
 
 impl PortSets {
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self(Vec::with_capacity(capacity))
+    }
+
     pub fn set(&mut self, addr: i32, reason: usize, value: crate::param::ParamValue) {
         self.0.push(PortSet::Set {
             addr,
@@ -135,12 +139,10 @@ impl PartialEq for PostMessage {
 /// case.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MotorStatus {
-    /// Motor position, steps.
-    pub position: f64,
-    /// Encoder position, counts.
-    pub encoder_position: f64,
-    /// Actual velocity, steps/s.
-    pub velocity: f64,
+    /// Motor position (steps), encoder position (counts) and actual
+    /// velocity (steps/s), written through [`Self::set_position`],
+    /// [`Self::set_encoder_position`] and [`Self::set_velocity`].
+    pub readbacks: Readbacks,
     /// True if the last move has completed.
     pub done: bool,
     /// True if the motor is currently moving: the poller's pace (C
@@ -192,9 +194,7 @@ pub struct MotorStatus {
 impl Default for MotorStatus {
     fn default() -> Self {
         Self {
-            position: 0.0,
-            encoder_position: 0.0,
-            velocity: 0.0,
+            readbacks: Readbacks::default(),
             done: false,
             moving: false,
             msta_moving: false,
@@ -213,6 +213,106 @@ impl Default for MotorStatus {
             has_encoder: false,
             vbas_supported: true,
         }
+    }
+}
+
+impl MotorStatus {
+    pub fn position(&self) -> f64 {
+        self.readbacks.get(Readback::Position)
+    }
+
+    pub fn encoder_position(&self) -> f64 {
+        self.readbacks.get(Readback::EncoderPosition)
+    }
+
+    pub fn velocity(&self) -> f64 {
+        self.readbacks.get(Readback::Velocity)
+    }
+
+    /// C `asynMotorAxis::setDoubleParam(motorPosition_, …)`.
+    pub fn set_position(&mut self, value: f64) {
+        self.readbacks.set(Readback::Position, value);
+    }
+
+    /// C `asynMotorAxis::setDoubleParam(motorEncoderPosition_, …)`.
+    pub fn set_encoder_position(&mut self, value: f64) {
+        self.readbacks.set(Readback::EncoderPosition, value);
+    }
+
+    /// C `asynMotorAxis::setDoubleParam(motorActVelocity_, …)`.
+    pub fn set_velocity(&mut self, value: f64) {
+        self.readbacks.set(Readback::Velocity, value);
+    }
+
+    /// [`Self::set_position`] on a status being built.
+    #[must_use]
+    pub fn with_position(mut self, value: f64) -> Self {
+        self.set_position(value);
+        self
+    }
+
+    /// [`Self::set_encoder_position`] on a status being built.
+    #[must_use]
+    pub fn with_encoder_position(mut self, value: f64) -> Self {
+        self.set_encoder_position(value);
+        self
+    }
+
+    /// [`Self::set_velocity`] on a status being built.
+    #[must_use]
+    pub fn with_velocity(mut self, value: f64) -> Self {
+        self.set_velocity(value);
+        self
+    }
+}
+
+/// A [`MotorStatus`] readback: C's `motorPosition_`,
+/// `motorEncoderPosition_` and `motorActVelocity_`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Readback {
+    Position,
+    EncoderPosition,
+    Velocity,
+}
+
+impl Readback {
+    pub const ALL: [Self; 3] = [Self::Position, Self::EncoderPosition, Self::Velocity];
+}
+
+/// A status's readbacks, and which of them the driver set since the poll
+/// loop last took them. C's paramLib holds each undefined until the
+/// driver's `setDoubleParam`, which a poll bailing to its error label may
+/// make before it bails (XPSAxis.cpp:706, :716), so only a set defines one.
+/// Two compare by their values alone, as C's `statusChanged_` does
+/// (asynMotorAxis.cpp:283-297).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Readbacks {
+    values: [f64; 3],
+    set: [bool; 3],
+}
+
+impl Readbacks {
+    pub fn get(&self, readback: Readback) -> f64 {
+        self.values[readback as usize]
+    }
+
+    /// Write `readback` and mark it set.
+    pub fn set(&mut self, readback: Readback, value: f64) {
+        self.values[readback as usize] = value;
+        self.set[readback as usize] = true;
+    }
+
+    /// The readbacks set since the last take, indexed by [`Readback`], with
+    /// the marks lowered: the poll loop's, which sets them on the port.
+    pub fn take_sets(&mut self) -> [Option<f64>; 3] {
+        let set = std::mem::take(&mut self.set);
+        std::array::from_fn(|at| set[at].then_some(self.values[at]))
+    }
+}
+
+impl PartialEq for Readbacks {
+    fn eq(&self, other: &Self) -> bool {
+        self.values == other.values
     }
 }
 
@@ -285,6 +385,9 @@ pub enum PidGainKind {
 pub enum StatusWrite {
     Position(f64),
     EncoderPosition(f64),
+    /// `motorActVelocity_`, which a write of MOTOR_ACT_VELOCITY sets
+    /// (asynMotorController.cpp:289).
+    Velocity(f64),
     Done(bool),
     PowerOn(bool),
     Problem(bool),
@@ -322,8 +425,9 @@ impl StatusWrite {
     /// Write the field into `status`.
     pub fn apply(self, status: &mut MotorStatus) {
         match self {
-            StatusWrite::Position(v) => status.position = v,
-            StatusWrite::EncoderPosition(v) => status.encoder_position = v,
+            StatusWrite::Position(v) => status.set_position(v),
+            StatusWrite::EncoderPosition(v) => status.set_encoder_position(v),
+            StatusWrite::Velocity(v) => status.set_velocity(v),
             StatusWrite::Done(v) => status.done = v,
             StatusWrite::PowerOn(v) => status.powered = v,
             StatusWrite::Problem(v) => status.problem = v,

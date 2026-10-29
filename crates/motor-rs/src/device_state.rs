@@ -671,8 +671,8 @@ fn print_status_callback(trace: &MotorTrace, ds: &MotorDeviceState, status: &Mot
         format_args!(
             "{} devMotorAsyn::statusCallback new value=[p:{:.6},e:{:.6},s:{:x}] {}{}\n",
             trace.record(),
-            CFloat(status.position),
-            CFloat(status.encoder_position),
+            CFloat(status.position()),
+            CFloat(status.encoder_position()),
             crate::flags::MstaFlags::from_status(status).bits(),
             if ds.need_update() { 'N' } else { ' ' },
             if ds.callbacks.move_request_pending > 0 {
@@ -803,10 +803,7 @@ mod tests {
     }
 
     fn at(position: f64) -> MotorStatus {
-        MotorStatus {
-            position,
-            ..Default::default()
-        }
+        MotorStatus::default().with_position(position)
     }
 
     /// A post of `position` from the list `ds` draws its stamps from.
@@ -831,7 +828,7 @@ mod tests {
 
     /// The position the next pass reads, taking it.
     fn read(ds: &mut MotorDeviceState) -> Option<f64> {
-        ds.update_values().map(|status| status.position)
+        ds.update_values().map(|status| status.position())
     }
 
     fn move_to() -> MotorCommand {
@@ -870,7 +867,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(4);
         axis.attach(later.clone(), tx, Arc::default());
         let latest = later.lock().unwrap().latest_status.clone().unwrap();
-        assert_eq!(latest.status.position, 2.0);
+        assert_eq!(latest.status.position(), 2.0);
     }
 
     #[test]
@@ -1001,7 +998,7 @@ mod tests {
         let read: Vec<_> = reads
             .take()
             .into_iter()
-            .map(|s| s.map(|s| s.position))
+            .map(|s| s.map(|s| s.position()))
             .collect();
         assert_eq!(read, [Some(1.0)]);
         assert!(rx.try_recv().is_err(), "a motordevCom callback queued");

@@ -18,7 +18,7 @@
 use std::sync::Arc;
 
 use asyn_rs::error::{AsynError, AsynResult, AsynStatus};
-use asyn_rs::interfaces::motor::PortSet;
+use asyn_rs::interfaces::motor::{PortSet, StatusWrite};
 use asyn_rs::manager::PortManager;
 use asyn_rs::param::{ParamType, ParamValue};
 use asyn_rs::port::InterfaceMask;
@@ -1155,6 +1155,15 @@ impl<P: ControllerParams> ControllerPort<P> {
                 let c = Some((user.reason as i32, WriteValue::Float64(value)));
                 run_on_axis(&mut self.base, self.hook.as_ref(), axis, addr, &command, c)
             }
+            (Some(_), None) if user.reason == index::ACT_VELOCITY => {
+                // C's pAxis->setDoubleParam sets status_ too (:289).
+                let field = StatusWrite::Velocity(value);
+                crate::poll_loop::apply_axis_set(
+                    &self.base.port_name,
+                    PortSet::Status { addr, field },
+                );
+                Ok(())
+            }
             (axis, _) => {
                 call_back_axis(axis);
                 Ok(())
@@ -1205,7 +1214,12 @@ impl<P: ControllerParams> ControllerPort<P> {
     /// them, the port's or the axis poller's.
     fn store(&mut self, addr: i32, delta: ParamDelta) {
         for (function, value) in delta.into_values() {
-            let _ = self.base.set_param_value(function, addr, value);
+            let set = PortSet::Set {
+                addr,
+                reason: function,
+                value,
+            };
+            apply_port_sets(&mut self.base, Some(addr), [set]);
         }
     }
 
@@ -1434,9 +1448,46 @@ fn call_back_axis(axis: Option<&MotorAxis>) {
 }
 
 /// A driver's own-port steps on the port's thread, as C makes them: on the
-/// parameter library itself. `axis` is the address a [`PortSet::Axis`]
-/// lands on, None for a controller poll's.
+/// parameter library itself, but for a readback ([`route_readback`]).
+/// `axis` is the address a [`PortSet::Axis`] lands on, None for a
+/// controller poll's.
 pub(crate) fn apply_port_sets(
+    base: &mut PortDriverBase,
+    axis: Option<i32>,
+    sets: impl IntoIterator<Item = PortSet>,
+) {
+    let sets = sets.into_iter().map(|set| route_readback(axis, set));
+    apply_routed_sets(base, axis, sets);
+}
+
+/// A driver's set of a readback as the axis's poll loop takes it, the one
+/// setter of MOTOR_POSITION, MOTOR_ENCODER_POSITION and MOTOR_ACT_VELOCITY:
+/// its status written, as C's `pAxis->setDoubleParam` writes `status_`.
+pub(crate) fn route_readback(axis: Option<i32>, set: PortSet) -> PortSet {
+    let (addr, reason, value) = match &set {
+        PortSet::Set {
+            addr,
+            reason,
+            value,
+        } => (Some(*addr), *reason, value),
+        PortSet::Axis { reason, value } => (axis, *reason, value),
+        _ => return set,
+    };
+    let (Some(addr), &ParamValue::Float64(v)) = (addr, value) else {
+        return set;
+    };
+    let field = match reason {
+        index::POSITION => StatusWrite::Position(v),
+        index::ENCODER_POSITION => StatusWrite::EncoderPosition(v),
+        index::ACT_VELOCITY => StatusWrite::Velocity(v),
+        _ => return set,
+    };
+    PortSet::Status { addr, field }
+}
+
+/// [`apply_port_sets`] of sets [`route_readback`] has routed, or the poll
+/// loop's own.
+pub(crate) fn apply_routed_sets(
     base: &mut PortDriverBase,
     axis: Option<i32>,
     sets: impl IntoIterator<Item = PortSet>,

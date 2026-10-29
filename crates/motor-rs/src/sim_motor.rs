@@ -184,8 +184,6 @@ impl SimMotor {
     fn post(&mut self, done: bool) {
         let p = self.nextpoint.p;
         self.posted = MotorStatus {
-            position: p + self.offset,
-            encoder_position: p + self.offset,
             // motorSim never sets motorActVelocity_, so RVEL stays 0.
             direction: self.nextpoint.v > 0.0,
             done,
@@ -198,6 +196,8 @@ impl SimMotor {
             msta_moving: !done,
             low_limit: p <= self.low_limit,
             ..MotorStatus::default()
+                .with_position(p + self.offset)
+                .with_encoder_position(p + self.offset)
         };
     }
 
@@ -368,7 +368,7 @@ impl AsynMotor for SimMotor {
         self.advance_to(Instant::now());
         self.offset = position - self.nextpoint.p;
         // asynMotorController::writeFloat64 stores the parameter first.
-        self.posted.position = position;
+        self.posted.set_position(position);
         Ok(())
     }
 
@@ -460,7 +460,7 @@ mod tests {
     fn test_sim_motor_initial_state() {
         let mut motor = SimMotor::new();
         let status = polled(&mut motor);
-        assert_eq!(status.position, 0.0);
+        assert_eq!(status.position(), 0.0);
         assert!(status.done);
         assert!(!status.moving);
         // motorSimDriver.cpp's poll never sets motorStatusPowerOn_: MSTA 2.
@@ -496,7 +496,7 @@ mod tests {
         assert!(!motor.posted.done, "the move clears Done at once");
         let first = step(&mut motor, 1);
         assert!(
-            (first.position - ramp_after_one_step()).abs() < 1e-12,
+            (first.position() - ramp_after_one_step()).abs() < 1e-12,
             "{first:?}"
         );
         assert!(first.direction && first.moving);
@@ -504,7 +504,7 @@ mod tests {
         assert!(!before_end.done, "{before_end:?}");
         let end = step(&mut motor, 1);
         assert!(end.done && !end.moving, "{end:?}");
-        assert!((end.position - 1.0).abs() < 1e-12, "{end:?}");
+        assert!((end.position() - 1.0).abs() < 1e-12, "{end:?}");
     }
 
     #[test]
@@ -519,7 +519,7 @@ mod tests {
         assert!(stopped.done, "{stopped:?}");
         // 0.2 s up (0.1), 0.3 s at 1 (0.3), 0.2 s down (0.1), less the
         // steps' overrun of 0.1 s.
-        assert!((stopped.position - 0.5).abs() < 2e-3, "{stopped:?}");
+        assert!((stopped.position() - 0.5).abs() < 2e-3, "{stopped:?}");
     }
 
     #[test]
@@ -527,7 +527,7 @@ mod tests {
         let mut motor = SimMotor::new();
         motor.set_position(&user(), 42.0).unwrap();
         let status = polled(&mut motor);
-        assert_eq!(status.position, 42.0);
+        assert_eq!(status.position(), 42.0);
         // The switches stay physical, as motorSimAxis::setPosition moves
         // only enc_offset_.
         assert!(status.encoder_home);
@@ -536,7 +536,7 @@ mod tests {
             .move_absolute(&user(), 52.0, 0.0, 100.0, 1000.0)
             .unwrap();
         let status = step(&mut motor, 3);
-        assert_eq!(status.position, 52.0);
+        assert_eq!(status.position(), 52.0);
         assert!(!status.encoder_home);
     }
 
@@ -553,7 +553,7 @@ mod tests {
             steps += 1;
             assert!(steps < 100, "never homed: {status:?}");
         }
-        assert_eq!(status.position, 0.0);
+        assert_eq!(status.position(), 0.0);
         assert!(status.encoder_home && status.homed);
     }
 
@@ -564,16 +564,16 @@ mod tests {
         let mut motor = SimMotor::new().with_limits(-2.0, 2.0).with_position(1.0);
         motor.home(&user(), 0.0, 1.0, 5.0, true).unwrap();
         let mut status = step(&mut motor, 1);
-        let mut peak = status.position;
+        let mut peak = status.position();
         for _ in 0..200 {
             if status.done {
                 break;
             }
             status = step(&mut motor, 1);
-            peak = peak.max(status.position);
+            peak = peak.max(status.position());
         }
         assert!(status.done && status.homed, "{status:?}");
-        assert_eq!(status.position, 0.0);
+        assert_eq!(status.position(), 0.0);
         assert!(peak > 2.0, "went past the limit before reversing: {peak}");
     }
 
@@ -610,8 +610,8 @@ mod tests {
             .move_absolute(&user(), 100.0, 0.0, 10.0, 50.0)
             .unwrap();
         let status = step(&mut motor, 3);
-        assert!(status.moving && status.position > 0.0, "{status:?}");
-        assert_eq!(status.velocity, 0.0);
+        assert!(status.moving && status.position() > 0.0, "{status:?}");
+        assert_eq!(status.velocity(), 0.0);
     }
 
     /// A long idle is skipped, not stepped, and leaves the axis where it was.
@@ -619,11 +619,11 @@ mod tests {
     fn test_sim_motor_idle_is_skipped() {
         let mut motor = SimMotor::new().with_position(3.0);
         let status = step(&mut motor, 1_000_000);
-        assert_eq!(status.position, 3.0);
+        assert_eq!(status.position(), 3.0);
         motor.move_absolute(&user(), 4.0, 0.0, 1.0, 5.0).unwrap();
         let first = step(&mut motor, 1);
         assert!(
-            (first.position - 3.0 - ramp_after_one_step()).abs() < 1e-9,
+            (first.position() - 3.0 - ramp_after_one_step()).abs() < 1e-9,
             "{first:?}"
         );
     }

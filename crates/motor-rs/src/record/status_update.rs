@@ -134,9 +134,9 @@ impl MotorRecord {
         // (devMotorAsyn.c:452-464): `(epicsInt32)floor(x + 0.5)`, half toward
         // +inf and INT_MIN out of range (x86) — not NINT, which the other raw
         // conversions in this file (rdif, rval, URIP rrbv) use.
-        self.pos.rmp = epics_base_rs::types::c_cast::f64_to_i32((status.position + 0.5).floor());
+        self.pos.rmp = epics_base_rs::types::c_cast::f64_to_i32((status.position() + 0.5).floor());
         self.pos.rep =
-            epics_base_rs::types::c_cast::f64_to_i32((status.encoder_position + 0.5).floor());
+            epics_base_rs::types::c_cast::f64_to_i32((status.encoder_position() + 0.5).floor());
 
         // C 3682: the RDBL read is skipped on the init call. A failed one
         // (3687-3697) flags the stop ahead of process()'s external-move
@@ -254,7 +254,7 @@ impl MotorRecord {
         }
 
         // C devMotorAsyn.c:469-474.
-        self.stat.rvel = epics_base_rs::types::c_cast::f64_to_i32(status.velocity.floor());
+        self.stat.rvel = epics_base_rs::types::c_cast::f64_to_i32(status.velocity().floor());
 
         // LVIO is NOT recomputed here. C re-evaluates it only at
         // enter_do_work (1463-1484: jog from live RBV, home disabled,
@@ -395,7 +395,7 @@ impl MotorRecord {
         }
 
         let restore = init_controller
-            && self.restores_position(status.position, autosaved_dval, autosaved_rval);
+            && self.restores_position(status.position(), autosaved_dval, autosaved_rval);
         if restore {
             // Tell the driver to redefine its current position to the
             // autosaved DVAL.
@@ -410,7 +410,7 @@ impl MotorRecord {
                 format_args!(
                     "devMotorAsyn::init_controller, {} setting of position not required, position={:.6}, mres={:.6}, dval={:.6}, rdbd={:.6}",
                     self.trace().record(),
-                    CFloat(status.position),
+                    CFloat(status.position()),
                     CFloat(self.conv.mres),
                     CFloat(autosaved_dval),
                     CFloat(rdbd),
@@ -453,7 +453,7 @@ impl MotorRecord {
                 ratio: (self.conv.mres / self.conv.eres).abs(),
             });
         }
-        if self.restores_position(status.position, self.pos.dval, self.pos.rval) {
+        if self.restores_position(status.position(), self.pos.dval, self.pos.rval) {
             commands.push(MotorCommand::InitPosition {
                 position: self.raw_position(self.pos.dval),
             });

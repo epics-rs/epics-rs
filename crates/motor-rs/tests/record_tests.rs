@@ -238,11 +238,11 @@ fn test_process_motor_info() {
     let mut rec = MotorRecord::new();
     rec.conv.mres = 0.001;
     let status = asyn_rs::interfaces::motor::MotorStatus {
-        position: 10000.0,
-        encoder_position: 10001.0,
         done: true,
         moving: false,
-        ..Default::default()
+        ..asyn_rs::interfaces::motor::MotorStatus::default()
+            .with_position(10000.0)
+            .with_encoder_position(10001.0)
     };
     rec.process_motor_info(&status);
     assert_eq!(rec.pos.rmp, 10000);
@@ -273,11 +273,10 @@ fn test_limit_strike_completes_move_and_clears_buttons() {
     );
 
     let struck = asyn_rs::interfaces::motor::MotorStatus {
-        position: 9.0,
         high_limit: true,
         done: false,
         moving: true,
-        ..Default::default()
+        ..asyn_rs::interfaces::motor::MotorStatus::default().with_position(9.0)
     };
     rec.process_motor_info(&struck);
     assert!(rec.stat.movn == 0, "ls_active zeroes MOVN");
@@ -392,11 +391,11 @@ fn test_sync_positions_rval_is_motor_raw_not_rrbv() {
     rec.conv.eres = 0.002;
     rec.conv.ueip = true;
     let status = asyn_rs::interfaces::motor::MotorStatus {
-        position: 10000.0,
-        encoder_position: 5000.0,
         done: true,
         has_encoder: true,
-        ..Default::default()
+        ..asyn_rs::interfaces::motor::MotorStatus::default()
+            .with_position(10000.0)
+            .with_encoder_position(5000.0)
     };
     rec.process_motor_info(&status);
     assert_eq!(rec.pos.rrbv, 5000, "encoder counts");
@@ -652,9 +651,8 @@ fn test_set_dval_load_pos_pulses_dmov_and_refreshes_status() {
 
     // GET_INFO callback: driver reports done at the new position.
     let status = asyn_rs::interfaces::motor::MotorStatus {
-        position: 0.0,
         done: true,
-        ..Default::default()
+        ..asyn_rs::interfaces::motor::MotorStatus::default().with_position(0.0)
     };
     rec.process_motor_info(&status);
     let _ = rec.check_completion();
@@ -918,9 +916,8 @@ fn test_runtime_mres_change_set_mode_resyncs_drive_values() {
 
     // GET_INFO callback: the controller still reports 8 steps, now 4 EGU.
     let status = asyn_rs::interfaces::motor::MotorStatus {
-        position: 8.0,
         done: true,
-        ..Default::default()
+        ..asyn_rs::interfaces::motor::MotorStatus::default().with_position(8.0)
     };
     rec.process_motor_info(&status);
     let _ = rec.check_completion();
@@ -975,9 +972,8 @@ fn test_db_loaded_ueip_survives_until_first_poll() {
     assert!(rec.conv.ueip, "load-time UEIP=Yes stored raw, not vetoed");
 
     let no_encoder = asyn_rs::interfaces::motor::MotorStatus {
-        position: 10.0,
         done: true,
-        ..Default::default()
+        ..asyn_rs::interfaces::motor::MotorStatus::default().with_position(10.0)
     };
     rec.process_motor_info(&no_encoder);
     assert!(!rec.conv.ueip, "first poll without encoder demotes UEIP");
@@ -1002,11 +998,11 @@ fn test_db_loaded_ueip_kept_when_encoder_present() {
 
     rec.put_field("UEIP", EpicsValue::Short(1)).unwrap();
     let status = asyn_rs::interfaces::motor::MotorStatus {
-        position: 10000.0,
-        encoder_position: 5000.0,
         done: true,
         has_encoder: true,
-        ..Default::default()
+        ..asyn_rs::interfaces::motor::MotorStatus::default()
+            .with_position(10000.0)
+            .with_encoder_position(5000.0)
     };
     rec.process_motor_info(&status);
     assert!(rec.conv.ueip, "encoder present: loaded UEIP=Yes is kept");
@@ -1062,22 +1058,22 @@ fn test_encoder_loss_demotes_ueip_on_poll() {
     rec.conv.ueip = true;
 
     let with_encoder = asyn_rs::interfaces::motor::MotorStatus {
-        position: 10000.0,
-        encoder_position: 5000.0,
         done: true,
         has_encoder: true,
-        ..Default::default()
+        ..asyn_rs::interfaces::motor::MotorStatus::default()
+            .with_position(10000.0)
+            .with_encoder_position(5000.0)
     };
     rec.process_motor_info(&with_encoder);
     assert!(rec.conv.ueip);
     assert!(rec.stat.msta.contains(MstaFlags::ENCODER_PRESENT));
 
     let lost_encoder = asyn_rs::interfaces::motor::MotorStatus {
-        position: 10000.0,
-        encoder_position: 5000.0,
         done: true,
         has_encoder: false,
-        ..Default::default()
+        ..asyn_rs::interfaces::motor::MotorStatus::default()
+            .with_position(10000.0)
+            .with_encoder_position(5000.0)
     };
     rec.process_motor_info(&lost_encoder);
     assert!(!rec.conv.ueip, "encoder loss demotes UEIP");
@@ -1786,9 +1782,8 @@ fn test_pause_onto_limit_switch_syncs_drive_values_to_readback() {
 
     // Idle at 0, no limit struck.
     let idle = asyn_rs::interfaces::motor::MotorStatus {
-        position: 0.0,
         done: true,
-        ..Default::default()
+        ..asyn_rs::interfaces::motor::MotorStatus::default().with_position(0.0)
     };
     rec.process_motor_info(&idle);
 
@@ -1799,11 +1794,10 @@ fn test_pause_onto_limit_switch_syncs_drive_values_to_readback() {
     assert!(rec.stat.cdir != 0, "the move commands the + direction");
 
     let in_flight = asyn_rs::interfaces::motor::MotorStatus {
-        position: 5.0,
         done: false,
         moving: true,
         direction: true,
-        ..Default::default()
+        ..asyn_rs::interfaces::motor::MotorStatus::default().with_position(5.0)
     };
     rec.process_motor_info(&in_flight);
 
@@ -1815,12 +1809,11 @@ fn test_pause_onto_limit_switch_syncs_drive_values_to_readback() {
 
     // It coasts onto the high limit and rests at 9.0, one EGU short.
     let on_limit = asyn_rs::interfaces::motor::MotorStatus {
-        position: 9.0,
         done: true,
         moving: false,
         direction: true,
         high_limit: true,
-        ..Default::default()
+        ..asyn_rs::interfaces::motor::MotorStatus::default().with_position(9.0)
     };
     rec.process_motor_info(&on_limit);
     assert!(rec.limits.hls != 0, "the poll carries the struck limit");
@@ -1939,11 +1932,11 @@ fn moving_to_50(rtry: i16) -> MotorRecord {
 
 fn status_at(position: f64, moving: bool) -> asyn_rs::interfaces::motor::MotorStatus {
     asyn_rs::interfaces::motor::MotorStatus {
-        position,
-        encoder_position: position,
         done: !moving,
         moving,
-        ..Default::default()
+        ..asyn_rs::interfaces::motor::MotorStatus::default()
+            .with_position(position)
+            .with_encoder_position(position)
     }
 }
 
@@ -2111,11 +2104,11 @@ fn test_ntm_direction_put_stops_at_the_next_moving_callback() {
     rec.pos.val = 50.0;
     let _ = rec.plan_motion(CommandSource::Val);
     let moving_at = |position: f64| asyn_rs::interfaces::motor::MotorStatus {
-        position,
-        encoder_position: position,
         done: false,
         moving: true,
-        ..Default::default()
+        ..asyn_rs::interfaces::motor::MotorStatus::default()
+            .with_position(position)
+            .with_encoder_position(position)
     };
     rec.process_motor_info(&moving_at(2500.0));
     assert_eq!(rec.check_completion().commands, []);
@@ -2480,11 +2473,11 @@ fn test_ueip_eres_readback() {
     rec.conv.ueip = true;
     rec.conv.eres = 0.002;
     let status = asyn_rs::interfaces::motor::MotorStatus {
-        position: 10000.0,
-        encoder_position: 5000.0,
         done: true,
         has_encoder: true,
-        ..Default::default()
+        ..asyn_rs::interfaces::motor::MotorStatus::default()
+            .with_position(10000.0)
+            .with_encoder_position(5000.0)
     };
     rec.process_motor_info(&status);
     // REP = encoder counts = 5000
@@ -2502,11 +2495,11 @@ fn test_ueip_eres_nan_fallback_to_mres() {
     rec.conv.ueip = true;
     rec.conv.eres = f64::NAN;
     let status = asyn_rs::interfaces::motor::MotorStatus {
-        position: 10000.0,
-        encoder_position: 10000.0,
         done: true,
         has_encoder: true,
-        ..Default::default()
+        ..asyn_rs::interfaces::motor::MotorStatus::default()
+            .with_position(10000.0)
+            .with_encoder_position(10000.0)
     };
     rec.process_motor_info(&status);
     // Should fall back to MRES for both REP and DRBV
@@ -2521,10 +2514,10 @@ fn test_ueip_false_uses_motor_position() {
     rec.conv.ueip = false;
     rec.conv.eres = 0.002;
     let status = asyn_rs::interfaces::motor::MotorStatus {
-        position: 10000.0,
-        encoder_position: 10000.0,
         done: true,
-        ..Default::default()
+        ..asyn_rs::interfaces::motor::MotorStatus::default()
+            .with_position(10000.0)
+            .with_encoder_position(10000.0)
     };
     rec.process_motor_info(&status);
     // UEIP=false: uses RMP path with MRES
@@ -2542,10 +2535,10 @@ fn test_rep_is_the_driver_encoder_count_even_under_ueip_no() {
     rec.conv.eres = 0.002;
     rec.conv.ueip = false;
     let status = asyn_rs::interfaces::motor::MotorStatus {
-        position: 10000.0,
-        encoder_position: 5000.0,
         done: true,
-        ..Default::default()
+        ..asyn_rs::interfaces::motor::MotorStatus::default()
+            .with_position(10000.0)
+            .with_encoder_position(5000.0)
     };
     rec.process_motor_info(&status);
     assert_eq!(rec.pos.rep, 5000, "REP is the encoder count");
@@ -2939,10 +2932,10 @@ fn test_put_pass_reads_an_injected_device_update() {
     assert_eq!(rec.stat.phase, MotionPhase::MainMove);
 
     let done = MotorStatus {
-        position: 10.0,
-        encoder_position: 10.0,
         done: true,
-        ..Default::default()
+        ..MotorStatus::default()
+            .with_position(10.0)
+            .with_encoder_position(10.0)
     };
     rec.put_field("CNEN", EpicsValue::Short(1)).unwrap();
     rec.set_event(MotorEvent::DeviceUpdate(done));
@@ -2969,10 +2962,10 @@ fn test_put_pass_reads_a_delay_expiry() {
     rec.plan_motion(CommandSource::Val);
 
     let done = MotorStatus {
-        position: 10.0,
-        encoder_position: 10.0,
         done: true,
-        ..Default::default()
+        ..MotorStatus::default()
+            .with_position(10.0)
+            .with_encoder_position(10.0)
     };
     rec.process_motor_info(&done);
     rec.check_completion();
@@ -3038,10 +3031,10 @@ fn test_stup_busy_ack_callback_skips_completion() {
     assert!(rec.stat.dmov == 0);
 
     let done = MotorStatus {
-        position: 10.0,
-        encoder_position: 10.0,
         done: true,
-        ..Default::default()
+        ..MotorStatus::default()
+            .with_position(10.0)
+            .with_encoder_position(10.0)
     };
     // The ack pass: determine_event returned BUSY to OFF and latched
     // the one-pass mark.
@@ -3075,11 +3068,10 @@ fn put_onto_struck_limit(
 ) -> ProcessEffects {
     use asyn_rs::interfaces::motor::MotorStatus;
     let on_limit = MotorStatus {
-        position: 100.0,
         done: true,
         high_limit: hls,
         low_limit: lls,
-        ..Default::default()
+        ..MotorStatus::default().with_position(100.0)
     };
     rec.set_event(MotorEvent::DeviceUpdate(on_limit.clone()));
     rec.do_process();
@@ -3314,20 +3306,20 @@ fn test_stop_during_the_settle_after_a_stop_syncs_targets() {
     rec.pos.val = 50.0;
     rec.plan_motion(CommandSource::Val);
     rec.process_motor_info(&asyn_rs::interfaces::motor::MotorStatus {
-        position: 20.0,
-        encoder_position: 20.0,
         done: false,
         moving: true,
-        ..Default::default()
+        ..asyn_rs::interfaces::motor::MotorStatus::default()
+            .with_position(20.0)
+            .with_encoder_position(20.0)
     });
     rec.plan_motion(CommandSource::Stop);
     assert_eq!(rec.stat.mip, MipFlags::STOP);
 
     rec.process_motor_info(&asyn_rs::interfaces::motor::MotorStatus {
-        position: 25.0,
-        encoder_position: 25.0,
         done: true,
-        ..Default::default()
+        ..asyn_rs::interfaces::motor::MotorStatus::default()
+            .with_position(25.0)
+            .with_encoder_position(25.0)
     });
     let effects = rec.check_completion();
     assert!(effects.schedule_delay.is_some());
@@ -4502,10 +4494,7 @@ fn test_rmp_overflows_to_int_min() {
     let rec = overflowed(
         1.0,
         0.0,
-        MotorStatus {
-            position: 5_000_000_000.0,
-            ..Default::default()
-        },
+        MotorStatus::default().with_position(5_000_000_000.0),
     );
     assert_eq!(rec.pos.rmp, i32::MIN);
     assert_eq!(rec.pos.rrbv, i32::MIN);
@@ -4521,10 +4510,7 @@ fn test_rep_eres_arm_overflows_to_int_min() {
     let rec = overflowed(
         1.0,
         1.0,
-        MotorStatus {
-            encoder_position: 5_000_000_000.0,
-            ..Default::default()
-        },
+        MotorStatus::default().with_encoder_position(5_000_000_000.0),
     );
     assert_eq!(rec.pos.rep, i32::MIN);
     assert!(matches!(
@@ -4539,10 +4525,7 @@ fn test_rep_mres_fallback_arm_overflows_to_int_min() {
     let rec = overflowed(
         1.0,
         0.0,
-        MotorStatus {
-            encoder_position: 5_000_000_000.0,
-            ..Default::default()
-        },
+        MotorStatus::default().with_encoder_position(5_000_000_000.0),
     );
     assert_eq!(rec.pos.rep, i32::MIN);
 }
@@ -4553,10 +4536,7 @@ fn test_rvel_overflows_to_int_min() {
     let rec = overflowed(
         1.0,
         0.0,
-        MotorStatus {
-            velocity: -2_500_000_000.0,
-            ..Default::default()
-        },
+        MotorStatus::default().with_velocity(-2_500_000_000.0),
     );
     assert_eq!(rec.stat.rvel, i32::MIN);
     assert!(matches!(
@@ -4588,11 +4568,10 @@ fn test_ra_problem_does_not_emit_stop_command() {
 
     // Driver reports a problem mid-motion
     let status = MotorStatus {
-        position: 10.0,
         problem: true,
         moving: true,
         done: false,
-        ..Default::default()
+        ..MotorStatus::default().with_position(10.0)
     };
     rec.process_motor_info(&status);
     assert!(rec.stat.msta.contains(MstaFlags::PROBLEM));
@@ -4617,11 +4596,10 @@ fn test_ra_problem_completes_normally_when_driver_done() {
 
     // Driver finished but flags a problem — record still finalizes, no STOP.
     let status = MotorStatus {
-        position: 10.0,
         problem: true,
         moving: false,
         done: true,
-        ..Default::default()
+        ..MotorStatus::default().with_position(10.0)
     };
     rec.process_motor_info(&status);
     let effects = rec.check_completion();
@@ -4822,10 +4800,7 @@ fn test_vbas_unsupported_clear_by_default() {
 fn test_rvel_is_floored_raw_velocity() {
     use asyn_rs::interfaces::motor::MotorStatus;
     let mut rec = MotorRecord::new();
-    let status = MotorStatus {
-        velocity: 3.7,
-        ..Default::default()
-    };
+    let status = MotorStatus::default().with_velocity(3.7);
     rec.process_motor_info(&status);
     // C devMotorAsyn: rvel = floor(raw velocity); mres=1 → floor(3.7)
     assert_eq!(rec.get_field("RVEL"), Some(EpicsValue::Long(3)));
@@ -4838,10 +4813,7 @@ fn test_rvel_is_the_floored_driver_velocity() {
     // controller reports.
     let mut rec = MotorRecord::new();
     rec.conv.mres = 0.001;
-    let status = MotorStatus {
-        velocity: 2500.0,
-        ..Default::default()
-    };
+    let status = MotorStatus::default().with_velocity(2500.0);
     rec.process_motor_info(&status);
     assert_eq!(
         rec.get_field("RVEL"),
@@ -4850,10 +4822,7 @@ fn test_rvel_is_the_floored_driver_velocity() {
     );
 
     // Negative raw velocity keeps C's floor() semantics.
-    let status = MotorStatus {
-        velocity: -1.5,
-        ..Default::default()
-    };
+    let status = MotorStatus::default().with_velocity(-1.5);
     rec.process_motor_info(&status);
     assert_eq!(
         rec.get_field("RVEL"),
@@ -4867,10 +4836,7 @@ fn test_rvel_is_independent_of_velo_setpoint() {
     use asyn_rs::interfaces::motor::MotorStatus;
     let mut rec = MotorRecord::new();
     rec.put_field("VELO", EpicsValue::Double(10.0)).unwrap(); // setpoint
-    let status = MotorStatus {
-        velocity: 7.0,
-        ..Default::default()
-    };
+    let status = MotorStatus::default().with_velocity(7.0);
     rec.process_motor_info(&status);
     // VELO setpoint and RVEL raw velocity are separate values
     assert_eq!(rec.get_field("VELO"), Some(EpicsValue::Double(10.0)));
@@ -5341,10 +5307,10 @@ fn test_urip_skipped_at_init_readback_applied_on_poll() {
     // skipped the init readback because `determine_event` flips it true
     // before dispatching Startup.
     let status = MotorStatus {
-        position: 3.0, // motor dial position
+        // motor dial position
         done: true,
         moving: false,
-        ..Default::default()
+        ..MotorStatus::default().with_position(3.0)
     };
 
     // Init readback: URIP suppressed, DRBV adopts the motor position (3.0).
@@ -5830,9 +5796,6 @@ fn test_external_move_detected_when_driver_moves_while_idle() {
     assert!(rec.stat.dmov != 0);
 
     let status = MotorStatus {
-        position: 5.0,
-        encoder_position: 5.0,
-        velocity: 0.0,
         moving: true,
         msta_moving: true,
         done: false,
@@ -5850,6 +5813,10 @@ fn test_external_move_detected_when_driver_moves_while_idle() {
         gain_support: true,
         has_encoder: false,
         vbas_supported: true,
+        ..MotorStatus::default()
+            .with_position(5.0)
+            .with_encoder_position(5.0)
+            .with_velocity(0.0)
     };
     rec.process_motor_info(&status);
 
@@ -5862,9 +5829,6 @@ fn test_external_move_idempotent_on_repeat_poll() {
     use asyn_rs::interfaces::motor::MotorStatus;
     let mut rec = MotorRecord::new();
     let status = MotorStatus {
-        position: 5.0,
-        encoder_position: 5.0,
-        velocity: 0.0,
         moving: true,
         msta_moving: true,
         done: false,
@@ -5882,6 +5846,10 @@ fn test_external_move_idempotent_on_repeat_poll() {
         gain_support: true,
         has_encoder: false,
         vbas_supported: true,
+        ..MotorStatus::default()
+            .with_position(5.0)
+            .with_encoder_position(5.0)
+            .with_velocity(0.0)
     };
     rec.process_motor_info(&status);
     assert!(rec.stat.mip.contains(MipFlags::EXTERNAL));
@@ -6207,11 +6175,11 @@ fn test_external_move_in_progress_keeps_dmov_false_via_do_process() {
     use asyn_rs::interfaces::motor::MotorStatus;
     let mut rec = MotorRecord::new();
     let moving = MotorStatus {
-        position: 3.0,
-        encoder_position: 3.0,
         moving: true,
         done: false,
-        ..Default::default()
+        ..MotorStatus::default()
+            .with_position(3.0)
+            .with_encoder_position(3.0)
     };
     rec.process_motor_info(&moving);
     // Still moving — do_process must not clear EXTERNAL or finalize.
@@ -6227,10 +6195,9 @@ fn test_stop_during_external_move_emits_stop() {
     let mut rec = MotorRecord::new();
     // External move flagged (phase stays Idle, MIP_EXTERNAL set).
     rec.process_motor_info(&MotorStatus {
-        position: 3.0,
         moving: true,
         done: false,
-        ..Default::default()
+        ..MotorStatus::default().with_position(3.0)
     });
     assert!(rec.stat.mip.contains(MipFlags::EXTERNAL));
 
@@ -6250,10 +6217,9 @@ fn test_spmg_stop_during_external_move_emits_stop() {
     use asyn_rs::interfaces::motor::MotorStatus;
     let mut rec = MotorRecord::new();
     rec.process_motor_info(&MotorStatus {
-        position: 3.0,
         moving: true,
         done: false,
-        ..Default::default()
+        ..MotorStatus::default().with_position(3.0)
     });
     rec.ctrl.spmg = SpmgMode::Stop;
     let effects = rec.plan_motion(CommandSource::Spmg);
@@ -6647,11 +6613,12 @@ fn test_rstm_never_always_syncs_to_driver() {
     rec.conv.rstm = RestoreMode::Never;
     rec.conv.mres = 1.0;
     rec.pos.dval = 7.0; // autosaved
+    // The driver lost its position.
     let status = MotorStatus {
-        position: 0.0, // driver lost position
-        encoder_position: 0.0,
         done: true,
-        ..Default::default()
+        ..MotorStatus::default()
+            .with_position(0.0)
+            .with_encoder_position(0.0)
     };
     let effects = rec.initial_readback(&status);
     // Never restore → adopt driver readback (0), no InitPosition emitted
@@ -6711,10 +6678,10 @@ fn test_rstm_always_restores_autosaved_dval() {
     rec.conv.mres = 1.0;
     rec.pos.dval = 7.0; // autosaved
     let status = MotorStatus {
-        position: 0.0,
-        encoder_position: 0.0,
         done: true,
-        ..Default::default()
+        ..MotorStatus::default()
+            .with_position(0.0)
+            .with_encoder_position(0.0)
     };
     let effects = rec.initial_readback(&status);
     // Always → keep autosaved DVAL, push InitPosition(7.0)
@@ -6799,11 +6766,12 @@ fn test_rstm_near_zero_restores_when_driver_near_zero() {
     rec.conv.mres = 0.01;
     rec.retry.rdbd = 0.05;
     rec.pos.dval = 5.0; // autosaved, |dval| > rdbd
+    // The driver is near zero.
     let status = MotorStatus {
-        position: 0.0, // driver near zero
-        encoder_position: 0.0,
         done: true,
-        ..Default::default()
+        ..MotorStatus::default()
+            .with_position(0.0)
+            .with_encoder_position(0.0)
     };
     let effects = rec.initial_readback(&status);
     assert_eq!(rec.pos.dval, 5.0);
@@ -6825,11 +6793,12 @@ fn test_rstm_near_zero_no_restore_when_driver_already_positioned() {
     // Autosaved DVAL and driver position are deliberately different (5 vs 8)
     // so restore (dval stays 5) and sync (dval becomes 8) are distinguishable.
     rec.pos.dval = 5.0;
+    // The driver is at 8.0, far from zero.
     let status = MotorStatus {
-        position: 8.0, // driver at 8.0 — far from zero
-        encoder_position: 8.0,
         done: true,
-        ..Default::default()
+        ..MotorStatus::default()
+            .with_position(8.0)
+            .with_encoder_position(8.0)
     };
     let effects = rec.initial_readback(&status);
     // Driver position is meaningful → no restore → adopt driver readback (8.0).
@@ -6858,12 +6827,14 @@ fn test_rstm_near_zero_uses_motor_position_not_encoder() {
     rec.conv.ueip = true;
     rec.retry.rdbd = 0.05;
     rec.pos.dval = 5.0; // autosaved, meaningful
+    // The motor is at zero, so a restore is expected; the encoder reads
+    // non-zero.
     let status = MotorStatus {
-        position: 0.0,         // motor at zero → restore expected
-        encoder_position: 5.0, // encoder reads non-zero
         done: true,
         has_encoder: true,
-        ..Default::default()
+        ..MotorStatus::default()
+            .with_position(0.0)
+            .with_encoder_position(5.0)
     };
     let effects = rec.initial_readback(&status);
     // Motor position is near zero → restore the autosaved DVAL.
@@ -6935,9 +6906,8 @@ fn test_loadpos_block_skips_rstm_restore() {
     rec.conv.loadpos_blocked = true;
     rec.pos.dval = 7.0;
     let status = MotorStatus {
-        position: 0.0,
         done: true,
-        ..Default::default()
+        ..MotorStatus::default().with_position(0.0)
     };
     let effects = rec.initial_readback(&status);
     // LOAD_POS blocked → no InitPosition, driver readback adopted
@@ -6973,10 +6943,10 @@ fn test_rstm_restore_skipped_on_mres_mismatch() {
     rec.pos.dval = 5.0;
     rec.pos.rval = 500;
     let status = MotorStatus {
-        position: 0.0,
-        encoder_position: 0.0,
         done: true,
-        ..Default::default()
+        ..MotorStatus::default()
+            .with_position(0.0)
+            .with_encoder_position(0.0)
     };
     let effects = rec.initial_readback(&status);
     // Inconsistent autosave → restore skipped, driver readback adopted
@@ -7000,10 +6970,10 @@ fn test_rstm_restore_proceeds_when_mres_consistent() {
     rec.pos.dval = 5.0;
     rec.pos.rval = 500;
     let status = MotorStatus {
-        position: 0.0,
-        encoder_position: 0.0,
         done: true,
-        ..Default::default()
+        ..MotorStatus::default()
+            .with_position(0.0)
+            .with_encoder_position(0.0)
     };
     let effects = rec.initial_readback(&status);
     assert_eq!(rec.pos.dval, 5.0);
@@ -7840,9 +7810,8 @@ fn init_device_half(rec: &mut MotorRecord, status: &asyn_rs::interfaces::motor::
 /// init tail, which reads DRBV after the readback (C 720-743).
 fn readback_at(drbv: f64) -> asyn_rs::interfaces::motor::MotorStatus {
     asyn_rs::interfaces::motor::MotorStatus {
-        position: drbv / 0.5,
         done: true,
-        ..Default::default()
+        ..asyn_rs::interfaces::motor::MotorStatus::default().with_position(drbv / 0.5)
     }
 }
 
@@ -10762,9 +10731,8 @@ mod retry_after_dly_settle {
         assert_eq!(rec.stat.mip, MipFlags::LOAD_P);
 
         rec.process_motor_info(&asyn_rs::interfaces::motor::MotorStatus {
-            position: 0.0,
             done: true,
-            ..Default::default()
+            ..asyn_rs::interfaces::motor::MotorStatus::default().with_position(0.0)
         });
         let effects = rec.check_completion();
         assert!(effects.schedule_delay.is_none());
@@ -11065,11 +11033,11 @@ fn test_lvio_refused_retry_collapses_to_done() {
     // Both legs run; the final approach stops short by 0.2 (> RDBD).
     for stop_at in [-10.5, -9.7] {
         let status = asyn_rs::interfaces::motor::MotorStatus {
-            position: stop_at,
-            encoder_position: stop_at,
             done: true,
             moving: false,
-            ..Default::default()
+            ..asyn_rs::interfaces::motor::MotorStatus::default()
+                .with_position(stop_at)
+                .with_encoder_position(stop_at)
         };
         rec.process_motor_info(&status);
         rec.check_completion();
@@ -11405,9 +11373,8 @@ fn test_same_value_set_redefinition_resends_load_pos_when_blinked() {
         "first redefinition dispatches LOAD_POS"
     );
     let status = asyn_rs::interfaces::motor::MotorStatus {
-        position: 0.0,
         done: true,
-        ..Default::default()
+        ..asyn_rs::interfaces::motor::MotorStatus::default().with_position(0.0)
     };
     rec.process_motor_info(&status);
     let _ = rec.check_completion();
@@ -11428,9 +11395,8 @@ fn test_same_value_set_redefinition_resends_load_pos_when_blinked() {
     // Unblinked same-value pass (no fresh drive write): entry gate
     // (2241) refuses — chain end, implicit GET_INFO.
     let status = asyn_rs::interfaces::motor::MotorStatus {
-        position: 0.0,
         done: true,
-        ..Default::default()
+        ..asyn_rs::interfaces::motor::MotorStatus::default().with_position(0.0)
     };
     rec.process_motor_info(&status);
     let _ = rec.check_completion();
@@ -11590,10 +11556,9 @@ fn test_blinked_put_onto_hw_limit_completes_with_readback_adopted() {
     rec.internal.init_invariants_synced = true;
     rec.conv.mres = 0.001;
     let on_limit = MotorStatus {
-        position: 0.0,
         done: true,
         high_limit: true,
-        ..Default::default()
+        ..MotorStatus::default().with_position(0.0)
     };
     rec.set_event(MotorEvent::DeviceUpdate(on_limit.clone()));
     rec.do_process();
@@ -11690,11 +11655,11 @@ fn test_driver_sees_raw_steps_at_negative_mres() {
     );
 
     rec.process_motor_info(&MotorStatus {
-        position: -150.0,
-        encoder_position: -150.0,
-        velocity: -37.5,
         done: true,
-        ..Default::default()
+        ..MotorStatus::default()
+            .with_position(-150.0)
+            .with_encoder_position(-150.0)
+            .with_velocity(-37.5)
     });
     let _ = rec.check_completion();
     assert_eq!(rec.pos.rmp, -150);
@@ -11753,12 +11718,11 @@ fn test_ls_bits_on_the_first_poll_off_the_limit_do_not_end_the_move() {
     rec.limits.dhlm = 200.0;
     rec.limits.dllm = -200.0;
     let at = |position: f64, moving: bool, limits: bool| MotorStatus {
-        position,
         done: !moving,
         moving,
         high_limit: limits,
         low_limit: limits,
-        ..Default::default()
+        ..MotorStatus::default().with_position(position)
     };
     rec.set_event(MotorEvent::DeviceUpdate(at(50.0, false, false)));
     rec.do_process();
@@ -11809,8 +11773,7 @@ fn test_val_put_during_external_motion_parks_until_done() {
             status: MotorStatus {
                 done: !moving,
                 moving,
-                position,
-                ..MotorStatus::default()
+                ..MotorStatus::default().with_position(position)
             },
         });
     };

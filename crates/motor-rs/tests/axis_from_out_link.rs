@@ -96,9 +96,8 @@ fn sim(card: i32, signal: i32) -> TraceUser {
 fn axis(user: TraceUser, position: f64) {
     let subscribers = AxisSubscribers::new();
     subscribers.store(MotorStatus {
-        position,
         done: true,
-        ..MotorStatus::default()
+        ..MotorStatus::default().with_position(position)
     });
     register_axis(unpolled(user, subscribers)).unwrap();
 }
@@ -276,9 +275,8 @@ async fn a_motor_interface_record_opens_its_axis_at_init() {
         };
         let subscribers = AxisSubscribers::new();
         subscribers.store(MotorStatus {
-            position: 70.0,
             done: true,
-            ..MotorStatus::default()
+            ..MotorStatus::default().with_position(70.0)
         });
         register_axis(unpolled(user, subscribers)).is_ok()
     });

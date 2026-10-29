@@ -229,9 +229,8 @@ record(motor, "S:post") { field(DTYP, "TestStrings") field(OUT, "#C47 S0 @") fie
     // A VAL put during the move is parked (C do_work 2457), so the next
     // move is built once this one is done.
     for pulse in subscribers.post(MotorStatus {
-        position: 5.0,
         done: true,
-        ..MotorStatus::default()
+        ..MotorStatus::default().with_position(5.0)
     }) {
         pulse.try_send(()).unwrap();
     }

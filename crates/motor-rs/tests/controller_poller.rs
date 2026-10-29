@@ -230,10 +230,7 @@ impl AsynMotor for Creeping {
     }
     fn poll(&mut self, _: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         let n = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-        *status = MotorStatus {
-            position: f64::from(n),
-            ..MotorStatus::default()
-        };
+        *status = MotorStatus::default().with_position(f64::from(n));
         Ok(())
     }
 }

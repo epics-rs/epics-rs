@@ -953,6 +953,51 @@ async fn a_drive_limit_clamp_is_not_a_request() {
     );
 }
 
+/// Post `stale` on `pv`'s VAL and leave VAL at `now` with no event.
+fn post_stale(db: &PvDatabase, pv: &str, stale: f64, now: f64) {
+    let rec = db.get_record(pv).unwrap();
+    let mut inst = rec.write();
+    inst.record
+        .put_field("VAL", EpicsValue::Double(stale))
+        .unwrap();
+    inst.notify_field("VAL", EventMask::VALUE | EventMask::LOG);
+    inst.record
+        .put_field("VAL", EpicsValue::Double(now))
+        .unwrap();
+}
+
+/// A stale theta event pending at a lattice change is not taken: the
+/// lattice pass keeps the standing theta.
+#[epics_base_rs::epics_test]
+async fn a_stale_event_at_a_lattice_change_is_not_taken() {
+    let (ioc, _scan) = boot([10.0, 10.0, 35.0, 100.0]).await;
+    settled(&ioc, "y offset changed to 35.000000").await;
+    put_process(&ioc, "M:ml_monoTheta", 20.0).await;
+    wait_near(&ioc, "M:ml_monoThetaSet", 20.0).await;
+    let mut set = DbSubscription::subscribe(&ioc, "M:ml_monoThetaSet")
+        .await
+        .unwrap();
+    put_process(&ioc, "M:ml_monoD", 20.0).await;
+    post_stale(&ioc, "M:ml_monoTheta", 10.0, 20.0);
+    settled(&ioc, "New effective d spacing").await;
+    stays(&mut set, 20.0).await;
+}
+
+/// A theta event holding a value the PV no longer holds, as an own put's
+/// echo landing after a later put's readback does, is not taken.
+#[epics_base_rs::epics_test]
+async fn a_stale_event_is_not_taken() {
+    let (ioc, _scan) = boot([10.0, 10.0, 35.0, 100.0]).await;
+    settled(&ioc, "y offset changed to 35.000000").await;
+    put_process(&ioc, "M:ml_monoTheta", 20.0).await;
+    wait_near(&ioc, "M:ml_monoThetaSet", 20.0).await;
+    let mut set = DbSubscription::subscribe(&ioc, "M:ml_monoThetaSet")
+        .await
+        .unwrap();
+    post_stale(&ioc, "M:ml_monoTheta", 10.0, 20.0);
+    stays(&mut set, 20.0).await;
+}
+
 /// A NaN request is done after its move though NaN != NaN, and its own
 /// echo is no request.
 #[epics_base_rs::epics_test]

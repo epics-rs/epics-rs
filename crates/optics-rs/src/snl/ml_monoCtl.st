@@ -759,24 +759,15 @@ state waitForCmnd {
 	 * failing value test consumes. */
 	when (efTestAndClear(E_mon) && !SAME(EReq, ELast)) {
 		if (ml_monoCtlDebug) %%printf("ml_monoCtl:waitForCmnd:E_mon\n");
-		E = EReq;
-		ELast = E;
-		ml_monoDone = 0;
-	} state eChanged
+	} state reqTake
 
 	when (efTestAndClear(lambda_mon) && !SAME(lambdaReq, lambdaLast)) {
 		if (ml_monoCtlDebug) %%printf("ml_monoCtl:waitForCmnd:lambda_mon\n");
-		lambda = lambdaReq;
-		lambdaLast = lambda;
-		ml_monoDone = 0;
-	} state lChanged
+	} state reqTake
 
 	when (efTestAndClear(theta_mon) && !SAME(thetaReq, thetaLast)) {
 		if (ml_monoCtlDebug) %%printf("ml_monoCtl:waitForCmnd:theta_mon\n");
-		theta = thetaReq;
-		thetaLast = theta;
-		ml_monoDone = 0;
-	} state thChanged
+	} state reqTake
 
 	when (putVals && delay(.1)) {
 		if (ml_monoCtlDebug) %%printf("ml_monoCtl:waitForCmnd:putVals\n");
@@ -807,6 +798,33 @@ state waitForCmnd {
 		sprintf(seqMsg2, " ");
 		pvPut(seqMsg2);
 	} state waitForCmndEnter
+}
+
+/* A request is taken from its PV: an event can hold a value the PV no
+ * longer holds, as an own put's echo landing after a later put does. */
+state reqTake {
+	entry {
+		pvGet(ENow);
+		pvGet(lambdaNow);
+		pvGet(thetaNow);
+	}
+	when (!SAME(ENow, ELast)) {
+		E = ENow;
+		ELast = E;
+		ml_monoDone = 0;
+	} state eChanged
+	when (!SAME(lambdaNow, lambdaLast)) {
+		lambda = lambdaNow;
+		lambdaLast = lambda;
+		ml_monoDone = 0;
+	} state lChanged
+	when (!SAME(thetaNow, thetaLast)) {
+		theta = thetaNow;
+		thetaLast = theta;
+		ml_monoDone = 0;
+	} state thChanged
+	when () {
+	} state waitForCmnd
 }
 
 state tweak {
@@ -912,18 +930,23 @@ state dInputChanged {
  * already in E or lambda, which was then never moved to. A request
  * pending at a layer spacing change is applied under the new 2d. */
 state dInputTake {
-	when (efTestAndClear(E_mon) && !SAME(EReq, ELast)) {
-		E = EReq;
+	entry {
+		pvGet(ENow);
+		pvGet(lambdaNow);
+		pvGet(thetaNow);
+	}
+	when (!SAME(ENow, ELast)) {
+		E = ENow;
 		ELast = E;
 		ml_monoDone = 0;
 	} state eChanged
-	when (efTestAndClear(lambda_mon) && !SAME(lambdaReq, lambdaLast)) {
-		lambda = lambdaReq;
+	when (!SAME(lambdaNow, lambdaLast)) {
+		lambda = lambdaNow;
 		lambdaLast = lambda;
 		ml_monoDone = 0;
 	} state lChanged
-	when (efTestAndClear(theta_mon) && !SAME(thetaReq, thetaLast)) {
-		theta = thetaReq;
+	when (!SAME(thetaNow, thetaLast)) {
+		theta = thetaNow;
 		thetaLast = theta;
 		ml_monoDone = 0;
 	} state thChanged

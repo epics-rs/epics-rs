@@ -1253,6 +1253,51 @@ async fn an_e_request_pending_at_a_lattice_change_takes_the_new_2d() {
     assert_near(&ioc, "K:KohzuMoving", 1.0).await;
 }
 
+/// Post `stale` on `pv`'s VAL and leave VAL at `now` with no event.
+fn post_stale(db: &PvDatabase, pv: &str, stale: f64, now: f64) {
+    let rec = db.get_record(pv).unwrap();
+    let mut inst = rec.write();
+    inst.record
+        .put_field("VAL", EpicsValue::Double(stale))
+        .unwrap();
+    inst.notify_field("VAL", EventMask::VALUE | EventMask::LOG);
+    inst.record
+        .put_field("VAL", EpicsValue::Double(now))
+        .unwrap();
+}
+
+/// A stale theta event pending at a lattice change is not taken: the
+/// lattice pass keeps the standing theta.
+#[epics_base_rs::epics_test]
+async fn a_stale_event_at_a_lattice_change_is_not_taken() {
+    let ioc = boot([10.0, -17.77, 100.78]).await;
+    ready(&ioc, "y offset changed to 17.500000").await;
+    put_process(&ioc, "K:BraggThetaAO", 20.0).await;
+    eventually_near(&ioc, "K:KohzuThetaSetAO", 20.0).await;
+    let mut set = DbSubscription::subscribe(&ioc, "K:KohzuThetaSetAO")
+        .await
+        .unwrap();
+    put_process(&ioc, "K:BraggHAO", 3.0).await;
+    post_stale(&ioc, "K:BraggThetaAO", 10.0, 20.0);
+    shown(&ioc, "New d spacing").await;
+    stays(&mut set, 20.0).await;
+}
+
+/// A theta event holding a value the PV no longer holds, as an own put's
+/// echo landing after a later put's readback does, is not taken.
+#[epics_base_rs::epics_test]
+async fn a_stale_event_is_not_taken() {
+    let ioc = boot([10.0, -17.77, 100.78]).await;
+    ready(&ioc, "y offset changed to 17.500000").await;
+    put_process(&ioc, "K:BraggThetaAO", 20.0).await;
+    eventually_near(&ioc, "K:KohzuThetaSetAO", 20.0).await;
+    let mut set = DbSubscription::subscribe(&ioc, "K:KohzuThetaSetAO")
+        .await
+        .unwrap();
+    post_stale(&ioc, "K:BraggThetaAO", 10.0, 20.0);
+    stays(&mut set, 20.0).await;
+}
+
 /// A NaN request is done after its move though NaN != NaN, and its own
 /// echo is no request.
 #[epics_base_rs::epics_test]

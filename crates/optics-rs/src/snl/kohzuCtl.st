@@ -788,24 +788,15 @@ state waitForCmnd {
 	 * failing value test consumes. */
 	when (efTestAndClear(E_mon) && !SAME(EReq, ELast)) {
 		if (kohzuCtlDebug) %%printf("kohzuCtl:waitForCmnd:E_mon\n");
-		E = EReq;
-		ELast = E;
-		kohzuDone = 0;
-	} state eChanged
+	} state reqTake
 
 	when (efTestAndClear(lambda_mon) && !SAME(lambdaReq, lambdaLast)) {
 		if (kohzuCtlDebug) %%printf("kohzuCtl:waitForCmnd:lambda_mon\n");
-		lambda = lambdaReq;
-		lambdaLast = lambda;
-		kohzuDone = 0;
-	} state lChanged
+	} state reqTake
 
 	when (efTestAndClear(theta_mon) && !SAME(thetaReq, thetaLast)) {
 		if (kohzuCtlDebug) %%printf("kohzuCtl:waitForCmnd:theta_mon\n");
-		theta = thetaReq;
-		thetaLast = theta;
-		kohzuDone = 0;
-	} state thChanged
+	} state reqTake
 
 	when (efTestAndClear(kMbusy)) {
 		if (kohzuCtlDebug) %%printf("kohzuCtl:waitForCmnd:kMbusy\n");
@@ -840,6 +831,33 @@ state waitForCmnd {
 		sprintf(seqMsg2, " ");
 		pvPut(seqMsg2);
 	} state waitForCmndEnter
+}
+
+/* A request is taken from its PV: an event can hold a value the PV no
+ * longer holds, as an own put's echo landing after a later put does. */
+state reqTake {
+	entry {
+		pvGet(ENow);
+		pvGet(lambdaNow);
+		pvGet(thetaNow);
+	}
+	when (!SAME(ENow, ELast)) {
+		E = ENow;
+		ELast = E;
+		kohzuDone = 0;
+	} state eChanged
+	when (!SAME(lambdaNow, lambdaLast)) {
+		lambda = lambdaNow;
+		lambdaLast = lambda;
+		kohzuDone = 0;
+	} state lChanged
+	when (!SAME(thetaNow, thetaLast)) {
+		theta = thetaNow;
+		thetaLast = theta;
+		kohzuDone = 0;
+	} state thChanged
+	when () {
+	} state waitForCmnd
 }
 
 state tweak {
@@ -948,18 +966,23 @@ state dInputChanged {
  * already in E or lambda, which was then never moved to. A request
  * pending at a lattice change is applied under the new d spacing. */
 state dInputTake {
-	when (efTestAndClear(E_mon) && !SAME(EReq, ELast)) {
-		E = EReq;
+	entry {
+		pvGet(ENow);
+		pvGet(lambdaNow);
+		pvGet(thetaNow);
+	}
+	when (!SAME(ENow, ELast)) {
+		E = ENow;
 		ELast = E;
 		kohzuDone = 0;
 	} state eChanged
-	when (efTestAndClear(lambda_mon) && !SAME(lambdaReq, lambdaLast)) {
-		lambda = lambdaReq;
+	when (!SAME(lambdaNow, lambdaLast)) {
+		lambda = lambdaNow;
 		lambdaLast = lambda;
 		kohzuDone = 0;
 	} state lChanged
-	when (efTestAndClear(theta_mon) && !SAME(thetaReq, thetaLast)) {
-		theta = thetaReq;
+	when (!SAME(thetaNow, thetaLast)) {
+		theta = thetaNow;
 		thetaLast = theta;
 		kohzuDone = 0;
 	} state thChanged
@@ -1007,21 +1030,26 @@ state thetaLimits {
  * to -1) but the Busy PV does get activated. A SNL evflag has been added
  * for the busy and the following state added to handle this situation.       */
 state busyChanged {
-	when (kohzuMoving > 0 && efTestAndClear(E_mon) && !SAME(EReq, ELast)) {
+	entry {
+		pvGet(ENow);
+		pvGet(lambdaNow);
+		pvGet(thetaNow);
+	}
+	when (kohzuMoving > 0 && !SAME(ENow, ELast)) {
 		if (kohzuCtlDebug) %%printf("kohzuCtl:busyChanged\n to Moving and E changed");
-		E = EReq;
+		E = ENow;
 		ELast = E;
 		kohzuDone = 0;
 	} state eChanged
-	when (kohzuMoving > 0 && efTestAndClear(lambda_mon) && !SAME(lambdaReq, lambdaLast)) {
+	when (kohzuMoving > 0 && !SAME(lambdaNow, lambdaLast)) {
 		if (kohzuCtlDebug) %%printf("kohzuCtl:busyChanged\n to Moving and lambda changed");
-		lambda = lambdaReq;
+		lambda = lambdaNow;
 		lambdaLast = lambda;
 		kohzuDone = 0;
 	} state lChanged
-	when (kohzuMoving > 0 && efTestAndClear(theta_mon) && !SAME(thetaReq, thetaLast)) {
+	when (kohzuMoving > 0 && !SAME(thetaNow, thetaLast)) {
 		if (kohzuCtlDebug) %%printf("kohzuCtl:busyChanged\n to Moving and theta changed");
-		theta = thetaReq;
+		theta = thetaNow;
 		thetaLast = theta;
 		kohzuDone = 0;
 	} state thChanged

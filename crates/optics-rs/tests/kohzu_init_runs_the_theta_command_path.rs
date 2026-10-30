@@ -1228,6 +1228,67 @@ async fn a_drive_limit_clamp_is_not_a_request() {
     );
 }
 
+/// A tweak after the theta LLM put clamps `ao` to `limit` starts from the
+/// clamp, as from C's monitored value.
+async fn a_tweak_after_a_drive_limit_clamp_starts_from_it(
+    [ao, limit, step_pv, button]: [&str; 4],
+    step: f64,
+) {
+    let ioc = boot([10.0, -17.77, 100.78]).await;
+    ready(&ioc, "y offset changed to 17.500000").await;
+    put_process(&ioc, "K:KohzuModeBO", 1.0).await;
+    put_process(&ioc, "K:th.LLM", 15.0).await;
+    eventually_near(&ioc, "K:BraggThetaAO", 15.0).await;
+    eventually_near(&ioc, "K:KohzuMoving", 0.0).await;
+    let clamp = f64_of(&ioc, limit).await;
+    assert_near(&ioc, ao, clamp).await;
+    put_process(&ioc, step_pv, step.abs()).await;
+    put_process(&ioc, button, 1.0).await;
+    eventually_near(&ioc, ao, clamp + step).await;
+}
+
+#[epics_base_rs::epics_test]
+async fn an_e_tweak_after_a_drive_limit_clamp_starts_from_it() {
+    a_tweak_after_a_drive_limit_clamp_starts_from_it(
+        [
+            "K:BraggEAO",
+            "K:BraggEAO.DRVH",
+            "K:BraggETweakAI",
+            "K:BraggEDecBO",
+        ],
+        -0.1,
+    )
+    .await;
+}
+
+#[epics_base_rs::epics_test]
+async fn a_lambda_tweak_after_a_drive_limit_clamp_starts_from_it() {
+    a_tweak_after_a_drive_limit_clamp_starts_from_it(
+        [
+            "K:BraggLambdaAO",
+            "K:BraggLambdaAO.DRVL",
+            "K:BraggLambdaTweakAI",
+            "K:BraggLambdaIncBO",
+        ],
+        0.01,
+    )
+    .await;
+}
+
+#[epics_base_rs::epics_test]
+async fn a_theta_tweak_after_a_drive_limit_clamp_starts_from_it() {
+    a_tweak_after_a_drive_limit_clamp_starts_from_it(
+        [
+            "K:BraggThetaAO",
+            "K:BraggThetaAO.DRVL",
+            "K:BraggThetaTweakAI",
+            "K:BraggThetaIncBO",
+        ],
+        1.0,
+    )
+    .await;
+}
+
 /// An E request and a lattice change raised during a move are both taken
 /// after it: the lattice pass applies the request under the new 2d, where
 /// C's thChanged recomputed E from the standing theta over it.

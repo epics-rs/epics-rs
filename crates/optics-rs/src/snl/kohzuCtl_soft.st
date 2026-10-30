@@ -651,6 +651,14 @@ state initSequence {
 }
 
 state waitForCmndEnter {
+	entry {
+		/* Between passes a working value is what its PV held after this
+		 * program's last put or take, clamp included, as C's monitored
+		 * one was. */
+		E = ELast;
+		lambda = lambdaLast;
+		theta = thetaLast;
+	}
 	when (initSeqDone && delay(.1)) {
 		if (kohzuCtlDebug) %%printf("kohzuCtl:waitForCmndEnter:initSeqDone\n");
 		thetaMotRdbkEcho = thetaMotRdbk;

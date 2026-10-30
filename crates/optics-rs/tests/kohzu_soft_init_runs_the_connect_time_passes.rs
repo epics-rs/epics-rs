@@ -376,6 +376,39 @@ async fn a_direct_theta_move_runs_one_only_theta_motor_moved_pass() {
     assert_eq!(passes, 1, "Only Theta Motor Moved passes");
 }
 
+/// A lattice pass after the theta motor's HLM refused a readback put keeps
+/// the theta the record kept, as C's monitored one did.
+#[epics_base_rs::epics_test]
+async fn a_lattice_change_after_a_refused_theta_put_keeps_the_standing_theta() {
+    let ioc = boot([10.0, -17.77, 100.78]).await;
+    ready(&ioc, "y offset changed to 17.500000").await;
+    let db = PvDatabase::clone(&ioc);
+    let post = |field: &str, v: f64| {
+        let rec = db.get_record("K:th").unwrap();
+        let mut inst = rec.write();
+        let motor = inst
+            .record
+            .as_any_mut()
+            .and_then(|a| a.downcast_mut::<motor_rs::MotorRecord>())
+            .unwrap();
+        match field {
+            "RBV" => motor.pos.rbv = v,
+            _ => motor.stat.dmov = i16::from(v != 0.0),
+        }
+        inst.notify_field(field, EventMask::VALUE | EventMask::LOG);
+    };
+    post("DMOV", 0.0);
+    post("RBV", 89.5);
+    post("DMOV", 1.0);
+    shown(&ioc, "Y will exceed soft limits").await;
+    idle(&db, "K:m:OperAck", "K:m:SeqMsg1").await;
+    assert_near(&ioc, "K:m:Theta", 10.0).await;
+    put_process(&ioc, "K:m:H", 3.0).await;
+    shown(&ioc, "New d spacing").await;
+    let d = f64_of(&ioc, "K:m:2dSpacing").await;
+    eventually_near(&ioc, "K:m:Lambda", d * (10.0 / RAD_CONV).sin()).await;
+}
+
 async fn use_set_and_motor_sets(ioc: &PvDatabase) -> [f64; 4] {
     [
         f64_of(ioc, "K:m:UseSet").await,

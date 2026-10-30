@@ -953,6 +953,68 @@ async fn a_drive_limit_clamp_is_not_a_request() {
     );
 }
 
+/// A tweak after the theta LLM put clamps `ao` to `limit` starts from the
+/// clamp, as from C's monitored value.
+async fn a_tweak_after_a_drive_limit_clamp_starts_from_it(
+    [ao, limit, step_pv, button]: [&str; 4],
+    step: f64,
+) {
+    let (ioc, _scan) = boot([10.0, 10.0, 35.0, 100.0]).await;
+    settled(&ioc, "y offset changed to 35.000000").await;
+    idle(&ioc, "M:ml_monoOperAck", "M:ml_monoSeqMsg1").await;
+    post(&ioc, "M:ml_monoMode", EpicsValue::Enum(1));
+    put_process(&ioc, "M:th.LLM", 15.0).await;
+    wait_near(&ioc, "M:ml_monoTheta", 15.0).await;
+    wait_near(&ioc, "M:ml_monoMoving", 0.0).await;
+    let clamp = f64_of(&ioc, limit).await;
+    assert_eq!(f64_of(&ioc, ao).await, clamp, "{ao}");
+    put_process(&ioc, step_pv, step.abs()).await;
+    put_process(&ioc, button, 1.0).await;
+    wait_near(&ioc, ao, clamp + step).await;
+}
+
+#[epics_base_rs::epics_test]
+async fn an_e_tweak_after_a_drive_limit_clamp_starts_from_it() {
+    a_tweak_after_a_drive_limit_clamp_starts_from_it(
+        [
+            "M:ml_monoE",
+            "M:ml_monoE.DRVH",
+            "M:ml_monoETweak",
+            "M:ml_monoEDec",
+        ],
+        -0.1,
+    )
+    .await;
+}
+
+#[epics_base_rs::epics_test]
+async fn a_lambda_tweak_after_a_drive_limit_clamp_starts_from_it() {
+    a_tweak_after_a_drive_limit_clamp_starts_from_it(
+        [
+            "M:ml_monoLambda",
+            "M:ml_monoLambda.DRVL",
+            "M:ml_monoLambdaTweak",
+            "M:ml_monoLambdaInc",
+        ],
+        0.01,
+    )
+    .await;
+}
+
+#[epics_base_rs::epics_test]
+async fn a_theta_tweak_after_a_drive_limit_clamp_starts_from_it() {
+    a_tweak_after_a_drive_limit_clamp_starts_from_it(
+        [
+            "M:ml_monoTheta",
+            "M:ml_monoTheta.DRVL",
+            "M:ml_monoThetaTweak",
+            "M:ml_monoThetaInc",
+        ],
+        1.0,
+    )
+    .await;
+}
+
 /// Post `stale` on `pv`'s VAL and leave VAL at `now` with no event.
 fn post_stale(db: &PvDatabase, pv: &str, stale: f64, now: f64) {
     let rec = db.get_record(pv).unwrap();

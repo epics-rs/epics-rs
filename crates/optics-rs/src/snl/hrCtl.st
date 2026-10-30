@@ -394,11 +394,9 @@ sync    phi2MotLoLim phi2MotLoLim_mon;
 
 double  phi1MotCmd;
 assign  phi1MotCmd to "{P}{M_PHI1}";
-int phi1PutComplete;
 
 double  phi2MotCmd;
 assign  phi2MotCmd to "{P}{M_PHI2}";
-int phi2PutComplete;
 
 double  phi1MotCmdMon;
 assign  phi1MotCmdMon to "{P}{M_PHI1}";
@@ -588,8 +586,6 @@ ss hr_Ctl
 			D2uR = 1000000*PI/180;
 			phi1MotStop = 1;
 			phi2MotStop = 1;
-			phi1PutComplete = 1;
-			phi2PutComplete = 1;
 			putVals = 0;
 			pvPut(putVals);
 			autoMode = 0;
@@ -1044,11 +1040,9 @@ ss hr_Ctl
 	state checkDone {
 		entry {
 			if (hrCtlDebug) %%printf("hrCtl:checkDone: entry\n");
-			if (!phi1PutComplete) phi1PutComplete = pvPutComplete(phi1MotCmd);
-			if (!phi2PutComplete) phi2PutComplete = pvPutComplete(phi2MotCmd);
 		}
 		/* when (phi1Dmov && phi2Dmov) { */
-		when (phi1PutComplete && phi2PutComplete) {
+		when (pvPutComplete(phi1MotCmd) && pvPutComplete(phi2MotCmd)) {
 			if (hrCtlDebug) %%printf("hrCtl:checkDone: done\n");
 			hr_Done = 1;
 		} state waitForCmndEnter
@@ -1479,12 +1473,9 @@ ss hr_Ctl
 			if (hrCtlDebug) %%printf("hrCtl:moveHR: putting to motors\n");
 			phi1MotCmd = phi1MotDesired;
 			if (opMode == 0) {
-				phi1PutComplete = 0;
 				pvPut(phi1MotCmd, ASYNC);
 			} else if ((opMode == 1) || (opMode == 2)) {
 				phi2MotCmd = phi2MotDesired;
-				phi1PutComplete = 0;
-				phi2PutComplete = 0;
 				pvPut(phi2MotCmd, ASYNC);
 				pvPut(phi1MotCmd, ASYNC);
             }
@@ -1501,8 +1492,6 @@ ss hr_Ctl
 	state updateRdbk {
 		entry {
 			if (hrCtlDebug) %%printf("hrCtl:updateRdbk: entry\n");
-			if (!phi1PutComplete) phi1PutComplete = pvPutComplete(phi1MotCmd);
-			if (!phi2PutComplete) phi2PutComplete = pvPutComplete(phi2MotCmd);
 		}
 		when (phi1Hls || phi1Lls || phi2Hls || phi2Lls) {
 			if (phi1Hls || phi1Lls) {
@@ -1538,7 +1527,10 @@ ss hr_Ctl
 			pvPut(ERdbk);
 		} state updateRdbkAfterDelay
 
-		when (phi1PutComplete && phi2PutComplete) {
+		/* Read at each wake, not sampled in the entry: a move whose DMOV 0
+		 * is overwritten before this state set runs leaves no arm to
+		 * re-enter, and only the put's completion wakes it. */
+		when (pvPutComplete(phi1MotCmd) && pvPutComplete(phi2MotCmd)) {
 			if (hrCtlDebug) %%printf("hrCtl:updateRdbk: motors stopped\n");
 			/* Calc and put readback values. */
 			%%hrCtl_calcReadback(pVar);        

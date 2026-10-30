@@ -525,6 +525,29 @@ async fn a_request_during_a_move_is_moved_to_before_done() {
     wait_near(&ioc, "H:HR1_Moving", 0.0).await;
 }
 
+/// A move over before the program sees its DMOV drop still ends, so the
+/// next request is moved to. updateRdbk read the put's completion only in
+/// its entry, which only that drop ran again.
+#[epics_base_rs::epics_test]
+async fn a_move_over_before_its_dmov_drop_is_seen_still_ends() {
+    let (ioc, _scan) = boot().await;
+    let db = PvDatabase::clone(&ioc);
+    idle(&db, "H:HR1_OperAckBO", "H:HR1_SeqMsg1SI").await;
+    post(&db, "H:HR1_ModeBO", EpicsValue::Enum(1));
+    let mut dmov = DbSubscription::subscribe(&db, "H:p1.DMOV").await.unwrap();
+    // Each move is finished from the record's own monitor, ahead of the
+    // program's CA one, which loses the drop most of the time.
+    for theta1 in [21.0, 22.0, 23.0, 24.0] {
+        put_process(&ioc, "H:HR1_Theta1AO", theta1).await;
+        task::timeout(Duration::from_secs(5), async {
+            while dmov.recv_f64().await.unwrap() != 0.0 {}
+        })
+        .await
+        .unwrap_or_else(|_| panic!("no move to {theta1}"));
+        finish(&db, "H:p1").await;
+    }
+}
+
 /// A drive limit put clamping theta1 is this program's own put, so theta1
 /// is not moved for it, and a tweak starts from the clamped theta1 as from
 /// C's monitored one.

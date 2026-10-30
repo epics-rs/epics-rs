@@ -144,6 +144,25 @@ assign  thetaLo to "{P}ml_monoTheta.DRVL";
 double  thetaRdbk;
 assign  thetaRdbk to "{P}ml_monoThetaRdbk";
 
+/* C defect: waitForCmndEnter cleared E_mon, lambda_mon and theta_mon,
+ * which dropped a request landing in a pass or in the enter's delay, and
+ * then asserted done for it. A request is now told from this program's
+ * own echo by value: *Last is what the PV held after this program's last
+ * put to it or take from it, read back so the AO's DRVH/DRVL clamp is in
+ * it, and done waits until each PV still holds it. */
+double  ELast;
+assign  ELast to "{P}ml_monoE";
+double  ENow;
+assign  ENow to "{P}ml_monoE";
+double  lambdaLast;
+assign  lambdaLast to "{P}ml_monoLambda";
+double  lambdaNow;
+assign  lambdaNow to "{P}ml_monoLambda";
+double  thetaLast;
+assign  thetaLast to "{P}ml_monoTheta";
+double  thetaNow;
+assign  thetaNow to "{P}ml_monoTheta";
+
 /* The following are "soft" PV's that contain motor information that is
  * either echoed to or echoed from the actual motor records. The reason
  * for these PV's is so the medm display can be independent from the
@@ -599,6 +618,11 @@ state initSequence {
 		pvPut(theta2MotName);
 		pvPut(zMotName);
 		pvPut(yMotName);
+		/* C's monitored E, lambda and theta started at the PVs' values. */
+		pvGet(ELast);
+		pvGet(lambdaLast);
+		pvGet(thetaLast);
+		theta = thetaLast;
 		initSeq = 1;
 	} state dInputChanged
 
@@ -621,21 +645,13 @@ state initSequence {
 		initSeqDone=1;
 		theta = thetaMotRdbk;
 		pvPut(theta);
+		pvGet(thetaLast);
 	} state thChanged
 }
 
 state waitForCmndEnter {
 	when (initSeqDone && delay(.1)) {
 		if (ml_monoCtlDebug) %%printf("ml_monoCtl:waitForCmndEnter:initSeqDone\n");
-		efClear(Order_mon);
-		efClear(D_mon);
-		/* C's monitored E, lambda and theta kept a request dropped here.
-		 * pvGet reads it from the PV: EReq, lambdaReq and thetaReq can
-		 * still hold the late echo of an earlier put. */
-		if (efTestAndClear(E_mon)) pvGet(E);
-		if (efTestAndClear(lambda_mon)) pvGet(lambda);
-		if (efTestAndClear(theta_mon)) pvGet(theta);
-
 		thetaMotRdbkEcho = thetaMotRdbk;
 		pvPut(thetaMotRdbkEcho);
 		theta2MotRdbkEcho = theta2MotRdbk;
@@ -677,7 +693,14 @@ state waitForCmndEnter {
 			%%printf("ml_monoCtl:waitForCmndEnter: ml_monoMoving=%d; ml_monoDone=%d\n",
 			%%	ml_monoMoving, ml_monoDone);
 		}
-		if (ml_monoMoving && ml_monoDone) {
+		/* A request still in a PV is not done; a NaN is not == itself. */
+		pvGet(ENow);
+		pvGet(lambdaNow);
+		pvGet(thetaNow);
+		if (ml_monoMoving && ml_monoDone &&
+		    (ENow == ELast || (ENow != ENow && ELast != ELast)) &&
+		    (lambdaNow == lambdaLast || (lambdaNow != lambdaNow && lambdaLast != lambdaLast)) &&
+		    (thetaNow == thetaLast || (thetaNow != thetaNow && thetaLast != thetaLast))) {
 			if (ml_monoCtlDebug) %%printf("ml_monoCtl:waitForCmndEnter: asserting 'done'.\n");
 			ml_monoMoving=0; ml_monoDone = 0;
 			pvPut(ml_monoMoving);
@@ -695,8 +718,6 @@ state waitForCmnd {
 		pvPut(seqMsg1);
 		sprintf(seqMsg2, " ");
 		pvPut(seqMsg2);
-		efClear(Order_mon);
-		efClear(D_mon);
 	} state dInputChanged
 
 	when (efTest(thetaMotHiLim_mon) || efTest(thetaMotLoLim_mon)) {
@@ -733,19 +754,27 @@ state waitForCmnd {
 		/*efSet(theta2MotRdbkPseudo_mon);*/
 	} state updateRdbk
 
-	when (efTestAndClear(E_mon)) {
+	/* An event holding *Last is this program's own echo, which the
+	 * failing value test consumes. */
+	when (efTestAndClear(E_mon) && EReq != ELast) {
 		if (ml_monoCtlDebug) %%printf("ml_monoCtl:waitForCmnd:E_mon\n");
 		E = EReq;
+		ELast = E;
+		ml_monoDone = 0;
 	} state eChanged
 
-	when (efTestAndClear(lambda_mon)) {
+	when (efTestAndClear(lambda_mon) && lambdaReq != lambdaLast) {
 		if (ml_monoCtlDebug) %%printf("ml_monoCtl:waitForCmnd:lambda_mon\n");
 		lambda = lambdaReq;
+		lambdaLast = lambda;
+		ml_monoDone = 0;
 	} state lChanged
 
-	when (efTestAndClear(theta_mon)) {
+	when (efTestAndClear(theta_mon) && thetaReq != thetaLast) {
 		if (ml_monoCtlDebug) %%printf("ml_monoCtl:waitForCmnd:theta_mon\n");
 		theta = thetaReq;
+		thetaLast = theta;
+		ml_monoDone = 0;
 	} state thChanged
 
 	when (putVals && delay(.1)) {
@@ -786,6 +815,7 @@ state tweak {
 		if ((temp>=ELo) && (temp<=EHi)) {
 			E = temp;
 			pvPut(E);
+			pvGet(ELast);
 		} else {
 			sprintf(seqMsg1, "E tweak exceeds limit");
 			pvPut(seqMsg1);
@@ -807,6 +837,7 @@ state tweak {
 		if ((temp>=lambdaLo) && (temp<=lambdaHi)) {
 			lambda = temp;
 			pvPut(lambda);
+			pvGet(lambdaLast);
 		} else {
 			sprintf(seqMsg1, "Lambda tweak exceeds limit");
 			pvPut(seqMsg1);
@@ -828,6 +859,7 @@ state tweak {
 		if ((temp>=thetaLo) && (temp<=thetaHi)) {
 			theta = temp;
 			pvPut(theta);
+			pvGet(thetaLast);
 		} else {
 			sprintf(seqMsg1, "Theta tweak exceeds limit");
 			pvPut(seqMsg1);
@@ -847,14 +879,20 @@ state tweak {
 state dInputChanged {
 	when () {
 		if (ml_monoCtlDebug) %%printf("ml_monoCtl:dInputChanged\n");
-		/* C's monitored theta already held a request that landed. */
-		if (efTest(theta_mon)) theta = thetaReq;
+		/* Cleared where Order and D are read, so a change landing after
+		 * this runs the pass again. */
+		efClear(Order_mon);
+		efClear(D_mon);
 		autoMode = 0;
 		pvPut(autoMode);
 		sprintf(seqMsg2, "Set to Manual Mode");
 		pvPut(seqMsg2);
 		TwoD = ml_monoCtl_calc2dSpacing();
 		pvPut(seqMsg1);
+		/* A drive limit put clamps the AO's VAL. *Last takes that clamp
+		 * only when no request is in the PV, so a request stays one. */
+		pvGet(lambdaNow);
+		pvGet(ENow);
 		lambdaHi = TwoD*sin(thetaHi/radConv);
 		pvPut(lambdaHi);
 		lambdaLo = TwoD*sin(thetaLo/radConv);
@@ -863,7 +901,32 @@ state dInputChanged {
 		pvPut(EHi);
 		ELo = hc/lambdaHi;
 		pvPut(ELo);
+		if (lambdaNow == lambdaLast) pvGet(lambdaLast);
+		if (ENow == ELast) pvGet(ELast);
 		pvPut(opAlert);
+	} state dInputTake
+}
+
+/* C defect: thChanged recomputed E and lambda from theta over a request
+ * already in E or lambda, which was then never moved to. A request
+ * pending at a layer spacing change is applied under the new 2d. */
+state dInputTake {
+	when (efTestAndClear(E_mon) && EReq != ELast) {
+		E = EReq;
+		ELast = E;
+		ml_monoDone = 0;
+	} state eChanged
+	when (efTestAndClear(lambda_mon) && lambdaReq != lambdaLast) {
+		lambda = lambdaReq;
+		lambdaLast = lambda;
+		ml_monoDone = 0;
+	} state lChanged
+	when (efTestAndClear(theta_mon) && thetaReq != thetaLast) {
+		theta = thetaReq;
+		thetaLast = theta;
+		ml_monoDone = 0;
+	} state thChanged
+	when () {
 	} state thChanged
 }
 
@@ -882,6 +945,10 @@ state thetaLimits {
 			sprintf(seqMsg2, "ThetaLoLim < 0.1 deg. (Using 0.1 deg.)");
 			pvPut(seqMsg2);
 		}
+		/* Read back as in dInputChanged. */
+		pvGet(thetaNow);
+		pvGet(lambdaNow);
+		pvGet(ENow);
 		pvPut(thetaHi);
 		pvPut(thetaLo);
 		lambdaHi = TwoD*sin(thetaHi/radConv);
@@ -892,6 +959,9 @@ state thetaLimits {
 		pvPut(EHi);
 		ELo = hc/lambdaHi;
 		pvPut(ELo);
+		if (thetaNow == thetaLast) pvGet(thetaLast);
+		if (lambdaNow == lambdaLast) pvGet(lambdaLast);
+		if (ENow == ELast) pvGet(ELast);
 	} state checkDone
 }
 
@@ -900,6 +970,7 @@ state eChanged {
 		if (ml_monoCtlDebug) %%printf("ml_monoCtl:eChanged\n");
 		lambda = hc/E;
 		pvPut(lambda);
+		pvGet(lambdaLast);
 	} state lChanged
 }
 
@@ -917,6 +988,7 @@ state lChanged {
 		if (ml_monoCtlDebug) %%printf("ml_monoCtl:lChanged\n");
 		theta = radConv * asin(lambda/TwoD);
 		pvPut(theta);
+		pvGet(thetaLast);
 	} state thChanged
 }
 
@@ -935,8 +1007,10 @@ state thChanged {
 		}
 		lambda = TwoD*sin(theta/radConv);
 		pvPut(lambda);
+		pvGet(lambdaLast);
 		E = hc/lambda;
 		pvPut(E);            
+		pvGet(ELast);
 
 		/* Update the readback values as well */
 		thetaRdbk = thetaMotRdbk;
@@ -1164,10 +1238,13 @@ state thetaMotStopped {
 		}
 		theta = thetaMotRdbk;
 		pvPut(theta);
+		pvGet(thetaLast);
 		lambda = TwoD*sin(theta/radConv);
 		pvPut(lambda);
+		pvGet(lambdaLast);
 		E = hc/lambda;
 		pvPut(E);  
+		pvGet(ELast);
 	} state thChanged
 }
 

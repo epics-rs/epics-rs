@@ -124,6 +124,9 @@ macro_rules! seqg_escaped {
     ($env:ident, r#"printf("kohzuCtl:busyChanged\n to Moving but unclear why");"#) => {
         printf("kohzuCtl:busyChanged\n to Moving but unclear why", &[])
     };
+    ($env:ident, r#"printf("kohzuCtl:busyChanged\n to Moving and held");"#) => {
+        printf("kohzuCtl:busyChanged\n to Moving and held", &[])
+    };
     ($env:ident, r#"printf("kohzuCtl:busyChanged\n to Done");"#) => {
         printf("kohzuCtl:busyChanged\n to Done", &[])
     };
@@ -225,7 +228,7 @@ macro_rules! seqg_escaped {
 
 epics_seq_rs::include_program!("kohzuCtl");
 
-/// `kohzuCtl_calc2dSpacing` (`kohzuCtl.st:1554-1578`), by the name the SNL
+/// `kohzuCtl_calc2dSpacing` (`kohzuCtl.st:1645-1669`), by the name the SNL
 /// code calls, on the `-r` block.
 #[allow(non_snake_case)]
 fn kohzuCtl_calc2dSpacing() -> f64 {
@@ -234,7 +237,7 @@ fn kohzuCtl_calc2dSpacing() -> f64 {
     s.store(&v.opAlert, &v.avg, &v.nint, &v.seqMsg1)
 }
 
-/// initSequence's block (`kohzuCtl.st:597-620`, `kohzuCtl_soft.st:552-575`):
+/// initSequence's block (`kohzuCtl.st:619-642`, `kohzuCtl_soft.st:571-594`):
 /// each motor is `{P}{M_x}`, or "??????" when either macro is undefined,
 /// and geom is 2 only for a GEOM whose first character is '2'.
 pub(crate) fn name_motors<V: ProgramVars>(

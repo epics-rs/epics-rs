@@ -176,6 +176,25 @@ assign  thetaLo to "{P}{MONO}Theta.LLM";
 double  thetaRdbk;
 assign  thetaRdbk to "{P}{MONO}ThetaRdbk";
 
+/* C defect: waitForCmndEnter cleared E_mon, lambda_mon and theta_mon,
+ * which dropped a request landing in a pass or in the enter's delay, and
+ * then asserted done for it. A request is now told from this program's
+ * own echo by value: *Last is what the PV held after this program's last
+ * put to it or take from it, read back so the motor record's handling of
+ * the put is in it, and done waits until each PV still holds it. */
+double  ELast;
+assign  ELast to "{P}{MONO}E";
+double  ENow;
+assign  ENow to "{P}{MONO}E";
+double  lambdaLast;
+assign  lambdaLast to "{P}{MONO}Lambda";
+double  lambdaNow;
+assign  lambdaNow to "{P}{MONO}Lambda";
+double  thetaLast;
+assign  thetaLast to "{P}{MONO}Theta";
+double  thetaNow;
+assign  thetaNow to "{P}{MONO}Theta";
+
 /* The following are "soft" PV's that contain motor information that is
  * either echoed to or echoed from the actual motor records. The reason
  * for these PV's is so the medm display can be independent from the
@@ -597,6 +616,11 @@ state initSequence {
 		pvPut(thetaMotName);
 		pvPut(yMotName);
 		pvPut(zMotName);
+		/* C's monitored E, lambda and theta started at the PVs' values. */
+		pvGet(ELast);
+		pvGet(lambdaLast);
+		pvGet(thetaLast);
+		theta = thetaLast;
 		initSeq = 1;
 	} state dInputChanged
 
@@ -619,23 +643,13 @@ state initSequence {
 		initSeqDone=1;
 		theta = thetaMotRdbk;
 		pvPut(theta);
+		pvGet(thetaLast);
 	} state thChanged
 }
 
 state waitForCmndEnter {
 	when (initSeqDone && delay(.1)) {
 		if (kohzuCtlDebug) %%printf("kohzuCtl:waitForCmndEnter:initSeqDone\n");
-		efClear(H_mon);
-		efClear(K_mon);
-		efClear(L_mon);
-		efClear(A_mon);
-		/* C's monitored E, lambda and theta kept a request dropped here.
-		 * pvGet reads it from the PV: EReq, lambdaReq and thetaReq can
-		 * still hold the late echo of an earlier put. */
-		if (efTestAndClear(E_mon)) pvGet(E);
-		if (efTestAndClear(lambda_mon)) pvGet(lambda);
-		if (efTestAndClear(theta_mon)) pvGet(theta);
-
 		thetaMotRdbkEcho = thetaMotRdbk;
 		pvPut(thetaMotRdbkEcho);
 		yMotRdbkEcho = yMotRdbk;
@@ -671,7 +685,14 @@ state waitForCmndEnter {
 		opAck = 0;
 		pvPut(opAck);
 		if (kohzuCtlDebug) %%printf("kohzuCtl:waitForCmndEnter: kohzuMoving=%d; kohzuDone=%d\n", kohzuMoving, kohzuDone);
-		if (kohzuMoving && kohzuDone) {
+		/* A request still in a PV is not done; a NaN is not == itself. */
+		pvGet(ENow);
+		pvGet(lambdaNow);
+		pvGet(thetaNow);
+		if (kohzuMoving && kohzuDone &&
+		    (ENow == ELast || (ENow != ENow && ELast != ELast)) &&
+		    (lambdaNow == lambdaLast || (lambdaNow != lambdaNow && lambdaLast != lambdaLast)) &&
+		    (thetaNow == thetaLast || (thetaNow != thetaNow && thetaLast != thetaLast))) {
 			if (kohzuCtlDebug) %%printf("kohzuCtl:waitForCmndEnter: asserting 'done'.\n");
 			kohzuMoving=0; kohzuDone = 0;
 			pvPut(kohzuMoving);
@@ -697,10 +718,6 @@ state waitForCmnd {
 		pvPut(seqMsg1);
 		sprintf(seqMsg2, " ");
 		pvPut(seqMsg2);
-		efClear(H_mon);
-		efClear(K_mon);
-		efClear(L_mon);
-		efClear(A_mon);
 	} state dInputChanged
 
 	when (efTest(thetaMotHiLim_mon) || efTest(thetaMotLoLim_mon)) {
@@ -718,19 +735,27 @@ state waitForCmnd {
 		efSet(thetaMotRdbkPseudo_mon);
 	} state updateRdbk
 
-	when (efTestAndClear(E_mon)) {
+	/* An event holding *Last is this program's own echo, which the
+	 * failing value test consumes. */
+	when (efTestAndClear(E_mon) && EReq != ELast) {
 		if (kohzuCtlDebug) %%printf("kohzuCtl:waitForCmnd:E_mon\n");
 		E = EReq;
+		ELast = E;
+		kohzuDone = 0;
 	} state eChanged
 
-	when (efTestAndClear(lambda_mon)) {
+	when (efTestAndClear(lambda_mon) && lambdaReq != lambdaLast) {
 		if (kohzuCtlDebug) %%printf("kohzuCtl:waitForCmnd:lambda_mon\n");
 		lambda = lambdaReq;
+		lambdaLast = lambda;
+		kohzuDone = 0;
 	} state lChanged
 
-	when (efTestAndClear(theta_mon)) {
+	when (efTestAndClear(theta_mon) && thetaReq != thetaLast) {
 		if (kohzuCtlDebug) %%printf("kohzuCtl:waitForCmnd:theta_mon\n");
 		theta = thetaReq;
+		thetaLast = theta;
+		kohzuDone = 0;
 	} state thChanged
 
 	when (putVals && delay(.1)) {
@@ -763,8 +788,12 @@ state waitForCmnd {
 state dInputChanged {
 	when () {
 		if (kohzuCtlDebug) %%printf("kohzuCtl:dInputChanged\n");
-		/* C's monitored theta already held a request that landed. */
-		if (efTest(theta_mon)) theta = thetaReq;
+		/* Cleared where H, K, L and A are read, so a change landing after
+		 * this runs the pass again. */
+		efClear(H_mon);
+		efClear(K_mon);
+		efClear(L_mon);
+		efClear(A_mon);
 		autoMode = 0;
 		pvPut(autoMode);
 		sprintf(seqMsg2, "Set to Manual Mode");
@@ -781,6 +810,29 @@ state dInputChanged {
 		ELo = hc/lambdaHi;
 		pvPut(ELo);
 		pvPut(opAlert);
+	} state dInputTake
+}
+
+/* C defect: thChanged recomputed E and lambda from theta over a request
+ * already in E or lambda, which was then never moved to. A request
+ * pending at a lattice change is applied under the new d spacing. */
+state dInputTake {
+	when (efTestAndClear(E_mon) && EReq != ELast) {
+		E = EReq;
+		ELast = E;
+		kohzuDone = 0;
+	} state eChanged
+	when (efTestAndClear(lambda_mon) && lambdaReq != lambdaLast) {
+		lambda = lambdaReq;
+		lambdaLast = lambda;
+		kohzuDone = 0;
+	} state lChanged
+	when (efTestAndClear(theta_mon) && thetaReq != thetaLast) {
+		theta = thetaReq;
+		thetaLast = theta;
+		kohzuDone = 0;
+	} state thChanged
+	when () {
 	} state thChanged
 }
 
@@ -817,6 +869,7 @@ state eChanged {
 		if (kohzuCtlDebug) %%printf("kohzuCtl:eChanged\n");
 		lambda = hc/E;
 		pvPut(lambda);
+		pvGet(lambdaLast);
 	} state lChanged
 }
 
@@ -834,6 +887,7 @@ state lChanged {
 		if (kohzuCtlDebug) %%printf("kohzuCtl:lChanged\n");
 		theta = radConv * asin(lambda/D);
 		pvPut(theta);
+		pvGet(thetaLast);
 	} state thChanged
 }
 
@@ -858,8 +912,10 @@ state thChanged {
 		}
 		lambda = D*sin(theta/radConv);
 		pvPut(lambda);
+		pvGet(lambdaLast);
 		E = hc/lambda;
 		pvPut(E);            
+		pvGet(ELast);
 
 		/* Update the readback values as well */
 		thetaRdbk = thetaMotRdbk;
@@ -983,10 +1039,13 @@ state moveKohzu {
 		if (willViolateLimit) {
 			E = prev_E;
 			pvPut(E);
+			pvGet(ELast);
 			theta = prev_theta;
 			pvPut(theta);
+			pvGet(thetaLast);
 			lambda = prev_lambda;
 			pvPut(lambda);
+			pvGet(lambdaLast);
 			thetaMotDesired = prev_thetaMotDesired;
 			pvPut(thetaMotDesired);
 			yMotDesired = prev_yMotDesired;
@@ -1155,10 +1214,13 @@ state thetaMotStopped {
 		}
 		theta = thetaMotRdbk;
 		pvPut(theta);
+		pvGet(thetaLast);
 		lambda = D*sin(theta/radConv);
 		pvPut(lambda);
+		pvGet(lambdaLast);
 		E = hc/lambda;
 		pvPut(E);  
+		pvGet(ELast);
 	} state thChanged
 }
 

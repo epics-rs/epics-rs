@@ -113,6 +113,9 @@ macro_rules! seqg_escaped {
     ($env:ident, r#"printf("ml_monoCtl:waitForCmnd:theta_mon\n");"#) => {
         printf("ml_monoCtl:waitForCmnd:theta_mon\n", &[])
     };
+    ($env:ident, r#"printf("ml_monoCtl:waitForCmnd:reqUntaken\n");"#) => {
+        printf("ml_monoCtl:waitForCmnd:reqUntaken\n", &[])
+    };
     ($env:ident, r#"printf("ml_monoCtl:waitForCmnd:mlMbusy\n");"#) => {
         printf("ml_monoCtl:waitForCmnd:mlMbusy\n", &[])
     };

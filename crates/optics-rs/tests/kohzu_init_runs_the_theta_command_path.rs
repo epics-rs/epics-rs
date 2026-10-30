@@ -1590,3 +1590,35 @@ async fn geom_2_0_moves_y_and_z_by_geometry_2() {
     eventually_near(&ioc, "K:KohzuYSetAO", y).await;
     eventually_near(&ioc, "K:KohzuZSetAO", z).await;
 }
+
+/// A theta request within its AO's MDEL of the posted theta posts no event,
+/// and in a manual hold raises no busy either. The enter after the hold's
+/// move takes it: the done gate saw it in the PV and withheld Done, with
+/// nothing left to wake waitForCmnd.
+#[epics_base_rs::epics_test]
+async fn a_request_with_no_event_during_a_hold_is_taken_after_its_move() {
+    let ioc = boot([10.0, -17.77, 100.78]).await;
+    ready(&ioc, "y offset changed to 17.500000").await;
+    put_process(&ioc, "K:BraggThetaAO", 20.0).await;
+    eventually_near(&ioc, "K:KohzuThetaSetAO", 20.0).await;
+    task::sleep(Duration::from_millis(300)).await;
+    ioc.get_record("K:BraggThetaAO")
+        .unwrap()
+        .write()
+        .record
+        .put_field("MDEL", EpicsValue::Double(5.0))
+        .unwrap();
+    put_process(&ioc, "K:BraggThetaAO", 22.0).await;
+    task::sleep(Duration::from_millis(300)).await;
+    assert_near(&ioc, "K:KohzuThetaSetAO", 20.0).await;
+    let z = f64_of(&ioc, "K:z.VAL").await;
+    put_process(&ioc, "K:KohzuPutBO", 1.0).await;
+    let z = z_moved(&ioc, z).await;
+    post_dmov(&ioc, true);
+    eventually_near(&ioc, "K:KohzuThetaSetAO", 22.0).await;
+    assert_near(&ioc, "K:KohzuMoving", 1.0).await;
+    put_process(&ioc, "K:KohzuPutBO", 1.0).await;
+    z_moved(&ioc, z).await;
+    post_dmov(&ioc, true);
+    eventually_near(&ioc, "K:KohzuMoving", 0.0).await;
+}

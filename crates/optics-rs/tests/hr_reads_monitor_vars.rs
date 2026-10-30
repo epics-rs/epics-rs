@@ -638,3 +638,29 @@ async fn connect_time_setting_events_are_not_changes() {
         "Theta2LoLim clipped at 0.500"
     );
 }
+
+/// A theta1 request within its AO's MDEL of the posted theta1 posts no
+/// event; one landing in a move is moved to after it, and Done waits for
+/// that move. The enter saw it in the PV and withheld Done, and with no
+/// event to wake waitForCmnd HR1_Moving stayed up.
+#[epics_base_rs::epics_test]
+async fn a_request_with_no_event_during_a_move_is_moved_to_before_done() {
+    let (ioc, _scan) = boot().await;
+    let db = PvDatabase::clone(&ioc);
+    idle(&db, "H:HR1_OperAckBO", "H:HR1_SeqMsg1SI").await;
+    post(&db, "H:HR1_ModeBO", EpicsValue::Enum(1));
+    put_process(&ioc, "H:HR1_Theta1AO", 21.0).await;
+    wait_near(&ioc, "H:p1.VAL", desired(&ioc, 21.0).await).await;
+    db.get_record("H:HR1_Theta1AO")
+        .unwrap()
+        .write()
+        .record
+        .put_field("MDEL", EpicsValue::Double(5.0))
+        .unwrap();
+    put_process(&ioc, "H:HR1_Theta1AO", 23.0).await;
+    finish(&db, "H:p1").await;
+    wait_near(&ioc, "H:p1.VAL", desired(&ioc, 23.0).await).await;
+    wait_near(&ioc, "H:HR1_Moving", 1.0).await;
+    finish(&db, "H:p1").await;
+    wait_near(&ioc, "H:HR1_Moving", 0.0).await;
+}

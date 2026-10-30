@@ -1237,3 +1237,35 @@ async fn debug_prints_c_lines() {
     post(&ioc, "M:ml_monoE", EpicsValue::Double(e * 1.01));
     task::sleep(Duration::from_millis(500)).await;
 }
+
+/// A theta request within its AO's MDEL of the posted theta posts no event,
+/// and in a manual hold raises no busy either. The enter after the hold's
+/// move takes it: the done gate saw it in the PV and withheld Done, with
+/// nothing left to wake waitForCmnd.
+#[epics_base_rs::epics_test]
+async fn a_request_with_no_event_during_a_hold_is_taken_after_its_move() {
+    let (ioc, _scan) = boot([10.0, 10.0, 35.0, 100.0]).await;
+    settled(&ioc, "y offset changed to 35.000000").await;
+    idle(&ioc, "M:ml_monoOperAck", "M:ml_monoSeqMsg1").await;
+    put_process(&ioc, "M:ml_monoTheta", 20.0).await;
+    wait_near(&ioc, "M:ml_monoThetaSet", 20.0).await;
+    task::sleep(Duration::from_millis(300)).await;
+    ioc.get_record("M:ml_monoTheta")
+        .unwrap()
+        .write()
+        .record
+        .put_field("MDEL", EpicsValue::Double(5.0))
+        .unwrap();
+    put_process(&ioc, "M:ml_monoTheta", 22.0).await;
+    task::sleep(Duration::from_millis(300)).await;
+    assert_eq!(f64_of(&ioc, "M:ml_monoThetaSet").await, 20.0);
+    put_process(&ioc, "M:ml_monoPut", 1.0).await;
+    wait_near(&ioc, "M:z.VAL", z_of(20.0)).await;
+    post_dmov(&ioc, true);
+    wait_near(&ioc, "M:ml_monoThetaSet", 22.0).await;
+    assert_eq!(f64_of(&ioc, "M:ml_monoMoving").await, 1.0);
+    put_process(&ioc, "M:ml_monoPut", 1.0).await;
+    wait_near(&ioc, "M:z.VAL", z_of(22.0)).await;
+    post_dmov(&ioc, true);
+    wait_near(&ioc, "M:ml_monoMoving", 0.0).await;
+}

@@ -530,6 +530,9 @@ double  theta2Last;
 assign  theta2Last to "{P}HR{N}_Theta2AO";
 double  theta2Now;
 assign  theta2Now to "{P}HR{N}_Theta2AO";
+/* Set where the enter finds a request in a PV that no take has read since:
+ * a put within its AO's MDEL posts no event to wake waitForCmnd. */
+short   reqUntaken;
 double  phi1OffLast;
 assign  phi1OffLast to "{P}HR{N}_phi1OffAO";
 double  phi2OffLast;
@@ -747,9 +750,9 @@ ss hr_Ctl
 			pvGet(theta1Now);
 			pvGet(theta2Now);
 			pvGet(hr_MovingNow);
-			if (hr_MovingNow && hr_Done &&
-			    SAME(ENow, ELast) && SAME(lambdaNow, lambdaLast) &&
-			    SAME(theta1Now, theta1Last) && SAME(theta2Now, theta2Last)) {
+			reqUntaken = !SAME(ENow, ELast) || !SAME(lambdaNow, lambdaLast) ||
+			    !SAME(theta1Now, theta1Last) || !SAME(theta2Now, theta2Last);
+			if (hr_MovingNow && hr_Done && !reqUntaken) {
 				if (hrCtlDebug) %%printf("hrCtl:waitForCmndEnter: asserting 'done'.\n");
 				hr_Moving=0; hr_Done = 0;
 				pvPut(hr_Moving);
@@ -804,6 +807,10 @@ ss hr_Ctl
 		when ((efTestAndClear(theta1_mon) && !SAME(theta1Req, theta1Last)) ||
 				(efTestAndClear(theta2_mon) && !SAME(theta2Req, theta2Last))) {
 			if (hrCtlDebug) %%printf("hrCtl:waitForCmd: theta*_mon\n");
+		} state reqTake
+
+		when (reqUntaken) {
+			if (hrCtlDebug) %%printf("hrCtl:waitForCmd: reqUntaken\n");
 		} state reqTake
 
 		when (efTestAndClear(worldOff_mon) && !SAME(worldOff, worldOffLast)) {
@@ -922,6 +929,7 @@ ss hr_Ctl
 	 * put's readback, so the take reads the PV. */
 	state reqTake {
 		entry {
+			reqUntaken = 0;
 			pvGet(ENow);
 			pvGet(lambdaNow);
 			pvGet(theta1Now);

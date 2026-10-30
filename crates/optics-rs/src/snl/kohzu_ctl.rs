@@ -74,6 +74,9 @@ macro_rules! seqg_escaped {
     ($env:ident, r#"printf("kohzuCtl:waitForCmnd:theta_mon\n");"#) => {
         printf("kohzuCtl:waitForCmnd:theta_mon\n", &[])
     };
+    ($env:ident, r#"printf("kohzuCtl:waitForCmnd:reqUntaken\n");"#) => {
+        printf("kohzuCtl:waitForCmnd:reqUntaken\n", &[])
+    };
     ($env:ident, r#"printf("kohzuCtl:waitForCmnd:kMbusy\n");"#) => {
         printf("kohzuCtl:waitForCmnd:kMbusy\n", &[])
     };

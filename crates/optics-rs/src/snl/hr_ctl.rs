@@ -179,6 +179,9 @@ macro_rules! seqg_escaped {
     ($env:ident, r#"printf("hrCtl:waitForCmd: theta*_mon\n");"#) => {
         printf("hrCtl:waitForCmd: theta*_mon\n", &[])
     };
+    ($env:ident, r#"printf("hrCtl:waitForCmd: reqUntaken\n");"#) => {
+        printf("hrCtl:waitForCmd: reqUntaken\n", &[])
+    };
     ($env:ident, r#"printf("hrCtl:waitForCmd: worldOff_mon\n");"#) => {
         printf("hrCtl:waitForCmd: worldOff_mon\n", &[])
     };

@@ -212,6 +212,9 @@ double  thetaLast;
 assign  thetaLast to "{P}BraggThetaAO";
 double  thetaNow;
 assign  thetaNow to "{P}BraggThetaAO";
+/* Set where the enter finds a request in a PV that no take has read since:
+ * a put within its AO's MDEL posts no event to wake waitForCmnd. */
+short   reqUntaken;
 
 /* The following are "soft" PV's that contain motor information that is
  * either echoed to or echoed from the actual motor records. The reason
@@ -754,8 +757,9 @@ state waitForCmndEnter {
 		pvGet(lambdaNow);
 		pvGet(thetaNow);
 		pvGet(kohzuMovingNow);
-		if (kohzuMovingNow && kohzuDone && SAME(ENow, ELast) &&
-		    SAME(lambdaNow, lambdaLast) && SAME(thetaNow, thetaLast)) {
+		reqUntaken = !SAME(ENow, ELast) || !SAME(lambdaNow, lambdaLast) ||
+		    !SAME(thetaNow, thetaLast);
+		if (kohzuMovingNow && kohzuDone && !reqUntaken) {
 			if (kohzuCtlDebug) %%printf("kohzuCtl:waitForCmndEnter: asserting 'done'.\n");
 			kohzuMoving=0; kohzuDone = 0; kohzuHeld = 0;
 			pvPut(kohzuMoving);
@@ -812,6 +816,10 @@ state waitForCmnd {
 		if (kohzuCtlDebug) %%printf("kohzuCtl:waitForCmnd:theta_mon\n");
 	} state reqTake
 
+	when (reqUntaken) {
+		if (kohzuCtlDebug) %%printf("kohzuCtl:waitForCmnd:reqUntaken\n");
+	} state reqTake
+
 	when (efTestAndClear(kMbusy)) {
 		if (kohzuCtlDebug) %%printf("kohzuCtl:waitForCmnd:kMbusy\n");
 	} state busyChanged
@@ -851,6 +859,7 @@ state waitForCmnd {
  * longer holds, as an own put's echo landing after a later put does. */
 state reqTake {
 	entry {
+		reqUntaken = 0;
 		pvGet(ENow);
 		pvGet(lambdaNow);
 		pvGet(thetaNow);

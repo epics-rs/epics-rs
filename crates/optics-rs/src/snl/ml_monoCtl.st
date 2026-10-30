@@ -175,6 +175,9 @@ double  thetaLast;
 assign  thetaLast to "{P}ml_monoTheta";
 double  thetaNow;
 assign  thetaNow to "{P}ml_monoTheta";
+/* Set where the enter finds a request in a PV that no take has read since:
+ * a put within its AO's MDEL posts no event to wake waitForCmnd. */
+short   reqUntaken;
 
 /* The following are "soft" PV's that contain motor information that is
  * either echoed to or echoed from the actual motor records. The reason
@@ -719,8 +722,9 @@ state waitForCmndEnter {
 		pvGet(lambdaNow);
 		pvGet(thetaNow);
 		pvGet(ml_monoMovingNow);
-		if (ml_monoMovingNow && ml_monoDone && SAME(ENow, ELast) &&
-		    SAME(lambdaNow, lambdaLast) && SAME(thetaNow, thetaLast)) {
+		reqUntaken = !SAME(ENow, ELast) || !SAME(lambdaNow, lambdaLast) ||
+		    !SAME(thetaNow, thetaLast);
+		if (ml_monoMovingNow && ml_monoDone && !reqUntaken) {
 			if (ml_monoCtlDebug) %%printf("ml_monoCtl:waitForCmndEnter: asserting 'done'.\n");
 			ml_monoMoving=0; ml_monoDone = 0; ml_monoHeld = 0;
 			pvPut(ml_monoMoving);
@@ -788,6 +792,10 @@ state waitForCmnd {
 		if (ml_monoCtlDebug) %%printf("ml_monoCtl:waitForCmnd:theta_mon\n");
 	} state reqTake
 
+	when (reqUntaken) {
+		if (ml_monoCtlDebug) %%printf("ml_monoCtl:waitForCmnd:reqUntaken\n");
+	} state reqTake
+
 	when (efTestAndClear(mlMbusy)) {
 		if (ml_monoCtlDebug) %%printf("ml_monoCtl:waitForCmnd:mlMbusy\n");
 	} state busyChanged
@@ -827,6 +835,7 @@ state waitForCmnd {
  * longer holds, as an own put's echo landing after a later put does. */
 state reqTake {
 	entry {
+		reqUntaken = 0;
 		pvGet(ENow);
 		pvGet(lambdaNow);
 		pvGet(thetaNow);

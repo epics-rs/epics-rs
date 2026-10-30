@@ -22,6 +22,9 @@ program ml_monoCtl  ("P=xxx:, M_THETA=m9, M_THETA2=m12, M_Y=m10, M_Z=m11, Y_OFF=
  * 03-12-09 tmm   Adapted from kohzuCtl.st for multilayer monochromator
  */
 
+/* A NaN is not == itself. */
+#define SAME(a,b) ((a)==(b) || ((a)!=(a) && (b)!=(b)))
+
 /* General Purpose PV's used by sequence */
 short ml_monoCtlDebug;
 assign  ml_monoCtlDebug to "{P}ml_monoCtlDebug"; 
@@ -693,14 +696,12 @@ state waitForCmndEnter {
 			%%printf("ml_monoCtl:waitForCmndEnter: ml_monoMoving=%d; ml_monoDone=%d\n",
 			%%	ml_monoMoving, ml_monoDone);
 		}
-		/* A request still in a PV is not done; a NaN is not == itself. */
+		/* A request still in a PV is not done. */
 		pvGet(ENow);
 		pvGet(lambdaNow);
 		pvGet(thetaNow);
-		if (ml_monoMoving && ml_monoDone &&
-		    (ENow == ELast || (ENow != ENow && ELast != ELast)) &&
-		    (lambdaNow == lambdaLast || (lambdaNow != lambdaNow && lambdaLast != lambdaLast)) &&
-		    (thetaNow == thetaLast || (thetaNow != thetaNow && thetaLast != thetaLast))) {
+		if (ml_monoMoving && ml_monoDone && SAME(ENow, ELast) &&
+		    SAME(lambdaNow, lambdaLast) && SAME(thetaNow, thetaLast)) {
 			if (ml_monoCtlDebug) %%printf("ml_monoCtl:waitForCmndEnter: asserting 'done'.\n");
 			ml_monoMoving=0; ml_monoDone = 0;
 			pvPut(ml_monoMoving);
@@ -756,21 +757,21 @@ state waitForCmnd {
 
 	/* An event holding *Last is this program's own echo, which the
 	 * failing value test consumes. */
-	when (efTestAndClear(E_mon) && EReq != ELast) {
+	when (efTestAndClear(E_mon) && !SAME(EReq, ELast)) {
 		if (ml_monoCtlDebug) %%printf("ml_monoCtl:waitForCmnd:E_mon\n");
 		E = EReq;
 		ELast = E;
 		ml_monoDone = 0;
 	} state eChanged
 
-	when (efTestAndClear(lambda_mon) && lambdaReq != lambdaLast) {
+	when (efTestAndClear(lambda_mon) && !SAME(lambdaReq, lambdaLast)) {
 		if (ml_monoCtlDebug) %%printf("ml_monoCtl:waitForCmnd:lambda_mon\n");
 		lambda = lambdaReq;
 		lambdaLast = lambda;
 		ml_monoDone = 0;
 	} state lChanged
 
-	when (efTestAndClear(theta_mon) && thetaReq != thetaLast) {
+	when (efTestAndClear(theta_mon) && !SAME(thetaReq, thetaLast)) {
 		if (ml_monoCtlDebug) %%printf("ml_monoCtl:waitForCmnd:theta_mon\n");
 		theta = thetaReq;
 		thetaLast = theta;
@@ -901,8 +902,8 @@ state dInputChanged {
 		pvPut(EHi);
 		ELo = hc/lambdaHi;
 		pvPut(ELo);
-		if (lambdaNow == lambdaLast) pvGet(lambdaLast);
-		if (ENow == ELast) pvGet(ELast);
+		if (SAME(lambdaNow, lambdaLast)) pvGet(lambdaLast);
+		if (SAME(ENow, ELast)) pvGet(ELast);
 		pvPut(opAlert);
 	} state dInputTake
 }
@@ -911,17 +912,17 @@ state dInputChanged {
  * already in E or lambda, which was then never moved to. A request
  * pending at a layer spacing change is applied under the new 2d. */
 state dInputTake {
-	when (efTestAndClear(E_mon) && EReq != ELast) {
+	when (efTestAndClear(E_mon) && !SAME(EReq, ELast)) {
 		E = EReq;
 		ELast = E;
 		ml_monoDone = 0;
 	} state eChanged
-	when (efTestAndClear(lambda_mon) && lambdaReq != lambdaLast) {
+	when (efTestAndClear(lambda_mon) && !SAME(lambdaReq, lambdaLast)) {
 		lambda = lambdaReq;
 		lambdaLast = lambda;
 		ml_monoDone = 0;
 	} state lChanged
-	when (efTestAndClear(theta_mon) && thetaReq != thetaLast) {
+	when (efTestAndClear(theta_mon) && !SAME(thetaReq, thetaLast)) {
 		theta = thetaReq;
 		thetaLast = theta;
 		ml_monoDone = 0;
@@ -959,9 +960,9 @@ state thetaLimits {
 		pvPut(EHi);
 		ELo = hc/lambdaHi;
 		pvPut(ELo);
-		if (thetaNow == thetaLast) pvGet(thetaLast);
-		if (lambdaNow == lambdaLast) pvGet(lambdaLast);
-		if (ENow == ELast) pvGet(ELast);
+		if (SAME(thetaNow, thetaLast)) pvGet(thetaLast);
+		if (SAME(lambdaNow, lambdaLast)) pvGet(lambdaLast);
+		if (SAME(ENow, ELast)) pvGet(ELast);
 	} state checkDone
 }
 

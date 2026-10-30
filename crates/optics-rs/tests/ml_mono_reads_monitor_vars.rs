@@ -953,6 +953,30 @@ async fn a_drive_limit_clamp_is_not_a_request() {
     );
 }
 
+/// A NaN request is done after its move though NaN != NaN, and its own
+/// echo is no request.
+#[epics_base_rs::epics_test]
+async fn a_nan_request_is_taken_once() {
+    let (ioc, _scan) = boot([10.0, 10.0, 35.0, 100.0]).await;
+    settled(&ioc, "y offset changed to 35.000000").await;
+    put_process(&ioc, "M:ml_monoTheta", f64::NAN).await;
+    for _ in 0..100 {
+        if f64_of(&ioc, "M:ml_monoThetaSet").await.is_nan() {
+            break;
+        }
+        task::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(f64_of(&ioc, "M:ml_monoThetaSet").await.is_nan());
+    assert_eq!(f64_of(&ioc, "M:ml_monoMoving").await, 1.0);
+    put_process(&ioc, "M:ml_monoPut", 1.0).await;
+    task::sleep(Duration::from_millis(300)).await;
+    post_dmov(&ioc, true);
+    wait_near(&ioc, "M:ml_monoMoving", 0.0).await;
+    idle(&ioc, "M:ml_monoOperAck", "M:ml_monoSeqMsg1").await;
+    put_process(&ioc, "M:ml_monoTheta", 20.0).await;
+    wait_near(&ioc, "M:ml_monoThetaSet", 20.0).await;
+}
+
 const CHILD: &str = "ML_MONO_CTL_DEBUG_CHILD";
 
 /// `test` run again in a child whose stdout is not captured, and the

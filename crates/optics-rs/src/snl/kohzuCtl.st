@@ -45,6 +45,9 @@ program kohzuCtl  ("P=nda, M_THETA=m9, M_Y=m10, M_Z=m11, GEOM=1")
  *                of the control hadn't changed so busy would never be unset.
  */
 
+/* A NaN is not == itself. */
+#define SAME(a,b) ((a)==(b) || ((a)!=(a) && (b)!=(b)))
+
 /* General Purpose PV's used by sequence */
 short kohzuCtlDebug;
 assign  kohzuCtlDebug to "{P}KohzuCtlDebug"; 
@@ -733,14 +736,12 @@ state waitForCmndEnter {
 		opAck = 0;
 		pvPut(opAck);
 		if (kohzuCtlDebug) %%printf("kohzuCtl:waitForCmndEnter: kohzuMoving=%d; kohzuDone=%d\n", kohzuMoving, kohzuDone);
-		/* A request still in a PV is not done; a NaN is not == itself. */
+		/* A request still in a PV is not done. */
 		pvGet(ENow);
 		pvGet(lambdaNow);
 		pvGet(thetaNow);
-		if (kohzuMoving && kohzuDone &&
-		    (ENow == ELast || (ENow != ENow && ELast != ELast)) &&
-		    (lambdaNow == lambdaLast || (lambdaNow != lambdaNow && lambdaLast != lambdaLast)) &&
-		    (thetaNow == thetaLast || (thetaNow != thetaNow && thetaLast != thetaLast))) {
+		if (kohzuMoving && kohzuDone && SAME(ENow, ELast) &&
+		    SAME(lambdaNow, lambdaLast) && SAME(thetaNow, thetaLast)) {
 			if (kohzuCtlDebug) %%printf("kohzuCtl:waitForCmndEnter: asserting 'done'.\n");
 			kohzuMoving=0; kohzuDone = 0; kohzuHeld = 0;
 			pvPut(kohzuMoving);
@@ -785,21 +786,21 @@ state waitForCmnd {
 
 	/* An event holding *Last is this program's own echo, which the
 	 * failing value test consumes. */
-	when (efTestAndClear(E_mon) && EReq != ELast) {
+	when (efTestAndClear(E_mon) && !SAME(EReq, ELast)) {
 		if (kohzuCtlDebug) %%printf("kohzuCtl:waitForCmnd:E_mon\n");
 		E = EReq;
 		ELast = E;
 		kohzuDone = 0;
 	} state eChanged
 
-	when (efTestAndClear(lambda_mon) && lambdaReq != lambdaLast) {
+	when (efTestAndClear(lambda_mon) && !SAME(lambdaReq, lambdaLast)) {
 		if (kohzuCtlDebug) %%printf("kohzuCtl:waitForCmnd:lambda_mon\n");
 		lambda = lambdaReq;
 		lambdaLast = lambda;
 		kohzuDone = 0;
 	} state lChanged
 
-	when (efTestAndClear(theta_mon) && thetaReq != thetaLast) {
+	when (efTestAndClear(theta_mon) && !SAME(thetaReq, thetaLast)) {
 		if (kohzuCtlDebug) %%printf("kohzuCtl:waitForCmnd:theta_mon\n");
 		theta = thetaReq;
 		thetaLast = theta;
@@ -937,8 +938,8 @@ state dInputChanged {
 		pvPut(EHi);
 		ELo = hc/lambdaHi;
 		pvPut(ELo);
-		if (lambdaNow == lambdaLast) pvGet(lambdaLast);
-		if (ENow == ELast) pvGet(ELast);
+		if (SAME(lambdaNow, lambdaLast)) pvGet(lambdaLast);
+		if (SAME(ENow, ELast)) pvGet(ELast);
 		pvPut(opAlert);
 	} state dInputTake
 }
@@ -947,17 +948,17 @@ state dInputChanged {
  * already in E or lambda, which was then never moved to. A request
  * pending at a lattice change is applied under the new d spacing. */
 state dInputTake {
-	when (efTestAndClear(E_mon) && EReq != ELast) {
+	when (efTestAndClear(E_mon) && !SAME(EReq, ELast)) {
 		E = EReq;
 		ELast = E;
 		kohzuDone = 0;
 	} state eChanged
-	when (efTestAndClear(lambda_mon) && lambdaReq != lambdaLast) {
+	when (efTestAndClear(lambda_mon) && !SAME(lambdaReq, lambdaLast)) {
 		lambda = lambdaReq;
 		lambdaLast = lambda;
 		kohzuDone = 0;
 	} state lChanged
-	when (efTestAndClear(theta_mon) && thetaReq != thetaLast) {
+	when (efTestAndClear(theta_mon) && !SAME(thetaReq, thetaLast)) {
 		theta = thetaReq;
 		thetaLast = theta;
 		kohzuDone = 0;
@@ -995,9 +996,9 @@ state thetaLimits {
 		pvPut(EHi);
 		ELo = hc/lambdaHi;
 		pvPut(ELo);
-		if (thetaNow == thetaLast) pvGet(thetaLast);
-		if (lambdaNow == lambdaLast) pvGet(lambdaLast);
-		if (ENow == ELast) pvGet(ELast);
+		if (SAME(thetaNow, thetaLast)) pvGet(thetaLast);
+		if (SAME(lambdaNow, lambdaLast)) pvGet(lambdaLast);
+		if (SAME(ENow, ELast)) pvGet(ELast);
 	} state checkDone
 }
 
@@ -1006,19 +1007,19 @@ state thetaLimits {
  * to -1) but the Busy PV does get activated. A SNL evflag has been added
  * for the busy and the following state added to handle this situation.       */
 state busyChanged {
-	when (kohzuMoving > 0 && efTestAndClear(E_mon) && EReq != ELast) {
+	when (kohzuMoving > 0 && efTestAndClear(E_mon) && !SAME(EReq, ELast)) {
 		if (kohzuCtlDebug) %%printf("kohzuCtl:busyChanged\n to Moving and E changed");
 		E = EReq;
 		ELast = E;
 		kohzuDone = 0;
 	} state eChanged
-	when (kohzuMoving > 0 && efTestAndClear(lambda_mon) && lambdaReq != lambdaLast) {
+	when (kohzuMoving > 0 && efTestAndClear(lambda_mon) && !SAME(lambdaReq, lambdaLast)) {
 		if (kohzuCtlDebug) %%printf("kohzuCtl:busyChanged\n to Moving and lambda changed");
 		lambda = lambdaReq;
 		lambdaLast = lambda;
 		kohzuDone = 0;
 	} state lChanged
-	when (kohzuMoving > 0 && efTestAndClear(theta_mon) && thetaReq != thetaLast) {
+	when (kohzuMoving > 0 && efTestAndClear(theta_mon) && !SAME(thetaReq, thetaLast)) {
 		if (kohzuCtlDebug) %%printf("kohzuCtl:busyChanged\n to Moving and theta changed");
 		theta = thetaReq;
 		thetaLast = theta;

@@ -1253,6 +1253,32 @@ async fn an_e_request_pending_at_a_lattice_change_takes_the_new_2d() {
     assert_near(&ioc, "K:KohzuMoving", 1.0).await;
 }
 
+/// A NaN request is done after its move though NaN != NaN, and its own
+/// echo is no request.
+#[epics_base_rs::epics_test]
+async fn a_nan_request_is_taken_once() {
+    let ioc = boot([10.0, -17.77, 100.78]).await;
+    ready(&ioc, "y offset changed to 17.500000").await;
+    put_process(&ioc, "K:BraggThetaAO", f64::NAN).await;
+    eventually(|| async {
+        let v = f64_of(&ioc, "K:KohzuThetaSetAO").await;
+        if v.is_nan() {
+            Ok(())
+        } else {
+            Err(format!("KohzuThetaSetAO {v}"))
+        }
+    })
+    .await;
+    assert_near(&ioc, "K:KohzuMoving", 1.0).await;
+    put_process(&ioc, "K:KohzuPutBO", 1.0).await;
+    task::sleep(Duration::from_millis(300)).await;
+    post_dmov(&ioc, true);
+    eventually_near(&ioc, "K:KohzuMoving", 0.0).await;
+    idle(&ioc, "K:KohzuOperAckBO", "K:KohzuSeqMsg1SI").await;
+    put_process(&ioc, "K:BraggThetaAO", 20.0).await;
+    eventually_near(&ioc, "K:KohzuThetaSetAO", 20.0).await;
+}
+
 const CHILD: &str = "KOHZU_CTL_DEBUG_CHILD";
 
 /// `test` run again in a child whose stdout is not captured, and the

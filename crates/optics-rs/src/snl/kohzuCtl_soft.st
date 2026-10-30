@@ -41,6 +41,9 @@ program kohzuCtl_soft("P=xxx:, MONO=Kohzu1:, M_THETA=m9, M_Y=m10, M_Z=m11, GEOM=
  *                the other ss.
  */
 
+/* A NaN is not == itself. */
+#define SAME(a,b) ((a)==(b) || ((a)!=(a) && (b)!=(b)))
+
 /* General Purpose PV's used by sequence */
 short kohzuCtlDebug;
 assign  kohzuCtlDebug to "{P}{MONO}CtlDebug"; 
@@ -685,14 +688,12 @@ state waitForCmndEnter {
 		opAck = 0;
 		pvPut(opAck);
 		if (kohzuCtlDebug) %%printf("kohzuCtl:waitForCmndEnter: kohzuMoving=%d; kohzuDone=%d\n", kohzuMoving, kohzuDone);
-		/* A request still in a PV is not done; a NaN is not == itself. */
+		/* A request still in a PV is not done. */
 		pvGet(ENow);
 		pvGet(lambdaNow);
 		pvGet(thetaNow);
-		if (kohzuMoving && kohzuDone &&
-		    (ENow == ELast || (ENow != ENow && ELast != ELast)) &&
-		    (lambdaNow == lambdaLast || (lambdaNow != lambdaNow && lambdaLast != lambdaLast)) &&
-		    (thetaNow == thetaLast || (thetaNow != thetaNow && thetaLast != thetaLast))) {
+		if (kohzuMoving && kohzuDone && SAME(ENow, ELast) &&
+		    SAME(lambdaNow, lambdaLast) && SAME(thetaNow, thetaLast)) {
 			if (kohzuCtlDebug) %%printf("kohzuCtl:waitForCmndEnter: asserting 'done'.\n");
 			kohzuMoving=0; kohzuDone = 0;
 			pvPut(kohzuMoving);
@@ -737,21 +738,21 @@ state waitForCmnd {
 
 	/* An event holding *Last is this program's own echo, which the
 	 * failing value test consumes. */
-	when (efTestAndClear(E_mon) && EReq != ELast) {
+	when (efTestAndClear(E_mon) && !SAME(EReq, ELast)) {
 		if (kohzuCtlDebug) %%printf("kohzuCtl:waitForCmnd:E_mon\n");
 		E = EReq;
 		ELast = E;
 		kohzuDone = 0;
 	} state eChanged
 
-	when (efTestAndClear(lambda_mon) && lambdaReq != lambdaLast) {
+	when (efTestAndClear(lambda_mon) && !SAME(lambdaReq, lambdaLast)) {
 		if (kohzuCtlDebug) %%printf("kohzuCtl:waitForCmnd:lambda_mon\n");
 		lambda = lambdaReq;
 		lambdaLast = lambda;
 		kohzuDone = 0;
 	} state lChanged
 
-	when (efTestAndClear(theta_mon) && thetaReq != thetaLast) {
+	when (efTestAndClear(theta_mon) && !SAME(thetaReq, thetaLast)) {
 		if (kohzuCtlDebug) %%printf("kohzuCtl:waitForCmnd:theta_mon\n");
 		theta = thetaReq;
 		thetaLast = theta;
@@ -817,17 +818,17 @@ state dInputChanged {
  * already in E or lambda, which was then never moved to. A request
  * pending at a lattice change is applied under the new d spacing. */
 state dInputTake {
-	when (efTestAndClear(E_mon) && EReq != ELast) {
+	when (efTestAndClear(E_mon) && !SAME(EReq, ELast)) {
 		E = EReq;
 		ELast = E;
 		kohzuDone = 0;
 	} state eChanged
-	when (efTestAndClear(lambda_mon) && lambdaReq != lambdaLast) {
+	when (efTestAndClear(lambda_mon) && !SAME(lambdaReq, lambdaLast)) {
 		lambda = lambdaReq;
 		lambdaLast = lambda;
 		kohzuDone = 0;
 	} state lChanged
-	when (efTestAndClear(theta_mon) && thetaReq != thetaLast) {
+	when (efTestAndClear(theta_mon) && !SAME(thetaReq, thetaLast)) {
 		theta = thetaReq;
 		thetaLast = theta;
 		kohzuDone = 0;

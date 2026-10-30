@@ -38,6 +38,8 @@ option +r;
 
 #define MAX(a,b) ((a)>(b)?(a):(b))
 #define MIN(a,b) ((a)<(b)?(a):(b))
+/* A NaN is not == itself. */
+#define SAME(a,b) ((a)==(b) || ((a)!=(a) && (b)!=(b)))
 
 /* General Purpose PV's used by sequence */
 short hrCtlDebug;
@@ -142,11 +144,19 @@ double  D2;
 assign  D2 to "{P}HR{N}_2d2AO";
 
 /* E (energy) and Lambda (wavelength) */
+/* C defect: monitored E, lambda, theta1 and theta2 themselves, so an
+ * event landing between a pass's assign and its put, such as the clamp
+ * phiLimits' DRVH/DRVL puts post, was put as the pass's value. Requests
+ * land in EReq, lambdaReq, theta1Req and theta2Req, which the request
+ * arms take. */
 double  E;
 assign  E to "{P}HR{N}_EAO";
-monitor E;
+
+double  EReq;
+assign  EReq to "{P}HR{N}_EAO";
+monitor EReq;
 evflag  E_mon;
-sync    E E_mon;
+sync    EReq E_mon;
 
 double  EHi;
 assign  EHi to "{P}HR{N}_EAO.DRVH";
@@ -160,9 +170,12 @@ assign  ERdbk to "{P}HR{N}_ERdbkAO";
 double  lambda;
 double  lambdaNom;
 assign  lambda to "{P}HR{N}_LambdaAO";
-monitor lambda;
+
+double  lambdaReq;
+assign  lambdaReq to "{P}HR{N}_LambdaAO";
+monitor lambdaReq;
 evflag  lambda_mon;
-sync    lambda lambda_mon;
+sync    lambdaReq lambda_mon;
 
 double  lambdaHi;
 assign  lambdaHi to "{P}HR{N}_LambdaAO.DRVH";
@@ -176,9 +189,12 @@ assign  lambdaRdbk to "{P}HR{N}_LambdaRdbkAO";
 /* theta 1 (angle between beam and crystal planes) */
 double  theta1;
 assign  theta1 to "{P}HR{N}_Theta1AO";
-monitor theta1;
+
+double  theta1Req;
+assign  theta1Req to "{P}HR{N}_Theta1AO";
+monitor theta1Req;
 evflag  theta1_mon;
-sync    theta1 theta1_mon;
+sync    theta1Req theta1_mon;
 
 double  theta1Hi;
 assign  theta1Hi to "{P}HR{N}_Theta1AO.DRVH";
@@ -214,9 +230,12 @@ assign  phi1Rdbk to "{P}HR{N}_phi1RdbkAO";
 /* theta 2 (angle between beam and crystal planes) */
 double  theta2;
 assign  theta2 to "{P}HR{N}_Theta2AO";
-monitor theta2;
+
+double  theta2Req;
+assign  theta2Req to "{P}HR{N}_Theta2AO";
+monitor theta2Req;
 evflag  theta2_mon;
-sync    theta2 theta2_mon;
+sync    theta2Req theta2_mon;
 
 double  theta2Nom;
 
@@ -485,6 +504,42 @@ double  thetaMax;
 assign  thetaMax to "{P}HR{N}_thetaMax";
 monitor thetaMax;
 
+/* C defect: waitForCmndEnter cleared every request's and setting's event
+ * flag, which dropped one landing in a move or in the enter's delay, and
+ * then asserted done for a dropped request. An event is now told from
+ * this program's own echo by value: *Last is what the PV held after this
+ * program's last put to it or take from it, read back so an AO's
+ * DRVH/DRVL clamp is in it, and done waits until each busy-raising PV
+ * still holds it. */
+double  ELast;
+assign  ELast to "{P}HR{N}_EAO";
+double  ENow;
+assign  ENow to "{P}HR{N}_EAO";
+double  lambdaLast;
+assign  lambdaLast to "{P}HR{N}_LambdaAO";
+double  lambdaNow;
+assign  lambdaNow to "{P}HR{N}_LambdaAO";
+double  theta1Last;
+assign  theta1Last to "{P}HR{N}_Theta1AO";
+double  theta1Now;
+assign  theta1Now to "{P}HR{N}_Theta1AO";
+double  theta2Last;
+assign  theta2Last to "{P}HR{N}_Theta2AO";
+double  theta2Now;
+assign  theta2Now to "{P}HR{N}_Theta2AO";
+double  phi1OffLast;
+assign  phi1OffLast to "{P}HR{N}_phi1OffAO";
+double  phi2OffLast;
+assign  phi2OffLast to "{P}HR{N}_phi2OffAO";
+double  worldOffLast;
+assign  worldOffLast to "{P}HR{N}_worldOffAO";
+short   opModeLast;
+assign  opModeLast to "{P}HR{N}_Mode2MO";
+short   GeomLast;
+assign  GeomLast to "{P}HR{N}_GeomMO";
+short   useSetModeLast;
+assign  useSetModeLast to "{P}HR{N}_UseSetBO";
+
 
 %%#include <string.h>
 %%#include <math.h>
@@ -536,6 +591,20 @@ ss hr_Ctl
 			pvPut(autoMode);
 			opAck = 0;
 			pvPut(opAck);
+			pvGet(ELast);
+			E = ELast;
+			pvGet(lambdaLast);
+			lambda = lambdaLast;
+			pvGet(theta1Last);
+			theta1 = theta1Last;
+			pvGet(theta2Last);
+			theta2 = theta2Last;
+			pvGet(phi1OffLast);
+			pvGet(phi2OffLast);
+			pvGet(worldOffLast);
+			pvGet(opModeLast);
+			pvGet(GeomLast);
+			pvGet(useSetModeLast);
 			/* C defect: strcpy and strcat wrote P and M_PHI* unbounded into
 			 * the 40-byte names, past them when the two exceed 39 chars. */
 			/* C defect: hrCtl_pmacP and hrCtl_pmacM were statics shared by all
@@ -586,6 +655,7 @@ ss hr_Ctl
 			pvPut(phi1);
 			theta1 = phi1;
 			pvPut(theta1);
+			pvGet(theta1Last);
 			if (Geom == 0) {
 				phi2 = phi2MotRdbk * uR2D + phi2Off + worldOff*uR2D;
 				theta2 = phi2 - phi1 - theta1;
@@ -596,34 +666,23 @@ ss hr_Ctl
 			if (hrCtlDebug) %%printf("hrCtl:initSequence: opMode=%d, Geom=%d, phi2=%f\n", pVar->opMode, pVar->Geom, pVar->phi2);
 			pvPut(phi2);
 			pvPut(theta2);
+			pvGet(theta2Last);
 		} state thChanged
 	}
 
 	state waitForCmndEnter {
 		entry {
 			if (hrCtlDebug) %%printf("hrCtl:waitForCmndEnter: entry\n");
+			/* Between passes a working value is what its PV held after this
+			 * program's last put or take, clamp included, as C's monitored
+			 * one was. */
+			E = ELast;
+			lambda = lambdaLast;
+			theta1 = theta1Last;
+			theta2 = theta2Last;
 		}
 		when (initSeqDone && delay(.1)) {
 			if (hrCtlDebug) %%printf("hrCtl:waitForCmdEnter: initSeqDone\n");
-			efClear(H1_mon);
-			efClear(K1_mon);
-			efClear(L1_mon);
-			efClear(A1_mon);
-			efClear(H2_mon);
-			efClear(K2_mon);
-			efClear(L2_mon);
-			efClear(A2_mon);
-			efClear(E_mon);
-			efClear(lambda_mon);
-			efClear(theta1_mon);
-			efClear(theta2_mon);
-			efClear(phi1Off_mon);
-			efClear(phi2Off_mon);
-			efClear(worldOff_mon);
-			efClear(useSetMode_mon);
-			efClear(opMode_mon);
-			efClear(Geom_mon);
-
 			phi1MotRdbkEcho = phi1MotRdbk;
 			pvPut(phi1MotRdbkEcho);
 			phi2MotRdbkEcho = phi2MotRdbk;
@@ -682,7 +741,13 @@ ss hr_Ctl
 			opAck = 0;
 			pvPut(opAck);
 			if (hrCtlDebug) %%printf("hrCtl:waitForCmndEnter: Moving=%d; Done=%d\n", pVar->hr_Moving, pVar->hr_Done);
-			if (hr_Moving && hr_Done) {
+			pvGet(ENow);
+			pvGet(lambdaNow);
+			pvGet(theta1Now);
+			pvGet(theta2Now);
+			if (hr_Moving && hr_Done &&
+			    SAME(ENow, ELast) && SAME(lambdaNow, lambdaLast) &&
+			    SAME(theta1Now, theta1Last) && SAME(theta2Now, theta2Last)) {
 				if (hrCtlDebug) %%printf("hrCtl:waitForCmndEnter: asserting 'done'.\n");
 				hr_Moving=0; hr_Done = 0;
 				pvPut(hr_Moving);
@@ -724,31 +789,31 @@ ss hr_Ctl
 			efSet(phi2MotRdbkPseudo_mon);
 		} state updateRdbk
 
-		when (efTest(E_mon)) {
+		/* An event holding *Last is this program's own echo, which the
+		 * enter's clears used to drop. */
+		when (efTestAndClear(E_mon) && !SAME(EReq, ELast)) {
 			if (hrCtlDebug) %%printf("hrCtl:waitForCmd: E_mon\n");
-			efClear(E_mon);
-		} state eChanged
-   
-		when (efTest(lambda_mon)) {
+		} state reqTake
+
+		when (efTestAndClear(lambda_mon) && !SAME(lambdaReq, lambdaLast)) {
 			if (hrCtlDebug) %%printf("hrCtl:waitForCmd: lambda_mon\n");
-			efClear(lambda_mon);
-		} state lChanged
-   
-		when (efTest(theta1_mon) || efTest(theta2_mon)) {
+		} state reqTake
+
+		when ((efTestAndClear(theta1_mon) && !SAME(theta1Req, theta1Last)) ||
+				(efTestAndClear(theta2_mon) && !SAME(theta2Req, theta2Last))) {
 			if (hrCtlDebug) %%printf("hrCtl:waitForCmd: theta*_mon\n");
-			efClear(theta1_mon);
-			efClear(theta2_mon);
-		} state thChanged
-   
-		when (efTest(worldOff_mon)) {
+		} state reqTake
+
+		when (efTestAndClear(worldOff_mon) && !SAME(worldOff, worldOffLast)) {
 			if (hrCtlDebug) %%printf("hrCtl:waitForCmd: worldOff_mon\n");
-			efClear(worldOff_mon);
+			worldOffLast = worldOff;
 		} state calcMovements
 
-		when (efTest(phi1Off_mon) || efTest(phi2Off_mon)) {
+		when ((efTestAndClear(phi1Off_mon) && !SAME(phi1Off, phi1OffLast)) ||
+				(efTestAndClear(phi2Off_mon) && !SAME(phi2Off, phi2OffLast))) {
 			if (hrCtlDebug) %%printf("hrCtl:waitForCmd: phi*Off_mon\n");
-			efClear(phi1Off_mon);
-			efClear(phi2Off_mon);
+			phi1OffLast = phi1Off;
+			phi2OffLast = phi2Off;
 			/* Calc and put readback values. */
 			%%hrCtl_calcReadback(pVar);        
 			pvPut(phi1Rdbk);
@@ -765,8 +830,12 @@ ss hr_Ctl
 			if (hrCtlDebug) %%printf("hrCtl:waitForCmnd:putVals\n");
 		} state calcMovements
 
-		when (efTest(useSetMode_mon) && useSetMode) {
+		when (efTest(useSetMode_mon) && useSetMode && useSetMode != useSetModeLast) {
 			efClear(useSetMode_mon);
+			useSetModeLast = useSetMode;
+			pvGet(lambdaNow);
+			pvGet(theta1Now);
+			pvGet(theta2Now);
 			EHi=0; pvPut(EHi);
 			ELo=0; pvPut(ELo);
 			lambdaHi=0; pvPut(lambdaHi);
@@ -779,22 +848,32 @@ ss hr_Ctl
 			theta2Lo=0; pvPut(theta2Lo);
 			phi2Hi=0; pvPut(phi2Hi);
 			phi2Lo=0; pvPut(phi2Lo);
+			/* Read back as in phiLimits, into the working values too, which
+			 * this pass reads past the clamps; eChanged starts from E as the
+			 * PV now holds it, clamp or request, as from C's monitored E. */
+			pvGet(ELast);
+			E = ELast;
+			if (SAME(lambdaNow, lambdaLast)) { pvGet(lambdaLast); lambda = lambdaLast; }
+			if (SAME(theta1Now, theta1Last)) { pvGet(theta1Last); theta1 = theta1Last; }
+			if (SAME(theta2Now, theta2Last)) { pvGet(theta2Last); theta2 = theta2Last; }
 		} state eChanged
 
-		when (efTest(useSetMode_mon) && !useSetMode) {
-			efClear(useSetMode_mon);
+		when (efTestAndClear(useSetMode_mon) && useSetMode != useSetModeLast) {
+			useSetModeLast = useSetMode;
 		} state phiLimits
 
-		when (efTestAndClear(opMode_mon)) {
+		when (efTestAndClear(opMode_mon) && opMode != opModeLast) {
 			if (hrCtlDebug) %%printf("hrCtl:waitForCmnd: opMode event.\n");
+			opModeLast = opMode;
 			autoMode = 0;
 			pvPut(autoMode);
 			sprintf(seqMsg2, "Set to Manual Mode");
 			pvPut(seqMsg2);
 		} state calcMovements
 
-		when (efTestAndClear(Geom_mon)) {
+		when (efTestAndClear(Geom_mon) && Geom != GeomLast) {
 			if (hrCtlDebug) %%printf("hrCtl:waitForCmnd: Geom event.\n");
+			GeomLast = Geom;
 			autoMode = 0;
 			pvPut(autoMode);
 			sprintf(seqMsg1, "New geometry.  Switch Phi 2 motor dir.");
@@ -837,12 +916,45 @@ ss hr_Ctl
 		} state waitForCmnd
 	}
 
+	/* A request arm's *Req can be an own put's echo landing after that
+	 * put's readback, so the take reads the PV. */
+	state reqTake {
+		entry {
+			pvGet(ENow);
+			pvGet(lambdaNow);
+			pvGet(theta1Now);
+			pvGet(theta2Now);
+		}
+		when (!SAME(ENow, ELast)) {
+			E = ENow;
+			ELast = E;
+		} state eChanged
+		when (!SAME(lambdaNow, lambdaLast)) {
+			lambda = lambdaNow;
+			lambdaLast = lambda;
+		} state lChanged
+		when (!SAME(theta1Now, theta1Last) || !SAME(theta2Now, theta2Last)) {
+			theta1 = theta1Now;
+			theta1Last = theta1;
+			theta2 = theta2Now;
+			theta2Last = theta2;
+		} state thChanged
+		when () {
+		} state waitForCmnd
+	}
+
 	state phiLimits {
 		entry {
 			if (hrCtlDebug) %%printf("hrCtl:phiLimits: entry\n");
 		}
 		when () {
 			if (hrCtlDebug) %%printf("hrCtl:phiLimits\n");
+			/* A drive limit put clamps the AO's VAL. That clamp is this
+			 * program's own unless a request is in the PV. */
+			pvGet(ENow);
+			pvGet(lambdaNow);
+			pvGet(theta1Now);
+			pvGet(theta2Now);
 			if (!useSetMode) {
 				/* translate phi1 motor limits into phi1, theta1 limits */
 				phi1Hi = phi1MotHiLim * uR2D + (phi1Off + worldOff*uR2D);
@@ -916,6 +1028,10 @@ ss hr_Ctl
 				phi2Hi=0; pvPut(phi2Hi);
 				phi2Lo=0; pvPut(phi2Lo);
 			}
+			if (SAME(ENow, ELast)) pvGet(ELast);
+			if (SAME(lambdaNow, lambdaLast)) pvGet(lambdaLast);
+			if (SAME(theta1Now, theta1Last)) pvGet(theta1Last);
+			if (SAME(theta2Now, theta2Last)) pvGet(theta2Last);
 		} state checkDone /*waitForCmndEnter*/
 	}
 
@@ -941,6 +1057,16 @@ ss hr_Ctl
 			if (hrCtlDebug) %%printf("hrCtl:dInputChanged: entry\n");
 		}
 		when () {
+			/* Cleared where read: an event in the lattice from here on is
+			 * a lattice change this pass did not see. */
+			efClear(H1_mon);
+			efClear(K1_mon);
+			efClear(L1_mon);
+			efClear(A1_mon);
+			efClear(H2_mon);
+			efClear(K2_mon);
+			efClear(L2_mon);
+			efClear(A2_mon);
 			autoMode = 0;
 			pvPut(autoMode);
 			sprintf(seqMsg2, "Set to Manual Mode");
@@ -963,11 +1089,44 @@ ss hr_Ctl
 				EHi = 0;
 				ELo = 0;
 			}
+			/* Read back as in phiLimits. */
+			pvGet(ENow);
+			pvGet(lambdaNow);
 			pvPut(lambdaLo);
 			pvPut(lambdaHi);
 			pvPut(EHi);
 			pvPut(ELo);
+			if (SAME(ENow, ELast)) pvGet(ELast);
+			if (SAME(lambdaNow, lambdaLast)) pvGet(lambdaLast);
 			pvPut(opAlert);
+		} state dInputTake
+	}
+
+	/* C defect: thChanged recomputed E and lambda from theta over a request
+	 * already in E or lambda, which was then never moved to. A request
+	 * pending at a lattice change is applied under the new d spacing. */
+	state dInputTake {
+		entry {
+			pvGet(ENow);
+			pvGet(lambdaNow);
+			pvGet(theta1Now);
+			pvGet(theta2Now);
+		}
+		when (!SAME(ENow, ELast)) {
+			E = ENow;
+			ELast = E;
+		} state eChanged
+		when (!SAME(lambdaNow, lambdaLast)) {
+			lambda = lambdaNow;
+			lambdaLast = lambda;
+		} state lChanged
+		when (!SAME(theta1Now, theta1Last) || !SAME(theta2Now, theta2Last)) {
+			theta1 = theta1Now;
+			theta1Last = theta1;
+			theta2 = theta2Now;
+			theta2Last = theta2;
+		} state thChanged
+		when () {
 		} state thChanged
 	}
 
@@ -985,6 +1144,7 @@ ss hr_Ctl
 			if (useSetMode || ((temp>=ELo) && (temp<=EHi))) {
 				E = temp;
 				pvPut(E);
+				pvGet(ELast);
 				sprintf(seqMsg1, "Tweaked E");
 				pvPut(seqMsg1);
 			} else {
@@ -1010,6 +1170,7 @@ ss hr_Ctl
 			if (useSetMode || ((temp>=lambdaLo) && (temp<=lambdaHi))) {
 				lambda = temp;
 				pvPut(lambda);
+				pvGet(lambdaLast);
 				sprintf(seqMsg1, "Tweaked Lambda");
 				pvPut(seqMsg1);
 			} else {
@@ -1034,6 +1195,7 @@ ss hr_Ctl
 			if (useSetMode || ((temp>=theta1Lo) && (temp<=theta1Hi))) {
 				theta1 = temp;
 				pvPut(theta1);
+				pvGet(theta1Last);
 				sprintf(seqMsg1, "Tweaked Theta 1");
 				pvPut(seqMsg1);
 			} else {
@@ -1058,6 +1220,7 @@ ss hr_Ctl
 			if (useSetMode || ((temp>=theta2Lo) && (temp<=theta2Hi))) {
 				theta2 = temp;
 				pvPut(theta2);
+				pvGet(theta2Last);
 				sprintf(seqMsg1, "Tweaked Theta 2");
 				pvPut(seqMsg1);
 			} else {
@@ -1079,6 +1242,7 @@ ss hr_Ctl
 			} else {
 				worldOff = worldOff - worldTweakVal;
 			}
+			worldOffLast = worldOff;
 			pvPut(worldOff);
 			sprintf(seqMsg1, "Tweaked world");
 			pvPut(seqMsg1);
@@ -1099,6 +1263,7 @@ ss hr_Ctl
 			if (hrCtlDebug) %%printf("hrCtl:eChanged\n");
 			lambda = hc/E;
 			pvPut(lambda);
+			pvGet(lambdaLast);
 		} state lChanged
 	}
 
@@ -1127,6 +1292,7 @@ ss hr_Ctl
 			/* single-crystal mode */
 			theta1 = asin(lambda/D1) * R2D;
 			pvPut(theta1);
+			pvGet(theta1Last);
 		} state thChanged
 
 		when (opMode == 1) {
@@ -1134,8 +1300,10 @@ ss hr_Ctl
 			/* two crystals locked together */
 			theta1 = asin(lambda/D1) * R2D;
 			pvPut(theta1);
+			pvGet(theta1Last);
 			theta2 = asin(lambda/D2) * R2D;
 			pvPut(theta2);
+			pvGet(theta2Last);
 		} state thChanged
 
 		when (opMode == 2) {
@@ -1148,6 +1316,7 @@ ss hr_Ctl
 			 */
 			theta2 = asin(lambda/D2) * R2D;
 			pvPut(theta2);
+			pvGet(theta2Last);
 		} state thChanged
 	}
 
@@ -1209,9 +1378,11 @@ ss hr_Ctl
 				pvPut(phi2);
 			}
 			pvPut(lambda);
+			pvGet(lambdaLast);
 
 			E = hc/lambda;
-			pvPut(E); 
+			pvPut(E);
+			pvGet(ELast);
 
 			/*
 			 * Update the readback values as well, since we may have gotten
@@ -1253,6 +1424,7 @@ ss hr_Ctl
 			/* Calculate new phiOff* */
 			/* phi1Off = phi1 - phi1MotRdbk/D2uR - worldOff*uR2D; */
 			phi1Off = phi1 - phi1MotRdbk/D2uR;
+			phi1OffLast = phi1Off;
 			pvPut(phi1Off);
 			if (opMode != 0) {
 				/* Don't consider world.  It's not part of calibration
@@ -1263,6 +1435,7 @@ ss hr_Ctl
 				 * }
 				 */
 				phi2Off = phi2 - phi2MotRdbk/D2uR;
+				phi2OffLast = phi2Off;
 				pvPut(phi2Off);
 			}
 			/* Calculate new phi* */

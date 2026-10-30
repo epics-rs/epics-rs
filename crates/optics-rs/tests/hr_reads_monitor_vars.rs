@@ -3,6 +3,7 @@
 
 use epics_base_rs::runtime::task;
 use epics_base_rs::server::database::PvDatabase;
+use epics_base_rs::server::database::db_access::DbSubscription;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::records::busy::BusyRecord;
@@ -76,7 +77,7 @@ async fn boot() -> (Arc<PvDatabase>, ScanOwner) {
 
 /// Return with the sequencer idle after an enter. An ack posted during a
 /// pass is lost to that pass's opAck = 0, as in C, so it is posted again
-/// until one is taken (msg1 " ") and its enter has ended (opAck 0).
+/// until one is taken (msg1 " ") and its enter has put opAck 0.
 async fn idle(db: &PvDatabase, ack: &str, msg1: &str) {
     let ack_ch = optics_rs::db_access::DbChannel::new(db, ack);
     for _ in 0..50 {
@@ -97,9 +98,9 @@ async fn idle(db: &PvDatabase, ack: &str, msg1: &str) {
     panic!("{ack} never taken");
 }
 
-/// Run `posts` once the sequencer has passed waitForCmndEnter's efClears
-/// (hrCtl.st:606-682): OperAck sends it there, and the enter's `opAck = 0` follows them.
-/// Its puts are queued, so no record lock can hold it inside the enter.
+/// Run `posts` once the sequencer has passed waitForCmndEnter's `opAck = 0`:
+/// OperAck sends it there. Its puts are queued, so no record lock can hold
+/// it inside the enter.
 async fn post_after_enter(db: &PvDatabase, posts: impl FnOnce(&PvDatabase)) {
     idle(db, "H:HR1_OperAckBO", "H:HR1_SeqMsg1SI").await;
     optics_rs::db_access::DbChannel::new(db, "H:HR1_OperAckBO")
@@ -381,8 +382,235 @@ async fn debug_prints_c_lines() {
     let (ioc, _scan) = boot().await;
     let db = PvDatabase::clone(&ioc);
     idle(&db, "H:HR1_OperAckBO", "H:HR1_SeqMsg1SI").await;
+    // The enter's action reads on past its opAck = 0 into waitForCmnd.
+    task::sleep(Duration::from_millis(200)).await;
     post(&db, "H:HR1CtlDebug", EpicsValue::Long(1));
     task::sleep(Duration::from_millis(200)).await;
     post(&db, "H:HR1_Mode2MO", EpicsValue::Enum(1));
     task::sleep(Duration::from_millis(500)).await;
+}
+
+/// Run `posts` in waitForCmndEnter's delay: an OperAck pass sends the
+/// sequencer there, its SeqMsg1 " " first, and the enter's action ends
+/// with opAck = 0.
+async fn post_in_enter(db: &PvDatabase, posts: impl FnOnce(&PvDatabase)) {
+    let (ack, msg1) = ("H:HR1_OperAckBO", "H:HR1_SeqMsg1SI");
+    idle(db, ack, msg1).await;
+    db.get_record(msg1)
+        .unwrap()
+        .write()
+        .record
+        .put_field("VAL", EpicsValue::String("-".into()))
+        .unwrap();
+    put_process(db, ack, 1.0).await;
+    for _ in 0..2000 {
+        if string_of(db, msg1).await == " " {
+            break;
+        }
+        task::sleep(Duration::from_millis(1)).await;
+    }
+    posts(db);
+    assert_eq!(
+        f64_of(db, ack).await,
+        1.0,
+        "the posts missed the enter's delay"
+    );
+}
+
+async fn shown(ioc: &PvDatabase, msg1: &str) {
+    for _ in 0..100 {
+        if string_of(ioc, "H:HR1_SeqMsg1SI").await == msg1 {
+            return;
+        }
+        task::sleep(Duration::from_millis(50)).await;
+    }
+    panic!(
+        "SeqMsg1 {:?}, want {msg1:?}",
+        string_of(ioc, "H:HR1_SeqMsg1SI").await
+    );
+}
+
+/// Finish `motor`'s move where it was sent, as its driver would, which
+/// completes hrCtl's put to it.
+async fn finish(db: &PvDatabase, motor: &str) {
+    {
+        let rec = db.get_record(motor).unwrap();
+        let mut inst = rec.write();
+        let m = inst
+            .record
+            .as_any_mut()
+            .and_then(|a| a.downcast_mut::<motor_rs::MotorRecord>())
+            .unwrap();
+        let to = m.pos.dval;
+        m.set_event(motor_rs::flags::MotorEvent::DeviceUpdate(
+            asyn_rs::interfaces::motor::MotorStatus {
+                done: true,
+                moving: false,
+                ..asyn_rs::interfaces::motor::MotorStatus::default()
+                    .with_position(to)
+                    .with_encoder_position(to)
+            },
+        ));
+    }
+    db.process_record(motor).await.unwrap();
+}
+
+/// A theta1 request landing in waitForCmndEnter's delay is taken. C's
+/// enter cleared its event, and the request stood untaken.
+#[epics_base_rs::epics_test]
+async fn a_request_in_the_enter_is_taken() {
+    let (ioc, _scan) = boot().await;
+    let db = PvDatabase::clone(&ioc);
+    post_in_enter(&db, |db| {
+        post(db, "H:HR1_Theta1AO", EpicsValue::Double(21.0))
+    })
+    .await;
+    wait_near(&ioc, "H:HR1_phi1SetAO", desired(&ioc, 21.0).await).await;
+}
+
+/// A geometry change landing in waitForCmndEnter's delay is taken. C's
+/// enter cleared its event.
+#[epics_base_rs::epics_test]
+async fn a_geometry_change_in_the_enter_is_taken() {
+    let (ioc, _scan) = boot().await;
+    let db = PvDatabase::clone(&ioc);
+    post_in_enter(&db, |db| post(db, "H:HR1_GeomMO", EpicsValue::Enum(1))).await;
+    shown(&ioc, "New geometry.  Switch Phi 2 motor dir.").await;
+}
+
+/// A lattice change landing with an E request in waitForCmndEnter's
+/// delay applies the request under the new 2d. C's enter cleared both,
+/// and its thChanged recomputed E from theta1 over a pending request.
+#[epics_base_rs::epics_test]
+async fn a_lattice_change_takes_a_pending_e_request_under_the_new_2d() {
+    let (ioc, _scan) = boot().await;
+    let db = PvDatabase::clone(&ioc);
+    let e = f64_of(&ioc, "H:HR1_EAO").await * 1.01;
+    post_in_enter(&db, |db| {
+        post(db, "H:HR1_H1AO", EpicsValue::Double(3.0));
+        post(db, "H:HR1_EAO", EpicsValue::Double(e));
+    })
+    .await;
+    // Si (311).
+    let d1 = 2.0 * 5.43102 / 11f64.sqrt();
+    wait_near(&ioc, "H:HR1_2d1AO", d1).await;
+    wait_near(
+        &ioc,
+        "H:HR1_Theta1AO",
+        (12.3984244 / e / d1).asin().to_degrees(),
+    )
+    .await;
+    assert!((f64_of(&ioc, "H:HR1_EAO").await - e).abs() < 1e-6);
+}
+
+/// A theta1 request landing in a move is moved to after it, and Done waits
+/// for that move. C's enter cleared its event and asserted Done for it.
+#[epics_base_rs::epics_test]
+async fn a_request_during_a_move_is_moved_to_before_done() {
+    let (ioc, _scan) = boot().await;
+    let db = PvDatabase::clone(&ioc);
+    idle(&db, "H:HR1_OperAckBO", "H:HR1_SeqMsg1SI").await;
+    post(&db, "H:HR1_ModeBO", EpicsValue::Enum(1));
+    put_process(&ioc, "H:HR1_Theta1AO", 21.0).await;
+    wait_near(&ioc, "H:p1.VAL", desired(&ioc, 21.0).await).await;
+    put_process(&ioc, "H:HR1_Theta1AO", 23.0).await;
+    let mut busy = DbSubscription::subscribe(&db, "H:HR1_Moving")
+        .await
+        .unwrap();
+    finish(&db, "H:p1").await;
+    wait_near(&ioc, "H:p1.VAL", desired(&ioc, 23.0).await).await;
+    while let Ok(v) = task::timeout(Duration::from_millis(20), busy.recv_f64()).await {
+        assert_ne!(v, Some(0.0), "Done before the move to 23");
+    }
+    finish(&db, "H:p1").await;
+    wait_near(&ioc, "H:HR1_Moving", 0.0).await;
+}
+
+/// A drive limit put clamping theta1 is this program's own put, so theta1
+/// is not moved for it, and a tweak starts from the clamped theta1 as from
+/// C's monitored one.
+#[epics_base_rs::epics_test]
+async fn a_limit_clamp_is_not_a_request_and_a_tweak_starts_from_it() {
+    let (ioc, _scan) = boot().await;
+    let db = PvDatabase::clone(&ioc);
+    idle(&db, "H:HR1_OperAckBO", "H:HR1_SeqMsg1SI").await;
+    put_process(&ioc, "H:HR1_Theta1AO", 20.0).await;
+    let at20 = desired(&ioc, 20.0).await;
+    wait_near(&ioc, "H:HR1_phi1SetAO", at20).await;
+    // theta1Hi = phi1MotHiLim*uR2D + off, here 15.
+    let off = 20.0 - at20 * UR2D;
+    db.put_record_field_from_ca("H:p1", "HLM", EpicsValue::Double((15.0 - off) / UR2D))
+        .await
+        .unwrap();
+    wait_near(&ioc, "H:HR1_Theta1AO", 15.0).await;
+    // Nothing to wait on for an absence: give a taken request time to show.
+    task::sleep(Duration::from_millis(500)).await;
+    wait_near(&ioc, "H:HR1_phi1SetAO", at20).await;
+    idle(&db, "H:HR1_OperAckBO", "H:HR1_SeqMsg1SI").await;
+    post(&db, "H:HR1_Theta1TweakAI", EpicsValue::Double(1.0));
+    put_process(&ioc, "H:HR1_Theta1DecBO", 1.0).await;
+    shown(&ioc, "Tweaked Theta 1").await;
+    wait_near(&ioc, "H:HR1_Theta1AO", 14.0).await;
+}
+
+/// A theta1 event holding a value the PV no longer holds, as an own put's
+/// echo landing after a later put's readback does, is not taken.
+#[epics_base_rs::epics_test]
+async fn a_stale_event_is_not_taken() {
+    let (ioc, _scan) = boot().await;
+    let db = PvDatabase::clone(&ioc);
+    idle(&db, "H:HR1_OperAckBO", "H:HR1_SeqMsg1SI").await;
+    put_process(&ioc, "H:HR1_Theta1AO", 20.0).await;
+    let at20 = desired(&ioc, 20.0).await;
+    wait_near(&ioc, "H:HR1_phi1SetAO", at20).await;
+    {
+        let rec = db.get_record("H:HR1_Theta1AO").unwrap();
+        let mut inst = rec.write();
+        inst.record
+            .put_field("VAL", EpicsValue::Double(10.0))
+            .unwrap();
+        inst.notify_field("VAL", EventMask::VALUE | EventMask::LOG);
+        inst.record
+            .put_field("VAL", EpicsValue::Double(20.0))
+            .unwrap();
+    }
+    task::sleep(Duration::from_millis(500)).await;
+    wait_near(&ioc, "H:HR1_phi1SetAO", at20).await;
+}
+
+/// A NaN request, which is not == itself, is taken once: the program goes
+/// on to take an ack and the next request.
+#[epics_base_rs::epics_test]
+async fn a_nan_request_is_taken_once() {
+    let (ioc, _scan) = boot().await;
+    let db = PvDatabase::clone(&ioc);
+    idle(&db, "H:HR1_OperAckBO", "H:HR1_SeqMsg1SI").await;
+    put_process(&ioc, "H:HR1_Theta1AO", f64::NAN).await;
+    for _ in 0..100 {
+        if f64_of(&ioc, "H:HR1_phi1SetAO").await.is_nan() {
+            break;
+        }
+        task::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(f64_of(&ioc, "H:HR1_phi1SetAO").await.is_nan());
+    idle(&db, "H:HR1_OperAckBO", "H:HR1_SeqMsg1SI").await;
+    put_process(&ioc, "H:HR1_Theta1AO", 20.0).await;
+    wait_near(&ioc, "H:HR1_phi1SetAO", desired(&ioc, 20.0).await).await;
+}
+
+/// The settings' connect-time events, which C's waitForCmndEnter cleared,
+/// are not changes: no mode or geometry pass follows boot's limits pass.
+#[epics_base_rs::epics_test]
+async fn connect_time_setting_events_are_not_changes() {
+    let (ioc, _scan) = boot().await;
+    // Nothing to wait on for an absence: give a taken event time to show.
+    task::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        string_of(&ioc, "H:HR1_SeqMsg1SI").await,
+        "Motor Soft Limit Changed"
+    );
+    assert_eq!(
+        string_of(&ioc, "H:HR1_SeqMsg2SI").await,
+        "Theta2LoLim clipped at 0.500"
+    );
 }

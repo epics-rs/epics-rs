@@ -69,8 +69,13 @@ monitor ccMode;
 short   ml_monoMoving; 
 assign  ml_monoMoving to "{P}ml_monoMoving";
 monitor ml_monoMoving;
+evflag  mlMbusy;
+sync    ml_monoMoving mlMbusy;
 
 short   ml_monoDone; 
+/* Set where move_ml_mono leaves ml_monoMoving raised for a manual move, so
+ * busyChanged tells that hold's own rise from an equal-value request's. */
+short   ml_monoHeld;
 
 /* crystal configuration */
 double  Order;
@@ -711,7 +716,7 @@ state waitForCmndEnter {
 		if (ml_monoMoving && ml_monoDone && SAME(ENow, ELast) &&
 		    SAME(lambdaNow, lambdaLast) && SAME(thetaNow, thetaLast)) {
 			if (ml_monoCtlDebug) %%printf("ml_monoCtl:waitForCmndEnter: asserting 'done'.\n");
-			ml_monoMoving=0; ml_monoDone = 0;
+			ml_monoMoving=0; ml_monoDone = 0; ml_monoHeld = 0;
 			pvPut(ml_monoMoving);
 		}
 	} state waitForCmnd  
@@ -776,6 +781,10 @@ state waitForCmnd {
 	when (efTestAndClear(theta_mon) && !SAME(thetaReq, thetaLast)) {
 		if (ml_monoCtlDebug) %%printf("ml_monoCtl:waitForCmnd:theta_mon\n");
 	} state reqTake
+
+	when (efTestAndClear(mlMbusy)) {
+		if (ml_monoCtlDebug) %%printf("ml_monoCtl:waitForCmnd:mlMbusy\n");
+	} state busyChanged
 
 	when (putVals && delay(.1)) {
 		if (ml_monoCtlDebug) %%printf("ml_monoCtl:waitForCmnd:putVals\n");
@@ -997,6 +1006,47 @@ state thetaLimits {
 	} state checkDone
 }
 
+/* C defect: had no busyChanged. A put equal to the standing E, lambda or
+ * theta posts no value event, but PutMoving raises ml_monoMoving, which
+ * then stayed raised. This is kohzuCtl's busyChanged. */
+state busyChanged {
+	entry {
+		pvGet(ENow);
+		pvGet(lambdaNow);
+		pvGet(thetaNow);
+	}
+	when (ml_monoMoving > 0 && !SAME(ENow, ELast)) {
+		if (ml_monoCtlDebug) %%printf("ml_monoCtl:busyChanged\n to Moving and E changed");
+		E = ENow;
+		ELast = E;
+		ml_monoDone = 0;
+	} state eChanged
+	when (ml_monoMoving > 0 && !SAME(lambdaNow, lambdaLast)) {
+		if (ml_monoCtlDebug) %%printf("ml_monoCtl:busyChanged\n to Moving and lambda changed");
+		lambda = lambdaNow;
+		lambdaLast = lambda;
+		ml_monoDone = 0;
+	} state lChanged
+	when (ml_monoMoving > 0 && !SAME(thetaNow, thetaLast)) {
+		if (ml_monoCtlDebug) %%printf("ml_monoCtl:busyChanged\n to Moving and theta changed");
+		theta = thetaNow;
+		thetaLast = theta;
+		ml_monoDone = 0;
+	} state thChanged
+	when (ml_monoMoving > 0 && !ml_monoHeld) {
+		if (ml_monoCtlDebug) %%printf("ml_monoCtl:busyChanged\n to Moving but unclear why");
+		ml_monoDone = 0;
+	} state eChanged
+	/* The rise of the move move_ml_mono holds. */
+	when (ml_monoMoving > 0) {
+		if (ml_monoCtlDebug) %%printf("ml_monoCtl:busyChanged\n to Moving and held");
+	} state waitForCmndEnter
+	when (ml_monoMoving == 0) {
+		if (ml_monoCtlDebug) %%printf("ml_monoCtl:busyChanged\n to Done");
+		ml_monoHeld = 0;
+	} state waitForCmndEnter
+}
+
 state eChanged {
 	when () { 
 		if (ml_monoCtlDebug) %%printf("ml_monoCtl:eChanged\n");
@@ -1149,6 +1199,7 @@ state move_ml_mono {
 
 	when (1) {
 		if (ml_monoCtlDebug) %%printf("ml_monoCtl:move_ml_mono\n");
+		ml_monoHeld = ml_monoMoving;
 	} state waitForCmndEnter
 }
 

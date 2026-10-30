@@ -1084,6 +1084,99 @@ async fn a_nan_request_is_taken_once() {
     wait_near(&ioc, "M:ml_monoThetaSet", 20.0).await;
 }
 
+/// An E put equal to the standing E posts no E event, only the Moving
+/// rise: busyChanged's pass moves to the standing setpoint, and Done waits
+/// for that move. C left ml_monoMoving raised.
+#[epics_base_rs::epics_test]
+async fn an_equal_e_request_is_done_after_its_move() {
+    let (ioc, _scan) = boot([10.0, 10.0, 35.0, 100.0]).await;
+    settled(&ioc, "y offset changed to 35.000000").await;
+    idle(&ioc, "M:ml_monoOperAck", "M:ml_monoSeqMsg1").await;
+    post(&ioc, "M:ml_monoMode", EpicsValue::Enum(1));
+    post_dmov(&ioc, false);
+    let e = f64_of(&ioc, "M:ml_monoE").await;
+    put_process(&ioc, "M:ml_monoE", e).await;
+    wait_near(&ioc, "M:ml_monoMoving", 1.0).await;
+    task::sleep(Duration::from_millis(500)).await;
+    assert_eq!(f64_of(&ioc, "M:ml_monoMoving").await, 1.0);
+    post_dmov(&ioc, true);
+    wait_near(&ioc, "M:ml_monoMoving", 0.0).await;
+    assert_eq!(f64_of(&ioc, "M:ml_monoE").await, e);
+}
+
+/// A manual-mode request's pass holds ml_monoMoving for Put, and a second
+/// put of the same value joins that hold: Done follows Put's move.
+#[epics_base_rs::epics_test]
+async fn an_equal_request_during_a_manual_hold_joins_it() {
+    let (ioc, _scan) = boot([10.0, 10.0, 35.0, 100.0]).await;
+    settled(&ioc, "y offset changed to 35.000000").await;
+    idle(&ioc, "M:ml_monoOperAck", "M:ml_monoSeqMsg1").await;
+    let th = f64_of(&ioc, "M:th.VAL").await;
+    put_process(&ioc, "M:ml_monoTheta", 20.0).await;
+    wait_near(&ioc, "M:ml_monoThetaSet", 20.0).await;
+    put_process(&ioc, "M:ml_monoTheta", 20.0).await;
+    task::sleep(Duration::from_millis(500)).await;
+    assert_eq!(f64_of(&ioc, "M:ml_monoMoving").await, 1.0);
+    assert_eq!(f64_of(&ioc, "M:th.VAL").await, th);
+    post_dmov(&ioc, false);
+    put_process(&ioc, "M:ml_monoPut", 1.0).await;
+    wait_near(&ioc, "M:z.VAL", z_of(20.0)).await;
+    task::sleep(Duration::from_millis(300)).await;
+    assert_eq!(f64_of(&ioc, "M:ml_monoMoving").await, 1.0);
+    post_dmov(&ioc, true);
+    wait_near(&ioc, "M:ml_monoMoving", 0.0).await;
+    assert_eq!(f64_of(&ioc, "M:th.VAL").await, 20.0);
+}
+
+/// Hold a manual theta request to 20, then switch to auto mode.
+async fn held_at_20() -> (Arc<PvDatabase>, ScanOwner) {
+    let (ioc, scan) = boot([10.0, 10.0, 35.0, 100.0]).await;
+    settled(&ioc, "y offset changed to 35.000000").await;
+    idle(&ioc, "M:ml_monoOperAck", "M:ml_monoSeqMsg1").await;
+    put_process(&ioc, "M:ml_monoTheta", 20.0).await;
+    wait_near(&ioc, "M:ml_monoThetaSet", 20.0).await;
+    task::sleep(Duration::from_millis(300)).await;
+    post(&ioc, "M:ml_monoMode", EpicsValue::Enum(1));
+    (ioc, scan)
+}
+
+/// An equal theta request in auto mode, put once the hold is lowered, is
+/// moved to and Done.
+async fn an_equal_request_after_the_hold_is_done(ioc: &PvDatabase) {
+    wait_near(ioc, "M:ml_monoMoving", 0.0).await;
+    // A move's limit monitors run thetaLimits, whose own theta put raises
+    // Moving and whose checkDone lowers it.
+    task::sleep(Duration::from_secs(1)).await;
+    let mut moving = DbSubscription::subscribe(ioc, "M:ml_monoMoving")
+        .await
+        .unwrap();
+    put_process(ioc, "M:ml_monoTheta", 20.0).await;
+    shows(&mut moving, 1.0).await;
+    task::sleep(Duration::from_millis(300)).await;
+    post_dmov(ioc, true);
+    shows(&mut moving, 0.0).await;
+}
+
+/// An equal request after a hold's move is done is not taken for that
+/// hold.
+#[epics_base_rs::epics_test]
+async fn a_hold_ends_at_its_done() {
+    let (ioc, _scan) = held_at_20().await;
+    post_dmov(&ioc, false);
+    put_process(&ioc, "M:ml_monoPut", 1.0).await;
+    wait_near(&ioc, "M:z.VAL", z_of(20.0)).await;
+    post_dmov(&ioc, true);
+    an_equal_request_after_the_hold_is_done(&ioc).await;
+}
+
+/// A hold lowered by hand ends with it.
+#[epics_base_rs::epics_test]
+async fn a_hold_ends_when_lowered_by_hand() {
+    let (ioc, _scan) = held_at_20().await;
+    put_process(&ioc, "M:ml_monoMoving", 0.0).await;
+    an_equal_request_after_the_hold_is_done(&ioc).await;
+}
+
 const CHILD: &str = "ML_MONO_CTL_DEBUG_CHILD";
 
 /// `test` run again in a child whose stdout is not captured, and the
@@ -1108,7 +1201,8 @@ fn trace_of(test: &str) -> Vec<String> {
 }
 
 /// With ml_monoCtlDebug set, an E put in manual mode prints C's lines
-/// (ml_monoCtl.st:759-764, :968-1121, :652-708).
+/// (ml_monoCtl.st:759-764, :968-1121, :652-708), then busyChanged's for
+/// the Moving rise its pass's puts raised, which the pass holds.
 #[epics_base_rs::epics_test]
 async fn debug_prints_c_lines() {
     if std::env::var_os(CHILD).is_none() {
@@ -1122,6 +1216,10 @@ async fn debug_prints_c_lines() {
                 "ml_monoCtl:thChanged",
                 "ml_monoCtl:calcMovements",
                 "ml_monoCtl:move_ml_mono",
+                "ml_monoCtl:waitForCmndEnter:initSeqDone",
+                "ml_monoCtl:waitForCmndEnter: ml_monoMoving=1; ml_monoDone=0",
+                "ml_monoCtl:waitForCmnd:mlMbusy",
+                "ml_monoCtl:busyChanged",
                 "ml_monoCtl:waitForCmndEnter:initSeqDone",
                 "ml_monoCtl:waitForCmndEnter: ml_monoMoving=1; ml_monoDone=0",
             ]

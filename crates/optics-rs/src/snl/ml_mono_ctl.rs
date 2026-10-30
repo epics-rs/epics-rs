@@ -113,6 +113,9 @@ macro_rules! seqg_escaped {
     ($env:ident, r#"printf("ml_monoCtl:waitForCmnd:theta_mon\n");"#) => {
         printf("ml_monoCtl:waitForCmnd:theta_mon\n", &[])
     };
+    ($env:ident, r#"printf("ml_monoCtl:waitForCmnd:mlMbusy\n");"#) => {
+        printf("ml_monoCtl:waitForCmnd:mlMbusy\n", &[])
+    };
     ($env:ident, r#"printf("ml_monoCtl:waitForCmnd:putVals\n");"#) => {
         printf("ml_monoCtl:waitForCmnd:putVals\n", &[])
     };
@@ -147,6 +150,24 @@ macro_rules! seqg_escaped {
     };
     ($env:ident, r#"printf("ml_monoCtl:thetaLimits\n");"#) => {
         printf("ml_monoCtl:thetaLimits\n", &[])
+    };
+    ($env:ident, r#"printf("ml_monoCtl:busyChanged\n to Moving and E changed");"#) => {
+        printf("ml_monoCtl:busyChanged\n to Moving and E changed", &[])
+    };
+    ($env:ident, r#"printf("ml_monoCtl:busyChanged\n to Moving and lambda changed");"#) => {
+        printf("ml_monoCtl:busyChanged\n to Moving and lambda changed", &[])
+    };
+    ($env:ident, r#"printf("ml_monoCtl:busyChanged\n to Moving and theta changed");"#) => {
+        printf("ml_monoCtl:busyChanged\n to Moving and theta changed", &[])
+    };
+    ($env:ident, r#"printf("ml_monoCtl:busyChanged\n to Moving but unclear why");"#) => {
+        printf("ml_monoCtl:busyChanged\n to Moving but unclear why", &[])
+    };
+    ($env:ident, r#"printf("ml_monoCtl:busyChanged\n to Moving and held");"#) => {
+        printf("ml_monoCtl:busyChanged\n to Moving and held", &[])
+    };
+    ($env:ident, r#"printf("ml_monoCtl:busyChanged\n to Done");"#) => {
+        printf("ml_monoCtl:busyChanged\n to Done", &[])
     };
     ($env:ident, r#"printf("ml_monoCtl:eChanged\n");"#) => {
         printf("ml_monoCtl:eChanged\n", &[])

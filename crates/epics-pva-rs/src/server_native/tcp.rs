@@ -18048,7 +18048,7 @@ mod tests {
         let defined = decode_type_desc_cached(&mut probe, order, &mut TypeCache::new())
             .expect("define frame descriptor decodes");
         assert_eq!(
-            decode_cache.get(&SLOT),
+            decode_cache.get(&SLOT).map(|c| &c.desc),
             Some(&defined),
             "cached slot holds exactly the descriptor the define carried"
         );

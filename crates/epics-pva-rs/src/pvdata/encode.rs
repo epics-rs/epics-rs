@@ -575,7 +575,43 @@ fn encode_structure_body_cached(
 ///
 /// Per-connection state. The wire emit-side encoder in this module
 /// never produces 0xFD/0xFE; we accept them for interop only.
-pub type TypeCache = std::collections::HashMap<u16, FieldDesc>;
+pub type TypeCache = std::collections::HashMap<u16, CachedType>;
+
+/// A resolved type-cache slot. Beyond the descriptor itself the slot
+/// carries the accounting a later `0xFE` reference is admitted on:
+/// `height` is the descriptor's resolved nesting depth in edges (a scalar
+/// leaf is 0) and `nodes` its `FieldDesc` count. Both are computed once,
+/// when the slot is bound, and re-checked against `MAX_FIELD_DEPTH` /
+/// `MAX_FIELD_NODES` as the referencing descriptor is assembled — so a
+/// reference is refused on the stored numbers, before its (possibly
+/// exponentially large) subtree is cloned into place, rather than after.
+#[derive(Debug, Clone)]
+pub struct CachedType {
+    pub desc: FieldDesc,
+    pub height: u32,
+    pub nodes: u32,
+}
+
+impl CachedType {
+    /// Build a slot from an already-resolved descriptor, measuring its
+    /// height and node count by one traversal. For callers that seed the
+    /// cache with a ready `FieldDesc`; the decoder stores the metrics it
+    /// already threaded up from the parse via `new_with_metrics`.
+    pub fn new(desc: FieldDesc) -> Self {
+        let m = TreeMetrics::measure(&desc);
+        Self::new_with_metrics(desc, m)
+    }
+
+    /// Build a slot from a descriptor whose metrics are already in hand (the
+    /// decode path), avoiding a re-traversal to measure what it just built.
+    fn new_with_metrics(desc: FieldDesc, m: TreeMetrics) -> Self {
+        Self {
+            desc,
+            height: m.height,
+            nodes: m.nodes,
+        }
+    }
+}
 
 /// Hard ceiling on FieldDesc / PvField nesting depth during decode.
 /// Matches pvxs `dataencode.cpp:71` (`from_wire(... depth) { if(depth>20)
@@ -587,7 +623,97 @@ pub type TypeCache = std::collections::HashMap<u16, FieldDesc>;
 /// tree to blow the per-task stack (tokio default 2 MB / ~256 KB on
 /// macOS — well within reach of the previous 64-level cap at ~50K
 /// recursion frames).
+///
+/// On embedded targets the limit drops to 10, matching pvxs's lower cap
+/// there (`dataencode.cpp:69-73`: `#if __rtems__ || vxWorks` → 10): the
+/// embedded stacks are smaller and the reference peer rejects a 11..=20
+/// tree, so accepting one would be a one-sided interop divergence.
+#[cfg(target_os = "rtems")]
+const MAX_FIELD_DEPTH: u32 = 10;
+#[cfg(not(target_os = "rtems"))]
 const MAX_FIELD_DEPTH: u32 = 20;
+
+/// Hard ceiling on the number of `FieldDesc` nodes in one resolved type
+/// descriptor. A `0xFE` reference splices a *clone* of a cached subtree,
+/// and a `0xFD`/`0xFE` chain can make each slot reference the previous one
+/// twice — doubling the node count per define, so a few hundred wire bytes
+/// expand into a multi-gigabyte tree before any value is decoded. It is
+/// reachable before authentication (CONNECTION_VALIDATION and pvRequest
+/// INIT both decode descriptors), which the recursion-`depth` guard alone
+/// does not stop: that guard counts wire-nesting, and a `0xFE` splice adds
+/// neither nesting nor a recursive call. pvxs bounds the same thing only
+/// implicitly — its field-offset `BitMask` is sized to `desc->size()` in a
+/// `uint16_t` (`bitmask.cpp:48`, `dataencode.cpp:428,722`), so a descriptor
+/// past 65535 nodes already breaks there; we reject it outright instead.
+const MAX_FIELD_NODES: u32 = u16::MAX as u32;
+
+/// Resolved-tree accounting threaded up through the cached descriptor
+/// decode. `height` is the subtree's nesting depth in edges (a scalar leaf
+/// is 0, a struct is `1 + max child height`) and bounds consumer recursion
+/// — clone, drop, re-encode — against the per-task stack; `nodes` is the
+/// subtree's `FieldDesc` count and bounds the memory a `0xFE` splice can
+/// materialize. The decode enforces `height <= MAX_FIELD_DEPTH` and
+/// `nodes <= MAX_FIELD_NODES` as each composite is assembled, so both hold
+/// by construction on every descriptor the decoder returns — including one
+/// spliced in from the cache, which the recursion-`depth` guard never saw.
+#[derive(Clone, Copy)]
+struct TreeMetrics {
+    height: u32,
+    nodes: u32,
+}
+
+impl TreeMetrics {
+    /// A scalar / variant / fixed leaf: no edges below it, one node.
+    const LEAF: Self = Self {
+        height: 0,
+        nodes: 1,
+    };
+
+    /// Measure an already-built descriptor iteratively, so measuring a
+    /// hostile tree cannot itself overflow the stack.
+    fn measure(desc: &FieldDesc) -> Self {
+        let mut nodes = 0u32;
+        let mut height = 0u32;
+        // (node, edge-depth-from-root); the root sits at depth 0.
+        let mut stack = vec![(desc, 0u32)];
+        while let Some((d, lvl)) = stack.pop() {
+            nodes = nodes.saturating_add(1);
+            height = height.max(lvl);
+            match d {
+                FieldDesc::Structure { fields, .. } | FieldDesc::StructureArray { fields, .. } => {
+                    for (_, c) in fields.iter() {
+                        stack.push((c, lvl + 1));
+                    }
+                }
+                FieldDesc::Union { variants, .. } | FieldDesc::UnionArray { variants, .. } => {
+                    for (_, c) in variants.iter() {
+                        stack.push((c, lvl + 1));
+                    }
+                }
+                _ => {}
+            }
+        }
+        Self { height, nodes }
+    }
+}
+
+/// Enforce the resolved-descriptor limits on a composite as each child is
+/// folded in, so an exponential `0xFE` expansion is refused at the first
+/// child that breaches a limit — before the next clone — rather than after
+/// the whole tree is built.
+fn check_field_metrics(m: &TreeMetrics) -> Result<(), DecodeError> {
+    if m.nodes > MAX_FIELD_NODES {
+        return Err(decode_err!(
+            "FieldDesc node count exceeds MAX_FIELD_NODES ({MAX_FIELD_NODES}) — type-cache expansion too large"
+        ));
+    }
+    if m.height > MAX_FIELD_DEPTH {
+        return Err(decode_err!(
+            "FieldDesc nesting exceeds MAX_FIELD_DEPTH ({MAX_FIELD_DEPTH}) after type-cache expansion"
+        ));
+    }
+    Ok(())
+}
 
 /// Policy for the EPICS base pvData / pvAccessCPP bounded-string descriptor
 /// tag (`0x83`). pvxs never emits this tag and faults on a bounded/fixed
@@ -639,7 +765,9 @@ pub fn decode_field_desc_cached(
     order: ByteOrder,
     cache: &mut TypeCache,
 ) -> Result<(String, FieldDesc), DecodeError> {
-    decode_field_desc_cached_at_depth(cur, order, cache, BoundedStringPolicy::Interop, 0)
+    let (name, desc, _) =
+        decode_field_desc_cached_at_depth(cur, order, cache, BoundedStringPolicy::Interop, 0)?;
+    Ok((name, desc))
 }
 
 fn decode_field_desc_cached_at_depth(
@@ -648,10 +776,10 @@ fn decode_field_desc_cached_at_depth(
     cache: &mut TypeCache,
     policy: BoundedStringPolicy,
     depth: u32,
-) -> Result<(String, FieldDesc), DecodeError> {
+) -> Result<(String, FieldDesc, TreeMetrics), DecodeError> {
     let name = decode_string(cur, order)?.unwrap_or_default();
-    let desc = decode_type_desc_cached_at_depth(cur, order, cache, policy, depth)?;
-    Ok((name, desc))
+    let (desc, metrics) = decode_type_desc_cached_at_depth(cur, order, cache, policy, depth)?;
+    Ok((name, desc, metrics))
 }
 
 /// Decode just the type-tag portion of a descriptor (no cache).
@@ -669,7 +797,7 @@ fn decode_type_desc_at_depth(
     depth: u32,
 ) -> Result<FieldDesc, DecodeError> {
     let mut empty = TypeCache::new();
-    decode_type_desc_cached_at_depth(cur, order, &mut empty, policy, depth)
+    decode_type_desc_cached_at_depth(cur, order, &mut empty, policy, depth).map(|(d, _)| d)
 }
 
 /// Decode a type descriptor honouring 0xFD (define) / 0xFE (lookup)
@@ -692,6 +820,7 @@ pub fn decode_type_desc_cached(
     cache: &mut TypeCache,
 ) -> Result<FieldDesc, DecodeError> {
     decode_type_desc_cached_at_depth(cur, order, cache, BoundedStringPolicy::Interop, 0)
+        .map(|(d, _)| d)
 }
 
 /// Decode a type descriptor that may be the NULL (`0xFF`) type code, the
@@ -738,7 +867,7 @@ pub fn decode_type_desc_cached_with_policy(
     cache: &mut TypeCache,
     policy: BoundedStringPolicy,
 ) -> Result<FieldDesc, DecodeError> {
-    decode_type_desc_cached_at_depth(cur, order, cache, policy, 0)
+    decode_type_desc_cached_at_depth(cur, order, cache, policy, 0).map(|(d, _)| d)
 }
 
 fn decode_type_desc_cached_at_depth(
@@ -747,7 +876,7 @@ fn decode_type_desc_cached_at_depth(
     cache: &mut TypeCache,
     policy: BoundedStringPolicy,
     depth: u32,
-) -> Result<FieldDesc, DecodeError> {
+) -> Result<(FieldDesc, TreeMetrics), DecodeError> {
     if depth > MAX_FIELD_DEPTH {
         return Err(decode_err!(
             "FieldDesc nesting exceeds MAX_FIELD_DEPTH ({MAX_FIELD_DEPTH})"
@@ -758,7 +887,8 @@ fn decode_type_desc_cached_at_depth(
         0xFD => {
             // define new cache slot, then full inline descriptor.
             let key = cur.get_u16(order)?;
-            let desc = decode_type_desc_cached_at_depth(cur, order, cache, policy, depth + 1)?;
+            let (desc, metrics) =
+                decode_type_desc_cached_at_depth(cur, order, cache, policy, depth + 1)?;
             // pvxs uses `std::map::emplace` (dataencode.cpp:91-95), which is
             // a no-op when the slot is already bound: a duplicate `0xFD`
             // for an existing slot is consumed and validated (the inline
@@ -768,15 +898,33 @@ fn decode_type_desc_cached_at_depth(
             // pvxs on the same byte stream. The current field still uses
             // the just-decoded inline `desc` (pvxs binds `descs[index]` to
             // the inline value regardless of the slot's prior contents).
-            cache.entry(key).or_insert_with(|| desc.clone());
-            Ok(desc)
+            //
+            // The slot carries the resolved metrics, so a later `0xFE` is
+            // admitted on the stored numbers — including across frames,
+            // where the referencing descriptor's recursion `depth` never
+            // saw this define.
+            cache
+                .entry(key)
+                .or_insert_with(|| CachedType::new_with_metrics(desc.clone(), metrics));
+            Ok((desc, metrics))
         }
         0xFE => {
-            // lookup existing cache slot.
+            // lookup existing cache slot. The slot was bounded when defined
+            // (its 0xFD store ran the assembly checks), so its stored metrics
+            // are returned as-is and the referencing composite re-checks the
+            // running total before the next clone.
             let key = cur.get_u16(order)?;
             cache
                 .get(&key)
-                .cloned()
+                .map(|slot| {
+                    (
+                        slot.desc.clone(),
+                        TreeMetrics {
+                            height: slot.height,
+                            nodes: slot.nodes,
+                        },
+                    )
+                })
                 .ok_or_else(|| decode_err!("typecache miss for slot {key}"))
         }
         TAG_STRUCTURE => {
@@ -794,10 +942,13 @@ fn decode_type_desc_cached_at_depth(
             // Recurse so a marker resolves, then lift the resolved
             // Structure to its array form. The literal-`0x80` element is
             // the same byte stream (tag + body) decoded by the same arm.
-            let elem = decode_type_desc_cached_at_depth(cur, order, cache, policy, depth + 1)?;
+            // Lifting Structure→StructureArray is the same node shape, so the
+            // element's metrics carry through unchanged.
+            let (elem, metrics) =
+                decode_type_desc_cached_at_depth(cur, order, cache, policy, depth + 1)?;
             match elem {
                 FieldDesc::Structure { struct_id, fields } => {
-                    Ok(FieldDesc::StructureArray { struct_id, fields })
+                    Ok((FieldDesc::StructureArray { struct_id, fields }, metrics))
                 }
                 other => Err(decode_err!(
                     "structure-array element resolved to a non-structure descriptor ({other:?})"
@@ -808,22 +959,26 @@ fn decode_type_desc_cached_at_depth(
             // Same as StructA — recurse (accepting `0xFD`/`0xFE` cache
             // markers), then require the resolved element to be a plain
             // Union.
-            let elem = decode_type_desc_cached_at_depth(cur, order, cache, policy, depth + 1)?;
+            let (elem, metrics) =
+                decode_type_desc_cached_at_depth(cur, order, cache, policy, depth + 1)?;
             match elem {
                 FieldDesc::Union {
                     struct_id,
                     variants,
-                } => Ok(FieldDesc::UnionArray {
-                    struct_id,
-                    variants,
-                }),
+                } => Ok((
+                    FieldDesc::UnionArray {
+                        struct_id,
+                        variants,
+                    },
+                    metrics,
+                )),
                 other => Err(decode_err!(
                     "union-array element resolved to a non-union descriptor ({other:?})"
                 )),
             }
         }
-        TAG_VARIANT => Ok(FieldDesc::Variant),
-        TAG_VARIANT_ARRAY => Ok(FieldDesc::VariantArray),
+        TAG_VARIANT => Ok((FieldDesc::Variant, TreeMetrics::LEAF)),
+        TAG_VARIANT_ARRAY => Ok((FieldDesc::VariantArray, TreeMetrics::LEAF)),
         // EPICS base pvData/pvAccessCPP serializes a `BoundedString` as the
         // `0x83` tag followed by `writeSize(maxLength)` and deserializes it
         // back into a `BoundedString` whose value is a normal string with a
@@ -839,7 +994,7 @@ fn decode_type_desc_cached_at_depth(
             // tag (normalized toward pvxs by construction).
             BoundedStringPolicy::Interop => {
                 decode_size_nonnull(cur, order, "bounded string size")?;
-                Ok(FieldDesc::Scalar(ScalarType::String))
+                Ok((FieldDesc::Scalar(ScalarType::String), TreeMetrics::LEAF))
             }
             // Strict pvxs: reject the tag (also rejects the legacy Rust-only
             // `0x83` that pre-interop builds emitted).
@@ -850,12 +1005,12 @@ fn decode_type_desc_cached_at_depth(
         b if b & 0x08 != 0 => {
             let scalar = ScalarType::from_array_type_code(b)
                 .ok_or_else(|| decode_err!("unknown scalar array tag 0x{b:02X}"))?;
-            Ok(FieldDesc::ScalarArray(scalar))
+            Ok((FieldDesc::ScalarArray(scalar), TreeMetrics::LEAF))
         }
         b => {
             let scalar = ScalarType::from_type_code(b)
                 .ok_or_else(|| decode_err!("unknown type tag 0x{b:02X}"))?;
-            Ok(FieldDesc::Scalar(scalar))
+            Ok((FieldDesc::Scalar(scalar), TreeMetrics::LEAF))
         }
     }
 }
@@ -872,19 +1027,35 @@ fn decode_structure_body_cached_at_depth(
     cache: &mut TypeCache,
     policy: BoundedStringPolicy,
     depth: u32,
-) -> Result<FieldDesc, DecodeError> {
+) -> Result<(FieldDesc, TreeMetrics), DecodeError> {
     let struct_id = decode_string(cur, order)?.unwrap_or_default();
     let n = decode_size_nonnull(cur, order, "structure field count")? as usize;
     let mut fields = Vec::with_capacity(safe_capacity(n, cur));
+    // Fold each field's resolved metrics into the running total and re-check
+    // before decoding the next one: a width-doubling `0xFE` chain is refused
+    // at the child that first breaches a limit, so at most one over-budget
+    // subtree is ever materialized (peak ≤ 2× budget) instead of the whole
+    // tree. `nodes` starts at 1 for the struct node itself; `height` is the
+    // deepest child's height + 1 (a childless struct stays height 0).
+    let mut metrics = TreeMetrics {
+        height: 0,
+        nodes: 1,
+    };
     for _ in 0..n {
-        fields.push(decode_field_desc_cached_at_depth(
-            cur, order, cache, policy, depth,
-        )?);
+        let (name, desc, child) =
+            decode_field_desc_cached_at_depth(cur, order, cache, policy, depth)?;
+        metrics.nodes = metrics.nodes.saturating_add(child.nodes);
+        metrics.height = metrics.height.max(child.height.saturating_add(1));
+        check_field_metrics(&metrics)?;
+        fields.push((name, desc));
     }
-    Ok(FieldDesc::Structure {
-        struct_id,
-        fields: fields.into(),
-    })
+    Ok((
+        FieldDesc::Structure {
+            struct_id,
+            fields: fields.into(),
+        },
+        metrics,
+    ))
 }
 
 // Union twin of [`decode_structure_body_cached_at_depth`] — decodes into
@@ -895,19 +1066,30 @@ fn decode_union_body_cached_at_depth(
     cache: &mut TypeCache,
     policy: BoundedStringPolicy,
     depth: u32,
-) -> Result<FieldDesc, DecodeError> {
+) -> Result<(FieldDesc, TreeMetrics), DecodeError> {
     let struct_id = decode_string(cur, order)?.unwrap_or_default();
     let n = decode_size_nonnull(cur, order, "union variant count")? as usize;
     let mut variants = Vec::with_capacity(safe_capacity(n, cur));
+    // Same incremental accounting as the struct body (see there).
+    let mut metrics = TreeMetrics {
+        height: 0,
+        nodes: 1,
+    };
     for _ in 0..n {
-        variants.push(decode_field_desc_cached_at_depth(
-            cur, order, cache, policy, depth,
-        )?);
+        let (name, desc, child) =
+            decode_field_desc_cached_at_depth(cur, order, cache, policy, depth)?;
+        metrics.nodes = metrics.nodes.saturating_add(child.nodes);
+        metrics.height = metrics.height.max(child.height.saturating_add(1));
+        check_field_metrics(&metrics)?;
+        variants.push((name, desc));
     }
-    Ok(FieldDesc::Union {
-        struct_id,
-        variants,
-    })
+    Ok((
+        FieldDesc::Union {
+            struct_id,
+            variants,
+        },
+        metrics,
+    ))
 }
 
 // ── ScalarValue encode/decode ────────────────────────────────────────────
@@ -3343,6 +3525,129 @@ mod tests {
         );
     }
 
+    // ── type-cache (0xFD/0xFE) resolved-tree bounds ──────────────────────
+
+    /// Wrap `inner` in `w` single-field structs, outermost first on the wire:
+    /// `struct{ x: struct{ x: ... inner } }`. Each layer is
+    /// `0x80 0xFF 0x01 0x01 'x'` (TAG_STRUCTURE, null id, 1 field, name "x").
+    #[cfg(test)]
+    fn nest_structs(w: usize, inner: &[u8]) -> Vec<u8> {
+        let mut b = inner.to_vec();
+        for _ in 0..w {
+            let mut s = vec![0x80u8, 0xFF, 0x01, 0x01, b'x'];
+            s.extend_from_slice(&b);
+            b = s;
+        }
+        b
+    }
+
+    /// A `0xFD <slot>` define carrying `body` as its inline descriptor (big
+    /// endian slot key, matching the decode calls below).
+    #[cfg(test)]
+    fn define_frame(slot: u16, body: &[u8]) -> Vec<u8> {
+        let mut f = vec![0xFDu8];
+        f.extend_from_slice(&slot.to_be_bytes());
+        f.extend_from_slice(body);
+        f
+    }
+
+    /// A `0xFD`/`0xFE` chain must be bounded by the RESOLVED nesting depth,
+    /// not just the wire-nesting the recursion `depth` guard counts: a slot
+    /// whose body nests only a few structs but bottoms out in a `0xFE` to a
+    /// previously-defined slot splices that slot's whole height in with no
+    /// extra wire nesting. Without the resolved-height check a chain of such
+    /// defines grows the tree one slot-height per define while the per-frame
+    /// wire depth stays flat — a pre-auth stack-overflow vector (clone/drop
+    /// of the resolved tree recurses). The ICSA-26-300-01 / pvDataCPP #109
+    /// RecurseGuard bounds the same thing on the C++ side.
+    #[test]
+    fn typecache_reference_is_bounded_by_resolved_depth() {
+        // 9 structs per define, each bottoming out in the previous slot:
+        // slot 0 → height 9, slot 1 → 18 (both ≤ MAX_FIELD_DEPTH=20), slot 2
+        // → 27, which must be refused.
+        const W: usize = 9;
+        let mut cache = TypeCache::new();
+
+        // slot 0: 9 structs around an Int leaf.
+        let s0 = define_frame(0, &nest_structs(W, &[0x22]));
+        decode_type_desc_cached(&mut Cursor::new(s0.as_slice()), ByteOrder::Big, &mut cache)
+            .expect("slot 0 (height 9) decodes");
+
+        // slot 1: 9 structs around 0xFE(0) → resolved height 18, still fine.
+        let r0 = [0xFEu8, 0x00, 0x00];
+        let s1 = define_frame(1, &nest_structs(W, &r0));
+        decode_type_desc_cached(&mut Cursor::new(s1.as_slice()), ByteOrder::Big, &mut cache)
+            .expect("slot 1 (height 18) decodes");
+
+        // slot 2: 9 structs around 0xFE(1) → resolved height 27 > 20: refused
+        // while assembling the body, before the referenced subtree recurses.
+        let r1 = [0xFEu8, 0x00, 0x01];
+        let s2 = define_frame(2, &nest_structs(W, &r1));
+        let err =
+            decode_type_desc_cached(&mut Cursor::new(s2.as_slice()), ByteOrder::Big, &mut cache)
+                .expect_err("slot 2 (height 27) must be refused");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("MAX_FIELD_DEPTH"),
+            "expected a depth-limit error, got: {msg}"
+        );
+    }
+
+    /// A width-doubling (here ×10) `0xFE` chain inflates the node count
+    /// exponentially in the resolved tree while costing a fixed handful of
+    /// wire bytes per define: slot k is a struct whose ten members each
+    /// reference slot k−1, so `nodes(k) = 1 + 10·nodes(k−1)`. A few hundred
+    /// wire bytes would otherwise materialize a multi-gigabyte tree. The
+    /// node-count check must refuse the chain within a handful of defines,
+    /// and — because it fires as each member is folded in — after cloning at
+    /// most one over-budget subtree rather than the whole tree.
+    #[test]
+    fn typecache_reference_is_bounded_by_node_count() {
+        const M: u16 = 10; // members per define, all referencing the prior slot
+        let mut cache = TypeCache::new();
+
+        // slot 0: Int leaf (1 node).
+        let s0 = define_frame(0, &[0x22]);
+        decode_type_desc_cached(&mut Cursor::new(s0.as_slice()), ByteOrder::Big, &mut cache)
+            .expect("slot 0 decodes");
+
+        // nodes(k) = 1 + 10·nodes(k-1): 1, 11, 111, 1111, 11111, then 111111
+        // which exceeds MAX_FIELD_NODES (65535) — refused no later than a few
+        // defines in, proving the blow-up never reaches memory exhaustion.
+        let mut rejected_at = None;
+        for k in 1..=20u16 {
+            let mut body = vec![0x80u8, 0xFF, M as u8];
+            for i in 0..M {
+                body.push(0x01);
+                body.push(b'a' + i as u8);
+                body.push(0xFE);
+                body.extend_from_slice(&(k - 1).to_be_bytes());
+            }
+            let frame = define_frame(k, &body);
+            match decode_type_desc_cached(
+                &mut Cursor::new(frame.as_slice()),
+                ByteOrder::Big,
+                &mut cache,
+            ) {
+                Ok(_) => {}
+                Err(e) => {
+                    rejected_at = Some((k, format!("{e:?}")));
+                    break;
+                }
+            }
+        }
+        let (k, msg) =
+            rejected_at.expect("a ×10 width-doubling chain must be refused within 20 defines");
+        assert!(
+            msg.contains("MAX_FIELD_NODES"),
+            "expected a node-count error, got: {msg}"
+        );
+        assert!(
+            k <= 6,
+            "a ×10 chain crosses 65535 nodes by slot 6; refused at slot {k}"
+        );
+    }
+
     // ── generic encode fallback ──────────────────────────────────
 
     /// `PvField::Null` against a Union descriptor must emit the `0xFF`
@@ -4304,7 +4609,7 @@ mod tests {
         // Simulate a connection-scope cache already populated by an earlier
         // frame: slot 5 = Int (the 0xFD define arrived in a prior message).
         let mut cache = TypeCache::new();
-        cache.insert(5, FieldDesc::Scalar(ScalarType::Int));
+        cache.insert(5, CachedType::new(FieldDesc::Scalar(ScalarType::Int)));
 
         // Variant wire bytes: 0xFE (backref), slot=5 (LE u16), Int value=42 (LE i32).
         let buf: &[u8] = &[0xFEu8, 0x05, 0x00, 0x2A, 0x00, 0x00, 0x00];

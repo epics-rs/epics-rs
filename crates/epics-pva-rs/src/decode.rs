@@ -1396,7 +1396,10 @@ mod tests {
         // Connection cache already holds slot 5 = Int (an earlier 0xFD
         // define on this connection).
         let mut cache = crate::pvdata::encode::TypeCache::new();
-        cache.insert(5, FieldDesc::Scalar(ScalarType::Int));
+        cache.insert(
+            5,
+            crate::pvdata::encode::CachedType::new(FieldDesc::Scalar(ScalarType::Int)),
+        );
         match decode_op_response_cached(&build(), Some(&intro), &mut cache).unwrap() {
             OpResponse::Data(d) => match d.value {
                 PvField::Structure(s) => {
@@ -1454,7 +1457,10 @@ mod tests {
         let reader_intro = dashmap::DashMap::new();
         // Slot 5 was defined earlier on this connection (a prior 0xFD
         // define); it lives in the reader cache — the single owner.
-        reader_cache.insert(5, FieldDesc::Scalar(ScalarType::Int));
+        reader_cache.insert(
+            5,
+            crate::pvdata::encode::CachedType::new(FieldDesc::Scalar(ScalarType::Int)),
+        );
 
         // Frame 1: INIT (subcmd 0x08) carrying the introspection inline. The
         // reader captures it for this IOID so a later DATA value can be

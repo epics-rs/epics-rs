@@ -1067,13 +1067,15 @@ async fn a_nan_request_is_taken_once() {
     let (ioc, _scan) = boot([10.0, 10.0, 35.0, 100.0]).await;
     settled(&ioc, "y offset changed to 35.000000").await;
     put_process(&ioc, "M:ml_monoTheta", f64::NAN).await;
+    let mut set = 0.0;
     for _ in 0..100 {
-        if f64_of(&ioc, "M:ml_monoThetaSet").await.is_nan() {
+        set = f64_of(&ioc, "M:ml_monoThetaSet").await;
+        if set.is_nan() {
             break;
         }
         task::sleep(Duration::from_millis(50)).await;
     }
-    assert!(f64_of(&ioc, "M:ml_monoThetaSet").await.is_nan());
+    assert!(set.is_nan(), "M:ml_monoThetaSet {set}");
     assert_eq!(f64_of(&ioc, "M:ml_monoMoving").await, 1.0);
     put_process(&ioc, "M:ml_monoPut", 1.0).await;
     task::sleep(Duration::from_millis(300)).await;

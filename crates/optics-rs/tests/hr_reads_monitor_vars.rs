@@ -213,16 +213,15 @@ async fn set_mode_takes_e_as_its_own_limit_put_clamped_it() {
     wait_near(&ioc, "H:HR1_EAO.DRVL", -229.18127).await;
     let e = f64_of(&ioc, "H:HR1_EAO").await;
     post_after_enter(&db, |db| post(db, "H:HR1_UseSetBO", EpicsValue::Enum(1))).await;
+    let mut msg1 = String::new();
     for _ in 0..100 {
-        if string_of(&ioc, "H:HR1_SeqMsg1SI").await == "Wavelength > 2d spacing of crystal 1." {
+        msg1 = string_of(&ioc, "H:HR1_SeqMsg1SI").await;
+        if msg1 == "Wavelength > 2d spacing of crystal 1." {
             break;
         }
         task::sleep(Duration::from_millis(50)).await;
     }
-    assert_eq!(
-        string_of(&ioc, "H:HR1_SeqMsg1SI").await,
-        "Wavelength > 2d spacing of crystal 1."
-    );
+    assert_eq!(msg1, "Wavelength > 2d spacing of crystal 1.");
     wait_near(&ioc, "H:HR1_EAO", e).await;
 }
 
@@ -586,13 +585,15 @@ async fn a_nan_request_is_taken_once() {
     let db = PvDatabase::clone(&ioc);
     idle(&db, "H:HR1_OperAckBO", "H:HR1_SeqMsg1SI").await;
     put_process(&ioc, "H:HR1_Theta1AO", f64::NAN).await;
+    let mut set = 0.0;
     for _ in 0..100 {
-        if f64_of(&ioc, "H:HR1_phi1SetAO").await.is_nan() {
+        set = f64_of(&ioc, "H:HR1_phi1SetAO").await;
+        if set.is_nan() {
             break;
         }
         task::sleep(Duration::from_millis(50)).await;
     }
-    assert!(f64_of(&ioc, "H:HR1_phi1SetAO").await.is_nan());
+    assert!(set.is_nan(), "H:HR1_phi1SetAO {set}");
     idle(&db, "H:HR1_OperAckBO", "H:HR1_SeqMsg1SI").await;
     put_process(&ioc, "H:HR1_Theta1AO", 20.0).await;
     wait_near(&ioc, "H:HR1_phi1SetAO", desired(&ioc, 20.0).await).await;

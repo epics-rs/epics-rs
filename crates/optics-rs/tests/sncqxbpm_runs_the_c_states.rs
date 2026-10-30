@@ -141,10 +141,12 @@ fn assert_near(ioc: &Ioc, pv: &str, want: f64) {
 /// Up to 20 s, the longest being set_offsets' sweep of about 7 s.
 async fn wait_for(ioc: &Ioc, pv: &str, want: f64) {
     let deadline = Instant::now() + Duration::from_secs(20);
-    while f64_of(ioc, pv) != want && Instant::now() < deadline {
+    let mut got = f64_of(ioc, pv);
+    while got != want && Instant::now() < deadline {
         task::sleep(Duration::from_millis(20)).await;
+        got = f64_of(ioc, pv);
     }
-    assert_eq!(f64_of(ioc, pv), want, "{pv}");
+    assert_eq!(got, want, "{pv}");
 }
 
 fn read_count(ioc: &Ioc) -> usize {

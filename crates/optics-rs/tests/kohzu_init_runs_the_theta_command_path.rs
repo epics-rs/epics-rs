@@ -588,13 +588,15 @@ async fn a_theta_tweak_past_the_limit_moves_to_the_standing_setpoint() {
 /// Poll `pv` until it is within [`assert_near`]'s tolerance of `want`, then
 /// assert it.
 async fn eventually_near(ioc: &PvDatabase, pv: &str, want: f64) {
+    let mut got = f64::NAN;
     for _ in 0..100 {
-        if (f64_of(ioc, pv).await - want).abs() <= 1e-4 * want.abs().max(1.0) {
-            break;
+        got = f64_of(ioc, pv).await;
+        if near(got, want) {
+            return;
         }
         task::sleep(Duration::from_millis(50)).await;
     }
-    assert_near(ioc, pv, want).await;
+    panic!("{pv}: {got}, C {want}");
 }
 
 /// Return with the sequencer idle after an enter. An ack posted during a

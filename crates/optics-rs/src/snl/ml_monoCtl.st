@@ -71,6 +71,11 @@ assign  ml_monoMoving to "{P}ml_monoMoving";
 monitor ml_monoMoving;
 evflag  mlMbusy;
 sync    ml_monoMoving mlMbusy;
+/* What a decision on ml_monoMoving reads. The monitored copy can lag a
+ * rise from this program's own puts: thetaLimits' DRVH/DRVL puts process
+ * the AOs, whose FLNK raises ml_monoMoving. */
+short   ml_monoMovingNow;
+assign  ml_monoMovingNow to "{P}ml_monoMoving";
 
 short   ml_monoDone; 
 /* Set where move_ml_mono leaves ml_monoMoving raised for a manual move, so
@@ -713,7 +718,8 @@ state waitForCmndEnter {
 		pvGet(ENow);
 		pvGet(lambdaNow);
 		pvGet(thetaNow);
-		if (ml_monoMoving && ml_monoDone && SAME(ENow, ELast) &&
+		pvGet(ml_monoMovingNow);
+		if (ml_monoMovingNow && ml_monoDone && SAME(ENow, ELast) &&
 		    SAME(lambdaNow, lambdaLast) && SAME(thetaNow, thetaLast)) {
 			if (ml_monoCtlDebug) %%printf("ml_monoCtl:waitForCmndEnter: asserting 'done'.\n");
 			ml_monoMoving=0; ml_monoDone = 0; ml_monoHeld = 0;
@@ -1014,34 +1020,35 @@ state busyChanged {
 		pvGet(ENow);
 		pvGet(lambdaNow);
 		pvGet(thetaNow);
+		pvGet(ml_monoMovingNow);
 	}
-	when (ml_monoMoving > 0 && !SAME(ENow, ELast)) {
+	when (ml_monoMovingNow > 0 && !SAME(ENow, ELast)) {
 		if (ml_monoCtlDebug) %%printf("ml_monoCtl:busyChanged\n to Moving and E changed");
 		E = ENow;
 		ELast = E;
 		ml_monoDone = 0;
 	} state eChanged
-	when (ml_monoMoving > 0 && !SAME(lambdaNow, lambdaLast)) {
+	when (ml_monoMovingNow > 0 && !SAME(lambdaNow, lambdaLast)) {
 		if (ml_monoCtlDebug) %%printf("ml_monoCtl:busyChanged\n to Moving and lambda changed");
 		lambda = lambdaNow;
 		lambdaLast = lambda;
 		ml_monoDone = 0;
 	} state lChanged
-	when (ml_monoMoving > 0 && !SAME(thetaNow, thetaLast)) {
+	when (ml_monoMovingNow > 0 && !SAME(thetaNow, thetaLast)) {
 		if (ml_monoCtlDebug) %%printf("ml_monoCtl:busyChanged\n to Moving and theta changed");
 		theta = thetaNow;
 		thetaLast = theta;
 		ml_monoDone = 0;
 	} state thChanged
-	when (ml_monoMoving > 0 && !ml_monoHeld) {
+	when (ml_monoMovingNow > 0 && !ml_monoHeld) {
 		if (ml_monoCtlDebug) %%printf("ml_monoCtl:busyChanged\n to Moving but unclear why");
 		ml_monoDone = 0;
 	} state eChanged
 	/* The rise of the move move_ml_mono holds. */
-	when (ml_monoMoving > 0) {
+	when (ml_monoMovingNow > 0) {
 		if (ml_monoCtlDebug) %%printf("ml_monoCtl:busyChanged\n to Moving and held");
 	} state waitForCmndEnter
-	when (ml_monoMoving == 0) {
+	when (ml_monoMovingNow == 0) {
 		if (ml_monoCtlDebug) %%printf("ml_monoCtl:busyChanged\n to Done");
 		ml_monoHeld = 0;
 	} state waitForCmndEnter
@@ -1199,7 +1206,8 @@ state move_ml_mono {
 
 	when (1) {
 		if (ml_monoCtlDebug) %%printf("ml_monoCtl:move_ml_mono\n");
-		ml_monoHeld = ml_monoMoving;
+		pvGet(ml_monoMovingNow);
+		ml_monoHeld = ml_monoMovingNow;
 	} state waitForCmndEnter
 }
 

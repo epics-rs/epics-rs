@@ -92,6 +92,11 @@ assign  kohzuMoving to "{P}KohzuMoving";
 monitor kohzuMoving;
 evflag  kMbusy;
 sync    kohzuMoving kMbusy;
+/* What a decision on KohzuMoving reads. The monitored copy can lag a
+ * rise from this program's own puts: thetaLimits' DRVH/DRVL puts process
+ * the AOs, whose FLNK raises KohzuMoving. */
+short   kohzuMovingNow;
+assign  kohzuMovingNow to "{P}KohzuMoving";
 
 short   kohzuDone;
 /* Set where moveKohzu leaves KohzuMoving raised for a manual move, so
@@ -748,7 +753,8 @@ state waitForCmndEnter {
 		pvGet(ENow);
 		pvGet(lambdaNow);
 		pvGet(thetaNow);
-		if (kohzuMoving && kohzuDone && SAME(ENow, ELast) &&
+		pvGet(kohzuMovingNow);
+		if (kohzuMovingNow && kohzuDone && SAME(ENow, ELast) &&
 		    SAME(lambdaNow, lambdaLast) && SAME(thetaNow, thetaLast)) {
 			if (kohzuCtlDebug) %%printf("kohzuCtl:waitForCmndEnter: asserting 'done'.\n");
 			kohzuMoving=0; kohzuDone = 0; kohzuHeld = 0;
@@ -1042,35 +1048,36 @@ state busyChanged {
 		pvGet(ENow);
 		pvGet(lambdaNow);
 		pvGet(thetaNow);
+		pvGet(kohzuMovingNow);
 	}
-	when (kohzuMoving > 0 && !SAME(ENow, ELast)) {
+	when (kohzuMovingNow > 0 && !SAME(ENow, ELast)) {
 		if (kohzuCtlDebug) %%printf("kohzuCtl:busyChanged\n to Moving and E changed");
 		E = ENow;
 		ELast = E;
 		kohzuDone = 0;
 	} state eChanged
-	when (kohzuMoving > 0 && !SAME(lambdaNow, lambdaLast)) {
+	when (kohzuMovingNow > 0 && !SAME(lambdaNow, lambdaLast)) {
 		if (kohzuCtlDebug) %%printf("kohzuCtl:busyChanged\n to Moving and lambda changed");
 		lambda = lambdaNow;
 		lambdaLast = lambda;
 		kohzuDone = 0;
 	} state lChanged
-	when (kohzuMoving > 0 && !SAME(thetaNow, thetaLast)) {
+	when (kohzuMovingNow > 0 && !SAME(thetaNow, thetaLast)) {
 		if (kohzuCtlDebug) %%printf("kohzuCtl:busyChanged\n to Moving and theta changed");
 		theta = thetaNow;
 		thetaLast = theta;
 		kohzuDone = 0;
 	} state thChanged
-	when (kohzuMoving > 0 && !kohzuHeld) {
+	when (kohzuMovingNow > 0 && !kohzuHeld) {
 		if (kohzuCtlDebug) %%printf("kohzuCtl:busyChanged\n to Moving but unclear why");
 		kohzuDone = 0;
 	} state eChanged
 	/* The rise of the move moveKohzu holds; C's efClear(kMbusy) dropped
 	 * it, with an equal-value request's. */
-	when (kohzuMoving > 0) {
+	when (kohzuMovingNow > 0) {
 		if (kohzuCtlDebug) %%printf("kohzuCtl:busyChanged\n to Moving and held");
 	} state waitForCmndEnter
-	when (kohzuMoving == 0) {
+	when (kohzuMovingNow == 0) {
 		if (kohzuCtlDebug) %%printf("kohzuCtl:busyChanged\n to Done");
 		kohzuHeld = 0;
 	} state waitForCmndEnter
@@ -1303,7 +1310,8 @@ state moveKohzu {
 
 	when (1) {
 		if (kohzuCtlDebug) %%printf("kohzuCtl:moveKohzu\n");
-		kohzuHeld = kohzuMoving;
+		pvGet(kohzuMovingNow);
+		kohzuHeld = kohzuMovingNow;
 	} state waitForCmndEnter
 }
 

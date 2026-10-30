@@ -84,6 +84,11 @@ assign  hr_Moving to "{P}HR{N}_Moving";
 monitor	hr_Moving;
 evflag  hr_Moving_mon;
 sync    hr_Moving hr_Moving_mon;
+/* What a decision on hr_Moving reads. The monitored copy can lag a rise
+ * from this program's own puts: phiLimits' DRVH/DRVL puts process the
+ * AOs, whose FLNK raises hr_Moving. */
+short   hr_MovingNow;
+assign  hr_MovingNow to "{P}HR{N}_Moving";
 
 short	hr_Done;
 
@@ -745,7 +750,8 @@ ss hr_Ctl
 			pvGet(lambdaNow);
 			pvGet(theta1Now);
 			pvGet(theta2Now);
-			if (hr_Moving && hr_Done &&
+			pvGet(hr_MovingNow);
+			if (hr_MovingNow && hr_Done &&
 			    SAME(ENow, ELast) && SAME(lambdaNow, lambdaLast) &&
 			    SAME(theta1Now, theta1Last) && SAME(theta2Now, theta2Last)) {
 				if (hrCtlDebug) %%printf("hrCtl:waitForCmndEnter: asserting 'done'.\n");

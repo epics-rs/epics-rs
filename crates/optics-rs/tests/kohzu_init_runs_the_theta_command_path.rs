@@ -1205,6 +1205,53 @@ async fn an_equal_request_during_a_manual_hold_joins_it() {
     assert_near(&ioc, "K:th.VAL", 20.0).await;
 }
 
+/// Hold a manual theta request to 20, then switch to auto mode.
+async fn held_at_20() -> Kohzu {
+    let ioc = boot([10.0, -17.77, 100.78]).await;
+    ready(&ioc, "y offset changed to 17.500000").await;
+    put_process(&ioc, "K:BraggThetaAO", 20.0).await;
+    eventually_near(&ioc, "K:KohzuThetaSetAO", 20.0).await;
+    task::sleep(Duration::from_millis(300)).await;
+    put_process(&ioc, "K:KohzuModeBO", 1.0).await;
+    ioc
+}
+
+/// An equal theta request in auto mode, put once the hold is lowered, is
+/// moved to and Done.
+async fn an_equal_request_after_the_hold_is_done(ioc: &PvDatabase) {
+    eventually_near(ioc, "K:KohzuMoving", 0.0).await;
+    // A move's limit monitors run thetaLimits, whose own DRVH/DRVL puts
+    // raise KohzuMoving and whose checkDone lowers it.
+    task::sleep(Duration::from_secs(1)).await;
+    let mut moving = DbSubscription::subscribe(ioc, "K:KohzuMoving")
+        .await
+        .unwrap();
+    put_process(ioc, "K:BraggThetaAO", 20.0).await;
+    shows(&mut moving, 1.0).await;
+    task::sleep(Duration::from_millis(300)).await;
+    post_dmov(ioc, true);
+    shows(&mut moving, 0.0).await;
+}
+
+/// An equal request after a hold's move is done is not taken for that
+/// hold.
+#[epics_base_rs::epics_test]
+async fn a_hold_ends_at_its_done() {
+    let ioc = held_at_20().await;
+    post_dmov(&ioc, false);
+    moves_to(&ioc, 20.0).await;
+    post_dmov(&ioc, true);
+    an_equal_request_after_the_hold_is_done(&ioc).await;
+}
+
+/// A hold lowered by hand ends with it.
+#[epics_base_rs::epics_test]
+async fn a_hold_ends_when_lowered_by_hand() {
+    let ioc = held_at_20().await;
+    put_process(&ioc, "K:KohzuMoving", 0.0).await;
+    an_equal_request_after_the_hold_is_done(&ioc).await;
+}
+
 /// A theta LLM put above the standing theta clamps BraggThetaAO to the new
 /// DRVL. The clamp is this program's own: no pass is computed for it, so
 /// nothing moves and no limit refusal replaces the limits message, and Done

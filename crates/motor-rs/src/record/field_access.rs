@@ -282,22 +282,30 @@ pub(crate) fn motor_put_field(
         "DIR" => {
             match value {
                 EpicsValue::Short(v) => {
-                    rec.conv.dir = MotorDir::from_i16(v);
+                    let dir = MotorDir::from_i16(v);
                     // C: branch on FOFF
                     match rec.conv.foff {
                         FreezeOffset::Frozen => {
                             // FOFF=Frozen: recalculate VAL from DVAL
-                            rec.pos.val =
-                                coordinate::dial_to_user(rec.pos.dval, rec.conv.dir, rec.pos.off);
+                            rec.pos.val = coordinate::dial_to_user(rec.pos.dval, dir, rec.pos.off);
                             rec.mark(m::VAL);
                         }
                         FreezeOffset::Variable => {
-                            // FOFF=Variable: recalculate OFF to preserve VAL
-                            rec.pos.off =
-                                coordinate::calc_offset(rec.pos.val, rec.pos.dval, rec.conv.dir);
+                            // FOFF=Variable: recalculate OFF to preserve VAL.
+                            // A C defect not copied: C 2777 derives it from
+                            // the VAL or DVAL a Pause or a disabled record
+                            // holds unprocessed, so a NaN one leaves OFF, RBV
+                            // and the user limits NaN. The DIR put is dropped
+                            // like a non-finite OFF put.
+                            let Some(off) = coordinate::calc_offset(rec.pos.val, rec.pos.dval, dir)
+                            else {
+                                return Ok(());
+                            };
+                            rec.pos.off = off;
                             rec.mark(m::OFF);
                         }
                     }
+                    rec.conv.dir = dir;
                     // C special DIR (2769-2783).
                     rec.pos.rbv = coordinate::dial_to_user(rec.pos.drbv, rec.conv.dir, rec.pos.off);
                     rec.mark(m::RBV);

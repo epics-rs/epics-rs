@@ -67,10 +67,14 @@ pub fn check_soft_limits(dval: f64, dhlm: f64, dllm: f64) -> bool {
     dval > dhlm || dval < dllm
 }
 
-/// Calculate offset from user and dial values.
-/// off = user - dir.sign() * dial
-pub fn calc_offset(user: f64, dial: f64, dir: MotorDir) -> f64 {
-    user - dir.sign() * dial
+/// Calculate offset from user and dial values: off = user - dir.sign() * dial.
+///
+/// A C defect not copied: C stores this offset unchecked (motorRecord.cc
+/// 2215, 2777, 3796-3798), so a NaN or infinite VAL or DVAL leaves OFF, RBV
+/// and the user limits non-finite. An offset that is not finite is None;
+/// OFF is never stored non-finite.
+pub fn calc_offset(user: f64, dial: f64, dir: MotorDir) -> Option<f64> {
+    Some(user - dir.sign() * dial).filter(|off| off.is_finite())
 }
 
 /// Update position cascade when VAL is written.
@@ -86,14 +90,13 @@ pub fn cascade_from_val(
 ) -> Result<(f64, i32, f64), MotorError> {
     if set_mode {
         // SET mode: redefine offset, no move
-        let new_off = calc_offset(val, current_dval, dir);
-        if !new_off.is_finite() {
-            return Err(MotorError::InvalidFieldValue(format!(
+        let new_off = calc_offset(val, current_dval, dir).ok_or_else(|| {
+            MotorError::InvalidFieldValue(format!(
                 "offset is not finite (val={}, dval={})",
                 CFloat(val).g(),
                 CFloat(current_dval).g()
-            )));
-        }
+            ))
+        })?;
         let rval = dial_to_raw(current_dval, mres)?;
         Ok((current_dval, rval, new_off))
     } else {

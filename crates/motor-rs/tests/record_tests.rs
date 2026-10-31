@@ -699,6 +699,113 @@ fn an_offset_put_that_is_not_finite_is_dropped() {
     }
 }
 
+/// A record at DVAL 5 and OFF 1 (VAL 6, user limits 11/-9) holding a NaN
+/// `field` unprocessed: stored, as a disabled record stores a put, or
+/// collected under SPMG=Pause, which returns before the move block.
+fn holding_a_nan(field: &str, paused: bool, foff: FreezeOffset) -> MotorRecord {
+    let mut rec = MotorRecord::new();
+    rec.internal.init_invariants_synced = true;
+    rec.conv.mres = 1.0;
+    rec.conv.foff = foff;
+    rec.stat.msta = MstaFlags::DONE;
+    rec.put_field("DHLM", EpicsValue::Double(10.0)).unwrap();
+    rec.put_field("DLLM", EpicsValue::Double(-10.0)).unwrap();
+    rec.pos.dval = 5.0;
+    rec.pos.drbv = 5.0;
+    rec.pos.rval = 5;
+    rec.internal.ldvl = 5.0;
+    rec.internal.lrvl = 5;
+    rec.put_field("OFF", EpicsValue::Double(1.0)).unwrap();
+    assert_eq!((rec.pos.val, rec.internal.lval), (6.0, 6.0));
+    if paused {
+        rec.put_field("SPMG", EpicsValue::Short(1)).unwrap();
+        rec.do_process();
+    }
+    rec.put_field(field, EpicsValue::Double(f64::NAN)).unwrap();
+    if paused {
+        rec.do_process();
+        assert!(
+            rec.pos.dval.is_nan(),
+            "the Pause holds the collected target"
+        );
+    }
+    rec
+}
+
+/// Special DIR derives the FOFF=Variable offset from the VAL and DVAL the
+/// record holds (C 2777), so a held NaN leaves OFF, RBV and the user limits
+/// NaN in C. The DIR put is dropped instead.
+#[test]
+fn a_dir_put_over_a_held_target_that_is_not_finite_is_dropped() {
+    for (field, paused) in [("VAL", false), ("DVAL", false), ("VAL", true)] {
+        let mut rec = holding_a_nan(field, paused, FreezeOffset::Variable);
+        rec.put_field("DIR", EpicsValue::Short(1)).unwrap();
+        let case = format!("{field} paused={paused}");
+        assert_eq!(rec.conv.dir, MotorDir::Pos, "{case}: DIR kept");
+        assert_eq!((rec.pos.off, rec.pos.rbv), (1.0, 6.0), "{case}");
+        assert_eq!((rec.limits.hlm, rec.limits.llm), (11.0, -9.0), "{case}");
+    }
+}
+
+/// C's resolution block loads the held target with no step-count gate
+/// (1988-1989): a NaN DVAL is loaded (3811), and under FOFF=Variable a NaN
+/// VAL or DVAL becomes OFF (3796-3798). The held target is refused and the
+/// load re-anchors at the last one.
+#[test]
+fn a_resolution_change_refuses_a_held_target_that_is_not_finite() {
+    for foff in [FreezeOffset::Variable, FreezeOffset::Frozen] {
+        for (field, paused) in [("VAL", false), ("DVAL", false), ("VAL", true)] {
+            let mut rec = holding_a_nan(field, paused, foff);
+            rec.put_field("MRES", EpicsValue::Double(0.5)).unwrap();
+            let effects = rec.do_process();
+            let case = format!("{foff:?} {field} paused={paused}");
+            assert!(
+                effects
+                    .commands
+                    .contains(&MotorCommand::SetPosition { position: 10.0 }),
+                "{case}: {:?}",
+                effects.commands
+            );
+            assert_eq!(
+                (rec.pos.val, rec.pos.dval, rec.pos.off),
+                (6.0, 5.0, 1.0),
+                "{case}"
+            );
+            assert_eq!((rec.internal.lval, rec.internal.ldvl), (6.0, 5.0), "{case}");
+            assert!(
+                rec.limits.hlm.is_finite() && rec.limits.llm.is_finite(),
+                "{case}"
+            );
+        }
+    }
+}
+
+/// A finite VAL and DVAL can still differ past f64::MAX, an infinite
+/// offset C load_pos stores (3796-3798). The SET redefinition is refused
+/// like a refused move.
+#[test]
+fn a_set_load_to_an_offset_that_is_not_finite_is_refused() {
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 1e300;
+    rec.stat.msta = MstaFlags::DONE;
+    rec.pos.val = 1e308;
+    rec.pos.off = 1e308;
+    rec.internal.lval = 1e308;
+    rec.put_field("SET", EpicsValue::Short(1)).unwrap();
+    rec.put_field("DVAL", EpicsValue::Double(-1e308)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Set);
+    assert!(
+        !(effects.commands.iter()).any(|c| matches!(c, MotorCommand::SetPosition { .. })),
+        "{:?}",
+        effects.commands
+    );
+    assert_eq!(
+        (rec.pos.val, rec.pos.dval, rec.pos.off),
+        (1e308, 0.0, 1e308)
+    );
+    assert!(rec.stat.dmov != 0 && rec.stat.mip.is_empty());
+}
+
 #[test]
 fn test_set_dval_load_pos_pulses_dmov_and_refreshes_status() {
     // C load_pos (motorRecord.cc:3771-3817): SET-mode DVAL re-anchors

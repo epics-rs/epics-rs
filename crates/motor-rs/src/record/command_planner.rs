@@ -1551,6 +1551,20 @@ impl MotorRecord {
     /// the cycle (process 1405-1409: MIP_LOAD_P -> MIP_DONE, DMOV ->
     /// TRUE, no DLY and no retry evaluation).
     pub(crate) fn load_pos(&mut self, effects: &mut ProcessEffects) {
+        // A C defect not copied: C 3796-3798 stores a Variable offset that
+        // is not finite. The redefinition is refused like a refused move
+        // (2434-2452).
+        let variable_off = match self.conv.foff {
+            FreezeOffset::Frozen => None,
+            FreezeOffset::Variable => {
+                let off = coordinate::calc_offset(self.pos.val, self.pos.dval, self.conv.dir);
+                if off.is_none() {
+                    self.refuse_move_restore_lasts();
+                    return;
+                }
+                off
+            }
+        };
         self.internal.ldvl = self.pos.dval;
         self.internal.lval = self.pos.val;
         if self.conv.mres != 0.0 {
@@ -1561,18 +1575,18 @@ impl MotorRecord {
             self.pos.rval = rval;
         }
         self.internal.lrvl = self.pos.rval;
-        if self.conv.foff == FreezeOffset::Frozen {
+        if let Some(off) = variable_off {
+            // C 3792-3800: adjust the offset to keep VAL and retranslate
+            // the user limits.
+            self.pos.off = off;
+            self.mark(m::OFF);
+            self.set_userlimits();
+        } else {
             // C 3782-3791: translate dial to user through the frozen
             // offset.
             self.pos.val = coordinate::dial_to_user(self.pos.dval, self.conv.dir, self.pos.off);
             self.mark(m::VAL);
             self.internal.lval = self.pos.val;
-        } else {
-            // C 3792-3800: adjust the offset to keep VAL and retranslate
-            // the user limits.
-            self.pos.off = coordinate::calc_offset(self.pos.val, self.pos.dval, self.conv.dir);
-            self.mark(m::OFF);
-            self.set_userlimits();
         }
         // C load_pos (motorRecord.cc:3771-3817) marks M_RVAL/M_VAL/M_OFF/
         // M_MIP/M_DMOV but never recomputes or MARKs RBV: the readback is
@@ -1630,6 +1644,15 @@ impl MotorRecord {
             self.internal.pp = 1;
             effects.commands.push(MotorCommand::Poll);
         } else if !self.stat.mip.contains(MipFlags::LOAD_P) {
+            // A C defect not copied: no step-count gate precedes this
+            // load_pos (1988-1989), so a NaN VAL or DVAL that a Pause or a
+            // disabled record holds unprocessed is loaded (3811) and
+            // becomes OFF (3796-3798). That pending target is refused as
+            // the move block refuses it, and the load re-anchors at the
+            // last one.
+            if !(self.pos.val.is_finite() && self.pos.dval.is_finite()) {
+                self.refuse_move_restore_lasts();
+            }
             self.load_pos(effects);
         }
     }

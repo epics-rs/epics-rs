@@ -257,6 +257,12 @@ pub(crate) fn motor_put_field(
         "OFF" => {
             match value {
                 EpicsValue::Double(v) => {
+                    // Rust guard, not C: special OFF (2786-2791) accepts a
+                    // NaN or infinite put and VAL, RBV and the user limits
+                    // follow it; an offset that is not finite is dropped.
+                    if !v.is_finite() {
+                        return Ok(());
+                    }
                     rec.pos.off = v;
                     // Recalculate user coords from dial
                     rec.pos.val = coordinate::dial_to_user(rec.pos.dval, rec.conv.dir, rec.pos.off);

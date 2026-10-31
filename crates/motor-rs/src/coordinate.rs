@@ -87,6 +87,13 @@ pub fn cascade_from_val(
     if set_mode {
         // SET mode: redefine offset, no move
         let new_off = calc_offset(val, current_dval, dir);
+        if !new_off.is_finite() {
+            return Err(MotorError::InvalidFieldValue(format!(
+                "offset is not finite (val={}, dval={})",
+                CFloat(val).g(),
+                CFloat(current_dval).g()
+            )));
+        }
         let rval = dial_to_raw(current_dval, mres)?;
         Ok((current_dval, rval, new_off))
     } else {

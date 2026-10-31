@@ -615,6 +615,90 @@ fn test_set_foff_variable_val_completes_without_command() {
     assert!(rec.stat.mip.is_empty(), "C 2223: mip = MIP_DONE");
 }
 
+/// C 2213 stores a NaN offset for a NaN VAL in SET + FOFF=Variable (the
+/// oracle on motorSim: OFF, RBV, HLM and LLM read nan). The redefinition
+/// is refused instead, for every input that folds into VAL.
+#[test]
+fn a_set_redefinition_to_a_non_finite_offset_is_refused() {
+    for (input, bad) in [
+        ("VAL", f64::NAN),
+        ("VAL", f64::INFINITY),
+        ("RLV", f64::NAN),
+        ("TWV", f64::NAN),
+    ] {
+        let mut rec = MotorRecord::new();
+        rec.internal.init_invariants_synced = true;
+        rec.conv.mres = 1.0;
+        rec.stat.msta = MstaFlags::DONE;
+        rec.put_field("DHLM", EpicsValue::Double(10.0)).unwrap();
+        rec.put_field("DLLM", EpicsValue::Double(-10.0)).unwrap();
+        rec.pos.val = 5.0;
+        rec.pos.dval = 5.0;
+        rec.pos.drbv = 5.0;
+        rec.internal.lval = 5.0;
+        rec.internal.ldvl = 5.0;
+        rec.internal.lrvl = 5;
+        rec.pos.rval = 5;
+        rec.put_field("SET", EpicsValue::Short(1)).unwrap();
+        let src = match input {
+            "TWV" => {
+                rec.ctrl.twv = bad;
+                rec.ctrl.twf = 1;
+                CommandSource::Twf
+            }
+            "RLV" => {
+                rec.put_field("RLV", EpicsValue::Double(bad)).unwrap();
+                CommandSource::Rlv
+            }
+            _ => {
+                rec.put_field("VAL", EpicsValue::Double(bad)).unwrap();
+                CommandSource::Val
+            }
+        };
+        let effects = rec.plan_motion(src);
+        let case = format!("{input} {bad}");
+        assert!(
+            !(effects.commands.iter()).any(|c| matches!(
+                c,
+                MotorCommand::MoveAbsolute { .. } | MotorCommand::SetPosition { .. }
+            )),
+            "{case}: {:?}",
+            effects.commands
+        );
+        assert_eq!(rec.pos.off, 0.0, "{case}: OFF kept");
+        assert_eq!((rec.limits.hlm, rec.limits.llm), (10.0, -10.0), "{case}");
+        assert_eq!(
+            (rec.pos.val, rec.pos.dval),
+            (5.0, 5.0),
+            "{case}: rolled back"
+        );
+        assert_eq!(rec.internal.lval, 5.0, "{case}");
+        assert!(rec.stat.dmov != 0 && rec.stat.mip.is_empty(), "{case}");
+    }
+}
+
+/// Special OFF (2786-2791) takes a NaN or infinite offset in C, and VAL,
+/// RBV and the user limits follow it; the put is dropped instead.
+#[test]
+fn an_offset_put_that_is_not_finite_is_dropped() {
+    for bad in [f64::NAN, f64::NEG_INFINITY] {
+        let mut rec = MotorRecord::new();
+        rec.internal.init_invariants_synced = true;
+        rec.conv.mres = 1.0;
+        rec.put_field("DHLM", EpicsValue::Double(10.0)).unwrap();
+        rec.put_field("DLLM", EpicsValue::Double(-10.0)).unwrap();
+        rec.pos.dval = 5.0;
+        rec.pos.drbv = 5.0;
+        rec.put_field("OFF", EpicsValue::Double(1.0)).unwrap();
+        assert_eq!((rec.pos.val, rec.pos.rbv), (6.0, 6.0));
+        rec.put_field("OFF", EpicsValue::Double(bad)).unwrap();
+        assert_eq!(rec.pos.off, 1.0, "OFF {bad}");
+        assert_eq!((rec.pos.val, rec.pos.rbv), (6.0, 6.0), "OFF {bad}");
+        assert_eq!((rec.limits.hlm, rec.limits.llm), (11.0, -9.0), "OFF {bad}");
+        assert_eq!(rec.internal.lval, 1.0, "OFF {bad}");
+    }
+}
+
 #[test]
 fn test_set_dval_load_pos_pulses_dmov_and_refreshes_status() {
     // C load_pos (motorRecord.cc:3771-3817): SET-mode DVAL re-anchors

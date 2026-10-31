@@ -1695,7 +1695,7 @@ impl MotorRecord {
     /// controller command (LOAD_POS belongs to the Frozen/DVAL/RVAL
     /// redefinition paths). Called only from collect_drive_fields.
     pub(crate) fn set_mode_redefine_val(&mut self, new_val: f64) {
-        if let Ok((dval, rval, off)) = coordinate::cascade_from_val(
+        match coordinate::cascade_from_val(
             new_val,
             self.conv.dir,
             self.pos.off,
@@ -1704,18 +1704,26 @@ impl MotorRecord {
             true,
             self.pos.dval,
         ) {
-            self.pos.val = new_val;
-            self.pos.dval = dval;
-            self.pos.rval = rval;
-            self.pos.off = off;
-            self.set_userlimits();
-            self.pos.rbv = coordinate::dial_to_user(self.pos.drbv, self.conv.dir, self.pos.off);
-            self.internal.lval = self.pos.val;
-            self.stat.mip = MipFlags::empty();
-            self.stat.dmov = 1;
-            // C 2206-2226, all unconditional.
-            self.mark(m::VAL | m::OFF | m::RBV | m::MIP | m::DMOV);
-            self.set_phase(MotionPhase::Idle);
+            Ok((dval, rval, off)) => {
+                self.pos.val = new_val;
+                self.pos.dval = dval;
+                self.pos.rval = rval;
+                self.pos.off = off;
+                self.set_userlimits();
+                self.pos.rbv = coordinate::dial_to_user(self.pos.drbv, self.conv.dir, self.pos.off);
+                self.internal.lval = self.pos.val;
+                self.stat.mip = MipFlags::empty();
+                self.stat.dmov = 1;
+                // C 2206-2226, all unconditional.
+                self.mark(m::VAL | m::OFF | m::RBV | m::MIP | m::DMOV);
+                self.set_phase(MotionPhase::Idle);
+            }
+            // A C defect not copied: C 2213 stores the offset unchecked, so
+            // a NaN or infinite VAL, RLV, TWV or DOL makes OFF, RBV and the
+            // user limits non-finite, and every later VAL a NaN DVAL (the
+            // oracle on motorSim). The redefinition is refused like a
+            // refused move (2434-2452).
+            Err(_) => self.refuse_move_restore_lasts(),
         }
     }
 

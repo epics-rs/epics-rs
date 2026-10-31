@@ -6826,6 +6826,89 @@ fn test_init_restore_adopts_drive_values_only_off_closed_loop() {
 }
 
 #[test]
+fn an_autosaved_dval_that_is_not_finite_is_not_restored() {
+    // C init_controller (devMotorAsyn.c:199-223) writes this DVAL as the
+    // controller position under each of these RSTM cases.
+    use asyn_rs::interfaces::motor::MotorStatus;
+    for (rstm, use_rel, dval, position) in [
+        (RestoreMode::Always, false, f64::NAN, 3.0),
+        (RestoreMode::Always, false, f64::NEG_INFINITY, 3.0),
+        (RestoreMode::Conditional, true, f64::NAN, 3.0),
+        (RestoreMode::NearZero, false, f64::INFINITY, 0.0),
+    ] {
+        let mut rec = MotorRecord::new();
+        rec.conv.rstm = rstm;
+        rec.conv.mres = 1.0;
+        rec.conv.ueip = use_rel;
+        rec.pos.dval = dval; // autosaved
+        let status = MotorStatus {
+            done: true,
+            has_encoder: true,
+            ..Default::default()
+        }
+        .with_position(position)
+        .with_encoder_position(position);
+        let effects = rec.initial_readback(&status);
+        let case = format!("{rstm:?} {dval}");
+        assert!(
+            !effects
+                .commands
+                .iter()
+                .any(|c| matches!(c, MotorCommand::InitPosition { .. })),
+            "{case}: {:?}",
+            effects.commands
+        );
+        let drive = (position, position, position as i32);
+        assert_eq!((rec.pos.val, rec.pos.dval, rec.pos.rval), drive, "{case}");
+        let i = &rec.internal;
+        assert_eq!((i.lval, i.ldvl, i.lrvl), drive, "{case}");
+    }
+}
+
+#[test]
+fn a_closed_loop_load_that_is_not_finite_takes_the_readback() {
+    // C init_record keeps the loaded closed-loop VAL and DVAL (706-714);
+    // the readback is the autosaved DVAL once it is restored.
+    use asyn_rs::interfaces::motor::MotorStatus;
+    for (rstm, val, dval, drive, restored) in [
+        (
+            RestoreMode::Never,
+            f64::NAN,
+            f64::INFINITY,
+            (3.0, 3.0),
+            false,
+        ),
+        (RestoreMode::Always, f64::INFINITY, 7.0, (7.0, 7.0), true),
+        (RestoreMode::Always, 2.0, f64::NAN, (2.0, 3.0), false),
+    ] {
+        let mut rec = MotorRecord::new();
+        rec.links.omsl = 1;
+        rec.conv.rstm = rstm;
+        rec.conv.mres = 1.0;
+        rec.pos.val = val; // autosaved
+        rec.pos.dval = dval;
+        let status = MotorStatus {
+            done: true,
+            ..Default::default()
+        }
+        .with_position(3.0);
+        let effects = rec.initial_readback(&status);
+        let case = format!("{rstm:?} {val} {dval}");
+        assert_eq!(
+            effects
+                .commands
+                .iter()
+                .any(|c| matches!(c, MotorCommand::InitPosition { .. })),
+            restored,
+            "{case}"
+        );
+        assert_eq!((rec.pos.val, rec.pos.dval), drive, "{case}");
+        let i = &rec.internal;
+        assert_eq!((i.lval, i.ldvl), drive, "{case}");
+    }
+}
+
+#[test]
 fn test_closed_loop_empty_array_dol_leaves_val() {
     // recGblInitConstantLink stores nothing for `[]`.
     use asyn_rs::interfaces::motor::MotorStatus;

@@ -279,6 +279,15 @@ async fn an_autosaved_dval_does_not_overwrite_a_card_away_from_zero() {
     assert_eq!(field(&booted.db, 2, "DVAL"), EpicsValue::Double(7.0));
 }
 
+/// C motor_init_record_com (motordevCom.cc:291-311) loads a NaN autosaved
+/// DVAL under RSTM Always; the port takes the card's position.
+#[tokio::test]
+async fn an_autosaved_dval_that_is_not_finite_is_not_loaded() {
+    let booted = boot(11, at_14(), r#"field(RSTM, "Always") field(DVAL, "nan")"#).await;
+    assert_eq!(booted.set_to, Vec::<f64>::new(), "no LOAD_POS");
+    assert_eq!(field(&booted.db, 11, "DVAL"), EpicsValue::Double(7.0));
+}
+
 /// The card at step 14 with PID support, which its driver reads without
 /// RA_DONE.
 fn gains_at_14() -> MotorStatus {

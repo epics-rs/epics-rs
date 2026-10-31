@@ -508,7 +508,15 @@ impl MotorRecord {
         // means MRES changed; restoring would place the axis at the wrong
         // position, so skip the restore and adopt the driver readback instead.
         // C init_controller has no such check, so nothing to print.
+        //
+        // A C defect not copied: init_controller (devMotorAsyn.c:199-223)
+        // and motor_init_record_com (motordevCom.cc:291-311) write a NaN
+        // DVAL as the controller position under Always or a Conditional
+        // use_rel, an infinite one under NearZero too, and motorSim then
+        // reads -2147483648 everywhere. A DVAL that is not finite is
+        // restored under no RSTM; the readback is taken.
         restore
+            && autosaved_dval.is_finite()
             && !self.conv.loadpos_blocked
             && (autosaved_rval == 0
                 || (autosaved_rval as f64 * self.conv.mres - autosaved_dval).abs() <= rdbd)
@@ -543,6 +551,18 @@ impl MotorRecord {
             }
         } else {
             self.seed_val_from_dol();
+            // A C defect not copied: closed loop keeps a loaded NaN or
+            // infinite VAL or DVAL (706-714); each takes the readback, the
+            // autosaved DVAL after a restore as above.
+            let readback = loaded.unwrap_or(self.pos.drbv);
+            if !self.pos.val.is_finite() {
+                self.pos.val = coordinate::dial_to_user(readback, self.conv.dir, self.pos.off);
+                self.mark(m::VAL);
+            }
+            if !self.pos.dval.is_finite() {
+                self.pos.dval = readback;
+                self.mark(m::DVAL);
+            }
         }
         self.internal.lval = self.pos.val;
         self.internal.ldvl = self.pos.dval;

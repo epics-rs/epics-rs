@@ -2181,8 +2181,9 @@ impl PutOp {
 
     /// The send half of [`Self::commit`]: returns once DATA is queued on the
     /// circuit, so puts sent one after another reach the server in that
-    /// order, and the [`PutSent`] awaits the completion — pvxs's `exec()`
-    /// and `Operation::wait()`.
+    /// order, and the [`PutSent`] awaits the completion — pvxs's `reExecPut`
+    /// on an `autoExec(false)` op, whose callback is the completion
+    /// (`client.h:157-161`).
     pub async fn send(self, value: &PvField, changed: &BitSet) -> PvaResult<PutSent> {
         let PutOp {
             server,

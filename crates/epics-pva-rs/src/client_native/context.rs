@@ -1716,7 +1716,10 @@ impl PvaClient {
     /// [`Self::pvput_begin`] with no deadline on the put
     /// (`op_put_begin_unbounded`),
     /// for a caller that ends it at the channel's disconnect.
-    pub(crate) async fn pvput_begin_unbounded(
+    /// The client's `timeout` bounds neither the INIT nor the
+    /// [`PutOp::commit`]: a `record[block=true]` put lasts as long as the
+    /// record's processing, and its deadline, if any, is the caller's.
+    pub async fn pvput_begin_unbounded(
         &self,
         pv_name: &str,
         request: Option<&crate::pv_request::PvRequestExpr>,

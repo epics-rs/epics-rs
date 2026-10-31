@@ -2,17 +2,20 @@
 //! in-process `SharedPV`: the readback rides the put's own op, the DATA
 //! phase writes the delta, an abandoned op is destroyed, and a circuit
 //! lost between the phases surfaces as `Disconnected` rather than being
-//! re-queued (pvxs `clientget.cpp:380-404`, non-autoExec).
+//! re-queued (pvxs `clientget.cpp:380-404`, non-autoExec), and
+//! `PutOp::send` returns before the completion `PutSent::wait` awaits.
 #![cfg(all(feature = "client", tokio_backend))]
 
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use epics_pva_rs::client_native::ops_v2::{MonitorConnEvent, PutLeaf};
 use epics_pva_rs::error::PvaError;
 use epics_pva_rs::nt::NTScalar;
-use epics_pva_rs::pv_request::PvRequestExpr;
+use epics_pva_rs::pv_request::{PvRequestBuilder, PvRequestExpr};
 use epics_pva_rs::pvdata::{FieldDesc, PvField, ScalarType, ScalarValue};
+use epics_pva_rs::server::PvDatabaseSource;
 use epics_pva_rs::server_native::{PvaServer, SharedPV, SharedSource};
 
 const T: Duration = Duration::from_secs(5);
@@ -195,6 +198,57 @@ async fn commit_on_a_lost_circuit_is_disconnected_not_requeued() {
         "expected Disconnected, got {err:?}"
     );
     assert_eq!(value_of(&pv.current().unwrap()), 1.5);
+}
+
+/// QSRV completes a `record[block=true]` put once the record has processed,
+/// here after its FLNK's 1 s ODLY; `send` must not wait for that.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn send_returns_before_a_block_put_completes() {
+    const DB: &str = r#"
+record(ao, "TP:SLOW") { field(FLNK, "TP:SLOW_D") }
+record(calcout, "TP:SLOW_D") { field(ODLY, "1") field(CALC, "1") }
+"#;
+    let ioc = epics_pva_rs::server::PvaServer::builder()
+        .db_string(DB, &HashMap::new())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let source = PvDatabaseSource::new(ioc.database().clone());
+    let server = PvaServer::isolated(Arc::new(source)).expect("isolated test server must start");
+    let client = server.client_config();
+
+    let req = PvRequestBuilder::new()
+        .field("value")
+        .record("block", true)
+        .build();
+    let op = tokio::time::timeout(
+        T,
+        client.pvput_begin_unbounded("TP:SLOW", Some(&req), false),
+    )
+    .await
+    .expect("timeout")
+    .expect("begin");
+    let started = Instant::now();
+    let sent = tokio::time::timeout(
+        T,
+        op.send_fields_typed(&[(
+            "value".into(),
+            PutLeaf::Typed(PvField::Scalar(ScalarValue::Double(1.0))),
+        )]),
+    )
+    .await
+    .expect("timeout")
+    .expect("send");
+    let sent_after = started.elapsed();
+    tokio::time::timeout(T, sent.wait())
+        .await
+        .expect("timeout")
+        .expect("wait");
+    let done_after = started.elapsed();
+
+    assert!(sent_after < Duration::from_millis(500), "{sent_after:?}");
+    assert!(done_after >= Duration::from_millis(900), "{done_after:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

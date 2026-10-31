@@ -664,3 +664,26 @@ async fn a_request_with_no_event_during_a_move_is_moved_to_before_done() {
     finish(&db, "H:p1").await;
     wait_near(&ioc, "H:HR1_Moving", 0.0).await;
 }
+
+/// A theta1 request within its AO's MDEL raises HR1_Moving alone; in
+/// manual mode it is calculated at that rise, and Put moves to it. C's
+/// busy wake went to checkAutoMode, and Put moved to the old theta1.
+#[epics_base_rs::epics_test]
+async fn a_request_with_no_event_in_manual_mode_is_calculated() {
+    let (ioc, _scan) = boot().await;
+    let db = PvDatabase::clone(&ioc);
+    idle(&db, "H:HR1_OperAckBO", "H:HR1_SeqMsg1SI").await;
+    // The boot passes' enters, which read the request, are over.
+    task::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(f64_of(&ioc, "H:HR1_ModeBO").await, 0.0);
+    wait_near(&ioc, "H:HR1_Moving", 0.0).await;
+    db.get_record("H:HR1_Theta1AO")
+        .unwrap()
+        .write()
+        .record
+        .put_field("MDEL", EpicsValue::Double(100.0))
+        .unwrap();
+    put_process(&ioc, "H:HR1_Theta1AO", 23.0).await;
+    wait_near(&ioc, "H:HR1_phi1SetAO", desired(&ioc, 23.0).await).await;
+    moves_to(&ioc, 23.0).await;
+}

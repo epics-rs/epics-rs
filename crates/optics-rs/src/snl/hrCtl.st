@@ -909,7 +909,7 @@ ss hr_Ctl
 
 		when (efTest(hr_Moving_mon)) {
 			efClear(hr_Moving_mon);
-		} state checkAutoMode
+		} state busyChanged
 		
 		when ((!phi1Dmov || !phi2Dmov) && delay(.1)) {
 		} state updateRdbk
@@ -923,6 +923,33 @@ ss hr_Ctl
 		} state checkDone
 		when (1) {
 		} state waitForCmnd
+	}
+
+	/* A request within its AO's MDEL posts only the busy rise, which C
+	 * sent to checkAutoMode, so in manual mode Put moved to the old one. */
+	state busyChanged {
+		entry {
+			pvGet(ENow);
+			pvGet(lambdaNow);
+			pvGet(theta1Now);
+			pvGet(theta2Now);
+		}
+		when (!SAME(ENow, ELast)) {
+			E = ENow;
+			ELast = E;
+		} state eChanged
+		when (!SAME(lambdaNow, lambdaLast)) {
+			lambda = lambdaNow;
+			lambdaLast = lambda;
+		} state lChanged
+		when (!SAME(theta1Now, theta1Last) || !SAME(theta2Now, theta2Last)) {
+			theta1 = theta1Now;
+			theta1Last = theta1;
+			theta2 = theta2Now;
+			theta2Last = theta2;
+		} state thChanged
+		when () {
+		} state checkAutoMode
 	}
 
 	/* A request arm's *Req can be an own put's echo landing after that

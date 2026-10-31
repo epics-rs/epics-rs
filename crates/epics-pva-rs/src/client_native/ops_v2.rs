@@ -2176,12 +2176,20 @@ impl PutOp {
     /// DATA phase: send `value` as the delta `changed` selects, await the
     /// completion status, and destroy the op.
     pub async fn commit(self, value: &PvField, changed: &BitSet) -> PvaResult<()> {
+        self.send(value, changed).await?.wait().await
+    }
+
+    /// The send half of [`Self::commit`]: returns once DATA is queued on the
+    /// circuit, so puts sent one after another reach the server in that
+    /// order, and the [`PutSent`] awaits the completion — pvxs's `exec()`
+    /// and `Operation::wait()`.
+    pub async fn send(self, value: &PvField, changed: &BitSet) -> PvaResult<PutSent> {
         let PutOp {
             server,
             sid,
             ioid,
-            mut stream,
-            mut ioid_guard,
+            stream,
+            ioid_guard,
             codec,
             order,
             intro,
@@ -2205,6 +2213,87 @@ impl PutOp {
         // A `?` here drops `ioid_guard`, which sends DESTROY and releases
         // the ioid — the same finalizer every abandoned op reaches.
         server.send_for_channel(sid, frame).await?;
+        Ok(PutSent {
+            server,
+            sid,
+            ioid,
+            stream,
+            ioid_guard,
+            codec,
+            intro,
+            op_timeout,
+        })
+    }
+
+    /// [`Self::commit`] of a delta built from dotted-path assignments against
+    /// the prototype — the same single owner (`build_field_delta`) the
+    /// one-call multi-field PUTs use, so both produce identical wire deltas.
+    pub async fn commit_fields_typed(self, assignments: &[(String, PutLeaf)]) -> PvaResult<()> {
+        self.send_fields_typed(assignments).await?.wait().await
+    }
+
+    /// [`Self::send`] of the delta [`Self::commit_fields_typed`] builds.
+    pub async fn send_fields_typed(self, assignments: &[(String, PutLeaf)]) -> PvaResult<PutSent> {
+        let (value, changed) = build_field_delta(&self.intro, assignments)?;
+        self.send(&value, &changed).await
+    }
+
+    /// [`Self::commit`] of the readback with `assignments` applied on top:
+    /// every leaf the readback marked goes back, plus each assigned leaf.
+    /// pvxs's `build()` put hands the `GetOPut` readback to the builder as
+    /// the prototype (`clientget.cpp:286-291`), so its marks ride the PUT.
+    /// With no readback the prototype default stands in, as for
+    /// [`Self::commit_fields_typed`].
+    pub async fn commit_fields_onto_present(
+        mut self,
+        assignments: &[(String, PutLeaf)],
+    ) -> PvaResult<()> {
+        let (base, marked) = self
+            .present
+            .take()
+            .unwrap_or_else(|| (default_value_for(&self.intro), BitSet::new()));
+        let (value, changed) = assign_fields(&self.intro, base, marked, assignments)?;
+        self.commit(&value, &changed).await
+    }
+}
+
+/// A [`PutOp`] whose DATA is sent ([`PutOp::send`]). Dropping it before
+/// [`Self::wait`] returns sends DESTROY_REQUEST and releases the ioid through
+/// its `IoidGuard`, as dropping an uncommitted [`PutOp`] does.
+pub struct PutSent {
+    server: Arc<super::server_conn::ServerConn>,
+    sid: u32,
+    ioid: u32,
+    stream: mpsc::UnboundedReceiver<super::decode::Frame>,
+    ioid_guard: IoidGuard,
+    codec: PvaCodec,
+    intro: Arc<FieldDesc>,
+    /// `None` for `op_put_begin_unbounded`'s op.
+    op_timeout: Option<Duration>,
+}
+
+impl std::fmt::Debug for PutSent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PutSent")
+            .field("sid", &self.sid)
+            .field("ioid", &self.ioid)
+            .finish()
+    }
+}
+
+impl PutSent {
+    /// Await the completion status and destroy the op.
+    pub async fn wait(self) -> PvaResult<()> {
+        let PutSent {
+            server,
+            sid,
+            ioid,
+            mut stream,
+            mut ioid_guard,
+            codec,
+            intro,
+            op_timeout,
+        } = self;
 
         let done_frame = await_frame_within(&mut stream, op_timeout).await?;
         let result = match decode_op_or_reset(&server, &done_frame, Some(&intro))? {
@@ -2230,32 +2319,6 @@ impl PutOp {
         let _ = server.send_for_channel(sid, destroy).await;
         server.unregister_ioid(ioid);
         result
-    }
-
-    /// [`Self::commit`] of a delta built from dotted-path assignments against
-    /// the prototype — the same single owner (`build_field_delta`) the
-    /// one-call multi-field PUTs use, so both produce identical wire deltas.
-    pub async fn commit_fields_typed(self, assignments: &[(String, PutLeaf)]) -> PvaResult<()> {
-        let (value, changed) = build_field_delta(&self.intro, assignments)?;
-        self.commit(&value, &changed).await
-    }
-
-    /// [`Self::commit`] of the readback with `assignments` applied on top:
-    /// every leaf the readback marked goes back, plus each assigned leaf.
-    /// pvxs's `build()` put hands the `GetOPut` readback to the builder as
-    /// the prototype (`clientget.cpp:286-291`), so its marks ride the PUT.
-    /// With no readback the prototype default stands in, as for
-    /// [`Self::commit_fields_typed`].
-    pub async fn commit_fields_onto_present(
-        mut self,
-        assignments: &[(String, PutLeaf)],
-    ) -> PvaResult<()> {
-        let (base, marked) = self
-            .present
-            .take()
-            .unwrap_or_else(|| (default_value_for(&self.intro), BitSet::new()));
-        let (value, changed) = assign_fields(&self.intro, base, marked, assignments)?;
-        self.commit(&value, &changed).await
     }
 }
 

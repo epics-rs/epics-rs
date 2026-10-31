@@ -621,6 +621,49 @@ record(motor, "G:m") { field(DTYP, "asynMotor") field(OUT, "@asyn(NEVER_CREATED_
     assert_eq!(field(&db, "G:m.LVIO"), EpicsValue::Short(0));
 }
 
+/// After `bad:` update_values copies nothing (needUpdate 0), so
+/// process_motor_info(true) reads the record's own RMP and MSTA, and
+/// VAL/DVAL take that readback off closed loop (motorRecord.cc:698-714).
+/// Each value is the C oracle's on motorSim.
+#[tokio::test]
+async fn an_asyn_record_that_dies_at_init_takes_its_own_readback() {
+    let db = boot(
+        r##"
+record(motor, "Q:nan") { field(DTYP, "asynMotor") field(OUT, "@asyn(NEVER_CREATED_Q,0)")
+    field(MRES, "1") field(DVAL, "nan") field(VAL, "nan") }
+record(motor, "Q:off") { field(DTYP, "asynMotor") field(OUT, "@asyn(NEVER_CREATED_Q,1)")
+    field(MRES, "1") field(DIR, "Neg") field(OFF, "1") field(DVAL, "5") field(VAL, "5") }
+record(motor, "Q:rmp") { field(DTYP, "asynMotor") field(OUT, "@asyn(NEVER_CREATED_Q,2)")
+    field(MRES, "0.5") field(RMP, "7") field(DVAL, "3") }
+record(motor, "Q:ueip") { field(DTYP, "asynMotor") field(OUT, "@asyn(NEVER_CREATED_Q,3)")
+    field(MRES, "1") field(UEIP, "Yes") field(MSTA, "0x4006") field(DVAL, "3") }
+record(motor, "Q:cl") { field(DTYP, "asynMotor") field(OUT, "@asyn(NEVER_CREATED_Q,4)")
+    field(MRES, "1") field(OMSL, "closed_loop") field(DVAL, "4") field(VAL, "6") }
+record(motor, "Q:clnan") { field(DTYP, "asynMotor") field(OUT, "@asyn(NEVER_CREATED_Q,5)")
+    field(MRES, "1") field(OMSL, "closed_loop") field(DVAL, "nan") field(VAL, "inf") }
+"##,
+    )
+    .await;
+    let num = |pv: &str| field(&db, pv).to_f64().unwrap();
+    let fields = ["VAL", "DVAL", "RVAL", "RBV", "DRBV", "DIFF", "LVAL", "LDVL"];
+    for (rec, want) in [
+        ("Q:nan", [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        ("Q:off", [1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0]),
+        ("Q:rmp", [3.5, 3.5, 7.0, 3.5, 3.5, 0.0, 3.5, 3.5]),
+        ("Q:ueip", [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        ("Q:cl", [6.0, 4.0, 0.0, 0.0, 0.0, 4.0, 6.0, 4.0]),
+        // A C defect not copied: C keeps the NaN and infinite load.
+        ("Q:clnan", [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+    ] {
+        let got: Vec<f64> = fields.iter().map(|f| num(&format!("{rec}.{f}"))).collect();
+        assert_eq!(got, want, "{rec} {fields:?}");
+    }
+    // No EA_PRESENT in MSTA demotes UEIP; RA_PLUS_LS is HLS.
+    assert_eq!(field(&db, "Q:ueip.UEIP"), EpicsValue::Short(0));
+    assert_eq!(field(&db, "Q:ueip.HLS"), EpicsValue::Short(1));
+    assert_eq!(field(&db, "Q:cl.RDIF"), EpicsValue::Long(4));
+}
+
 /// motorRecord.cc init_record never seeds MLST/ALST from VAL; only
 /// monitor() writes them, and only under a nonzero MDEL/ADEL (3485-3501).
 #[tokio::test]

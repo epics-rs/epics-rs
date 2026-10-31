@@ -125,6 +125,7 @@ async fn a_loaded_coordinate_that_is_not_finite_is_replaced_at_init() {
             assert_eq!(num(&db, &format!("{rec}.{field}")), 3.0, "{rec}.{field}");
         }
         assert_eq!(num(&db, &format!("{rec}.OFF")), 0.0, "{rec}.OFF");
+        assert_eq!(num(&db, &format!("{rec}.DIFF")), 0.0, "{rec}.DIFF");
     }
     assert_eq!(num(&db, "NF:off.HLM"), 10.0);
     assert_eq!(num(&db, "NF:off.LLM"), -10.0);

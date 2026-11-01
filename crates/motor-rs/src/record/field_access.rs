@@ -358,17 +358,9 @@ pub(crate) fn motor_put_field(
         },
         "MRES" => match value {
             EpicsValue::Double(v) => {
-                // Rust guard, not C: special MRES (2834-2843) accepts a
-                // zero put and lets the record degenerate; the Rust
-                // division sites (raw conversions, RDBD-in-steps) require
-                // a nonzero resolution, so a zero put is dropped.
                 // C special MRES (2837-2842): make UREV agree.
                 let urev = v * rec.conv.srev as f64;
-                // A C defect not copied: it applies a NaN or infinite put
-                // too, or one whose UREV overflows, and UREV, the speeds,
-                // the limits and the readback go non-finite; load_pos then
-                // writes the NaN as the position. That put is dropped as well.
-                if v == 0.0 || !urev.is_finite() {
+                if !has_step(v, urev) {
                     return Ok(());
                 }
                 rec.conv.mres = v;
@@ -413,25 +405,23 @@ pub(crate) fn motor_put_field(
             EpicsValue::Long(v) => {
                 // C special SREV (2914-2918): a non-positive put is
                 // clamped to 200, not rejected.
-                let v = if v <= 0 {
-                    rec.mark(m::SREV);
-                    200
-                } else {
-                    v
-                };
-                let old_mres = rec.conv.mres;
-                rec.conv.srev = v;
+                let clamped = v <= 0;
+                let v = if clamped { 200 } else { v };
                 // C special SREV (2919-2923): make MRES agree — and
                 // nothing else. Unlike the MRES/UREV cases, SREV breaks
                 // straight out: no velcheckB velocity re-derive, no
                 // dial-limit rescale (UREV is unchanged, so the EGU
                 // speeds already agree).
-                // The urev != 0 gate is a Rust guard, not C: C divides
-                // unconditionally and lets MRES go to 0; the Rust
-                // division sites require a nonzero resolution.
-                if rec.conv.urev != 0.0 {
-                    rec.conv.mres = rec.conv.urev / v as f64;
+                let mres = rec.conv.urev / v as f64;
+                if !has_step(mres, rec.conv.urev) {
+                    return Ok(());
                 }
+                if clamped {
+                    rec.mark(m::SREV);
+                }
+                let old_mres = rec.conv.mres;
+                rec.conv.srev = v;
+                rec.conv.mres = mres;
                 // C special SREV (2919-2922): MARK(M_MRES) only when
                 // MRES actually changed.
                 if rec.conv.mres != old_mres {
@@ -444,20 +434,14 @@ pub(crate) fn motor_put_field(
         },
         "UREV" => match value {
             EpicsValue::Double(v) => {
-                // Rust guard, not C: special UREV (2848-2853) accepts a
-                // zero put and derives MRES = 0; the Rust division sites
-                // require a nonzero resolution, so drop it — uniform
-                // with the zero-MRES-put reject above, as is a NaN or
-                // infinite one, from which C derives that MRES.
-                if v == 0.0 || !v.is_finite() {
+                // C special UREV (2849-2853): make MRES agree.
+                let mres = v / rec.conv.srev as f64;
+                if !has_step(mres, v) {
                     return Ok(());
                 }
                 let old_mres = rec.conv.mres;
                 rec.conv.urev = v;
-                // C special UREV (2849-2853): make MRES agree.
-                if rec.conv.srev > 0 {
-                    rec.conv.mres = v / rec.conv.srev as f64;
-                }
+                rec.conv.mres = mres;
                 apply_mres_cascade(rec);
                 // C special UREV (2848-2853): MARK(M_MRES) only when
                 // MRES actually changed.
@@ -1799,6 +1783,19 @@ fn apply_accu_cascade(rec: &mut MotorRecord) {
         AccsUsed::Accl => update_accs_from_accl(rec),
         AccsUsed::Accs => update_accl_from_accs(rec),
     }
+}
+
+/// Whether a runtime MRES, UREV or SREV put leaves the record a step:
+/// MRES finite and nonzero, UREV finite. The Rust division sites (raw
+/// conversions, RDBD-in-steps) need one, so a put without one is dropped.
+/// Rust guard, not C: special() (2834-2853, 2913-2924) stores a zero MRES
+/// and lets the record degenerate. A C defect not copied: it stores a NaN
+/// or infinite factor, or a UREV that overflows, and the speeds, limits
+/// and readback go non-finite (load_pos then writes the NaN as the
+/// position); and a UREV too small for SREV, or an SREV too large for
+/// UREV, underflows MRES to 0.
+fn has_step(mres: f64, urev: f64) -> bool {
+    mres != 0.0 && mres.is_finite() && urev.is_finite()
 }
 
 /// Apply velocity and limit cascade after MRES changes.

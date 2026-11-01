@@ -8376,6 +8376,42 @@ fn a_resolution_put_that_is_not_finite_is_dropped() {
 }
 
 #[test]
+fn a_resolution_put_whose_mres_underflows_is_dropped() {
+    // The C oracle on motorSim (a calcout link put, a binary double as a
+    // CA client sends) applies each and leaves MRES 0: UREV 1e-322 at
+    // SREV 200, and SREV 2147483647 at a UREV of 1e-315. The dial and user
+    // limits go 0 and a VAL put then moves nothing.
+    for (urev, field, v) in [
+        (None, "UREV", EpicsValue::Double(1e-322)),
+        (Some(1e-315), "SREV", EpicsValue::Long(i32::MAX)),
+    ] {
+        let mut rec = MotorRecord::new();
+        for (f, load) in [("MRES", 0.01), ("DHLM", 10.0), ("DLLM", -10.0)] {
+            rec.put_field(f, EpicsValue::Double(load)).unwrap();
+        }
+        rec.put_field("VELO", EpicsValue::Double(1.0)).unwrap();
+        rec.init_record(0).unwrap();
+        rec.init_record(1).unwrap();
+        if let Some(urev) = urev {
+            rec.put_field("UREV", EpicsValue::Double(urev)).unwrap();
+            assert_ne!(rec.conv.mres, 0.0, "UREV {urev}");
+        }
+        let state = |r: &MotorRecord| {
+            let (c, v, l) = (&r.conv, &r.vel, &r.limits);
+            (
+                (c.mres, c.urev, c.srev),
+                [v.velo, v.vbas, v.bvel],
+                [l.dhlm, l.dllm, l.hlm, l.llm],
+                r.internal.res_reanchor,
+            )
+        };
+        let before = state(&rec);
+        rec.put_field(field, v.clone()).unwrap();
+        assert_eq!(state(&rec), before, "{field} {v:?}");
+    }
+}
+
+#[test]
 fn a_loaded_resolution_that_is_not_finite_takes_its_default() {
     // The C oracle on motorSim keeps each load: MRES nan leaves UREV,
     // ERES, RBV, DRBV and DVAL NaN; UREV inf makes MRES and ERES inf and

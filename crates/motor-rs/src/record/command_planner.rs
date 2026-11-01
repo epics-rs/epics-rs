@@ -1760,7 +1760,7 @@ impl MotorRecord {
                 self.mark(m::VAL | m::OFF | m::RBV | m::MIP | m::DMOV);
                 self.set_phase(MotionPhase::Idle);
             }
-            // A C defect not copied: C 2213 stores the offset unchecked, so
+            // A C defect not copied: C 2215 stores the offset unchecked, so
             // a NaN or infinite VAL, RLV, TWV or DOL makes OFF, RBV and the
             // user limits non-finite, and every later VAL a NaN DVAL (the
             // oracle on motorSim). The redefinition is refused like a

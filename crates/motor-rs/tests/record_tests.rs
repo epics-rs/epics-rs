@@ -618,7 +618,7 @@ fn test_set_foff_variable_val_completes_without_command() {
     assert!(rec.stat.mip.is_empty(), "C 2223: mip = MIP_DONE");
 }
 
-/// C 2213 stores a NaN offset for a NaN VAL in SET + FOFF=Variable (the
+/// C 2215 stores a NaN offset for a NaN VAL in SET + FOFF=Variable (the
 /// oracle on motorSim: OFF, RBV, HLM and LLM read nan). The redefinition
 /// is refused instead, for every input that folds into VAL.
 #[test]

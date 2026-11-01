@@ -362,12 +362,16 @@ pub(crate) fn motor_put_field(
                 // zero put and lets the record degenerate; the Rust
                 // division sites (raw conversions, RDBD-in-steps) require
                 // a nonzero resolution, so a zero put is dropped.
-                if v == 0.0 {
+                // C special MRES (2837-2842): make UREV agree.
+                let urev = v * rec.conv.srev as f64;
+                // A C defect not copied: it applies a NaN or infinite put
+                // too, or one whose UREV overflows, and UREV, the speeds,
+                // the limits and the readback go non-finite; load_pos then
+                // writes the NaN as the position. That put is dropped as well.
+                if v == 0.0 || !urev.is_finite() {
                     return Ok(());
                 }
                 rec.conv.mres = v;
-                // C special MRES (2837-2842): make UREV agree.
-                let urev = v * rec.conv.srev as f64;
                 if rec.conv.urev != urev {
                     rec.conv.urev = urev;
                     rec.mark(m::UREV);
@@ -383,6 +387,12 @@ pub(crate) fn motor_put_field(
         },
         "ERES" => match value {
             EpicsValue::Double(v) => {
+                // A C defect not copied: special ERES (2927-2930) applies
+                // a NaN or infinite put, which the encoder readback and
+                // ratio then carry. The put is dropped, as for MRES.
+                if !v.is_finite() {
+                    return Ok(());
+                }
                 // C special ERES (2927-2929): don't allow ERES = 0.
                 rec.conv.eres = if v == 0.0 { rec.conv.mres } else { v };
                 // C special ERES (2930): MARK(M_ERES) unconditionally.
@@ -391,6 +401,13 @@ pub(crate) fn motor_put_field(
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        // A C defect not copied: RRES has no special() at all, so C stores
+        // a NaN or infinite put, and NINT then reads RRBV and DRBV as 0
+        // whatever RDBL holds (3701, 4437). The put is dropped, as for MRES.
+        "RRES" => match value {
+            EpicsValue::Double(v) if !v.is_finite() => Ok(()),
+            _ => motor_store_field(rec, name, value),
         },
         "SREV" => match value {
             EpicsValue::Long(v) => {
@@ -430,8 +447,9 @@ pub(crate) fn motor_put_field(
                 // Rust guard, not C: special UREV (2848-2853) accepts a
                 // zero put and derives MRES = 0; the Rust division sites
                 // require a nonzero resolution, so drop it — uniform
-                // with the zero-MRES-put reject above.
-                if v == 0.0 {
+                // with the zero-MRES-put reject above, as is a NaN or
+                // infinite one, from which C derives that MRES.
+                if v == 0.0 || !v.is_finite() {
                     return Ok(());
                 }
                 let old_mres = rec.conv.mres;
@@ -1887,6 +1905,21 @@ fn revalidate_velocities(rec: &mut MotorRecord) {
 /// write. A nonzero loaded UREV wins over a loaded MRES; SREV is clamped
 /// sane first so both derivations divide by the final value.
 pub(crate) fn motor_sync_resolution_at_init(rec: &mut MotorRecord) {
+    // A C defect not copied: a loaded NaN or infinite UREV, MRES or ERES
+    // passes these zero tests and init_record's ERES seed (692-696), and
+    // the readback and DVAL go non-finite; a loaded one in RRES reads
+    // RRBV as 0, as the put does. Each takes its field default, as a
+    // loaded non-finite OFF does; the rules below then apply.
+    if !rec.conv.urev.is_finite() {
+        rec.conv.urev = 0.0;
+    }
+    if !rec.conv.eres.is_finite() {
+        rec.conv.eres = 0.0;
+        rec.mark(m::ERES);
+    }
+    if !rec.conv.rres.is_finite() {
+        rec.conv.rres = 0.0;
+    }
     // C 3905-3909: SREV (steps/revolution) must be sane.
     if rec.conv.srev <= 0 {
         rec.conv.srev = 200;
@@ -1896,6 +1929,11 @@ pub(crate) fn motor_sync_resolution_at_init(rec: &mut MotorRecord) {
     if rec.conv.urev != 0.0 {
         rec.conv.mres = rec.conv.urev / rec.conv.srev as f64;
         rec.mark(m::MRES);
+    }
+    // The MRES test of the defect above: an MRES that is not finite, or
+    // whose UREV (3922-3927) overflows, takes its default too.
+    if !(rec.conv.mres * rec.conv.srev as f64).is_finite() {
+        rec.conv.mres = 0.0;
     }
     // C 3917-3921: MRES must end up nonzero.
     if rec.conv.mres == 0.0 {

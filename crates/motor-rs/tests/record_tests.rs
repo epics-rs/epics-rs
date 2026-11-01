@@ -8412,6 +8412,44 @@ fn a_resolution_put_whose_mres_underflows_is_dropped() {
 }
 
 #[test]
+fn a_resolution_put_that_overflows_a_speed_or_limit_is_dropped() {
+    // The C oracle on motorSim (VELO 1, DHLM 100, DLLM -100 at MRES 0.001)
+    // applies each: UREV 1e308 makes VELO infinite, MRES 1e305 DHLM, and
+    // MRES 1e303 at OFF 1e308 HLM. One case per value: the speeds (no
+    // limits), the dial limits (VELO stays 1e308), the user limits.
+    for (limit, off, field, v) in [
+        (0.0, None, "UREV", 1e308),
+        (100.0, None, "MRES", 1e305),
+        (100.0, Some(1e308), "MRES", 1e303),
+    ] {
+        let mut rec = MotorRecord::new();
+        for (f, load) in [("MRES", 0.001), ("DHLM", limit), ("DLLM", -limit)] {
+            rec.put_field(f, EpicsValue::Double(load)).unwrap();
+        }
+        rec.put_field("VELO", EpicsValue::Double(1.0)).unwrap();
+        rec.init_record(0).unwrap();
+        rec.init_record(1).unwrap();
+        if let Some(off) = off {
+            rec.put_field("OFF", EpicsValue::Double(off)).unwrap();
+            assert_eq!(rec.pos.off, off);
+        }
+        let state = |r: &MotorRecord| {
+            let (c, v, l) = (&r.conv, &r.vel, &r.limits);
+            (
+                (c.mres, c.urev),
+                [v.velo, v.vbas, v.bvel, v.vmax],
+                [l.dhlm, l.dllm, l.hlm, l.llm],
+                r.retry.rdbd,
+                r.internal.res_reanchor,
+            )
+        };
+        let before = state(&rec);
+        rec.put_field(field, EpicsValue::Double(v)).unwrap();
+        assert_eq!(state(&rec), before, "{field} {v}");
+    }
+}
+
+#[test]
 fn a_loaded_resolution_that_is_not_finite_takes_its_default() {
     // The C oracle on motorSim keeps each load: MRES nan leaves UREV,
     // ERES, RBV, DRBV and DVAL NaN; UREV inf makes MRES and ERES inf and

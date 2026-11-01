@@ -360,15 +360,13 @@ pub(crate) fn motor_put_field(
             EpicsValue::Double(v) => {
                 // C special MRES (2837-2842): make UREV agree.
                 let urev = v * rec.conv.srev as f64;
-                if !has_step(v, urev) {
+                let Some(rescale) = rescale(rec, v, urev) else {
                     return Ok(());
-                }
-                rec.conv.mres = v;
+                };
                 if rec.conv.urev != urev {
-                    rec.conv.urev = urev;
                     rec.mark(m::UREV);
                 }
-                apply_mres_cascade(rec);
+                apply_mres_cascade(rec, rescale);
                 // C special MRES (2835): MARK(M_MRES) unconditionally —
                 // the pp(TRUE) process pass re-anchors (do_work 1936).
                 rec.internal.res_reanchor = true;
@@ -435,14 +433,11 @@ pub(crate) fn motor_put_field(
         "UREV" => match value {
             EpicsValue::Double(v) => {
                 // C special UREV (2849-2853): make MRES agree.
-                let mres = v / rec.conv.srev as f64;
-                if !has_step(mres, v) {
+                let Some(rescale) = rescale(rec, v / rec.conv.srev as f64, v) else {
                     return Ok(());
-                }
+                };
                 let old_mres = rec.conv.mres;
-                rec.conv.urev = v;
-                rec.conv.mres = mres;
-                apply_mres_cascade(rec);
+                apply_mres_cascade(rec, rescale);
                 // C special UREV (2848-2853): MARK(M_MRES) only when
                 // MRES actually changed.
                 if rec.conv.mres != old_mres {
@@ -1798,53 +1793,87 @@ fn has_step(mres: f64, urev: f64) -> bool {
     mres != 0.0 && mres.is_finite() && urev.is_finite()
 }
 
-/// Apply velocity and limit cascade after MRES changes.
-/// Used by MRES, SREV, and UREV handlers to avoid duplication.
-///
-/// C: `2e89b552` (PR #193) — raw limits (RHLM/RLLM in motor steps) are the
-/// invariant across MRES changes. Dial and user limits are recomputed.
-/// `fd808eb2` (PR #206) — when MRES < 0, the high/low pair must be ordered
-/// so DHLM >= DLLM.
-/// C velcheckB (motorRecord.cc:2855-2909) — the runtime tail of a
-/// resolution change. Callers (the MRES/UREV/SREV runtime put branches)
-/// own the load gate: during `dbLoadRecords` the resolution handlers
-/// store raw and never reach here; `motor_sync_resolution_at_init` /
-/// `motor_sync_speed_at_init` / `motor_sync_limits_at_init` reconcile
-/// once loading completes (C check_speed_and_resolution /
-/// set_dial_highlimit / set_dial_lowlimit).
-fn apply_mres_cascade(rec: &mut MotorRecord) {
-    // C velcheckB (motorRecord.cc:2855-2875): across a resolution change
-    // the rev-unit speeds are invariant — re-derive the EGU speeds.
-    let urev_abs = rec.conv.urev.abs();
-    if urev_abs > 0.0 {
-        let (velo, vbas) = (urev_abs * rec.vel.s, urev_abs * rec.vel.sbas);
-        if rec.vel.velo != velo {
-            rec.vel.velo = velo;
-            rec.mark(m::VELO);
-        }
-        if rec.vel.vbas != vbas {
-            rec.vel.vbas = vbas;
-            rec.mark(m::VBAS);
-        }
-        rec.vel.bvel = urev_abs * rec.vel.sbak;
-        rec.vel.vmax = urev_abs * rec.vel.smax;
+/// The resolution an MRES or UREV put stores and the speeds and dial
+/// limits it derives (C velcheckB, motorRecord.cc:2855-2909), built only
+/// by [`rescale`] and so only when every one is finite.
+struct Rescale {
+    mres: f64,
+    urev: f64,
+    /// VELO, VBAS, BVEL, VMAX: |UREV| times S, SBAS, SBAK, SMAX.
+    speeds: [f64; 4],
+    dhlm: f64,
+    dllm: f64,
+}
+
+/// The rescale of an MRES or UREV put to `mres` and `urev`, or None when
+/// it leaves no step or a speed, dial or user limit that is not finite.
+/// A C defect not copied: velcheckB stores |UREV|·S and RHLM·MRES
+/// unchecked, so on motorSim (VELO 1, DHLM 100 at MRES 0.001) UREV 1e308
+/// makes VELO and DHLM infinite, MRES 1e305 DHLM, and MRES 1e303 at OFF
+/// 1e308 HLM, after which a VAL put of 1 drives DVAL to -1e308.
+fn rescale(rec: &MotorRecord, mres: f64, urev: f64) -> Option<Rescale> {
+    if !has_step(mres, urev) {
+        return None;
     }
-    if rec.conv.mres == 0.0 {
-        return;
-    }
-    let (dhlm, dllm) = (rec.limits.dhlm, rec.limits.dllm);
+    // C velcheckB (2855-2875): across a resolution change the rev-unit
+    // speeds are invariant — re-derive the EGU speeds.
+    let urev_abs = urev.abs();
+    let v = &rec.vel;
+    let speeds = [v.s, v.sbas, v.sbak, v.smax].map(|s| urev_abs * s);
     // C special MRES (2877-2906): the raw pair is the invariant —
     // recompute dial from raw. MRES < 0 crosses the assignment with
     // the SIGNED resolution (dhlm = rllm * mres, dllm = rhlm * mres,
     // "MRES < 0 swaps DHLM DLLM"), leaving the raw registers
     // untouched. Raw is always populated here: init seeds it and
     // every runtime dial/user limit put maintains it.
-    if rec.conv.mres > 0.0 {
-        rec.limits.dllm = rec.limits.rllm * rec.conv.mres;
-        rec.limits.dhlm = rec.limits.rhlm * rec.conv.mres;
-    } else {
-        rec.limits.dhlm = rec.limits.rllm * rec.conv.mres;
-        rec.limits.dllm = rec.limits.rhlm * rec.conv.mres;
+    let (low, high) = (rec.limits.rllm * mres, rec.limits.rhlm * mres);
+    let (dhlm, dllm) = if mres > 0.0 { (high, low) } else { (low, high) };
+    let (hlm, llm) = coordinate::dial_limits_to_user(dhlm, dllm, rec.conv.dir, rec.pos.off);
+    let finite = speeds
+        .iter()
+        .chain(&[dhlm, dllm, hlm, llm])
+        .all(|x| x.is_finite());
+    finite.then_some(Rescale {
+        mres,
+        urev,
+        speeds,
+        dhlm,
+        dllm,
+    })
+}
+
+/// Store an MRES or UREV put's [`Rescale`]: the resolution, then the
+/// velocity and limit cascade.
+///
+/// C: `2e89b552` (PR #193) — raw limits (RHLM/RLLM in motor steps) are the
+/// invariant across MRES changes. Dial and user limits are recomputed.
+/// `fd808eb2` (PR #206) — when MRES < 0, the high/low pair must be ordered
+/// so DHLM >= DLLM.
+/// C velcheckB (motorRecord.cc:2855-2909) — the runtime tail of a
+/// resolution change. Callers (the MRES/UREV runtime put branches)
+/// own the load gate: during `dbLoadRecords` the resolution handlers
+/// store raw and never reach here; `motor_sync_resolution_at_init` /
+/// `motor_sync_speed_at_init` / `motor_sync_limits_at_init` reconcile
+/// once loading completes (C check_speed_and_resolution /
+/// set_dial_highlimit / set_dial_lowlimit).
+fn apply_mres_cascade(rec: &mut MotorRecord, rescale: Rescale) {
+    rec.conv.mres = rescale.mres;
+    rec.conv.urev = rescale.urev;
+    let [velo, vbas, bvel, vmax] = rescale.speeds;
+    if rec.vel.velo != velo {
+        rec.vel.velo = velo;
+        rec.mark(m::VELO);
+    }
+    if rec.vel.vbas != vbas {
+        rec.vel.vbas = vbas;
+        rec.mark(m::VBAS);
+    }
+    rec.vel.bvel = bvel;
+    rec.vel.vmax = vmax;
+    let (dhlm, dllm) = (rec.limits.dhlm, rec.limits.dllm);
+    rec.limits.dhlm = rescale.dhlm;
+    rec.limits.dllm = rescale.dllm;
+    if rescale.mres < 0.0 {
         rec.internal.put_posted |= m::PUT_HLM_SWAP | m::PUT_LLM_SWAP;
     }
     // C 2880-2909: posted from special(), not marked.

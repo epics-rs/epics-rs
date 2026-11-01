@@ -526,11 +526,12 @@ impl MotorRecord {
         // A C defect not copied: init_controller (devMotorAsyn.c:199-223)
         // and motor_init_record_com (motordevCom.cc:291-311) write a NaN
         // DVAL as the controller position under Always or a Conditional
-        // use_rel, an infinite one under NearZero too, and motorSim then
-        // reads -2147483648 everywhere. A DVAL that is not finite is
-        // restored under no RSTM; the readback is taken.
+        // use_rel, an infinite one under NearZero too, and under Always one
+        // with no epicsInt32 step count (DVAL 10 at MRES 1e-9 loads 1e10);
+        // motorSim then reads -2147483648 everywhere. A DVAL load_admissible
+        // refuses is restored under no RSTM; the readback is taken.
         restore
-            && autosaved_dval.is_finite()
+            && self.load_admissible(autosaved_dval)
             && !self.conv.loadpos_blocked
             && (autosaved_rval == 0
                 || (autosaved_rval as f64 * self.conv.mres - autosaved_dval).abs() <= rdbd)

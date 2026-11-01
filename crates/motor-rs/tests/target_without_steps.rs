@@ -1,5 +1,5 @@
-//! A target with no i64 step count (NaN, ±Inf, or |DVAL/MRES| of 2^63 steps
-//! or more) is one C dispatches anyway: its NINT casts are unchecked, and the
+//! A target with no step count (NaN, ±Inf, or DVAL/MRES outside the epicsInt32
+//! RVAL) is one C dispatches anyway: its NINT casts are unchecked, and the
 //! oracle on motorSim reads DMOV 0, MOVN 1, MIP 0x20 after `dbpf N.VAL nan`,
 //! `-inf`, `inf` or `-1e300`. The port refuses it before the move block, SET
 //! mode included, like a refused move, so nothing is sent and the axis is not

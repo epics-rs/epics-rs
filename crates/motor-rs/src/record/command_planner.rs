@@ -408,19 +408,14 @@ impl MotorRecord {
     /// Plan an absolute move to current DVAL: C do_work's move block,
     /// dispatching only at `mip == MIP_DONE || mip == MIP_RETRY`.
     pub(crate) fn plan_absolute_move(&mut self, effects: &mut ProcessEffects) {
-        // A target with no i64 step count (NaN, ±Inf, or DVAL/MRES past
-        // 2^63) is a C defect not copied: NINT (motor.h:88) casts it to long
-        // unchecked, which is undefined, and C dispatches it to sit moving
-        // (the oracle on motorSim, for NaN, ±Inf and -1e300). Here NaN read
-        // as 0 steps and re-armed the sub-step poll without end, -Inf and
-        // -1e300 overflowed the step difference, +Inf reached the driver. It
-        // is refused like a refused move (2434-2452), before the SET test.
-        let npos = (self.pos.dval / self.conv.mres).round();
-        let countable = (i64::MIN as f64..i64::MAX as f64).contains(&npos);
-        if !self.pos.dval.is_finite() || (self.conv.mres != 0.0 && !countable) {
+        // A target load_admissible refuses is one C dispatches to sit moving
+        // (the oracle on motorSim, for NaN, ±Inf and -1e300). It is refused
+        // like a refused move (2434-2452), before the SET test.
+        if !self.load_admissible(self.pos.dval) {
             self.refuse_move_restore_lasts();
             return;
         }
+        let npos = (self.pos.dval / self.conv.mres).round();
         // C move-block entry (2248-2255): DIFF and RDIF are recomputed
         // from the requested target before anything else — they post
         // even when the pass is then suppressed (too_small) or refused
@@ -1404,6 +1399,24 @@ impl MotorRecord {
         effects.commands.extend(leg.after_speeds(SpeedWrites::MOVE));
     }
 
+    /// The admission every move and position load passes: the move block
+    /// and its SET-mode load_pos, the resolution re-anchor, and init's
+    /// position restore. DVAL needs a step count, NINT(dval / mres) inside
+    /// the epicsInt32 RVAL it lands in.
+    ///
+    /// A C defect not copied: NINT (motor.h:88) casts to long unchecked and
+    /// RVAL truncates it, so C moves to or loads a target with none. On
+    /// motorSim, an MRES of 1e-9 at DVAL 10 sends LOAD_POS 1e10, wraps RVAL
+    /// to 1410065408 and reads RRBV -2147483648; at 1e-300 the record then
+    /// dispatches no move until MRES is put back.
+    pub(crate) fn load_admissible(&self, dval: f64) -> bool {
+        if self.conv.mres == 0.0 {
+            return dval.is_finite();
+        }
+        let steps = (dval / self.conv.mres).round();
+        (f64::from(i32::MIN)..=f64::from(i32::MAX)).contains(&steps)
+    }
+
     /// A dial position or distance in the driver's units, C's raw steps
     /// (`dval / mres`).
     pub(crate) fn raw_position(&self, dial: f64) -> f64 {
@@ -1644,16 +1657,22 @@ impl MotorRecord {
             self.internal.pp = 1;
             effects.commands.push(MotorCommand::Poll);
         } else if !self.stat.mip.contains(MipFlags::LOAD_P) {
-            // A C defect not copied: no step-count gate precedes this
+            // A C defect not copied: load_admissible does not precede this
             // load_pos (1988-1989), so a NaN VAL or DVAL that a Pause or a
             // disabled record holds unprocessed is loaded (3811) and
             // becomes OFF (3796-3798). That pending target is refused as
             // the move block refuses it, and the load re-anchors at the
-            // last one.
-            if !(self.pos.val.is_finite() && self.pos.dval.is_finite()) {
+            // last one. When that has no step count at the new MRES either,
+            // nothing is loaded and the readback is taken as in SET mode.
+            if !(self.pos.val.is_finite() && self.load_admissible(self.pos.dval)) {
                 self.refuse_move_restore_lasts();
             }
-            self.load_pos(effects);
+            if self.load_admissible(self.pos.dval) {
+                self.load_pos(effects);
+            } else {
+                self.internal.pp = 1;
+                effects.commands.push(MotorCommand::Poll);
+            }
         }
     }
 

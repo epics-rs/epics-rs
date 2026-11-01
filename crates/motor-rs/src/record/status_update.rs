@@ -117,26 +117,46 @@ impl MotorRecord {
         status: &asyn_rs::interfaces::motor::MotorStatus,
         initcall: bool,
     ) {
+        self.store_status(status);
+        self.process_motor_info_fields(initcall);
+    }
+
+    /// devMotorAsyn `update_values`' copy of the driver status into RMP,
+    /// REP, MSTA and RVEL (devMotorAsyn.c:449-476).
+    fn store_status(&mut self, status: &asyn_rs::interfaces::motor::MotorStatus) {
+        // `(epicsInt32)floor(x + 0.5)`, half toward +inf and INT_MIN out of
+        // range (x86) — not NINT, which the other raw conversions in this
+        // file (rdif, rval, URIP rrbv) use.
+        self.pos.rmp = epics_base_rs::types::c_cast::f64_to_i32((status.position() + 0.5).floor());
+        self.pos.rep =
+            epics_base_rs::types::c_cast::f64_to_i32((status.encoder_position() + 0.5).floor());
+        let msta = MstaFlags::from_status(status);
+        // C process() 1277-1278, right after update_values.
+        if msta != self.stat.msta {
+            self.mark(m::MSTA);
+        }
+        self.stat.msta = msta;
+        self.stat.vbas_unsupported = !status.vbas_supported;
+        // C devMotorAsyn.c:469-474.
+        self.stat.rvel = epics_base_rs::types::c_cast::f64_to_i32(status.velocity().floor());
+    }
+
+    /// C `process_motor_info` (motorRecord.cc:3652-3768), which reads the
+    /// record alone: RMP, REP and MSTA as update_values last left them.
+    pub(crate) fn process_motor_info_fields(&mut self, initcall: bool) {
+        let msta = self.stat.msta;
         // C 3671-3675: UEIP=Yes is demoted to No on any poll where the
         // driver reports no encoder. This — not the put handler — is
         // what vets a .db-loaded UEIP=Yes: dbLoadRecords writes field()
         // values raw, and the first poll performs the encoder check.
         // C posts the change without MARKing M_UEIP, so no re-anchor.
-        if self.conv.ueip && !status.has_encoder {
+        if self.conv.ueip && !msta.contains(MstaFlags::ENCODER_PRESENT) {
             self.conv.ueip = false;
             self.internal.ueip_posted = true;
         }
         let (old_rrbv, old_drbv, old_rbv) = (self.pos.rrbv, self.pos.drbv, self.pos.rbv);
         let (old_tdir, old_movn) = (self.stat.tdir, self.stat.movn);
         let (old_hls, old_lls, old_athm) = (self.limits.hls, self.limits.lls, self.stat.athm);
-
-        // Layer 1: the raw counts, devMotorAsyn update_values
-        // (devMotorAsyn.c:452-464): `(epicsInt32)floor(x + 0.5)`, half toward
-        // +inf and INT_MIN out of range (x86) — not NINT, which the other raw
-        // conversions in this file (rdif, rval, URIP rrbv) use.
-        self.pos.rmp = epics_base_rs::types::c_cast::f64_to_i32((status.position() + 0.5).floor());
-        self.pos.rep =
-            epics_base_rs::types::c_cast::f64_to_i32((status.encoder_position() + 0.5).floor());
 
         // C 3682: the RDBL read is skipped on the init call. A failed one
         // (3687-3697) flags the stop ahead of process()'s external-move
@@ -161,29 +181,22 @@ impl MotorRecord {
             self.mark(m::RBV);
         }
 
-        // DIFF and RDIF
-        self.pos.diff = self.pos.dval - self.pos.drbv;
-        // C: rdif = NINT(diff / mres) -- raw step difference
-        self.pos.rdif = if self.conv.mres != 0.0 {
-            coordinate::to_long((self.pos.diff / self.conv.mres).round())
-        } else {
-            0
-        };
-        // C 3764-3767: marked whether or not they moved.
-        self.mark(m::DIFF | m::RDIF);
+        self.derive_diff();
 
         // MOVN: C uses RAW limit switches (rhls/rlls) with RAW cdir
         // Must compute ls_active BEFORE mapping limits to user coordinates
-        let ls_active =
-            (status.high_limit && self.stat.cdir != 0) || (status.low_limit && self.stat.cdir == 0);
-        self.stat.movn = i16::from(!(ls_active || status.done || status.problem));
+        let high_limit = msta.contains(MstaFlags::PLUS_LS);
+        let low_limit = msta.contains(MstaFlags::MINUS_LS);
+        let problem = msta.contains(MstaFlags::PROBLEM);
+        let ls_active = (high_limit && self.stat.cdir != 0) || (low_limit && self.stat.cdir == 0);
+        self.stat.movn = i16::from(!(ls_active || msta.contains(MstaFlags::DONE) || problem));
         if self.stat.movn != old_movn {
             self.mark(m::MOVN);
         }
         // C 3744-3747: a struck limit in the commanded direction or a
         // driver problem releases every latched motion button, so the
         // stopped axis is not re-commanded on the next pass.
-        if ls_active || status.problem {
+        if ls_active || problem {
             self.clear_buttons();
         }
 
@@ -208,8 +221,8 @@ impl MotorRecord {
         // Raw limit switch readbacks (C 3727-3728), then the user-mapped
         // pair derives from them by DIR/MRES polarity (C 3733-3734:
         // hls = ((dir == Pos) == (mres >= 0)) ? rhls : rlls).
-        self.limits.rhls = i16::from(status.high_limit);
-        self.limits.rlls = i16::from(status.low_limit);
+        self.limits.rhls = i16::from(high_limit);
+        self.limits.rlls = i16::from(low_limit);
         let same_polarity = (self.conv.dir == MotorDir::Pos) == (self.conv.mres >= 0.0);
         if same_polarity {
             self.limits.hls = self.limits.rhls;
@@ -225,17 +238,8 @@ impl MotorRecord {
             self.mark(m::LLS);
         }
 
-        let msta = MstaFlags::from_status(status);
-        let msta_changed = msta != self.stat.msta;
-        self.stat.msta = msta;
-        self.stat.vbas_unsupported = !status.vbas_supported;
-        // C process() 1277-1278, right after update_values.
-        if msta_changed {
-            self.mark(m::MSTA);
-        }
-
         // C: tdir = msta.RA_DIRECTION (from driver on every poll)
-        self.stat.tdir = i16::from(status.direction);
+        self.stat.tdir = i16::from(msta.contains(MstaFlags::DIRECTION));
         if self.stat.tdir != old_tdir {
             self.mark(m::TDIR);
         }
@@ -253,9 +257,6 @@ impl MotorRecord {
             self.mark(m::ATHM);
         }
 
-        // C devMotorAsyn.c:469-474.
-        self.stat.rvel = epics_base_rs::types::c_cast::f64_to_i32(status.velocity().floor());
-
         // LVIO is NOT recomputed here. C re-evaluates it only at
         // enter_do_work (1463-1484: jog from live RBV, home disabled,
         // everything else preserves the latched value) — ported in
@@ -271,6 +272,19 @@ impl MotorRecord {
             self.stat.movn = 0;
             self.mark(m::DMOV | m::MOVN);
         }
+    }
+
+    /// DIFF and RDIF from DVAL and DRBV (C 3764-3767, init_record
+    /// 727-730), marked whether or not they moved.
+    fn derive_diff(&mut self) {
+        self.pos.diff = self.pos.dval - self.pos.drbv;
+        // C: rdif = NINT(diff / mres) -- raw step difference
+        self.pos.rdif = if self.conv.mres != 0.0 {
+            coordinate::to_long((self.pos.diff / self.conv.mres).round())
+        } else {
+            0
+        };
+        self.mark(m::DIFF | m::RDIF);
     }
 
     /// Sync all positions from readback.
@@ -508,7 +522,16 @@ impl MotorRecord {
         // means MRES changed; restoring would place the axis at the wrong
         // position, so skip the restore and adopt the driver readback instead.
         // C init_controller has no such check, so nothing to print.
+        //
+        // A C defect not copied: init_controller (devMotorAsyn.c:199-223)
+        // and motor_init_record_com (motordevCom.cc:291-311) write a NaN
+        // DVAL as the controller position under Always or a Conditional
+        // use_rel, an infinite one under NearZero too, and under Always one
+        // with no epicsInt32 step count (DVAL 10 at MRES 1e-9 loads 1e10);
+        // motorSim then reads -2147483648 everywhere. A DVAL load_admissible
+        // refuses is restored under no RSTM; the readback is taken.
         restore
+            && self.load_admissible(autosaved_dval)
             && !self.conv.loadpos_blocked
             && (autosaved_rval == 0
                 || (autosaved_rval as f64 * self.conv.mres - autosaved_dval).abs() <= rdbd)
@@ -527,7 +550,23 @@ impl MotorRecord {
         // C init_record runs `process_motor_info(pmr, true)` — the init call
         // skips URIP RDBL scaling and seeds the readback from motor position.
         self.process_motor_info_initcall(status, true);
+        self.init_drive_values(loaded);
+    }
 
+    /// C init_record's half after devMotorAsyn's `bad:` arm returns 0
+    /// (devMotorAsyn.c:432-434): update_values copies nothing, so
+    /// process_motor_info(true) reads the record's own RMP, REP and MSTA,
+    /// and the drive values take that readback.
+    pub(crate) fn init_without_device(&mut self) {
+        self.finish_init();
+        self.process_motor_info_fields(true);
+        self.init_drive_values(None);
+    }
+
+    /// C init_record after process_motor_info(true) (706-714, 727-733):
+    /// the drive values take the readback, or the `loaded` DVAL, unless
+    /// closed-loop OMSL keeps the DOL's; DIFF and the lasts follow.
+    fn init_drive_values(&mut self, loaded: Option<f64>) {
         // C init_record loads a CONSTANT DOL into VAL (677-681) and then
         // adopts the readback into VAL/DVAL/RVAL unless closed-loop OMSL
         // (706-714), where the drive values stay the DOL's.
@@ -543,7 +582,20 @@ impl MotorRecord {
             }
         } else {
             self.seed_val_from_dol();
+            // A C defect not copied: closed loop keeps a loaded NaN or
+            // infinite VAL or DVAL (706-714); each takes the readback, the
+            // autosaved DVAL after a restore as above.
+            let readback = loaded.unwrap_or(self.pos.drbv);
+            if !self.pos.val.is_finite() {
+                self.pos.val = coordinate::dial_to_user(readback, self.conv.dir, self.pos.off);
+                self.mark(m::VAL);
+            }
+            if !self.pos.dval.is_finite() {
+                self.pos.dval = readback;
+                self.mark(m::DVAL);
+            }
         }
+        self.derive_diff();
         self.internal.lval = self.pos.val;
         self.internal.ldvl = self.pos.dval;
         self.internal.lrvl = self.pos.rval;

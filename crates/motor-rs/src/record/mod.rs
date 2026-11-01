@@ -908,6 +908,13 @@ impl Record for MotorRecord {
             field_access::motor_sync_resolution_at_init(self);
             field_access::motor_sync_speed_at_init(self);
             field_access::motor_sync_limits_at_init(self);
+            // A C defect not copied: init_record keeps a loaded NaN or
+            // infinite OFF, and VAL, RBV and the user limits follow it.
+            // OFF has no readback, so it takes the field default.
+            if !self.pos.off.is_finite() {
+                self.pos.off = 0.0;
+                self.mark(m::OFF);
+            }
             // C 653-670: CARD from the OUT link's type, the record's only
             // read of that link at init.
             field_access::motor_derive_card(self);

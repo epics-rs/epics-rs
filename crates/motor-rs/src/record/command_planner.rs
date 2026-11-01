@@ -408,19 +408,14 @@ impl MotorRecord {
     /// Plan an absolute move to current DVAL: C do_work's move block,
     /// dispatching only at `mip == MIP_DONE || mip == MIP_RETRY`.
     pub(crate) fn plan_absolute_move(&mut self, effects: &mut ProcessEffects) {
-        // A target with no i64 step count (NaN, ±Inf, or DVAL/MRES past
-        // 2^63) is a C defect not copied: NINT (motor.h:88) casts it to long
-        // unchecked, which is undefined, and C dispatches it to sit moving
-        // (the oracle on motorSim, for NaN, ±Inf and -1e300). Here NaN read
-        // as 0 steps and re-armed the sub-step poll without end, -Inf and
-        // -1e300 overflowed the step difference, +Inf reached the driver. It
-        // is refused like a refused move (2434-2452), before the SET test.
-        let npos = (self.pos.dval / self.conv.mres).round();
-        let countable = (i64::MIN as f64..i64::MAX as f64).contains(&npos);
-        if !self.pos.dval.is_finite() || (self.conv.mres != 0.0 && !countable) {
+        // A target load_admissible refuses is one C dispatches to sit moving
+        // (the oracle on motorSim, for NaN, ±Inf and -1e300). It is refused
+        // like a refused move (2434-2452), before the SET test.
+        if !self.load_admissible(self.pos.dval) {
             self.refuse_move_restore_lasts();
             return;
         }
+        let npos = (self.pos.dval / self.conv.mres).round();
         // C move-block entry (2248-2255): DIFF and RDIF are recomputed
         // from the requested target before anything else — they post
         // even when the pass is then suppressed (too_small) or refused
@@ -1404,6 +1399,24 @@ impl MotorRecord {
         effects.commands.extend(leg.after_speeds(SpeedWrites::MOVE));
     }
 
+    /// The admission every move and position load passes: the move block
+    /// and its SET-mode load_pos, the resolution re-anchor, and init's
+    /// position restore. DVAL needs a step count, NINT(dval / mres) inside
+    /// the epicsInt32 RVAL it lands in.
+    ///
+    /// A C defect not copied: NINT (motor.h:88) casts to long unchecked and
+    /// RVAL truncates it, so C moves to or loads a target with none. On
+    /// motorSim, an MRES of 1e-9 at DVAL 10 sends LOAD_POS 1e10, wraps RVAL
+    /// to 1410065408 and reads RRBV -2147483648; at 1e-300 the record then
+    /// dispatches no move until MRES is put back.
+    pub(crate) fn load_admissible(&self, dval: f64) -> bool {
+        if self.conv.mres == 0.0 {
+            return dval.is_finite();
+        }
+        let steps = (dval / self.conv.mres).round();
+        (f64::from(i32::MIN)..=f64::from(i32::MAX)).contains(&steps)
+    }
+
     /// A dial position or distance in the driver's units, C's raw steps
     /// (`dval / mres`).
     pub(crate) fn raw_position(&self, dial: f64) -> f64 {
@@ -1551,6 +1564,20 @@ impl MotorRecord {
     /// the cycle (process 1405-1409: MIP_LOAD_P -> MIP_DONE, DMOV ->
     /// TRUE, no DLY and no retry evaluation).
     pub(crate) fn load_pos(&mut self, effects: &mut ProcessEffects) {
+        // A C defect not copied: C 3796-3798 stores a Variable offset that
+        // is not finite. The redefinition is refused like a refused move
+        // (2434-2452).
+        let variable_off = match self.conv.foff {
+            FreezeOffset::Frozen => None,
+            FreezeOffset::Variable => {
+                let off = coordinate::calc_offset(self.pos.val, self.pos.dval, self.conv.dir);
+                if off.is_none() {
+                    self.refuse_move_restore_lasts();
+                    return;
+                }
+                off
+            }
+        };
         self.internal.ldvl = self.pos.dval;
         self.internal.lval = self.pos.val;
         if self.conv.mres != 0.0 {
@@ -1561,18 +1588,18 @@ impl MotorRecord {
             self.pos.rval = rval;
         }
         self.internal.lrvl = self.pos.rval;
-        if self.conv.foff == FreezeOffset::Frozen {
+        if let Some(off) = variable_off {
+            // C 3792-3800: adjust the offset to keep VAL and retranslate
+            // the user limits.
+            self.pos.off = off;
+            self.mark(m::OFF);
+            self.set_userlimits();
+        } else {
             // C 3782-3791: translate dial to user through the frozen
             // offset.
             self.pos.val = coordinate::dial_to_user(self.pos.dval, self.conv.dir, self.pos.off);
             self.mark(m::VAL);
             self.internal.lval = self.pos.val;
-        } else {
-            // C 3792-3800: adjust the offset to keep VAL and retranslate
-            // the user limits.
-            self.pos.off = coordinate::calc_offset(self.pos.val, self.pos.dval, self.conv.dir);
-            self.mark(m::OFF);
-            self.set_userlimits();
         }
         // C load_pos (motorRecord.cc:3771-3817) marks M_RVAL/M_VAL/M_OFF/
         // M_MIP/M_DMOV but never recomputes or MARKs RBV: the readback is
@@ -1630,7 +1657,22 @@ impl MotorRecord {
             self.internal.pp = 1;
             effects.commands.push(MotorCommand::Poll);
         } else if !self.stat.mip.contains(MipFlags::LOAD_P) {
-            self.load_pos(effects);
+            // A C defect not copied: load_admissible does not precede this
+            // load_pos (1988-1989), so a NaN VAL or DVAL that a Pause or a
+            // disabled record holds unprocessed is loaded (3811) and
+            // becomes OFF (3796-3798). That pending target is refused as
+            // the move block refuses it, and the load re-anchors at the
+            // last one. When that has no step count at the new MRES either,
+            // nothing is loaded and the readback is taken as in SET mode.
+            if !(self.pos.val.is_finite() && self.load_admissible(self.pos.dval)) {
+                self.refuse_move_restore_lasts();
+            }
+            if self.load_admissible(self.pos.dval) {
+                self.load_pos(effects);
+            } else {
+                self.internal.pp = 1;
+                effects.commands.push(MotorCommand::Poll);
+            }
         }
     }
 
@@ -1695,7 +1737,7 @@ impl MotorRecord {
     /// controller command (LOAD_POS belongs to the Frozen/DVAL/RVAL
     /// redefinition paths). Called only from collect_drive_fields.
     pub(crate) fn set_mode_redefine_val(&mut self, new_val: f64) {
-        if let Ok((dval, rval, off)) = coordinate::cascade_from_val(
+        match coordinate::cascade_from_val(
             new_val,
             self.conv.dir,
             self.pos.off,
@@ -1704,18 +1746,26 @@ impl MotorRecord {
             true,
             self.pos.dval,
         ) {
-            self.pos.val = new_val;
-            self.pos.dval = dval;
-            self.pos.rval = rval;
-            self.pos.off = off;
-            self.set_userlimits();
-            self.pos.rbv = coordinate::dial_to_user(self.pos.drbv, self.conv.dir, self.pos.off);
-            self.internal.lval = self.pos.val;
-            self.stat.mip = MipFlags::empty();
-            self.stat.dmov = 1;
-            // C 2206-2226, all unconditional.
-            self.mark(m::VAL | m::OFF | m::RBV | m::MIP | m::DMOV);
-            self.set_phase(MotionPhase::Idle);
+            Ok((dval, rval, off)) => {
+                self.pos.val = new_val;
+                self.pos.dval = dval;
+                self.pos.rval = rval;
+                self.pos.off = off;
+                self.set_userlimits();
+                self.pos.rbv = coordinate::dial_to_user(self.pos.drbv, self.conv.dir, self.pos.off);
+                self.internal.lval = self.pos.val;
+                self.stat.mip = MipFlags::empty();
+                self.stat.dmov = 1;
+                // C 2206-2226, all unconditional.
+                self.mark(m::VAL | m::OFF | m::RBV | m::MIP | m::DMOV);
+                self.set_phase(MotionPhase::Idle);
+            }
+            // A C defect not copied: C 2213 stores the offset unchecked, so
+            // a NaN or infinite VAL, RLV, TWV or DOL makes OFF, RBV and the
+            // user limits non-finite, and every later VAL a NaN DVAL (the
+            // oracle on motorSim). The redefinition is refused like a
+            // refused move (2434-2452).
+            Err(_) => self.refuse_move_restore_lasts(),
         }
     }
 

@@ -422,20 +422,23 @@ fn test_soft_limit_rejects_move() {
     assert!(effects.commands.is_empty());
 }
 
-/// A DVAL/MRES rounding outside i64 has no step count and is refused like
-/// a refused move, as is a non-finite DVAL under MRES 0; the widest counts
-/// either side are dispatched, from a DRBV of the other sign.
+/// A DVAL/MRES rounding outside the epicsInt32 RVAL has no step count and
+/// is refused like a refused move, as is a non-finite DVAL under MRES 0;
+/// the widest counts either side are dispatched, from a DRBV of the other
+/// sign.
 #[test]
-fn a_target_is_dispatched_only_with_an_i64_step_count() {
-    const TOP: f64 = 9_223_372_036_854_775_808.0; // 2^63
+fn a_target_is_dispatched_only_with_an_i32_step_count() {
+    const TOP: f64 = 2_147_483_648.0; // 2^31
     for (mres, dval, drbv, dispatched) in [
         (1.0, TOP, 0.0, false),
-        (1.0, -TOP - 2048.0, 0.0, false),
+        (1.0, TOP - 0.5, 0.0, false),
+        (1.0, -TOP - 1.0, 0.0, false),
         (0.5, TOP / 2.0, 0.0, false),
+        (1e-9, 10.0, 0.0, false),
         (0.0, f64::INFINITY, 0.0, false),
-        (1.0, TOP - 1024.0, -2048.0, true),
+        (1.0, TOP - 1.0, -2048.0, true),
         (1.0, -TOP, 2048.0, true),
-        (0.5, (TOP - 1024.0) / 2.0, 0.0, true),
+        (0.5, (TOP - 1.0) / 2.0, 0.0, true),
     ] {
         let mut rec = MotorRecord::new();
         rec.conv.mres = mres;
@@ -613,6 +616,197 @@ fn test_set_foff_variable_val_completes_without_command() {
     assert_eq!(rec.pos.rbv, 100.0, "RBV retranslated through new OFF");
     assert!(rec.stat.dmov != 0, "C 2225: dmov = TRUE");
     assert!(rec.stat.mip.is_empty(), "C 2223: mip = MIP_DONE");
+}
+
+/// C 2213 stores a NaN offset for a NaN VAL in SET + FOFF=Variable (the
+/// oracle on motorSim: OFF, RBV, HLM and LLM read nan). The redefinition
+/// is refused instead, for every input that folds into VAL.
+#[test]
+fn a_set_redefinition_to_a_non_finite_offset_is_refused() {
+    for (input, bad) in [
+        ("VAL", f64::NAN),
+        ("VAL", f64::INFINITY),
+        ("RLV", f64::NAN),
+        ("TWV", f64::NAN),
+    ] {
+        let mut rec = MotorRecord::new();
+        rec.internal.init_invariants_synced = true;
+        rec.conv.mres = 1.0;
+        rec.stat.msta = MstaFlags::DONE;
+        rec.put_field("DHLM", EpicsValue::Double(10.0)).unwrap();
+        rec.put_field("DLLM", EpicsValue::Double(-10.0)).unwrap();
+        rec.pos.val = 5.0;
+        rec.pos.dval = 5.0;
+        rec.pos.drbv = 5.0;
+        rec.internal.lval = 5.0;
+        rec.internal.ldvl = 5.0;
+        rec.internal.lrvl = 5;
+        rec.pos.rval = 5;
+        rec.put_field("SET", EpicsValue::Short(1)).unwrap();
+        let src = match input {
+            "TWV" => {
+                rec.ctrl.twv = bad;
+                rec.ctrl.twf = 1;
+                CommandSource::Twf
+            }
+            "RLV" => {
+                rec.put_field("RLV", EpicsValue::Double(bad)).unwrap();
+                CommandSource::Rlv
+            }
+            _ => {
+                rec.put_field("VAL", EpicsValue::Double(bad)).unwrap();
+                CommandSource::Val
+            }
+        };
+        let effects = rec.plan_motion(src);
+        let case = format!("{input} {bad}");
+        assert!(
+            !(effects.commands.iter()).any(|c| matches!(
+                c,
+                MotorCommand::MoveAbsolute { .. } | MotorCommand::SetPosition { .. }
+            )),
+            "{case}: {:?}",
+            effects.commands
+        );
+        assert_eq!(rec.pos.off, 0.0, "{case}: OFF kept");
+        assert_eq!((rec.limits.hlm, rec.limits.llm), (10.0, -10.0), "{case}");
+        assert_eq!(
+            (rec.pos.val, rec.pos.dval),
+            (5.0, 5.0),
+            "{case}: rolled back"
+        );
+        assert_eq!(rec.internal.lval, 5.0, "{case}");
+        assert!(rec.stat.dmov != 0 && rec.stat.mip.is_empty(), "{case}");
+    }
+}
+
+/// Special OFF (2786-2791) takes a NaN or infinite offset in C, and VAL,
+/// RBV and the user limits follow it; the put is dropped instead.
+#[test]
+fn an_offset_put_that_is_not_finite_is_dropped() {
+    for bad in [f64::NAN, f64::NEG_INFINITY] {
+        let mut rec = MotorRecord::new();
+        rec.internal.init_invariants_synced = true;
+        rec.conv.mres = 1.0;
+        rec.put_field("DHLM", EpicsValue::Double(10.0)).unwrap();
+        rec.put_field("DLLM", EpicsValue::Double(-10.0)).unwrap();
+        rec.pos.dval = 5.0;
+        rec.pos.drbv = 5.0;
+        rec.put_field("OFF", EpicsValue::Double(1.0)).unwrap();
+        assert_eq!((rec.pos.val, rec.pos.rbv), (6.0, 6.0));
+        rec.put_field("OFF", EpicsValue::Double(bad)).unwrap();
+        assert_eq!(rec.pos.off, 1.0, "OFF {bad}");
+        assert_eq!((rec.pos.val, rec.pos.rbv), (6.0, 6.0), "OFF {bad}");
+        assert_eq!((rec.limits.hlm, rec.limits.llm), (11.0, -9.0), "OFF {bad}");
+        assert_eq!(rec.internal.lval, 1.0, "OFF {bad}");
+    }
+}
+
+/// A record at DVAL 5 and OFF 1 (VAL 6, user limits 11/-9) holding a NaN
+/// `field` unprocessed: stored, as a disabled record stores a put, or
+/// collected under SPMG=Pause, which returns before the move block.
+fn holding_a_nan(field: &str, paused: bool, foff: FreezeOffset) -> MotorRecord {
+    let mut rec = MotorRecord::new();
+    rec.internal.init_invariants_synced = true;
+    rec.conv.mres = 1.0;
+    rec.conv.foff = foff;
+    rec.stat.msta = MstaFlags::DONE;
+    rec.put_field("DHLM", EpicsValue::Double(10.0)).unwrap();
+    rec.put_field("DLLM", EpicsValue::Double(-10.0)).unwrap();
+    rec.pos.dval = 5.0;
+    rec.pos.drbv = 5.0;
+    rec.pos.rval = 5;
+    rec.internal.ldvl = 5.0;
+    rec.internal.lrvl = 5;
+    rec.put_field("OFF", EpicsValue::Double(1.0)).unwrap();
+    assert_eq!((rec.pos.val, rec.internal.lval), (6.0, 6.0));
+    if paused {
+        rec.put_field("SPMG", EpicsValue::Short(1)).unwrap();
+        rec.do_process();
+    }
+    rec.put_field(field, EpicsValue::Double(f64::NAN)).unwrap();
+    if paused {
+        rec.do_process();
+        assert!(
+            rec.pos.dval.is_nan(),
+            "the Pause holds the collected target"
+        );
+    }
+    rec
+}
+
+/// Special DIR derives the FOFF=Variable offset from the VAL and DVAL the
+/// record holds (C 2777), so a held NaN leaves OFF, RBV and the user limits
+/// NaN in C. The DIR put is dropped instead.
+#[test]
+fn a_dir_put_over_a_held_target_that_is_not_finite_is_dropped() {
+    for (field, paused) in [("VAL", false), ("DVAL", false), ("VAL", true)] {
+        let mut rec = holding_a_nan(field, paused, FreezeOffset::Variable);
+        rec.put_field("DIR", EpicsValue::Short(1)).unwrap();
+        let case = format!("{field} paused={paused}");
+        assert_eq!(rec.conv.dir, MotorDir::Pos, "{case}: DIR kept");
+        assert_eq!((rec.pos.off, rec.pos.rbv), (1.0, 6.0), "{case}");
+        assert_eq!((rec.limits.hlm, rec.limits.llm), (11.0, -9.0), "{case}");
+    }
+}
+
+/// C's resolution block loads the held target with no step-count gate
+/// (1988-1989): a NaN DVAL is loaded (3811), and under FOFF=Variable a NaN
+/// VAL or DVAL becomes OFF (3796-3798). The held target is refused and the
+/// load re-anchors at the last one.
+#[test]
+fn a_resolution_change_refuses_a_held_target_that_is_not_finite() {
+    for foff in [FreezeOffset::Variable, FreezeOffset::Frozen] {
+        for (field, paused) in [("VAL", false), ("DVAL", false), ("VAL", true)] {
+            let mut rec = holding_a_nan(field, paused, foff);
+            rec.put_field("MRES", EpicsValue::Double(0.5)).unwrap();
+            let effects = rec.do_process();
+            let case = format!("{foff:?} {field} paused={paused}");
+            assert!(
+                effects
+                    .commands
+                    .contains(&MotorCommand::SetPosition { position: 10.0 }),
+                "{case}: {:?}",
+                effects.commands
+            );
+            assert_eq!(
+                (rec.pos.val, rec.pos.dval, rec.pos.off),
+                (6.0, 5.0, 1.0),
+                "{case}"
+            );
+            assert_eq!((rec.internal.lval, rec.internal.ldvl), (6.0, 5.0), "{case}");
+            assert!(
+                rec.limits.hlm.is_finite() && rec.limits.llm.is_finite(),
+                "{case}"
+            );
+        }
+    }
+}
+
+/// A finite VAL and DVAL can still differ past f64::MAX, an infinite
+/// offset C load_pos stores (3796-3798). The SET redefinition is refused
+/// like a refused move.
+#[test]
+fn a_set_load_to_an_offset_that_is_not_finite_is_refused() {
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 1e300;
+    rec.stat.msta = MstaFlags::DONE;
+    rec.pos.val = 1e308;
+    rec.pos.off = 1e308;
+    rec.internal.lval = 1e308;
+    rec.put_field("SET", EpicsValue::Short(1)).unwrap();
+    rec.put_field("DVAL", EpicsValue::Double(-1e308)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Set);
+    assert!(
+        !(effects.commands.iter()).any(|c| matches!(c, MotorCommand::SetPosition { .. })),
+        "{:?}",
+        effects.commands
+    );
+    assert_eq!(
+        (rec.pos.val, rec.pos.dval, rec.pos.off),
+        (1e308, 0.0, 1e308)
+    );
+    assert!(rec.stat.dmov != 0 && rec.stat.mip.is_empty());
 }
 
 #[test]
@@ -924,6 +1118,48 @@ fn test_runtime_mres_change_set_mode_resyncs_drive_values() {
     assert!(rec.internal.pp == 0, "postProcess consumed pp");
     assert_eq!(rec.pos.dval, 4.0, "DVAL re-synced from the readback");
     assert_eq!(rec.pos.val, rec.pos.rbv, "VAL re-synced from RBV");
+}
+
+/// C's resolution block loads DVAL with no step count at the new MRES
+/// (1988-1989): on motorSim, MRES 1e-9 at DVAL 10 sends LOAD_POS 1e10 and
+/// reads RRBV -2147483648, and 1e-300 leaves the record moving nowhere.
+/// Nothing is loaded; the record takes the readback as SET mode does
+/// (1981-1987).
+#[test]
+fn a_resolution_change_with_no_step_count_takes_the_readback() {
+    for mres in [1e-9, 1e-300] {
+        let mut rec = MotorRecord::new();
+        rec.stat.msta = MstaFlags::DONE;
+        rec.internal.init_invariants_synced = true;
+        rec.conv.mres = 0.001;
+        (rec.pos.val, rec.pos.dval, rec.pos.rval) = (10.0, 10.0, 10_000);
+        let i = &mut rec.internal;
+        (i.lval, i.ldvl, i.lrvl) = (10.0, 10.0, 10_000);
+        (rec.pos.rbv, rec.pos.drbv, rec.pos.rmp, rec.pos.rrbv) = (10.0, 10.0, 10_000, 10_000);
+
+        rec.put_field("MRES", EpicsValue::Double(mres)).unwrap();
+        let effects = rec.do_process();
+        assert_eq!(effects.commands, [MotorCommand::Poll], "MRES {mres:e}");
+        assert!(rec.internal.pp != 0, "MRES {mres:e}");
+        assert!(rec.stat.dmov != 0 && rec.stat.mip.is_empty());
+
+        // GET_INFO callback: the controller still reports 10000 steps.
+        let status = asyn_rs::interfaces::motor::MotorStatus {
+            done: true,
+            ..asyn_rs::interfaces::motor::MotorStatus::default().with_position(10_000.0)
+        };
+        rec.process_motor_info(&status);
+        let _ = rec.check_completion();
+        let dial = 10_000.0 * mres;
+        let drive = (dial, dial, 10_000);
+        assert_eq!(
+            (rec.pos.val, rec.pos.dval, rec.pos.rval),
+            drive,
+            "MRES {mres:e}"
+        );
+        let i = &rec.internal;
+        assert_eq!((i.lval, i.ldvl, i.lrvl), drive, "MRES {mres:e}");
+    }
 }
 
 #[test]
@@ -6738,6 +6974,129 @@ fn test_init_restore_adopts_drive_values_only_off_closed_loop() {
         assert_eq!((rec.pos.val, rec.pos.dval, rec.pos.rval), drive, "{omsl}");
         let i = &rec.internal;
         assert_eq!((i.lval, i.ldvl, i.lrvl), drive, "{omsl}");
+    }
+}
+
+#[test]
+fn an_autosaved_dval_that_is_not_finite_is_not_restored() {
+    // C init_controller (devMotorAsyn.c:199-223) writes this DVAL as the
+    // controller position under each of these RSTM cases.
+    use asyn_rs::interfaces::motor::MotorStatus;
+    for (rstm, use_rel, dval, position) in [
+        (RestoreMode::Always, false, f64::NAN, 3.0),
+        (RestoreMode::Always, false, f64::NEG_INFINITY, 3.0),
+        (RestoreMode::Conditional, true, f64::NAN, 3.0),
+        (RestoreMode::NearZero, false, f64::INFINITY, 0.0),
+    ] {
+        let mut rec = MotorRecord::new();
+        rec.conv.rstm = rstm;
+        rec.conv.mres = 1.0;
+        rec.conv.ueip = use_rel;
+        rec.pos.dval = dval; // autosaved
+        let status = MotorStatus {
+            done: true,
+            has_encoder: true,
+            ..Default::default()
+        }
+        .with_position(position)
+        .with_encoder_position(position);
+        let effects = rec.initial_readback(&status);
+        let case = format!("{rstm:?} {dval}");
+        assert!(
+            !effects
+                .commands
+                .iter()
+                .any(|c| matches!(c, MotorCommand::InitPosition { .. })),
+            "{case}: {:?}",
+            effects.commands
+        );
+        let drive = (position, position, position as i32);
+        assert_eq!((rec.pos.val, rec.pos.dval, rec.pos.rval), drive, "{case}");
+        let i = &rec.internal;
+        assert_eq!((i.lval, i.ldvl, i.lrvl), drive, "{case}");
+    }
+}
+
+#[test]
+fn an_autosaved_dval_with_no_step_count_is_not_restored() {
+    // C init_controller loads DVAL 10 at MRES 1e-9 as 1e10 steps; motorSim
+    // then reads VAL, DVAL and RBV -2.147483648 and RVAL -2147483648.
+    use asyn_rs::interfaces::motor::MotorStatus;
+    for (mres, restored) in [(1e-8, true), (1e-9, false), (1e-300, false)] {
+        let mut rec = MotorRecord::new();
+        rec.conv.rstm = RestoreMode::Always;
+        rec.conv.mres = mres;
+        rec.pos.dval = 10.0; // autosaved
+        let status = MotorStatus {
+            done: true,
+            ..Default::default()
+        }
+        .with_position(3.0);
+        let effects = rec.initial_readback(&status);
+        assert_eq!(
+            effects
+                .commands
+                .iter()
+                .any(|c| matches!(c, MotorCommand::InitPosition { .. })),
+            restored,
+            "MRES {mres:e}: {:?}",
+            effects.commands
+        );
+        let drive = if restored {
+            (10.0, 10.0, 1_000_000_000)
+        } else {
+            (3.0 * mres, 3.0 * mres, 3)
+        };
+        assert_eq!(
+            (rec.pos.val, rec.pos.dval, rec.pos.rval),
+            drive,
+            "MRES {mres:e}"
+        );
+        let i = &rec.internal;
+        assert_eq!((i.lval, i.ldvl, i.lrvl), drive, "MRES {mres:e}");
+    }
+}
+
+#[test]
+fn a_closed_loop_load_that_is_not_finite_takes_the_readback() {
+    // C init_record keeps the loaded closed-loop VAL and DVAL (706-714);
+    // the readback is the autosaved DVAL once it is restored.
+    use asyn_rs::interfaces::motor::MotorStatus;
+    for (rstm, val, dval, drive, restored) in [
+        (
+            RestoreMode::Never,
+            f64::NAN,
+            f64::INFINITY,
+            (3.0, 3.0),
+            false,
+        ),
+        (RestoreMode::Always, f64::INFINITY, 7.0, (7.0, 7.0), true),
+        (RestoreMode::Always, 2.0, f64::NAN, (2.0, 3.0), false),
+    ] {
+        let mut rec = MotorRecord::new();
+        rec.links.omsl = 1;
+        rec.conv.rstm = rstm;
+        rec.conv.mres = 1.0;
+        rec.pos.val = val; // autosaved
+        rec.pos.dval = dval;
+        let status = MotorStatus {
+            done: true,
+            ..Default::default()
+        }
+        .with_position(3.0);
+        let effects = rec.initial_readback(&status);
+        let case = format!("{rstm:?} {val} {dval}");
+        assert_eq!(
+            effects
+                .commands
+                .iter()
+                .any(|c| matches!(c, MotorCommand::InitPosition { .. })),
+            restored,
+            "{case}"
+        );
+        assert_eq!((rec.pos.val, rec.pos.dval), drive, "{case}");
+        let i = &rec.internal;
+        assert_eq!((i.lval, i.ldvl), drive, "{case}");
     }
 }
 

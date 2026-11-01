@@ -936,14 +936,15 @@ const MOTOR_DRV_INFO: [&str; 19] = [
 ];
 
 /// devMotorAsyn's `bad:` arm: `pmr->pact = 1; return 0`, after which
-/// motorRecord's init_record runs on to its closing `monitor()`, through
-/// set_dial_highlimit/lowlimit (717-718).
+/// motorRecord's init_record runs on to its closing `monitor()`: the
+/// readback and drive sync (698-714), then set_dial_highlimit/lowlimit
+/// (717-718).
 fn bad(record: &mut dyn Record) -> DeviceInitOutcome {
     if let Some(motor) = record
         .as_any_mut()
         .and_then(|a| a.downcast_mut::<crate::record::MotorRecord>())
     {
-        motor.finish_init();
+        motor.init_without_device();
         motor.set_dial_limit(true);
         motor.set_dial_limit(false);
     }
@@ -952,7 +953,9 @@ fn bad(record: &mut dyn Record) -> DeviceInitOutcome {
 
 /// A model-1 init that returned a status: `motor_init_record_com`'s
 /// readback reset when the card or signal is refused (motordevCom.cc:250-256),
-/// then `motorRecord`'s `pmr->card = -1` (motorRecord.cc:648-651).
+/// then `motorRecord`'s `pmr->card = -1` (motorRecord.cc:648-651). C returns
+/// before the drive sync (706-714), so VAL and DVAL keep what was loaded, a
+/// NaN or infinite one included; so does the port.
 fn failed_init(record: &mut dyn Record, readback: bool) {
     if let Some(motor) = record
         .as_any_mut()

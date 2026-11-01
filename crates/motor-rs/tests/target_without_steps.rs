@@ -1,9 +1,10 @@
-//! A target with no i64 step count (NaN, ±Inf, or |DVAL/MRES| of 2^63 steps
-//! or more) is one C dispatches anyway: its NINT casts are unchecked, and the
+//! A target with no step count (NaN, ±Inf, or DVAL/MRES outside the epicsInt32
+//! RVAL) is one C dispatches anyway: its NINT casts are unchecked, and the
 //! oracle on motorSim reads DMOV 0, MOVN 1, MIP 0x20 after `dbpf N.VAL nan`,
 //! `-inf`, `inf` or `-1e300`. The port refuses it before the move block, SET
 //! mode included, like a refused move, so nothing is sent and the axis is not
-//! polled again and again.
+//! polled again and again. A SET + FOFF=Variable redefinition to a NaN offset
+//! (C 2213 stores it) is refused the same way.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -70,8 +71,8 @@ fn num(db: &PvDatabase, pv: &str) -> f64 {
 }
 
 /// One axis per record, polled only on demand. NT:dol reads a NaN through
-/// its closed-loop DOL, NT:set takes a NaN DVAL in SET mode, the others a
-/// VAL put. Each pass refuses the target, so the drive fields keep the last
+/// its closed-loop DOL, NT:setdol the same in SET mode, NT:set takes a NaN
+/// DVAL in SET mode, the others a VAL put. Each pass refuses the target, so the drive fields keep the last
 /// one, DMOV ends 1 and no axis is re-polled.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_target_without_a_step_count_is_refused_before_the_move_block() {
@@ -85,7 +86,7 @@ async fn a_target_without_a_step_count_is_refused_before_the_move_block() {
     let recs: Vec<&str> = vals
         .iter()
         .map(|(rec, _)| *rec)
-        .chain(["NT:dol", "NT:set"])
+        .chain(["NT:dol", "NT:setdol", "NT:set"])
         .collect();
     register_controller_port(&open_owner(), port, recs.len() as i32, ()).unwrap();
     let mut controller = ControllerBuilder::new();
@@ -120,7 +121,7 @@ async fn a_target_without_a_step_count_is_refused_before_the_move_block() {
         .enumerate()
         .map(|(addr, rec)| {
             let extra = match *rec {
-                "NT:dol" => r#"field(OMSL, "closed_loop") field(DOL, "NT:src")"#,
+                "NT:dol" | "NT:setdol" => r#"field(OMSL, "closed_loop") field(DOL, "NT:src")"#,
                 _ => "",
             };
             format!(
@@ -150,6 +151,12 @@ async fn a_target_without_a_step_count_is_refused_before_the_move_block() {
     db.put_record_field_from_ca("NT:dol", "PROC", EpicsValue::Short(1))
         .await
         .unwrap();
+    db.put_record_field_from_ca("NT:setdol", "SET", EpicsValue::Short(1))
+        .await
+        .unwrap();
+    db.put_record_field_from_ca("NT:setdol", "PROC", EpicsValue::Short(1))
+        .await
+        .unwrap();
     db.put_record_field_from_ca("NT:set", "SET", EpicsValue::Short(1))
         .await
         .unwrap();
@@ -174,7 +181,7 @@ async fn a_target_without_a_step_count_is_refused_before_the_move_block() {
             0,
             "{rec} loaded no position"
         );
-        for field in ["VAL", "DVAL", "RVAL", "LDVL"] {
+        for field in ["VAL", "DVAL", "RVAL", "LDVL", "OFF"] {
             assert_eq!(num(&db, &format!("{rec}.{field}")), 0.0, "{rec}.{field}");
         }
         assert_eq!(num(&db, &format!("{rec}.DMOV")), 1.0, "{rec}.DMOV");

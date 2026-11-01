@@ -8328,6 +8328,99 @@ fn test_resolution_init_zero_mres_forced_to_one() {
     );
 }
 
+#[test]
+fn a_resolution_put_that_is_not_finite_is_dropped() {
+    // The C oracle on motorSim applies each: MRES nan leaves UREV, VELO,
+    // VBAS, BVEL, the limits, RBV and DRBV NaN and RMP -2147483648; UREV
+    // inf makes MRES inf; ERES keeps the NaN or inf; RRES keeps it, and
+    // with URIP RRBV and DRBV read 0 whatever RDBL holds. An MRES of 1e307
+    // makes UREV (MRES * SREV 200) inf.
+    for (field, v) in [
+        ("MRES", f64::NAN),
+        ("MRES", f64::INFINITY),
+        ("MRES", f64::NEG_INFINITY),
+        ("MRES", 1e307),
+        ("UREV", f64::NAN),
+        ("UREV", f64::INFINITY),
+        ("ERES", f64::NAN),
+        ("ERES", f64::NEG_INFINITY),
+        ("RRES", f64::NAN),
+        ("RRES", f64::INFINITY),
+        ("RRES", f64::NEG_INFINITY),
+    ] {
+        let mut rec = MotorRecord::new();
+        for (f, load) in [
+            ("MRES", 0.01),
+            ("ERES", 0.01),
+            ("RRES", 0.01),
+            ("DHLM", 10.0),
+            ("DLLM", -10.0),
+        ] {
+            rec.put_field(f, EpicsValue::Double(load)).unwrap();
+        }
+        rec.put_field("VELO", EpicsValue::Double(1.0)).unwrap();
+        rec.init_record(0).unwrap();
+        rec.init_record(1).unwrap();
+        let state = |r: &MotorRecord| {
+            let (c, v, l) = (&r.conv, &r.vel, &r.limits);
+            (
+                [c.mres, c.urev, c.eres, c.rres, v.velo, v.vbas, v.bvel],
+                [l.dhlm, l.dllm, l.hlm, l.llm],
+                r.internal.res_reanchor,
+            )
+        };
+        let before = state(&rec);
+        rec.put_field(field, EpicsValue::Double(v)).unwrap();
+        assert_eq!(state(&rec), before, "{field} {v}");
+    }
+}
+
+#[test]
+fn a_loaded_resolution_that_is_not_finite_takes_its_default() {
+    // The C oracle on motorSim keeps each load: MRES nan leaves UREV,
+    // ERES, RBV, DRBV and DVAL NaN; UREV inf makes MRES and ERES inf and
+    // the readback -nan; ERES nan and RRES inf stay. An MRES of 1e307
+    // makes UREV (MRES * SREV 200) inf.
+    use asyn_rs::interfaces::motor::MotorStatus;
+    let cases = [
+        (&[("MRES", f64::NAN)][..], [1.0, 200.0, 1.0, 0.0]),
+        (&[("MRES", 1e307)], [1.0, 200.0, 1.0, 0.0]),
+        (
+            &[("MRES", 0.01), ("UREV", f64::INFINITY)],
+            [0.01, 2.0, 0.01, 0.0],
+        ),
+        (
+            &[("MRES", 0.01), ("UREV", f64::NAN)],
+            [0.01, 2.0, 0.01, 0.0],
+        ),
+        (
+            &[("MRES", 0.01), ("ERES", f64::NAN)],
+            [0.01, 2.0, 0.01, 0.0],
+        ),
+        (
+            &[("MRES", 0.01), ("RRES", f64::INFINITY)],
+            [0.01, 2.0, 0.01, 0.0],
+        ),
+    ];
+    for (loads, resolution) in cases {
+        let mut rec = MotorRecord::new();
+        for &(f, v) in loads {
+            rec.put_field(f, EpicsValue::Double(v)).unwrap();
+        }
+        rec.init_record(0).unwrap();
+        rec.init_record(1).unwrap();
+        rec.initial_readback(&MotorStatus {
+            done: true,
+            ..MotorStatus::default().with_position(100.0)
+        });
+        let c = &rec.conv;
+        assert_eq!([c.mres, c.urev, c.eres, c.rres], resolution, "{loads:?}");
+        let drbv = 100.0 * resolution[0];
+        let p = &rec.pos;
+        assert_eq!([p.drbv, p.rbv, p.dval], [drbv; 3], "{loads:?}");
+    }
+}
+
 // --- RSTM (C: 2906f3d8, PR #160) ---
 
 #[test]

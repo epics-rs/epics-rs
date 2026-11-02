@@ -128,7 +128,6 @@ option -w;  /* Suppress SNC warnings */
 #define MOVE_TIMEOUT                (5*60.0)
 #define IDLE_POLL_INTERVAL          (30)
 #define MOVING_POLL_INTERVAL        (0.2)
-#define ERROR_RECONNECT_INTERVAL    (10*60.0)
 
 /*
  * there are 14 error messages from the HSC
@@ -669,20 +668,8 @@ ss xiahsc {
     } state init
   }
 
-  /*
-   * _any_ communications errors will land us here
-   */
-  /* C defect: nothing enters comm_error (dead since optics b414555), so C
-  ** left communication faults silent. Every read here ends in a timeout, so
-  ** rs reports faults from idle with REPORT_COMM_ERROR(); this stays dead. */
-  state comm_error {
-    when (init || !s_sevr || delay(ERROR_RECONNECT_INTERVAL)) { 
-      DEBUG_PRINT2 (20, "comm_error: init=%d  s_sevr=%d", init, s_sevr)
-      init_delay = 1.0;
-      s_sevr = 0;  /* try this, just to see if communications are working now */
-      PVPUT(init, 1);
-    } state init
-  }
+  /* C's comm_error state is left out: nothing enters it since optics
+  ** b414555, and rs reports faults from idle with REPORT_COMM_ERROR(). */
 
  /*  */
   state init {

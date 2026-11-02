@@ -184,16 +184,17 @@ async fn settled(
     panic!("never settled: {:?}", calls.lock().unwrap());
 }
 
-async fn running(calls: &Mutex<Vec<Call>>, call: Call) {
+/// Once `call` reached the card and the record shows MOVN, which a put made
+/// mid-motion branches on (motorRecord.cc:2026).
+async fn running(db: &PvDatabase, card: i32, calls: &Mutex<Vec<Call>>, call: Call) {
     for _ in 0..300 {
-        if calls.lock().unwrap().contains(&call) {
-            // A pass or two, so MOVN is up.
-            tokio::time::sleep(Duration::from_millis(50)).await;
+        let movn = db.get_pv(format!("W:m{card}.MOVN")).unwrap();
+        if calls.lock().unwrap().contains(&call) && movn == EpicsValue::Short(1) {
             return;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    panic!("{call:?} never reached the card");
+    panic!("{call:?} never ran: {:?}", calls.lock().unwrap());
 }
 
 // motorRecord.cc:2527-2534: SET_VELOCITY, SET_VEL_BASE, SET_ACCEL, MOVE_ABS.
@@ -212,7 +213,7 @@ async fn a_move_writes_velocity_base_and_accel_ahead_of_it() {
 async fn a_jog_writes_base_and_accel_ahead_of_it() {
     let (db, calls) = boot(1, false, "").await;
     put(&db, 1, "JOGF", EpicsValue::Short(1)).await;
-    running(&calls, Call::Jog(3.0)).await;
+    running(&db, 1, &calls, Call::Jog(3.0)).await;
     use Call::*;
     assert_eq!(*calls.lock().unwrap(), [VelBase(1.0), Accel(5.0), Jog(3.0)]);
 }
@@ -247,7 +248,7 @@ async fn a_move_s_backlash_leg_writes_velocity_and_accel_alone() {
 async fn a_jog_s_backlash_leg_writes_velocity_and_accel_alone() {
     let (db, calls) = boot(3, false, r#"field(BDST, "1")"#).await;
     put(&db, 3, "JOGF", EpicsValue::Short(1)).await;
-    running(&calls, Call::Jog(3.0)).await;
+    running(&db, 3, &calls, Call::Jog(3.0)).await;
     put(&db, 3, "JOGF", EpicsValue::Short(0)).await;
     let calls = settled(&db, 3, &calls, |c| {
         c.iter().filter(|c| matches!(c, Call::Move(_))).count() == 2
@@ -292,7 +293,7 @@ async fn a_home_writes_velocity_base_and_accel_ahead_of_it() {
 async fn a_home_after_a_stop_writes_velocity_base_and_accel_ahead_of_it() {
     let (db, calls) = boot(5, true, "").await;
     put(&db, 5, "VAL", EpicsValue::Double(50.0)).await;
-    running(&calls, Call::Move(50.0)).await;
+    running(&db, 5, &calls, Call::Move(50.0)).await;
     put(&db, 5, "HOMF", EpicsValue::Short(1)).await;
     let calls = settled(&db, 5, &calls, |c| c.contains(&Call::Home(true))).await;
     use Call::*;
@@ -320,7 +321,7 @@ async fn a_home_after_a_stop_writes_velocity_base_and_accel_ahead_of_it() {
 async fn a_jvel_retune_of_a_running_jog_does_not_jog_again() {
     let (db, calls) = boot(6, false, "").await;
     put(&db, 6, "JOGF", EpicsValue::Short(1)).await;
-    running(&calls, Call::Jog(3.0)).await;
+    running(&db, 6, &calls, Call::Jog(3.0)).await;
     put(&db, 6, "JVEL", EpicsValue::Double(2.0)).await;
     for _ in 0..300 {
         if calls.lock().unwrap().len() > 3 {

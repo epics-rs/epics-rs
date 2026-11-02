@@ -1710,6 +1710,7 @@ impl DrvAsynIPPort {
     /// The `restoreSettings` C's `asynInterposeCOM` runs at configure
     /// (`asynInterposeCom.c:858-866`), for the configuring thread to report.
     /// `None` for a port without the COM layer.
+    #[cfg(feature = "epics")]
     pub(crate) fn restore_com_settings_at_configure(&mut self) -> Option<AsynResult<()>> {
         self.with_negotiation(&AsynUser::default(), |com, link| com.restore_settings(link))
     }

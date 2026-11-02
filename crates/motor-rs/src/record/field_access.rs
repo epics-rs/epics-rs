@@ -8,6 +8,7 @@ use crate::flags::*;
 
 use super::MotorRecord;
 use super::dbd_generated::MOTOR_FIELDS;
+use super::velocity::{FiniteVelocity, VelocityChange};
 
 /// The motorRecord version this port tracks (C `#define VERSION 7.4`,
 /// stamped into VERS at init_record:608; SPC_NOMOD).
@@ -495,262 +496,47 @@ pub(crate) fn motor_put_field(
             }
             _ => Err(CaError::TypeMismatch(name.into())),
         },
-        // Velocity -- C: cross-calculate EGU/s <-> rev/s pairs
-        "VELO" => match value {
-            EpicsValue::Double(v) => {
-                rec.vel.velo = v;
-                // The clamp and rev↔EGU cross-calc are C special() — runtime
-                // only. During dbLoadRecords each field() lands raw (C writes
-                // the struct directly); `motor_sync_speed_at_init` reconciles
-                // the pairs once all fields are applied.
-                // C motorRecord.cc:2690: VELO is clamped into [VBAS, VMAX].
-                if range_check(&mut rec.vel.velo, rec.vel.vbas, rec.vel.vmax) {
-                    rec.internal.put_posted |= m::PUT_VELO;
-                }
-                let urev_abs = rec.conv.urev.abs();
-                if urev_abs > 0.0 {
-                    rec.vel.s = rec.vel.velo / urev_abs;
-                }
-                // C: 7291b556 — recalc ACCL/ACCS based on ACCU. Also
-                // special()-only: a load must leave the accel pair raw
-                // (see `motor_sync_speed_at_init`).
-                apply_accu_cascade(rec);
-                Ok(())
+        // Velocity -- C: cross-calculate EGU/s <-> rev/s pairs. The clamps
+        // and cross-calcs are C special() — runtime only. During
+        // dbLoadRecords each field() lands raw (C writes the struct
+        // directly); `motor_sync_speed_at_init` reconciles them once all
+        // fields are applied.
+        "VELO" => put_velocity(rec, name, value, VelocityChange::velo).map(drop),
+        "VBAS" => put_velocity(rec, name, value, VelocityChange::vbas).map(drop),
+        "VMAX" => put_velocity(rec, name, value, VelocityChange::vmax).map(drop),
+        "S" => put_velocity(rec, name, value, VelocityChange::s).map(drop),
+        "SBAS" => put_velocity(rec, name, value, VelocityChange::sbas).map(drop),
+        "SMAX" => put_velocity(rec, name, value, VelocityChange::smax).map(drop),
+        "ACCL" => put_velocity(rec, name, value, VelocityChange::accl).map(drop),
+        "ACCS" => put_velocity(rec, name, value, VelocityChange::accs).map(drop),
+        "BVEL" => put_velocity(rec, name, value, VelocityChange::bvel).map(drop),
+        "BACC" => put_velocity(rec, name, value, VelocityChange::bacc).map(drop),
+        "HVEL" => put_velocity(rec, name, value, VelocityChange::hvel).map(drop),
+        "JVEL" => {
+            // C motorRecord.cc:3059-3072: a JVEL write landing on an active
+            // jog retunes it in place. Direction comes from the JOGR field,
+            // not the MIP bit (3064), folded to the dial frame as emit_jog
+            // does.
+            if put_velocity(rec, name, value, VelocityChange::jvel)?
+                && rec.stat.mip.intersects(MipFlags::JOGF | MipFlags::JOGR)
+            {
+                let forward = rec.ctrl.jogr == 0;
+                let dial_forward = forward != (rec.conv.dir == MotorDir::Neg);
+                let jog = MotorCommand::JogVelocity {
+                    min_velocity: rec.raw_rate(rec.effective_vbas()),
+                    velocity: rec.raw_position(if dial_forward {
+                        rec.vel.jvel
+                    } else {
+                        -rec.vel.jvel
+                    }),
+                    acceleration: rec.raw_rate(rec.jog_accel_egu()),
+                };
+                rec.send_special(jog.after_speeds(SpeedWrites::JOG_RETUNE));
             }
-            _ => Err(CaError::TypeMismatch(name.into())),
-        },
-        "VBAS" => match value {
-            EpicsValue::Double(v) => {
-                rec.vel.vbas = v;
-                // C motorRecord.cc:2628-2632: VBAS is forced non-negative.
-                if rec.vel.vbas < 0.0 {
-                    rec.vel.vbas = 0.0;
-                    rec.internal.put_posted |= m::PUT_VBAS;
-                }
-                let urev_abs = rec.conv.urev.abs();
-                if urev_abs > 0.0 && rec.vel.sbas != rec.vel.vbas / urev_abs {
-                    rec.vel.sbas = rec.vel.vbas / urev_abs;
-                    rec.internal.put_posted |= m::PUT_SBAS;
-                }
-                apply_accu_cascade(rec);
-                // C motorRecord.cc:3121-3127: a VBAS raised above VMAX
-                // drags VMAX (and SMAX) up with it.
-                if rec.vel.vmax != 0.0 && rec.vel.vbas > rec.vel.vmax {
-                    rec.vel.vmax = rec.vel.vbas;
-                    rec.vel.smax = rec.vel.sbas;
-                }
-                revalidate_velocities(rec);
-                Ok(())
-            }
-            _ => Err(CaError::TypeMismatch(name.into())),
-        },
-        "VMAX" => match value {
-            EpicsValue::Double(v) => {
-                rec.vel.vmax = v;
-                // C motorRecord.cc:2660-2664: VMAX is forced non-negative.
-                if rec.vel.vmax < 0.0 {
-                    rec.vel.vmax = 0.0;
-                }
-                let urev_abs = rec.conv.urev.abs();
-                if urev_abs > 0.0 {
-                    rec.vel.smax = rec.vel.vmax / urev_abs;
-                }
-                // C motorRecord.cc:3110-3117: a VMAX dropped below VBAS
-                // drags VBAS (and SBAS) down with it.
-                if rec.vel.vmax != 0.0 && rec.vel.vmax < rec.vel.vbas {
-                    rec.vel.vbas = rec.vel.vmax;
-                    rec.vel.sbas = rec.vel.smax;
-                    rec.mark(m::VBAS | m::SBAS);
-                }
-                revalidate_velocities(rec);
-                Ok(())
-            }
-            _ => Err(CaError::TypeMismatch(name.into())),
-        },
-        "S" => match value {
-            EpicsValue::Double(v) => {
-                rec.vel.s = v;
-                // C motorRecord.cc:2702: S is clamped into [SBAS, SMAX].
-                range_check(&mut rec.vel.s, rec.vel.sbas, rec.vel.smax);
-                let urev_abs = rec.conv.urev.abs();
-                if urev_abs > 0.0 && rec.vel.velo != rec.vel.s * urev_abs {
-                    rec.vel.velo = rec.vel.s * urev_abs;
-                    rec.internal.put_posted |= m::PUT_VELO;
-                }
-                // C motorRecord.cc:2710: ACCL/ACCS follow the VELO change.
-                apply_accu_cascade(rec);
-                Ok(())
-            }
-            _ => Err(CaError::TypeMismatch(name.into())),
-        },
-        "SBAS" => match value {
-            EpicsValue::Double(v) => {
-                rec.vel.sbas = v;
-                // C motorRecord.cc:2644-2648: SBAS is forced non-negative.
-                if rec.vel.sbas < 0.0 {
-                    rec.vel.sbas = 0.0;
-                    rec.internal.put_posted |= m::PUT_SBAS;
-                }
-                // C 2650 has no UREV guard here.
-                let vbas = rec.conv.urev.abs() * rec.vel.sbas;
-                if rec.vel.vbas != vbas {
-                    rec.vel.vbas = vbas;
-                    rec.internal.put_posted |= m::PUT_VBAS;
-                }
-                // C motorRecord.cc:2655: ACCL/ACCS follow the VBAS change.
-                apply_accu_cascade(rec);
-                // C motorRecord.cc:3121-3127 (shared VBAS/SBAS tail).
-                if rec.vel.vmax != 0.0 && rec.vel.vbas > rec.vel.vmax {
-                    rec.vel.vmax = rec.vel.vbas;
-                    rec.vel.smax = rec.vel.sbas;
-                }
-                revalidate_velocities(rec);
-                Ok(())
-            }
-            _ => Err(CaError::TypeMismatch(name.into())),
-        },
-        "SMAX" => match value {
-            EpicsValue::Double(v) => {
-                rec.vel.smax = v;
-                // C motorRecord.cc:2675-2679: SMAX is forced non-negative.
-                if rec.vel.smax < 0.0 {
-                    rec.vel.smax = 0.0;
-                }
-                let urev_abs = rec.conv.urev.abs();
-                if urev_abs > 0.0 {
-                    rec.vel.vmax = rec.vel.smax * urev_abs;
-                }
-                // C motorRecord.cc:3110-3117 (shared VMAX/SMAX tail).
-                if rec.vel.vmax != 0.0 && rec.vel.vmax < rec.vel.vbas {
-                    rec.vel.vbas = rec.vel.vmax;
-                    rec.vel.sbas = rec.vel.smax;
-                    rec.mark(m::VBAS | m::SBAS);
-                }
-                revalidate_velocities(rec);
-                Ok(())
-            }
-            _ => Err(CaError::TypeMismatch(name.into())),
-        },
-        "ACCL" => match value {
-            EpicsValue::Double(v) => {
-                rec.vel.accl = v;
-                // C special() motorRecordACCL (motorRecord.cc:2735-2742): floor
-                // ACCL to 0.1 if <= 0, then updateACCSfromACCL. ACCU is NOT
-                // touched — 63bfe5d0 made ACCU a user/autosave control and
-                // dropped the 36177f7b auto-switch from the accel helpers.
-                // special() never runs during dbLoadRecords, so a load stores
-                // the field() value raw and leaves ACCS alone —
-                // `motor_sync_speed_at_init` reconciles the pair, keying on
-                // "did the .db set ACCS" exactly as C does.
-                if rec.vel.accl <= 0.0 {
-                    rec.vel.accl = 0.1;
-                }
-                update_accs_from_accl(rec);
-                Ok(())
-            }
-            _ => Err(CaError::TypeMismatch(name.into())),
-        },
-        "ACCS" => match value {
-            EpicsValue::Double(v) => {
-                // C special() motorRecordACCS (motorRecord.cc:2745-2752): the
-                // raw put lands in ACCS; if it is non-positive C derives ACCS
-                // from ACCL (updateACCSfromACCL, accs = velo/accl — NOT a
-                // literal 1.0), then recomputes ACCL from ACCS
-                // (updateACCLfromACCS). ACCU is NOT touched (63bfe5d0 dropped
-                // the 36177f7b auto-switch). Runtime-only, as for ACCL.
-                rec.vel.accs = v;
-                if rec.vel.accs <= 0.0 {
-                    update_accs_from_accl(rec);
-                }
-                update_accl_from_accs(rec);
-                Ok(())
-            }
-            _ => Err(CaError::TypeMismatch(name.into())),
-        },
-        "BVEL" => match value {
-            EpicsValue::Double(v) => {
-                rec.vel.bvel = v;
-                // C motorRecord.cc:2714: BVEL is clamped into [VBAS, VMAX].
-                range_check(&mut rec.vel.bvel, rec.vel.vbas, rec.vel.vmax);
-                let urev_abs = rec.conv.urev.abs();
-                if urev_abs > 0.0 {
-                    rec.vel.sbak = rec.vel.bvel / urev_abs;
-                }
-                Ok(())
-            }
-            _ => Err(CaError::TypeMismatch(name.into())),
-        },
-        "BACC" => match value {
-            EpicsValue::Double(v) => {
-                // C: BACC must be > 0 (forces to 0.1 if <= 0)
-                rec.vel.bacc = if v <= 0.0 { 0.1 } else { v };
-                Ok(())
-            }
-            _ => Err(CaError::TypeMismatch(name.into())),
-        },
-        "HVEL" => match value {
-            EpicsValue::Double(v) => {
-                rec.vel.hvel = v;
-                // C motorRecord.cc:3081: HVEL is clamped into [VBAS, VMAX].
-                range_check(&mut rec.vel.hvel, rec.vel.vbas, rec.vel.vmax);
-                Ok(())
-            }
-            _ => Err(CaError::TypeMismatch(name.into())),
-        },
-        "JVEL" => match value {
-            EpicsValue::Double(v) => {
-                rec.vel.jvel = v;
-                // C motorRecord.cc:3057: JVEL is clamped into [VBAS, VMAX].
-                range_check(&mut rec.vel.jvel, rec.vel.vbas, rec.vel.vmax);
-                // C motorRecord.cc:3059-3072: a JVEL write landing on an
-                // active jog retunes it in place. Direction comes from
-                // the JOGR field, not the MIP bit (3064), folded to the
-                // dial frame as emit_jog does.
-                if rec.stat.mip.intersects(MipFlags::JOGF | MipFlags::JOGR) {
-                    let forward = rec.ctrl.jogr == 0;
-                    let dial_forward = forward != (rec.conv.dir == MotorDir::Neg);
-                    let jog = MotorCommand::JogVelocity {
-                        min_velocity: rec.raw_rate(rec.effective_vbas()),
-                        velocity: rec.raw_position(if dial_forward {
-                            rec.vel.jvel
-                        } else {
-                            -rec.vel.jvel
-                        }),
-                        acceleration: rec.raw_rate(rec.jog_accel_egu()),
-                    };
-                    rec.send_special(jog.after_speeds(SpeedWrites::JOG_RETUNE));
-                }
-                Ok(())
-            }
-            _ => Err(CaError::TypeMismatch(name.into())),
-        },
-        "JAR" => match value {
-            EpicsValue::Double(v) => {
-                rec.vel.jar = v;
-                // C motorRecord.cc:3074-3078: a non-positive JAR is replaced
-                // by JVEL / 0.1. Runtime special() only — during load field()
-                // lands raw, and an unconfigured JAR (== 0) is derived from
-                // VELO/ACCL at init.
-                if rec.vel.jar <= 0.0 {
-                    rec.vel.jar = rec.vel.jvel / 0.1;
-                }
-                Ok(())
-            }
-            _ => Err(CaError::TypeMismatch(name.into())),
-        },
-        "SBAK" => match value {
-            EpicsValue::Double(v) => {
-                rec.vel.sbak = v;
-                // C motorRecord.cc:2725: SBAK is clamped into [SBAS, SMAX].
-                range_check(&mut rec.vel.sbak, rec.vel.sbas, rec.vel.smax);
-                let urev_abs = rec.conv.urev.abs();
-                if urev_abs > 0.0 {
-                    rec.vel.bvel = rec.vel.sbak * urev_abs;
-                }
-                Ok(())
-            }
-            _ => Err(CaError::TypeMismatch(name.into())),
-        },
+            Ok(())
+        }
+        "JAR" => put_velocity(rec, name, value, VelocityChange::jar).map(drop),
+        "SBAK" => put_velocity(rec, name, value, VelocityChange::sbak).map(drop),
         // Retry
         "BDST" => match value {
             EpicsValue::Double(v) => {
@@ -1737,47 +1523,25 @@ fn put_link_string(value: EpicsValue, slot: &mut PvString, name: &str) -> CaResu
     }
 }
 
-/// The acceleration-rate numerator every ACCL↔ACCS conversion divides by its
-/// partner: `(velo - vbas)` while `velo > vbas`, else the full `velo`. C repeats
-/// this ternary in `updateACCLfromACCS` / `updateACCSfromACCL` /
-/// `updateACCL_ACCSfromVELO` (motorRecord.cc:499-546); one owner here so the
-/// three cannot drift.
-fn accel_numerator(rec: &MotorRecord) -> f64 {
-    let vbas = rec.effective_vbas();
-    if rec.vel.velo > vbas {
-        rec.vel.velo - vbas
-    } else {
-        rec.vel.velo
-    }
-}
-
-/// C `updateACCLfromACCS` (motorRecord.cc:499-510): ACCS is the master, ACCL
-/// follows. A non-positive ACCS leaves ACCL alone (C's `accs > 0.0` guard).
-fn update_accl_from_accs(rec: &mut MotorRecord) {
-    if rec.vel.accs > 0.0 {
-        rec.vel.accl = accel_numerator(rec) / rec.vel.accs;
-    }
-}
-
-/// C `updateACCSfromACCL` (motorRecord.cc:512-521): ACCL is the master, ACCS
-/// follows, divided by the raw ACCL (515, 539): a negative ACCL, which init
-/// keeps (4041), gives a negative ACCS. An ACCL of 0, derived from ACCS at a
-/// VELO of 0 (503), is C's divide by zero; leaving ACCS stands in for it.
-fn update_accs_from_accl(rec: &mut MotorRecord) {
-    if rec.vel.accl != 0.0 {
-        rec.vel.accs = accel_numerator(rec) / rec.vel.accl;
-    }
-}
-
-/// Recalc the slave of ACCL/ACCS after VELO or VBAS changes.
-/// C: `7291b556` (2023-05-19) — when ACCU=Accl, ACCS follows; when ACCU=Accs, ACCL follows.
-fn apply_accu_cascade(rec: &mut MotorRecord) {
-    // C updateACCL_ACCSfromVELO (motorRecord.cc:523-546): recomputes/posts the
-    // ACCU-named slave field in both the velo > vbas and velo <= vbas cases.
-    match rec.vel.accu {
-        AccsUsed::Accl => update_accs_from_accl(rec),
-        AccsUsed::Accs => update_accl_from_accs(rec),
-    }
+/// A runtime velocity-field put: `special` on a copy of the velocity
+/// fields, stored only when every one it leaves is finite. Returns whether
+/// it was; a put that is not is dropped, as for MRES.
+fn put_velocity(
+    rec: &mut MotorRecord,
+    name: &str,
+    value: EpicsValue,
+    special: fn(&mut VelocityChange, f64),
+) -> CaResult<bool> {
+    let EpicsValue::Double(v) = value else {
+        return Err(CaError::TypeMismatch(name.into()));
+    };
+    let mut change = VelocityChange::new(rec, rec.vel.clone(), rec.conv.urev);
+    special(&mut change, v);
+    let Some(finite) = change.admit() else {
+        return Ok(false);
+    };
+    finite.commit(rec);
+    Ok(true)
 }
 
 /// Whether a runtime MRES, UREV or SREV put leaves the record a step:
@@ -1799,8 +1563,7 @@ fn has_step(mres: f64, urev: f64) -> bool {
 struct Rescale {
     mres: f64,
     urev: f64,
-    /// VELO, VBAS, BVEL, VMAX: |UREV| times S, SBAS, SBAK, SMAX.
-    speeds: [f64; 4],
+    speeds: FiniteVelocity,
     dhlm: f64,
     dllm: f64,
 }
@@ -1815,11 +1578,9 @@ fn rescale(rec: &MotorRecord, mres: f64, urev: f64) -> Option<Rescale> {
     if !has_step(mres, urev) {
         return None;
     }
-    // C velcheckB (2855-2875): across a resolution change the rev-unit
-    // speeds are invariant — re-derive the EGU speeds.
-    let urev_abs = urev.abs();
-    let v = &rec.vel;
-    let speeds = [v.s, v.sbas, v.sbak, v.smax].map(|s| urev_abs * s);
+    let mut speeds = VelocityChange::new(rec, rec.vel.clone(), urev);
+    speeds.rescale();
+    let speeds = speeds.admit()?;
     // C special MRES (2877-2906): the raw pair is the invariant —
     // recompute dial from raw. MRES < 0 crosses the assignment with
     // the SIGNED resolution (dhlm = rllm * mres, dllm = rhlm * mres,
@@ -1829,10 +1590,7 @@ fn rescale(rec: &MotorRecord, mres: f64, urev: f64) -> Option<Rescale> {
     let (low, high) = (rec.limits.rllm * mres, rec.limits.rhlm * mres);
     let (dhlm, dllm) = if mres > 0.0 { (high, low) } else { (low, high) };
     let (hlm, llm) = coordinate::dial_limits_to_user(dhlm, dllm, rec.conv.dir, rec.pos.off);
-    let finite = speeds
-        .iter()
-        .chain(&[dhlm, dllm, hlm, llm])
-        .all(|x| x.is_finite());
+    let finite = [dhlm, dllm, hlm, llm].iter().all(|x| x.is_finite());
     finite.then_some(Rescale {
         mres,
         urev,
@@ -1859,17 +1617,7 @@ fn rescale(rec: &MotorRecord, mres: f64, urev: f64) -> Option<Rescale> {
 fn apply_mres_cascade(rec: &mut MotorRecord, rescale: Rescale) {
     rec.conv.mres = rescale.mres;
     rec.conv.urev = rescale.urev;
-    let [velo, vbas, bvel, vmax] = rescale.speeds;
-    if rec.vel.velo != velo {
-        rec.vel.velo = velo;
-        rec.mark(m::VELO);
-    }
-    if rec.vel.vbas != vbas {
-        rec.vel.vbas = vbas;
-        rec.mark(m::VBAS);
-    }
-    rec.vel.bvel = bvel;
-    rec.vel.vmax = vmax;
+    rescale.speeds.commit(rec);
     let (dhlm, dllm) = (rec.limits.dhlm, rec.limits.dllm);
     rec.limits.dhlm = rescale.dhlm;
     rec.limits.dllm = rescale.dllm;
@@ -1889,40 +1637,6 @@ fn apply_mres_cascade(rec: &mut MotorRecord, rescale: Rescale) {
     // (do_work 1971); enforcing here is the same invariant, one pass
     // earlier.
     rec.enforce_min_retry_deadband();
-}
-
-/// C `range_check` (motorRecord.cc:4358): clamp `parm` up to `min`, and
-/// down to `max` unless `max` is 0 (no ceiling configured).
-fn range_check(parm: &mut f64, min: f64, max: f64) -> bool {
-    let old = *parm;
-    if *parm < min {
-        *parm = min;
-    }
-    if max != 0.0 && *parm > max {
-        *parm = max;
-    }
-    *parm != old
-}
-
-/// C special() `velcheckA` tail (motorRecord.cc:3128-3146): after a
-/// VBAS/SBAS/VMAX/SMAX write changes the velocity window, re-clamp every
-/// dependent velocity into the new [VBAS, VMAX] and re-derive the rev-unit
-/// partners of VELO and BVEL.
-fn revalidate_velocities(rec: &mut MotorRecord) {
-    let urev_abs = rec.conv.urev.abs();
-    // range_check posts what it clamps (4374-4378).
-    if range_check(&mut rec.vel.velo, rec.vel.vbas, rec.vel.vmax) {
-        rec.internal.put_posted |= m::PUT_VELO;
-    }
-    if urev_abs > 0.0 {
-        rec.vel.s = rec.vel.velo / urev_abs;
-    }
-    range_check(&mut rec.vel.bvel, rec.vel.vbas, rec.vel.vmax);
-    if urev_abs > 0.0 {
-        rec.vel.sbak = rec.vel.bvel / urev_abs;
-    }
-    range_check(&mut rec.vel.jvel, rec.vel.vbas, rec.vel.vmax);
-    range_check(&mut rec.vel.hvel, rec.vel.vbas, rec.vel.vmax);
 }
 
 /// Reconcile the SREV/UREV/MRES resolution triple at IOC init — the head
@@ -1992,82 +1706,23 @@ pub(crate) fn motor_sync_resolution_at_init(rec: &mut MotorRecord) {
 /// divide by the final UREV (C runs both inside the same
 /// check_speed_and_resolution call, resolution first).
 pub(crate) fn motor_sync_speed_at_init(rec: &mut MotorRecord) {
-    let urev_abs = rec.conv.urev.abs();
-    if urev_abs > 0.0 {
-        // SMAX (rev/s) <-> VMAX (EGU/s)
-        if rec.vel.smax > 0.0 {
-            rec.vel.vmax = rec.vel.smax * urev_abs;
-        } else if rec.vel.vmax > 0.0 {
-            rec.vel.smax = rec.vel.vmax / urev_abs;
-        } else {
-            rec.vel.smax = 0.0;
-            rec.vel.vmax = 0.0;
-        }
-        // SBAS (rev/s) <-> VBAS (EGU/s)
-        if rec.vel.sbas != 0.0 {
-            range_check(&mut rec.vel.sbas, 0.0, rec.vel.smax);
-            rec.vel.vbas = rec.vel.sbas * urev_abs;
-        } else {
-            range_check(&mut rec.vel.vbas, 0.0, rec.vel.vmax);
-            rec.vel.sbas = rec.vel.vbas / urev_abs;
-        }
-        // S (rev/s) <-> VELO (EGU/s)
-        if rec.vel.s != 0.0 {
-            range_check(&mut rec.vel.s, rec.vel.sbas, rec.vel.smax);
-            rec.vel.velo = rec.vel.s * urev_abs;
-        } else {
-            range_check(&mut rec.vel.velo, rec.vel.vbas, rec.vel.vmax);
-            rec.vel.s = rec.vel.velo / urev_abs;
-        }
-        // SBAK (rev/s) <-> BVEL (EGU/s)
-        if rec.vel.sbak != 0.0 {
-            range_check(&mut rec.vel.sbak, rec.vel.sbas, rec.vel.smax);
-            rec.vel.bvel = rec.vel.sbak * urev_abs;
-        } else {
-            range_check(&mut rec.vel.bvel, rec.vel.vbas, rec.vel.vmax);
-            rec.vel.sbak = rec.vel.bvel / urev_abs;
-        }
-    }
-    // ACCS <-> ACCL, C check_speed_and_resolution (motorRecord.cc:4034-4047).
-    // The key is `accs > 0.0` — the loaded ACCS value — NOT ACCU: ACCS's dbd
-    // default is 0.0 (as is `VelocityFields::default`), the accel cross-calcs
-    // are special()-only and so never fire during dbLoadRecords, and therefore
-    // a nonzero ACCS here can only mean the .db wrote `field(ACCS,…)`. It then
-    // wins and ACCL is derived from it; otherwise ACCL is the master (a 0
-    // floored to 0.1 first, C:4041-4045) and ACCS is derived. ACCU stays a pure
-    // user/autosave control (63bfe5d0) — it selects the master only for the
-    // *runtime* VELO/VBAS cascade (`apply_accu_cascade`), not at init.
-    if rec.vel.accs > 0.0 {
-        update_accl_from_accs(rec);
-    } else {
-        if rec.vel.accl == 0.0 {
-            rec.vel.accl = 0.1;
-        }
-        update_accs_from_accl(rec);
-    }
-    // C 4048-4053: the backlash acceleration time's sanity check.
-    if rec.vel.bacc == 0.0 {
-        rec.vel.bacc = 0.1;
-    }
-
-    // C motorRecord.cc:4055-4067 — jog/home velocity sanity checks, after
-    // the speed pairs and accelerations settle. A zero field means "not
-    // configured" (JVEL/JAR/HVEL have no initial() in the dbd): JVEL
-    // defaults to VELO, JAR to VELO/ACCL, HVEL to VBAS; a configured value
-    // is clamped into [VBAS, VMAX].
-    if rec.vel.jvel == 0.0 {
-        rec.vel.jvel = rec.vel.velo;
-    } else {
-        range_check(&mut rec.vel.jvel, rec.vel.vbas, rec.vel.vmax);
-    }
-    if rec.vel.jar == 0.0 {
-        rec.vel.jar = rec.vel.velo / rec.vel.accl;
-    }
-    if rec.vel.hvel == 0.0 {
-        rec.vel.hvel = rec.vel.vbas;
-    } else {
-        range_check(&mut rec.vel.hvel, rec.vel.vbas, rec.vel.vmax);
-    }
+    let sync = |vel: VelocityFields| {
+        let mut change = VelocityChange::new(rec, vel, rec.conv.urev);
+        change.sync_at_init();
+        change.admit()
+    };
+    // A load the sync cannot keep finite leaves the fields at their
+    // defaults, as a dropped put leaves them as they were; ACCU, a menu,
+    // keeps its load. The defaults sync finite (0, ACCL 0.2, BACC 0.5) at
+    // any UREV motor_sync_resolution_at_init leaves.
+    let defaults = VelocityFields {
+        accu: rec.vel.accu,
+        ..VelocityFields::default()
+    };
+    let finite = sync(rec.vel.clone())
+        .or_else(|| sync(defaults))
+        .expect("the default velocity fields sync finite");
+    finite.commit(rec);
 }
 
 /// C `motorRecord.cc:653-670` — CARD is a function of the OUT link's TYPE:

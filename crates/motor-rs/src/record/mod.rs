@@ -4,6 +4,7 @@ mod field_access;
 pub(crate) use field_access::motor_failed_dset_init;
 mod state_machine;
 mod status_update;
+mod velocity;
 
 use epics_base_rs::error::CaResult;
 use epics_base_rs::server::device_support::DevicePost;

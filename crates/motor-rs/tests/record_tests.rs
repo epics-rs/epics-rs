@@ -8495,6 +8495,117 @@ fn a_loaded_resolution_that_is_not_finite_takes_its_default() {
     }
 }
 
+const VELOCITY_FIELDS: [&str; 14] = [
+    "VELO", "VBAS", "VMAX", "S", "SBAS", "SMAX", "ACCL", "ACCS", "BVEL", "BACC", "HVEL", "JVEL",
+    "JAR", "SBAK",
+];
+
+fn velocity_state(r: &MotorRecord) -> ([f64; 14], AccsUsed, u64) {
+    let v = &r.vel;
+    (
+        [
+            v.velo, v.vbas, v.vmax, v.s, v.sbas, v.smax, v.accl, v.accs, v.bvel, v.bacc, v.hvel,
+            v.jvel, v.jar, v.sbak,
+        ],
+        v.accu,
+        r.internal.put_posted,
+    )
+}
+
+fn velocity_record(mres: f64, vmax: f64) -> MotorRecord {
+    let mut rec = MotorRecord::new();
+    for (f, v) in [("MRES", mres), ("VMAX", vmax), ("VELO", 1.0)] {
+        rec.put_field(f, EpicsValue::Double(v)).unwrap();
+    }
+    rec.init_record(0).unwrap();
+    rec.init_record(1).unwrap();
+    rec
+}
+
+#[test]
+fn a_velocity_put_that_is_not_finite_is_dropped() {
+    // C special() stores each and derives from it: a NaN, or an infinity
+    // no VMAX ceiling clamps, lands in the field or its partner.
+    for field in VELOCITY_FIELDS {
+        for (vmax, v) in [(0.0, f64::NAN), (0.0, f64::INFINITY), (10.0, f64::NAN)] {
+            let mut rec = velocity_record(0.01, vmax);
+            let before = velocity_state(&rec);
+            rec.put_field(field, EpicsValue::Double(v)).unwrap();
+            assert_eq!(velocity_state(&rec), before, "{field} {v} VMAX {vmax}");
+        }
+    }
+}
+
+#[test]
+fn a_velocity_put_that_a_clamp_makes_finite_applies() {
+    // The gate is on what special() leaves, not on the value put.
+    for (vmax, field, v, stored) in [
+        (10.0, "VELO", f64::INFINITY, 10.0),
+        (0.0, "VBAS", f64::NEG_INFINITY, 0.0),
+        (0.0, "ACCL", f64::NEG_INFINITY, 0.1),
+        (0.0, "BACC", f64::NEG_INFINITY, 0.1),
+    ] {
+        let mut rec = velocity_record(0.01, vmax);
+        rec.put_field(field, EpicsValue::Double(v)).unwrap();
+        assert_eq!(
+            rec.get_field(field),
+            Some(EpicsValue::Double(stored)),
+            "{field} {v}"
+        );
+    }
+}
+
+#[test]
+fn a_velocity_put_whose_derivation_overflows_is_dropped() {
+    // |UREV|·S (2704, and SBAS/SMAX/SBAK alike) at a UREV of 1e300, the
+    // VELO/ACCL quotient (515, 503) at an ACCL or ACCS of 1e-320, and the
+    // JAR fallback JVEL/0.1 (3074-3078) at a JVEL of 1e308.
+    for (mres, jvel, field, v) in [
+        (5e297, None, "S", 1e10),
+        (5e297, None, "SBAS", 1e10),
+        (5e297, None, "SMAX", 1e10),
+        (5e297, None, "SBAK", 1e10),
+        (0.01, None, "ACCL", 1e-320),
+        (0.01, None, "ACCS", 1e-320),
+        (0.01, Some(1e308), "JAR", -1.0),
+    ] {
+        let mut rec = velocity_record(mres, 0.0);
+        if let Some(jvel) = jvel {
+            rec.put_field("JVEL", EpicsValue::Double(jvel)).unwrap();
+            assert_eq!(rec.vel.jvel, jvel);
+        }
+        let before = velocity_state(&rec);
+        rec.put_field(field, EpicsValue::Double(v)).unwrap();
+        assert_eq!(velocity_state(&rec), before, "{field} {v}");
+    }
+}
+
+#[test]
+fn a_loaded_velocity_that_is_not_finite_takes_the_defaults() {
+    // check_speed_and_resolution keeps each: S 2 at UREV 1e308 makes VELO
+    // infinite (3958), a NaN VELO stays, and ACCL 1e-320 makes ACCS
+    // infinite (4046). The whole family takes its synced defaults; ACCU,
+    // a menu, keeps its load.
+    for loads in [
+        &[("UREV", 1e308), ("S", 2.0)][..],
+        &[("MRES", 0.01), ("VMAX", 10.0), ("VELO", f64::NAN)],
+        &[("MRES", 0.01), ("VELO", 1.0), ("ACCL", 1e-320)],
+    ] {
+        let mut rec = MotorRecord::new();
+        rec.put_field("ACCU", EpicsValue::Short(1)).unwrap();
+        for &(f, v) in loads {
+            rec.put_field(f, EpicsValue::Double(v)).unwrap();
+        }
+        rec.init_record(0).unwrap();
+        rec.init_record(1).unwrap();
+        let (speeds, accu, _) = velocity_state(&rec);
+        let mut defaults = [0.0; 14];
+        defaults[6] = 0.2; // ACCL
+        defaults[9] = 0.5; // BACC
+        assert_eq!((speeds, accu), (defaults, AccsUsed::Accs), "{loads:?}");
+    }
+}
+
 // --- RSTM (C: 2906f3d8, PR #160) ---
 
 #[test]
@@ -11001,6 +11112,16 @@ mod jvel_live_retune {
         rec.init_record(1).unwrap();
         rec.put_field("JVEL", EpicsValue::Double(2.5)).unwrap();
         assert_eq!(sent(&mut rx), [], "no jog active, no retune");
+    }
+
+    // A dropped JVEL put leaves the jog at the JVEL it runs at.
+    #[test]
+    fn a_dropped_jvel_write_during_a_jog_sends_nothing() {
+        let mut rec = jogging_after_init(true);
+        let mut rx = capture(&mut rec);
+        rec.put_field("JVEL", EpicsValue::Double(f64::NAN)).unwrap();
+        assert_eq!(rec.vel.jvel, 1.0);
+        assert_eq!(sent(&mut rx), [], "no retune at a dropped JVEL");
     }
 
     // C 3074-3078: a non-positive JAR put is replaced by JVEL / 0.1 at

@@ -4,7 +4,7 @@
 //! `-inf`, `inf` or `-1e300`. The port refuses it before the move block, SET
 //! mode included, like a refused move, so nothing is sent and the axis is not
 //! polled again and again. A SET + FOFF=Variable redefinition to a NaN offset
-//! (C 2213 stores it) is refused the same way.
+//! (C 2215 stores it) is refused the same way.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};

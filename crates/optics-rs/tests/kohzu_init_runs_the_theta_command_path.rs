@@ -92,11 +92,8 @@ async fn boot_seq(rbv: [f64; 3], presets: &[(&str, f64)], macro_def: &str) -> Ko
             .unwrap()
             .write()
             .record
-            .as_any_mut()
-            .and_then(|a| a.downcast_mut::<motor_rs::MotorRecord>())
-            .unwrap()
-            .pos
-            .rbv = rbv;
+            .put_field("RBV", EpicsValue::Double(rbv))
+            .unwrap();
     }
     // iocInit's PINI pass, which seq waits for and st.cmd's presets follow.
     let scan = ScanOwner::start(ioc.clone());
@@ -420,20 +417,17 @@ async fn a_direct_theta_move_runs_one_only_theta_motor_moved_pass() {
     let mut theta = DbSubscription::subscribe(&db, "K:BraggThetaAO")
         .await
         .unwrap();
-    // RBV and DMOV are readbacks a put refuses: store them as the driver
-    // would and post the monitor kohzuCtl holds.
+    // RBV and DMOV are readbacks a database put refuses: the record's own
+    // put stores them as the driver would, then post the monitor kohzuCtl
+    // holds.
     let post = |field: &str, v: f64| {
         let rec = db.get_record("K:th").unwrap();
         let mut inst = rec.write();
-        let motor = inst
-            .record
-            .as_any_mut()
-            .and_then(|a| a.downcast_mut::<motor_rs::MotorRecord>())
-            .unwrap();
-        match field {
-            "RBV" => motor.pos.rbv = v,
-            _ => motor.stat.dmov = i16::from(v != 0.0),
-        }
+        let value = match field {
+            "RBV" => EpicsValue::Double(v),
+            _ => EpicsValue::Short(i16::from(v != 0.0)),
+        };
+        inst.record.put_field(field, value).unwrap();
         inst.notify_field(field, EventMask::VALUE | EventMask::LOG);
     };
     post("DMOV", 0.0);
@@ -544,11 +538,8 @@ async fn a_tweak_past_the_limit_moves_to_the_standing_setpoint(
         .unwrap()
         .write()
         .record
-        .as_any_mut()
-        .and_then(|a| a.downcast_mut::<motor_rs::MotorRecord>())
-        .unwrap()
-        .pos
-        .val = 5.0;
+        .put_field("VAL", EpicsValue::Double(5.0))
+        .unwrap();
     put(step, 1000.0).await;
     put(inc, 1.0).await;
     eventually(|| async {
@@ -653,11 +644,8 @@ async fn an_e_put_queued_after_auto_mode_moves() {
         .unwrap()
         .write()
         .record
-        .as_any_mut()
-        .and_then(|a| a.downcast_mut::<motor_rs::MotorRecord>())
-        .unwrap()
-        .pos
-        .val = 5.0;
+        .put_field("VAL", EpicsValue::Double(5.0))
+        .unwrap();
     let e = f64_of(&ioc, "K:BraggEAO").await;
     post_after_enter(&db, "K:KohzuOperAckBO", |db| {
         post(db, "K:KohzuModeBO", EpicsValue::Enum(1));
@@ -693,11 +681,8 @@ async fn a_setpoint_put_during_a_move_is_dropped() {
             let rec = db.get_record(motor).unwrap();
             let mut inst = rec.write();
             inst.record
-                .as_any_mut()
-                .and_then(|a| a.downcast_mut::<motor_rs::MotorRecord>())
-                .unwrap()
-                .stat
-                .dmov = i16::from(done);
+                .put_field("DMOV", EpicsValue::Short(i16::from(done)))
+                .unwrap();
             inst.notify_field("DMOV", EventMask::VALUE | EventMask::LOG);
         }
     };
@@ -797,11 +782,8 @@ fn post_dmov(db: &PvDatabase, done: bool) {
         let rec = db.get_record(motor).unwrap();
         let mut inst = rec.write();
         inst.record
-            .as_any_mut()
-            .and_then(|a| a.downcast_mut::<motor_rs::MotorRecord>())
-            .unwrap()
-            .stat
-            .dmov = i16::from(done);
+            .put_field("DMOV", EpicsValue::Short(i16::from(done)))
+            .unwrap();
         inst.notify_field("DMOV", EventMask::VALUE | EventMask::LOG);
     }
 }

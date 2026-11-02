@@ -86,11 +86,8 @@ async fn ioc_with(rbv: [f64; 4], presets: &[(&str, f64)]) -> (Arc<PvDatabase>, S
             .unwrap()
             .write()
             .record
-            .as_any_mut()
-            .and_then(|a| a.downcast_mut::<motor_rs::MotorRecord>())
-            .unwrap()
-            .pos
-            .rbv = rbv;
+            .put_field("RBV", EpicsValue::Double(rbv))
+            .unwrap();
     }
     for (pv, v) in presets {
         optics_rs::db_access::DbChannel::new(&db, pv)
@@ -247,11 +244,8 @@ async fn a_theta_readback_of_0_holds_init_in_chk_motor_limits() {
         let rec = db.get_record("M:th").unwrap();
         let mut inst = rec.write();
         inst.record
-            .as_any_mut()
-            .and_then(|a| a.downcast_mut::<motor_rs::MotorRecord>())
-            .unwrap()
-            .pos
-            .rbv = 10.0;
+            .put_field("RBV", EpicsValue::Double(10.0))
+            .unwrap();
         inst.notify_field("RBV", EventMask::VALUE | EventMask::LOG);
     }
     settled(&ioc, "y offset changed to 35.000000").await;
@@ -323,11 +317,8 @@ fn post_y_rbv(ioc: &PvDatabase, rbv: f64) {
     let rec = ioc.get_record("M:y").unwrap();
     let mut inst = rec.write();
     inst.record
-        .as_any_mut()
-        .and_then(|a| a.downcast_mut::<motor_rs::MotorRecord>())
-        .unwrap()
-        .pos
-        .rbv = rbv;
+        .put_field("RBV", EpicsValue::Double(rbv))
+        .unwrap();
     inst.notify_field("RBV", EventMask::VALUE | EventMask::LOG);
 }
 
@@ -594,11 +585,8 @@ fn post_dmov(db: &PvDatabase, done: bool) {
         let rec = db.get_record(motor).unwrap();
         let mut inst = rec.write();
         inst.record
-            .as_any_mut()
-            .and_then(|a| a.downcast_mut::<motor_rs::MotorRecord>())
-            .unwrap()
-            .stat
-            .dmov = i16::from(done);
+            .put_field("DMOV", EpicsValue::Short(i16::from(done)))
+            .unwrap();
         inst.notify_field("DMOV", EventMask::VALUE | EventMask::LOG);
     }
 }

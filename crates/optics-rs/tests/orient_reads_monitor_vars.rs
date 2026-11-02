@@ -241,12 +241,7 @@ fn set_rbvs(db: &PvDatabase, rbvs: &[(&str, f64)]) {
     for &(m, v) in rbvs {
         let rec = db.get_record(format!("X:m:{m}")).unwrap();
         let mut inst = rec.write();
-        inst.record
-            .as_any_mut()
-            .and_then(|a| a.downcast_mut::<motor_rs::MotorRecord>())
-            .unwrap()
-            .pos
-            .rbv = v;
+        inst.record.put_field("RBV", EpicsValue::Double(v)).unwrap();
         inst.notify_field("RBV", EventMask::VALUE | EventMask::LOG);
     }
 }

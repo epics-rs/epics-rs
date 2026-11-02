@@ -12,6 +12,8 @@ use asyn_rs::error::{AsynError, AsynResult, AsynStatus};
 use asyn_rs::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
 use asyn_rs::user::AsynUser;
 use epics_base_rs::server::device_support::DeviceSupport;
+use epics_base_rs::server::record::Record;
+use epics_base_rs::types::EpicsValue;
 use motor_rs::MotorRecord;
 use motor_rs::builder::ControllerBuilder;
 use motor_rs::device_support::StatusPoster;
@@ -84,9 +86,9 @@ async fn a_model2_record_reads_the_status_its_init_write_posted() {
     let poller = controller.build(IDLE, IDLE, 0).start();
     let mut support = added.axis.attach();
     let mut rec = MotorRecord::new();
-    rec.conv.mres = 0.001;
+    rec.put_field("MRES", EpicsValue::Double(0.001)).unwrap();
     support.init(&mut rec).unwrap();
-    assert_eq!(rec.stat.msta, MstaFlags::from_status(&ensemble_status()));
+    assert_eq!(rec.stat().msta, MstaFlags::from_status(&ensemble_status()));
     added.poll_cmd_tx.send(PollCommand::Shutdown).await.unwrap();
     poller.await;
 }
@@ -139,12 +141,16 @@ async fn a_restored_position_is_read_back_from_the_load_s_post() {
     let poller = controller.build(IDLE, IDLE, 0).start();
     let mut support = added.axis.attach();
     let mut rec = MotorRecord::new();
-    rec.conv.mres = 0.001;
-    rec.conv.rstm = RestoreMode::Always;
-    rec.pos.dval = 5.0;
+    rec.put_field("MRES", EpicsValue::Double(0.001)).unwrap();
+    rec.put_field("RSTM", EpicsValue::Short(RestoreMode::Always as i16))
+        .unwrap();
+    rec.put_field("DVAL", EpicsValue::Double(5.0)).unwrap();
     support.init(&mut rec).unwrap();
-    assert_eq!((rec.pos.rmp, rec.pos.drbv), (5000, 5.0));
-    assert_eq!((rec.pos.val, rec.pos.dval, rec.pos.rval), (5.0, 5.0, 5000));
+    assert_eq!((rec.pos().rmp, rec.pos().drbv), (5000, 5.0));
+    assert_eq!(
+        (rec.pos().val, rec.pos().dval, rec.pos().rval),
+        (5.0, 5.0, 5000)
+    );
     added.poll_cmd_tx.send(PollCommand::Shutdown).await.unwrap();
     poller.await;
 }
@@ -197,12 +203,16 @@ async fn a_refused_position_load_is_read_back_unloaded() {
     let poller = controller.build(IDLE, IDLE, 0).start();
     let mut support = added.axis.attach();
     let mut rec = MotorRecord::new();
-    rec.conv.mres = 0.001;
-    rec.conv.rstm = RestoreMode::Always;
-    rec.pos.dval = 5.0;
+    rec.put_field("MRES", EpicsValue::Double(0.001)).unwrap();
+    rec.put_field("RSTM", EpicsValue::Short(RestoreMode::Always as i16))
+        .unwrap();
+    rec.put_field("DVAL", EpicsValue::Double(5.0)).unwrap();
     support.init(&mut rec).unwrap();
-    assert_eq!((rec.pos.rmp, rec.pos.drbv), (0, 0.0));
-    assert_eq!((rec.pos.val, rec.pos.dval, rec.pos.rval), (0.0, 0.0, 0));
+    assert_eq!((rec.pos().rmp, rec.pos().drbv), (0, 0.0));
+    assert_eq!(
+        (rec.pos().val, rec.pos().dval, rec.pos().rval),
+        (0.0, 0.0, 0)
+    );
     added.poll_cmd_tx.send(PollCommand::Shutdown).await.unwrap();
     poller.await;
 }
@@ -223,9 +233,10 @@ async fn init_on_an_ended_poller_returns() {
     poller.await;
     let mut support = added.axis.attach();
     let mut rec = MotorRecord::new();
-    rec.conv.mres = 0.001;
-    rec.conv.rstm = RestoreMode::Always;
-    rec.pos.dval = 5.0;
+    rec.put_field("MRES", EpicsValue::Double(0.001)).unwrap();
+    rec.put_field("RSTM", EpicsValue::Short(RestoreMode::Always as i16))
+        .unwrap();
+    rec.put_field("DVAL", EpicsValue::Double(5.0)).unwrap();
     support.init(&mut rec).unwrap();
-    assert_eq!((rec.pos.rmp, rec.pos.dval), (0, 5.0));
+    assert_eq!((rec.pos().rmp, rec.pos().dval), (0, 5.0));
 }

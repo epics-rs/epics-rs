@@ -24,7 +24,8 @@ fn bench_motor_move_to_done(c: &mut Criterion) {
                     .with_encoder_position(10.0)
             };
             rec.process_motor_info(&status);
-            rec.stat.msta = MstaFlags::DONE;
+            rec.put_field("MSTA", EpicsValue::ULong(MstaFlags::DONE.bits()))
+                .unwrap();
             rec.check_completion();
         });
     });

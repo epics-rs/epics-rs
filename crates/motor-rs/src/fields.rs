@@ -559,7 +559,10 @@ pub struct InternalFields {
     /// `field(MRES,…)`, so cascading mid-load would derive S against the
     /// default UREV (and then rewrite VELO from that stale S), or rescale a
     /// freshly-loaded DHLM against the pre-MRES default resolution.
-    pub init_invariants_synced: bool,
+    ///
+    /// Crate-private: a put while it is false stores raw, past the
+    /// velocity admit, so only `init_record` may set it.
+    pub(crate) init_invariants_synced: bool,
     /// C `MARK(M_MRES)` / `M_ERES` / `M_UEIP` — a runtime resolution (or
     /// encoder-use) change is pending its do_work re-anchor pass
     /// (motorRecord.cc:1937-1991). Armed by the MRES/SREV/UREV/ERES put

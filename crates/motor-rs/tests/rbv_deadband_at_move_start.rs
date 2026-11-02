@@ -18,6 +18,7 @@ mod common;
 
 use common::{MotorFixture, drain};
 use epics_base_rs::server::recgbl::EventMask;
+use epics_base_rs::server::record::Record;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
 /// MDEL = 0: each move posts its own new readback exactly once. The move-start
@@ -53,7 +54,8 @@ async fn move_start_does_not_repost_the_previous_readback() {
 /// completion's 1.0 crosses the deadband from 0.0 and posts.
 #[tokio::test]
 async fn move_start_leaves_mlst_tracking_the_readback() {
-    let mut fx = MotorFixture::new(|rec| rec.disp.mdel = 0.5).await;
+    let mut fx =
+        MotorFixture::new(|rec| rec.put_field("MDEL", EpicsValue::Double(0.5)).unwrap()).await;
     let mut rx = fx.subscribe("RBV", 1, DbFieldType::Double, EventMask::VALUE);
 
     fx.start_move(1.0).await;

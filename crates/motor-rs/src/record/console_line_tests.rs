@@ -5,13 +5,13 @@
 
 use std::time::Duration;
 
+use crate::device_support::MotorDeviceSupport;
+use crate::flags::*;
+use crate::record::MotorRecord;
 use asyn_rs::interfaces::motor::MotorStatus;
 use epics_base_rs::server::device_support::DeviceSupport;
 use epics_base_rs::server::record::{Record, ScanType};
 use epics_base_rs::types::EpicsValue;
-use motor_rs::device_support::MotorDeviceSupport;
-use motor_rs::flags::*;
-use motor_rs::record::MotorRecord;
 
 const SCENARIO: &str = "MOTOR_CONSOLE_SCENARIO";
 
@@ -23,8 +23,8 @@ fn named_record() -> MotorRecord {
     rec.limits.dllm = -100.0;
     rec.limits.hlm = 100.0;
     rec.limits.llm = -100.0;
-    rec.vel.velo = 10.0;
-    rec.vel.accl = 0.5;
+    rec.put_field("VELO", EpicsValue::Double(10.0)).unwrap();
+    rec.put_field("ACCL", EpicsValue::Double(0.5)).unwrap();
     rec.stat.msta = MstaFlags::DONE;
     rec.timing.ntm = true;
 
@@ -36,7 +36,7 @@ fn named_record() -> MotorRecord {
         Duration::from_secs(1),
         poll_cmd_tx,
         motor_cmd_tx,
-        motor_rs::device_state::new_shared_state(),
+        crate::device_state::new_shared_state(),
     );
     dev.set_record_info("m1", ScanType::Passive);
     dev.init(&mut rec as &mut dyn Record).unwrap();
@@ -111,13 +111,13 @@ fn scenario_child() {
 
 /// The record's own lines from `scenario`, libtest's chatter dropped.
 fn printed(scenario: &str) -> Vec<String> {
+    // libtest names a unit test by its module path less the crate.
+    let child = format!(
+        "{}::scenario_child",
+        module_path!().split_once("::").unwrap().1
+    );
     let out = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "scenario_child",
-            "--nocapture",
-            "--test-threads=1",
-        ])
+        .args(["--exact", &child, "--nocapture", "--test-threads=1"])
         .env(SCENARIO, scenario)
         .output()
         .unwrap();
@@ -125,7 +125,7 @@ fn printed(scenario: &str) -> Vec<String> {
     assert!(out.status.success(), "{stdout}");
     stdout
         .lines()
-        .map(|l| l.trim_start_matches("test scenario_child ... "))
+        .map(|l| l.trim_start_matches(&format!("test {child} ... ")))
         .filter(|l| l.starts_with("m1"))
         .map(str::to_owned)
         .collect()

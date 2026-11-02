@@ -1441,14 +1441,9 @@ impl MotorRecord {
         }
     }
 
-    /// Effective base velocity for acceleration math: 0 for a driver that
-    /// does not support a base velocity (epics-modules/motor #76).
+    /// [`VelocityFields::effective_vbas`] at this driver's support.
     pub(crate) fn effective_vbas(&self) -> f64 {
-        if self.stat.vbas_unsupported {
-            0.0
-        } else {
-            self.vel.vbas
-        }
+        self.vel.effective_vbas(self.stat.vbas_unsupported)
     }
 
     /// Acceleration sent to the driver for a normal move, in EGU/sec².
@@ -1760,7 +1755,7 @@ impl MotorRecord {
                 self.mark(m::VAL | m::OFF | m::RBV | m::MIP | m::DMOV);
                 self.set_phase(MotionPhase::Idle);
             }
-            // A C defect not copied: C 2213 stores the offset unchecked, so
+            // A C defect not copied: C 2215 stores the offset unchecked, so
             // a NaN or infinite VAL, RLV, TWV or DOL makes OFF, RBV and the
             // user limits non-finite, and every later VAL a NaN DVAL (the
             // oracle on motorSim). The redefinition is refused like a

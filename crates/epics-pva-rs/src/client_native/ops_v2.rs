@@ -1051,20 +1051,15 @@ async fn op_put_field_attempt(
     ioid_guard.arm_destroy(sid);
     let intro = init.introspection;
 
-    let parts: Vec<&str> = field_path.split('.').filter(|s| !s.is_empty()).collect();
-    let value = build_put_value_for_path(&intro, &parts, value_str)?;
-    let bit = intro.bit_for_path(field_path).ok_or_else(|| {
-        PvaError::InvalidValue(format!(
-            "field path '{field_path}' not present in introspection"
-        ))
-    })?;
+    let (value, changed) = build_field_delta(
+        &intro,
+        &[(field_path.to_string(), PutLeaf::Str(value_str.to_string()))],
+    )?;
 
     let mut payload = Vec::new();
     payload.put_u32(sid, order);
     payload.put_u32(ioid, order);
     payload.put_u8(0x00);
-    let mut changed = BitSet::new();
-    changed.set(bit);
     changed.write_into(order, &mut payload);
     // pvxs `from_wire_valid` (serverget.cpp:451) decodes a BitSet delta —
     // only the fields whose bit is set. Encode consistently so a desync
@@ -1348,20 +1343,15 @@ async fn op_put_field_with_request_attempt(
     ioid_guard.arm_destroy(sid);
     let intro = init.introspection;
 
-    let parts: Vec<&str> = field_path.split('.').filter(|s| !s.is_empty()).collect();
-    let value = build_put_value_for_path(&intro, &parts, value_str)?;
-    let bit = intro.bit_for_path(field_path).ok_or_else(|| {
-        PvaError::InvalidValue(format!(
-            "field path '{field_path}' not present in introspection"
-        ))
-    })?;
+    let (value, changed) = build_field_delta(
+        &intro,
+        &[(field_path.to_string(), PutLeaf::Str(value_str.to_string()))],
+    )?;
 
     let mut payload = Vec::new();
     payload.put_u32(sid, order);
     payload.put_u32(ioid, order);
     payload.put_u8(0x00);
-    let mut changed = BitSet::new();
-    changed.set(bit);
     changed.write_into(order, &mut payload);
     encode_pv_field_with_bitset(&value, &intro, &changed, 0, order, &mut payload);
     let header = PvaHeader::application(false, order, Command::Put.code(), payload.len() as u32);
@@ -1469,23 +1459,13 @@ async fn op_put_value_field_with_request_attempt(
     // drill one level deeper so the typed value lands on the actual
     // scalar/array leaf (pvxs `linkBuildPut:138-143`).
     let effective_path = effective_typed_put_path(&intro, field_path);
-    let parts: Vec<&str> = effective_path
-        .split('.')
-        .filter(|s| !s.is_empty())
-        .collect();
-    let put_value = build_put_value_typed_for_path(&intro, &parts, value)?;
-    let bit = intro.bit_for_path(&effective_path).ok_or_else(|| {
-        PvaError::InvalidValue(format!(
-            "field path '{effective_path}' not present in introspection"
-        ))
-    })?;
+    let (put_value, changed) =
+        build_field_delta(&intro, &[(effective_path, PutLeaf::Typed(value.clone()))])?;
 
     let mut payload = Vec::new();
     payload.put_u32(sid, order);
     payload.put_u32(ioid, order);
     payload.put_u8(0x00);
-    let mut changed = BitSet::new();
-    changed.set(bit);
     changed.write_into(order, &mut payload);
     encode_pv_field_with_bitset(&put_value, &intro, &changed, 0, order, &mut payload);
     let header = PvaHeader::application(false, order, Command::Put.code(), payload.len() as u32);
@@ -1545,82 +1525,20 @@ pub fn effective_typed_put_path(intro: &FieldDesc, field_path: &str) -> String {
     parts.into_iter().chain(drill).collect::<Vec<_>>().join(".")
 }
 
-/// Like [`build_put_value_for_path`] but places a pre-built typed
-/// [`PvField`] at the leaf instead of parsing a string. Every field
-/// off the target path is filled with its default value so the
-/// encoded structure matches the introspection layout; only the
-/// path's bit is set in the changed BitSet by the caller.
-fn build_put_value_typed_for_path(
-    desc: &FieldDesc,
-    field_path: &[&str],
-    value: &PvField,
-) -> PvaResult<PvField> {
-    if field_path.is_empty() {
-        return Ok(value.clone());
+/// The delta a whole-value PUT sends. A structure goes as given under the
+/// `value` bit (the root bit when the prototype has no `value`); a bare
+/// leaf is assigned into `value`, or into the root of a prototype without
+/// one, through [`build_field_delta`], so it meets the same field rule as
+/// every addressed PUT instead of encoding against a mismatched shape.
+fn value_put_delta(intro: &FieldDesc, value: &PvField) -> PvaResult<(PvField, BitSet)> {
+    let value_bit = intro.bit_for_path("value");
+    if let PvField::Structure(_) = value {
+        let mut changed = BitSet::new();
+        changed.set(value_bit.unwrap_or(0));
+        return Ok((value.clone(), changed));
     }
-    match desc {
-        FieldDesc::Structure { fields, struct_id } => {
-            let head = field_path[0];
-            let tail = &field_path[1..];
-            if !fields.iter().any(|(n, _)| n == head) {
-                return Err(PvaError::InvalidValue(format!(
-                    "field '{head}' not present in target structure"
-                )));
-            }
-            let mut s = PvStructure::new(struct_id);
-            for (name, child) in fields {
-                if name == head {
-                    s.fields.push((
-                        name.clone(),
-                        build_put_value_typed_for_path(child, tail, value)?,
-                    ));
-                } else {
-                    s.fields.push((
-                        name.clone(),
-                        crate::pvdata::encode::default_value_for(child),
-                    ));
-                }
-            }
-            Ok(PvField::Structure(s))
-        }
-        _ => Err(PvaError::InvalidValue(format!(
-            "cannot navigate path through {desc} (remaining: {field_path:?})"
-        ))),
-    }
-}
-
-/// Coerce a typed PUT `value` to the shape `intro` expects before
-/// encoding.
-///
-/// `op_put_value` / `op_put_value_raw` encode `value` against the
-/// server's introspection and target the `value` bit. Callers pass
-/// either a full NT structure (`pvput_typed` via
-/// `TypedNT::to_pv_field`) or a *bare leaf* value — pvalink OUT
-/// arrays go through `crate::convert::epics_to_pv_field`, which
-/// returns a bare `PvField::ScalarArray` / `PvField::Scalar`.
-///
-/// `encode_pv_field` has no `(Structure desc, bare-leaf value)` arm,
-/// so a bare leaf encoded directly against a `Structure` intro emits
-/// zero bytes and the server applies an empty value. When `intro` is
-/// a `Structure` with a `value` sub-field and `value` is not itself
-/// a `Structure`, this wraps the bare leaf at the `value` path so
-/// the encoder sees a structurally-matching value. A `value` that is
-/// already a `Structure`, or an `intro` that is itself a bare leaf,
-/// passes through unchanged.
-fn coerce_typed_put_value(intro: &FieldDesc, value: &PvField) -> PvaResult<PvField> {
-    match (intro, value) {
-        (FieldDesc::Structure { fields, .. }, v) if !matches!(v, PvField::Structure(_)) => {
-            if fields.iter().any(|(n, _)| n == "value") {
-                build_put_value_typed_for_path(intro, &["value"], value)
-            } else {
-                // No `value` sub-field to target — leave as-is; the
-                // encoder mismatch will surface as a clear "PUT
-                // failed" rather than a silent empty write.
-                Ok(value.clone())
-            }
-        }
-        _ => Ok(value.clone()),
-    }
+    let path = if value_bit.is_some() { "value" } else { "" };
+    build_field_delta(intro, &[(path.to_string(), PutLeaf::Typed(value.clone()))])
 }
 
 /// PUT a pre-built [`PvField`] (typed-NT path). Skips the
@@ -1679,23 +1597,14 @@ async fn op_put_value_attempt(
     ioid_guard.arm_destroy(sid);
     let intro = init.introspection;
 
+    let (put_value, changed) = value_put_delta(&intro, value)?;
     let mut payload = Vec::new();
     payload.put_u32(sid, order);
     payload.put_u32(ioid, order);
     payload.put_u8(0x00);
-    let mut changed = BitSet::new();
-    if let Some(bit) = intro.bit_for_path("value") {
-        changed.set(bit);
-    } else {
-        changed.set(0);
-    }
     changed.write_into(order, &mut payload);
     // pvxs `from_wire_valid` (serverget.cpp:451) decodes a BitSet delta —
     // only the fields whose bit is set. Encode consistently.
-    // Wrap a bare-leaf `value` at the `value` path when `intro` is a
-    // structure (pvalink OUT arrays arrive as a bare
-    // `ScalarArray`, which would otherwise encode to zero bytes).
-    let put_value = coerce_typed_put_value(&intro, value)?;
     encode_pv_field_with_bitset(&put_value, &intro, &changed, 0, order, &mut payload);
     let header = PvaHeader::application(false, order, Command::Put.code(), payload.len() as u32);
     let mut frame = Vec::new();
@@ -1782,20 +1691,12 @@ async fn op_put_value_raw_attempt(
     ioid_guard.arm_destroy(sid);
     let intro = init.introspection;
 
+    let (put_value, changed) = value_put_delta(&intro, value)?;
     let mut payload = Vec::new();
     payload.put_u32(sid, order);
     payload.put_u32(ioid, order);
     payload.put_u8(0x00);
-    let mut changed = BitSet::new();
-    if let Some(bit) = intro.bit_for_path("value") {
-        changed.set(bit);
-    } else {
-        changed.set(0);
-    }
     changed.write_into(order, &mut payload);
-    // wrap a bare-leaf `value` (pvalink OUT arrays) at the
-    // `value` path so the encoder sees a structurally-matching value.
-    let put_value = coerce_typed_put_value(&intro, value)?;
     encode_pv_field_with_bitset(&put_value, &intro, &changed, 0, order, &mut payload);
     let header = PvaHeader::application(false, order, Command::Put.code(), payload.len() as u32);
     let mut frame = Vec::new();
@@ -4486,68 +4387,6 @@ fn sentinel_all_fields() -> &'static [u8] {
     &[0xFD, 0x02, 0x00, 0x80, 0x00, 0x00]
 }
 
-/// Build a PUT value where only `field_path` (e.g. `"alarm.severity"`)
-/// carries the parsed value; every other field gets a default. Mirrors
-/// pvxs `PutBuilder::set("alarm.severity", val)` semantics — the
-/// matching changed-bitset must be built separately via
-/// [`crate::pvdata::FieldDesc::bit_for_path`].
-fn build_put_value_for_path(
-    desc: &FieldDesc,
-    field_path: &[&str],
-    value_str: &str,
-) -> PvaResult<PvField> {
-    if field_path.is_empty() {
-        // Targeting the root: parse value directly into the descriptor
-        // shape (recurses into the "value" subfield convention used by
-        // build_put_value for compatibility).
-        return build_put_value(desc, value_str);
-    }
-    match desc {
-        FieldDesc::Structure { fields, struct_id } => {
-            let head = field_path[0];
-            let tail = &field_path[1..];
-            let mut s = PvStructure::new(struct_id);
-            for (name, child) in fields {
-                if name == head {
-                    s.fields.push((
-                        name.clone(),
-                        build_put_value_for_path(child, tail, value_str)?,
-                    ));
-                } else {
-                    s.fields.push((
-                        name.clone(),
-                        crate::pvdata::encode::default_value_for(child),
-                    ));
-                }
-            }
-            // Path didn't match any field → clear failure.
-            if !fields.iter().any(|(n, _)| n == head) {
-                return Err(PvaError::InvalidValue(format!(
-                    "field '{head}' not present in target structure"
-                )));
-            }
-            Ok(PvField::Structure(s))
-        }
-        FieldDesc::Scalar(st) if field_path.is_empty() => ScalarValue::parse(*st, value_str)
-            .map(PvField::Scalar)
-            .map_err(PvaError::InvalidValue),
-        FieldDesc::ScalarArray(st) if field_path.is_empty() => {
-            let mut items = Vec::new();
-            for tok in value_str
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-            {
-                items.push(ScalarValue::parse(*st, tok).map_err(PvaError::InvalidValue)?);
-            }
-            Ok(PvField::ScalarArray(items))
-        }
-        _ => Err(PvaError::InvalidValue(format!(
-            "cannot navigate path through {desc} (remaining: {field_path:?})"
-        ))),
-    }
-}
-
 /// The descriptor a bare `.value` write targets: the `value` member of
 /// a structure prototype, or the prototype itself when it is already a
 /// bare leaf. Used to classify legacy positional PUT tokens against the
@@ -4766,7 +4605,7 @@ fn build_put_value_mode(
 /// sibling-field PUT path.
 pub enum PutLeaf {
     /// CLI/text leaf, parsed against the target descriptor by
-    /// `build_put_value_for_path`.
+    /// `leaf_into_field`.
     Str(String),
     /// Already-typed pvData leaf, assigned directly into the selected
     /// descriptor leaf.
@@ -4803,42 +4642,47 @@ fn assign_fields(
 ) -> PvaResult<(PvField, BitSet)> {
     for (path, leaf) in assignments {
         let parts: Vec<&str> = path.split('.').filter(|s| !s.is_empty()).collect();
-        let bit = intro.bit_for_path(path).ok_or_else(|| {
-            PvaError::InvalidValue(format!("field path '{path}' not present in introspection"))
-        })?;
-        match leaf {
-            // Text leaf: reuse the single-path builder (parse + tree
-            // shape), then lift just this path's leaf into the shared
-            // accumulator.
-            PutLeaf::Str(value_str) => {
-                let one = build_put_value_for_path(intro, &parts, value_str)?;
-                let leaf_val = value_at_path(&one, &parts).ok_or_else(|| {
-                    PvaError::InvalidValue(format!("could not build field '{path}'"))
-                })?;
-                assign_at_path(&mut value, &parts, leaf_val);
-            }
-            // Typed leaf: assign the original pvData payload directly,
-            // bypassing `Display`/`ScalarValue::parse` so a typed array
-            // keeps its element type and byte content.
-            PutLeaf::Typed(pv) => match typed_leaf_for(pv, field_desc_at_path(intro, &parts))? {
-                Some(pv) => assign_at_path(&mut value, &parts, pv),
-                None => continue,
-            },
-        }
+        let missing =
+            || PvaError::InvalidValue(format!("field path '{path}' not present in introspection"));
+        let bit = intro.bit_for_path(path).ok_or_else(missing)?;
+        let desc = field_desc_at_path(intro, &parts).ok_or_else(missing)?;
+        let Some(pv) = leaf_into_field(desc, leaf)? else {
+            continue;
+        };
+        assign_at_path(&mut value, &parts, pv);
         changed.set(bit);
     }
     Ok((value, changed))
 }
 
-/// The leaf pvxs `linkBuildPut` assigns for a typed `pv` into a field of
-/// shape `desc` (`pvalink_channel.cpp:147-178`): an array field takes the
-/// array, a scalar field its first element, converted as `Value::copyIn`
-/// does (`data.cpp:535-593`). `None` for an empty array into a scalar
-/// field, which pvxs skips.
-fn typed_leaf_for(pv: &PvField, desc: Option<&FieldDesc>) -> PvaResult<Option<PvField>> {
-    let Some(FieldDesc::Scalar(t)) = desc else {
+/// What `leaf` assigns into a field of shape `desc`: pvxs `Value::copyIn`
+/// on the field a PUT addresses, which the put builder rethrows for a
+/// named field (`clientget.cpp:31-38`). A structure takes no scalar,
+/// array or text (`data.cpp:765`), so naming one is an error, never its
+/// defaults. Text parses as the CLI does; a typed leaf follows
+/// `linkBuildPut` (`pvalink_channel.cpp:147-178`): an array field takes
+/// the array, a scalar field the first element converted
+/// (`data.cpp:535-593`), and `None` for an empty array, which pvxs skips.
+fn leaf_into_field(desc: &FieldDesc, leaf: &PutLeaf) -> PvaResult<Option<PvField>> {
+    let pv = match (desc, leaf) {
+        (FieldDesc::Structure { .. }, PutLeaf::Typed(pv @ PvField::Structure(_))) => {
+            return Ok(Some(pv.clone()));
+        }
+        (FieldDesc::Structure { .. }, _) => {
+            let source = match leaf {
+                PutLeaf::Str(_) => FieldDesc::Scalar(crate::pvdata::ScalarType::String),
+                PutLeaf::Typed(pv) => pv.descriptor(),
+            };
+            return Err(PvaError::InvalidValue(format!(
+                "Unable to assign struct with {source}"
+            )));
+        }
+        (_, PutLeaf::Str(text)) => return build_put_value(desc, text).map(Some),
+        (_, PutLeaf::Typed(pv)) => pv,
+    };
+    let FieldDesc::Scalar(t) = desc else {
         return Ok(Some(match (pv, desc) {
-            (PvField::Scalar(sv), Some(FieldDesc::ScalarArray(_))) => {
+            (PvField::Scalar(sv), FieldDesc::ScalarArray(_)) => {
                 PvField::ScalarArray(vec![sv.clone()])
             }
             _ => pv.clone(),
@@ -5153,12 +4997,12 @@ fn build_put_field_pairs(
             // any other is reported and left out of the put.
             epics_libcom_rs::stderr_println!("{fname} : Error: need a scalar field");
         } else {
-            let one = build_put_value_for_path(intro, &parts, raw)?;
-            let leaf_val = value_at_path(&one, &parts).ok_or_else(|| {
-                PvaError::InvalidValue(format!("could not build field '{fname}'"))
-            })?;
-            assign_at_path(&mut value, &parts, leaf_val);
-            changed.set(bit);
+            (value, changed) = assign_fields(
+                intro,
+                value,
+                changed,
+                &[(fname.clone(), PutLeaf::Str(raw.clone()))],
+            )?;
         }
     }
     Ok((value, changed))
@@ -6315,6 +6159,53 @@ mod tests {
             let (_, changed) = build_put_from_args(&intro, &t(&["value=1"]), None).unwrap();
             assert!(changed.is_empty());
         }
+
+        /// A field PUT naming the `enum_t` structure with a scalar is
+        /// refused, as pvxs `Value::copyIn` refuses it (`data.cpp:765`),
+        /// instead of sending a default `enum_t` that zeroes the index and
+        /// empties the choices; `value.index` takes the same scalar.
+        #[test]
+        fn a_scalar_naming_the_enum_structure_is_refused() {
+            let intro = nt_enum();
+            let leaves = [
+                PutLeaf::Typed(PvField::Scalar(ScalarValue::Int(1))),
+                PutLeaf::Typed(PvField::Scalar(ScalarValue::String("Peaks".into()))),
+                PutLeaf::Str("1".to_string()),
+                PutLeaf::Str("Peaks".to_string()),
+            ];
+            for leaf in leaves {
+                let err = build_field_delta(&intro, &[("value".to_string(), leaf)]).unwrap_err();
+                assert!(
+                    matches!(err, PvaError::InvalidValue(ref m) if m.starts_with("Unable to assign struct")),
+                    "got: {err:?}"
+                );
+            }
+            for leaf in [
+                PutLeaf::Typed(PvField::Scalar(ScalarValue::Int(1))),
+                PutLeaf::Str("1".to_string()),
+            ] {
+                let (value, changed) =
+                    build_field_delta(&intro, &[("value.index".to_string(), leaf)]).unwrap();
+                assert_eq!(index_of(&value), 1);
+                assert!(changed.get(intro.bit_for_path("value.index").unwrap()));
+                assert!(!changed.get(intro.bit_for_path("value").unwrap()));
+            }
+        }
+
+        /// A bare leaf PUT to the whole value meets the same rule: an
+        /// NTEnum `value`, or the root of a prototype with no `value`,
+        /// refuses it rather than sending that structure's defaults.
+        #[test]
+        fn a_bare_leaf_value_put_naming_a_structure_is_refused() {
+            let one = PvField::Scalar(ScalarValue::Int(1));
+            assert!(value_put_delta(&nt_enum(), &one).is_err());
+            let no_value = FieldDesc::Structure {
+                struct_id: "alarm_t".to_string(),
+                fields: vec![("severity".to_string(), FieldDesc::Scalar(ScalarType::Int))].into(),
+            };
+            assert!(value_put_delta(&no_value, &one).is_err());
+        }
+
         fn index_of(v: &PvField) -> i32 {
             match v {
                 PvField::Structure(s) => {
@@ -6605,6 +6496,56 @@ mod tests {
 
             let boolean = nt(FieldDesc::Scalar(ScalarType::Boolean));
             assert!(put(&boolean, PvField::Scalar(ScalarValue::Double(1.0))).is_err());
+        }
+
+        /// A union or `any` field is no structure: it still takes a
+        /// scalar, as text or typed (`data.cpp:683-730`).
+        #[test]
+        fn a_union_or_any_field_still_takes_a_scalar() {
+            let intro = FieldDesc::Structure {
+                struct_id: "test:compound".to_string(),
+                fields: vec![
+                    ("any".to_string(), FieldDesc::Variant),
+                    (
+                        "u".to_string(),
+                        FieldDesc::Union {
+                            struct_id: String::new(),
+                            variants: vec![("i".to_string(), FieldDesc::Scalar(ScalarType::Int))],
+                        },
+                    ),
+                ]
+                .into(),
+            };
+            let five = || PvField::Scalar(ScalarValue::Int(5));
+            for (path, leaf) in [
+                ("any", PutLeaf::Str("5".to_string())),
+                ("any", PutLeaf::Typed(five())),
+                ("u", PutLeaf::Str("5".to_string())),
+                ("u", PutLeaf::Typed(five())),
+            ] {
+                let (_, changed) = build_field_delta(&intro, &[(path.to_string(), leaf)]).unwrap();
+                assert!(changed.get(intro.bit_for_path(path).unwrap()), "{path}");
+            }
+        }
+
+        /// A bare leaf PUT to the whole value converts into `value` and
+        /// marks its bit; an empty array into a scalar `value` marks
+        /// nothing, as `linkBuildPut` skips it.
+        #[test]
+        fn a_bare_leaf_value_put_converts_into_value() {
+            let intro = FieldDesc::Structure {
+                struct_id: "epics:nt/NTScalar:1.0".into(),
+                fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Int))].into(),
+            };
+            let (value, changed) =
+                value_put_delta(&intro, &PvField::Scalar(ScalarValue::Double(3.7))).unwrap();
+            assert_eq!(
+                value_at_path(&value, &["value"]),
+                Some(PvField::Scalar(ScalarValue::Int(3)))
+            );
+            assert!(changed.get(intro.bit_for_path("value").unwrap()));
+            let (_, changed) = value_put_delta(&intro, &PvField::ScalarArray(Vec::new())).unwrap();
+            assert!(changed.is_empty());
         }
 
         /// A typed leaf for a path absent from the prototype is rejected,

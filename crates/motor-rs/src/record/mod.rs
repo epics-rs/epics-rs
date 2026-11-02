@@ -5,6 +5,13 @@ pub(crate) use field_access::motor_failed_dset_init;
 mod state_machine;
 mod status_update;
 mod velocity;
+// In the crate because they set record state that no put reaches.
+#[cfg(test)]
+mod console_line_tests;
+#[cfg(test)]
+mod record_tests;
+#[cfg(test)]
+mod scenario_tests;
 
 use epics_base_rs::error::CaResult;
 use epics_base_rs::server::device_support::DevicePost;
@@ -24,25 +31,27 @@ use crate::flags::*;
 /// EPICS Motor Record implementation.
 #[derive(Debug, Clone)]
 pub struct MotorRecord {
-    pub pos: PositionFields,
-    pub conv: ConversionFields,
+    // Crate-private, so that outside the crate a field changes only through
+    // `put_field`, where special() and its gates run.
+    pub(crate) pos: PositionFields,
+    pub(crate) conv: ConversionFields,
     /// Private so that, once init has reconciled it, only
     /// `FiniteVelocity::commit` replaces it; read it through [`Self::vel`].
     vel: VelocityFields,
-    pub retry: RetryFields,
-    pub limits: LimitFields,
-    pub ctrl: ControlFields,
-    pub stat: StatusFields,
-    pub pid: PidFields,
-    pub disp: DisplayFields,
-    pub timing: TimingFields,
-    pub internal: InternalFields,
+    pub(crate) retry: RetryFields,
+    pub(crate) limits: LimitFields,
+    pub(crate) ctrl: ControlFields,
+    pub(crate) stat: StatusFields,
+    pub(crate) pid: PidFields,
+    pub(crate) disp: DisplayFields,
+    pub(crate) timing: TimingFields,
+    pub(crate) internal: InternalFields,
     /// Database-link / menu fields imported from the public C motorRecord.dbd
     /// surface (OUT/RDBL/DOL/OMSL/RLNK/STOO/DINP/RINP/POST).
-    pub links: LinkFields,
+    pub(crate) links: LinkFields,
     /// Alarm-limit fields imported from the public C motorRecord.dbd surface
     /// (HIHI/HIGH/LOW/LOLO/HHSV/LLSV).
-    pub alarm: AlarmFields,
+    pub(crate) alarm: AlarmFields,
     /// Pending event for next process() call
     pending_event: Option<MotorEvent>,
     /// The axis's asyn user, which also carries `pmr->name`.
@@ -229,6 +238,61 @@ impl MotorRecord {
     /// ```
     pub fn vel(&self) -> &VelocityFields {
         &self.vel
+    }
+
+    /// The position fields. Like every field group, they are read here and
+    /// written through `put_field`.
+    ///
+    /// ```compile_fail,E0616
+    /// let mut rec = motor_rs::MotorRecord::new();
+    /// rec.pos.val = 1.0;
+    /// ```
+    pub fn pos(&self) -> &PositionFields {
+        &self.pos
+    }
+
+    pub fn conv(&self) -> &ConversionFields {
+        &self.conv
+    }
+
+    pub fn retry(&self) -> &RetryFields {
+        &self.retry
+    }
+
+    pub fn limits(&self) -> &LimitFields {
+        &self.limits
+    }
+
+    pub fn ctrl(&self) -> &ControlFields {
+        &self.ctrl
+    }
+
+    pub fn stat(&self) -> &StatusFields {
+        &self.stat
+    }
+
+    pub fn pid(&self) -> &PidFields {
+        &self.pid
+    }
+
+    pub fn disp(&self) -> &DisplayFields {
+        &self.disp
+    }
+
+    pub fn timing(&self) -> &TimingFields {
+        &self.timing
+    }
+
+    pub fn internal(&self) -> &InternalFields {
+        &self.internal
+    }
+
+    pub fn links(&self) -> &LinkFields {
+        &self.links
+    }
+
+    pub fn alarm(&self) -> &AlarmFields {
+        &self.alarm
     }
 
     /// Create a motor record wired to a shared device state mailbox.

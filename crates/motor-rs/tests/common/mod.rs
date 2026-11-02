@@ -137,14 +137,15 @@ impl MotorFixture {
 
         let mut rec = MotorRecord::new();
         rec.set_device_state(state.clone());
-        rec.conv.mres = 0.001;
-        rec.limits.dhlm = 100.0;
-        rec.limits.dllm = -100.0;
-        rec.limits.hlm = 100.0;
-        rec.limits.llm = -100.0;
+        rec.put_field("MRES", EpicsValue::Double(0.001)).unwrap();
+        rec.put_field("DHLM", EpicsValue::Double(100.0)).unwrap();
+        rec.put_field("DLLM", EpicsValue::Double(-100.0)).unwrap();
+        rec.put_field("HLM", EpicsValue::Double(100.0)).unwrap();
+        rec.put_field("LLM", EpicsValue::Double(-100.0)).unwrap();
         rec.put_field("VELO", EpicsValue::Double(100000.0)).unwrap();
         rec.put_field("ACCL", EpicsValue::Double(0.5)).unwrap();
-        rec.stat.msta = MstaFlags::DONE;
+        rec.put_field("MSTA", EpicsValue::ULong(MstaFlags::DONE.bits()))
+            .unwrap();
         configure(&mut rec);
 
         let (poll_cmd_tx, _poll_cmd_rx) = tokio::sync::mpsc::channel(16);

@@ -181,6 +181,7 @@ fn init_reads_the_cached_status_and_a_lost_controller_prints_nothing() {
     use asyn_rs::interfaces::motor::MotorStatus;
     use epics_base_rs::server::device_support::DeviceSupport;
     use epics_base_rs::server::record::{Record, ScanType};
+    use epics_base_rs::types::EpicsValue;
     use motor_rs::device_state::StampedStatus;
     use motor_rs::device_support::MotorDeviceSupport;
 
@@ -199,7 +200,7 @@ fn init_reads_the_cached_status_and_a_lost_controller_prints_nothing() {
         },
     });
     let mut rec = motor_rs::MotorRecord::new();
-    rec.conv.mres = 0.01;
+    rec.put_field("MRES", EpicsValue::Double(0.01)).unwrap();
     let lines = traced_by(port, || {
         let (poll_cmd_tx, _poll_cmd_rx) = tokio::sync::mpsc::channel(16);
         let (motor_cmd_tx, _motor_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -214,8 +215,12 @@ fn init_reads_the_cached_status_and_a_lost_controller_prints_nothing() {
         dev.init(&mut rec as &mut dyn Record).unwrap();
     });
     assert!(lines.is_empty(), "{lines:#?}");
-    assert_eq!(rec.pos.rrbv, 250);
-    assert!(rec.stat.msta.contains(motor_rs::flags::MstaFlags::COMM_ERR));
+    assert_eq!(rec.pos().rrbv, 250);
+    assert!(
+        rec.stat()
+            .msta
+            .contains(motor_rs::flags::MstaFlags::COMM_ERR)
+    );
 }
 
 #[test]
@@ -367,6 +372,8 @@ fn a_refused_runtime_encoder_ratio_prints_the_async_callback_line() {
 fn an_init_that_loads_no_position_says_so_under_flow() {
     use asyn_rs::interfaces::motor::MotorStatus;
     use asyn_rs::trace::TraceMask;
+    use epics_base_rs::server::record::Record;
+    use epics_base_rs::types::EpicsValue;
 
     let port = "traceLinesNoLoad";
     PortManager::global()
@@ -377,9 +384,13 @@ fn an_init_that_loads_no_position_says_so_under_flow() {
         trace.set_record("XPS:m1");
         let mut rec = motor_rs::MotorRecord::new();
         rec.set_trace(trace);
-        rec.conv.mres = 0.01;
-        rec.conv.rstm = motor_rs::flags::RestoreMode::Never;
-        rec.pos.dval = 3.0;
+        rec.put_field("MRES", EpicsValue::Double(0.01)).unwrap();
+        rec.put_field(
+            "RSTM",
+            EpicsValue::Short(motor_rs::flags::RestoreMode::Never as i16),
+        )
+        .unwrap();
+        rec.put_field("DVAL", EpicsValue::Double(3.0)).unwrap();
         rec.initial_readback(&MotorStatus::default().with_position(100.0));
     });
     assert_eq!(
@@ -820,11 +831,11 @@ fn build_trans_lines(port: &str) -> Vec<String> {
             new_shared_state(),
         );
         let mut rec = motor_rs::MotorRecord::new();
-        rec.conv.mres = 1.0;
-        rec.limits.dhlm = 100.0;
-        rec.limits.dllm = -100.0;
-        rec.limits.hlm = 100.0;
-        rec.limits.llm = -100.0;
+        rec.put_field("MRES", EpicsValue::Double(1.0)).unwrap();
+        rec.put_field("DHLM", EpicsValue::Double(100.0)).unwrap();
+        rec.put_field("DLLM", EpicsValue::Double(-100.0)).unwrap();
+        rec.put_field("HLM", EpicsValue::Double(100.0)).unwrap();
+        rec.put_field("LLM", EpicsValue::Double(-100.0)).unwrap();
         rec.put_field("VELO", EpicsValue::Double(2.0)).unwrap();
         rec.put_field("VBAS", EpicsValue::Double(1.0)).unwrap();
         rec.put_field("ACCL", EpicsValue::Double(0.5)).unwrap();

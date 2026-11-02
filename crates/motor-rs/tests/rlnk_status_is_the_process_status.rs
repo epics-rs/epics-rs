@@ -35,7 +35,8 @@ async fn readback_pass(rlnk: &str) -> Result<(), CaError> {
     let state = motor_rs::device_state::new_shared_state();
     let mut rec = MotorRecord::new();
     rec.set_device_state(state.clone());
-    rec.stat.msta = MstaFlags::DONE;
+    rec.put_field("MSTA", EpicsValue::ULong(MstaFlags::DONE.bits()))
+        .unwrap();
     rec.put_field("RLNK", EpicsValue::String(rlnk.into()))
         .unwrap();
     let db = PvDatabase::new();

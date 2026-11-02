@@ -25,7 +25,8 @@ fn polled(
 fn make_record(state: motor_rs::device_state::SharedDeviceState) -> MotorRecord {
     let mut rec = MotorRecord::new();
     rec.set_device_state(state);
-    rec.stat.msta = MstaFlags::DONE;
+    rec.put_field("MSTA", EpicsValue::ULong(MstaFlags::DONE.bits()))
+        .unwrap();
     rec
 }
 
@@ -141,7 +142,11 @@ async fn a_pid_gain_put_reaches_the_driver_at_put_time() {
     let mut rec = make_record(motor_rs::device_state::new_shared_state());
     let (port, mut sent) = motor_rs::device_support::CommandPort::capture();
     rec.set_command_port(port);
-    rec.stat.msta = MstaFlags::DONE | MstaFlags::GAIN_SUPPORT;
+    rec.put_field(
+        "MSTA",
+        EpicsValue::ULong((MstaFlags::DONE | MstaFlags::GAIN_SUPPORT).bits()),
+    )
+    .unwrap();
     let db = PvDatabase::new();
     db.add_record("M1", Box::new(rec)).await.unwrap();
 
@@ -262,15 +267,16 @@ async fn retry_dispatched_on_callback_pass_reaches_the_driver() {
     let state = motor_rs::device_state::new_shared_state();
     let mut rec = MotorRecord::new();
     rec.set_device_state(state.clone());
-    rec.conv.mres = 0.001;
-    rec.limits.dhlm = 100.0;
-    rec.limits.dllm = -100.0;
-    rec.limits.hlm = 100.0;
-    rec.limits.llm = -100.0;
-    rec.limits.lvio = 0;
+    rec.put_field("MRES", EpicsValue::Double(0.001)).unwrap();
+    rec.put_field("DHLM", EpicsValue::Double(100.0)).unwrap();
+    rec.put_field("DLLM", EpicsValue::Double(-100.0)).unwrap();
+    rec.put_field("HLM", EpicsValue::Double(100.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-100.0)).unwrap();
+    rec.put_field("LVIO", EpicsValue::Short(0)).unwrap();
     rec.put_field("VELO", EpicsValue::Double(100000.0)).unwrap();
     rec.put_field("ACCL", EpicsValue::Double(0.5)).unwrap();
-    rec.stat.msta = MstaFlags::DONE;
+    rec.put_field("MSTA", EpicsValue::ULong(MstaFlags::DONE.bits()))
+        .unwrap();
 
     // poll_cmd_rx is held alive so PollDirective sends succeed; the test
     // drives statuses by hand instead of running the poll loop.
@@ -446,15 +452,16 @@ async fn a_put_before_the_first_pulse_moves_at_once() {
     let state = motor_rs::device_state::new_shared_state();
     let mut rec = MotorRecord::new();
     rec.set_device_state(state.clone());
-    rec.conv.mres = 0.001;
-    rec.limits.dhlm = 100.0;
-    rec.limits.dllm = -100.0;
-    rec.limits.hlm = 100.0;
-    rec.limits.llm = -100.0;
-    rec.limits.lvio = 0;
+    rec.put_field("MRES", EpicsValue::Double(0.001)).unwrap();
+    rec.put_field("DHLM", EpicsValue::Double(100.0)).unwrap();
+    rec.put_field("DLLM", EpicsValue::Double(-100.0)).unwrap();
+    rec.put_field("HLM", EpicsValue::Double(100.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-100.0)).unwrap();
+    rec.put_field("LVIO", EpicsValue::Short(0)).unwrap();
     rec.put_field("VELO", EpicsValue::Double(100000.0)).unwrap();
     rec.put_field("ACCL", EpicsValue::Double(0.5)).unwrap();
-    rec.stat.msta = MstaFlags::DONE;
+    rec.put_field("MSTA", EpicsValue::ULong(MstaFlags::DONE.bits()))
+        .unwrap();
 
     let (poll_cmd_tx, _poll_cmd_rx) = tokio::sync::mpsc::channel(16);
     let (motor_cmd_tx, mut motor_cmd_rx) = tokio::sync::mpsc::unbounded_channel();

@@ -58,11 +58,8 @@ async fn boot() -> (Arc<PvDatabase>, ScanOwner) {
             .unwrap()
             .write()
             .record
-            .as_any_mut()
-            .and_then(|a| a.downcast_mut::<motor_rs::MotorRecord>())
-            .unwrap()
-            .pos
-            .rbv = 200_000.0;
+            .put_field("RBV", EpicsValue::Double(200_000.0))
+            .unwrap();
     }
     seq(&hrCtl, "P=H:, N=1, M_PHI1=p1, M_PHI2=p2", 0, &db).expect("hrCtl starts");
     // The boot phiLimits pass: theta1Hi = HLM in degrees.
@@ -241,11 +238,8 @@ async fn the_cmd_and_dmov_echoes_follow_the_motor_monitors() {
             {
                 let mut inst = rec.write();
                 inst.record
-                    .as_any_mut()
-                    .and_then(|a| a.downcast_mut::<motor_rs::MotorRecord>())
-                    .unwrap()
-                    .stat
-                    .dmov = i16::from(dmov == 1);
+                    .put_field("DMOV", EpicsValue::Short(i16::from(dmov == 1)))
+                    .unwrap();
                 inst.notify_field("DMOV", EventMask::VALUE | EventMask::LOG);
             }
             wait_near(&ioc, echo, f64::from(dmov)).await;

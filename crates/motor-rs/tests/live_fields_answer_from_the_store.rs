@@ -16,7 +16,7 @@
 //! Read through `client_field_value`, not `get_field` — that is the projection
 //! a CA GET serves, so the assertion is on the byte a `caget` returns.
 
-use epics_base_rs::server::record::RecordInstance;
+use epics_base_rs::server::record::{Record, RecordInstance};
 use epics_base_rs::types::EpicsValue;
 use motor_rs::flags::SpmgMode;
 use motor_rs::record::MotorRecord;
@@ -32,11 +32,12 @@ fn instance_of(rec: MotorRecord) -> RecordInstance {
 fn lspg_answers_the_store_once_it_leaves_the_initial() {
     let mut rec = MotorRecord::default();
     assert_eq!(
-        rec.internal.lspg,
+        rec.internal().lspg,
         SpmgMode::Go,
         "the store starts on the .dbd initial"
     );
-    rec.internal.lspg = SpmgMode::Pause;
+    rec.put_field("LSPG", EpicsValue::Short(SpmgMode::Pause as i16))
+        .unwrap();
 
     let inst = instance_of(rec);
     assert_eq!(
@@ -63,8 +64,11 @@ fn lspg_on_the_initial_answers_the_initial() {
 #[test]
 fn pp_answers_the_store_once_it_leaves_the_initial() {
     let mut rec = MotorRecord::default();
-    assert!(rec.internal.pp == 0, "the store starts on the .dbd initial");
-    rec.internal.pp = 1;
+    assert!(
+        rec.internal().pp == 0,
+        "the store starts on the .dbd initial"
+    );
+    rec.put_field("PP", EpicsValue::Short(1)).unwrap();
 
     let inst = instance_of(rec);
     assert_eq!(

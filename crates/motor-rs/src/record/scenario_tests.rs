@@ -1,9 +1,10 @@
-use motor_rs::flags::*;
-use motor_rs::record::MotorRecord;
-use motor_rs::sim_motor::SimMotor;
+use crate::flags::*;
+use crate::record::MotorRecord;
+use crate::sim_motor::SimMotor;
 
 use asyn_rs::interfaces::motor::{AsynMotor, MotorStatus};
 use asyn_rs::user::AsynUser;
+use epics_base_rs::server::device_support::DeviceSupport;
 use epics_base_rs::server::record::Record;
 use epics_base_rs::types::EpicsValue;
 
@@ -594,9 +595,9 @@ fn startup_moving_waits_for_the_poller() {
 /// `rec`'s device init on an axis whose cached status is `status`: the
 /// commands it queued for the poller.
 fn device_init(rec: &mut MotorRecord, status: MotorStatus) -> Vec<MotorCommand> {
+    use crate::device_state::{StampedStatus, new_shared_state};
+    use crate::device_support::MotorDeviceSupport;
     use epics_base_rs::server::device_support::DeviceSupport;
-    use motor_rs::device_state::{StampedStatus, new_shared_state};
-    use motor_rs::device_support::MotorDeviceSupport;
 
     let state = new_shared_state();
     state.lock().unwrap().latest_status = Some(StampedStatus { seq: 1, status });
@@ -611,7 +612,7 @@ fn device_init(rec: &mut MotorRecord, status: MotorStatus) -> Vec<MotorCommand> 
     );
     dev.init(rec as &mut dyn Record).unwrap();
     let mut commands = Vec::new();
-    while let Ok(motor_rs::poll_loop::ToAxis::Batch(batch)) = motor_cmd_rx.try_recv() {
+    while let Ok(crate::poll_loop::ToAxis::Batch(batch)) = motor_cmd_rx.try_recv() {
         commands.extend(batch.commands);
     }
     commands
@@ -731,7 +732,7 @@ fn stup_protocol_round_trip_through_live_path() {
     // C STUP lifecycle: ON (put) → BUSY + GET_INFO (do_work top,
     // 1817-1830) → OFF when the data callback arrives (process_exit,
     // 1498-1502).
-    use motor_rs::device_state::{StampedStatus, new_shared_state};
+    use crate::device_state::{StampedStatus, new_shared_state};
 
     let state = new_shared_state();
     let idle = MotorStatus {
@@ -774,8 +775,8 @@ fn stup_protocol_round_trip_through_live_path() {
 
 /// Helper: an idle done status at dial `pos` on a `make_record` axis,
 /// stamped with the given seq.
-fn idle_status_at(seq: u64, pos: f64) -> motor_rs::device_state::StampedStatus {
-    motor_rs::device_state::StampedStatus {
+fn idle_status_at(seq: u64, pos: f64) -> crate::device_state::StampedStatus {
+    crate::device_state::StampedStatus {
         seq,
         status: MotorStatus {
             done: true,
@@ -795,7 +796,7 @@ fn set_mode_load_pos_collapses_through_live_path() {
     // determine_event consumes the status in place — the pass must
     // still reach the idle completion pipeline, or the SET-mode load
     // wedges with DMOV stuck low.
-    use motor_rs::device_state::new_shared_state;
+    use crate::device_state::new_shared_state;
 
     let state = new_shared_state();
     state.lock().unwrap().latest_status = Some(idle_status_at(1, 0.0));
@@ -830,7 +831,7 @@ fn set_mode_load_pos_collapses_through_live_path() {
 }
 
 /// Helper: an idle done status at dial `pos` resting on the low limit switch.
-fn on_low_limit_at(seq: u64, pos: f64) -> motor_rs::device_state::StampedStatus {
+fn on_low_limit_at(seq: u64, pos: f64) -> crate::device_state::StampedStatus {
     let mut s = idle_status_at(seq, pos);
     s.status.low_limit = true;
     s
@@ -840,10 +841,8 @@ fn on_low_limit_at(seq: u64, pos: f64) -> motor_rs::device_state::StampedStatus 
 /// after a reverse move, on a controller that ignores the load (the nf874x
 /// `DH`). `cdir` is the boundary: C 1367 takes the LS-error update only for
 /// the limit in the commanded direction.
-fn frozen_load_on_low_limit(
-    cdir: bool,
-) -> (MotorRecord, motor_rs::device_state::SharedDeviceState) {
-    use motor_rs::device_state::new_shared_state;
+fn frozen_load_on_low_limit(cdir: bool) -> (MotorRecord, crate::device_state::SharedDeviceState) {
+    use crate::device_state::new_shared_state;
 
     let state = new_shared_state();
     state.lock().unwrap().latest_status = Some(on_low_limit_at(1, -5.0));
@@ -935,7 +934,7 @@ fn load_pos_leaves_rbv_in_old_frame_until_get_info_callback() {
     // the old frame until the GET_INFO callback re-runs process_motor_info
     // (3717) with the fresh DRBV, where RBV converges to 0 because the
     // motor never physically moved.
-    use motor_rs::device_state::new_shared_state;
+    use crate::device_state::new_shared_state;
 
     let state = new_shared_state();
     state.lock().unwrap().latest_status = Some(idle_status_at(1, 0.0));
@@ -979,7 +978,7 @@ fn parked_set_redefinition_replays_at_load_pos_collapse() {
     // written while a LOAD_POS is in flight parks (load_pos is skipped
     // while MIP_LOAD_P is set); the collapse pass re-enters do_work
     // and its `dval != ldvl` entry (2241) replays it through load_pos.
-    use motor_rs::device_state::new_shared_state;
+    use crate::device_state::new_shared_state;
 
     let state = new_shared_state();
     state.lock().unwrap().latest_status = Some(idle_status_at(1, 0.0));
@@ -1033,7 +1032,7 @@ fn latent_sync_latched_during_load_pos_applies_at_collapse() {
     // chain-end pass with mip == MIP_DONE. A SYNC put while a LOAD_POS
     // is in flight stays latched (the Sync dispatch arm's apply is
     // mip-gated) and applies on the collapse pass.
-    use motor_rs::device_state::new_shared_state;
+    use crate::device_state::new_shared_state;
 
     let state = new_shared_state();
     state.lock().unwrap().latest_status = Some(idle_status_at(1, 0.0));
@@ -1073,7 +1072,7 @@ fn noop_put_pass_fires_implicit_get_info_through_live_path() {
     // and a GET_INFO refreshes the device status. The data callback
     // returns STUP to OFF (process_exit 1498-1502) and, being a
     // CALLBACK_DATA pass, must not re-fire — C's loop prevention.
-    use motor_rs::device_state::new_shared_state;
+    use crate::device_state::new_shared_state;
 
     let state = new_shared_state();
     state.lock().unwrap().latest_status = Some(idle_status_at(1, 0.0));
@@ -1118,7 +1117,7 @@ fn coalesced_put_and_status_share_one_pass() {
     // status statusCallback left (devMotorAsyn.c:757-766) and runs the
     // completion pipeline; the callback's own dbProcess then reads
     // nothing.
-    use motor_rs::device_state::new_shared_state;
+    use crate::device_state::new_shared_state;
 
     let state = new_shared_state();
     state.lock().unwrap().latest_status = Some(idle_status_at(1, 0.0));
@@ -1153,8 +1152,8 @@ fn move_start_notify_posts_diff_and_rdif() {
     // before too_small/LVIO, so monitor() posts the new full-distance
     // following error on the move-start pass. The Rust DMOV 1->0 notify must
     // carry DIFF and RDIF, not just the position triplet.
+    use crate::device_state::new_shared_state;
     use epics_base_rs::server::record::RecordProcessResult;
-    use motor_rs::device_state::new_shared_state;
 
     let state = new_shared_state();
     state.lock().unwrap().latest_status = Some(idle_status_at(1, 0.0));
@@ -1173,7 +1172,7 @@ fn move_start_notify_posts_diff_and_rdif() {
         .take_cycle_posted_fields()
         .map(|(ix, _)| {
             let name = epics_base_rs::server::record::field_at(
-                motor_rs::record::dbd_generated::MOTOR_FIELDS,
+                crate::record::dbd_generated::MOTOR_FIELDS,
                 ix,
             )
             .expect("declared")
@@ -1202,7 +1201,7 @@ fn coalesced_put_and_delay_expiry_ack_on_the_put_pass() {
     // whatever pass comes next: the put's pass takes the ACK and sends its
     // GET_INFO (1416-1426); the expiry's own pass still enters the callback
     // block on the ACK (1280) and ends the wait.
-    use motor_rs::device_state::new_shared_state;
+    use crate::device_state::new_shared_state;
 
     let state = new_shared_state();
     state.lock().unwrap().latest_status = Some(idle_status_at(1, 0.0));
@@ -2056,7 +2055,7 @@ struct DeferringDevice {
     remaining: std::sync::atomic::AtomicUsize,
 }
 
-impl motor_rs::device_support::BuildTrans for DeferringDevice {
+impl crate::device_support::BuildTrans for DeferringDevice {
     fn defers(&self, _command: &MotorCommand) -> bool {
         use std::sync::atomic::Ordering;
         self.remaining
@@ -2070,7 +2069,7 @@ struct DeferringMoves {
     armed: std::sync::atomic::AtomicBool,
 }
 
-impl motor_rs::device_support::BuildTrans for DeferringMoves {
+impl crate::device_support::BuildTrans for DeferringMoves {
     fn defers(&self, command: &MotorCommand) -> bool {
         self.armed.load(std::sync::atomic::Ordering::Relaxed)
             && matches!(
@@ -2092,18 +2091,18 @@ fn deferred_retry(deferred: usize) -> (MotorRecord, Vec<MotorCommand>) {
 }
 
 /// The retry rig on `device`, with `arm` run just before the retry pass.
-fn retry_on<D: motor_rs::device_support::BuildTrans + 'static>(
+fn retry_on<D: crate::device_support::BuildTrans + 'static>(
     device: std::sync::Arc<D>,
     arm: impl FnOnce(&D),
 ) -> (MotorRecord, Vec<MotorCommand>) {
-    use motor_rs::device_state::{StampedStatus, new_shared_state};
+    use crate::device_state::{StampedStatus, new_shared_state};
 
     let state = new_shared_state();
     state.lock().unwrap().latest_status = Some(idle_status_at(1, 0.0));
     let mut rec = make_record();
     rec.retry.rtry = 3;
     rec.set_device_state(state.clone());
-    let (port, _rx) = motor_rs::device_support::CommandPort::capture();
+    let (port, _rx) = crate::device_support::CommandPort::capture();
     rec.set_command_port(port.with_build_trans(device.clone()));
     rec.process().unwrap(); // startup
 
@@ -2198,4 +2197,152 @@ fn retry_last_deferred_keeps_the_built_commands() {
         .collect();
     expect.push(MotorCommand::Poll);
     assert_eq!(commands, expect);
+}
+
+/// The integration tests' builder: the record loads MRES 0.001, ±100 dial
+/// and user limits and fast speeds, and is past init_record once built.
+fn make_builder(
+    motor: std::sync::Arc<std::sync::Mutex<dyn AsynMotor>>,
+) -> crate::builder::MotorBuilder {
+    crate::builder::MotorBuilder::new(motor)
+        .poll_interval(Duration::from_millis(5))
+        .configure_record(|rec| {
+            rec.conv.mres = 0.001;
+            rec.limits.dhlm = 100.0;
+            rec.limits.dllm = -100.0;
+            rec.limits.hlm = 100.0;
+            rec.limits.llm = -100.0;
+            rec.limits.lvio = 0;
+            rec.put_field("VELO", EpicsValue::Double(100000.0)).unwrap(); // very fast for tests
+            rec.put_field("ACCL", EpicsValue::Double(0.5)).unwrap();
+            rec.put_field("BVEL", EpicsValue::Double(100000.0)).unwrap();
+            rec.put_field("BACC", EpicsValue::Double(0.5)).unwrap();
+            rec.put_field("HVEL", EpicsValue::Double(100000.0)).unwrap();
+            rec.put_field("JVEL", EpicsValue::Double(5.0)).unwrap();
+            rec.put_field("JAR", EpicsValue::Double(1.0)).unwrap();
+            rec.stat.msta = MstaFlags::DONE;
+        })
+}
+
+fn read_motor_pos(motor: &std::sync::Arc<std::sync::Mutex<dyn AsynMotor>>) -> f64 {
+    let mut m = motor.lock().unwrap();
+    polled(&mut *m, &asyn_rs::user::AsynUser::new(0)).position()
+}
+
+/// R59 regression: device-support `init()` must NOT reseed the controller.
+/// The RSTM/loadpos(#231)/MRES(#196) restore decision is owned by
+/// `initial_readback` (C `devMotorAsyn.c::init_controller`), which fires on
+/// the Startup process and tests the controller's *actual current position*.
+/// A controller that kept its true absolute position across an IOC restart
+/// must not be clobbered by a stale autosaved DVAL: with the controller far
+/// from zero, RSTM=NearZero's `dval_non_zero_pos_near_zero` gate is false, so
+/// no reseed occurs and the record adopts the controller readback. (An
+/// earlier Rust `init()` reseeded unconditionally on any pass0 restore,
+/// before the first poll — the exact data loss RSTM prevents. C does NOT
+/// reseed here: a saved DVAL that the live controller contradicts, with the
+/// controller nowhere near zero, fails `initPos`.)
+#[tokio::test]
+async fn init_does_not_clobber_live_controller_position() {
+    // The controller (SimMotor) kept its true position 5.0 across the restart.
+    let motor: std::sync::Arc<std::sync::Mutex<dyn AsynMotor>> =
+        std::sync::Arc::new(std::sync::Mutex::new(SimMotor::new().with_position(5.0)));
+    let mut setup = make_builder(motor.clone()).build();
+    // The poller's startup pass ran before init.
+    setup.poll_loop.run_startup_pass();
+    setup.record.conv.mres = 1.0; // dial == raw for a clean assertion
+    setup.record.conv.rstm = RestoreMode::NearZero;
+    setup.record.retry.rdbd = 0.05;
+
+    // Autosave restored a STALE DVAL (2.0) that disagrees with the hardware.
+    setup
+        .record
+        .put_field("DVAL", EpicsValue::Double(2.0))
+        .unwrap();
+    assert!(setup.record.was_position_restored());
+
+    // init() polls the controller (true 5.0) and reseeds nothing.
+    setup.device_support.init(&mut setup.record).unwrap();
+    assert!(
+        (read_motor_pos(&motor) - 5.0).abs() < 1e-9,
+        "init() must not reseed — controller stays at its true 5.0"
+    );
+
+    // The Startup process applies the RSTM gate: the controller is far from
+    // zero, so NearZero does not restore — no SetPosition reaches the driver.
+    setup.record.process().unwrap();
+    setup.device_support.write(&mut setup.record).unwrap();
+    setup.poll_loop.run_queued_commands();
+    assert!(
+        (read_motor_pos(&motor) - 5.0).abs() < 1e-9,
+        "RSTM=NearZero with a live controller far from zero must not reseed"
+    );
+    assert!(
+        (setup.record.pos.dval - 5.0).abs() < 1e-9,
+        "record adopts the controller readback (5.0), discarding the stale 2.0"
+    );
+}
+
+/// R59 companion (positive path): when the controller lost its position
+/// across the restart (reads near zero) and a meaningful DVAL was restored,
+/// the RSTM=NearZero gate DOES reseed — and the SetPosition now reaches the
+/// driver through the Startup process → pending_actions → write path, not the
+/// deleted `init()` reseed.
+#[tokio::test]
+async fn startup_reseeds_controller_that_lost_position() {
+    // Controller powered up at 0.0 (lost its absolute position).
+    let motor: std::sync::Arc<std::sync::Mutex<dyn AsynMotor>> =
+        std::sync::Arc::new(std::sync::Mutex::new(SimMotor::new().with_position(0.0)));
+    let mut setup = make_builder(motor.clone()).build();
+    setup.record.conv.mres = 1.0;
+    setup.record.conv.rstm = RestoreMode::NearZero;
+    setup.record.retry.rdbd = 0.05;
+
+    // Autosave restored a meaningful DVAL the controller no longer holds.
+    setup
+        .record
+        .put_field("DVAL", EpicsValue::Double(5.0))
+        .unwrap();
+
+    setup.device_support.init(&mut setup.record).unwrap();
+    assert!(
+        read_motor_pos(&motor).abs() < 1e-9,
+        "init() does not reseed; controller still at 0.0"
+    );
+
+    // The Startup process restores: controller near zero + meaningful DVAL.
+    setup.record.process().unwrap();
+    setup.device_support.write(&mut setup.record).unwrap();
+    setup.poll_loop.run_queued_commands();
+    assert!(
+        (read_motor_pos(&motor) - 5.0).abs() < 1e-9,
+        "RSTM=NearZero reseeds the lost controller to the autosaved 5.0"
+    );
+    assert!(
+        (setup.record.pos.dval - 5.0).abs() < 1e-9,
+        "record keeps the autosaved DVAL after the restore"
+    );
+}
+
+/// R59 companion: when NO position was restored during pass0, neither
+/// `init()` nor the Startup process reseeds — the controller keeps its
+/// hardware position and the record adopts the readback.
+#[tokio::test]
+async fn init_does_not_reseed_controller_when_nothing_restored() {
+    let motor: std::sync::Arc<std::sync::Mutex<dyn AsynMotor>> =
+        std::sync::Arc::new(std::sync::Mutex::new(SimMotor::new().with_position(5.0)));
+    let mut setup = make_builder(motor.clone()).build();
+    setup.record.conv.mres = 1.0;
+
+    // No put_field("DVAL", ...) — nothing was restored.
+    assert!(!setup.record.was_position_restored());
+
+    setup.device_support.init(&mut setup.record).unwrap();
+    setup.record.process().unwrap();
+    setup.device_support.write(&mut setup.record).unwrap();
+    setup.poll_loop.run_queued_commands();
+
+    assert!(
+        (read_motor_pos(&motor) - 5.0).abs() < 1e-9,
+        "controller untouched when nothing was restored"
+    );
 }

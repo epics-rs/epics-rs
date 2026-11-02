@@ -40,12 +40,12 @@ fn make_builder(motor: Arc<Mutex<dyn AsynMotor>>) -> MotorBuilder {
     MotorBuilder::new(motor)
         .poll_interval(Duration::from_millis(5))
         .configure_record(|rec| {
-            rec.conv.mres = 0.001;
-            rec.limits.dhlm = 100.0;
-            rec.limits.dllm = -100.0;
-            rec.limits.hlm = 100.0;
-            rec.limits.llm = -100.0;
-            rec.limits.lvio = 0;
+            rec.put_field("MRES", EpicsValue::Double(0.001)).unwrap();
+            rec.put_field("DHLM", EpicsValue::Double(100.0)).unwrap();
+            rec.put_field("DLLM", EpicsValue::Double(-100.0)).unwrap();
+            rec.put_field("HLM", EpicsValue::Double(100.0)).unwrap();
+            rec.put_field("LLM", EpicsValue::Double(-100.0)).unwrap();
+            rec.put_field("LVIO", EpicsValue::Short(0)).unwrap();
             rec.put_field("VELO", EpicsValue::Double(100000.0)).unwrap(); // very fast for tests
             rec.put_field("ACCL", EpicsValue::Double(0.5)).unwrap();
             rec.put_field("BVEL", EpicsValue::Double(100000.0)).unwrap();
@@ -53,7 +53,8 @@ fn make_builder(motor: Arc<Mutex<dyn AsynMotor>>) -> MotorBuilder {
             rec.put_field("HVEL", EpicsValue::Double(100000.0)).unwrap();
             rec.put_field("JVEL", EpicsValue::Double(5.0)).unwrap();
             rec.put_field("JAR", EpicsValue::Double(1.0)).unwrap();
-            rec.stat.msta = MstaFlags::DONE;
+            rec.put_field("MSTA", EpicsValue::ULong(MstaFlags::DONE.bits()))
+                .unwrap();
         })
 }
 
@@ -67,7 +68,7 @@ fn a_put_on_a_built_record_runs_special() {
         .record
         .put_field("HLM", EpicsValue::Double(50.0))
         .unwrap();
-    assert_eq!(setup.record.limits.dhlm, 50.0);
+    assert_eq!(setup.record.limits().dhlm, 50.0);
 }
 
 #[tokio::test]
@@ -93,7 +94,7 @@ async fn test_full_move_via_mailbox() {
     setup.record.process().unwrap();
     setup.device_support.write(&mut setup.record).unwrap();
 
-    assert!(setup.record.stat.dmov == 0);
+    assert!(setup.record.stat().dmov == 0);
 
     // Wait for DMOV=true with polling
     let record_ref = &mut setup.record;
@@ -102,12 +103,12 @@ async fn test_full_move_via_mailbox() {
         // Process record to pick up device updates
         record_ref.process().unwrap();
         ds_ref.write(record_ref).unwrap();
-        record_ref.stat.dmov != 0
+        record_ref.stat().dmov != 0
     })
     .await;
 
     assert!(reached, "DMOV should become true after move completes");
-    assert!((setup.record.pos.rbv - 10.0).abs() < 0.1);
+    assert!((setup.record.pos().rbv - 10.0).abs() < 0.1);
 
     // Shutdown
     let _ = setup.poll_cmd_tx.send(PollCommand::Shutdown).await;
@@ -138,7 +139,7 @@ async fn test_stop_during_move() {
     setup.record.process().unwrap();
     setup.device_support.write(&mut setup.record).unwrap();
 
-    assert!(setup.record.stat.dmov == 0);
+    assert!(setup.record.stat().dmov == 0);
 
     // Let it move a bit
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -159,13 +160,13 @@ async fn test_stop_during_move() {
     let reached = wait_until(Duration::from_secs(2), || {
         record_ref.process().unwrap();
         ds_ref.write(record_ref).unwrap();
-        record_ref.stat.dmov != 0
+        record_ref.stat().dmov != 0
     })
     .await;
 
     assert!(reached, "DMOV should become true after stop");
     assert!(
-        setup.record.pos.rbv < 50.0,
+        setup.record.pos().rbv < 50.0,
         "motor should not have reached target"
     );
 
@@ -178,18 +179,19 @@ async fn test_delay_via_poll_loop() {
     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(SimMotor::new()));
     let mut setup = make_builder(motor)
         .configure_record(|rec| {
-            rec.conv.mres = 0.001;
-            rec.limits.dhlm = 100.0;
-            rec.limits.dllm = -100.0;
-            rec.limits.hlm = 100.0;
-            rec.limits.llm = -100.0;
-            rec.limits.lvio = 0;
+            rec.put_field("MRES", EpicsValue::Double(0.001)).unwrap();
+            rec.put_field("DHLM", EpicsValue::Double(100.0)).unwrap();
+            rec.put_field("DLLM", EpicsValue::Double(-100.0)).unwrap();
+            rec.put_field("HLM", EpicsValue::Double(100.0)).unwrap();
+            rec.put_field("LLM", EpicsValue::Double(-100.0)).unwrap();
+            rec.put_field("LVIO", EpicsValue::Short(0)).unwrap();
             rec.put_field("VELO", EpicsValue::Double(100000.0)).unwrap(); // very fast
             rec.put_field("ACCL", EpicsValue::Double(0.5)).unwrap();
             rec.put_field("BVEL", EpicsValue::Double(5.0)).unwrap();
             rec.put_field("BACC", EpicsValue::Double(0.5)).unwrap();
-            rec.stat.msta = MstaFlags::DONE;
-            rec.timing.dly = 0.05; // 50ms delay
+            rec.put_field("MSTA", EpicsValue::ULong(MstaFlags::DONE.bits()))
+                .unwrap();
+            rec.put_field("DLY", EpicsValue::Double(0.05)).unwrap(); // 50ms delay
         })
         .build();
 
@@ -215,7 +217,7 @@ async fn test_delay_via_poll_loop() {
     let reached = wait_until(Duration::from_secs(2), || {
         record_ref.process().unwrap();
         ds_ref.write(record_ref).unwrap();
-        record_ref.stat.dmov != 0
+        record_ref.stat().dmov != 0
     })
     .await;
 
@@ -240,18 +242,19 @@ async fn test_backlash_via_mailbox() {
     ));
     let mut setup = make_builder(motor)
         .configure_record(|rec| {
-            rec.conv.mres = 0.001;
-            rec.limits.dhlm = 100.0;
-            rec.limits.dllm = -100.0;
-            rec.limits.hlm = 100.0;
-            rec.limits.llm = -100.0;
-            rec.limits.lvio = 0;
+            rec.put_field("MRES", EpicsValue::Double(0.001)).unwrap();
+            rec.put_field("DHLM", EpicsValue::Double(100.0)).unwrap();
+            rec.put_field("DLLM", EpicsValue::Double(-100.0)).unwrap();
+            rec.put_field("HLM", EpicsValue::Double(100.0)).unwrap();
+            rec.put_field("LLM", EpicsValue::Double(-100.0)).unwrap();
+            rec.put_field("LVIO", EpicsValue::Short(0)).unwrap();
             rec.put_field("VELO", EpicsValue::Double(100000.0)).unwrap();
             rec.put_field("ACCL", EpicsValue::Double(0.5)).unwrap();
             rec.put_field("BVEL", EpicsValue::Double(100000.0)).unwrap();
             rec.put_field("BACC", EpicsValue::Double(0.5)).unwrap();
-            rec.stat.msta = MstaFlags::DONE;
-            rec.retry.bdst = 1.0; // positive backlash
+            rec.put_field("MSTA", EpicsValue::ULong(MstaFlags::DONE.bits()))
+                .unwrap();
+            rec.put_field("BDST", EpicsValue::Double(1.0)).unwrap(); // positive backlash
         })
         .build();
 
@@ -270,7 +273,7 @@ async fn test_backlash_via_mailbox() {
     setup.record.process().unwrap();
     setup.device_support.write(&mut setup.record).unwrap();
 
-    assert!(setup.record.stat.dmov == 0);
+    assert!(setup.record.stat().dmov == 0);
 
     // Wait for DMOV
     let record_ref = &mut setup.record;
@@ -278,15 +281,15 @@ async fn test_backlash_via_mailbox() {
     let reached = wait_until(Duration::from_secs(2), || {
         record_ref.process().unwrap();
         ds_ref.write(record_ref).unwrap();
-        record_ref.stat.dmov != 0
+        record_ref.stat().dmov != 0
     })
     .await;
 
     assert!(reached, "DMOV should become true after backlash");
     assert!(
-        (setup.record.pos.rbv - (-10.0)).abs() < 0.1,
+        (setup.record.pos().rbv - (-10.0)).abs() < 0.1,
         "final position should be near -10.0, got {}",
-        setup.record.pos.rbv
+        setup.record.pos().rbv
     );
 
     let _ = setup.poll_cmd_tx.send(PollCommand::Shutdown).await;
@@ -545,7 +548,7 @@ async fn test_jog_held_through_a_move_strands_until_pressed_again() {
     // Phase 1: the move completes (finalize runs; the jog is NOT fired in
     // the completion pass).
     let completed = wait_until(Duration::from_secs(2), || {
-        motor_record(&|r| r.stat.dmov != 0 && r.stat.phase == MotionPhase::Idle)
+        motor_record(&|r| r.stat().dmov != 0 && r.stat().phase == MotionPhase::Idle)
     })
     .await;
     assert!(completed, "the positional move must complete close-enough");
@@ -553,141 +556,21 @@ async fn test_jog_held_through_a_move_strands_until_pressed_again() {
     // Phase 2: every pass the poller's callbacks still run leaves the axis
     // idle.
     let jogged = wait_until(Duration::from_millis(300), || {
-        motor_record(&|r| r.stat.phase == MotionPhase::Jog)
+        motor_record(&|r| r.stat().phase == MotionPhase::Jog)
     })
     .await;
     assert!(!jogged, "a callback pass started the stranded jog");
     assert!(
-        motor_record(&|r| r.ctrl.jogf != 0),
+        motor_record(&|r| r.ctrl().jogf != 0),
         "the button stays latched"
     );
 
     // Phase 3: a fresh press on the idle record arms and starts the jog.
     put("JOGF", EpicsValue::Short(1)).await;
-    assert!(motor_record(&|r| r.stat.phase == MotionPhase::Jog));
+    assert!(motor_record(&|r| r.stat().phase == MotionPhase::Jog));
 
     let _ = setup.poll_cmd_tx.send(PollCommand::Shutdown).await;
     let _ = poll_handle.await;
-}
-
-fn read_motor_pos(motor: &Arc<Mutex<dyn AsynMotor>>) -> f64 {
-    let mut m = motor.lock().unwrap();
-    polled(&mut *m, &asyn_rs::user::AsynUser::new(0)).position()
-}
-
-/// R59 regression: device-support `init()` must NOT reseed the controller.
-/// The RSTM/loadpos(#231)/MRES(#196) restore decision is owned by
-/// `initial_readback` (C `devMotorAsyn.c::init_controller`), which fires on
-/// the Startup process and tests the controller's *actual current position*.
-/// A controller that kept its true absolute position across an IOC restart
-/// must not be clobbered by a stale autosaved DVAL: with the controller far
-/// from zero, RSTM=NearZero's `dval_non_zero_pos_near_zero` gate is false, so
-/// no reseed occurs and the record adopts the controller readback. (An
-/// earlier Rust `init()` reseeded unconditionally on any pass0 restore,
-/// before the first poll — the exact data loss RSTM prevents. C does NOT
-/// reseed here: a saved DVAL that the live controller contradicts, with the
-/// controller nowhere near zero, fails `initPos`.)
-#[tokio::test]
-async fn init_does_not_clobber_live_controller_position() {
-    // The controller (SimMotor) kept its true position 5.0 across the restart.
-    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(SimMotor::new().with_position(5.0)));
-    let mut setup = make_builder(motor.clone()).build();
-    // The poller's startup pass ran before init.
-    setup.poll_loop.run_startup_pass();
-    setup.record.conv.mres = 1.0; // dial == raw for a clean assertion
-    setup.record.conv.rstm = RestoreMode::NearZero;
-    setup.record.retry.rdbd = 0.05;
-
-    // Autosave restored a STALE DVAL (2.0) that disagrees with the hardware.
-    setup
-        .record
-        .put_field("DVAL", EpicsValue::Double(2.0))
-        .unwrap();
-    assert!(setup.record.was_position_restored());
-
-    // init() polls the controller (true 5.0) and reseeds nothing.
-    setup.device_support.init(&mut setup.record).unwrap();
-    assert!(
-        (read_motor_pos(&motor) - 5.0).abs() < 1e-9,
-        "init() must not reseed — controller stays at its true 5.0"
-    );
-
-    // The Startup process applies the RSTM gate: the controller is far from
-    // zero, so NearZero does not restore — no SetPosition reaches the driver.
-    setup.record.process().unwrap();
-    setup.device_support.write(&mut setup.record).unwrap();
-    setup.poll_loop.run_queued_commands();
-    assert!(
-        (read_motor_pos(&motor) - 5.0).abs() < 1e-9,
-        "RSTM=NearZero with a live controller far from zero must not reseed"
-    );
-    assert!(
-        (setup.record.pos.dval - 5.0).abs() < 1e-9,
-        "record adopts the controller readback (5.0), discarding the stale 2.0"
-    );
-}
-
-/// R59 companion (positive path): when the controller lost its position
-/// across the restart (reads near zero) and a meaningful DVAL was restored,
-/// the RSTM=NearZero gate DOES reseed — and the SetPosition now reaches the
-/// driver through the Startup process → pending_actions → write path, not the
-/// deleted `init()` reseed.
-#[tokio::test]
-async fn startup_reseeds_controller_that_lost_position() {
-    // Controller powered up at 0.0 (lost its absolute position).
-    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(SimMotor::new().with_position(0.0)));
-    let mut setup = make_builder(motor.clone()).build();
-    setup.record.conv.mres = 1.0;
-    setup.record.conv.rstm = RestoreMode::NearZero;
-    setup.record.retry.rdbd = 0.05;
-
-    // Autosave restored a meaningful DVAL the controller no longer holds.
-    setup
-        .record
-        .put_field("DVAL", EpicsValue::Double(5.0))
-        .unwrap();
-
-    setup.device_support.init(&mut setup.record).unwrap();
-    assert!(
-        read_motor_pos(&motor).abs() < 1e-9,
-        "init() does not reseed; controller still at 0.0"
-    );
-
-    // The Startup process restores: controller near zero + meaningful DVAL.
-    setup.record.process().unwrap();
-    setup.device_support.write(&mut setup.record).unwrap();
-    setup.poll_loop.run_queued_commands();
-    assert!(
-        (read_motor_pos(&motor) - 5.0).abs() < 1e-9,
-        "RSTM=NearZero reseeds the lost controller to the autosaved 5.0"
-    );
-    assert!(
-        (setup.record.pos.dval - 5.0).abs() < 1e-9,
-        "record keeps the autosaved DVAL after the restore"
-    );
-}
-
-/// R59 companion: when NO position was restored during pass0, neither
-/// `init()` nor the Startup process reseeds — the controller keeps its
-/// hardware position and the record adopts the readback.
-#[tokio::test]
-async fn init_does_not_reseed_controller_when_nothing_restored() {
-    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(SimMotor::new().with_position(5.0)));
-    let mut setup = make_builder(motor.clone()).build();
-    setup.record.conv.mres = 1.0;
-
-    // No put_field("DVAL", ...) — nothing was restored.
-    assert!(!setup.record.was_position_restored());
-
-    setup.device_support.init(&mut setup.record).unwrap();
-    setup.record.process().unwrap();
-    setup.device_support.write(&mut setup.record).unwrap();
-    setup.poll_loop.run_queued_commands();
-
-    assert!(
-        (read_motor_pos(&motor) - 5.0).abs() < 1e-9,
-        "controller untouched when nothing was restored"
-    );
 }
 
 /// C init_record 717-718 ("Reset limits in case database values are
@@ -748,7 +631,11 @@ async fn pid_gain_put_forward_reaches_driver() {
 
     // SimMotor's status does not report gain support; model a
     // gain-capable controller the way C reads it — from MSTA.
-    setup.record.stat.msta.insert(MstaFlags::GAIN_SUPPORT);
+    let msta = setup.record.stat().msta | MstaFlags::GAIN_SUPPORT;
+    setup
+        .record
+        .put_field("MSTA", EpicsValue::ULong(msta.bits()))
+        .unwrap();
     setup
         .record
         .put_field("PCOF", EpicsValue::Double(1.5))
@@ -1226,11 +1113,12 @@ async fn pass0_restored_dval_is_not_a_move_command() {
     setup.poll_loop.run_queued_commands();
 
     assert_eq!(
-        setup.record.pos.val, 1.5,
+        setup.record.pos().val,
+        1.5,
         "restored DVAL survives init and the Startup pass"
     );
-    assert_eq!(setup.record.pos.dval, 1.5);
-    assert!(setup.record.stat.dmov != 0, "restored axis comes up done");
+    assert_eq!(setup.record.pos().dval, 1.5);
+    assert!(setup.record.stat().dmov != 0, "restored axis comes up done");
     assert_eq!(
         moves.load(Ordering::SeqCst),
         0,
@@ -1737,14 +1625,14 @@ async fn init_dial_limit_follows_a_refusing_device() {
     let setup = make_builder(motor).build_axis();
     let mut support = setup.axis.with_build_trans(Arc::new(Clamp)).attach();
     let mut rec = motor_rs::MotorRecord::new();
-    rec.conv.mres = 0.001;
-    rec.limits.dhlm = 100.0;
-    rec.limits.dllm = -100.0;
-    rec.limits.hlm = 100.0;
-    rec.limits.llm = -100.0;
+    rec.put_field("MRES", EpicsValue::Double(0.001)).unwrap();
+    rec.put_field("DHLM", EpicsValue::Double(100.0)).unwrap();
+    rec.put_field("DLLM", EpicsValue::Double(-100.0)).unwrap();
+    rec.put_field("HLM", EpicsValue::Double(100.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-100.0)).unwrap();
     support.init(&mut rec).unwrap();
-    assert_eq!((rec.limits.dhlm, rec.limits.hlm), (80.0, 80.0));
-    assert_eq!((rec.limits.dllm, rec.limits.llm), (-100.0, -100.0));
+    assert_eq!((rec.limits().dhlm, rec.limits().hlm), (80.0, 80.0));
+    assert_eq!((rec.limits().dllm, rec.limits().llm), (-100.0, -100.0));
 }
 
 /// motordevCom.cc:327-343: init_record's commands go through the device's
@@ -1765,7 +1653,7 @@ async fn init_commands_reach_the_device_build_trans() {
     let setup = make_builder(motor).build_axis();
     let mut support = setup.axis.with_build_trans(seen.clone()).attach();
     let mut rec = motor_rs::MotorRecord::new();
-    rec.conv.mres = 0.001;
+    rec.put_field("MRES", EpicsValue::Double(0.001)).unwrap();
     support.init(&mut rec).unwrap();
     let seen = seen.0.lock().unwrap();
     assert!(
@@ -1799,14 +1687,18 @@ async fn init_dial_limits_always_set_user_and_raw_limits() {
             .with_build_trans(Arc::new(Clamp(refuse)))
             .attach();
         let mut rec = motor_rs::MotorRecord::new();
-        rec.conv.mres = 0.001;
-        rec.limits.dhlm = 100.0;
-        rec.limits.dllm = -100.0;
+        rec.put_field("MRES", EpicsValue::Double(0.001)).unwrap();
+        rec.put_field("DHLM", EpicsValue::Double(100.0)).unwrap();
+        rec.put_field("DLLM", EpicsValue::Double(-100.0)).unwrap();
         support.init(&mut rec).unwrap();
         let hlm = if refuse { 80.0 } else { 100.0 };
-        assert_eq!((rec.limits.hlm, rec.limits.llm), (hlm, -100.0), "{refuse}");
         assert_eq!(
-            (rec.limits.rhlm, rec.limits.rllm),
+            (rec.limits().hlm, rec.limits().llm),
+            (hlm, -100.0),
+            "{refuse}"
+        );
+        assert_eq!(
+            (rec.limits().rhlm, rec.limits().rllm),
             (100.0 / 0.001, -100.0 / 0.001),
             "{refuse}"
         );
@@ -1827,7 +1719,7 @@ async fn review_loaded_hlm_yields_to_dhlm_at_init() {
     rec.put_field("HLM", EpicsValue::Double(50.0)).unwrap();
     rec.init_record(1).unwrap();
     support.init(&mut rec).unwrap();
-    assert_eq!((rec.limits.dhlm, rec.limits.hlm), (20.0, 20.0));
+    assert_eq!((rec.limits().dhlm, rec.limits().hlm), (20.0, 20.0));
 }
 
 /// Review probe: dbLoadRecords OFF then DIR are raw field() writes in C;
@@ -1844,7 +1736,7 @@ async fn review_loaded_off_survives_loaded_dir() {
     rec.put_field("DIR", EpicsValue::Short(1)).unwrap();
     rec.init_record(1).unwrap();
     support.init(&mut rec).unwrap();
-    assert_eq!(rec.pos.off, 5.0);
+    assert_eq!(rec.pos().off, 5.0);
 }
 
 /// Review probe: no device init reaches 717 (C returns at 646-652), so a
@@ -1859,5 +1751,5 @@ fn review_loaded_hlm_kept_without_device_init() {
     rec.put_field("DIR", EpicsValue::Short(1)).unwrap();
     rec.put_field("OFF", EpicsValue::Double(1.0)).unwrap();
     rec.init_record(1).unwrap();
-    assert_eq!((rec.limits.dhlm, rec.limits.hlm), (20.0, 50.0));
+    assert_eq!((rec.limits().dhlm, rec.limits().hlm), (20.0, 50.0));
 }

@@ -1,9 +1,9 @@
+use crate::MotorRecord;
+use crate::flags::*;
 use epics_base_rs::server::record::FieldDeclaration;
 use epics_base_rs::server::record::LinkType;
 use epics_base_rs::server::record::Record;
 use epics_base_rs::types::EpicsValue;
-use motor_rs::MotorRecord;
-use motor_rs::flags::*;
 
 /// The port `rec`'s special() puts send through from now on.
 /// Whether the pass sent a GET_INFO.
@@ -13,18 +13,18 @@ fn sends_get_info(effects: &ProcessEffects) -> bool {
 
 fn capture(
     rec: &mut MotorRecord,
-) -> tokio::sync::mpsc::UnboundedReceiver<motor_rs::poll_loop::ToAxis> {
-    let (port, rx) = motor_rs::device_support::CommandPort::capture();
+) -> tokio::sync::mpsc::UnboundedReceiver<crate::poll_loop::ToAxis> {
+    let (port, rx) = crate::device_support::CommandPort::capture();
     rec.set_command_port(port);
     rx
 }
 
 /// What the port sent since the last read.
 fn sent(
-    rx: &mut tokio::sync::mpsc::UnboundedReceiver<motor_rs::poll_loop::ToAxis>,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::poll_loop::ToAxis>,
 ) -> Vec<MotorCommand> {
     let mut commands = Vec::new();
-    while let Ok(motor_rs::poll_loop::ToAxis::Batch(batch)) = rx.try_recv() {
+    while let Ok(crate::poll_loop::ToAxis::Batch(batch)) = rx.try_recv() {
         commands.extend(batch.commands);
     }
     commands
@@ -35,9 +35,9 @@ fn sent(
 /// put/scan passes must run them against an anchored record — an unanchored
 /// mailbox-wired record parks its signals until the anchor
 /// (do_process_inner's anchor-first gate).
-fn anchor(rec: &mut MotorRecord, state: &motor_rs::device_state::SharedDeviceState) {
+fn anchor(rec: &mut MotorRecord, state: &crate::device_state::SharedDeviceState) {
+    use crate::device_state::StampedStatus;
     use asyn_rs::interfaces::motor::MotorStatus;
-    use motor_rs::device_state::StampedStatus;
     state.lock().unwrap().latest_status = Some(StampedStatus {
         seq: 1,
         status: MotorStatus {
@@ -2787,7 +2787,7 @@ fn test_rep_is_the_driver_encoder_count_even_under_ueip_no() {
 #[test]
 fn test_stup_triggers_status_refresh() {
     let mut rec = MotorRecord::new();
-    rec.set_device_state(motor_rs::device_state::new_shared_state());
+    rec.set_device_state(crate::device_state::new_shared_state());
     rec.stat.stup = 1;
     let effects = rec.do_process();
     assert!(sends_get_info(&effects));
@@ -2820,7 +2820,7 @@ fn test_stup_does_not_drop_concurrent_user_write() {
     // write (last_write) arriving in the same cycle must still be planned —
     // the STUP must not early-return and discard it.
     let mut rec = MotorRecord::new();
-    let state = motor_rs::device_state::new_shared_state();
+    let state = crate::device_state::new_shared_state();
     rec.set_device_state(state.clone());
     anchor(&mut rec, &state);
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
@@ -2851,7 +2851,7 @@ fn test_stup_in_comm_alarm_returns_to_off() {
     // in COMM_ALARM (devMotorAsyn.c:530-532), so do_work's GET_INFO
     // returns ERROR and STUP drops back to OFF (motorRecord.cc:1827-1828).
     let mut rec = MotorRecord::new();
-    rec.set_device_state(motor_rs::device_state::new_shared_state());
+    rec.set_device_state(crate::device_state::new_shared_state());
     rec.internal.comm_alarm = true;
     rec.stat.stup = 1;
     let effects = rec.do_process();
@@ -2870,7 +2870,7 @@ fn test_refused_implicit_get_info_marks_stup_off() {
     };
     let soft_channel = MotorRecord::new();
     let mut comm_alarm = MotorRecord::new();
-    comm_alarm.set_device_state(motor_rs::device_state::new_shared_state());
+    comm_alarm.set_device_state(crate::device_state::new_shared_state());
     comm_alarm.internal.comm_alarm = true;
     for (case, mut rec) in [("no device", soft_channel), ("COMM_ALARM", comm_alarm)] {
         let effects = rec.do_process();
@@ -2884,11 +2884,11 @@ fn test_refused_implicit_get_info_marks_stup_off() {
 fn test_model1_stup_in_comm_alarm_still_sends_get_info() {
     // motordevCom's build_trans has no COMM_ALARM check.
     let mut rec = MotorRecord::new();
-    let state = motor_rs::device_state::new_shared_state();
+    let state = crate::device_state::new_shared_state();
     state
         .lock()
         .unwrap()
-        .set_dset(motor_rs::device_state::MotorDset::MotordevCom);
+        .set_dset(crate::device_state::MotorDset::MotordevCom);
     rec.set_device_state(state);
     rec.internal.comm_alarm = true;
     rec.stat.stup = 1;
@@ -2904,7 +2904,7 @@ fn test_stup_put_rejects_non_on_and_busy_retrigger() {
     // while the previous request is in flight is refused.
     let mut rec = MotorRecord::new();
     rec.init_record(1).unwrap();
-    let state = motor_rs::device_state::new_shared_state();
+    let state = crate::device_state::new_shared_state();
     rec.set_device_state(state.clone());
     anchor(&mut rec, &state);
 
@@ -2941,7 +2941,7 @@ fn test_idle_status_pass_blocks_implicit_get_info() {
     // one-pass mark from determine_event's Idle consume carries that
     // discriminator.
     let mut rec = MotorRecord::new();
-    let state = motor_rs::device_state::new_shared_state();
+    let state = crate::device_state::new_shared_state();
     rec.set_device_state(state.clone());
     anchor(&mut rec, &state);
 
@@ -2972,7 +2972,7 @@ fn test_cnen_put_pass_fires_implicit_get_info() {
     // not from gain support.
     let mut rec = MotorRecord::new();
     rec.init_record(1).unwrap();
-    rec.set_device_state(motor_rs::device_state::new_shared_state());
+    rec.set_device_state(crate::device_state::new_shared_state());
     let mut rx = capture(&mut rec);
 
     // Without GAIN_SUPPORT: no torque command, the refresh still fires.
@@ -3010,7 +3010,7 @@ fn test_spmg_noop_go_flip_fires_implicit_get_info() {
     // the move-block entry (2241: dval == ldvl && dmov) and falls to
     // the chain end — the implicit GET_INFO fires.
     let mut rec = MotorRecord::new();
-    rec.set_device_state(motor_rs::device_state::new_shared_state());
+    rec.set_device_state(crate::device_state::new_shared_state());
 
     rec.ctrl.spmg = SpmgMode::Pause;
     let effects = rec.plan_motion(CommandSource::Spmg);
@@ -3046,7 +3046,7 @@ fn test_blocked_home_put_fires_implicit_get_info_button_stays() {
     // blocked by its limit switch — the pass falls through the section
     // to the chain end (implicit GET_INFO) and the button stays latched.
     let mut rec = MotorRecord::new();
-    rec.set_device_state(motor_rs::device_state::new_shared_state());
+    rec.set_device_state(crate::device_state::new_shared_state());
 
     rec.limits.hls = 1;
     rec.put_field("HOMF", EpicsValue::Short(1)).unwrap();
@@ -3069,7 +3069,7 @@ fn test_idle_jog_release_fires_implicit_get_info() {
     // MIP_JOGF/JOGR, no queued jog) — the pass falls through to the
     // chain end (2546).
     let mut rec = MotorRecord::new();
-    rec.set_device_state(motor_rs::device_state::new_shared_state());
+    rec.set_device_state(crate::device_state::new_shared_state());
 
     rec.put_field("JOGF", EpicsValue::Short(0)).unwrap();
     let effects = rec.plan_motion(CommandSource::Jogf);
@@ -3087,7 +3087,7 @@ fn test_hw_blocked_jog_fires_implicit_get_info_button_stays() {
     // MIP_JOG_REQ, so the put pass skips the jog section and falls to
     // the chain end; the button stays latched for the latent collection.
     let mut rec = MotorRecord::new();
-    rec.set_device_state(motor_rs::device_state::new_shared_state());
+    rec.set_device_state(crate::device_state::new_shared_state());
 
     rec.limits.hls = 1;
     rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
@@ -3108,7 +3108,7 @@ fn test_lvio_refused_jog_consumes_pass_no_get_info() {
     // reaches the implicit GET_INFO arm.
     let mut rec = MotorRecord::new();
     rec.init_record(1).unwrap();
-    rec.set_device_state(motor_rs::device_state::new_shared_state());
+    rec.set_device_state(crate::device_state::new_shared_state());
     rec.limits.dhlm = 10.0;
     rec.limits.dllm = -10.0;
     rec.limits.hlm = 10.0;
@@ -3133,7 +3133,7 @@ fn test_go_resume_dispatch_consumes_pass_no_get_info() {
     // C: a Go pass the move block consumes (entry true, dispatch at
     // 2455) never reaches the chain end — no implicit GET_INFO.
     let mut rec = MotorRecord::new();
-    rec.set_device_state(motor_rs::device_state::new_shared_state());
+    rec.set_device_state(crate::device_state::new_shared_state());
 
     rec.ctrl.spmg = SpmgMode::Pause;
     rec.plan_motion(CommandSource::Spmg);
@@ -3235,7 +3235,7 @@ fn test_closed_loop_button_put_fires_implicit_get_info() {
     // end, so a button put that dispatched nothing fires the implicit
     // GET_INFO while the button stays latched for an OMSL flip.
     let mut rec = MotorRecord::new();
-    rec.set_device_state(motor_rs::device_state::new_shared_state());
+    rec.set_device_state(crate::device_state::new_shared_state());
     rec.links.omsl = 1;
     rec.links.dol = "setpoint_src.VAL".into();
     rec.set_link_type("DOL", LinkType::Db);
@@ -4941,7 +4941,7 @@ fn test_move_accel_velo_equals_vbas_fallback() {
     assert_eq!(accel, Some(2.0));
 }
 
-fn emitted_accel(effects: &motor_rs::flags::ProcessEffects) -> Option<f64> {
+fn emitted_accel(effects: &crate::flags::ProcessEffects) -> Option<f64> {
     effects.commands.iter().find_map(|c| match c {
         MotorCommand::MoveAbsolute { acceleration, .. } => Some(*acceleration),
         MotorCommand::MoveRelative { acceleration, .. } => Some(*acceleration),
@@ -5775,14 +5775,14 @@ fn test_urip_rdbl_error_stop_clears_latched_buttons() {
     assert!(rec.ctrl.jogf == 0, "JOGF released by the error stop");
 }
 
-fn sends_stop(actions: &motor_rs::device_state::DeviceActions) -> bool {
+fn sends_stop(actions: &crate::device_state::DeviceActions) -> bool {
     actions
         .commands
         .iter()
         .any(|c| matches!(c, MotorCommand::Stop { .. }))
 }
 
-fn sends_move(actions: &motor_rs::device_state::DeviceActions) -> bool {
+fn sends_move(actions: &crate::device_state::DeviceActions) -> bool {
     actions.commands.iter().any(|c| {
         matches!(
             c,
@@ -6091,9 +6091,9 @@ fn test_external_move_arms_pp() {
 /// A mailbox-wired, anchored record: its passes read statuses and delay
 /// expiries from the returned state, and its puts are database puts, as in
 /// the IOC.
-fn live_axis(rec: &mut MotorRecord) -> motor_rs::device_state::SharedDeviceState {
+fn live_axis(rec: &mut MotorRecord) -> crate::device_state::SharedDeviceState {
     rec.init_record(1).unwrap();
-    let state = motor_rs::device_state::new_shared_state();
+    let state = crate::device_state::new_shared_state();
     rec.set_device_state(state.clone());
     anchor(rec, &state);
     state
@@ -6102,13 +6102,13 @@ fn live_axis(rec: &mut MotorRecord) -> motor_rs::device_state::SharedDeviceState
 /// Post `status` (if any) to the mailbox, run the pass, and take what it sent.
 fn live_pass(
     rec: &mut MotorRecord,
-    state: &motor_rs::device_state::SharedDeviceState,
+    state: &crate::device_state::SharedDeviceState,
     status: Option<asyn_rs::interfaces::motor::MotorStatus>,
-) -> motor_rs::device_state::DeviceActions {
+) -> crate::device_state::DeviceActions {
     if let Some(status) = status {
         let mut ds = state.lock().unwrap();
         let seq = ds.latest_status.as_ref().map_or(1, |s| s.seq + 1);
-        ds.latest_status = Some(motor_rs::device_state::StampedStatus { seq, status });
+        ds.latest_status = Some(crate::device_state::StampedStatus { seq, status });
     }
     rec.process().unwrap();
     state
@@ -10360,9 +10360,9 @@ struct LimitDevice {
     controller_high: Option<f64>,
 }
 
-impl motor_rs::device_support::BuildTrans for LimitDevice {
-    fn limit(&self, high: bool, raw: f64, _mres: f64) -> motor_rs::device_support::LimitBuild {
-        use motor_rs::device_support::{DialLimitReset, LimitBuild};
+impl crate::device_support::BuildTrans for LimitDevice {
+    fn limit(&self, high: bool, raw: f64, _mres: f64) -> crate::device_support::LimitBuild {
+        use crate::device_support::{DialLimitReset, LimitBuild};
         match self.controller_high {
             None => LimitBuild::Refused(None),
             Some(max) if high && raw > max => LimitBuild::Refused(Some(DialLimitReset::Dhlm(max))),
@@ -10375,10 +10375,10 @@ fn limit_device_record(
     controller_high: Option<f64>,
 ) -> (
     MotorRecord,
-    tokio::sync::mpsc::UnboundedReceiver<motor_rs::poll_loop::ToAxis>,
+    tokio::sync::mpsc::UnboundedReceiver<crate::poll_loop::ToAxis>,
 ) {
     let mut rec = MotorRecord::new();
-    let (port, rx) = motor_rs::device_support::CommandPort::capture();
+    let (port, rx) = crate::device_support::CommandPort::capture();
     rec.set_command_port(
         port.with_build_trans(std::sync::Arc::new(LimitDevice { controller_high })),
     );
@@ -10420,16 +10420,16 @@ fn test_refused_user_limit_restores_hlm() {
 #[test]
 fn test_deferred_limit_is_not_refused() {
     struct DefersAll;
-    impl motor_rs::device_support::BuildTrans for DefersAll {
-        fn limit(&self, _: bool, _: f64, _: f64) -> motor_rs::device_support::LimitBuild {
-            motor_rs::device_support::LimitBuild::Refused(None)
+    impl crate::device_support::BuildTrans for DefersAll {
+        fn limit(&self, _: bool, _: f64, _: f64) -> crate::device_support::LimitBuild {
+            crate::device_support::LimitBuild::Refused(None)
         }
         fn defers(&self, _: &MotorCommand) -> bool {
             true
         }
     }
     let (mut rec, _) = limit_device_record(None);
-    let (port, mut rx) = motor_rs::device_support::CommandPort::capture();
+    let (port, mut rx) = crate::device_support::CommandPort::capture();
     rec.set_command_port(port.with_build_trans(std::sync::Arc::new(DefersAll)));
     rec.put_field("HLM", EpicsValue::Double(50.0)).unwrap();
     assert_eq!(sent(&mut rx), [MotorCommand::Poll]);
@@ -10443,9 +10443,9 @@ fn test_deferred_limit_is_not_refused() {
 fn test_a_limit_is_asked_for_deferral_once() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     struct DefersFirst(AtomicUsize);
-    impl motor_rs::device_support::BuildTrans for DefersFirst {
-        fn limit(&self, _: bool, _: f64, _: f64) -> motor_rs::device_support::LimitBuild {
-            motor_rs::device_support::LimitBuild::Refused(None)
+    impl crate::device_support::BuildTrans for DefersFirst {
+        fn limit(&self, _: bool, _: f64, _: f64) -> crate::device_support::LimitBuild {
+            crate::device_support::LimitBuild::Refused(None)
         }
         fn defers(&self, _: &MotorCommand) -> bool {
             self.0.fetch_add(1, Ordering::Relaxed) == 0
@@ -10453,7 +10453,7 @@ fn test_a_limit_is_asked_for_deferral_once() {
     }
     let (mut rec, _) = limit_device_record(None);
     let device = std::sync::Arc::new(DefersFirst(AtomicUsize::new(0)));
-    let (port, mut rx) = motor_rs::device_support::CommandPort::capture();
+    let (port, mut rx) = crate::device_support::CommandPort::capture();
     rec.set_command_port(port.with_build_trans(device.clone()));
     rec.put_field("HLM", EpicsValue::Double(50.0)).unwrap();
     let asked = device.0.load(Ordering::Relaxed);
@@ -11931,7 +11931,7 @@ fn test_same_value_unblinked_pass_after_miss_giveup_refuses_with_get_info() {
     // `dval != ldvl || !dmov` — no new move dispatches; the pass falls
     // to the chain end and fires the implicit GET_INFO (2546-2557).
     let mut rec = MotorRecord::new();
-    rec.set_device_state(motor_rs::device_state::new_shared_state());
+    rec.set_device_state(crate::device_state::new_shared_state());
     rec.stat.msta = MstaFlags::DONE;
     rec.stat.phase = MotionPhase::MainMove;
     rec.stat.mip = MipFlags::MOVE;
@@ -11981,7 +11981,7 @@ fn test_same_value_dbput_after_miss_giveup_redispatches() {
     // re-dispatch this test asserts on.
     let mut rec = MotorRecord::new();
     rec.init_record(1).unwrap();
-    let state = motor_rs::device_state::new_shared_state();
+    let state = crate::device_state::new_shared_state();
     rec.set_device_state(state.clone());
     anchor(&mut rec, &state);
     rec.stat.msta = MstaFlags::DONE;
@@ -12065,7 +12065,7 @@ fn test_same_value_set_redefinition_resends_load_pos_when_blinked() {
     // Without the blink (no fresh drive write) the entry gate refuses
     // and the pass falls to the chain end instead.
     let mut rec = MotorRecord::new();
-    rec.set_device_state(motor_rs::device_state::new_shared_state());
+    rec.set_device_state(crate::device_state::new_shared_state());
     rec.conv.mres = 1.0;
     rec.stat.msta = MstaFlags::DONE;
     rec.pos.val = 5.0;
@@ -12132,7 +12132,7 @@ fn test_unblinked_zero_tweak_refuses_and_falls_to_chain_end() {
     // entry (2241) both refuse, and the pass ends at the chain end
     // (implicit GET_INFO, 2546-2557) — no move, no DMOV pulse.
     let mut rec = MotorRecord::new();
-    rec.set_device_state(motor_rs::device_state::new_shared_state());
+    rec.set_device_state(crate::device_state::new_shared_state());
     rec.stat.msta = MstaFlags::DONE;
     rec.conv.mres = 0.001;
     rec.pos.val = 10.0;
@@ -12161,7 +12161,7 @@ fn test_unblinked_zero_tweak_refuses_and_falls_to_chain_end() {
 #[test]
 fn test_set_variable_zero_tweak_falls_to_chain_end() {
     let mut rec = MotorRecord::new();
-    rec.set_device_state(motor_rs::device_state::new_shared_state());
+    rec.set_device_state(crate::device_state::new_shared_state());
     rec.stat.msta = MstaFlags::DONE;
     rec.conv.mres = 0.001;
     rec.conv.set = true;
@@ -12192,7 +12192,7 @@ fn test_blinked_zero_tweak_pulses_dmov() {
     // record parks every pass (do_process_inner's anchor-first gate),
     // which would swallow the recovery pass this test asserts on.
     let mut rec = MotorRecord::new();
-    let state = motor_rs::device_state::new_shared_state();
+    let state = crate::device_state::new_shared_state();
     rec.set_device_state(state.clone());
     anchor(&mut rec, &state);
     rec.stat.msta = MstaFlags::DONE;
@@ -12469,15 +12469,15 @@ fn test_val_put_during_external_motion_parks_until_done() {
     // `mip == MIP_DONE || mip == MIP_RETRY` (2457), so a VAL put sends
     // nothing. pp, armed with MIP_EXTERNAL, replays the parked VAL when
     // the axis stops (1382-1397).
+    use crate::device_state::StampedStatus;
     use asyn_rs::interfaces::motor::MotorStatus;
-    use motor_rs::device_state::StampedStatus;
     let mut rec = MotorRecord::new();
     rec.conv.mres = 0.001;
     rec.put_field("VELO", EpicsValue::Double(1.0)).unwrap();
     rec.put_field("HVEL", EpicsValue::Double(0.01)).unwrap();
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
-    let state = motor_rs::device_state::new_shared_state();
+    let state = crate::device_state::new_shared_state();
     rec.set_device_state(state.clone());
     anchor(&mut rec, &state);
     let status = |seq, moving: bool, position: f64| {
@@ -12915,9 +12915,9 @@ fn test_dval_put_during_jog_backlash_rtry0_does_not_move() {
 fn review_deferred_limit_is_asked_once() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     struct DefersOnce(AtomicUsize);
-    impl motor_rs::device_support::BuildTrans for DefersOnce {
-        fn limit(&self, _: bool, _: f64, _: f64) -> motor_rs::device_support::LimitBuild {
-            motor_rs::device_support::LimitBuild::Refused(None)
+    impl crate::device_support::BuildTrans for DefersOnce {
+        fn limit(&self, _: bool, _: f64, _: f64) -> crate::device_support::LimitBuild {
+            crate::device_support::LimitBuild::Refused(None)
         }
         fn defers(&self, _: &MotorCommand) -> bool {
             self.0.fetch_add(1, Ordering::Relaxed) == 0
@@ -12925,7 +12925,7 @@ fn review_deferred_limit_is_asked_once() {
     }
     let (mut rec, _) = limit_device_record(None);
     let device = std::sync::Arc::new(DefersOnce(AtomicUsize::new(0)));
-    let (port, mut rx) = motor_rs::device_support::CommandPort::capture();
+    let (port, mut rx) = crate::device_support::CommandPort::capture();
     rec.set_command_port(port.with_build_trans(device.clone()));
     rec.put_field("HLM", EpicsValue::Double(50.0)).unwrap();
     let asked = device.0.load(Ordering::Relaxed);

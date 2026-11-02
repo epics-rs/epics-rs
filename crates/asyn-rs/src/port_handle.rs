@@ -1876,6 +1876,7 @@ impl PortHandle {
     }
 
     /// The port's announcement owner, which its exception lists hang off.
+    #[cfg(feature = "epics")]
     pub(crate) fn announcer(&self) -> crate::port::ExceptionAnnouncer {
         self.devices.announcer()
     }

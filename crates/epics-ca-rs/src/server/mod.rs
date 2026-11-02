@@ -118,16 +118,17 @@ pub(crate) use epics_base_rs::server::database::dbr_delivery::DeliveryStage;
 /// executes on, that only this entry point can reach.
 ///
 /// The `ca` link set comes with it for the same reason: C's dbCa is in every
-/// IOC, so it is the runner's to install, not each head's.
+/// IOC, so it is the runner's to install, not each head's. It needs the CA
+/// client a link rides on, so a build without `client-core` has no `ca` links.
 pub async fn run_ca_ioc_app(app: epics_base_rs::server::ioc_app::IocApplication) -> CaResult<()> {
-    iocsh::register_rsrv_commands(app)
-        .register_link_type("ca", {
-            let reactor = epics_base_rs::runtime::task::Reactor::current()
-                .expect("run_ca_ioc_app is awaited on the IOC's reactor");
-            move |db| crate::calink::calink_link_set_install(db, reactor)
-        })
-        .run(run_ca_ioc)
-        .await
+    let app = iocsh::register_rsrv_commands(app);
+    #[cfg(feature = "client-core")]
+    let app = app.register_link_type("ca", {
+        let reactor = epics_base_rs::runtime::task::Reactor::current()
+            .expect("run_ca_ioc_app is awaited on the IOC's reactor");
+        move |db| crate::calink::calink_link_set_install(db, reactor)
+    });
+    app.run(run_ca_ioc).await
 }
 
 /// Run an IOC with the Channel Access protocol.

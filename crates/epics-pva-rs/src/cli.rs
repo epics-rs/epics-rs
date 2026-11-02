@@ -427,7 +427,7 @@ pub fn env_client_config_lines(indent: &str) -> String {
 /// [`crate::config::env::Config::expand_server`].
 ///
 /// An invalid interface or ignore entry is pvxs `Config::fromEnv`'s throw,
-/// returned as its `what()`. Host-only, as [`effective_config_string`].
+/// returned as its `what()`. Host-only, as [`crate::config::env::Config`].
 #[cfg(not(epics_embedded_target))]
 pub fn env_server_config_lines(indent: &str) -> Result<String, String> {
     let mut cfg = crate::config::env::Config::from_server_env()?;

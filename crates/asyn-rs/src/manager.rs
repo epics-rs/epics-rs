@@ -432,6 +432,7 @@ impl DeviceUser {
 
     /// A layer below wrote `pasynUser->errorMessage`: a driver call or a
     /// manager refusal on a request this user made.
+    #[cfg(feature = "epics")]
     pub(crate) fn set_error_message(&mut self, message: ErrorMessage) {
         self.error_message = message;
     }

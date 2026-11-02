@@ -341,6 +341,25 @@ jobs:
         key: no-default-features
     - name: Check (no default features)
       run: cargo check --workspace --no-default-features --all-targets
+    # The row above is the workspace's union, and a member that takes another
+    # with its defaults turns them back on: epics-ca-rs there always has its
+    # client. Each package alone, libs and bins only (dev-dependencies unify
+    # the same way), is the build a `default-features = false` dependent gets.
+    - name: Check and document each package in its own empty selection
+      run: |
+        set -euo pipefail
+        cargo metadata --no-deps --format-version 1 \
+          | jq -r '.packages[].name' \
+          | sort \
+          | while read -r pkg; do
+              echo "::group::$pkg"
+              cargo check -p "$pkg" --no-default-features
+              cargo doc --no-deps -p "$pkg" --no-default-features --document-private-items
+              echo "::endgroup::"
+            done
+      env:
+        RUSTFLAGS: -D warnings
+        RUSTDOCFLAGS: -D warnings
 
   # Every job above runs each test exactly ONCE, and that is the hole two
   # exec-backend defects walked through: `cancel_is_a_sync_point_resource_released`
@@ -432,8 +451,11 @@ jobs:
   #
   #   * `--all-features --document-private-items` — every cargo feature on.
   #     Reports 15 sites the other rows do not.
-  #   * `--no-default-features --document-private-items` — every cargo feature
-  #     off. Reports 19 the others do not: the `epics-bridge-rs` and
+  #   * `--no-default-features --document-private-items` — every member's
+  #     defaults off, though not every feature: a member that takes another
+  #     with its defaults turns them back on, so epics-ca-rs keeps `client`
+  #     here. A package's own empty selection is the `no-default-features`
+  #     job's reading. Reports 19 the others do not: the `epics-bridge-rs` and
   #     `epics-tools-rs` lib docs are compiled only here.
   #   * `--document-private-items` at default features — reports 0 that the
   #     others miss TODAY, and is kept for a class that is not hypothetical:

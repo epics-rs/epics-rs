@@ -461,3 +461,41 @@ fn range_check(parm: &mut f64, min: f64, max: f64) -> bool {
     }
     *parm != old
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// VELO below VBAS with a stale ACCU slave: a state C reaches only by a
+    /// struct write, since special() and init clamp VELO into [VBAS, VMAX]
+    /// (motorRecord.cc:2690, 3128-3146), so it is set on the change itself.
+    fn below_vbas(accl: f64, accs: f64) -> VelocityChange {
+        let vel = VelocityFields {
+            velo: 5.0,
+            vbas: 8.0,
+            accl,
+            accs,
+            ..VelocityFields::default()
+        };
+        VelocityChange::new(&MotorRecord::new(), vel, 1.0)
+    }
+
+    #[test]
+    fn accl_below_vbas_derives_accs_from_the_full_velo() {
+        // C updateACCSfromACCL (motorRecord.cc:512-521).
+        let mut change = below_vbas(0.2, 99.0);
+        change.accl(2.0);
+        assert_eq!(change.vel.accu, AccsUsed::Accl);
+        assert_eq!(change.vel.accs, 5.0 / 2.0);
+    }
+
+    #[test]
+    fn accs_below_vbas_derives_accl_from_the_full_velo() {
+        // C updateACCLfromACCS (motorRecord.cc:499-510); ACCU stays the
+        // master it was (63bfe5d0).
+        let mut change = below_vbas(99.0, 0.0);
+        change.accs(4.0);
+        assert_eq!(change.vel.accu, AccsUsed::Accl);
+        assert_eq!(change.vel.accl, 5.0 / 4.0);
+    }
+}

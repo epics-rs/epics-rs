@@ -23,8 +23,8 @@ fn named_record() -> MotorRecord {
     rec.limits.dllm = -100.0;
     rec.limits.hlm = 100.0;
     rec.limits.llm = -100.0;
-    rec.vel.velo = 10.0;
-    rec.vel.accl = 0.5;
+    rec.put_field("VELO", EpicsValue::Double(10.0)).unwrap();
+    rec.put_field("ACCL", EpicsValue::Double(0.5)).unwrap();
     rec.stat.msta = MstaFlags::DONE;
     rec.timing.ntm = true;
 

@@ -12,7 +12,7 @@ use common::{MotorFixture, drain};
 use epics_base_rs::server::database::ProcStack;
 use epics_base_rs::server::event_queue::{CircuitEvent, EventReader, EventUser, no_context};
 use epics_base_rs::server::recgbl::{EventMask, alarm_condition_string};
-use epics_base_rs::server::record::MENU_ALARM_SEVR;
+use epics_base_rs::server::record::{MENU_ALARM_SEVR, Record};
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
 const PVS: [(&str, &str, DbFieldType); 10] = [
@@ -128,7 +128,8 @@ async fn put(fx: &MotorFixture, field: &str, value: f64) {
 
 #[tokio::test]
 async fn limit_dir_and_off_puts_post_their_marks_as_the_oracle_does() {
-    let mut fx = MotorFixture::new(|rec| rec.vel.velo = 1.0).await;
+    let mut fx =
+        MotorFixture::new(|rec| rec.put_field("VELO", EpicsValue::Double(1.0)).unwrap()).await;
     fx.move_to(1.0).await;
     let mut readers = subscribe(&fx);
     for (field, value) in [
@@ -158,7 +159,7 @@ async fn limit_dir_and_off_puts_post_their_marks_as_the_oracle_does() {
 
 #[tokio::test]
 async fn a_set_mode_val_put_posts_the_blink_and_the_redefinition_as_the_oracle_does() {
-    let fx = MotorFixture::new(|rec| rec.vel.velo = 1.0).await;
+    let fx = MotorFixture::new(|rec| rec.put_field("VELO", EpicsValue::Double(1.0)).unwrap()).await;
     let mut readers = subscribe(&fx);
     for (field, value) in [("SET", 1.0), ("VAL", 5.0), ("SET", 0.0)] {
         put(&fx, field, value).await;
@@ -181,7 +182,7 @@ async fn a_set_mode_val_put_posts_the_blink_and_the_redefinition_as_the_oracle_d
 /// too, since C's VAL collection precedes the stop_or_pause return (2237).
 #[tokio::test]
 async fn a_set_mode_val_put_under_spmg_stop_redefines_as_the_oracle_does() {
-    let fx = MotorFixture::new(|rec| rec.vel.velo = 1.0).await;
+    let fx = MotorFixture::new(|rec| rec.put_field("VELO", EpicsValue::Double(1.0)).unwrap()).await;
     let mut readers = subscribe(&fx);
     for (field, value) in [("SPMG", 0.0), ("SET", 1.0), ("VAL", 5.0), ("SET", 0.0)] {
         put(&fx, field, value).await;
@@ -216,7 +217,8 @@ M1.DMOV 1
 
 #[tokio::test]
 async fn a_negative_mres_put_posts_the_user_limits_as_the_oracle_does() {
-    let mut fx = MotorFixture::new(|rec| rec.vel.velo = 1.0).await;
+    let mut fx =
+        MotorFixture::new(|rec| rec.put_field("VELO", EpicsValue::Double(1.0)).unwrap()).await;
     let mut readers = subscribe(&fx);
     for mres in [-0.001, 0.002] {
         put(&fx, "MRES", mres).await;
@@ -296,7 +298,8 @@ async fn a_cnen_derived_on_an_alarm_move_carries_the_alarm_as_the_oracle_does() 
 /// Runs the steps (a driver status bit, or a put) on a fresh `M1` and returns
 /// what `camonitor -m v|a|l M1.CNEN M1.MSTA` would print.
 async fn cnen_streams(steps: &[&str]) -> Vec<String> {
-    let mut fx = MotorFixture::new(|rec| rec.vel.velo = 1.0).await;
+    let mut fx =
+        MotorFixture::new(|rec| rec.put_field("VELO", EpicsValue::Double(1.0)).unwrap()).await;
     let classes = [EventMask::VALUE, EventMask::ALARM, EventMask::LOG];
     let mut readers: Vec<[EventReader; 2]> = (0u32..)
         .step_by(2)
@@ -419,7 +422,8 @@ impl MotorFixture {
 /// Runs the steps (a put, a driver poll, the jog's stop, the DLY watchdog)
 /// and returns each class's JOGF, MIP and DMOV posts.
 async fn mip_streams(steps: &[&str]) -> Vec<String> {
-    let mut fx = MotorFixture::new(|rec| rec.vel.velo = 1.0).await;
+    let mut fx =
+        MotorFixture::new(|rec| rec.put_field("VELO", EpicsValue::Double(1.0)).unwrap()).await;
     let pvs = [("M1.JOGF", "JOGF"), ("M1.MIP", "MIP"), ("M1.DMOV", "DMOV")];
     let classes = [EventMask::VALUE, EventMask::ALARM, EventMask::LOG];
     let mut sid = 0;
@@ -542,7 +546,8 @@ fn stream(user: &EventUser, order: &[usize]) -> Vec<String> {
 }
 
 async fn move_streams(reversed: bool) -> (Vec<String>, Vec<String>) {
-    let mut fx = MotorFixture::new(|rec| rec.vel.velo = 1.0).await;
+    let mut fx =
+        MotorFixture::new(|rec| rec.put_field("VELO", EpicsValue::Double(1.0)).unwrap()).await;
     let user = EventUser::new();
     let mut order: Vec<usize> = (0..MOVE_FIELDS.len()).collect();
     if reversed {
@@ -630,7 +635,8 @@ async fn a_soft_limit_alarm_posts_the_monitor_list_to_its_tail_as_the_oracle_doe
         ("M1.RHLM", "RHLM", DbFieldType::Double),
         ("M1.RLLM", "RLLM", DbFieldType::Double),
     ];
-    let mut fx = MotorFixture::new(|rec| rec.vel.velo = 1.0).await;
+    let mut fx =
+        MotorFixture::new(|rec| rec.put_field("VELO", EpicsValue::Double(1.0)).unwrap()).await;
     let mut readers: Vec<EventReader> = (1u32..)
         .zip(ALARM_PVS)
         .map(|(sid, (_, field, ty))| fx.subscribe(field, sid, ty, EventMask::ALARM))
@@ -693,7 +699,7 @@ async fn a_soft_limit_alarm_posts_the_monitor_list_to_its_tail_as_the_oracle_doe
 /// window the oracle cannot hold open.
 #[tokio::test]
 async fn an_alarm_move_with_nothing_marked_posts_to_msta_and_stops() {
-    let fx = MotorFixture::new(|rec| rec.vel.velo = 1.0).await;
+    let fx = MotorFixture::new(|rec| rec.put_field("VELO", EpicsValue::Double(1.0)).unwrap()).await;
     let mut msta = fx.subscribe("MSTA", 1, DbFieldType::ULong, EventMask::ALARM);
     let mut velo = fx.subscribe("VELO", 2, DbFieldType::Double, EventMask::ALARM);
     let mut rllm = fx.subscribe("RLLM", 3, DbFieldType::Double, EventMask::ALARM);
@@ -713,7 +719,8 @@ async fn an_alarm_move_with_nothing_marked_posts_to_msta_and_stops() {
 /// its start pass, a pass reporting the driver moving forward, and the pass
 /// reporting it done.
 async fn move_phases(fields: &[(&str, DbFieldType)]) -> [Vec<String>; 3] {
-    let mut fx = MotorFixture::new(|rec| rec.vel.velo = 1.0).await;
+    let mut fx =
+        MotorFixture::new(|rec| rec.put_field("VELO", EpicsValue::Double(1.0)).unwrap()).await;
     let user = EventUser::new();
     let _readers: Vec<_> = fields
         .iter()

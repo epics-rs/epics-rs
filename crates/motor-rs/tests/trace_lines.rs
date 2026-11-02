@@ -825,9 +825,9 @@ fn build_trans_lines(port: &str) -> Vec<String> {
         rec.limits.dllm = -100.0;
         rec.limits.hlm = 100.0;
         rec.limits.llm = -100.0;
-        rec.vel.velo = 2.0;
-        rec.vel.vbas = 1.0;
-        rec.vel.accl = 0.5;
+        rec.put_field("VELO", EpicsValue::Double(2.0)).unwrap();
+        rec.put_field("VBAS", EpicsValue::Double(1.0)).unwrap();
+        rec.put_field("ACCL", EpicsValue::Double(0.5)).unwrap();
         support.init(&mut rec).unwrap();
         rec.put_field("VAL", EpicsValue::Double(5.0)).unwrap();
         rec.process().unwrap();

@@ -46,13 +46,13 @@ fn make_builder(motor: Arc<Mutex<dyn AsynMotor>>) -> MotorBuilder {
             rec.limits.hlm = 100.0;
             rec.limits.llm = -100.0;
             rec.limits.lvio = 0;
-            rec.vel.velo = 100000.0; // very fast for tests
-            rec.vel.accl = 0.5;
-            rec.vel.bvel = 100000.0;
-            rec.vel.bacc = 0.5;
-            rec.vel.hvel = 100000.0;
-            rec.vel.jvel = 5.0;
-            rec.vel.jar = 1.0;
+            rec.put_field("VELO", EpicsValue::Double(100000.0)).unwrap(); // very fast for tests
+            rec.put_field("ACCL", EpicsValue::Double(0.5)).unwrap();
+            rec.put_field("BVEL", EpicsValue::Double(100000.0)).unwrap();
+            rec.put_field("BACC", EpicsValue::Double(0.5)).unwrap();
+            rec.put_field("HVEL", EpicsValue::Double(100000.0)).unwrap();
+            rec.put_field("JVEL", EpicsValue::Double(5.0)).unwrap();
+            rec.put_field("JAR", EpicsValue::Double(1.0)).unwrap();
             rec.stat.msta = MstaFlags::DONE;
         })
 }
@@ -127,7 +127,10 @@ async fn test_stop_during_move() {
     setup.device_support.write(&mut setup.record).unwrap();
 
     // Start a slow move (velocity=1, target=50 → 50s)
-    setup.record.vel.velo = 1.0;
+    setup
+        .record
+        .put_field("VELO", EpicsValue::Double(1.0))
+        .unwrap();
     setup
         .record
         .put_field("VAL", EpicsValue::Double(50.0))
@@ -181,10 +184,10 @@ async fn test_delay_via_poll_loop() {
             rec.limits.hlm = 100.0;
             rec.limits.llm = -100.0;
             rec.limits.lvio = 0;
-            rec.vel.velo = 100000.0; // very fast
-            rec.vel.accl = 0.5;
-            rec.vel.bvel = 5.0;
-            rec.vel.bacc = 0.5;
+            rec.put_field("VELO", EpicsValue::Double(100000.0)).unwrap(); // very fast
+            rec.put_field("ACCL", EpicsValue::Double(0.5)).unwrap();
+            rec.put_field("BVEL", EpicsValue::Double(5.0)).unwrap();
+            rec.put_field("BACC", EpicsValue::Double(0.5)).unwrap();
             rec.stat.msta = MstaFlags::DONE;
             rec.timing.dly = 0.05; // 50ms delay
         })
@@ -243,10 +246,10 @@ async fn test_backlash_via_mailbox() {
             rec.limits.hlm = 100.0;
             rec.limits.llm = -100.0;
             rec.limits.lvio = 0;
-            rec.vel.velo = 100000.0;
-            rec.vel.accl = 0.5;
-            rec.vel.bvel = 100000.0;
-            rec.vel.bacc = 0.5;
+            rec.put_field("VELO", EpicsValue::Double(100000.0)).unwrap();
+            rec.put_field("ACCL", EpicsValue::Double(0.5)).unwrap();
+            rec.put_field("BVEL", EpicsValue::Double(100000.0)).unwrap();
+            rec.put_field("BACC", EpicsValue::Double(0.5)).unwrap();
             rec.stat.msta = MstaFlags::DONE;
             rec.retry.bdst = 1.0; // positive backlash
         })
@@ -714,9 +717,6 @@ async fn limit_put_forward_reaches_driver() {
     let mut setup = make_builder(motor).build();
 
     setup.device_support.init(&mut setup.record).unwrap();
-    // The builder harness skips the record init passes; the live IOC
-    // sets this in init_record(pass1).
-    setup.record.internal.init_invariants_synced = true;
     setup.record.process().unwrap();
     setup.device_support.write(&mut setup.record).unwrap();
     setup.poll_loop.run_queued_commands();

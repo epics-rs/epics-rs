@@ -26,7 +26,9 @@ use crate::flags::*;
 pub struct MotorRecord {
     pub pos: PositionFields,
     pub conv: ConversionFields,
-    pub vel: VelocityFields,
+    /// Private so that, once init has reconciled it, only
+    /// `FiniteVelocity::commit` replaces it; read it through [`Self::vel`].
+    vel: VelocityFields,
     pub retry: RetryFields,
     pub limits: LimitFields,
     pub ctrl: ControlFields,
@@ -210,6 +212,23 @@ enum MotionDirection {
 impl MotorRecord {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The speeds and accelerations; they are written through `put_field`.
+    ///
+    /// ```compile_fail,E0616
+    /// let mut rec = motor_rs::MotorRecord::new();
+    /// rec.vel.velo = f64::NAN;
+    /// ```
+    ///
+    /// Nor can a caller reopen the load path, where a put stores raw:
+    ///
+    /// ```compile_fail,E0616
+    /// let mut rec = motor_rs::MotorRecord::new();
+    /// rec.internal.init_invariants_synced = false;
+    /// ```
+    pub fn vel(&self) -> &VelocityFields {
+        &self.vel
     }
 
     /// Create a motor record wired to a shared device state mailbox.
@@ -1190,14 +1209,14 @@ mod tests {
     fn test_stup_processes_after_put_only_when_on() {
         // STUP == ON -> reprocess.
         let mut on = MotorRecord::new();
-        on.internal.init_invariants_synced = true;
+        on.init_record(1).unwrap();
         on.put_field("STUP", EpicsValue::Short(1)).unwrap();
         assert_eq!(on.stat.stup, 1);
         assert!(on.processes_after_put("STUP", true));
 
         // STUP == BUSY -> clamped to OFF, no reprocess (C return ERROR).
         let mut off = MotorRecord::new();
-        off.internal.init_invariants_synced = true;
+        off.init_record(1).unwrap();
         off.put_field("STUP", EpicsValue::Short(2)).unwrap();
         assert_eq!(off.stat.stup, 0);
         assert!(!off.processes_after_put("STUP", true));

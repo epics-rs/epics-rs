@@ -61,8 +61,8 @@ fn test_default_values() {
     assert_eq!(rec.conv.mres, 0.0);
     // C dbd: VELO has no initial() (0.0, like JVEL/HVEL); ACCL carries
     // initial("0.2").
-    assert_eq!(rec.vel.velo, 0.0);
-    assert_eq!(rec.vel.accl, 0.2);
+    assert_eq!(rec.vel().velo, 0.0);
+    assert_eq!(rec.vel().accl, 0.2);
     assert_eq!(rec.retry.rtry, 10);
     // C dbd LVIO initial("1"); init_record clears it before the
     // initial-readback check (motorRecord.cc:734-743).
@@ -98,7 +98,9 @@ fn a_put_short_button_reads_back_the_value() {
     ] {
         for synced in [false, true] {
             let mut rec = MotorRecord::new();
-            rec.internal.init_invariants_synced = synced;
+            if synced {
+                rec.init_record(1).unwrap();
+            }
             rec.put_field(field, EpicsValue::Short(3)).unwrap();
             assert_eq!(
                 rec.get_field(field),
@@ -185,7 +187,7 @@ fn test_unknown_field() {
 fn test_hlm_cascades_to_dhlm() {
     let mut rec = MotorRecord::new();
     // A runtime put: a load-time HLM/LLM is a raw write.
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     rec.put_field("HLM", EpicsValue::Double(100.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-100.0)).unwrap();
     assert_eq!(rec.limits.dhlm, 100.0);
@@ -197,7 +199,7 @@ fn test_dir_neg_limit_mapping() {
     let mut rec = MotorRecord::new();
     rec.conv.dir = MotorDir::Neg;
     // A runtime put: a load-time HLM/LLM is a raw write.
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     rec.put_field("HLM", EpicsValue::Double(100.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-100.0)).unwrap();
     // DIR=Neg: user 100 -> dial -100, user -100 -> dial 100
@@ -260,10 +262,10 @@ fn test_limit_strike_completes_move_and_clears_buttons() {
     // process callback then takes the stopped branch (1301/1345)
     // instead of waiting for RA_DONE.
     let mut rec = MotorRecord::new();
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     rec.conv.mres = 1.0;
     rec.stat.msta = MstaFlags::DONE;
-    rec.vel.jvel = 2.0;
+    rec.put_field("JVEL", EpicsValue::Double(2.0)).unwrap();
     rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
     rec.plan_motion(CommandSource::Jogf);
     assert_eq!(rec.stat.phase, MotionPhase::Jog);
@@ -512,8 +514,8 @@ fn test_stop_during_move() {
 #[test]
 fn test_jog_start_stop() {
     let mut rec = MotorRecord::new();
-    rec.internal.init_invariants_synced = true;
-    rec.vel.jvel = 1.0;
+    rec.init_record(1).unwrap();
+    rec.put_field("JVEL", EpicsValue::Double(1.0)).unwrap();
     rec.conv.mres = 0.01;
     rec.stat.msta = MstaFlags::DONE;
 
@@ -630,7 +632,7 @@ fn a_set_redefinition_to_a_non_finite_offset_is_refused() {
         ("TWV", f64::NAN),
     ] {
         let mut rec = MotorRecord::new();
-        rec.internal.init_invariants_synced = true;
+        rec.init_record(1).unwrap();
         rec.conv.mres = 1.0;
         rec.stat.msta = MstaFlags::DONE;
         rec.put_field("DHLM", EpicsValue::Double(10.0)).unwrap();
@@ -686,7 +688,7 @@ fn a_set_redefinition_to_a_non_finite_offset_is_refused() {
 fn an_offset_put_that_is_not_finite_is_dropped() {
     for bad in [f64::NAN, f64::NEG_INFINITY] {
         let mut rec = MotorRecord::new();
-        rec.internal.init_invariants_synced = true;
+        rec.init_record(1).unwrap();
         rec.conv.mres = 1.0;
         rec.put_field("DHLM", EpicsValue::Double(10.0)).unwrap();
         rec.put_field("DLLM", EpicsValue::Double(-10.0)).unwrap();
@@ -707,7 +709,7 @@ fn an_offset_put_that_is_not_finite_is_dropped() {
 /// collected under SPMG=Pause, which returns before the move block.
 fn holding_a_nan(field: &str, paused: bool, foff: FreezeOffset) -> MotorRecord {
     let mut rec = MotorRecord::new();
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     rec.conv.mres = 1.0;
     rec.conv.foff = foff;
     rec.stat.msta = MstaFlags::DONE;
@@ -994,7 +996,7 @@ fn test_sset_suse_fof_vof_momentary_commands() {
     // triggers too.
     let mut rec = MotorRecord::new();
     rec.stat.msta = MstaFlags::DONE;
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
 
     rec.put_field("SSET", EpicsValue::Short(0)).unwrap();
     assert!(rec.conv.set, "any SSET write forces SET mode");
@@ -1020,7 +1022,7 @@ fn test_runtime_mres_change_use_mode_reanchors_with_load_pos() {
     // GET_INFO.
     let mut rec = MotorRecord::new();
     rec.stat.msta = MstaFlags::DONE;
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
 
     rec.put_field("MRES", EpicsValue::Double(0.5)).unwrap();
     let effects = rec.do_process();
@@ -1049,7 +1051,7 @@ fn test_runtime_mres_change_with_an_encoder_sends_the_ratio_first() {
     // re-anchor's LOAD_POS; build_trans divides the pulse pair.
     let mut rec = MotorRecord::new();
     rec.stat.msta = MstaFlags::DONE | MstaFlags::ENCODER_PRESENT;
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     rec.conv.eres = 0.001;
 
     rec.put_field("MRES", EpicsValue::Double(0.004)).unwrap();
@@ -1069,7 +1071,7 @@ fn test_runtime_mres_change_with_an_encoder_sends_the_ratio_first() {
 fn test_runtime_mres_change_without_an_encoder_sends_no_ratio() {
     let mut rec = MotorRecord::new();
     rec.stat.msta = MstaFlags::DONE;
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
 
     rec.put_field("MRES", EpicsValue::Double(0.004)).unwrap();
     let effects = rec.do_process();
@@ -1091,7 +1093,7 @@ fn test_runtime_mres_change_set_mode_resyncs_drive_values() {
     // drive values from the readback at the new resolution.
     let mut rec = MotorRecord::new();
     rec.stat.msta = MstaFlags::DONE;
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     rec.pos.val = 5.0;
     rec.internal.lval = 5.0;
     rec.pos.dval = 5.0;
@@ -1130,7 +1132,7 @@ fn a_resolution_change_with_no_step_count_takes_the_readback() {
     for mres in [1e-9, 1e-300] {
         let mut rec = MotorRecord::new();
         rec.stat.msta = MstaFlags::DONE;
-        rec.internal.init_invariants_synced = true;
+        rec.init_record(1).unwrap();
         rec.conv.mres = 0.001;
         (rec.pos.val, rec.pos.dval, rec.pos.rval) = (10.0, 10.0, 10_000);
         let i = &mut rec.internal;
@@ -1170,7 +1172,7 @@ fn test_plain_ueip_change_does_not_reanchor() {
     // mark and re-anchors.
     let mut rec = MotorRecord::new();
     rec.stat.msta = MstaFlags::DONE | MstaFlags::ENCODER_PRESENT;
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
 
     rec.put_field("UEIP", EpicsValue::Short(1)).unwrap();
     assert!(rec.conv.ueip);
@@ -1220,7 +1222,7 @@ fn test_db_loaded_ueip_survives_until_first_poll() {
 
     // After init, a runtime put repeats the C special() veto (2947-2948):
     // UEIP=Yes with no encoder is overridden back and MARKs M_UEIP.
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     rec.put_field("UEIP", EpicsValue::Short(1)).unwrap();
     assert!(!rec.conv.ueip, "runtime no-encoder put is vetoed");
     assert!(rec.internal.res_reanchor, "the veto path MARKs M_UEIP");
@@ -1257,7 +1259,7 @@ fn test_db_loaded_urip_does_not_kill_ueip() {
     assert!(rec.conv.urip);
 
     // At runtime the special interplay applies: URIP=Yes forces UEIP=No.
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     rec.put_field("URIP", EpicsValue::Short(1)).unwrap();
     assert!(!rec.conv.ueip, "runtime URIP=Yes forces UEIP off");
 }
@@ -1327,7 +1329,7 @@ fn test_mres_reanchor_mark_dies_on_stop_pass() {
     // mark and the re-anchor never fires for that write.
     let mut rec = MotorRecord::new();
     rec.stat.msta = MstaFlags::DONE;
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
 
     rec.put_field("MRES", EpicsValue::Double(0.5)).unwrap();
     rec.ctrl.stop = 1; // latent stop pulse rides the same pass
@@ -1487,7 +1489,7 @@ fn test_homf_homr_puts_rejected_while_home_in_flight() {
     // C special() (motorRecord.cc:2610-2614): a HOMF/HOMR put while
     // mip & MIP_HOME returns ERROR — button not written, no processing.
     let mut rec = MotorRecord::new();
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     rec.stat.msta = MstaFlags::DONE;
     assert!(rec.put_field("HOMF", EpicsValue::Short(1)).is_ok());
     rec.plan_motion(CommandSource::Homf);
@@ -1509,7 +1511,7 @@ fn test_homf_put_rejected_while_home_queued_behind_stop() {
     // A queued home reads back as MIP_HOMF|MIP_STOP (C 2023-2033),
     // which still intersects MIP_HOME — the 2610-2614 veto applies.
     let mut rec = MotorRecord::new();
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     rec.pos.dval = 50.0;
@@ -1533,10 +1535,10 @@ fn test_home_accel_derives_from_hvel_not_velo() {
     let mut rec = MotorRecord::new();
     rec.conv.mres = 1.0;
     rec.stat.msta = MstaFlags::DONE;
-    rec.vel.vbas = 0.5;
-    rec.vel.velo = 5.0;
-    rec.vel.hvel = 2.0;
-    rec.vel.accl = 0.5;
+    rec.put_field("VBAS", EpicsValue::Double(0.5)).unwrap();
+    rec.put_field("VELO", EpicsValue::Double(5.0)).unwrap();
+    rec.put_field("HVEL", EpicsValue::Double(2.0)).unwrap();
+    rec.put_field("ACCL", EpicsValue::Double(0.5)).unwrap();
 
     rec.ctrl.homf = 1;
     let effects = rec.plan_motion(CommandSource::Homf);
@@ -1559,9 +1561,9 @@ fn test_home_at_zero_hvel_carries_no_acceleration() {
         let mut rec = MotorRecord::new();
         rec.conv.mres = 1.0;
         rec.stat.msta = MstaFlags::DONE;
-        rec.vel.vbas = vbas;
-        rec.vel.hvel = 0.0;
-        rec.vel.accl = 0.5;
+        rec.put_field("VBAS", EpicsValue::Double(vbas)).unwrap();
+        rec.put_field("HVEL", EpicsValue::Double(0.0)).unwrap();
+        rec.put_field("ACCL", EpicsValue::Double(0.5)).unwrap();
 
         rec.ctrl.homf = 1;
         let effects = rec.plan_motion(CommandSource::Homf);
@@ -1585,10 +1587,10 @@ fn test_queued_home_refire_accel_derives_from_hvel() {
     rec.conv.mres = 1.0;
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
-    rec.vel.vbas = 0.5;
-    rec.vel.velo = 5.0;
-    rec.vel.hvel = 2.0;
-    rec.vel.accl = 0.5;
+    rec.put_field("VBAS", EpicsValue::Double(0.5)).unwrap();
+    rec.put_field("VELO", EpicsValue::Double(5.0)).unwrap();
+    rec.put_field("HVEL", EpicsValue::Double(2.0)).unwrap();
+    rec.put_field("ACCL", EpicsValue::Double(0.5)).unwrap();
     rec.pos.dval = 50.0;
     rec.plan_motion(CommandSource::Val);
     rec.stat.msta = MstaFlags::MOVING;
@@ -2556,8 +2558,8 @@ fn parked_during_move(rtry: i16, bdst: f64) -> (MotorRecord, ProcessEffects) {
     rec.limits.dllm = -100.0;
     rec.retry.rtry = rtry;
     rec.retry.bdst = bdst;
-    rec.vel.velo = 1.0;
-    rec.vel.bvel = 0.5;
+    rec.put_field("VELO", EpicsValue::Double(1.0)).unwrap();
+    rec.put_field("BVEL", EpicsValue::Double(0.5)).unwrap();
     rec.stat.msta = MstaFlags::DONE;
     rec.pos.dval = 50.0;
     rec.pos.val = 50.0;
@@ -2619,7 +2621,7 @@ fn test_val_parked_during_move_dispatches_at_completion_as_a_retry() {
 #[test]
 fn test_val_put_riding_a_retry_pass_retries_to_the_new_target() {
     let mut rec = moving_to_50(3);
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     rec.put_field("VAL", EpicsValue::Double(80.0)).unwrap();
     rec.set_event(MotorEvent::DeviceUpdate(status_at(4900.0, false)));
     let e = rec.do_process();
@@ -2634,7 +2636,7 @@ fn test_sync_put_riding_a_retry_pass_still_retries() {
     // C's move block (2455) dispatches the armed retry before the SYNC arm
     // (2540), which needs MIP_DONE and leaves SYNC latched.
     let mut rec = moving_to_50(3);
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     rec.put_field("SYNC", EpicsValue::Short(1)).unwrap();
     rec.set_event(MotorEvent::DeviceUpdate(status_at(4900.0, false)));
     let e = rec.do_process();
@@ -2901,7 +2903,7 @@ fn test_stup_put_rejects_non_on_and_busy_retrigger() {
     // back to OFF and does not trigger the protocol; (2615-2617): a put
     // while the previous request is in flight is refused.
     let mut rec = MotorRecord::new();
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     let state = motor_rs::device_state::new_shared_state();
     rec.set_device_state(state.clone());
     anchor(&mut rec, &state);
@@ -2969,7 +2971,7 @@ fn test_cnen_put_pass_fires_implicit_get_info() {
     // implicit GET_INFO (2546-2557). The refresh comes from the pass,
     // not from gain support.
     let mut rec = MotorRecord::new();
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     rec.set_device_state(motor_rs::device_state::new_shared_state());
     let mut rx = capture(&mut rec);
 
@@ -3105,13 +3107,13 @@ fn test_lvio_refused_jog_consumes_pass_no_get_info() {
     // pass is consumed (buttons released, LVIO raised) and never
     // reaches the implicit GET_INFO arm.
     let mut rec = MotorRecord::new();
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     rec.set_device_state(motor_rs::device_state::new_shared_state());
     rec.limits.dhlm = 10.0;
     rec.limits.dllm = -10.0;
     rec.limits.hlm = 10.0;
     rec.limits.llm = -10.0;
-    rec.vel.jvel = 5.0;
+    rec.put_field("JVEL", EpicsValue::Double(5.0)).unwrap();
     rec.pos.val = 8.0; // 8.0 > HLM - JVEL = 5.0: forward jog violates
 
     rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
@@ -3162,7 +3164,7 @@ fn test_put_pass_reads_an_injected_device_update() {
     // own later pass reads nothing.
     let mut rec = MotorRecord::new();
     rec.conv.mres = 1.0;
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
     rec.do_process();
     assert_eq!(rec.stat.phase, MotionPhase::MainMove);
@@ -3192,7 +3194,7 @@ fn test_put_pass_reads_a_delay_expiry() {
     // GET_INFO (1416-1426), and the pass after it ends the wait.
     let mut rec = MotorRecord::new();
     rec.conv.mres = 1.0;
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     rec.timing.dly = 0.5;
     rec.pos.dval = 10.0;
     rec.plan_motion(CommandSource::Val);
@@ -3407,7 +3409,7 @@ fn test_cnen_put_sends_torque_whatever_the_pass_returns() {
     // lands; the pass that follows may return at the latent-stop branch
     // (1874) and the command is already out.
     let mut rec = MotorRecord::new();
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     let mut rx = capture(&mut rec);
     rec.stat.msta = MstaFlags::DONE | MstaFlags::GAIN_SUPPORT;
     rec.ctrl.stop = 1;
@@ -3427,7 +3429,7 @@ fn test_cnen_put_sends_torque_whatever_the_pass_returns() {
 #[test]
 fn test_cnen_put_sends_enable_and_disable_with_gain_support() {
     let mut rec = MotorRecord::new();
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     let mut rx = capture(&mut rec);
     rec.stat.msta = MstaFlags::GAIN_SUPPORT; // controller supports gain
     rec.put_field("CNEN", EpicsValue::Short(1)).unwrap();
@@ -3783,7 +3785,7 @@ fn test_spmg_pause_then_go_resumes_queued_jog_from_button() {
     // the still-latched jog BUTTON survives; Go re-arms the jog from the
     // button (motorRecord.cc:1916-1918).
     let mut rec = MotorRecord::new();
-    rec.vel.jvel = 1.0;
+    rec.put_field("JVEL", EpicsValue::Double(1.0)).unwrap();
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     rec.pos.dval = 50.0;
@@ -3941,8 +3943,8 @@ fn test_latent_homf_during_move_stops_and_queues_home() {
 #[test]
 fn test_latent_jogf_fires_on_move_block_pass() {
     let mut rec = MotorRecord::new();
-    rec.internal.init_invariants_synced = true;
-    rec.vel.jvel = 1.0;
+    rec.init_record(1).unwrap();
+    rec.put_field("JVEL", EpicsValue::Double(1.0)).unwrap();
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     rec.put_field("JOGF", EpicsValue::Short(1)).unwrap(); // bare put, never dispatched
@@ -3972,7 +3974,7 @@ fn test_latent_jog_release_stops_jog() {
     // A bare JOGF=0 put (button released) overtaken in last_write must
     // still stop the jog: C's jog-stop section (2148) fires on state.
     let mut rec = MotorRecord::new();
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
@@ -4000,7 +4002,7 @@ fn test_latent_jog_release_stops_jog() {
 #[test]
 fn test_latent_release_with_opposite_latched_only_stops() {
     let mut rec = MotorRecord::new();
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
@@ -4066,7 +4068,7 @@ fn test_latent_home_blocked_by_limit_falls_through_to_val() {
 #[test]
 fn test_held_jog_button_does_not_refire_during_own_jog() {
     let mut rec = MotorRecord::new();
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
@@ -4331,10 +4333,10 @@ fn test_stop_field_clears_latched_buttons_while_moving() {
 #[test]
 fn test_accs_default_mirrors_accl() {
     let rec = MotorRecord::new();
-    assert_eq!(rec.vel.accu, AccsUsed::Accl);
+    assert_eq!(rec.vel().accu, AccsUsed::Accl);
     // C dbd: ACCS has no initial() — it loads 0.0 and derives from ACCL
     // at init ((velo=0.0 - vbas=0.0) / accl=0.2 == 0.0).
-    assert!((rec.vel.accs - 0.0).abs() < 1e-12);
+    assert!((rec.vel().accs - 0.0).abs() < 1e-12);
 }
 
 #[test]
@@ -4363,14 +4365,15 @@ fn test_put_accl_recalculates_accs_and_leaves_accu_untouched() {
     // (a load leaves ACCL/ACCS raw; see motor_sync_speed_at_init).
     rec.init_record(0).unwrap();
     rec.init_record(1).unwrap();
-    rec.vel.velo = 10.0;
-    rec.vel.vbas = 0.0;
-    rec.vel.accu = AccsUsed::Accs; // start from Accs — must survive the put
+    rec.put_field("VELO", EpicsValue::Double(10.0)).unwrap();
+    rec.put_field("VBAS", EpicsValue::Double(0.0)).unwrap();
+    rec.put_field("ACCU", EpicsValue::Short(AccsUsed::Accs as i16))
+        .unwrap(); // start from Accs — must survive the put
     rec.put_field("ACCL", EpicsValue::Double(2.0)).unwrap();
-    assert_eq!(rec.vel.accu, AccsUsed::Accs);
-    assert!((rec.vel.accl - 2.0).abs() < 1e-12);
+    assert_eq!(rec.vel().accu, AccsUsed::Accs);
+    assert!((rec.vel().accl - 2.0).abs() < 1e-12);
     // ACCS = (10 - 0) / 2 = 5
-    assert!((rec.vel.accs - 5.0).abs() < 1e-12);
+    assert!((rec.vel().accs - 5.0).abs() < 1e-12);
 }
 
 #[test]
@@ -4382,14 +4385,15 @@ fn test_put_accs_recalculates_accl_and_leaves_accu_untouched() {
     // (a load leaves ACCL/ACCS raw; see motor_sync_speed_at_init).
     rec.init_record(0).unwrap();
     rec.init_record(1).unwrap();
-    rec.vel.velo = 10.0;
-    rec.vel.vbas = 0.0;
-    rec.vel.accu = AccsUsed::Accl; // default master — must survive the put
+    rec.put_field("VELO", EpicsValue::Double(10.0)).unwrap();
+    rec.put_field("VBAS", EpicsValue::Double(0.0)).unwrap();
+    rec.put_field("ACCU", EpicsValue::Short(AccsUsed::Accl as i16))
+        .unwrap(); // default master — must survive the put
     rec.put_field("ACCS", EpicsValue::Double(4.0)).unwrap();
-    assert_eq!(rec.vel.accu, AccsUsed::Accl);
-    assert!((rec.vel.accs - 4.0).abs() < 1e-12);
+    assert_eq!(rec.vel().accu, AccsUsed::Accl);
+    assert!((rec.vel().accs - 4.0).abs() < 1e-12);
     // ACCL = (10 - 0) / 4 = 2.5
-    assert!((rec.vel.accl - 2.5).abs() < 1e-12);
+    assert!((rec.vel().accl - 2.5).abs() < 1e-12);
 }
 
 #[test]
@@ -4402,14 +4406,22 @@ fn test_put_accs_nonpositive_derives_from_accl_not_literal() {
     // (a load leaves ACCL/ACCS raw; see motor_sync_speed_at_init).
     rec.init_record(0).unwrap();
     rec.init_record(1).unwrap();
-    rec.vel.velo = 10.0;
-    rec.vel.vbas = 0.0;
-    rec.vel.accl = 2.0;
+    rec.put_field("VELO", EpicsValue::Double(10.0)).unwrap();
+    rec.put_field("VBAS", EpicsValue::Double(0.0)).unwrap();
+    rec.put_field("ACCL", EpicsValue::Double(2.0)).unwrap();
     rec.put_field("ACCS", EpicsValue::Double(0.0)).unwrap();
     // accs <= 0 → accs = (10 - 0) / 2 = 5 (from ACCL), not 1.0
-    assert!((rec.vel.accs - 5.0).abs() < 1e-12, "ACCS={}", rec.vel.accs);
+    assert!(
+        (rec.vel().accs - 5.0).abs() < 1e-12,
+        "ACCS={}",
+        rec.vel().accs
+    );
     // ACCL stays consistent: (10 - 0) / 5 = 2 (round-trip)
-    assert!((rec.vel.accl - 2.0).abs() < 1e-12, "ACCL={}", rec.vel.accl);
+    assert!(
+        (rec.vel().accl - 2.0).abs() < 1e-12,
+        "ACCL={}",
+        rec.vel().accl
+    );
 }
 
 #[test]
@@ -4419,14 +4431,15 @@ fn test_put_velo_cascades_to_accs_when_accu_is_accl() {
     // (a load leaves ACCL/ACCS raw; see motor_sync_speed_at_init).
     rec.init_record(0).unwrap();
     rec.init_record(1).unwrap();
-    rec.vel.accu = AccsUsed::Accl;
-    rec.vel.accl = 2.0;
-    rec.vel.vbas = 0.0;
+    rec.put_field("ACCU", EpicsValue::Short(AccsUsed::Accl as i16))
+        .unwrap();
+    rec.put_field("ACCL", EpicsValue::Double(2.0)).unwrap();
+    rec.put_field("VBAS", EpicsValue::Double(0.0)).unwrap();
     rec.put_field("VELO", EpicsValue::Double(20.0)).unwrap();
     // ACCS = (20 - 0) / 2 = 10
-    assert!((rec.vel.accs - 10.0).abs() < 1e-12);
+    assert!((rec.vel().accs - 10.0).abs() < 1e-12);
     // ACCL unchanged
-    assert!((rec.vel.accl - 2.0).abs() < 1e-12);
+    assert!((rec.vel().accl - 2.0).abs() < 1e-12);
 }
 
 #[test]
@@ -4436,13 +4449,14 @@ fn test_put_velo_cascades_to_accl_when_accu_is_accs() {
     // (a load leaves ACCL/ACCS raw; see motor_sync_speed_at_init).
     rec.init_record(0).unwrap();
     rec.init_record(1).unwrap();
-    rec.vel.accu = AccsUsed::Accs;
-    rec.vel.accs = 5.0;
-    rec.vel.vbas = 0.0;
+    rec.put_field("ACCU", EpicsValue::Short(AccsUsed::Accs as i16))
+        .unwrap();
+    rec.put_field("ACCS", EpicsValue::Double(5.0)).unwrap();
+    rec.put_field("VBAS", EpicsValue::Double(0.0)).unwrap();
     rec.put_field("VELO", EpicsValue::Double(20.0)).unwrap();
     // ACCL = (20 - 0) / 5 = 4
-    assert!((rec.vel.accl - 4.0).abs() < 1e-12);
-    assert!((rec.vel.accs - 5.0).abs() < 1e-12);
+    assert!((rec.vel().accl - 4.0).abs() < 1e-12);
+    assert!((rec.vel().accs - 5.0).abs() < 1e-12);
 }
 
 #[test]
@@ -4452,24 +4466,25 @@ fn test_put_vbas_cascades_per_accu() {
     // (a load leaves ACCL/ACCS raw; see motor_sync_speed_at_init).
     rec.init_record(0).unwrap();
     rec.init_record(1).unwrap();
-    rec.vel.velo = 10.0;
-    rec.vel.accu = AccsUsed::Accl;
-    rec.vel.accl = 2.0;
+    rec.put_field("VELO", EpicsValue::Double(10.0)).unwrap();
+    rec.put_field("ACCU", EpicsValue::Short(AccsUsed::Accl as i16))
+        .unwrap();
+    rec.put_field("ACCL", EpicsValue::Double(2.0)).unwrap();
     rec.put_field("VBAS", EpicsValue::Double(2.0)).unwrap();
     // ACCS = (10 - 2) / 2 = 4
-    assert!((rec.vel.accs - 4.0).abs() < 1e-12);
+    assert!((rec.vel().accs - 4.0).abs() < 1e-12);
 }
 
 #[test]
 fn test_put_accu_does_not_recompute() {
     let mut rec = MotorRecord::new();
-    rec.vel.accl = 2.0;
-    rec.vel.accs = 5.0;
+    rec.put_field("ACCL", EpicsValue::Double(2.0)).unwrap();
+    rec.put_field("ACCS", EpicsValue::Double(5.0)).unwrap();
     rec.put_field("ACCU", EpicsValue::Short(1)).unwrap();
-    assert_eq!(rec.vel.accu, AccsUsed::Accs);
+    assert_eq!(rec.vel().accu, AccsUsed::Accs);
     // No recompute on bare ACCU put — autosave path
-    assert!((rec.vel.accl - 2.0).abs() < 1e-12);
-    assert!((rec.vel.accs - 5.0).abs() < 1e-12);
+    assert!((rec.vel().accl - 2.0).abs() < 1e-12);
+    assert!((rec.vel().accs - 5.0).abs() < 1e-12);
 }
 
 // --- STOP is sent unconditionally (C: motorRecord.cc "just in case") ---
@@ -4854,7 +4869,7 @@ fn test_move_accel_is_egu_per_sec_squared() {
     // VELO=10, VBAS=0, ACCL=2 → accel = (10-0)/2 = 5 EGU/s²
     let mut rec = MotorRecord::new();
     rec.conv.mres = 1.0;
-    rec.vel.vbas = 0.0;
+    rec.put_field("VBAS", EpicsValue::Double(0.0)).unwrap();
     rec.put_field("VELO", EpicsValue::Double(10.0)).unwrap();
     rec.put_field("ACCL", EpicsValue::Double(2.0)).unwrap();
     rec.put_field("VAL", EpicsValue::Double(50.0)).unwrap();
@@ -4871,7 +4886,7 @@ fn test_move_accel_is_egu_per_sec_squared() {
 fn test_move_accel_uses_accs_directly_when_accu_is_accs() {
     let mut rec = MotorRecord::new();
     rec.conv.mres = 1.0;
-    rec.vel.vbas = 0.0;
+    rec.put_field("VBAS", EpicsValue::Double(0.0)).unwrap();
     rec.put_field("VELO", EpicsValue::Double(10.0)).unwrap();
     rec.put_field("ACCS", EpicsValue::Double(7.0)).unwrap();
     rec.put_field("ACCU", EpicsValue::Short(1)).unwrap(); // select ACCS as master
@@ -4940,9 +4955,9 @@ fn test_move_accel_zero_for_unconfigured_axis() {
     // (motorRecord.cc:2529); the poller moves on the stored acceleration.
     let mut rec = MotorRecord::new();
     rec.conv.mres = 1.0;
-    rec.vel.velo = 0.0;
-    rec.vel.vbas = 0.0;
-    rec.vel.accl = 0.5;
+    rec.put_field("VELO", EpicsValue::Double(0.0)).unwrap();
+    rec.put_field("VBAS", EpicsValue::Double(0.0)).unwrap();
+    rec.put_field("ACCL", EpicsValue::Double(0.5)).unwrap();
     rec.put_field("VAL", EpicsValue::Double(50.0)).unwrap();
     let effects = rec.plan_motion(CommandSource::Val);
     let a = emitted_accel(&effects).expect("a move command must be emitted for a 50-unit move");
@@ -4964,12 +4979,13 @@ fn test_accs_cascade_consistent_with_move_accel_under_vbas_unsupported() {
         vbas_supported: false,
         ..Default::default()
     });
-    rec.vel.vbas = 6.0; // would skew accs if used raw
-    rec.vel.accu = AccsUsed::Accl;
-    rec.vel.accl = 2.0;
+    rec.put_field("VBAS", EpicsValue::Double(6.0)).unwrap(); // would skew accs if used raw
+    rec.put_field("ACCU", EpicsValue::Short(AccsUsed::Accl as i16))
+        .unwrap();
+    rec.put_field("ACCL", EpicsValue::Double(2.0)).unwrap();
     rec.put_field("VELO", EpicsValue::Double(10.0)).unwrap();
     // apply_accu_cascade derived ACCS using effective VBAS (0): (10-0)/2 = 5
-    assert!((rec.vel.accs - 5.0).abs() < 1e-12);
+    assert!((rec.vel().accs - 5.0).abs() < 1e-12);
     // The driver-bound acceleration (ACCU=Accl path) must yield the same.
     rec.put_field("VAL", EpicsValue::Double(50.0)).unwrap();
     let effects = rec.plan_motion(CommandSource::Val);
@@ -5091,14 +5107,14 @@ fn test_accl_stays_positive_when_velo_equals_vbas() {
     // (a load leaves ACCL/ACCS raw; see motor_sync_speed_at_init).
     rec.init_record(0).unwrap();
     rec.init_record(1).unwrap();
-    rec.vel.vbas = 5.0;
+    rec.put_field("VBAS", EpicsValue::Double(5.0)).unwrap();
     rec.put_field("VELO", EpicsValue::Double(5.0)).unwrap(); // VELO == VBAS
     // ACCL is whatever the user wrote (default 0.2); never derived to 0
-    assert!(rec.vel.accl > 0.0);
+    assert!(rec.vel().accl > 0.0);
     // Put ACCL=0 should be clamped to 0.1
     rec.put_field("ACCL", EpicsValue::Double(0.0)).unwrap();
-    assert!(rec.vel.accl > 0.0);
-    assert!((rec.vel.accl - 0.1).abs() < 1e-12);
+    assert!(rec.vel().accl > 0.0);
+    assert!((rec.vel().accl - 0.1).abs() < 1e-12);
 }
 
 #[test]
@@ -5111,54 +5127,20 @@ fn test_accu_cascade_recomputes_slave_with_full_velo_when_velo_equals_vbas() {
     // (a load leaves ACCL/ACCS raw; see motor_sync_speed_at_init).
     rec.init_record(0).unwrap();
     rec.init_record(1).unwrap();
-    rec.vel.accu = AccsUsed::Accl;
-    rec.vel.accl = 2.0;
-    rec.vel.accs = 5.0; // pre-existing slave value (must be overwritten)
-    rec.vel.vbas = 5.0;
+    rec.put_field("ACCU", EpicsValue::Short(AccsUsed::Accl as i16))
+        .unwrap();
+    rec.put_field("ACCL", EpicsValue::Double(2.0)).unwrap();
+    // The VBAS raise clamps VELO up to 5 after its cascade, which leaves
+    // the slave stale.
+    rec.put_field("VBAS", EpicsValue::Double(5.0)).unwrap();
+    assert_ne!(rec.vel().accs, 2.5);
     rec.put_field("VELO", EpicsValue::Double(5.0)).unwrap();
     // velo == vbas → numerator = velo = 5.0; ACCS = 5.0 / 2.0 = 2.5
-    assert!((rec.vel.accs - 2.5).abs() < 1e-12, "ACCS={}", rec.vel.accs);
-}
-
-#[test]
-fn test_put_accl_recomputes_accs_with_full_velo_when_velo_le_vbas() {
-    // C updateACCSfromACCL (motorRecord.cc:512-521): writing ACCL recomputes
-    // ACCS; at velo <= vbas the numerator is the full velo, not the span.
-    let mut rec = MotorRecord::new();
-    // The accel cross-calcs are C special() — runtime semantics, so init first
-    // (a load leaves ACCL/ACCS raw; see motor_sync_speed_at_init).
-    rec.init_record(0).unwrap();
-    rec.init_record(1).unwrap();
-    // velo < vbas as record STATE (C reaches it by struct write or a VBAS
-    // raise; a runtime VELO put cannot — special() range_checks VELO into
-    // [VBAS, VMAX], motorRecord.cc:2690).
-    rec.vel.vbas = 8.0;
-    rec.vel.velo = 5.0;
-    rec.vel.accs = 99.0; // stale slave that must be overwritten
-    rec.put_field("ACCL", EpicsValue::Double(2.0)).unwrap();
-    assert_eq!(rec.vel.accu, AccsUsed::Accl);
-    // velo < vbas → numerator = velo = 5.0; ACCS = 5.0 / 2.0 = 2.5
-    assert!((rec.vel.accs - 2.5).abs() < 1e-12, "ACCS={}", rec.vel.accs);
-}
-
-#[test]
-fn test_put_accs_recomputes_accl_with_full_velo_when_velo_le_vbas() {
-    // C updateACCLfromACCS (motorRecord.cc:499-510): writing ACCS recomputes
-    // ACCL; at velo <= vbas the numerator is the full velo, not the span.
-    let mut rec = MotorRecord::new();
-    // The accel cross-calcs are C special() — runtime semantics, so init first
-    // (a load leaves ACCL/ACCS raw; see motor_sync_speed_at_init).
-    rec.init_record(0).unwrap();
-    rec.init_record(1).unwrap();
-    // velo < vbas as record STATE (see the ACCL twin above).
-    rec.vel.vbas = 8.0;
-    rec.vel.velo = 5.0;
-    rec.vel.accl = 99.0; // stale slave that must be overwritten
-    rec.put_field("ACCS", EpicsValue::Double(4.0)).unwrap();
-    // ACCS put no longer switches ACCU (R22 / 63bfe5d0); default master survives.
-    assert_eq!(rec.vel.accu, AccsUsed::Accl);
-    // velo < vbas → numerator = velo = 5.0; ACCL = 5.0 / 4.0 = 1.25
-    assert!((rec.vel.accl - 1.25).abs() < 1e-12, "ACCL={}", rec.vel.accl);
+    assert!(
+        (rec.vel().accs - 2.5).abs() < 1e-12,
+        "ACCS={}",
+        rec.vel().accs
+    );
 }
 
 // --- Home ignores soft limit error (C: dbcf4bc2 2011-10, 85511023 2013-06) ---
@@ -5207,7 +5189,7 @@ fn test_home_reverse_proceeds_below_low_soft_limit() {
 #[test]
 fn test_spmg_go_resumes_latched_jog() {
     let mut rec = MotorRecord::new();
-    rec.vel.jvel = 1.0;
+    rec.put_field("JVEL", EpicsValue::Double(1.0)).unwrap();
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     // Jog button latched while paused.
@@ -5249,8 +5231,8 @@ fn test_spmg_go_without_jog_replans_to_dval() {
 #[test]
 fn test_jogr_command_clears_latched_jogf() {
     let mut rec = MotorRecord::new();
-    rec.internal.init_invariants_synced = true;
-    rec.vel.jvel = 1.0;
+    rec.init_record(1).unwrap();
+    rec.put_field("JVEL", EpicsValue::Double(1.0)).unwrap();
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     // Both buttons latched (the ambiguous state #170 addresses)
@@ -5269,8 +5251,8 @@ fn test_jogr_command_clears_latched_jogf() {
 #[test]
 fn test_jogf_command_clears_latched_jogr() {
     let mut rec = MotorRecord::new();
-    rec.internal.init_invariants_synced = true;
-    rec.vel.jvel = 1.0;
+    rec.init_record(1).unwrap();
+    rec.put_field("JVEL", EpicsValue::Double(1.0)).unwrap();
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
@@ -5290,10 +5272,10 @@ fn test_forward_jog_at_high_limit_is_rejected_and_clears_button() {
     // C 2087: refuse when val > hlm - jvel — one JVEL of decel margin.
     let mut rec = MotorRecord::new();
     // A runtime put: a load-time HLM/LLM is a raw write.
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     rec.put_field("HLM", EpicsValue::Double(10.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-10.0)).unwrap();
-    rec.vel.jvel = 1.0;
+    rec.put_field("JVEL", EpicsValue::Double(1.0)).unwrap();
     rec.pos.val = 9.5; // inside the limit but within the JVEL window
     rec.pos.dval = 9.5;
     rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
@@ -5315,10 +5297,10 @@ fn test_reverse_jog_at_low_limit_is_rejected_and_clears_button() {
     // C 2088: refuse when val < llm + jvel.
     let mut rec = MotorRecord::new();
     // A runtime put: a load-time HLM/LLM is a raw write.
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     rec.put_field("HLM", EpicsValue::Double(10.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-10.0)).unwrap();
-    rec.vel.jvel = 1.0;
+    rec.put_field("JVEL", EpicsValue::Double(1.0)).unwrap();
     rec.pos.val = -9.5;
     rec.pos.dval = -9.5;
     rec.put_field("JOGR", EpicsValue::Short(1)).unwrap();
@@ -5335,10 +5317,10 @@ fn test_jog_soft_limit_uses_user_frame_with_dir_neg() {
     let mut rec = MotorRecord::new();
     rec.conv.dir = MotorDir::Neg;
     // A runtime put: a load-time HLM/LLM is a raw write.
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     rec.put_field("HLM", EpicsValue::Double(10.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-10.0)).unwrap();
-    rec.vel.jvel = 1.0;
+    rec.put_field("JVEL", EpicsValue::Double(1.0)).unwrap();
     rec.pos.val = 10.0; // at user high limit
     rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
     rec.plan_motion(CommandSource::Jogf);
@@ -5352,7 +5334,7 @@ fn test_jog_soft_limit_uses_user_frame_with_dir_neg() {
 #[test]
 fn test_reverse_jog_at_high_limit_is_allowed() {
     let mut rec = MotorRecord::new();
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     rec.put_field("HLM", EpicsValue::Double(10.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-10.0)).unwrap();
     rec.pos.val = 10.0; // at high limit
@@ -5433,7 +5415,7 @@ fn test_jog_started_while_moving_only_stops() {
     // starts nothing. The axis rests with JOGF latched.
     let mut rec = MotorRecord::new();
     rec.conv.mres = 1.0;
-    rec.vel.jvel = 1.0;
+    rec.put_field("JVEL", EpicsValue::Double(1.0)).unwrap();
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     // A move is in progress.
@@ -5624,7 +5606,7 @@ fn test_urip_rdbl_error_jog_and_home_dispatch_normally() {
     // move-block rtnstat gate (2418-2453), so both dispatch with the
     // readback link down.
     let mut rec = MotorRecord::new();
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     rec.conv.urip = true;
     rec.set_rdbl_error(true);
     rec.stat.msta = MstaFlags::DONE;
@@ -5775,7 +5757,7 @@ fn test_urip_rdbl_error_stop_clears_latched_buttons() {
     // setting stop=1, releasing any held jog/home button so the halted
     // axis is not re-commanded on the next pass.
     let mut rec = MotorRecord::new();
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     rec.conv.urip = true;
     rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
     rec.plan_motion(CommandSource::Jogf);
@@ -5968,7 +5950,7 @@ fn test_rdbl_resolution_report_drives_rdbl_error() {
 #[test]
 fn test_dllm_greater_than_dhlm_sets_lvio_immediately() {
     let mut rec = MotorRecord::new();
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     // Sequence that produces an inverted dial pair via direct DHLM put.
     rec.put_field("DHLM", EpicsValue::Double(10.0)).unwrap();
     rec.put_field("DLLM", EpicsValue::Double(100.0)).unwrap();
@@ -5982,7 +5964,7 @@ fn test_llm_greater_than_hlm_sets_lvio_immediately() {
     // Each user-limit write moves one dial limit (C set_user_*limit), so
     // the inverted pair lands in BOTH frames and latches LVIO.
     // A runtime put: a load-time HLM/LLM is a raw write.
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     rec.put_field("HLM", EpicsValue::Double(10.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(100.0)).unwrap();
     assert!(rec.limits.llm > rec.limits.hlm);
@@ -5994,7 +5976,7 @@ fn test_correcting_inverted_limits_clears_lvio_without_poll() {
     // C: 270347df — LVIO must clear when the limit pair becomes valid again,
     // even on an idle axis that is not being polled.
     let mut rec = MotorRecord::new();
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     rec.conv.mres = 1.0;
     rec.pos.dval = 0.0; // inside any sane window
     // Create the inverted state.
@@ -6012,7 +5994,7 @@ fn test_correcting_inverted_limits_clears_lvio_without_poll() {
 #[test]
 fn test_correcting_limits_keeps_lvio_when_position_still_outside() {
     let mut rec = MotorRecord::new();
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     rec.conv.mres = 1.0;
     rec.pos.dval = 500.0; // far outside the corrected window
     rec.put_field("DHLM", EpicsValue::Double(10.0)).unwrap();
@@ -6110,7 +6092,7 @@ fn test_external_move_arms_pp() {
 /// expiries from the returned state, and its puts are database puts, as in
 /// the IOC.
 fn live_axis(rec: &mut MotorRecord) -> motor_rs::device_state::SharedDeviceState {
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     let state = motor_rs::device_state::new_shared_state();
     rec.set_device_state(state.clone());
     anchor(rec, &state);
@@ -6213,7 +6195,7 @@ fn test_move_replayed_from_the_external_pp_pass_completes_as_a_move() {
     // any move: a short stop retries.
     let mut rec = MotorRecord::new();
     rec.conv.mres = 1.0;
-    rec.vel.velo = 1.0;
+    rec.put_field("VELO", EpicsValue::Double(1.0)).unwrap();
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     let state = live_axis(&mut rec);
@@ -6252,8 +6234,8 @@ fn test_home_during_an_external_move_stops_and_queues() {
     // re-fires the home (827-891).
     let mut rec = MotorRecord::new();
     rec.conv.mres = 1.0;
-    rec.vel.velo = 1.0;
-    rec.vel.hvel = 1.0;
+    rec.put_field("VELO", EpicsValue::Double(1.0)).unwrap();
+    rec.put_field("HVEL", EpicsValue::Double(1.0)).unwrap();
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     let state = live_axis(&mut rec);
@@ -6288,8 +6270,8 @@ fn test_parked_jog_request_survives_the_pp_pass_maybe_retry() {
     for dly in [0.0, 0.5] {
         let mut rec = MotorRecord::new();
         rec.conv.mres = 1.0;
-        rec.vel.velo = 1.0;
-        rec.vel.jvel = 1.0;
+        rec.put_field("VELO", EpicsValue::Double(1.0)).unwrap();
+        rec.put_field("JVEL", EpicsValue::Double(1.0)).unwrap();
         rec.put_field("RTRY", EpicsValue::Short(1)).unwrap();
         rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
         rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
@@ -6336,8 +6318,8 @@ fn test_parked_jog_request_retries_on_an_idle_status_pass() {
     // re-arms the jog from its button (1914-1918).
     let mut rec = MotorRecord::new();
     rec.conv.mres = 1.0;
-    rec.vel.velo = 1.0;
-    rec.vel.jvel = 1.0;
+    rec.put_field("VELO", EpicsValue::Double(1.0)).unwrap();
+    rec.put_field("JVEL", EpicsValue::Double(1.0)).unwrap();
     rec.put_field("RTRY", EpicsValue::Short(3)).unwrap();
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
@@ -6377,7 +6359,7 @@ fn test_idle_pause_under_dly_keeps_mip_stop_until_go() {
     // (1914-1918).
     let mut rec = MotorRecord::new();
     rec.timing.dly = 0.5;
-    rec.vel.jvel = 1.0;
+    rec.put_field("JVEL", EpicsValue::Double(1.0)).unwrap();
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     let state = live_axis(&mut rec);
@@ -6565,7 +6547,7 @@ fn test_closed_loop_constant_dol_keeps_buttons_active() {
     // C 1994 requires dol.type == DB_LINK: a constant DOL under closed
     // loop leaves the collection block running.
     let mut rec = MotorRecord::new();
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     rec.links.omsl = 1;
     rec.links.dol = "5.0".into(); // CONSTANT, not a DB link
     rec.stat.msta = MstaFlags::DONE;
@@ -6667,7 +6649,7 @@ fn test_latent_jog_fires_on_no_event_pass_after_omsl_flip() {
     // here the no-event process pass after the OMSL flip — without
     // JOGF being re-written.
     let mut rec = MotorRecord::new();
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     rec.links.omsl = 1;
     rec.links.dol = "setpoint_src.VAL".into();
     rec.set_link_type("DOL", LinkType::Db);
@@ -7632,8 +7614,8 @@ fn test_field_metadata_graphic_control_limits() {
     rec.put_field("DLLM", EpicsValue::Double(-50.0)).unwrap();
     rec.put_field("MRES", EpicsValue::Double(0.5)).unwrap();
     rec.init_record(1).unwrap();
-    rec.vel.vmax = 20.0;
-    rec.vel.vbas = 0.1;
+    rec.put_field("VMAX", EpicsValue::Double(20.0)).unwrap();
+    rec.put_field("VBAS", EpicsValue::Double(0.1)).unwrap();
 
     let lim = |f: &str| rec.field_metadata_override(f).unwrap().disp_limits;
     assert_eq!(lim("VAL"), Some((rec.limits.hlm, rec.limits.llm)));
@@ -7703,16 +7685,24 @@ fn test_template_load_velo_before_mres_preserves_velo() {
     rec.init_record(0).unwrap();
     rec.init_record(1).unwrap();
 
-    assert!((rec.vel.velo - 50.0).abs() < 1e-9, "VELO={}", rec.vel.velo);
+    assert!(
+        (rec.vel().velo - 50.0).abs() < 1e-9,
+        "VELO={}",
+        rec.vel().velo
+    );
     // S derived from VELO at the final UREV = 0.001 × 200 = 0.2
-    assert!((rec.vel.s - 250.0).abs() < 1e-9, "S={}", rec.vel.s);
+    assert!((rec.vel().s - 250.0).abs() < 1e-9, "S={}", rec.vel().s);
     assert!(
         (rec.conv.urev - 0.2).abs() < 1e-12,
         "UREV={}",
         rec.conv.urev
     );
     // ACCU=Accl master: ACCS reconciled from the surviving VELO
-    assert!((rec.vel.accs - 250.0).abs() < 1e-9, "ACCS={}", rec.vel.accs);
+    assert!(
+        (rec.vel().accs - 250.0).abs() < 1e-9,
+        "ACCS={}",
+        rec.vel().accs
+    );
 }
 
 #[test]
@@ -7726,10 +7716,22 @@ fn test_load_velo_clamped_to_vmax_at_init() {
     rec.init_record(0).unwrap();
     rec.init_record(1).unwrap();
 
-    assert!((rec.vel.vmax - 20.0).abs() < 1e-9, "VMAX={}", rec.vel.vmax);
-    assert!((rec.vel.smax - 100.0).abs() < 1e-9, "SMAX={}", rec.vel.smax);
-    assert!((rec.vel.velo - 20.0).abs() < 1e-9, "VELO={}", rec.vel.velo);
-    assert!((rec.vel.s - 100.0).abs() < 1e-9, "S={}", rec.vel.s);
+    assert!(
+        (rec.vel().vmax - 20.0).abs() < 1e-9,
+        "VMAX={}",
+        rec.vel().vmax
+    );
+    assert!(
+        (rec.vel().smax - 100.0).abs() < 1e-9,
+        "SMAX={}",
+        rec.vel().smax
+    );
+    assert!(
+        (rec.vel().velo - 20.0).abs() < 1e-9,
+        "VELO={}",
+        rec.vel().velo
+    );
+    assert!((rec.vel().s - 100.0).abs() < 1e-9, "S={}", rec.vel().s);
 }
 
 #[test]
@@ -7743,8 +7745,12 @@ fn test_load_s_specified_wins_over_velo_at_init() {
     rec.init_record(0).unwrap();
     rec.init_record(1).unwrap();
 
-    assert!((rec.vel.s - 2.5).abs() < 1e-9, "S={}", rec.vel.s);
-    assert!((rec.vel.velo - 0.5).abs() < 1e-9, "VELO={}", rec.vel.velo);
+    assert!((rec.vel().s - 2.5).abs() < 1e-9, "S={}", rec.vel().s);
+    assert!(
+        (rec.vel().velo - 0.5).abs() < 1e-9,
+        "VELO={}",
+        rec.vel().velo
+    );
 }
 
 // --- ACCS/ACCL at init (C check_speed_and_resolution, motorRecord.cc:4034-4047)
@@ -7765,8 +7771,16 @@ fn test_load_accs_wins_over_accl_at_init() {
     rec.init_record(0).unwrap();
     rec.init_record(1).unwrap();
 
-    assert!((rec.vel.accs - 5.0).abs() < 1e-9, "ACCS={}", rec.vel.accs);
-    assert!((rec.vel.accl - 2.0).abs() < 1e-9, "ACCL={}", rec.vel.accl);
+    assert!(
+        (rec.vel().accs - 5.0).abs() < 1e-9,
+        "ACCS={}",
+        rec.vel().accs
+    );
+    assert!(
+        (rec.vel().accl - 2.0).abs() < 1e-9,
+        "ACCL={}",
+        rec.vel().accl
+    );
 }
 
 #[test]
@@ -7780,8 +7794,16 @@ fn test_load_accu_accs_without_accs_derives_accs_from_accl_at_init() {
     rec.init_record(0).unwrap();
     rec.init_record(1).unwrap();
 
-    assert!((rec.vel.accl - 0.2).abs() < 1e-9, "ACCL={}", rec.vel.accl);
-    assert!((rec.vel.accs - 50.0).abs() < 1e-9, "ACCS={}", rec.vel.accs);
+    assert!(
+        (rec.vel().accl - 0.2).abs() < 1e-9,
+        "ACCL={}",
+        rec.vel().accl
+    );
+    assert!(
+        (rec.vel().accs - 50.0).abs() < 1e-9,
+        "ACCS={}",
+        rec.vel().accs
+    );
 }
 
 #[test]
@@ -7794,8 +7816,16 @@ fn test_load_zero_accl_and_accs_floors_accl_at_init() {
     rec.init_record(0).unwrap();
     rec.init_record(1).unwrap();
 
-    assert!((rec.vel.accl - 0.1).abs() < 1e-9, "ACCL={}", rec.vel.accl);
-    assert!((rec.vel.accs - 100.0).abs() < 1e-9, "ACCS={}", rec.vel.accs);
+    assert!(
+        (rec.vel().accl - 0.1).abs() < 1e-9,
+        "ACCL={}",
+        rec.vel().accl
+    );
+    assert!(
+        (rec.vel().accs - 100.0).abs() < 1e-9,
+        "ACCS={}",
+        rec.vel().accs
+    );
 }
 
 #[test]
@@ -7806,7 +7836,7 @@ fn test_load_zero_bacc_floors_bacc_at_init() {
     rec.init_record(0).unwrap();
     rec.init_record(1).unwrap();
 
-    assert_eq!(rec.vel.bacc, 0.1);
+    assert_eq!(rec.vel().bacc, 0.1);
 }
 
 #[test]
@@ -7815,11 +7845,11 @@ fn test_negative_bacc_backlash_leg_skips_set_accel() {
     // own, and init floors only a BACC of 0, so a loaded negative BACC gives a
     // negative rate and the in-range backlash leg skips SET_ACCEL (2528).
     let mut rec = MotorRecord::new();
-    rec.internal.init_invariants_synced = true;
     rec.conv.mres = 0.01;
-    rec.vel.velo = 2.0;
-    rec.vel.bvel = 1.0;
-    rec.vel.bacc = -0.5;
+    rec.put_field("VELO", EpicsValue::Double(2.0)).unwrap();
+    rec.put_field("BVEL", EpicsValue::Double(1.0)).unwrap();
+    rec.put_field("BACC", EpicsValue::Double(-0.5)).unwrap();
+    rec.init_record(1).unwrap();
     rec.retry.bdst = 1.0;
     rec.stat.msta = MstaFlags::DONE;
 
@@ -7846,10 +7876,10 @@ fn test_negative_accl_move_skips_set_accel() {
     // init floors only an ACCL of 0 (4041), so a loaded negative ACCL gives a
     // negative rate and the move skips SET_ACCEL (2528).
     let mut rec = MotorRecord::new();
-    rec.internal.init_invariants_synced = true;
     rec.conv.mres = 0.01;
-    rec.vel.velo = 2.0;
-    rec.vel.accl = -0.5;
+    rec.put_field("VELO", EpicsValue::Double(2.0)).unwrap();
+    rec.put_field("ACCL", EpicsValue::Double(-0.5)).unwrap();
+    rec.init_record(1).unwrap();
     rec.stat.msta = MstaFlags::DONE;
 
     rec.put_field("VAL", EpicsValue::Double(0.5)).unwrap();
@@ -7868,9 +7898,9 @@ fn test_negative_accl_home_skips_set_accel() {
     let mut rec = MotorRecord::new();
     rec.conv.mres = 1.0;
     rec.stat.msta = MstaFlags::DONE;
-    rec.vel.vbas = 0.5;
-    rec.vel.hvel = 2.0;
-    rec.vel.accl = -0.5;
+    rec.put_field("VBAS", EpicsValue::Double(0.5)).unwrap();
+    rec.put_field("HVEL", EpicsValue::Double(2.0)).unwrap();
+    rec.put_field("ACCL", EpicsValue::Double(-0.5)).unwrap();
 
     rec.ctrl.homf = 1;
     let effects = rec.plan_motion(CommandSource::Homf);
@@ -7891,7 +7921,7 @@ fn test_load_negative_accl_derives_accs_at_init() {
     rec.init_record(0).unwrap();
     rec.init_record(1).unwrap();
 
-    assert_eq!((rec.vel.accl, rec.vel.accs), (-0.5, -20.0));
+    assert_eq!((rec.vel().accl, rec.vel().accs), (-0.5, -20.0));
 }
 
 #[test]
@@ -7904,12 +7934,12 @@ fn test_accl_zero_from_accs_stands_in_for_the_divide_by_zero() {
     rec.init_record(1).unwrap();
     rec.put_field("VELO", EpicsValue::Double(0.0)).unwrap();
     rec.put_field("ACCS", EpicsValue::Double(5.0)).unwrap();
-    assert_eq!(rec.vel.accl, 0.0);
+    assert_eq!(rec.vel().accl, 0.0);
     rec.put_field("VELO", EpicsValue::Double(4.0)).unwrap();
-    assert_eq!(rec.vel.accs, 5.0);
+    assert_eq!(rec.vel().accs, 5.0);
 
     rec.stat.msta = MstaFlags::DONE;
-    rec.vel.hvel = 2.0;
+    rec.put_field("HVEL", EpicsValue::Double(2.0)).unwrap();
     rec.ctrl.homf = 1;
     let effects = rec.plan_motion(CommandSource::Homf);
     let accel = effects.commands.iter().find_map(|c| match c {
@@ -7930,17 +7960,41 @@ fn test_runtime_accl_accs_puts_cross_calc_after_init() {
     rec.init_record(1).unwrap();
 
     rec.put_field("ACCL", EpicsValue::Double(2.0)).unwrap();
-    assert!((rec.vel.accs - 5.0).abs() < 1e-9, "ACCS={}", rec.vel.accs);
+    assert!(
+        (rec.vel().accs - 5.0).abs() < 1e-9,
+        "ACCS={}",
+        rec.vel().accs
+    );
     rec.put_field("ACCS", EpicsValue::Double(4.0)).unwrap();
-    assert!((rec.vel.accl - 2.5).abs() < 1e-9, "ACCL={}", rec.vel.accl);
+    assert!(
+        (rec.vel().accl - 2.5).abs() < 1e-9,
+        "ACCL={}",
+        rec.vel().accl
+    );
     // Non-positive ACCL floors to 0.1 and re-derives ACCS.
     rec.put_field("ACCL", EpicsValue::Double(-1.0)).unwrap();
-    assert!((rec.vel.accl - 0.1).abs() < 1e-9, "ACCL={}", rec.vel.accl);
-    assert!((rec.vel.accs - 100.0).abs() < 1e-9, "ACCS={}", rec.vel.accs);
+    assert!(
+        (rec.vel().accl - 0.1).abs() < 1e-9,
+        "ACCL={}",
+        rec.vel().accl
+    );
+    assert!(
+        (rec.vel().accs - 100.0).abs() < 1e-9,
+        "ACCS={}",
+        rec.vel().accs
+    );
     // Non-positive ACCS is sanitized from ACCL (accs = velo/accl), not to 1.0.
     rec.put_field("ACCS", EpicsValue::Double(0.0)).unwrap();
-    assert!((rec.vel.accs - 100.0).abs() < 1e-9, "ACCS={}", rec.vel.accs);
-    assert!((rec.vel.accl - 0.1).abs() < 1e-9, "ACCL={}", rec.vel.accl);
+    assert!(
+        (rec.vel().accs - 100.0).abs() < 1e-9,
+        "ACCS={}",
+        rec.vel().accs
+    );
+    assert!(
+        (rec.vel().accl - 0.1).abs() < 1e-9,
+        "ACCL={}",
+        rec.vel().accl
+    );
 }
 
 #[test]
@@ -7953,9 +8007,13 @@ fn test_runtime_velo_s_puts_cross_calc_after_init() {
     rec.init_record(1).unwrap();
 
     rec.put_field("VELO", EpicsValue::Double(10.0)).unwrap();
-    assert!((rec.vel.s - 50.0).abs() < 1e-9, "S={}", rec.vel.s);
+    assert!((rec.vel().s - 50.0).abs() < 1e-9, "S={}", rec.vel().s);
     rec.put_field("S", EpicsValue::Double(100.0)).unwrap();
-    assert!((rec.vel.velo - 20.0).abs() < 1e-9, "VELO={}", rec.vel.velo);
+    assert!(
+        (rec.vel().velo - 20.0).abs() < 1e-9,
+        "VELO={}",
+        rec.vel().velo
+    );
 }
 
 #[test]
@@ -7967,7 +8025,7 @@ fn test_runtime_mres_change_rederives_velo_from_s() {
     rec.put_field("MRES", EpicsValue::Double(0.001)).unwrap();
     rec.init_record(0).unwrap();
     rec.init_record(1).unwrap();
-    assert!((rec.vel.s - 250.0).abs() < 1e-9, "S={}", rec.vel.s);
+    assert!((rec.vel().s - 250.0).abs() < 1e-9, "S={}", rec.vel().s);
 
     rec.put_field("MRES", EpicsValue::Double(0.002)).unwrap();
     // UREV = 0.002 × 200 = 0.4; VELO = UREV × S = 0.4 × 250 = 100
@@ -7976,8 +8034,12 @@ fn test_runtime_mres_change_rederives_velo_from_s() {
         "UREV={}",
         rec.conv.urev
     );
-    assert!((rec.vel.s - 250.0).abs() < 1e-9, "S={}", rec.vel.s);
-    assert!((rec.vel.velo - 100.0).abs() < 1e-9, "VELO={}", rec.vel.velo);
+    assert!((rec.vel().s - 250.0).abs() < 1e-9, "S={}", rec.vel().s);
+    assert!(
+        (rec.vel().velo - 100.0).abs() < 1e-9,
+        "VELO={}",
+        rec.vel().velo
+    );
 }
 
 // --- Resolution triple at init (C check_speed_and_resolution, motorRecord.cc:3905-3927) ---
@@ -8117,8 +8179,12 @@ fn test_runtime_srev_put_recomputes_mres_only() {
         rec.conv.urev
     );
     // No velcheckB: VELO/S untouched.
-    assert!((rec.vel.velo - 8.0).abs() < 1e-9, "VELO={}", rec.vel.velo);
-    assert!((rec.vel.s - 0.08).abs() < 1e-9, "S={}", rec.vel.s);
+    assert!(
+        (rec.vel().velo - 8.0).abs() < 1e-9,
+        "VELO={}",
+        rec.vel().velo
+    );
+    assert!((rec.vel().s - 0.08).abs() < 1e-9, "S={}", rec.vel().s);
     // No limit rescale: DHLM stays, raw register stays.
     assert!(
         (rec.limits.dhlm - 10.0).abs() < 1e-9,
@@ -8362,7 +8428,7 @@ fn a_resolution_put_that_is_not_finite_is_dropped() {
         rec.init_record(0).unwrap();
         rec.init_record(1).unwrap();
         let state = |r: &MotorRecord| {
-            let (c, v, l) = (&r.conv, &r.vel, &r.limits);
+            let (c, v, l) = (&r.conv, r.vel(), &r.limits);
             (
                 [c.mres, c.urev, c.eres, c.rres, v.velo, v.vbas, v.bvel],
                 [l.dhlm, l.dllm, l.hlm, l.llm],
@@ -8397,7 +8463,7 @@ fn a_resolution_put_whose_mres_underflows_is_dropped() {
             assert_ne!(rec.conv.mres, 0.0, "UREV {urev}");
         }
         let state = |r: &MotorRecord| {
-            let (c, v, l) = (&r.conv, &r.vel, &r.limits);
+            let (c, v, l) = (&r.conv, r.vel(), &r.limits);
             (
                 (c.mres, c.urev, c.srev),
                 [v.velo, v.vbas, v.bvel],
@@ -8434,7 +8500,7 @@ fn a_resolution_put_that_overflows_a_speed_or_limit_is_dropped() {
             assert_eq!(rec.pos.off, off);
         }
         let state = |r: &MotorRecord| {
-            let (c, v, l) = (&r.conv, &r.vel, &r.limits);
+            let (c, v, l) = (&r.conv, r.vel(), &r.limits);
             (
                 (c.mres, c.urev),
                 [v.velo, v.vbas, v.bvel, v.vmax],
@@ -8501,7 +8567,7 @@ const VELOCITY_FIELDS: [&str; 14] = [
 ];
 
 fn velocity_state(r: &MotorRecord) -> ([f64; 14], AccsUsed, u64) {
-    let v = &r.vel;
+    let v = r.vel();
     (
         [
             v.velo, v.vbas, v.vmax, v.s, v.sbas, v.smax, v.accl, v.accs, v.bvel, v.bacc, v.hvel,
@@ -8572,7 +8638,7 @@ fn a_velocity_put_whose_derivation_overflows_is_dropped() {
         let mut rec = velocity_record(mres, 0.0);
         if let Some(jvel) = jvel {
             rec.put_field("JVEL", EpicsValue::Double(jvel)).unwrap();
-            assert_eq!(rec.vel.jvel, jvel);
+            assert_eq!(rec.vel().jvel, jvel);
         }
         let before = velocity_state(&rec);
         rec.put_field(field, EpicsValue::Double(v)).unwrap();
@@ -8645,8 +8711,8 @@ fn test_rstm_should_restore_dispatch() {
 #[test]
 fn test_accs_roundtrip_via_pv() {
     let mut rec = MotorRecord::new();
-    rec.vel.velo = 8.0;
-    rec.vel.vbas = 0.0;
+    rec.put_field("VELO", EpicsValue::Double(8.0)).unwrap();
+    rec.put_field("VBAS", EpicsValue::Double(0.0)).unwrap();
     rec.put_field("ACCS", EpicsValue::Double(4.0)).unwrap();
     assert_eq!(rec.get_field("ACCS"), Some(EpicsValue::Double(4.0)));
     // ACCS put does not switch ACCU (R22 / 63bfe5d0); it stays the default Accl.
@@ -8864,8 +8930,8 @@ fn test_pause_during_active_jog_syncs_and_button_resumes_jog() {
     // post-processes (sync) instead of arming a move resume; the
     // still-latched button resumes the JOG on Go (1916-1918).
     let mut rec = MotorRecord::new();
-    rec.internal.init_invariants_synced = true;
-    rec.vel.jvel = 1.0;
+    rec.init_record(1).unwrap();
+    rec.put_field("JVEL", EpicsValue::Double(1.0)).unwrap();
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
@@ -9073,7 +9139,7 @@ fn test_val_written_during_jog_stops_it_and_is_dropped() {
     // exclude a jog stop from the replay, so the written VAL is synced
     // away at the stop completion.
     let mut rec = MotorRecord::new();
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
@@ -9103,7 +9169,7 @@ fn test_val_written_during_jog_dropped_on_commanded_stop() {
     // C 1385-1386: MIP_JOG_STOP is excluded from the replay — a release
     // of the jog button drops the mid-jog write via the postProcess sync.
     let mut rec = MotorRecord::new();
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
@@ -9136,13 +9202,14 @@ fn test_val_written_during_jog_backlash_replays_at_bl2_done() {
     // jog backlash correction re-fires when BL2 completes.
     let mut rec = MotorRecord::new();
     rec.conv.mres = 1.0;
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     rec.retry.bdst = 2.0;
     // Keep the replayed move single-leg (C case 1 needs BVEL == VELO
     // AND BACC == ACCL) so the replay assertion sees the target itself.
-    rec.vel.bacc = rec.vel.accl;
+    rec.put_field("BACC", EpicsValue::Double(rec.vel().accl))
+        .unwrap();
     rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
     rec.plan_motion(CommandSource::Jogf);
     rec.stat.msta = MstaFlags::MOVING;
@@ -9220,12 +9287,12 @@ fn test_sub_step_replay_quiesces_without_loop() {
 fn jogging_record() -> MotorRecord {
     let mut rec = MotorRecord::new();
     // A runtime put: a load-time HLM/LLM is a raw write.
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     rec.put_field("HLM", EpicsValue::Double(100.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-100.0)).unwrap();
     // JVEL has no dbd initial (defaults 0.0 = "not configured"); set it
     // as a .db would — the LVIO jog window tests depend on JVEL=1.
-    rec.vel.jvel = 1.0;
+    rec.put_field("JVEL", EpicsValue::Double(1.0)).unwrap();
     rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
     rec.plan_motion(CommandSource::Jogf);
     assert_eq!(rec.stat.phase, MotionPhase::Jog);
@@ -9284,7 +9351,7 @@ fn test_jog_away_from_limit_does_not_stop() {
     // jogr near the HIGH limit: the reverse-jog window (rbv < llm + jvel)
     // is not violated, so the jog keeps running.
     let mut rec = MotorRecord::new();
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     rec.put_field("HLM", EpicsValue::Double(100.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-100.0)).unwrap();
     rec.pos.rbv = 95.0;
@@ -9554,7 +9621,7 @@ fn test_sudden_jog_stop_skips_backlash() {
     // postProcess's backlash branch requires MIP_JOG_STOP or MIP_MOVE
     // (908) — so no correction fires, the record syncs and finishes.
     let mut rec = MotorRecord::new();
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     rec.retry.bdst = 2.0;
@@ -9583,7 +9650,7 @@ fn test_commanded_jog_stop_still_corrects_backlash() {
     // Boundary: the commanded release (JogStopping = C MIP_JOG_STOP)
     // keeps the postProcess backlash correction (932-947).
     let mut rec = MotorRecord::new();
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     rec.retry.bdst = 2.0;
@@ -9685,7 +9752,7 @@ fn test_hlm_put_while_idle_does_not_stop() {
 fn paused_idle_record() -> MotorRecord {
     let mut rec = MotorRecord::new();
     rec.conv.mres = 1.0;
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     rec.put_field("HLM", EpicsValue::Double(100.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-100.0)).unwrap();
     rec.ctrl.spmg = SpmgMode::Pause;
@@ -9702,7 +9769,7 @@ fn test_jogf_put_while_paused_parks_jog_req() {
     // !hls) arms MIP_JOG_REQ; the dispatch gate (2082) refuses while
     // stop_or_pause, so the request parks in the MIP readback.
     let mut rec = paused_idle_record();
-    rec.vel.jvel = 1.0;
+    rec.put_field("JVEL", EpicsValue::Double(1.0)).unwrap();
     rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
     assert_eq!(rec.stat.mip, MipFlags::JOG_REQ, "armed at the put");
     let effects = rec.plan_motion(CommandSource::Jogf);
@@ -9901,7 +9968,7 @@ fn test_jog_direction_folds_dir_into_dial_command() {
     // dial-negative. CDIR stays raw: jogf, inverted for DIR=Neg and
     // MRES<0 (C 2126-2137).
     let mut rec = MotorRecord::new();
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     rec.put_field("HLM", EpicsValue::Double(100.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-100.0)).unwrap();
     rec.put_field("DIR", EpicsValue::Short(1)).unwrap(); // Neg
@@ -10160,7 +10227,7 @@ fn test_pid_gain_clamp_under_gain_support() {
     // C special pidcof (3003-3014): GAIN_SUPPORT clamps the PID gains
     // to [0,1] at write time.
     let mut rec = MotorRecord::new();
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     rec.stat.msta = MstaFlags::GAIN_SUPPORT;
     rec.put_field("PCOF", EpicsValue::Double(1.5)).unwrap();
     rec.put_field("ICOF", EpicsValue::Double(-0.5)).unwrap();
@@ -10186,7 +10253,7 @@ fn test_pid_gain_put_forwards_driver_command() {
     // put builds SET_PGAIN/SET_IGAIN/SET_DGAIN with the CLAMPED value
     // and sends it from special(), with no process.
     let mut rec = MotorRecord::new();
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     let mut rx = capture(&mut rec);
     rec.stat.msta = MstaFlags::DONE | MstaFlags::GAIN_SUPPORT;
     rec.put_field("PCOF", EpicsValue::Double(1.5)).unwrap();
@@ -10231,7 +10298,7 @@ fn test_dial_limit_put_forwards_one_sided() {
     let mut rx = capture(&mut rec);
     rec.conv.mres = 0.01;
     rec.stat.msta = MstaFlags::DONE;
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
 
     rec.put_field("DHLM", EpicsValue::Double(10.0)).unwrap();
     assert_eq!(
@@ -10268,7 +10335,7 @@ fn test_user_limit_put_folds_dir_into_forwarded_side() {
     let mut rx = capture(&mut rec);
     rec.conv.mres = 0.01;
     rec.stat.msta = MstaFlags::DONE;
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
 
     rec.put_field("HLM", EpicsValue::Double(10.0)).unwrap();
     assert_eq!(
@@ -10323,7 +10390,7 @@ fn limit_device_record(
     rec.limits.llm = -100.0;
     rec.limits.rhlm = 100.0;
     rec.limits.rllm = -100.0;
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     (rec, rx)
 }
 
@@ -10464,7 +10531,6 @@ fn test_limit_put_during_load_does_not_forward() {
     let mut rx = capture(&mut rec);
     rec.conv.mres = 0.01;
     rec.stat.msta = MstaFlags::DONE;
-    assert!(!rec.internal.init_invariants_synced);
 
     rec.put_field("DHLM", EpicsValue::Double(10.0)).unwrap();
     assert_eq!(
@@ -10500,7 +10566,7 @@ fn test_special_sends_at_put_time_not_on_the_pass() {
     rec.limits.hlm = 100.0;
     rec.limits.llm = -100.0;
     rec.stat.msta = MstaFlags::DONE | MstaFlags::GAIN_SUPPORT;
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
 
     rec.put_field("PCOF", EpicsValue::Double(0.5)).unwrap();
     assert_eq!(
@@ -10759,9 +10825,9 @@ mod flnk_dmov_gate {
     #[test]
     fn refused_jog_at_soft_limit_fires_flnk() {
         let mut rec = MotorRecord::new();
-        rec.internal.init_invariants_synced = true;
+        rec.init_record(1).unwrap();
         rec.conv.mres = 1.0;
-        rec.vel.jvel = 1.0;
+        rec.put_field("JVEL", EpicsValue::Double(1.0)).unwrap();
         rec.limits.hlm = 10.0;
         rec.limits.llm = -10.0;
         rec.limits.dhlm = 10.0;
@@ -10792,7 +10858,7 @@ mod one_sided_limit_writes {
         let mut rec = MotorRecord::new();
         rec.conv.mres = 1.0;
         // A runtime put: a load-time HLM/LLM is a raw write.
-        rec.internal.init_invariants_synced = true;
+        rec.init_record(1).unwrap();
         rec.put_field("HLM", EpicsValue::Double(10.0)).unwrap();
         rec.put_field("LLM", EpicsValue::Double(-10.0)).unwrap();
         assert!(rec.limits.lvio == 0 || rec.pos.dval > 10.0);
@@ -10813,7 +10879,7 @@ mod one_sided_limit_writes {
         rec.pos.off = 5.0;
         rec.limits.dhlm = 77.0;
         // A runtime put: a load-time HLM/LLM is a raw write.
-        rec.internal.init_invariants_synced = true;
+        rec.init_record(1).unwrap();
         rec.put_field("HLM", EpicsValue::Double(100.0)).unwrap();
         assert_eq!(rec.limits.dllm, -95.0); // -(100 - 5)
         assert_eq!(rec.limits.dhlm, 77.0, "DHLM untouched");
@@ -10828,7 +10894,7 @@ mod one_sided_limit_writes {
         rec.conv.mres = 1.0;
         rec.pos.off = 5.0;
         rec.limits.hlm = 33.0;
-        rec.internal.init_invariants_synced = true;
+        rec.init_record(1).unwrap();
         rec.put_field("DHLM", EpicsValue::Double(50.0)).unwrap();
         assert_eq!(rec.limits.llm, -45.0); // -(50) + 5
         assert_eq!(rec.limits.hlm, 33.0, "HLM untouched");
@@ -10857,10 +10923,10 @@ mod velocity_clamps {
         rec.put_field("VBAS", EpicsValue::Double(0.5)).unwrap();
         rec.put_field("VMAX", EpicsValue::Double(4.0)).unwrap();
         rec.put_field("VELO", EpicsValue::Double(9.0)).unwrap();
-        assert_eq!(rec.vel.velo, 4.0);
-        assert_eq!(rec.vel.s, 4.0);
+        assert_eq!(rec.vel().velo, 4.0);
+        assert_eq!(rec.vel().s, 4.0);
         rec.put_field("VELO", EpicsValue::Double(0.1)).unwrap();
-        assert_eq!(rec.vel.velo, 0.5);
+        assert_eq!(rec.vel().velo, 0.5);
     }
 
     // C 4364-4372: max == 0 means "no ceiling" — only the VBAS floor applies.
@@ -10869,7 +10935,7 @@ mod velocity_clamps {
         let mut rec = inited();
         rec.put_field("VBAS", EpicsValue::Double(0.5)).unwrap();
         rec.put_field("VELO", EpicsValue::Double(900.0)).unwrap();
-        assert_eq!(rec.vel.velo, 900.0);
+        assert_eq!(rec.vel().velo, 900.0);
     }
 
     // C 2629-2633 / 2660-2664: VBAS and VMAX are forced non-negative.
@@ -10877,9 +10943,9 @@ mod velocity_clamps {
     fn negative_vbas_and_vmax_forced_to_zero() {
         let mut rec = inited();
         rec.put_field("VBAS", EpicsValue::Double(-1.0)).unwrap();
-        assert_eq!(rec.vel.vbas, 0.0);
+        assert_eq!(rec.vel().vbas, 0.0);
         rec.put_field("VMAX", EpicsValue::Double(-2.0)).unwrap();
-        assert_eq!(rec.vel.vmax, 0.0);
+        assert_eq!(rec.vel().vmax, 0.0);
     }
 
     // C 3110-3117: VMAX dropped below VBAS drags VBAS (and SBAS) down,
@@ -10892,10 +10958,10 @@ mod velocity_clamps {
         rec.put_field("VELO", EpicsValue::Double(8.0)).unwrap();
         rec.put_field("JVEL", EpicsValue::Double(8.0)).unwrap();
         rec.put_field("VMAX", EpicsValue::Double(1.0)).unwrap();
-        assert_eq!(rec.vel.vbas, 1.0, "VBAS dragged down to VMAX");
-        assert_eq!(rec.vel.sbas, 1.0, "SBAS follows VBAS");
-        assert_eq!(rec.vel.velo, 1.0, "VELO re-clamped");
-        assert_eq!(rec.vel.jvel, 1.0, "JVEL re-clamped");
+        assert_eq!(rec.vel().vbas, 1.0, "VBAS dragged down to VMAX");
+        assert_eq!(rec.vel().sbas, 1.0, "SBAS follows VBAS");
+        assert_eq!(rec.vel().velo, 1.0, "VELO re-clamped");
+        assert_eq!(rec.vel().jvel, 1.0, "JVEL re-clamped");
     }
 
     // C 3121-3127: VBAS raised above VMAX drags VMAX (and SMAX) up.
@@ -10904,9 +10970,9 @@ mod velocity_clamps {
         let mut rec = inited();
         rec.put_field("VMAX", EpicsValue::Double(3.0)).unwrap();
         rec.put_field("VBAS", EpicsValue::Double(5.0)).unwrap();
-        assert_eq!(rec.vel.vmax, 5.0, "VMAX dragged up to VBAS");
-        assert_eq!(rec.vel.smax, 5.0, "SMAX follows VMAX");
-        assert_eq!(rec.vel.velo, 5.0, "VELO re-clamped up to the new floor");
+        assert_eq!(rec.vel().vmax, 5.0, "VMAX dragged up to VBAS");
+        assert_eq!(rec.vel().smax, 5.0, "SMAX follows VMAX");
+        assert_eq!(rec.vel().velo, 5.0, "VELO re-clamped up to the new floor");
     }
 
     // C 3128-3148 velcheckA: BVEL/JVEL/HVEL re-clamp on a VBAS write, and
@@ -10919,10 +10985,10 @@ mod velocity_clamps {
         rec.put_field("JVEL", EpicsValue::Double(0.2)).unwrap();
         rec.put_field("HVEL", EpicsValue::Double(0.2)).unwrap();
         rec.put_field("VBAS", EpicsValue::Double(1.0)).unwrap();
-        assert_eq!(rec.vel.bvel, 1.0);
-        assert_eq!(rec.vel.sbak, 1.0);
-        assert_eq!(rec.vel.jvel, 1.0);
-        assert_eq!(rec.vel.hvel, 1.0);
+        assert_eq!(rec.vel().bvel, 1.0);
+        assert_eq!(rec.vel().sbak, 1.0);
+        assert_eq!(rec.vel().jvel, 1.0);
+        assert_eq!(rec.vel().hvel, 1.0);
     }
 
     // C 2702 / 2725: the rev-unit pair members clamp in rev units
@@ -10933,11 +10999,11 @@ mod velocity_clamps {
         rec.conv.urev = 2.0;
         rec.put_field("SMAX", EpicsValue::Double(3.0)).unwrap();
         rec.put_field("S", EpicsValue::Double(5.0)).unwrap();
-        assert_eq!(rec.vel.s, 3.0);
-        assert_eq!(rec.vel.velo, 6.0, "VELO = S * |UREV|");
+        assert_eq!(rec.vel().s, 3.0);
+        assert_eq!(rec.vel().velo, 6.0, "VELO = S * |UREV|");
         rec.put_field("SBAK", EpicsValue::Double(7.0)).unwrap();
-        assert_eq!(rec.vel.sbak, 3.0);
-        assert_eq!(rec.vel.bvel, 6.0, "BVEL = SBAK * |UREV|");
+        assert_eq!(rec.vel().sbak, 3.0);
+        assert_eq!(rec.vel().bvel, 6.0, "BVEL = SBAK * |UREV|");
     }
 
     // The clamps are C special() semantics — runtime only. During
@@ -10946,9 +11012,9 @@ mod velocity_clamps {
     fn clamps_inert_before_init() {
         let mut rec = MotorRecord::new();
         rec.put_field("VBAS", EpicsValue::Double(-1.0)).unwrap();
-        assert_eq!(rec.vel.vbas, -1.0, "raw during load");
+        assert_eq!(rec.vel().vbas, -1.0, "raw during load");
         rec.put_field("VELO", EpicsValue::Double(900.0)).unwrap();
-        assert_eq!(rec.vel.velo, 900.0, "raw during load");
+        assert_eq!(rec.vel().velo, 900.0, "raw during load");
     }
 }
 
@@ -10966,7 +11032,7 @@ mod init_jog_home_velocity_defaults {
         let mut rec = MotorRecord::new();
         rec.put_field("VELO", EpicsValue::Double(3.0)).unwrap();
         rec.init_record(1).unwrap();
-        assert_eq!(rec.vel.jvel, 3.0);
+        assert_eq!(rec.vel().jvel, 3.0);
     }
 
     // C 4057-4058: a configured JVEL is clamped into [VBAS, VMAX].
@@ -10976,7 +11042,7 @@ mod init_jog_home_velocity_defaults {
         rec.put_field("VMAX", EpicsValue::Double(2.0)).unwrap();
         rec.put_field("JVEL", EpicsValue::Double(9.0)).unwrap();
         rec.init_record(1).unwrap();
-        assert_eq!(rec.vel.jvel, 2.0);
+        assert_eq!(rec.vel().jvel, 2.0);
     }
 
     // C 4060-4061: an unconfigured JAR takes VELO/ACCL.
@@ -10986,7 +11052,7 @@ mod init_jog_home_velocity_defaults {
         rec.put_field("VELO", EpicsValue::Double(4.0)).unwrap();
         rec.put_field("ACCL", EpicsValue::Double(0.5)).unwrap();
         rec.init_record(1).unwrap();
-        assert_eq!(rec.vel.jar, 8.0);
+        assert_eq!(rec.vel().jar, 8.0);
     }
 
     // C 4064-4065: an unconfigured HVEL takes VBAS.
@@ -10995,7 +11061,7 @@ mod init_jog_home_velocity_defaults {
         let mut rec = MotorRecord::new();
         rec.put_field("VBAS", EpicsValue::Double(0.7)).unwrap();
         rec.init_record(1).unwrap();
-        assert_eq!(rec.vel.hvel, 0.7);
+        assert_eq!(rec.vel().hvel, 0.7);
     }
 
     // C 4066-4067: a configured HVEL is clamped into [VBAS, VMAX].
@@ -11005,7 +11071,7 @@ mod init_jog_home_velocity_defaults {
         rec.put_field("VBAS", EpicsValue::Double(0.5)).unwrap();
         rec.put_field("HVEL", EpicsValue::Double(0.1)).unwrap();
         rec.init_record(1).unwrap();
-        assert_eq!(rec.vel.hvel, 0.5);
+        assert_eq!(rec.vel().hvel, 0.5);
     }
 }
 
@@ -11120,7 +11186,7 @@ mod jvel_live_retune {
         let mut rec = jogging_after_init(true);
         let mut rx = capture(&mut rec);
         rec.put_field("JVEL", EpicsValue::Double(f64::NAN)).unwrap();
-        assert_eq!(rec.vel.jvel, 1.0);
+        assert_eq!(rec.vel().jvel, 1.0);
         assert_eq!(sent(&mut rx), [], "no retune at a dropped JVEL");
     }
 
@@ -11132,9 +11198,9 @@ mod jvel_live_retune {
         rec.init_record(1).unwrap();
         rec.put_field("JVEL", EpicsValue::Double(2.0)).unwrap();
         rec.put_field("JAR", EpicsValue::Double(-1.0)).unwrap();
-        assert_eq!(rec.vel.jar, 20.0);
+        assert_eq!(rec.vel().jar, 20.0);
         rec.put_field("JAR", EpicsValue::Double(0.0)).unwrap();
-        assert_eq!(rec.vel.jar, 20.0);
+        assert_eq!(rec.vel().jar, 20.0);
     }
 
     // During load the JAR fallback must stay inert: field() lands raw and
@@ -11145,9 +11211,9 @@ mod jvel_live_retune {
         rec.put_field("VELO", EpicsValue::Double(4.0)).unwrap();
         rec.put_field("ACCL", EpicsValue::Double(0.5)).unwrap();
         rec.put_field("JAR", EpicsValue::Double(0.0)).unwrap();
-        assert_eq!(rec.vel.jar, 0.0, "raw during load");
+        assert_eq!(rec.vel().jar, 0.0, "raw during load");
         rec.init_record(1).unwrap();
-        assert_eq!(rec.vel.jar, 8.0, "init derives VELO/ACCL");
+        assert_eq!(rec.vel().jar, 8.0, "init derives VELO/ACCL");
     }
 }
 
@@ -11255,7 +11321,7 @@ mod retry_after_dly_settle {
 
     fn dly_record() -> MotorRecord {
         let mut rec = MotorRecord::new();
-        rec.internal.init_invariants_synced = true;
+        rec.init_record(1).unwrap();
         rec.conv.mres = 0.1;
         rec.retry.rtry = 3;
         rec.retry.rdbd = 0.5;
@@ -11315,7 +11381,7 @@ mod retry_after_dly_settle {
     fn jog_stop_completion_post_delay_runs_maybe_retry() {
         for drift in [false, true] {
             let mut rec = dly_record();
-            rec.vel.jvel = 1.0;
+            rec.put_field("JVEL", EpicsValue::Double(1.0)).unwrap();
             rec.stat.msta = MstaFlags::DONE;
             rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
             rec.do_process();
@@ -11571,10 +11637,10 @@ fn test_toward_valid_exception_applies_to_non_preferred_move() {
     // backlash leg whose pretarget is also outside.
     let mut rec = MotorRecord::new();
     rec.conv.mres = 0.001;
-    rec.vel.velo = 10.0;
-    rec.vel.accl = 0.5;
-    rec.vel.bvel = 5.0;
-    rec.vel.bacc = 0.5;
+    rec.put_field("VELO", EpicsValue::Double(10.0)).unwrap();
+    rec.put_field("ACCL", EpicsValue::Double(0.5)).unwrap();
+    rec.put_field("BVEL", EpicsValue::Double(5.0)).unwrap();
+    rec.put_field("BACC", EpicsValue::Double(0.5)).unwrap();
     rec.put_field("HLM", EpicsValue::Double(10.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-10.0)).unwrap();
     rec.retry.bdst = 1.0; // dval < ldvl with bdst > 0: non-preferred
@@ -11607,7 +11673,7 @@ fn test_lvio_refused_fresh_move_still_resets_rcnt() {
     let mut rec = MotorRecord::new();
     rec.conv.mres = 0.001;
     // A runtime put: a load-time HLM/LLM is a raw write.
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     rec.put_field("HLM", EpicsValue::Double(10.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-10.0)).unwrap();
     rec.pos.drbv = 0.0;
@@ -11628,7 +11694,7 @@ fn test_lvio_refused_write_rolls_back_drive_fields() {
     let mut rec = MotorRecord::new();
     rec.conv.mres = 0.001;
     // A runtime put: a load-time HLM/LLM is a raw write.
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     rec.put_field("HLM", EpicsValue::Double(10.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-10.0)).unwrap();
     rec.stat.msta = MstaFlags::DONE;
@@ -11656,10 +11722,10 @@ fn test_lvio_refused_retry_collapses_to_done() {
     rec.limits.dllm = -10.0;
     rec.limits.hlm = 10.0;
     rec.limits.llm = -10.0;
-    rec.vel.velo = 10.0;
-    rec.vel.accl = 0.5;
-    rec.vel.bvel = 5.0;
-    rec.vel.bacc = 0.5;
+    rec.put_field("VELO", EpicsValue::Double(10.0)).unwrap();
+    rec.put_field("ACCL", EpicsValue::Double(0.5)).unwrap();
+    rec.put_field("BVEL", EpicsValue::Double(5.0)).unwrap();
+    rec.put_field("BACC", EpicsValue::Double(0.5)).unwrap();
     rec.retry.bdst = 1.0;
     rec.retry.rdbd = 0.1;
     rec.retry.rtry = 5;
@@ -11705,12 +11771,12 @@ fn test_lvio_refused_retry_collapses_to_done() {
 fn test_jog_with_inverted_limits_is_rejected() {
     // C 2089: DLLM > DHLM refuses the jog in either direction.
     let mut rec = MotorRecord::new();
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     rec.limits.dhlm = -5.0;
     rec.limits.dllm = 5.0;
     rec.limits.hlm = -5.0;
     rec.limits.llm = 5.0;
-    rec.vel.jvel = 1.0;
+    rec.put_field("JVEL", EpicsValue::Double(1.0)).unwrap();
     rec.pos.val = 0.0;
     rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
     let effects = rec.plan_motion(CommandSource::Jogf);
@@ -11731,13 +11797,13 @@ fn test_jog_limit_disable_gate_is_dial_frame() {
     // the DIAL pair. A nonzero OFF leaves the user pair offset from
     // zero, but the limits are still disabled.
     let mut rec = MotorRecord::new();
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     rec.limits.dhlm = 0.0;
     rec.limits.dllm = 0.0;
     rec.pos.off = 3.0;
     rec.limits.hlm = 3.0;
     rec.limits.llm = 3.0;
-    rec.vel.jvel = 1.0;
+    rec.put_field("JVEL", EpicsValue::Double(1.0)).unwrap();
     rec.pos.val = 50.0;
     rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
     let effects = rec.plan_motion(CommandSource::Jogf);
@@ -11758,10 +11824,10 @@ fn test_jog_refusal_clears_both_buttons() {
     // pressed one.
     let mut rec = MotorRecord::new();
     // A runtime put: a load-time HLM/LLM is a raw write.
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     rec.put_field("HLM", EpicsValue::Double(10.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-10.0)).unwrap();
-    rec.vel.jvel = 1.0;
+    rec.put_field("JVEL", EpicsValue::Double(1.0)).unwrap();
     rec.pos.val = 9.5;
     rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
     rec.put_field("JOGR", EpicsValue::Short(1)).unwrap(); // both held (e.g. racing writes)
@@ -11914,7 +11980,7 @@ fn test_same_value_dbput_after_miss_giveup_redispatches() {
     // (do_process_inner's anchor-first gate), which would swallow the
     // re-dispatch this test asserts on.
     let mut rec = MotorRecord::new();
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     let state = motor_rs::device_state::new_shared_state();
     rec.set_device_state(state.clone());
     anchor(&mut rec, &state);
@@ -12200,7 +12266,7 @@ fn test_blinked_put_onto_hw_limit_completes_with_readback_adopted() {
     // is left for a later SPMG pass to dispatch.
     use asyn_rs::interfaces::motor::MotorStatus;
     let mut rec = MotorRecord::new();
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     rec.conv.mres = 0.001;
     let on_limit = MotorStatus {
         done: true,
@@ -12274,12 +12340,12 @@ fn every_field_default_is_the_dbd_initial() {
 fn test_driver_sees_raw_steps_at_negative_mres() {
     use asyn_rs::interfaces::motor::MotorStatus;
     let mut rec = MotorRecord::new();
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     rec.conv.mres = -0.01;
-    rec.vel.velo = 1.0;
-    rec.vel.accl = 0.2;
-    rec.vel.jvel = 1.0;
-    rec.vel.jar = 5.0;
+    rec.put_field("VELO", EpicsValue::Double(1.0)).unwrap();
+    rec.put_field("ACCL", EpicsValue::Double(0.2)).unwrap();
+    rec.put_field("JVEL", EpicsValue::Double(1.0)).unwrap();
+    rec.put_field("JAR", EpicsValue::Double(5.0)).unwrap();
     rec.stat.msta = MstaFlags::DONE;
 
     rec.put_field("VAL", EpicsValue::Double(1.5)).unwrap();
@@ -12407,8 +12473,8 @@ fn test_val_put_during_external_motion_parks_until_done() {
     use motor_rs::device_state::StampedStatus;
     let mut rec = MotorRecord::new();
     rec.conv.mres = 0.001;
-    rec.vel.velo = 1.0;
-    rec.vel.hvel = 0.01;
+    rec.put_field("VELO", EpicsValue::Double(1.0)).unwrap();
+    rec.put_field("HVEL", EpicsValue::Double(0.01)).unwrap();
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     let state = motor_rs::device_state::new_shared_state();
@@ -12469,11 +12535,12 @@ fn test_val_put_during_external_motion_parks_until_done() {
 fn jog_backlash_bl2() -> MotorRecord {
     let mut rec = MotorRecord::new();
     rec.conv.mres = 1.0;
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     rec.retry.bdst = 2.0;
-    rec.vel.bacc = rec.vel.accl;
+    rec.put_field("BACC", EpicsValue::Double(rec.vel().accl))
+        .unwrap();
     rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
     rec.plan_motion(CommandSource::Jogf);
     rec.stat.msta = MstaFlags::MOVING;
@@ -12517,7 +12584,7 @@ fn test_jog_backlash_put_at_readback_replays_at_bl2_done() {
 #[test]
 fn test_put_during_jog_stops_the_jog() {
     let mut rec = MotorRecord::new();
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
@@ -12610,7 +12677,7 @@ fn test_stop_during_queued_jog_does_not_jog() {
 fn jogging() -> MotorRecord {
     let mut rec = MotorRecord::new();
     rec.conv.mres = 1.0;
-    rec.internal.init_invariants_synced = true;
+    rec.init_record(1).unwrap();
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();

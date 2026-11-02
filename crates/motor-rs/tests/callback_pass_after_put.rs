@@ -78,8 +78,8 @@ impl Rig {
         rec.limits.dllm = -100.0;
         rec.limits.hlm = 100.0;
         rec.limits.llm = -100.0;
-        rec.vel.velo = 100000.0;
-        rec.vel.accl = 0.5;
+        rec.put_field("VELO", EpicsValue::Double(100000.0)).unwrap();
+        rec.put_field("ACCL", EpicsValue::Double(0.5)).unwrap();
         rec.stat.msta = MstaFlags::DONE;
         rec.retry.rtry = rtry;
         rec.timing.dly = dly;

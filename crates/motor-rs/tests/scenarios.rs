@@ -36,20 +36,20 @@ fn motion(effects: &ProcessEffects) -> Vec<&MotorCommand> {
 
 fn make_record() -> MotorRecord {
     let mut rec = MotorRecord::new();
-    rec.internal.init_invariants_synced = true;
     rec.conv.mres = MRES;
     rec.limits.dhlm = 100.0;
     rec.limits.dllm = -100.0;
     rec.limits.hlm = 100.0;
     rec.limits.llm = -100.0;
     rec.limits.lvio = 0;
-    rec.vel.velo = 10.0;
-    rec.vel.accl = 0.5;
-    rec.vel.bvel = 5.0;
-    rec.vel.bacc = 0.5;
-    rec.vel.hvel = 5.0;
-    rec.vel.jvel = 5.0;
-    rec.vel.jar = 1.0;
+    rec.put_field("VELO", EpicsValue::Double(10.0)).unwrap();
+    rec.put_field("ACCL", EpicsValue::Double(0.5)).unwrap();
+    rec.put_field("BVEL", EpicsValue::Double(5.0)).unwrap();
+    rec.put_field("BACC", EpicsValue::Double(0.5)).unwrap();
+    rec.put_field("HVEL", EpicsValue::Double(5.0)).unwrap();
+    rec.put_field("JVEL", EpicsValue::Double(5.0)).unwrap();
+    rec.put_field("JAR", EpicsValue::Double(1.0)).unwrap();
+    rec.init_record(1).unwrap();
     rec.stat.msta = MstaFlags::DONE;
     rec
 }
@@ -211,7 +211,7 @@ fn backlash_generates_two_phase_move() {
     } = motion(&effects)[0]
     {
         assert!((*position - (-10_000.0)).abs() < 1e-6);
-        assert_eq!(*velocity, rec.vel.bvel / rec.conv.mres);
+        assert_eq!(*velocity, rec.vel().bvel / rec.conv.mres);
     } else {
         panic!("expected MoveAbsolute");
     }
@@ -1644,7 +1644,7 @@ fn rbv_updates_during_move() {
     let mut motor = SimMotor::new();
     let user = AsynUser::new(0);
     let mut rec = make_record();
-    rec.vel.velo = 5.0; // slower velocity so we can observe intermediate positions
+    rec.put_field("VELO", EpicsValue::Double(5.0)).unwrap(); // slower velocity so we can observe intermediate positions
 
     rec.put_field("VAL", EpicsValue::Double(2.0)).unwrap();
     let effects = rec.plan_motion(CommandSource::Val);

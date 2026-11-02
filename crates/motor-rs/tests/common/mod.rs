@@ -15,6 +15,7 @@ use asyn_rs::user::AsynUser;
 use epics_base_rs::server::database::{ProcStack, PvDatabase};
 use epics_base_rs::server::event_queue::EventReader;
 use epics_base_rs::server::recgbl::EventMask;
+use epics_base_rs::server::record::Record;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 use motor_rs::MotorRecord;
 use motor_rs::device_state::{SharedDeviceState, StampedStatus};
@@ -141,8 +142,8 @@ impl MotorFixture {
         rec.limits.dllm = -100.0;
         rec.limits.hlm = 100.0;
         rec.limits.llm = -100.0;
-        rec.vel.velo = 100000.0;
-        rec.vel.accl = 0.5;
+        rec.put_field("VELO", EpicsValue::Double(100000.0)).unwrap();
+        rec.put_field("ACCL", EpicsValue::Double(0.5)).unwrap();
         rec.stat.msta = MstaFlags::DONE;
         configure(&mut rec);
 

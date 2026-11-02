@@ -7,6 +7,7 @@
 //! tests pin the gate end-to-end through the database put path.
 
 use epics_base_rs::server::database::PvDatabase;
+use epics_base_rs::server::record::Record;
 use epics_base_rs::types::EpicsValue;
 use motor_rs::MotorRecord;
 use motor_rs::flags::*;
@@ -267,8 +268,8 @@ async fn retry_dispatched_on_callback_pass_reaches_the_driver() {
     rec.limits.hlm = 100.0;
     rec.limits.llm = -100.0;
     rec.limits.lvio = 0;
-    rec.vel.velo = 100000.0;
-    rec.vel.accl = 0.5;
+    rec.put_field("VELO", EpicsValue::Double(100000.0)).unwrap();
+    rec.put_field("ACCL", EpicsValue::Double(0.5)).unwrap();
     rec.stat.msta = MstaFlags::DONE;
 
     // poll_cmd_rx is held alive so PollDirective sends succeed; the test
@@ -451,8 +452,8 @@ async fn a_put_before_the_first_pulse_moves_at_once() {
     rec.limits.hlm = 100.0;
     rec.limits.llm = -100.0;
     rec.limits.lvio = 0;
-    rec.vel.velo = 100000.0;
-    rec.vel.accl = 0.5;
+    rec.put_field("VELO", EpicsValue::Double(100000.0)).unwrap();
+    rec.put_field("ACCL", EpicsValue::Double(0.5)).unwrap();
     rec.stat.msta = MstaFlags::DONE;
 
     let (poll_cmd_tx, _poll_cmd_rx) = tokio::sync::mpsc::channel(16);

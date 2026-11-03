@@ -35,9 +35,10 @@ use std::sync::Arc;
 
 use epics_base_rs::error::CaResult;
 use epics_base_rs::server::database::PvDatabase;
+use epics_base_rs::server::ioc_app::GroupLoadRequest;
 use epics_base_rs::server::ioc_builder::BareIoc;
 use epics_base_rs::types::EpicsValue;
-use epics_bridge_rs::qsrv::{BridgeProvider, QsrvMount, QsrvPvStore};
+use epics_bridge_rs::qsrv::build_qsrv_mount;
 #[cfg(tokio_backend)]
 use epics_ca_rs::server::CaServer;
 #[cfg(tokio_backend)]
@@ -78,29 +79,26 @@ async fn main() -> CaResult<()> {
     let (ioc, group_file) = parse_and_build(&script).await?;
     let db = Arc::clone(ioc.database());
 
-    // ── QSRV provider (group PVs, PVA-only) ──
-    let provider = BridgeProvider::new(db.clone());
-    if let Some(ref path) = group_file {
-        provider
-            .load_group_file(path)
-            .unwrap_or_else(|e| panic!("failed to load group config {path}: {e}"));
-    }
-    let provider = Arc::new(provider);
-    let store = Arc::new(QsrvPvStore::new(reactor.clone(), provider));
-
     // ── Build both servers from the same database ──
     // One policy cell for both protocols, so an `asInit` from the shell
     // (or a future ACF reload) gates CA and PVA together.
     let acf = epics_base_rs::server::access_security::new_acf_cell(None);
+    // Group PVs (PVA-only) from the records' info(Q:group) tags and then the
+    // group file, as every QSRV IOC builds them.
+    let group_files: Vec<GroupLoadRequest> = group_file
+        .into_iter()
+        .map(|filename| GroupLoadRequest {
+            filename,
+            macros: String::new(),
+        })
+        .collect();
     // Singles on `qsrvSingle`, groups on `qsrvGroup`, as every QSRV IOC
     // mounts them.
     let composite = CompositeSource::new();
-    QsrvMount {
-        store,
-        acf: acf.clone(),
-    }
-    .install_channel_sources(&db, &composite)
-    .map_err(epics_base_rs::error::CaError::InvalidValue)?;
+    build_qsrv_mount(&db, acf.clone(), &group_files)
+        .await
+        .install_channel_sources(&db, &composite)
+        .map_err(epics_base_rs::error::CaError::InvalidValue)?;
 
     let pv_list = composite.list_pvs();
     epics_base_rs::stderr_println!("qsrv-ioc: dual-protocol IOC");

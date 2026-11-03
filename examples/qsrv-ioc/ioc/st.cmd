@@ -12,6 +12,8 @@
 #   pvget  DEMO:BI                # NTEnum  — beam status (Off/On)
 #   pvget  DEMO:GROUP             # Group PV — composite structure
 #   pvmonitor DEMO:GROUP          # Live group updates
+#   pvget  DEMO:table             # NTTable — five typed columns
+#   pvget  DEMO:ntndarray         # NTNDArray — 3x2 int64 image
 #   pvput  DEMO:AO 42.5           # Write setpoint
 #============================================================
 
@@ -21,6 +23,7 @@ epicsEnvSet("QSRV_IOC", "$(QSRV_IOC)")
 
 # Load records
 dbLoadRecords("$(QSRV_IOC)/db/qsrv_demo.db", "P=$(P)")
+dbLoadRecords("$(QSRV_IOC)/db/nt_groups.db", "device=$(P)")
 
 # Load group PV definitions (pvxs/QSRV-compatible JSON)
 qsrvGroupLoadConfig("$(QSRV_IOC)/db/group.json")

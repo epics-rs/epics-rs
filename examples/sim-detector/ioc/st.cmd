@@ -32,6 +32,10 @@ NDStdArraysConfigure("IMAGE1", $(QSIZE), 0, "$(PORT)", 0)
 dbLoadRecords("NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=IMAGE1,NDARRAY_PORT=$(PORT),TYPE=$(TYPE=Int8),FTVL=$(FTVL=UCHAR),NELEMENTS=$(NELEMENTS)")
 < $(ADCORE)/iocBoot/commonPlugins.cmd
 
+# HDF2, a second HDF5 writer for two file streams from one detector
+NDFileHDF5Configure("FileHDF2", $(QSIZE), 0, "$(PORT)", 0)
+dbLoadRecords("NDFileHDF5.template", "P=$(PREFIX),R=HDF2:,PORT=FileHDF2,NDARRAY_PORT=$(PORT)")
+
 # Autosave configuration, after commonPlugins.cmd, whose C autosave block
 # sets the save path to ./autosave
 set_requestfile_path("$(ADSIMDETECTOR)/db")

@@ -9079,6 +9079,7 @@ fn test_retry_resume_within_deadband_quiesces() {
     let effects = rec.plan_motion(CommandSource::Spmg);
     assert!(effects.commands.is_empty(), "within RDBD: no resume move");
     assert_eq!(rec.stat.mip, MipFlags::empty());
+    assert!(rec.stat.dmov != 0, "C 2335: DMOV restored on the Go pass");
     assert_eq!(rec.internal.ldvl, 50.0, "quiesced against the target");
 }
 
@@ -12180,21 +12181,14 @@ fn test_set_variable_zero_tweak_falls_to_chain_end() {
 }
 
 #[test]
-fn test_blinked_zero_tweak_pulses_dmov() {
+fn test_blinked_zero_tweak_completes_on_its_pass() {
     // A dbPut to TWF is preceded by the special() pass-0 blink
     // (2591-2620, TWF is in the blink list), so even a zero fold
     // (TWV = 0) enters the move block via `!dmov` (2241); at position
-    // the request is too_small and the sub-step pulse runs — DMOV
-    // 1→0→1, no controller command (C 2334-2343 restores DMOV=TRUE on
-    // the same pass; the Rust pulse posts the low half and the
-    // recovery pass restores it). Anchored first: in C a TWF put can
-    // only exist after init_record, and an unanchored mailbox-wired
-    // record parks every pass (do_process_inner's anchor-first gate),
-    // which would swallow the recovery pass this test asserts on.
+    // the request is too_small, which restores DMOV=TRUE on the same
+    // pass with no controller command (C 2333-2343).
     let mut rec = MotorRecord::new();
-    let state = crate::device_state::new_shared_state();
-    rec.set_device_state(state.clone());
-    anchor(&mut rec, &state);
+    rec.set_device_state(crate::device_state::new_shared_state());
     rec.stat.msta = MstaFlags::DONE;
     rec.conv.mres = 0.001;
     rec.pos.val = 10.0;
@@ -12209,14 +12203,9 @@ fn test_blinked_zero_tweak_pulses_dmov() {
     rec.ctrl.twf = 1;
     let effects = rec.plan_motion(CommandSource::Twf);
     assert!(effects.commands.is_empty(), "zero fold sends no command");
-    assert!(rec.stat.dmov == 0, "pulse low half");
-    assert!(rec.stat.movn != 0, "pulse presents as a (zero-length) move");
-    assert!(effects.request_poll, "pulse schedules the recovery pass");
-
-    // The recovery pass (no pending put) restores DMOV=1.
-    let _ = rec.do_process();
-    assert!(rec.stat.dmov != 0, "pulse high half restores DMOV");
-    assert!(rec.stat.movn == 0);
+    assert!(rec.stat.dmov != 0, "C 2335: DMOV restored on the put pass");
+    assert!(rec.stat.movn == 0, "no motion, no MOVN");
+    assert!(!effects.request_poll, "nothing left for a later pass");
 }
 
 #[test]

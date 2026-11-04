@@ -321,10 +321,6 @@ pub struct CaDiagnostics {
     pub subscriptions_stale: AtomicU64,
     pub beacon_anomalies: AtomicU64,
     pub search_requests: AtomicU64,
-    /// Monitor updates dropped because the application's queue was full.
-    /// Slow consumers should bump up EPICS_CA_MONITOR_QUEUE or call
-    /// recv() more often.
-    pub dropped_monitors: AtomicU64,
     /// Ring buffer of recent events for post-mortem analysis.
     history: std::sync::Mutex<Vec<DiagRecord>>,
 }
@@ -340,7 +336,6 @@ impl Default for CaDiagnostics {
             subscriptions_stale: AtomicU64::new(0),
             beacon_anomalies: AtomicU64::new(0),
             search_requests: AtomicU64::new(0),
-            dropped_monitors: AtomicU64::new(0),
             history: std::sync::Mutex::new(Vec::with_capacity(EVENT_HISTORY_CAPACITY)),
         }
     }
@@ -373,7 +368,6 @@ impl CaDiagnostics {
             subscriptions_stale: self.subscriptions_stale.load(Ordering::Relaxed),
             beacon_anomalies: self.beacon_anomalies.load(Ordering::Relaxed),
             search_requests: self.search_requests.load(Ordering::Relaxed),
-            dropped_monitors: self.dropped_monitors.load(Ordering::Relaxed),
             history,
         }
     }
@@ -390,7 +384,6 @@ pub struct DiagnosticsSnapshot {
     pub subscriptions_stale: u64,
     pub beacon_anomalies: u64,
     pub search_requests: u64,
-    pub dropped_monitors: u64,
     pub history: Vec<DiagRecord>,
 }
 
@@ -404,7 +397,6 @@ impl std::fmt::Display for DiagnosticsSnapshot {
         writeln!(f, "Subscriptions stale:    {}", self.subscriptions_stale)?;
         writeln!(f, "Beacon anomalies:       {}", self.beacon_anomalies)?;
         writeln!(f, "Search requests:        {}", self.search_requests)?;
-        writeln!(f, "Dropped monitors:       {}", self.dropped_monitors)?;
         if !self.history.is_empty() {
             writeln!(f, "Recent events ({}):", self.history.len())?;
             let start = self
@@ -3719,74 +3711,24 @@ async fn run_coordinator(
                         }
                     }
                     CoordRequest::Unsubscribe { subid } => {
-                        if let Some(rec) = subscriptions.get(subid) {
-                            let cid = rec.cid;
-                            if let Some(ch) = channels.get(&cid) {
-                                // Same predicate as the EVENT_ADD: the server
-                                // holds the subscription while the circuit is
-                                // unresponsive.
-                                if ch.state.is_operational() {
-                                    if let Some(data_type) = rec.data_type {
-                                        let server_addr = ch.server_addr.unwrap();
-                                        // C `tcpiiu::subscriptionCancelRequest`
-                                        // (`tcpiiu.cpp:1659`) re-resolves the wire
-                                        // count through the same
-                                        // `getCount(CA_V413(minor))` gate the
-                                        // EVENT_ADD used, so the cancel echoes the
-                                        // count the server was given.
-                                        let peer_minor = server_minor_version
-                                            .get(&(server_addr, ch.priority))
-                                            .copied()
-                                            .unwrap_or(0);
-                                        let _ = transport_tx.send(TransportCommand::Unsubscribe {
-                                            sid: ch.sid,
-                                            subid,
-                                            data_type,
-                                            count: crate::protocol::subscription_cancel_wire_count(
-                                                rec.count.unwrap_or(0),
-                                                ch.element_count,
-                                                peer_minor,
-                                            ),
-                                            server_addr,
-                                            priority: ch.priority,
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                        subscriptions.remove(subid);
+                        cancel_subscription(
+                            subid,
+                            &mut subscriptions,
+                            &channels,
+                            &server_minor_version,
+                            &transport_tx,
+                        );
                     }
                     CoordRequest::DropChannel { cid } => {
                         // Cancel all subscriptions for this channel
-                        let sub_ids = subscriptions.for_cid(cid);
-                        for subid in sub_ids {
-                            if let Some(rec) = subscriptions.get(subid) {
-                                if let Some(ch) = channels.get(&cid) {
-                                    if ch.state.is_operational() {
-                                        if let Some(data_type) = rec.data_type {
-                                            let server_addr = ch.server_addr.unwrap();
-                                            let peer_minor = server_minor_version
-                                                .get(&(server_addr, ch.priority))
-                                                .copied()
-                                                .unwrap_or(0);
-                                            let _ = transport_tx.send(TransportCommand::Unsubscribe {
-                                                sid: ch.sid,
-                                                subid,
-                                                data_type,
-                                                count:
-                                                    crate::protocol::subscription_cancel_wire_count(
-                                                        rec.count.unwrap_or(0),
-                                                        ch.element_count,
-                                                        peer_minor,
-                                                    ),
-                                                server_addr,
-                                                priority: ch.priority,
-                                            });
-                                        }
-                                    }
-                                }
-                            }
-                            subscriptions.remove(subid);
+                        for subid in subscriptions.for_cid(cid) {
+                            cancel_subscription(
+                                subid,
+                                &mut subscriptions,
+                                &channels,
+                                &server_minor_version,
+                                &transport_tx,
+                            );
                         }
 
                         // Clear channel on server + clean reverse index
@@ -4234,18 +4176,19 @@ async fn run_coordinator(
                                 )
                                 .increment(1);
                             }
-                            MonitorDeliveryOutcome::Dropped => {
-                                // With the coalesce slot, this is reachable
-                                // only when the consumer channel is closed —
-                                // i.e. the application dropped the
-                                // `MonitorHandle`. Bumping the counter is
-                                // still useful as a stale-handle signal.
-                                diag.dropped_monitors.fetch_add(1, Ordering::Relaxed);
-                                tracing::warn!(
+                            MonitorDeliveryOutcome::ConsumerGone => {
+                                // An event racing the handle's own
+                                // `Unsubscribe`, as a libca event for a
+                                // cleared subscription is (`cac.cpp:961`), or
+                                // the first event of a subscribe cancelled
+                                // before it built a handle, which sends none.
+                                cancel_subscription(
                                     subid,
-                                    "monitor dropped (consumer handle closed)"
+                                    &mut subscriptions,
+                                    &channels,
+                                    &server_minor_version,
+                                    &transport_tx,
                                 );
-                                metrics::counter!("ca_client_dropped_monitors_total").increment(1);
                             }
                             MonitorDeliveryOutcome::Filtered
                             | MonitorDeliveryOutcome::NotFound => {}
@@ -4272,12 +4215,14 @@ async fn run_coordinator(
                                 )
                                 .increment(1);
                             }
-                            MonitorDeliveryOutcome::Dropped => {
-                                diag.dropped_monitors.fetch_add(1, Ordering::Relaxed);
-                                metrics::counter!(
-                                    "ca_client_monitor_error_drops_total"
-                                )
-                                .increment(1);
+                            MonitorDeliveryOutcome::ConsumerGone => {
+                                cancel_subscription(
+                                    subid,
+                                    &mut subscriptions,
+                                    &channels,
+                                    &server_minor_version,
+                                    &transport_tx,
+                                );
                             }
                             MonitorDeliveryOutcome::Filtered
                             | MonitorDeliveryOutcome::NotFound => {}
@@ -4916,6 +4861,49 @@ fn remove_server_channel(
         if set.is_empty() {
             server_channels.remove(&circuit);
         }
+    }
+}
+
+/// Forget a subscription and send its EVENT_CANCEL. A later event for
+/// `subid` then finds no subscription and is ignored, as libca ignores an
+/// event for a cleared one (`cac.cpp:961`).
+fn cancel_subscription(
+    subid: u32,
+    subscriptions: &mut SubscriptionRegistry,
+    channels: &HashMap<u32, ChannelInner>,
+    server_minor_version: &HashMap<types::CircuitKey, u16>,
+    transport_tx: &mpsc::UnboundedSender<TransportCommand>,
+) {
+    let Some(rec) = subscriptions.remove(subid) else {
+        return;
+    };
+    // Same predicate as the EVENT_ADD: the server holds the subscription
+    // while the circuit is unresponsive.
+    if let Some(ch) = channels.get(&rec.cid)
+        && ch.state.is_operational()
+        && let Some(data_type) = rec.data_type
+    {
+        let server_addr = ch.server_addr.unwrap();
+        // C `tcpiiu::subscriptionCancelRequest` (`tcpiiu.cpp:1659`)
+        // re-resolves the wire count through the same
+        // `getCount(CA_V413(minor))` gate the EVENT_ADD used, so the cancel
+        // echoes the count the server was given.
+        let peer_minor = server_minor_version
+            .get(&(server_addr, ch.priority))
+            .copied()
+            .unwrap_or(0);
+        let _ = transport_tx.send(TransportCommand::Unsubscribe {
+            sid: ch.sid,
+            subid,
+            data_type,
+            count: crate::protocol::subscription_cancel_wire_count(
+                rec.count.unwrap_or(0),
+                ch.element_count,
+                peer_minor,
+            ),
+            server_addr,
+            priority: ch.priority,
+        });
     }
 }
 

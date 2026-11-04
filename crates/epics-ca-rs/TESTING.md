@@ -121,7 +121,7 @@ ca-soak \
 
 ```
 [soak +  60.0s] mons=1180 reads=120 (err 0) writes=596 (err 0)
-  diag: conns=4 disconns=0 reconns=0 unresp=0 drop_mon=0 beacon_anom=2
+  diag: conns=4 disconns=0 reconns=0 unresp=0 beacon_anom=2
 
 === Soak summary ===
 Duration:       60.0s
@@ -142,8 +142,6 @@ After a soak run, inspect the `CaDiagnostics` summary:
 - `Disconnections` climbing slowly → circuit instability
 - `Reconnections >= Disconnections` → expected (every disconnect should
   be followed by a reconnect)
-- `Dropped monitors` non-zero → consumer is too slow, or the monitor
-  queue is too small (`EPICS_CA_MONITOR_QUEUE`)
 - Frequent `Unresponsive events` → echo timeouts; check network or IOC
   load
 - `Beacon anomalies` increase whenever any IOC on the LAN restarts

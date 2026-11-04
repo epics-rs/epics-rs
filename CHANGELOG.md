@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Breaking
+
+- CA client: `CaDiagnostics::dropped_monitors`, `DiagnosticsSnapshot::dropped_monitors` and the `ca_client_dropped_monitors_total` and `ca_client_monitor_error_drops_total` metrics removed; a full monitor queue coalesces, and an event for a dropped `MonitorHandle` now cancels the subscription instead of counting a drop.
+
 ## v0.33.0 — 2026-10-29
 
 Minor release; the pinned toolchain stays at 1.99.1. VxWorks is no

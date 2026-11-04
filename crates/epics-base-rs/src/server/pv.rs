@@ -57,8 +57,7 @@ pub(crate) fn max_subscribers_per_pv() -> usize {
 /// because a later post replaced them in the event queue — C `evSubscrip
 /// ::nreplace` (`dbEvent.c:821`), summed over every monitor. Covers both
 /// `ProcessVariable` and `RecordInstance` posts, because both reach the queue
-/// through the single [`EventSink::post`] owner. Mirrors the pattern of
-/// `dropped_monitors` on the client side (subscribe_with_deadband).
+/// through the single [`EventSink::post`] owner.
 ///
 /// read via [`dropped_monitor_events`]. That reader is not yet
 /// wired to a live scrape surface — the `/queues` admin endpoint

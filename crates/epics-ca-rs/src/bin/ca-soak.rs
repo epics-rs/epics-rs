@@ -174,12 +174,11 @@ async fn main() {
                 );
                 epics_libcom_rs::stderr_println!(
                     "  diag: conns={} disconns={} reconns={} \
-                     unresp={} drop_mon={} beacon_anom={}",
+                     unresp={} beacon_anom={}",
                     snap.connections,
                     snap.disconnections,
                     snap.reconnections,
                     snap.unresponsive_events,
-                    snap.dropped_monitors,
                     snap.beacon_anomalies,
                 );
                 if let Some(deadline) = stop_at

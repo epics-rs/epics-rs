@@ -199,6 +199,10 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ),
     (
         "epics-ca-rs",
+        "tests/a_cancelled_subscribe_is_cancelled_on_the_server.rs",
+    ),
+    (
+        "epics-ca-rs",
         "tests/a_loopback_interface_binds_two_responder_sockets.rs",
     ),
     (

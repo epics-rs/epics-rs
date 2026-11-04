@@ -269,9 +269,10 @@ pub struct SubscriptionRecord {
 ```
 
 `callback_tx` capacity is `EPICS_CA_MONITOR_QUEUE` (default 256).
-`on_monitor_data` does a `try_send`; on `Full` or `Closed` it returns
-`MonitorDeliveryOutcome::Dropped` so the coordinator can bump
-`CaDiagnostics::dropped_monitors`.
+`on_monitor_data` does a `try_send`; on `Full` the value goes to the
+coalesce slot (`Slotted`), and on `Closed` (the application dropped its
+`MonitorHandle`) it returns `ConsumerGone` and the coordinator cancels
+the subscription.
 
 Client-side deadband (`deadband > 0`) suppresses scalar updates whose
 absolute change is below the threshold. Disabled (0.0) by default.
@@ -361,7 +362,6 @@ pub struct CaDiagnostics {
     pub subscriptions_stale:   AtomicU64,
     pub beacon_anomalies:      AtomicU64,
     pub search_requests:       AtomicU64,
-    pub dropped_monitors:      AtomicU64,
     history: Mutex<Vec<DiagRecord>>, // ring buffer, capacity 256
 }
 ```

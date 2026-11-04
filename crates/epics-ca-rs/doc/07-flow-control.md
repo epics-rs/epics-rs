@@ -108,15 +108,16 @@ When a `MonitorData` arrives, the coordinator calls
 
 ```rust
 match rec.callback_tx.try_send(Ok(snapshot)) {
-    Ok(())                 => MonitorDeliveryOutcome::Queued(server_addr),
-    Err(TrySendError::Full(_))   => MonitorDeliveryOutcome::Dropped(server_addr),
-    Err(TrySendError::Closed(_)) => MonitorDeliveryOutcome::Dropped(server_addr),
+    Ok(())                       => MonitorDeliveryOutcome::Queued,
+    Err(TrySendError::Full(_))   => MonitorDeliveryOutcome::Slotted,
+    Err(TrySendError::Closed(_)) => MonitorDeliveryOutcome::ConsumerGone,
 }
 ```
 
-The coordinator increments `CaDiagnostics::dropped_monitors` on
-`Dropped`. There is no client-side coalesce slot; the assumption is
-that EVENTS_OFF will trigger before the queue fills repeatedly.
+A full queue puts the newest value in the coalesce slot, replacing the
+one there, as C `db_queue_event_log` replaces its last entry. A closed
+one means the application dropped its `MonitorHandle`, and the
+coordinator cancels the subscription.
 
 If your application needs lossless delivery, increase
 `EPICS_CA_MONITOR_QUEUE` and ensure `MonitorHandle::recv` is called

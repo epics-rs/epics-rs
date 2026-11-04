@@ -94,10 +94,9 @@ Per-subscription mpsc capacity on the **client** side. Default: 256.
 Minimum: 8.
 
 When the queue fills (the application is calling `MonitorHandle::recv`
-slower than events arrive), `try_send` fails and
-`CaDiagnostics::dropped_monitors` increments. Combined with
-EVENTS_OFF flow control, the client should converge before this
-matters; raise the queue if you're seeing dropped events.
+slower than events arrive), the newest update replaces the one held in
+the subscription's coalesce slot, so the consumer still gets the latest
+value but not every intermediate one; raise the queue to keep more.
 
 ### `EPICS_CA_USE_SHELL_VARS` (libca)
 

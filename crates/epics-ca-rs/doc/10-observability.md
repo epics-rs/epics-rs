@@ -55,7 +55,6 @@ INFO  channel reconnected pv=MOTOR:X:VAL cid=1 sid=8 server=10.0.0.5:5064
 | `ca_client_tcp_closed_total` | counter | `server` | Distinct TCP circuit terminations |
 | `ca_client_unresponsive_total` | counter | `server` | First echo timeout (1st miss) |
 | `ca_client_beacon_anomalies_total` | counter | `server` | beacon ID skip / fast period |
-| `ca_client_dropped_monitors_total` | counter | (none) | Monitor events dropped due to queue full |
 | `ca_client_search_responses_total` | counter | (none) | Total SEARCH replies received |
 | `ca_client_search_rtt_seconds` | histogram | `server` | UDP search RTT, per destination |
 | `ca_client_channels_connected` | gauge | (none) | Currently-connected channels |
@@ -180,7 +179,7 @@ The hot paths (per-monitor delivery, per-search packet) emit at
 | Symptom | Metric / log to check |
 |---------|------------------------|
 | Channels keep flapping | `ca_client_disconnections_total` rate, log `channel reconnected` events |
-| Monitor latency growing | `ca_client_dropped_monitors_total`, `ca_client_unresponsive_total` |
+| Monitor latency growing | `ca_client_unresponsive_total` |
 | Slow PV search | `ca_client_search_rtt_seconds` p99 |
 | Server overloaded | `ca_server_clients_active` gauge, `ca_server_accepts_total` rate |
 | IOC unstable | `ca_client_beacon_anomalies_total` per server |

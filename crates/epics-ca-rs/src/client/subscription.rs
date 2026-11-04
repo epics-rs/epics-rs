@@ -238,9 +238,10 @@ pub(crate) enum MonitorDeliveryOutcome {
     /// Buffered in the coalesce slot (overflow `ready`, during-pause
     /// `gated`, or overflow error). Diagnostic only.
     Slotted,
-    /// Dropped because the consumer channel is closed (the application
-    /// dropped its `MonitorHandle`). The only remaining drop case.
-    Dropped,
+    /// Nobody will read this subscription again: the application dropped
+    /// its `MonitorHandle`, or a cancelled subscribe never built one. Not
+    /// a lost update; the coordinator cancels the subscription.
+    ConsumerGone,
     /// Filtered by client-side deadband (no action).
     Filtered,
     /// Subscription not found.
@@ -397,6 +398,9 @@ impl SubscriptionRegistry {
         let Some(rec) = self.subscriptions.get_mut(&subid) else {
             return MonitorDeliveryOutcome::NotFound;
         };
+        if rec.callback_tx.is_closed() {
+            return MonitorDeliveryOutcome::ConsumerGone;
+        }
         try_deliver_err(rec, epics_base_rs::error::CaError::ServerError(eca_status))
     }
 
@@ -410,6 +414,11 @@ impl SubscriptionRegistry {
         let Some(rec) = self.subscriptions.get_mut(&subid) else {
             return MonitorDeliveryOutcome::NotFound;
         };
+        // Checked before routing: a pause-held value goes to the slot
+        // without touching the channel and would never see it closed.
+        if rec.callback_tx.is_closed() {
+            return MonitorDeliveryOutcome::ConsumerGone;
+        }
         let snapshot = if data_type <= 6 {
             // Same wire carrier as the read path: an EVENT_ADD payload is
             // `dbr_char_t` for the CHAR row, so a monitored CHAR waveform
@@ -474,7 +483,7 @@ impl SubscriptionRegistry {
                     rec.coalesce_slot.put_value(snap);
                     MonitorDeliveryOutcome::Slotted
                 }
-                Err(TrySendError::Closed(_)) => MonitorDeliveryOutcome::Dropped,
+                Err(TrySendError::Closed(_)) => MonitorDeliveryOutcome::ConsumerGone,
             },
         }
     }
@@ -692,7 +701,7 @@ fn try_deliver_err(rec: &mut SubscriptionRecord, err: CaError) -> MonitorDeliver
             rec.coalesce_slot.put_error(e);
             MonitorDeliveryOutcome::Slotted
         }
-        Err(TrySendError::Closed(_)) => MonitorDeliveryOutcome::Dropped,
+        Err(TrySendError::Closed(_)) => MonitorDeliveryOutcome::ConsumerGone,
     }
 }
 
@@ -1555,6 +1564,32 @@ mod tests {
             matches!(got, Err(CaError::ServerError(192))),
             "ECA_DISCONN delivered while paused"
         );
+    }
+
+    /// A closed consumer is reported as gone on every route, a pause-held
+    /// value included, and the record is left for the coordinator to cancel.
+    #[test]
+    fn a_closed_consumer_is_gone_on_every_route() {
+        for paused in [false, true] {
+            let mut reg = SubscriptionRegistry::new();
+            let (callback_tx, rx) = mpsc::channel::<CaResult<Snapshot>>(2);
+            let slot = CoalesceSlot::new();
+            slot.set_paused(paused);
+            reg.add(slotted_record(slot, callback_tx));
+            drop(rx);
+            assert!(
+                matches!(post_long(&mut reg, 1), MonitorDeliveryOutcome::ConsumerGone),
+                "value, paused={paused}"
+            );
+            assert!(
+                matches!(
+                    reg.on_monitor_error(1, 192),
+                    MonitorDeliveryOutcome::ConsumerGone
+                ),
+                "error, paused={paused}"
+            );
+            assert!(reg.get(1).is_some());
+        }
     }
 
     /// `route_value` when not paused: empty → TryChannel, occupied →

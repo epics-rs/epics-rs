@@ -936,7 +936,7 @@ impl Record for MotorRecord {
     /// processes — that blink is what carries the put pass through the
     /// do_work move-block entry gate (2241, `dval != ldvl || !dmov`)
     /// even when the target equals the last-dispatched one; the move
-    /// block then decides between the sub-step pulse restore
+    /// block then decides between the too-small DMOV restore
     /// (too_small, 2332-2349), a re-dispatch (2455, `mip == MIP_DONE ||
     /// MIP_RETRY`), and the SET-mode load_pos. The entry gate itself
     /// only ever refuses passes that did NOT come through database put

@@ -362,7 +362,7 @@ impl MotorRecord {
                 // move block firing on the folded val change). A dbPut
                 // to TWF/TWR is blinked (special pass-0, 2591-2620), so
                 // even a zero fold (TWV = 0) enters via `!dmov` and
-                // too_small pulses DMOV like C; only an unblinked zero
+                // too_small restores DMOV like C; only an unblinked zero
                 // fold refuses at the entry gate (2241) — chain end.
                 if tweak_pending {
                     if self.stat.dmov == 0 || self.pos.dval != self.internal.ldvl {
@@ -475,16 +475,17 @@ impl MotorRecord {
                         && (self.pos.dval + self.retry.spdb) > self.pos.drbv)
             };
             if too_small {
-                // C 2334-2343: a pending non-move (paused-RETRY resume
-                // whose error drifted under RDBD) completes here with
-                // mip = DONE; the quiesce below plus the DMOV pulse
-                // recovery in do_process_inner restore DMOV=1.
-                let pending_completion = self.stat.dmov == 0;
-                if pending_completion
+                // C 2333-2343: a pending non-move — the put's special()
+                // blink, or a paused-RETRY resume whose error drifted
+                // under RDBD — completes on this pass, put-notify included.
+                if self.stat.dmov == 0
                     && (self.stat.mip.is_empty() || self.stat.mip == MipFlags::RETRY)
                 {
-                    self.stat.mip = MipFlags::empty();
-                    self.mark(m::MIP);
+                    self.set_dmov(true);
+                    if !self.stat.mip.is_empty() {
+                        self.stat.mip = MipFlags::empty();
+                        self.mark(m::MIP);
+                    }
                 }
                 // C 2345-2347: update the previous-target registers so the
                 // suppressed divergence is not re-detected on every later
@@ -492,19 +493,6 @@ impl MotorRecord {
                 self.internal.ldvl = self.pos.dval;
                 self.internal.lval = self.pos.val;
                 self.internal.lrvl = self.pos.rval;
-                // Rust-side deviation from C (deliberate, ophyd/bluesky):
-                // a sub-step request pulses DMOV 1→0→1 so clients watching
-                // DMOV see the "move" complete; a pending completion runs
-                // the same flow to restore DMOV=1. dmov=false posts
-                // DMOV=0 on this pass; the immediate re-process
-                // (no pending event) finalizes with DMOV=1. An SPDB
-                // suppress with DMOV already 1 stays quiet, like C's
-                // dmov==FALSE gate (2333).
-                if steps < 1 || pending_completion {
-                    self.set_dmov(false);
-                    self.set_movn(true);
-                    effects.request_poll = true;
-                }
                 return;
             }
         }
@@ -1922,39 +1910,6 @@ impl MotorRecord {
         // One-pass CALLBACK_DATA mark from determine_event's Idle
         // consume — the C process_reason discriminator.
         let idle_status_pass = std::mem::take(&mut self.internal.idle_status_pass);
-
-        // Sub-step pulse recovery: if DMOV is false but phase is Idle
-        // (no real motion started), finalize to restore DMOV=1. This is
-        // the pulse's high half — C's too_small (2333-2347) restores
-        // DMOV on the same pass; the Rust pulse splits it so the low
-        // half posts, and too_small's lasts adoption (ldvl <- dval) is
-        // what marks the pulse as started. Two states share the DMOV-
-        // low/Idle/MIP-empty shape and must NOT be finalized:
-        //
-        // - A put-owned pass: the C special() pass-0 blink (2591-2620)
-        //   drops DMOV before the record processes, so a pending
-        //   last_write/UserWrite arrives here with DMOV already low —
-        //   the blink is the pass's move-block entry ticket (2241), not
-        //   a completed pulse, and the pass must reach its dispatch arm.
-        // - A parked blinked put (dval != ldvl): written under
-        //   SPMG=Pause/Stop, waiting for the Go pass to dispatch — C
-        //   keeps DMOV low across the pause ("not done": a move is
-        //   pending).
-        // - The LS-error update (1367-1378) of a load on a limit: pp is
-        //   armed and the GET_INFO pass must run postProcess.
-        let put_owned =
-            self.put_rides() || matches!(self.pending_event, Some(MotorEvent::UserWrite(_)));
-        if !put_owned
-            && self.internal.pp == 0
-            && self.stat.dmov == 0
-            && self.stat.phase == MotionPhase::Idle
-            && self.stat.mip.is_empty()
-            && self.pos.dval == self.internal.ldvl
-        {
-            let mut effects = ProcessEffects::default();
-            self.finalize_motion(&mut effects);
-            return effects;
-        }
 
         // C process() 1276-1293: what update_values read, or a settle
         // delay's ACK, makes this a CALLBACK_DATA pass whether or not a

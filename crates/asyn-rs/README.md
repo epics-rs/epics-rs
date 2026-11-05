@@ -133,9 +133,9 @@ Add to `Cargo.toml`:
 
 ```toml
 [dependencies]
-asyn-rs = "0.33"
+asyn-rs = "0.34"
 # Driver framework only, no record system:
-# asyn-rs = { version = "0.33", default-features = false }
+# asyn-rs = { version = "0.34", default-features = false }
 ```
 
 ### Implementing a Driver

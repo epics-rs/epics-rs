@@ -64,7 +64,7 @@ without the CLI dependencies (`clap`, `tracing-subscriber`):
 
 ```toml
 [dependencies]
-epics-tools-rs = { version = "0.33", default-features = false, features = ["procserv"] }
+epics-tools-rs = { version = "0.34", default-features = false, features = ["procserv"] }
 ```
 
 ## Run

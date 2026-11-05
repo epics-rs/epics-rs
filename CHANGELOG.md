@@ -1,10 +1,32 @@
 # Changelog
 
-## Unreleased
+## v0.34.0 — 2026-11-05
+
+Minor release; the pinned toolchain stays at 1.99.1. The motor record
+refuses non-finite and overflowing puts and loads, and its field groups
+are read-only outside the crate. A PVA client can send a put and await
+its completion separately.
 
 ### Breaking
 
 - CA client: `CaDiagnostics::dropped_monitors`, `DiagnosticsSnapshot::dropped_monitors` and the `ca_client_dropped_monitors_total` and `ca_client_monitor_error_drops_total` metrics removed; a full monitor queue coalesces, and an event for a dropped `MonitorHandle` now cancels the subscription instead of counting a drop.
+- motor: `MotorRecord`'s field groups (`pos`, `conv`, `vel`, `retry`, `limits`, `ctrl`, `stat`, `pid`, `disp`, `timing`, `internal`, `links`, `alarm`) are crate-private; read them through the getters of the same name, and write a field through `put_field`.
+- PVA: `pvdata::encode::TypeCache` maps a slot to `CachedType`, the `FieldDesc` with its tree height and node count, instead of a bare `FieldDesc`.
+
+### New
+
+- PVA: `PutOp::send` and `send_fields_typed` return once DATA is queued and `PutSent::wait` awaits the completion; `PvaClient::pvput_begin_unbounded` is public, its put bounded by no client timeout.
+- Examples: `qsrv-ioc` serves ophyd-async's NTTable and NTNDArray group PVs (`DEMO:table`, `DEMO:ntndarray`) and builds group PVs from `info(Q:group)` tags too; `sim-detector` gains a second HDF5 plugin, HDF2.
+
+### Fixed
+
+- PVA: a type-cache `0xFE` reference is bounded by tree depth and node count, so nesting reached through the cache no longer escapes the decoder's depth guard.
+- PVA: a scalar, array or text put into a structure field is refused as pvxs `Value::copyIn` refuses it; it used to zero an NTEnum's index.
+- CA client: a subscribe cancelled before it built its `MonitorHandle` no longer stays on the server.
+- motor: a NaN, infinite or overflowing MRES, UREV, SREV, ERES, RRES, speed, acceleration or offset put is dropped, and such a load takes the field default or the readback, where C stores it unchecked; a move whose step count does not fit an `i32` is refused.
+- motor: a too-small move restores DMOV in its own pass, as C does, so a DMOV get after the put callback reads 1; devMotorAsyn's failed-init arm runs init_record's readback tail.
+- optics: `xia_slit.st`'s unreachable `comm_error` state is gone, and with it the snc warning on every build.
+- Every crate builds and documents without warnings in its own empty feature selection (`epics-ca-rs` without `client-core` did not build), and CI checks it.
 
 ## v0.33.0 — 2026-10-29
 

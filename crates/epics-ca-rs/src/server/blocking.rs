@@ -1835,9 +1835,10 @@ fn handle_client_blocking(
                                 postponed = Some(blocked);
                                 continue;
                             }
-                            // Sync WRITE_NOTIFY reply / fire-and-forget WRITE / any
-                            // error frame is already queued in `outbox`; it flushes at
-                            // the loop top under the send lock.
+                            // Any error frame is already queued in `outbox`; it
+                            // flushes at the loop top under the send lock. A sync
+                            // WRITE_NOTIFY's Completion is the event thread's to
+                            // stage, behind the monitor updates its put posted.
                             Ok(Ok(WriteHeadOutcome::Done)) => {}
                             Ok(Ok(WriteHeadOutcome::AsyncPending(pending))) => {
                                 // The record's process cycle went async. Do NOT park
@@ -3031,6 +3032,52 @@ mod tests {
             reply, reference,
             "blocking driver must ship the shared dispatch handler's exact bytes"
         );
+
+        server.shutdown();
+        accept.join().unwrap();
+    }
+
+    /// rsrv answers a record's put callback from `event_task`'s extra labor
+    /// (`camessage.c:1342-1346`), once `event_read` has taken the updates
+    /// queued before it (`dbEvent.c:1038-1053`): each put's update reaches
+    /// the client before its completion. The dispatch thread no longer writes
+    /// the completion itself, so it cannot overtake the event thread.
+    #[test]
+    fn a_put_callback_is_answered_after_the_update_it_posted() {
+        let db = seed_ao_db("BLK:ORD");
+        let server =
+            Arc::new(BlockingCaServer::bind("127.0.0.1:0", db.clone(), new_acf()).unwrap());
+        let addr = server.local_addr().unwrap();
+        let srv = server.clone();
+        let accept = thread::spawn(move || srv.serve());
+
+        let mut c = TcpStream::connect(addr).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let _ = read_until_cmmd(&mut c, CA_PROTO_VERSION);
+        c.write_all(&version_frame()).unwrap();
+        c.write_all(&create_chan_frame(1, "BLK:ORD")).unwrap();
+        let cc = read_until_cmmd(&mut c, CA_PROTO_CREATE_CHAN);
+        let sid = u32::from_be_bytes([cc[12], cc[13], cc[14], cc[15]]);
+        c.write_all(&event_add_double_frame(sid, 1)).unwrap();
+        let _ = read_until_cmmd(&mut c, CA_PROTO_EVENT_ADD);
+
+        for ioid in 1..=50u32 {
+            let value = f64::from(ioid);
+            c.write_all(&write_notify_frame(sid, ioid, DBR_DOUBLE_MON, value))
+                .unwrap();
+            let mut last = None;
+            loop {
+                let f = read_one_frame(&mut c);
+                match u16::from_be_bytes([f[0], f[1]]) {
+                    CA_PROTO_EVENT_ADD => {
+                        last = Some(f64::from_be_bytes(f[16..24].try_into().unwrap()))
+                    }
+                    CA_PROTO_WRITE_NOTIFY => break,
+                    _ => {}
+                }
+            }
+            assert_eq!(last, Some(value), "put {ioid}'s update came first");
+        }
 
         server.shutdown();
         accept.join().unwrap();
@@ -4667,7 +4714,7 @@ mod tests {
     /// (an array landed in a scalar channel) and echoed back.
     #[test]
     fn write_notify_count_above_capacity_clamps_to_channel_elements() {
-        let (db, mut state, outbox, mut drain, sid) =
+        let (db, mut state, outbox, _drain, sid) =
             write_test_session_on(seed_ao_db("WR:CLAMP"), "WR:CLAMP");
         let peer: SocketAddr = "127.0.0.1:5064".parse().unwrap();
 
@@ -4704,13 +4751,11 @@ mod tests {
         assert_eq!(db.get_pv("WR:CLAMP").unwrap(), EpicsValue::Double(9.0));
 
         // The WRITE_NOTIFY reply echoes the clamped count (C echoes the
-        // mutated mp->m_count).
-        let reply = loop {
-            let f = drain.try_next().expect("a WRITE_NOTIFY reply frame");
-            if u16::from_be_bytes([f[0], f[1]]) == CA_PROTO_WRITE_NOTIFY {
-                break f.to_vec();
-            }
-        };
+        // mutated mp->m_count). A record's is the event thread's to stage.
+        let reply = crate::server::tcp::due_replies(&state.event_user())
+            .into_iter()
+            .find(|f| u16::from_be_bytes([f[0], f[1]]) == CA_PROTO_WRITE_NOTIFY)
+            .expect("a WRITE_NOTIFY reply frame");
         let (rh, _) = CaHeader::from_bytes_for_peer(&reply, state.client_minor_version()).unwrap();
         assert_eq!(rh.actual_count(), 1, "reply must echo the clamped count");
     }
@@ -5427,7 +5472,7 @@ mod tests {
         let mut state = ClientState::new(acf, 5064, db.clone());
         let peer: SocketAddr = "127.0.0.1:5064".parse().unwrap();
         state.apply_connection_identity(peer, None, None);
-        let (outbox, mut drain) = outbox::channel();
+        let (outbox, _drain) = outbox::channel();
 
         let run = |state: &mut ClientState, frame: Vec<u8>| {
             let (hdr, hdr_size) =
@@ -5471,16 +5516,14 @@ mod tests {
             .expect("blockable")
             .expect("completion");
         let chain = block_on_sync(&mut p.rx).expect("blockable");
-        // Nothing else writes this test's outbox, so the commit is a no-op.
-        p.settle(chain, &outbox, crate::protocol::CA_MINOR_VERSION, || true)
+        let events = state.event_user();
+        p.settle(chain, &outbox, &events, crate::protocol::CA_MINOR_VERSION)
             .expect("encode completion");
 
-        while let Some(f) = drain.try_next() {
-            if u16::from_be_bytes([f[0], f[1]]) == CA_PROTO_WRITE_NOTIFY {
-                return f.to_vec();
-            }
-        }
-        panic!("reference produced no WRITE_NOTIFY completion frame");
+        crate::server::tcp::due_replies(&events)
+            .into_iter()
+            .find(|f| u16::from_be_bytes([f[0], f[1]]) == CA_PROTO_WRITE_NOTIFY)
+            .expect("reference produced no WRITE_NOTIFY completion frame")
     }
 
     /// (S1c-b-i) A WRITE_NOTIFY over a real TCP socket, on a record whose process

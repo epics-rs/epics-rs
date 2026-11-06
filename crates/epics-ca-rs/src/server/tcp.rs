@@ -427,7 +427,8 @@ struct PutNotifyCompletion {
     /// Sender of the "this put-callback is answered" signal the channel's next
     /// WRITE_NOTIFY waits on. [`claim`](Self::claim) moves it into the
     /// [`PutNotifyReply`] it hands out, so the successor is released when that
-    /// token dies — which is AFTER the reply it owns has been written. C
+    /// token dies — which is AFTER the circuit's event consumer has staged the
+    /// reply it owns, the token riding with the frame as its hold. C
     /// signals `client->blockSem` from the tail of `write_notify_reply`
     /// (`camessage.c:1460`), once every queued reply is committed, for exactly
     /// that reason: a successor woken at claim time can put its own reply on
@@ -471,6 +472,25 @@ impl PutNotifyCompletion {
                 settled: std::sync::Mutex::new(Some(settled)),
             }),
             wait,
+        )
+    }
+
+    /// [`Self::new`] for a put-callback answered as it registers: the reply is
+    /// owned from the start, so no other path can claim it, and its
+    /// trap-write bracket is already closed.
+    fn new_claimed() -> (Arc<Self>, tokio::sync::watch::Receiver<()>, PutNotifyReply) {
+        let (settled, wait) = tokio::sync::watch::channel(());
+        (
+            Arc::new(Self {
+                replied: AtomicBool::new(true),
+                trap_guard: std::sync::Mutex::new(None),
+                settled: std::sync::Mutex::new(None),
+            }),
+            wait,
+            PutNotifyReply {
+                trap_guard: None,
+                _settled: Some(settled),
+            },
         )
     }
 
@@ -1147,6 +1167,7 @@ impl ClientState {
                 .spawn(run_write_notify_queue(
                     rx,
                     outbox.clone(),
+                    self.event_user.clone(),
                     self.minor.clone(),
                 ))
                 .abort_handle();
@@ -2379,6 +2400,7 @@ where
                                 peer,
                                 conn_events.as_ref(),
                                 &outbox,
+                                &conn_reactor,
                             )
                             .await
                                 > 0
@@ -2424,7 +2446,14 @@ where
                 // first, as pcas drains the `channelDestroyEvent`s queued
                 // with the canceled IO before that timer fires.
                 () = PostponedRequest::signalled(&mut postponed), if postponed.is_some() => {
-                    sweep_destroyed_channels(&mut state, peer, conn_events.as_ref(), &outbox).await;
+                    sweep_destroyed_channels(
+                        &mut state,
+                        peer,
+                        conn_events.as_ref(),
+                        &outbox,
+                        &conn_reactor,
+                    )
+                    .await;
                     None
                 }
                 read = read_with_optional_timeout(&mut reader, &mut buf[..room], inactivity), if room > 0 => {
@@ -2837,10 +2866,16 @@ async fn sweep_destroyed_channels(
     peer: SocketAddr,
     conn_events: Option<&broadcast::Sender<ServerConnectionEvent>>,
     writer: &Outbox,
+    reactor: &epics_base_rs::runtime::task::Reactor,
 ) -> usize {
     let cids = retire_destroyed_channels(state, peer, conn_events).await;
+    if !cids.is_empty() {
+        // Behind the completions the retired channels owed, which their
+        // owner posted to the same reply queue before this.
+        state.start_circuit_monitors(writer, reactor);
+    }
     for &cid in &cids {
-        writer.push(server_disconn_frame(cid));
+        state.event_user.post_reply(server_disconn_frame(cid), None);
     }
     cids.len()
 }
@@ -3652,6 +3687,7 @@ pub(crate) async fn dispatch_message(
             // here the async server spawns a task to await the record's chain and
             // send the deferred WRITE_NOTIFY reply; the blocking driver hands the
             // receiver to its event thread. Wire behavior is unchanged.
+            start_reply_owner(hdr, state, writer, &delivery);
             let outcome = serve_write_head(hdr, payload, state, db, writer).await?;
             return queue_write_outcome(outcome, state, writer, &delivery);
         }
@@ -3976,12 +4012,7 @@ pub(crate) async fn dispatch_message(
             // so a probing peer could send CLEAR_CHANNEL on random
             // SIDs indefinitely.
             if !state.channels.contains_key(&sid) {
-                if let Some(&elements) = state.retired.get(&sid) {
-                    let refusal = PcasRefusal {
-                        status: ECA_BADCHID,
-                        cid: 0xFFFF_FFFF,
-                        elements,
-                    };
+                if let Some(refusal) = retired_refusal(state, sid) {
                     return answer_pcas_refusal(writer, hdr, state, refusal)
                         .map(|()| Dispatched::Done);
                 }
@@ -4083,8 +4114,27 @@ pub(crate) async fn resume_dispatch(
     writer: &Outbox,
     delivery: SubscriptionDelivery,
 ) -> CaResult<Dispatched> {
+    start_reply_owner(hdr, state, writer, &delivery);
     let outcome = resume_write(hdr, payload, put, state, db, writer).await?;
     queue_write_outcome(outcome, state, writer, &delivery)
+}
+
+/// A WRITE_NOTIFY's Completion is staged by the circuit's event consumer
+/// ([`EventUser::post_reply`]), so the async server starts it before the head
+/// can post one. The blocking driver's event thread always runs.
+///
+/// [`EventUser::post_reply`]: epics_base_rs::server::event_queue::EventUser::post_reply
+fn start_reply_owner(
+    hdr: &CaHeader,
+    state: &mut ClientState,
+    writer: &Outbox,
+    delivery: &SubscriptionDelivery,
+) {
+    if hdr.cmmd == CA_PROTO_WRITE_NOTIFY {
+        if let Some(reactor) = delivery.spawn_on() {
+            state.start_circuit_monitors(writer, reactor);
+        }
+    }
 }
 
 /// A wire `data_type` that a `CA_PROTO_WRITE` / `CA_PROTO_WRITE_NOTIFY` may
@@ -4731,11 +4781,8 @@ async fn write_admitted(
             let result = match &entry.target {
                 ChannelTarget::RecordField { record, field } => {
                     let name: &[u8] = record.name();
-                    // Alarm-ack puts are immediate in C even for the
-                    // notify variant — `rsrv/camessage.c` writes ACKT/
-                    // ACKS via `dbPutField` and replies straight away,
-                    // never building a putNotify. Neither mode here
-                    // awaits a completion receiver, so park nothing.
+                    // The acknowledgement itself is immediate: no record
+                    // processes, so there is no completion to await.
                     db.put_alarm_ack_from_ca(name, field, ack, value).await
                 }
                 ChannelTarget::SimplePv(_) => Err(epics_base_rs::error::CaError::Protocol(
@@ -4747,18 +4794,24 @@ async fn write_admitted(
                     Ok(()) => PutStatus::OK,
                     Err(e) => PutStatus::of_failure(e),
                 };
-                send_put_notify_response(
-                    writer,
-                    NotifyReplyKind::Completion,
-                    hdr.data_type,
-                    count,
-                    eca.eca(),
+                // C runs an ACKT/ACKS put callback through `dbProcessNotify`
+                // like any other (`camessage.c:1802`), so it is busy and
+                // answered from extra labor too.
+                let reply = WriteNotifyReply {
+                    write_type: hdr.data_type,
+                    write_count: count,
                     ioid,
-                    ReplyContext {
-                        req_hdr: *hdr,
-                        client_minor: state.client_minor_version(),
-                    },
-                )?;
+                    req_hdr: *hdr,
+                };
+                let owned = register_answered_put_notify(entry, &reply);
+                finish_write_notify(
+                    owned,
+                    eca.eca(),
+                    &reply,
+                    CompletionRoute::of(&entry.target).to(writer, &state.event_user),
+                    state.client_minor_version(),
+                    None,
+                );
             } else if let Err(e) = &result {
                 // deprecated CA_PROTO_WRITE for DBR_PUT_ACKT/
                 // DBR_PUT_ACKS must surface put failure via
@@ -5119,6 +5172,7 @@ async fn write_admitted(
             },
             eca_status,
             cid: entry_cid,
+            route: CompletionRoute::of(&entry.target),
         }
     } else {
         // A plain WRITE goes async only when a simple PV held it (a gateway
@@ -5130,14 +5184,34 @@ async fn write_admitted(
             name: rsrv_name.to_vec(),
         }
     };
+    // A put answered now is registered as answered: its reply token goes out
+    // with the frame. The trap-write bracket closed above, with the audit
+    // status.
     let rx = match tail {
-        // The trap-write bracket closed above, with the audit status.
         WriteTail::Now(ended) => {
-            reply.send(ended, &mut None, writer, state.client_minor_version())?;
+            let owned = reply
+                .write_notify()
+                .and_then(|r| register_answered_put_notify(entry, r));
+            reply.send(
+                ended,
+                owned,
+                writer,
+                &state.event_user,
+                state.client_minor_version(),
+            )?;
             return Ok(WriteHeadOutcome::Done);
         }
         WriteTail::Posted(ended, end) => {
-            reply.send(ended, &mut None, writer, state.client_minor_version())?;
+            let owned = reply
+                .write_notify()
+                .and_then(|r| register_answered_put_notify(entry, r));
+            reply.send(
+                ended,
+                owned,
+                writer,
+                &state.event_user,
+                state.client_minor_version(),
+            )?;
             drop(end);
             return Ok(WriteHeadOutcome::Done);
         }
@@ -5148,19 +5222,8 @@ async fn write_admitted(
     // closes it — C keeps `asWritePvt` on `pciu->pPutNotify` for the same
     // reason.
     let (completion, settled) = PutNotifyCompletion::new(trap_guard.take());
-    // Register HERE, in the head both receive loops run, not in the caller:
-    // an unregistered channel silently opts out of the serialisation above,
-    // which is exactly how the two loops came to answer a concurrent
-    // put-callback differently. A simple PV's put callback is a PCAS one
-    // (`writeNotifyAction`, `casStrmClient.cc:1133-1190`), which no later
-    // request waits on.
-    if let (Some(_), DeferredReply::WriteNotify { reply, .. }) = (&notify_record, &reply) {
-        entry.put_notify_slot.install(InFlightPutNotify {
-            completion: completion.clone(),
-            reply: *reply,
-            busy_since: std::time::Instant::now(),
-            settled,
-        });
+    if let Some(r) = reply.write_notify() {
+        register_put_notify(entry, r, completion.clone(), settled);
     }
     Ok(WriteHeadOutcome::AsyncPending(PendingWriteNotify {
         rx,
@@ -5186,27 +5249,28 @@ pub(crate) struct WriteNotifyReply {
     pub req_hdr: CaHeader,
 }
 
-/// Send a WRITE_NOTIFY completion reply and fire the deferred trap-write
-/// AfterWrite — the single shared tail both the async server's completion
-/// task and the blocking driver's event thread run once the record's chain
-/// settles. `final_status` is the put's real completion status
-/// (`eca_status` on success, `ECA_PUTFAIL` if the completion sender was
-/// dropped). Keeping this in one place keeps the deferred-reply bytes and the
+/// Post a WRITE_NOTIFY completion reply and fire the deferred trap-write
+/// AfterWrite — the single shared tail every put-callback's answer runs, sync
+/// or not, on both front-ends. `final_status` is the put's real completion
+/// status (`eca_status` on success, `ECA_PUTFAIL` if the completion sender
+/// was dropped). Keeping this in one place keeps the reply bytes and the
 /// put-log AfterWrite status identical across both front-ends. `exception`
-/// goes out right behind the reply, in the same push, as pcas sends both
+/// goes out right behind the reply, in the same frame, as pcas sends both
 /// under the client lock.
-pub(crate) fn finish_write_notify(
-    trap_guard: &mut Option<epics_base_rs::server::access_security::TrapWriteGuard>,
+///
+/// `to` says where the reply goes; see [`CompletionRoute`].
+fn finish_write_notify(
+    mut owned: Option<PutNotifyReply>,
     final_status: u32,
     reply: &WriteNotifyReply,
-    writer: &impl FrameSink,
+    to: ReplyTo<'_, impl FrameSink>,
     client_minor: u16,
     exception: Option<Vec<u8>>,
-) -> CaResult<()> {
+) {
     // AfterWrite at real device-side completion. `status` carries "ok" for
     // ECA_NORMAL or the ECA-code form otherwise so listeners can filter
     // failed puts. `complete` disarms the guard so its later Drop is a no-op.
-    if let Some(guard) = trap_guard {
+    if let Some(guard) = owned.as_mut().and_then(|o| o.trap_guard.as_mut()) {
         let status_s = if final_status == ECA_NORMAL {
             "ok".to_string()
         } else {
@@ -5222,13 +5286,59 @@ pub(crate) fn finish_write_notify(
         reply.ioid,
         client_minor,
     ) else {
-        return Ok(());
+        return;
     };
     if let Some(exception) = exception {
         frame.extend_from_slice(&exception);
     }
-    writer.push(frame);
-    Ok(())
+    match to {
+        ReplyTo::Events(events) => events.post_reply(
+            frame,
+            owned.map(|o| Box::new(o) as epics_base_rs::server::event_queue::ReplyHold),
+        ),
+        ReplyTo::Stream(writer) => writer.push(frame),
+    }
+}
+
+/// Where a put-callback's completion reply goes, by the server C answers
+/// the channel's put from.
+#[derive(Clone, Copy)]
+enum CompletionRoute {
+    /// RSRV, for a record: `write_notify_done_callback` hands the reply to
+    /// `event_task`'s extra labor, behind the monitor updates the put posted
+    /// (`camessage.c:1342-1346`). The reply token rides with it and releases
+    /// the channel's next put-callback once it is staged, as C signals
+    /// `blockSem` after `cas_commit_msg` (`camessage.c:1452-1460`).
+    Events,
+    /// pcas, for a simple PV: `writeNotifyResponse` answers on the stream as
+    /// the write ends (casStrmClient.cc:1213-1233).
+    Stream,
+}
+
+impl CompletionRoute {
+    fn of(target: &ChannelTarget) -> Self {
+        match target {
+            ChannelTarget::RecordField { .. } => CompletionRoute::Events,
+            ChannelTarget::SimplePv(_) => CompletionRoute::Stream,
+        }
+    }
+
+    fn to<'a, W: FrameSink>(
+        self,
+        writer: &'a W,
+        events: &'a epics_base_rs::server::event_queue::EventUser,
+    ) -> ReplyTo<'a, W> {
+        match self {
+            CompletionRoute::Events => ReplyTo::Events(events),
+            CompletionRoute::Stream => ReplyTo::Stream(writer),
+        }
+    }
+}
+
+/// A [`CompletionRoute`] with its sink.
+enum ReplyTo<'a, W> {
+    Events(&'a epics_base_rs::server::event_queue::EventUser),
+    Stream(&'a W),
 }
 
 /// The sync-vs-async fork [`serve_write_head`] returns (C `dbProcessNotify`).
@@ -5352,6 +5462,45 @@ pub(crate) struct PendingWriteNotify {
     cancel: Option<(Arc<PvDatabase>, epics_base_rs::types::RecordName)>,
 }
 
+/// Register a put-callback as `entry`'s in-flight one, HERE in the head both
+/// receive loops run rather than in a caller: an unregistered channel
+/// silently opts out of [`PutNotifySlot::serialize`], which is exactly how the
+/// two loops came to answer a concurrent put-callback differently. A simple
+/// PV's put callback is a PCAS one (`writeNotifyAction`,
+/// `casStrmClient.cc:1133-1190`), which no later request waits on.
+fn register_put_notify(
+    entry: &ChannelEntry,
+    reply: &WriteNotifyReply,
+    completion: Arc<PutNotifyCompletion>,
+    settled: tokio::sync::watch::Receiver<()>,
+) {
+    if let ChannelTarget::RecordField { .. } = entry.target {
+        entry.put_notify_slot.install(InFlightPutNotify {
+            completion,
+            reply: *reply,
+            busy_since: std::time::Instant::now(),
+            settled,
+        });
+    }
+}
+
+/// [`register_put_notify`] for a put-callback answered as it is made: C sets
+/// `busy` for every one (`camessage.c:1772`) and clears it only once the
+/// reply is committed, so the channel's next put-callback waits for that
+/// reply as it would for a deferred one. The reply token, for the reply to
+/// carry; `None` for a simple PV, which registers nothing.
+fn register_answered_put_notify(
+    entry: &ChannelEntry,
+    reply: &WriteNotifyReply,
+) -> Option<PutNotifyReply> {
+    let ChannelTarget::RecordField { .. } = entry.target else {
+        return None;
+    };
+    let (completion, settled, owned) = PutNotifyCompletion::new_claimed();
+    register_put_notify(entry, reply, completion, settled);
+    Some(owned)
+}
+
 /// What a write sends once it ends.
 enum DeferredReply {
     /// A WRITE_NOTIFY's completion reply: `eca_status` on success,
@@ -5360,6 +5509,7 @@ enum DeferredReply {
         reply: WriteNotifyReply,
         eca_status: u32,
         cid: u32,
+        route: CompletionRoute,
     },
     /// A plain WRITE's: an ECA_PUTFAIL error on failure, nothing on success.
     WriteFailure {
@@ -5370,11 +5520,22 @@ enum DeferredReply {
 }
 
 impl DeferredReply {
+    /// The completion a WRITE_NOTIFY owes; `None` for a plain WRITE.
+    fn write_notify(&self) -> Option<&WriteNotifyReply> {
+        match self {
+            DeferredReply::WriteNotify { reply, .. } => Some(reply),
+            DeferredReply::WriteFailure { .. } => None,
+        }
+    }
+
+    /// `owned` is the reply's [`PutNotifyReply`], when the put registered
+    /// one: a WRITE_NOTIFY's goes out with its frame.
     fn send(
         &self,
         ended: WriteEnded,
-        trap_guard: &mut Option<epics_base_rs::server::access_security::TrapWriteGuard>,
+        owned: Option<PutNotifyReply>,
         writer: &impl FrameSink,
+        events: &epics_base_rs::server::event_queue::EventUser,
         client_minor: u16,
     ) -> CaResult<()> {
         match self {
@@ -5382,6 +5543,7 @@ impl DeferredReply {
                 reply,
                 eca_status,
                 cid,
+                route,
             } => {
                 let (final_status, exception) = match ended {
                     WriteEnded::Done => (*eca_status, None),
@@ -5400,13 +5562,13 @@ impl DeferredReply {
                     ),
                 };
                 finish_write_notify(
-                    trap_guard,
+                    owned,
                     final_status,
                     reply,
-                    writer,
+                    route.to(writer, events),
                     client_minor,
                     exception,
-                )?;
+                );
             }
             DeferredReply::WriteFailure { req_hdr, cid, name } => {
                 // pcas answers a failed write with its status's text:
@@ -5500,35 +5662,26 @@ impl PendingWriteNotify {
     /// `ended` is how the write ended: an aborted chain surfaces as
     /// ECA_PUTFAIL so the client never sees a false success — C rsrv.
     ///
-    /// `commit` is how THIS driver gets the queued reply into the circuit's
-    /// wire order, and it is a parameter rather than something the caller runs
-    /// afterwards because the channel's next put-callback is released by the
-    /// reply token dying — which happens here, after `commit` has returned. C
-    /// signals `blockSem` only after `cas_commit_msg`
-    /// (`camessage.c:1452-1460`), and for the same reason: a successor
-    /// released before the commit can reach the socket first. On the async
-    /// server the shared outbox this pushed to IS the single writer's queue,
-    /// so its `commit` has nothing to do; the blocking driver stages into a
-    /// private outbox and has to drain it under the send lock. `false` reports
-    /// the peer gone.
+    /// A WRITE_NOTIFY's reply is posted to `events` with the reply token as
+    /// its hold, so the channel's next put-callback is released only once
+    /// the circuit's event consumer has staged it: C signals `blockSem` after
+    /// `cas_commit_msg` (`camessage.c:1452-1460`). A plain WRITE's error goes
+    /// to `writer`.
     pub(crate) fn settle(
         &mut self,
         ended: WriteEnded,
         writer: &impl FrameSink,
+        events: &epics_base_rs::server::event_queue::EventUser,
         client_minor: u16,
-        commit: impl FnOnce() -> bool,
-    ) -> CaResult<bool> {
+    ) -> CaResult<()> {
         // Losing the claim means a predecessor-timeout supersede already
         // answered this ioid with ECA_PUTCBINPROG and closed its put-log
         // bracket with it. One ioid, one reply.
-        let Some(mut owned) = self.completion.claim() else {
-            return Ok(commit());
+        let Some(owned) = self.completion.claim() else {
+            return Ok(());
         };
         self.reply
-            .send(ended, &mut owned.trap_guard, writer, client_minor)?;
-        // `owned` — and with it the successor's release — dies at the end of
-        // this scope, after the commit.
-        Ok(commit())
+            .send(ended, Some(owned), writer, events, client_minor)
     }
 }
 
@@ -6024,6 +6177,8 @@ enum EventStep {
     Control(Option<EventTaskControl>),
     /// Pending write-completion `idx` ended.
     WriteDone(usize, WriteEnded),
+    /// A reply posted to the circuit is due, left in the slot.
+    Reply,
 }
 
 /// Wait for the next in-flight put-callback to report, and say which one did.
@@ -6104,6 +6259,9 @@ async fn next_event_step(
             match slot {
                 Some(CircuitEvent::Event { remaining, .. }) => {
                     return std::task::Poll::Ready(EventStep::Delivered(*remaining));
+                }
+                Some(CircuitEvent::Reply { .. }) => {
+                    return std::task::Poll::Ready(EventStep::Reply);
                 }
                 Some(CircuitEvent::Ended(id)) => {
                     let id = *id;
@@ -6255,6 +6413,7 @@ async fn retire_destroyed(
     subs: &mut Vec<MonitorDelivery>,
     pending_writes: &mut Vec<PendingWriteNotify>,
     sink: &mut impl EventSink,
+    events: &epics_base_rs::server::event_queue::EventUser,
     client_minor: u16,
 ) -> bool {
     destroyed
@@ -6264,7 +6423,7 @@ async fn retire_destroyed(
                 acks.extend(take_control(msg, subs, pending_writes));
             }
             for cid in cids {
-                if !retire_channel(cid, pending_writes, sink, client_minor) {
+                if !retire_channel(cid, pending_writes, sink, events, client_minor) {
                     return false;
                 }
             }
@@ -6277,28 +6436,26 @@ async fn retire_destroyed(
 }
 
 /// The blocking driver's retirement of channel `cid`: answer every write still
-/// owed on it, then stage its `CA_PROTO_SERVER_DISCONN`. `false` reports the
-/// peer gone.
+/// owed on it, then owe its `CA_PROTO_SERVER_DISCONN` behind those answers.
+/// `false` reports the peer gone.
 fn retire_channel(
     cid: u32,
     pending_writes: &mut Vec<PendingWriteNotify>,
     sink: &mut impl EventSink,
+    events: &epics_base_rs::server::event_queue::EventUser,
     client_minor: u16,
 ) -> bool {
-    {
-        let to = StageNow::new(&mut *sink);
-        for (mut p, ended) in take_owed_writes(pending_writes, |p| p.cid() == cid) {
-            // An unshippable reply (16k-array boundary) is dropped, as
-            // `WriteDone` drops it.
-            if let Ok(false) = p.settle(ended, &to, client_minor, || !to.gone.get()) {
-                return false;
-            }
-        }
-        if to.gone.get() {
-            return false;
-        }
+    let to = StageNow::new(sink);
+    for (mut p, ended) in take_owed_writes(pending_writes, |p| p.cid() == cid) {
+        // An unshippable reply (16k-array boundary) is dropped, as
+        // `WriteDone` drops it.
+        let _ = p.settle(ended, &to, events, client_minor);
     }
-    sink.stage(&server_disconn_frame(cid)).is_ok()
+    if to.gone.get() {
+        return false;
+    }
+    events.post_reply(server_disconn_frame(cid), None);
+    true
 }
 
 /// [`run_event_task`]'s side of the client's send buffer — C `client->send`
@@ -6439,6 +6596,7 @@ pub(crate) async fn run_event_task(
     // The circuit's oldest entry, moved here from its ring slot once and
     // framed in place; emptied before the next poll.
     let mut slot = None;
+    let _closed = CloseReplies(&events);
     loop {
         // C `read_reply` sends a delivered frame only `if (!eventsRemaining)`
         // (`camessage.c:525`, `:536`, `:593`), below. The frames the other
@@ -6477,6 +6635,7 @@ pub(crate) async fn run_event_task(
                     &mut subs,
                     &mut pending_writes,
                     &mut sink.0,
+                    &events,
                     minor.get(),
                 )
                 .await
@@ -6492,6 +6651,7 @@ pub(crate) async fn run_event_task(
                     &mut subs,
                     &mut pending_writes,
                     &mut sink.0,
+                    &events,
                     minor.get(),
                 )
                 .await
@@ -6553,27 +6713,32 @@ pub(crate) async fn run_event_task(
                 }
             }
             EventStep::WriteDone(idx, res) => {
-                // A deferred WRITE_NOTIFY's record chain settled. Send its
-                // completion reply under the send lock through the SAME shared
-                // tail the async server's completion task runs
-                // (`PendingWriteNotify::settle`), so the deferred-reply bytes and
-                // the decision about whether a reply is still owed are one copy,
-                // not two.
+                // A deferred WRITE_NOTIFY's record chain settled. Its reply
+                // takes the SAME shared tail the async server's completion
+                // task runs (`PendingWriteNotify::settle`), so the reply bytes
+                // and the decision about whether one is still owed are one
+                // copy, not two.
                 let mut p = pending_writes.remove(idx);
-                // Staging INSIDE `settle` is what keeps this driver's two
-                // writers in order: they meet only in the shared send buffer,
-                // and the dispatch thread, released by this reply, would
-                // otherwise be free to stage its own put-callback's reply
-                // ahead of it.
                 let to = StageNow::new(&mut sink.0);
-                let committed = p.settle(res, &to, minor.get(), || !to.gone.get());
-                match committed {
-                    // Encoding the reply failed (16k-array boundary): the reply
-                    // is unshippable, drop this completion and keep serving.
-                    Err(_) => continue,
-                    Ok(false) => break,
-                    Ok(true) => {}
+                // An unshippable inline reply (16k-array boundary) is dropped
+                // and the circuit keeps serving.
+                let _ = p.settle(res, &to, &events, minor.get());
+                if to.gone.get() {
+                    break;
                 }
+            }
+            EventStep::Reply => {
+                let Some(epics_base_rs::server::event_queue::CircuitEvent::Reply { frame, hold }) =
+                    slot.take()
+                else {
+                    unreachable!("a reply step leaves its reply in the slot")
+                };
+                if !frame.is_empty() && sink.0.stage(&frame).is_err() {
+                    break;
+                }
+                // Staged in the buffer the dispatch thread shares, so the
+                // successor this releases stages behind it.
+                drop(hold);
             }
         }
     }
@@ -7412,13 +7577,21 @@ pub(crate) async fn run_circuit_monitors(
     minor: CircuitMinor,
 ) {
     use epics_base_rs::server::event_queue::CircuitEvent;
+    // The connection loop aborts this task when the circuit ends.
+    let _closed = CloseReplies(&events);
     loop {
-        // An ended stream needs nothing here: the connection loop retires a
-        // destroyed channel itself (`sweep_destroyed_channels`).
-        let CircuitEvent::Event { context, event, .. } =
-            std::future::poll_fn(|cx| events.poll_next(cx)).await
-        else {
-            continue;
+        let (context, event) = match std::future::poll_fn(|cx| events.poll_next(cx)).await {
+            CircuitEvent::Event { context, event, .. } => (context, event),
+            CircuitEvent::Reply { frame, hold } => {
+                if !frame.is_empty() {
+                    outbox.push(frame);
+                }
+                drop(hold);
+                continue;
+            }
+            // An ended stream needs nothing here: the connection loop retires
+            // a destroyed channel itself (`sweep_destroyed_channels`).
+            CircuitEvent::Ended(_) => continue,
         };
         let Some(m) = context.downcast_ref::<CircuitMonitor>() else {
             continue;
@@ -7435,6 +7608,36 @@ pub(crate) async fn run_circuit_monitors(
             }
         }
     }
+}
+
+/// Closes a circuit's reply queue when its event consumer exits by any path,
+/// so a reply posted after that is dropped with its hold rather than owed
+/// forever: a hold is a put-callback's busy state, and a successor waits on
+/// it ([`PutNotifySlot::serialize`]).
+struct CloseReplies<'a>(&'a epics_base_rs::server::event_queue::EventUser);
+
+impl Drop for CloseReplies<'_> {
+    fn drop(&mut self) {
+        self.0.close_replies();
+    }
+}
+
+/// Every reply `events` has due now, in order, as the circuit's consumer
+/// would stage them; their holds are released. The circuit has no monitor.
+#[cfg(test)]
+pub(crate) fn due_replies(events: &epics_base_rs::server::event_queue::EventUser) -> Vec<Vec<u8>> {
+    use epics_base_rs::server::event_queue::CircuitEvent;
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    let mut out = Vec::new();
+    while let std::task::Poll::Ready(e) = events.poll_next(&mut cx) {
+        match e {
+            CircuitEvent::Reply { frame, .. } => out.push(frame),
+            CircuitEvent::Event { .. } | CircuitEvent::Ended(_) => {
+                panic!("a monitor entry on a circuit with no monitor")
+            }
+        }
+    }
+    out
 }
 
 /// Deliver one queued entry of a record-field monitor.
@@ -8283,6 +8486,7 @@ async fn next_write_notify_step(
 async fn run_write_notify_queue(
     mut control: tokio::sync::mpsc::UnboundedReceiver<WriteNotifyQueueMsg>,
     outbox: Outbox,
+    events: Arc<epics_base_rs::server::event_queue::EventUser>,
     minor: CircuitMinor,
 ) {
     let mut pending: Vec<PendingWriteNotify> = Vec::new();
@@ -8296,7 +8500,7 @@ async fn run_write_notify_queue(
             #[cfg(tokio_backend)]
             WriteNotifyStep::Control(Some(WriteNotifyQueueMsg::Retire(sids, done))) => {
                 for (mut p, ended) in take_owed_writes(&mut pending, |p| sids.contains(&p.sid)) {
-                    let _ = p.settle(ended, &outbox, minor.get(), || true);
+                    let _ = p.settle(ended, &outbox, &events, minor.get());
                 }
                 let _ = done.send(());
             }
@@ -8306,9 +8510,7 @@ async fn run_write_notify_queue(
                 let mut p = pending.remove(idx);
                 // An unshippable reply (16k-array boundary) is dropped, as it
                 // is on the blocking driver's owner; the circuit keeps serving.
-                // The commit is a no-op: `outbox` is the one writer task's
-                // queue, so the push `settle` made is already the wire order.
-                let _ = p.settle(res, &outbox, minor.get(), || true);
+                let _ = p.settle(res, &outbox, &events, minor.get());
             }
         }
     }
@@ -8750,6 +8952,9 @@ struct PcasRefusal {
     cid: u32,
     /// The channel's element count.
     elements: u32,
+    /// The channel was retired: its `CA_PROTO_SERVER_DISCONN` is owed on the
+    /// circuit's reply queue, and this answer goes behind it.
+    retired: bool,
 }
 
 /// PCAS `verifyRequest`, which READ, READ_NOTIFY, WRITE, WRITE_NOTIFY and
@@ -8778,6 +8983,7 @@ fn pcas_verify_request(
         status,
         cid: entry.cid,
         elements: entry.final_element_count,
+        retired: false,
     })
 }
 
@@ -8788,6 +8994,7 @@ fn retired_refusal(state: &ClientState, sid: u32) -> Option<PcasRefusal> {
         status: ECA_BADCHID,
         cid: 0xFFFF_FFFF,
         elements,
+        retired: true,
     })
 }
 
@@ -8801,11 +9008,48 @@ fn answer_pcas_refusal(
     state: &ClientState,
     refusal: PcasRefusal,
 ) -> CaResult<()> {
+    if !refusal.retired {
+        return refuse_pcas_request(writer, hdr, state, refusal);
+    }
+    // pcas commits a retired channel's SERVER_DISCONN as it leaves the table
+    // (`casStrmClient.cc:2171-2209`), so no answer naming it can go ahead.
+    let mut frames = Collected::default();
+    let refused = refuse_pcas_request(&StageNow::new(&mut frames), hdr, state, refusal);
+    if !frames.0.is_empty() {
+        state.event_user.post_reply(frames.0, None);
+    }
+    refused
+}
+
+/// Frames gathered for one [`EventUser::post_reply`].
+///
+/// [`EventUser::post_reply`]: epics_base_rs::server::event_queue::EventUser::post_reply
+#[derive(Default)]
+struct Collected(Vec<u8>);
+
+impl EventSink for Collected {
+    fn stage(&mut self, frame: &[u8]) -> std::io::Result<()> {
+        self.0.extend_from_slice(frame);
+        Ok(())
+    }
+    fn send(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// [`answer_pcas_refusal`]'s frames, written to `writer`.
+fn refuse_pcas_request(
+    writer: &impl FrameSink,
+    hdr: &CaHeader,
+    state: &ClientState,
+    refusal: PcasRefusal,
+) -> CaResult<()> {
     let minor = state.client_minor_version();
     let PcasRefusal {
         status,
         cid,
         elements,
+        retired: _,
     } = refusal;
     let reply = |frame: Result<Vec<u8>, ExtendedHeaderUnsupported>| {
         writer.push(frame.map_err(|_| {
@@ -8875,7 +9119,7 @@ fn answer_pcas_refusal(
 /// PCAS `logBadIdWithFileAndLineno` (`casStrmClient.cc:2925-2950`) for the
 /// `logBadId` at `line`, with `__FILE__` as the pcas module build spells it.
 fn pcas_log_bad_id(
-    writer: &Outbox,
+    writer: &impl FrameSink,
     hdr: &CaHeader,
     state: &ClientState,
     line: u32,
@@ -9127,24 +9371,27 @@ mod write_notify_queue_tests {
                 },
                 eca_status: crate::protocol::ECA_NORMAL,
                 cid: 1,
+                route: super::CompletionRoute::Events,
             },
             completion: PutNotifyCompletion::new(None).0,
             sid,
-            // A simple-PV put: nothing parks a notify, so nothing to cancel.
+            // No record parks a notify here, so nothing to cancel.
             cancel: None,
         };
         (p, tx)
     }
 
-    /// A channel's next put-callback is released by [`PendingWriteNotify::settle`]
-    /// only AFTER the driver's commit has run, because on the blocking driver
-    /// the commit — not the outbox push — is what fixes the wire order.
+    /// A channel's next put-callback is released once the circuit's consumer
+    /// has taken the reply [`PendingWriteNotify::settle`] posted, not by the
+    /// post: the consumer's staging is what fixes the wire order.
     // RTEMS-EXEC-MODEL-ALLOW(1): measured — passes under
     // `EPICS_RS_BUILD_EXEC_BACKEND=thread`; it awaits nothing and needs no
     // reactor.
     #[tokio::test]
-    async fn the_commit_runs_before_the_successor_is_released() {
+    async fn the_successor_is_released_once_the_reply_is_taken() {
+        use epics_base_rs::server::event_queue::{CircuitEvent, EventUser};
         let (outbox, _drain) = crate::server::outbox::channel();
+        let events = EventUser::new();
         let (completion, settled) = PutNotifyCompletion::new(None);
         let mut p = PendingWriteNotify {
             rx: super::PutEnd::Chain(tokio::sync::oneshot::channel().1),
@@ -9157,43 +9404,50 @@ mod write_notify_queue_tests {
                 },
                 eca_status: crate::protocol::ECA_NORMAL,
                 cid: 1,
+                route: super::CompletionRoute::Events,
             },
             completion,
             sid: 1,
             cancel: None,
         };
-        let committed = p.settle(
+        p.settle(
             super::WriteEnded::Done,
             &outbox,
+            &events,
             crate::protocol::CA_MINOR_VERSION,
-            || {
-                assert!(
-                    settled.has_changed().is_ok(),
-                    "the successor must still be waiting while the reply is being committed"
-                );
-                true
-            },
+        )
+        .expect("encode");
+        assert!(
+            settled.has_changed().is_ok(),
+            "the successor must still be waiting while the reply is owed"
+        );
+        let std::task::Poll::Ready(CircuitEvent::Reply { frame, hold }) =
+            events.poll_next(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+        else {
+            panic!("the reply is due: nothing is queued ahead of it")
+        };
+        assert_eq!(
+            u16::from_be_bytes([frame[0], frame[1]]),
+            CA_PROTO_WRITE_NOTIFY
         );
         assert!(
-            committed.expect("encode"),
-            "the commit reported the peer live"
+            settled.has_changed().is_ok(),
+            "nor while the consumer is staging it"
         );
+        drop(hold);
         assert!(
             settled.has_changed().is_err(),
-            "and released once it is committed"
+            "and released once it is staged"
         );
     }
 
-    /// The ioid of every WRITE_NOTIFY frame the outbox holds, in wire order.
-    fn completions(drain: &mut crate::server::outbox::OutboxDrain) -> Vec<u32> {
-        let mut out = Vec::new();
-        while let Some(frame) = drain.try_next() {
-            let f = frame.to_vec();
-            if u16::from_be_bytes([f[0], f[1]]) == CA_PROTO_WRITE_NOTIFY {
-                out.push(u32::from_be_bytes([f[12], f[13], f[14], f[15]]));
-            }
-        }
-        out
+    /// The ioid of every WRITE_NOTIFY reply `events` owes, in wire order.
+    fn completions(events: &epics_base_rs::server::event_queue::EventUser) -> Vec<u32> {
+        super::due_replies(events)
+            .iter()
+            .filter(|f| u16::from_be_bytes([f[0], f[1]]) == CA_PROTO_WRITE_NOTIFY)
+            .map(|f| u32::from_be_bytes([f[12], f[13], f[14], f[15]]))
+            .collect()
     }
 
     /// The whole point of the queue: when two put-callbacks report together,
@@ -9267,11 +9521,13 @@ mod write_notify_queue_tests {
     // backend.
     #[tokio::test]
     async fn clearing_a_channel_drops_only_that_channels_put_callbacks() {
-        let (outbox, mut drain) = crate::server::outbox::channel();
+        let (outbox, _drain) = crate::server::outbox::channel();
+        let events = std::sync::Arc::new(epics_base_rs::server::event_queue::EventUser::new());
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let owner = tokio::spawn(run_write_notify_queue(
             rx,
             outbox,
+            events.clone(),
             super::CircuitMinor::new(crate::protocol::CA_MINOR_VERSION),
         ));
 
@@ -9297,7 +9553,7 @@ mod write_notify_queue_tests {
 
         drop(tx);
         owner.await.expect("owner ends when its sender is dropped");
-        assert_eq!(completions(&mut drain), vec![0xBBBB]);
+        assert_eq!(completions(&events), vec![0xBBBB]);
     }
 
     /// The owner ends with the circuit. A put-callback still queued when the
@@ -9306,11 +9562,13 @@ mod write_notify_queue_tests {
     // backend.
     #[tokio::test]
     async fn the_owner_ends_when_the_connection_drops_its_sender() {
-        let (outbox, mut drain) = crate::server::outbox::channel();
+        let (outbox, _drain) = crate::server::outbox::channel();
+        let events = std::sync::Arc::new(epics_base_rs::server::event_queue::EventUser::new());
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let owner = tokio::spawn(run_write_notify_queue(
             rx,
             outbox,
+            events.clone(),
             super::CircuitMinor::new(crate::protocol::CA_MINOR_VERSION),
         ));
         let (p, _tx_never_fires) = pending(1, 0xD00D);
@@ -9318,7 +9576,7 @@ mod write_notify_queue_tests {
             .expect("owner alive");
         drop(tx);
         owner.await.expect("owner ends when its sender is dropped");
-        assert!(completions(&mut drain).is_empty());
+        assert!(completions(&events).is_empty());
     }
 
     /// What the event task asked of its sink, with each staged frame's
@@ -9442,6 +9700,7 @@ mod write_notify_queue_tests {
                 },
                 eca_status: crate::protocol::ECA_NORMAL,
                 cid: 1,
+                route: super::CompletionRoute::Events,
             },
             completion,
             sid: 1,
@@ -9852,7 +10111,7 @@ mod postponed_put_resume_tests {
         }
     }
 
-    fn write_notify_frame(sid: u32, ioid: u32, value: f64) -> Vec<u8> {
+    pub(super) fn write_notify_frame(sid: u32, ioid: u32, value: f64) -> Vec<u8> {
         let mut h = CaHeader::new(CA_PROTO_WRITE_NOTIFY);
         h.data_type = epics_base_rs::types::DBR_DOUBLE;
         h.count = 1;
@@ -9880,7 +10139,7 @@ mod postponed_put_resume_tests {
 
     /// A circuit with one channel open on `name`, an async-once record; the
     /// ACF reload sender stands in for `asInit`.
-    async fn open_circuit(
+    pub(super) async fn open_circuit(
         db: &Arc<PvDatabase>,
         acf: epics_base_rs::server::access_security::AcfCell,
         name: &str,
@@ -10018,6 +10277,116 @@ mod postponed_put_resume_tests {
         client.flush().await.expect("flush");
         assert_eq!(next_header(&mut client).await.cmmd, CA_PROTO_ECHO);
         drop((client, acf_reload_tx));
+        handle.abort();
+    }
+}
+
+#[cfg(all(test, tokio_backend))]
+mod put_reply_order_tests {
+    //! rsrv answers a record's put callback from `event_task`'s extra labor
+    //! (`camessage.c:1342-1346`), which runs once `event_read` has taken the
+    //! updates queued before it (`dbEvent.c:1038-1053`): the client reads the
+    //! update its put posted before the put's completion.
+    use super::non_graceful_disconnect_teardown_tests::event_add_frame;
+    use super::postponed_put_resume_tests::{open_circuit, write_notify_frame};
+    use super::*;
+    use epics_base_rs::server::access_security::new_acf_cell;
+    use epics_base_rs::server::database::PvDatabase;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// The next frame's header and payload.
+    async fn next_frame(client: &mut tokio::io::DuplexStream) -> (CaHeader, Vec<u8>) {
+        let mut head = vec![0u8; CaHeader::SIZE];
+        tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut head))
+            .await
+            .expect("answered")
+            .expect("header");
+        let (h, _) = CaHeader::from_bytes_extended(&head).expect("header parses");
+        let mut body = vec![0u8; h.actual_postsize()];
+        client.read_exact(&mut body).await.expect("body");
+        (h, body)
+    }
+
+    /// The value of every DBR_TIME_DOUBLE update read before `ioid`'s
+    /// completion, which must be ECA_NORMAL.
+    async fn updates_before(client: &mut tokio::io::DuplexStream, ioid: u32) -> Vec<f64> {
+        let mut values = Vec::new();
+        loop {
+            let (h, body) = next_frame(client).await;
+            match h.cmmd {
+                // status, severity, stamp, RISC_pad, then the value.
+                CA_PROTO_EVENT_ADD => {
+                    values.push(f64::from_be_bytes(body[16..24].try_into().unwrap()))
+                }
+                CA_PROTO_WRITE_NOTIFY if h.available == ioid => {
+                    assert_eq!(h.cid, ECA_NORMAL);
+                    return values;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// A circuit subscribed to an async-once record, its first update read.
+    async fn subscribed(
+        db: &Arc<PvDatabase>,
+        name: &str,
+    ) -> (
+        tokio::io::DuplexStream,
+        tokio::sync::broadcast::Sender<()>,
+        tokio::task::JoinHandle<CaResult<()>>,
+        u32,
+    ) {
+        let (mut client, acf_reload_tx, handle, sid) =
+            open_circuit(db, new_acf_cell(None), name).await;
+        client
+            .write_all(&event_add_frame(sid, 1))
+            .await
+            .expect("event_add");
+        loop {
+            if next_frame(&mut client).await.0.cmmd == CA_PROTO_EVENT_ADD {
+                return (client, acf_reload_tx, handle, sid);
+            }
+        }
+    }
+
+    /// Boundary: the record's chain goes async, and the completion comes from
+    /// the write-notify queue.
+    #[tokio::test]
+    async fn an_async_put_callback_is_answered_after_the_update_it_posted() {
+        let db = Arc::new(PvDatabase::new());
+        let (mut client, _acf, handle, sid) = subscribed(&db, "PO:ASY").await;
+        client
+            .write_all(&write_notify_frame(sid, 1, 1.0))
+            .await
+            .expect("write_notify");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        db.complete_async_record("PO:ASY").await.expect("completed");
+        assert_eq!(updates_before(&mut client, 1).await.last(), Some(&1.0));
+        handle.abort();
+    }
+
+    /// Boundary: the put is answered as it is made.
+    #[tokio::test]
+    async fn a_sync_put_callback_is_answered_after_the_update_it_posted() {
+        let db = Arc::new(PvDatabase::new());
+        let (mut client, _acf, handle, sid) = subscribed(&db, "PO:SYN").await;
+        // The record's one async process, spent first.
+        client
+            .write_all(&write_notify_frame(sid, 1, 1.0))
+            .await
+            .expect("write_notify");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        db.complete_async_record("PO:SYN").await.expect("completed");
+        updates_before(&mut client, 1).await;
+
+        client
+            .write_all(&write_notify_frame(sid, 2, 2.0))
+            .await
+            .expect("write_notify");
+        assert_eq!(updates_before(&mut client, 2).await.last(), Some(&2.0));
         handle.abort();
     }
 }
@@ -16531,26 +16900,23 @@ mod destroyed_channel_teardown_tests {
         assert!(drain.try_next().is_none(), "nothing on the wire");
     }
 
-    /// [`EventTaskControl::Sweep`] is answered after the retirements it
-    /// finds are staged, though no wake-up announced them: a postponing PV is
+    /// [`EventTaskControl::Sweep`] is answered once the retirements it finds
+    /// are owed, though no wake-up announced them: a postponing PV is
     /// signalled by its destroy before the destroy's wake-up is sent, and the
-    /// request it held must run again behind the `CA_PROTO_SERVER_DISCONN`.
+    /// request it held runs again on the ack. What that run answers is
+    /// staged behind the `CA_PROTO_SERVER_DISCONN`.
     // RTEMS-EXEC-MODEL-ALLOW(1): drives `run_event_task` on the test runtime
     // with a recording sink, no socket.
     #[tokio::test]
     async fn a_sweep_request_is_answered_after_the_retirements_it_finds() {
         use epics_base_rs::server::event_queue::EventUser;
 
-        /// Records each staged frame with whether the sweep was answered yet.
-        struct AckSeen {
-            swept: tokio::sync::oneshot::Receiver<()>,
-            staged: Vec<(u16, bool)>,
-        }
-        impl EventSink for &mut AckSeen {
+        /// Records each staged frame's command.
+        #[derive(Default)]
+        struct Commands(Vec<u16>);
+        impl EventSink for &mut Commands {
             fn stage(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-                let answered = self.swept.try_recv().is_ok();
-                self.staged
-                    .push((u16::from_be_bytes([bytes[0], bytes[1]]), answered));
+                self.0.push(u16::from_be_bytes([bytes[0], bytes[1]]));
                 Ok(())
             }
             fn send(&mut self) -> std::io::Result<()> {
@@ -16560,26 +16926,32 @@ mod destroyed_channel_teardown_tests {
 
         let destroyed = DestroyedCids::default();
         destroyed.destroy_unannounced(7);
+        let events = Arc::new(EventUser::new());
         let (ack, swept) = tokio::sync::oneshot::channel();
-        let mut sink = AckSeen {
-            swept,
-            staged: Vec::new(),
-        };
         let (ctl_tx, ctl_rx) = tokio::sync::mpsc::unbounded_channel();
         ctl_tx
             .send(EventTaskControl::Sweep(ack))
             .expect("receiver is held");
-        drop(ctl_tx);
+        // The held request, run again once the sweep is answered.
+        let rerun = tokio::spawn({
+            let events = events.clone();
+            async move {
+                swept.await.expect("the sweep is answered");
+                events.post_reply(CaHeader::new(CA_PROTO_ERROR).to_bytes().to_vec(), None);
+                drop(ctl_tx);
+            }
+        });
+        let mut sink = Commands::default();
         run_event_task(
-            Arc::new(EventUser::new()),
+            events,
             ctl_rx,
             destroyed,
             &mut sink,
             crate::server::tcp::CircuitMinor::new(crate::protocol::CA_MINOR_VERSION),
         )
         .await;
-        assert_eq!(sink.staged, [(CA_PROTO_SERVER_DISCONN, false)]);
-        assert!(sink.swept.try_recv().is_ok(), "the sweep is answered");
+        rerun.await.expect("the rerun ends");
+        assert_eq!(sink.0, [CA_PROTO_SERVER_DISCONN, CA_PROTO_ERROR]);
     }
 }
 
@@ -17852,6 +18224,7 @@ mod access_change_walk_tests {
                     }
                 }
                 CircuitEvent::Ended(_) => panic!("monitor ended"),
+                CircuitEvent::Reply { .. } => panic!("no reply is owed"),
             })
     }
 

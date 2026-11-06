@@ -1203,6 +1203,7 @@ async fn deliver_events(events: Arc<LocalEvents>) {
                         monitor.end();
                     }
                 }
+                CircuitEvent::Reply { .. } => unreachable!("local links post no replies"),
             }
             std::task::Poll::Ready(())
         })

@@ -143,25 +143,35 @@ impl Client {
     fn put(&mut self, cmd: u16, sid: u32) -> Vec<(u16, u32)> {
         let mut f = hdr(cmd, 8, DBR_DOUBLE, 1, sid, 7);
         f.extend(1.0f64.to_be_bytes());
-        f.extend(hdr(CA_PROTO_ECHO, 0, 0, 0, 0, 0));
         self.sock.write_all(&f).unwrap();
         let mut got = Vec::new();
+        // rsrv answers a WRITE_NOTIFY from its event task, unordered against
+        // the ECHO the receive thread answers (`camessage.c:1342-1346`), so
+        // the ECHO goes out once that reply is in.
+        while cmd == CA_PROTO_WRITE_NOTIFY && !got.iter().any(|&(c, _)| c == cmd) {
+            let frame = self.next();
+            got.extend(status(&frame));
+        }
+        self.sock
+            .write_all(&hdr(CA_PROTO_ECHO, 0, 0, 0, 0, 0))
+            .unwrap();
         loop {
             let frame = self.next();
-            let status = u32::from_be_bytes(frame[8..12].try_into().unwrap());
-            match u16::from_be_bytes([frame[0], frame[1]]) {
-                CA_PROTO_ECHO => return got,
-                c @ (CA_PROTO_ERROR | CA_PROTO_WRITE_NOTIFY) => {
-                    let status = if c == CA_PROTO_ERROR {
-                        u32::from_be_bytes(frame[12..16].try_into().unwrap())
-                    } else {
-                        status
-                    };
-                    got.push((c, status));
-                }
-                _ => {}
+            if u16::from_be_bytes([frame[0], frame[1]]) == CA_PROTO_ECHO {
+                return got;
             }
+            got.extend(status(&frame));
         }
+    }
+}
+
+/// The status an ERROR or WRITE_NOTIFY reply carries.
+fn status(frame: &[u8]) -> Option<(u16, u32)> {
+    let word = |at: usize| u32::from_be_bytes(frame[at..at + 4].try_into().unwrap());
+    match u16::from_be_bytes([frame[0], frame[1]]) {
+        CA_PROTO_ERROR => Some((CA_PROTO_ERROR, word(12))),
+        CA_PROTO_WRITE_NOTIFY => Some((CA_PROTO_WRITE_NOTIFY, word(8))),
+        _ => None,
     }
 }
 

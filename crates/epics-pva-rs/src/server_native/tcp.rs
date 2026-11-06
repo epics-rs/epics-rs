@@ -3804,6 +3804,14 @@ enum Outbound {
     Hosting(Queued, HostedSubscriber),
 }
 
+impl Outbound {
+    fn len(&self) -> usize {
+        match self {
+            Self::Frame(Queued(frame, _)) | Self::Hosting(Queued(frame, _), _) => frame.len(),
+        }
+    }
+}
+
 #[cfg(test)]
 impl Outbound {
     /// The frame, dropping its bytes and any subscriber it carries.
@@ -4101,41 +4109,76 @@ fn poll_unbudgeted<T>(
 struct WriterQueues {
     rx: tokio::sync::mpsc::Receiver<Outbound>,
     subscribers: SubscriberSet,
+    /// Entries taken from `rx` and not written yet.
+    held: VecDeque<Outbound>,
+    /// Subscriber frames that go on the wire ahead of `held`.
+    ahead: VecDeque<Queued>,
 }
 
 impl WriterQueues {
+    fn new(rx: tokio::sync::mpsc::Receiver<Outbound>, subscribers: SubscriberSet) -> Self {
+        Self {
+            rx,
+            subscribers,
+            held: VecDeque::new(),
+            ahead: VecDeque::new(),
+        }
+    }
+
     /// Fill `batch` for one write: `first` and at most
     /// [`WRITER_PASS_FRAMES`] entries from `rx` in all, then — the
     /// subscribers polled once those are taken — the frames the subscribers
     /// queued. Each half stops at [`WRITER_COALESCE_BYTES`] of its own, so a
     /// busy `rx` cannot crowd the subscribers out of a write.
     ///
-    /// A subscriber is adopted as its INIT reply is taken and polled before
-    /// the subscribers' frames are, so its first frames follow that reply in
-    /// the same write and never precede it.
-    async fn fill(&mut self, mut first: Option<Outbound>, batch: &mut WriteBatch) {
-        let mut taken = 0;
-        while taken < WRITER_PASS_FRAMES && batch.bytes.len() < WRITER_COALESCE_BYTES {
-            let Some(next) = first.take().or_else(|| self.rx.try_recv().ok()) else {
+    /// An `rx` entry goes on the wire behind every frame the subscribers
+    /// yield when polled right after it is taken. pvxs dispatches a post's
+    /// update and an op's reply onto one loop in the order they happen
+    /// (`servermon.cpp:84`, `serverget.cpp:290`), so a PUT whose source
+    /// posted to a subscription (`sharedpv.cpp:127-129`) replies behind that
+    /// update; taking the reply first wrote it ahead.
+    ///
+    /// A subscriber is adopted as its INIT reply is written and polled after
+    /// it, so its first frames follow that reply in the same write and never
+    /// precede it.
+    async fn fill(&mut self, first: Option<Outbound>, batch: &mut WriteBatch) {
+        let held = self.held.len();
+        self.held.extend(first);
+        let mut held_bytes: usize = self.held.iter().map(Outbound::len).sum();
+        while self.held.len() < WRITER_PASS_FRAMES && held_bytes < WRITER_COALESCE_BYTES {
+            let Ok(next) = self.rx.try_recv() else {
                 break;
             };
-            taken += 1;
-            match next {
-                Outbound::Frame(frame) => batch.push(frame),
-                Outbound::Hosting(frame, task) => {
-                    batch.push(frame);
-                    self.subscribers.adopt(task);
+            held_bytes += next.len();
+            self.held.push_back(next);
+        }
+        if self.held.len() > held {
+            self.poll_subscribers().await;
+            self.ahead
+                .extend(std::iter::from_fn(|| self.subscribers.take_frame()));
+        }
+        while batch.bytes.len() < WRITER_COALESCE_BYTES {
+            let Some(frame) = self.ahead.pop_front() else {
+                break;
+            };
+            batch.push(frame);
+        }
+        if !self.ahead.is_empty() {
+            return;
+        }
+        // With nothing held there is nothing new to adopt, and the
+        // `select!` polls before the writer waits.
+        if !self.held.is_empty() {
+            for next in self.held.drain(..) {
+                match next {
+                    Outbound::Frame(frame) => batch.push(frame),
+                    Outbound::Hosting(frame, task) => {
+                        batch.push(frame);
+                        self.subscribers.adopt(task);
+                    }
                 }
             }
-        }
-        // With nothing taken there is nothing new to adopt, and the
-        // `select!` polls before the writer waits.
-        if taken > 0 {
-            std::future::poll_fn(|cx| {
-                let _ = self.subscribers.poll_drive(cx);
-                std::task::Poll::Ready(())
-            })
-            .await;
+            self.poll_subscribers().await;
         }
         let rx_bytes = batch.bytes.len();
         while batch.bytes.len() - rx_bytes < WRITER_COALESCE_BYTES {
@@ -4144,6 +4187,15 @@ impl WriterQueues {
             };
             batch.push(frame);
         }
+    }
+
+    /// Poll every woken subscriber once, without waiting for one.
+    async fn poll_subscribers(&mut self) {
+        std::future::poll_fn(|cx| {
+            let _ = self.subscribers.poll_drive(cx);
+            std::task::Poll::Ready(())
+        })
+        .await;
     }
 }
 
@@ -4484,7 +4536,7 @@ pub(super) async fn handle_connection_io(
     let send_tmo = config.send_timeout;
     let (tx, rx, writer_budget, subscribers) =
         SrvTx::channel(config.write_queue_depth, tx_limit_bytes);
-    let mut queues = WriterQueues { rx, subscribers };
+    let mut queues = WriterQueues::new(rx, subscribers);
     let writer_peer = peer;
     let peer_entry_writer = peer_entry.clone();
     let last_rx_writer = last_rx.clone();
@@ -23467,7 +23519,7 @@ mod tx_byte_budget_tests {
     #[epics_macros_rs::epics_test]
     async fn a_hosted_frame_holds_its_bytes_until_written() {
         let (tx, rx, budget, subscribers) = SrvTx::channel(4, 1024);
-        let mut queues = WriterQueues { rx, subscribers };
+        let mut queues = WriterQueues::new(rx, subscribers);
         let (_abort, ()) = tx
             .send_hosting(b"i".to_vec(), |tx| {
                 let task = async move {
@@ -23498,7 +23550,7 @@ mod tx_byte_budget_tests {
         use tokio::io::AsyncReadExt;
         const LIMIT: usize = 1024;
         let (tx, rx, budget, subscribers) = SrvTx::channel(8, LIMIT);
-        let mut queues = WriterQueues { rx, subscribers };
+        let mut queues = WriterQueues::new(rx, subscribers);
         let (_abort, ()) = tx
             .send_hosting(vec![1u8; 30], |tx| {
                 let task = async move {
@@ -23738,14 +23790,15 @@ mod hosted_subscriber_tests {
     }
 
     /// A hosted subscriber's first frame follows its INIT reply in the same
-    /// write. Revert-verify: writing the subscribers' frames ahead of the
-    /// `rx` frames in [`WriterQueues::fill`] (`subs_first`) fails it.
+    /// write. Revert-verify: adopting the subscriber in
+    /// [`WriterQueues::fill`] as its INIT reply is taken, before the poll
+    /// whose frames go ahead of it, fails it.
     #[epics_macros_rs::epics_test]
     async fn a_hosted_subscribers_first_frame_follows_its_init_reply() {
         use super::{SrvTx, TxBudget, WriteBatch, WriterQueues};
 
         let (tx, rx, _budget, subscribers) = SrvTx::channel(4, TxBudget::MAX_CHARGE);
-        let mut queues = WriterQueues { rx, subscribers };
+        let mut queues = WriterQueues::new(rx, subscribers);
         let (_abort, ()) = tx
             .send_hosting(b"init".to_vec(), |tx| {
                 let task = async move {
@@ -23762,6 +23815,44 @@ mod hosted_subscriber_tests {
             batch.frames(),
             [b"init".to_vec(), b"subscribe-time".to_vec()]
         );
+    }
+
+    /// An `rx` frame follows the frame a subscriber yields for a post made
+    /// before it was queued, as a PUT reply follows the update its source
+    /// posted. Revert-verify: writing the `rx` entries before polling the
+    /// subscribers in [`WriterQueues::fill`] puts the reply first.
+    #[epics_macros_rs::epics_test]
+    async fn an_rx_frame_follows_the_update_posted_before_it() {
+        use super::{SrvTx, TxBudget, WriteBatch, WriterQueues};
+
+        let (tx, rx, _budget, subscribers) = SrvTx::channel(4, TxBudget::MAX_CHARGE);
+        let mut queues = WriterQueues::new(rx, subscribers);
+        let (post, mut posted) = tokio::sync::mpsc::channel::<()>(1);
+        let (_abort, ()) = tx
+            .send_hosting(b"init".to_vec(), |tx| {
+                let task = async move {
+                    while posted.recv().await.is_some() {
+                        if tx.send(b"update".to_vec()).await.is_err() {
+                            break;
+                        }
+                    }
+                };
+                (task, ())
+            })
+            .await;
+        let mut batch = WriteBatch::default();
+        let first = queues.rx.try_recv().ok();
+        queues.fill(first, &mut batch).await;
+        assert_eq!(batch.frames(), [b"init".to_vec()]);
+
+        post.try_send(()).expect("the source has room");
+        tx.send(b"reply".to_vec())
+            .await
+            .expect("the writer queue has room");
+        batch.reset();
+        let first = queues.rx.try_recv().ok();
+        queues.fill(first, &mut batch).await;
+        assert_eq!(batch.frames(), [b"update".to_vec(), b"reply".to_vec()]);
     }
 
     /// The longest run of `rx` frames (`frame`, tagged `r`) the writer puts
@@ -23787,7 +23878,7 @@ mod hosted_subscriber_tests {
 
         const QUEUED: usize = 8 * WRITER_PASS_FRAMES;
         let (tx, rx, _budget, subscribers) = SrvTx::channel(QUEUED + 1, TxBudget::MAX_CHARGE);
-        let mut queues = WriterQueues { rx, subscribers };
+        let mut queues = WriterQueues::new(rx, subscribers);
         let (_abort, ()) = tx
             .send_hosting(b"i".to_vec(), |tx| {
                 let task = async move {
@@ -23841,7 +23932,7 @@ mod hosted_subscriber_tests {
         use super::{SrvTx, TxBudget, WriteBatch, WriterQueues};
 
         let (tx, rx, _budget, subscribers) = SrvTx::channel(4, TxBudget::MAX_CHARGE);
-        let mut queues = WriterQueues { rx, subscribers };
+        let mut queues = WriterQueues::new(rx, subscribers);
         let (src_tx, mut src) = tokio::sync::mpsc::channel::<()>(1);
         let (_abort, ()) = tx
             .send_hosting(b"i".to_vec(), |tx| {
@@ -23888,7 +23979,7 @@ mod hosted_subscriber_tests {
         use super::{SrvTx, TxBudget, WriteBatch, WriterQueues};
 
         let (tx, rx, _budget, subscribers) = SrvTx::channel(4, TxBudget::MAX_CHARGE);
-        let mut queues = WriterQueues { rx, subscribers };
+        let mut queues = WriterQueues::new(rx, subscribers);
         let (doomed, ()) = tx.send_hosting(b"d".to_vec(), |_| (doomed, ())).await;
         let (go, mut went) = tokio::sync::mpsc::channel::<()>(1);
         let (_live, ()) = tx
@@ -23951,7 +24042,7 @@ mod hosted_subscriber_tests {
         use super::{SrvTx, TxBudget, WriteBatch, WriterQueues};
 
         let (tx, rx, _budget, subscribers) = SrvTx::channel(4, TxBudget::MAX_CHARGE);
-        let mut queues = WriterQueues { rx, subscribers };
+        let mut queues = WriterQueues::new(rx, subscribers);
         let (alive, ended) = std::sync::mpsc::channel::<()>();
         let mut aborts = Vec::new();
         for _ in 0..2 {

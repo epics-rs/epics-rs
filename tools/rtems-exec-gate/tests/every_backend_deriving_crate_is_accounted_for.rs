@@ -215,6 +215,10 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ),
     (
         "epics-ca-rs",
+        "tests/a_put_callback_resolves_after_its_update.rs",
+    ),
+    (
+        "epics-ca-rs",
         "tests/a_put_the_task_cannot_send_is_dropped.rs",
     ),
     (

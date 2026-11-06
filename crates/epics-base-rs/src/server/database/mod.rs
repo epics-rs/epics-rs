@@ -1095,6 +1095,9 @@ struct PvDatabaseInner {
     /// the record held; written only by a `.dbd` load or a binary's
     /// declaration.
     link_list: SnapshotCell<crate::server::record::LinkList>,
+    /// The `event_user` of every [`db_access::DbEventSource`] drain attached
+    /// here, for [`PvDatabase::events_delivered`].
+    event_drains: parking_lot::Mutex<Vec<std::sync::Weak<crate::server::event_queue::EventUser>>>,
 }
 
 thread_local! {
@@ -1649,6 +1652,7 @@ impl PvDatabase {
                         crate::server::cvt_bpt::BreakTableRegistry::new(),
                     ),
                     link_list: SnapshotCell::new(crate::server::record::LinkList::base()),
+                    event_drains: Default::default(),
                 }
             }),
         }

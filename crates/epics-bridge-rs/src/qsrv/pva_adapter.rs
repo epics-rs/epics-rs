@@ -461,9 +461,9 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
             // pvxs `onPutGroup`'s `CurrentOp` spans the whole group put
             // (`groupsource.cpp:591`).
             let put = channel.put_with_options(&pv, opts, atomic_override, &ctx.log);
-            epics_pva_rs::server::current_op::attached(&ctx, put)
-                .await
-                .map_err(|e| OpError::failed(crate::qsrv::put_status::wire_message(&e)))
+            let result = epics_pva_rs::server::current_op::attached(&ctx, put).await;
+            provider.database().events_delivered().await;
+            result.map_err(|e| OpError::failed(crate::qsrv::put_status::wire_message(&e)))
         }
     }
 
@@ -534,9 +534,9 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                 None => crate::qsrv::channel::atomic_from_pv_request(&pv),
             };
             let put = channel.put_with_options(&pv, opts, atomic_override, &ctx.log);
-            epics_pva_rs::server::current_op::attached(&ctx, put)
-                .await
-                .map_err(|e| OpError::failed(crate::qsrv::put_status::wire_message(&e)))
+            let result = epics_pva_rs::server::current_op::attached(&ctx, put).await;
+            provider.database().events_delivered().await;
+            result.map_err(|e| OpError::failed(crate::qsrv::put_status::wire_message(&e)))
         }
     }
 
@@ -779,10 +779,9 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                     )));
                 }
             };
-            channel
-                .put(&pv)
-                .await
-                .map_err(|e| OpError::failed(crate::qsrv::put_status::wire_message(&e)))
+            let result = channel.put(&pv).await;
+            self.provider.database().events_delivered().await;
+            result.map_err(|e| OpError::failed(crate::qsrv::put_status::wire_message(&e)))
         }
     }
 

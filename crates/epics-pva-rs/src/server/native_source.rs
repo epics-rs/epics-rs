@@ -1506,7 +1506,9 @@ impl ChannelSource for PvDatabaseSource {
                 // `RecordInstance::notify` until the record's async work ends.
                 Some(PvEntry::Record(rec)) => {
                     let epics = record_put_value(&db, &rec, &cn, &value, &filters)?;
-                    put_record_field(&db, &cn, epics, &PutOptions::default()).await
+                    let result = put_record_field(&db, &cn, epics, &PutOptions::default()).await;
+                    db.events_delivered().await;
+                    result
                 }
                 // Name not in the database: report it rather than falling
                 // through to a write that would silently find nothing.
@@ -2441,11 +2443,13 @@ async fn put_record(
     };
     // pvxs's `CurrentOp` spans a put that does not wait
     // (`singlesource.cpp:371`); a blocking one went to `dbProcessNotify`.
-    if opts.block {
+    let result = if opts.block {
         put.await
     } else {
         super::current_op::attached(ctx, put).await
-    }
+    };
+    db.events_delivered().await;
+    result
 }
 
 /// The record-arm backing write of a PVA PUT, shared by the ctx-less

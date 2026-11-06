@@ -924,6 +924,7 @@ impl<D: EventDelivery> DbEventSource<D> {
             canceled: canceled.clone(),
         });
         let drain = self.drain();
+        db.register_event_drain(&drain.user);
         let reader = {
             let mut instance = rec.write();
             let reader = instance.add_subscriber_on(
@@ -1078,8 +1079,59 @@ impl<D: EventDelivery> DrainTask<D> {
                         route.delivery.ended();
                     }
                 }
-                Some(CircuitEvent::Reply { .. }) => unreachable!("db access posts no replies"),
+                // A drain has no wire: its replies are
+                // `PvDatabase::events_delivered` barriers, released here.
+                Some(CircuitEvent::Reply { hold, .. }) => drop(hold),
             }
+        }
+    }
+}
+
+/// However the drain ends, every barrier still owed is released.
+impl<D> Drop for DrainTask<D> {
+    fn drop(&mut self) {
+        self.user.close_replies();
+    }
+}
+
+impl PvDatabase {
+    /// Resolves once every [`DbEventSource`] drain attached here has
+    /// delivered the entries queued on it before the call: C
+    /// `db_post_extra_labor` on each drain's `event_user`. A put that awaits
+    /// it before replying lets its client see the updates the put posted
+    /// first, which a drain thread racing the reply does not.
+    pub fn events_delivered(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let users: Vec<_> = self
+            .inner
+            .event_drains
+            .lock()
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .collect();
+        let owed: Vec<_> = users
+            .iter()
+            .map(|user| {
+                let (tx, rx) = crate::runtime::sync::oneshot::channel::<()>();
+                user.post_reply(Vec::new(), Some(Box::new(tx)));
+                rx
+            })
+            .collect();
+        async move {
+            for rx in owed {
+                // The drain releases the hold by dropping it.
+                let _ = rx.await;
+            }
+        }
+    }
+
+    fn register_event_drain(&self, user: &std::sync::Arc<crate::server::event_queue::EventUser>) {
+        let mut drains = self.inner.event_drains.lock();
+        drains.retain(|w| w.strong_count() > 0);
+        if !drains
+            .iter()
+            .any(|w| std::ptr::eq(w.as_ptr(), std::sync::Arc::as_ptr(user)))
+        {
+            drains.push(std::sync::Arc::downgrade(user));
         }
     }
 }
@@ -1602,6 +1654,63 @@ mod tests {
         post(&db, 0, 1.0);
         wait_until("the entry", || tally.delivered.load(Ordering::Acquire) == 1);
         assert_eq!(settled_wakes(&probe) - before, 1);
+    }
+
+    /// The drain holds its first entry with a second queued behind it.
+    async fn held_drain_with_one_queued() -> (PvDatabase, Source, Tally, Vec<DbAttachment>) {
+        let db = ai_db(1).await;
+        let source = source();
+        let tally = Tally {
+            hold_first: Some(Default::default()),
+            ..Tally::default()
+        };
+        let subs = attach_all(&db, &source, 1, &tally);
+        post(&db, 0, 1.0);
+        wait_until("the drain to take the first entry", || {
+            tally.entered.load(Ordering::Acquire)
+        });
+        post(&db, 0, 2.0);
+        (db, source, tally, subs)
+    }
+
+    fn open(tally: &Tally) {
+        let (open, cv) = &**tally.hold_first.as_ref().unwrap();
+        *open.lock() = true;
+        cv.notify_all();
+    }
+
+    /// `events_delivered` resolves only after the entry queued before it
+    /// has been delivered.
+    #[epics_macros_rs::epics_test]
+    async fn events_delivered_follows_the_entries_queued_before_it() {
+        let (db, _source, tally, _subs) = held_drain_with_one_queued().await;
+        let mut delivered = std::pin::pin!(db.events_delivered());
+        assert!(
+            crate::runtime::task::timeout(Duration::from_millis(50), &mut delivered)
+                .await
+                .is_err(),
+            "resolved while the drain held an entry ahead of it"
+        );
+        open(&tally);
+        delivered.await;
+        assert_eq!(tally.delivered.load(Ordering::Acquire), 2);
+        assert_eq!(tally.last.lock().get(&0), Some(&2.0));
+    }
+
+    /// A drain that ends with the barrier still owed releases it.
+    #[epics_macros_rs::epics_test]
+    async fn events_delivered_resolves_when_the_drain_ends_first() {
+        let (db, source, tally, subs) = held_drain_with_one_queued().await;
+        let delivered = db.events_delivered();
+        // The drop waits for the delivery in flight, so it runs off this
+        // thread until the gate opens.
+        let dropped = std::thread::spawn(move || drop(subs));
+        open(&tally);
+        dropped.join().unwrap();
+        wait_until("the drain to end", || source.live_drains() == 0);
+        crate::runtime::task::timeout(fact_budget::FACT_BUDGET, delivered)
+            .await
+            .expect("an ended drain releases the barrier it owed");
     }
 
     /// Lost-wake probe: three producers post into one source while a

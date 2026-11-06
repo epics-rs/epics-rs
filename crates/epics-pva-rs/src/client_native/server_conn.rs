@@ -54,6 +54,7 @@ use super::decode::{
     Frame, PeerRole, decode_connection_validated, decode_connection_validation_request,
     try_parse_frame_role,
 };
+use super::monitor_queue::{DeliveryFence, FencePoint};
 
 /// How often we send the heartbeat application CMD_ECHO.
 ///
@@ -123,10 +124,10 @@ pub(crate) enum IoidSlot {
     /// removes a drained queue, because that removal races the op task's
     /// replacement (the reader's send is what wakes that task) and would
     /// delete the `Reusable` slot the next GET reply is routed to.
-    TwoShot(VecDeque<oneshot::Sender<Frame>>),
+    TwoShot(VecDeque<oneshot::Sender<Reply>>),
     /// Multi-frame ops whose frame count the op itself bounds (GetField,
     /// PUT sequences, RPC): unbounded channel.
-    Stream(mpsc::UnboundedSender<Frame>),
+    Stream(mpsc::UnboundedSender<Reply>),
     /// MONITOR: the server-driven stream, bounded at the subscription's
     /// `queueSize` with pvxs's tail squash
     /// ([`crate::client_native::monitor_queue`]).
@@ -136,7 +137,23 @@ pub(crate) enum IoidSlot {
     /// the channel skip INIT for subsequent GETs against the same
     /// (sid, ioid) — server keeps the introspection binding alive
     /// because we never DESTROY the ioid.
-    Reusable(Arc<Mutex<Option<oneshot::Sender<Frame>>>>),
+    Reusable(Arc<Mutex<Option<oneshot::Sender<Reply>>>>),
+}
+
+/// An op reply, routed behind the monitor frames its connection read
+/// before it.
+pub struct Reply {
+    frame: Frame,
+    after: FencePoint,
+}
+
+impl Reply {
+    /// The frame, once every monitor frame routed before it has been handed
+    /// to its subscription's callback or discarded.
+    pub async fn settle(self) -> Frame {
+        self.after.reached().await;
+        self.frame
+    }
 }
 
 /// A persistent server connection.
@@ -712,6 +729,8 @@ impl ServerConn {
         let bytes_rx = Arc::new(AtomicU64::new(0));
         let bytes_tx = Arc::new(AtomicU64::new(0));
         let by_ioid: Arc<DashMap<u32, IoidSlot>> = Arc::new(DashMap::new());
+        // The reader alone issues tickets and points, so only it holds this.
+        let fence_reader = DeliveryFence::new();
         let by_cid: Arc<DashMap<u32, oneshot::Sender<Frame>>> = Arc::new(DashMap::new());
         let by_sid_close: Arc<DashMap<u32, (Arc<AtomicBool>, Arc<tokio::sync::Notify>)>> =
             Arc::new(DashMap::new());
@@ -933,7 +952,7 @@ impl ServerConn {
                                         return;
                                     }
                                 }
-                                route_frame(dispatch_frame, target, &by_ioid_reader, &by_cid_reader, &by_sid_close_reader, &ioid_to_sid_reader, &ioid_to_cmd_reader, &chan_stats_reader, &writer_tx_reader, &cancel_reader);
+                                route_frame(dispatch_frame, target, &by_ioid_reader, &fence_reader, &by_cid_reader, &by_sid_close_reader, &ioid_to_sid_reader, &ioid_to_cmd_reader, &chan_stats_reader, &writer_tx_reader, &cancel_reader);
                             }
                         }
                         Err(_) => break,
@@ -1225,7 +1244,7 @@ impl ServerConn {
         sid: u32,
         ioid: u32,
         expected_cmd: u8,
-    ) -> (oneshot::Receiver<Frame>, oneshot::Receiver<Frame>) {
+    ) -> (oneshot::Receiver<Reply>, oneshot::Receiver<Reply>) {
         let (tx1, rx1) = oneshot::channel();
         let (tx2, rx2) = oneshot::channel();
         let mut q = VecDeque::with_capacity(2);
@@ -1247,7 +1266,7 @@ impl ServerConn {
         sid: u32,
         ioid: u32,
         expected_cmd: u8,
-    ) -> mpsc::UnboundedReceiver<Frame> {
+    ) -> mpsc::UnboundedReceiver<Reply> {
         let (tx, rx) = mpsc::unbounded_channel();
         self.by_ioid.insert(ioid, IoidSlot::Stream(tx));
         self.ioid_to_sid.insert(ioid, sid);
@@ -1274,7 +1293,7 @@ impl ServerConn {
         expected_cmd: u8,
         limit: usize,
         pipeline: bool,
-    ) -> Arc<crate::client_native::monitor_queue::MonitorBacklog> {
+    ) -> crate::client_native::monitor_queue::MonitorStream {
         let (sink, backlog) =
             crate::client_native::monitor_queue::MonitorSink::new(limit, pipeline);
         self.by_ioid.insert(ioid, IoidSlot::Monitor(sink));
@@ -1296,7 +1315,7 @@ impl ServerConn {
         sid: u32,
         ioid: u32,
         expected_cmd: u8,
-    ) -> Arc<Mutex<Option<oneshot::Sender<Frame>>>> {
+    ) -> Arc<Mutex<Option<oneshot::Sender<Reply>>>> {
         let slot = Arc::new(Mutex::new(None));
         self.by_ioid.insert(ioid, IoidSlot::Reusable(slot.clone()));
         self.ioid_to_sid.insert(ioid, sid);
@@ -1642,6 +1661,7 @@ fn route_frame(
     frame: Frame,
     peer: SocketAddr,
     by_ioid: &Arc<DashMap<u32, IoidSlot>>,
+    fence: &Arc<DeliveryFence>,
     by_cid: &Arc<DashMap<u32, oneshot::Sender<Frame>>>,
     by_sid_close: &Arc<DashMap<u32, (Arc<AtomicBool>, Arc<tokio::sync::Notify>)>>,
     ioid_to_sid: &Arc<DashMap<u32, u32>>,
@@ -1655,6 +1675,7 @@ fn route_frame(
         frame,
         peer,
         by_ioid,
+        fence,
         by_cid,
         by_sid_close,
         ioid_to_sid,
@@ -1676,6 +1697,7 @@ fn route_frame_checked(
     frame: Frame,
     peer: SocketAddr,
     by_ioid: &Arc<DashMap<u32, IoidSlot>>,
+    fence: &Arc<DeliveryFence>,
     by_cid: &Arc<DashMap<u32, oneshot::Sender<Frame>>>,
     by_sid_close: &Arc<DashMap<u32, (Arc<AtomicBool>, Arc<tokio::sync::Notify>)>>,
     ioid_to_sid: &Arc<DashMap<u32, u32>>,
@@ -1867,27 +1889,31 @@ fn route_frame_checked(
         }
         // Try to dispatch. For TwoShot, pop the first available oneshot.
         // For Stream, send to the unbounded channel.
+        let reply = |frame| Reply {
+            frame,
+            after: fence.point(),
+        };
         if let Some(mut entry) = by_ioid.get_mut(&ioid) {
             match entry.value_mut() {
                 IoidSlot::TwoShot(q) => {
                     // A drained queue stays registered: the entry belongs
                     // to the op that registered it (see `IoidSlot::TwoShot`).
                     if let Some(tx) = q.pop_front() {
-                        let _ = tx.send(frame);
+                        let _ = tx.send(reply(frame));
                     }
                 }
                 IoidSlot::Stream(tx) => {
-                    let _ = tx.send(frame);
+                    let _ = tx.send(reply(frame));
                 }
                 IoidSlot::Monitor(sink) => {
-                    sink.push(frame);
+                    sink.push(frame, fence.issue());
                 }
                 IoidSlot::Reusable(slot) => {
                     // Take the current sender (if any) and fulfil it.
                     // The slot itself stays registered — next warm
                     // GET will refill it.
                     if let Some(tx) = slot.lock().take() {
-                        let _ = tx.send(frame);
+                        let _ = tx.send(reply(frame));
                     }
                 }
             }
@@ -2461,7 +2487,7 @@ pub(crate) mod tests {
         );
         ioid_to_sid.insert(ioid, sid);
         ioid_to_cmd.insert(ioid, Command::Monitor.code());
-        let (tx, _rx) = mpsc::unbounded_channel::<Frame>();
+        let (tx, _rx) = mpsc::unbounded_channel::<Reply>();
         by_ioid.insert(ioid, IoidSlot::Stream(tx));
 
         let order = ByteOrder::Little;
@@ -2475,6 +2501,7 @@ pub(crate) mod tests {
             Frame { header, payload },
             ROUTER_PEER,
             &by_ioid,
+            &DeliveryFence::new(),
             &by_cid,
             &by_sid_close,
             &ioid_to_sid,
@@ -2490,7 +2517,7 @@ pub(crate) mod tests {
 
         // A frame on an unmapped IOID must not touch any channel counter.
         let unmapped_ioid = 999u32;
-        let (tx2, _rx2) = mpsc::unbounded_channel::<Frame>();
+        let (tx2, _rx2) = mpsc::unbounded_channel::<Reply>();
         by_ioid.insert(unmapped_ioid, IoidSlot::Stream(tx2));
         ioid_to_cmd.insert(unmapped_ioid, Command::Monitor.code());
         let mut payload2 = Vec::new();
@@ -2504,6 +2531,7 @@ pub(crate) mod tests {
             },
             ROUTER_PEER,
             &by_ioid,
+            &DeliveryFence::new(),
             &by_cid,
             &by_sid_close,
             &ioid_to_sid,
@@ -2544,6 +2572,7 @@ pub(crate) mod tests {
             frame,
             ROUTER_PEER,
             &by_ioid,
+            &DeliveryFence::new(),
             &by_cid,
             &by_sid_close,
             &ioid_to_sid,
@@ -2597,6 +2626,7 @@ pub(crate) mod tests {
             Frame { header, payload },
             ROUTER_PEER,
             &by_ioid,
+            &DeliveryFence::new(),
             &by_cid,
             &by_sid_close,
             &ioid_to_sid,
@@ -2651,6 +2681,7 @@ pub(crate) mod tests {
             Frame { header, payload },
             ROUTER_PEER,
             &by_ioid,
+            &DeliveryFence::new(),
             &by_cid,
             &by_sid_close,
             &ioid_to_sid,
@@ -2674,9 +2705,9 @@ pub(crate) mod tests {
         let other_sid = 99u32;
 
         // Register two streams on the destroyed sid + one on another sid.
-        let (tx_a, mut rx_a) = mpsc::unbounded_channel::<Frame>();
-        let (tx_b, mut rx_b) = mpsc::unbounded_channel::<Frame>();
-        let (tx_c, mut rx_c) = mpsc::unbounded_channel::<Frame>();
+        let (tx_a, mut rx_a) = mpsc::unbounded_channel::<Reply>();
+        let (tx_b, mut rx_b) = mpsc::unbounded_channel::<Reply>();
+        let (tx_c, mut rx_c) = mpsc::unbounded_channel::<Reply>();
         by_ioid.insert(1001, IoidSlot::Stream(tx_a));
         ioid_to_sid.insert(1001, sid);
         by_ioid.insert(1002, IoidSlot::Stream(tx_b));
@@ -2703,6 +2734,7 @@ pub(crate) mod tests {
             Frame { header, payload },
             ROUTER_PEER,
             &by_ioid,
+            &DeliveryFence::new(),
             &by_cid,
             &by_sid_close,
             &ioid_to_sid,
@@ -2752,9 +2784,9 @@ pub(crate) mod tests {
         // Register ops on the destroyed sid + one on another sid, each
         // with a command expectation in `ioid_to_cmd` exactly as
         // `register_ioid_twoshot` / `register_ioid_reusable` do.
-        let (tx_a, _rx_a) = mpsc::unbounded_channel::<Frame>();
-        let (tx_b, _rx_b) = mpsc::unbounded_channel::<Frame>();
-        let (tx_c, _rx_c) = mpsc::unbounded_channel::<Frame>();
+        let (tx_a, _rx_a) = mpsc::unbounded_channel::<Reply>();
+        let (tx_b, _rx_b) = mpsc::unbounded_channel::<Reply>();
+        let (tx_c, _rx_c) = mpsc::unbounded_channel::<Reply>();
         by_ioid.insert(2001, IoidSlot::Stream(tx_a));
         ioid_to_sid.insert(2001, sid);
         ioid_to_cmd.insert(2001, Command::Get.code());
@@ -2784,6 +2816,7 @@ pub(crate) mod tests {
             Frame { header, payload },
             ROUTER_PEER,
             &by_ioid,
+            &DeliveryFence::new(),
             &by_cid,
             &by_sid_close,
             &ioid_to_sid,
@@ -2823,7 +2856,7 @@ pub(crate) mod tests {
         let (by_ioid, by_cid, by_sid_close, ioid_to_sid, ioid_to_cmd, writer_tx, cancel) =
             fresh_router();
         let ioid = 0x01020304u32; // BE bytes != LE bytes
-        let (tx, mut rx) = oneshot::channel::<Frame>();
+        let (tx, mut rx) = oneshot::channel::<Reply>();
         let mut q = std::collections::VecDeque::new();
         q.push_back(tx);
         by_ioid.insert(ioid, IoidSlot::TwoShot(q));
@@ -2839,6 +2872,7 @@ pub(crate) mod tests {
             Frame { header, payload },
             ROUTER_PEER,
             &by_ioid,
+            &DeliveryFence::new(),
             &by_cid,
             &by_sid_close,
             &ioid_to_sid,
@@ -2910,6 +2944,7 @@ pub(crate) mod tests {
                 },
                 ROUTER_PEER,
                 &by_ioid,
+                &DeliveryFence::new(),
                 &by_cid,
                 &by_sid_close,
                 &ioid_to_sid,
@@ -2963,6 +2998,7 @@ pub(crate) mod tests {
                 Frame { header, payload },
                 ROUTER_PEER,
                 &by_ioid,
+                &DeliveryFence::new(),
                 &by_cid,
                 &by_sid_close,
                 &ioid_to_sid,
@@ -3058,6 +3094,7 @@ pub(crate) mod tests {
             Frame { header, payload },
             ROUTER_PEER,
             &by_ioid,
+            &DeliveryFence::new(),
             &by_cid,
             &by_sid_close,
             &ioid_to_sid,
@@ -4169,6 +4206,7 @@ pub(crate) mod tests {
                 frame,
                 ROUTER_PEER,
                 &by_ioid,
+                &DeliveryFence::new(),
                 &by_cid,
                 &by_sid_close,
                 &ioid_to_sid,
@@ -4179,8 +4217,8 @@ pub(crate) mod tests {
             )
         };
 
-        let (tx_init, mut rx_init) = oneshot::channel::<Frame>();
-        let (tx_data, mut rx_data) = oneshot::channel::<Frame>();
+        let (tx_init, mut rx_init) = oneshot::channel::<Reply>();
+        let (tx_data, mut rx_data) = oneshot::channel::<Reply>();
         let mut q = std::collections::VecDeque::new();
         q.push_back(tx_init);
         q.push_back(tx_data);
@@ -4203,7 +4241,7 @@ pub(crate) mod tests {
         );
 
         // The op task's transition to the warm-GET slot, then one warm GET.
-        let (tx_warm, mut rx_warm) = oneshot::channel::<Frame>();
+        let (tx_warm, mut rx_warm) = oneshot::channel::<Reply>();
         let slot = Arc::new(Mutex::new(Some(tx_warm)));
         by_ioid.insert(ioid, IoidSlot::Reusable(slot));
         route(get_frame());
@@ -4212,6 +4250,59 @@ pub(crate) mod tests {
             "the warm GET reply must route to the Reusable slot"
         );
         assert!(!cancel.is_cancelled());
+    }
+
+    /// A reply settles once the monitor frame its connection routed before
+    /// it is handed on, as pvxs runs the update's and the reply's callbacks
+    /// on one loop in wire order. Revert-verify: routing the reply with no
+    /// fence point fails it.
+    #[epics_macros_rs::epics_test]
+    async fn a_reply_settles_after_the_monitor_frame_routed_before_it() {
+        let (by_ioid, by_cid, by_sid_close, ioid_to_sid, ioid_to_cmd, writer_tx, cancel) =
+            fresh_router();
+        let fence = DeliveryFence::new();
+        let order = ByteOrder::Little;
+        let route = |ioid: u32, cmd: Command| {
+            let mut payload = Vec::new();
+            payload.put_u32(ioid, order);
+            payload.put_u8(0x00);
+            let header = PvaHeader::application(true, order, cmd.code(), payload.len() as u32);
+            route_frame(
+                Frame { header, payload },
+                ROUTER_PEER,
+                &by_ioid,
+                &fence,
+                &by_cid,
+                &by_sid_close,
+                &ioid_to_sid,
+                &ioid_to_cmd,
+                &Arc::new(DashMap::new()),
+                &writer_tx,
+                &cancel,
+            )
+        };
+        let (sink, monitor) = crate::client_native::monitor_queue::MonitorSink::new(4, false);
+        by_ioid.insert(1, IoidSlot::Monitor(sink));
+        ioid_to_cmd.insert(1, Command::Monitor.code());
+        let (tx, mut rx) = mpsc::unbounded_channel::<Reply>();
+        by_ioid.insert(2, IoidSlot::Stream(tx));
+        ioid_to_cmd.insert(2, Command::Put.code());
+
+        route(1, Command::Monitor);
+        route(2, Command::Put);
+        let reply = rx.try_recv().expect("the reply is routed");
+        let mut settled = std::pin::pin!(reply.settle());
+        let mut poll = || {
+            settled
+                .as_mut()
+                .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+                .is_ready()
+        };
+        assert!(!poll(), "the update is still queued");
+        let (_, delivered) = monitor.recv().await.expect("the update");
+        assert!(!poll(), "taken is not yet handed on");
+        drop(delivered);
+        assert!(poll());
     }
 
     /// pvxs runs `handle_CONNECTION_VALIDATION` whenever the frame arrives

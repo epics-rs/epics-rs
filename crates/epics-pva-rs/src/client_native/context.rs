@@ -2359,7 +2359,7 @@ impl PvaClient {
             channel: Arc<Channel>,
             warm: super::channel::CachedGet,
             // oneshot the writer-task signal will fulfil
-            rx: tokio::sync::oneshot::Receiver<super::decode::Frame>,
+            rx: tokio::sync::oneshot::Receiver<super::server_conn::Reply>,
             // for decode: cached intro
             intro: Arc<FieldDesc>,
         }
@@ -2512,7 +2512,13 @@ impl PvaClient {
             if failed_warm.contains(&wi) {
                 continue;
             }
-            let frame_res = epics_base_rs::runtime::task::timeout(op_timeout, rx).await;
+            let frame_res = epics_base_rs::runtime::task::timeout(op_timeout, async {
+                match rx.await {
+                    Ok(reply) => Ok(reply.settle().await),
+                    Err(closed) => Err(closed),
+                }
+            })
+            .await;
             let value = match frame_res {
                 // Decode with no shared cache. The reader side
                 // (`flatten_type_cache_markers`) has already flattened every

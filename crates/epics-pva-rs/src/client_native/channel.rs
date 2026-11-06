@@ -164,7 +164,7 @@ pub(crate) struct CachedGet {
     pub(crate) ioid: u32,
     pub(crate) intro: Arc<crate::pvdata::FieldDesc>,
     pub(crate) slot:
-        Arc<parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<super::decode::Frame>>>>,
+        Arc<parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<super::server_conn::Reply>>>>,
 }
 
 /// How a channel resolves its PV name to a server address.

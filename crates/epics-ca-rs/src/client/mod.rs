@@ -1639,13 +1639,17 @@ pub(crate) struct CachedRead {
 struct PendingRead {
     reads: Arc<dashmap::DashMap<u32, ReadWaiter>>,
     ioid: u32,
-    reply_rx: oneshot::Receiver<CaResult<ReadReply>>,
+    reply_rx: oneshot::Receiver<types::Answer<ReadReply>>,
 }
 
 impl PendingRead {
     /// The answer, or the disconnect's error.
     async fn reply(mut self) -> CaResult<ReadReply> {
-        (&mut self.reply_rx).await.map_err(|_| CaError::Shutdown)?
+        (&mut self.reply_rx)
+            .await
+            .map_err(|_| CaError::Shutdown)?
+            .settle()
+            .await
     }
 }
 
@@ -1660,13 +1664,17 @@ impl Drop for PendingRead {
 struct PendingWrite {
     writes: Arc<dashmap::DashMap<u32, (u32, WriteReplyTx)>>,
     ioid: u32,
-    reply_rx: oneshot::Receiver<CaResult<()>>,
+    reply_rx: oneshot::Receiver<types::Answer<()>>,
 }
 
 impl PendingWrite {
     /// The server's completion, or the disconnect's error.
     async fn reply(mut self) -> CaResult<()> {
-        (&mut self.reply_rx).await.map_err(|_| CaError::Shutdown)?
+        (&mut self.reply_rx)
+            .await
+            .map_err(|_| CaError::Shutdown)?
+            .settle()
+            .await
     }
 }
 
@@ -2282,7 +2290,7 @@ impl CaChannel {
 
         struct Pending {
             index: usize,
-            reply_rx: oneshot::Receiver<CaResult<ReadReply>>,
+            reply_rx: oneshot::Receiver<types::Answer<ReadReply>>,
             kind: PendingKind,
         }
 
@@ -2535,11 +2543,17 @@ impl CaChannel {
                 reply_rx,
                 kind,
             } = p;
-            let result = epics_base_rs::runtime::task::timeout_at(deadline, reply_rx).await;
+            let result = epics_base_rs::runtime::task::timeout_at(deadline, async {
+                match reply_rx.await {
+                    Ok(answer) => Some(answer.settle().await),
+                    Err(_) => None,
+                }
+            })
+            .await;
             let decoded: CaResult<(DbFieldType, EpicsValue)> = match result {
-                Ok(Ok(Ok(reply))) => Self::decode_plain_read_reply(reply),
-                Ok(Ok(Err(e))) => Err(e),
-                Ok(Err(_)) => Err(CaError::Shutdown),
+                Ok(Some(Ok(reply))) => Self::decode_plain_read_reply(reply),
+                Ok(Some(Err(e))) => Err(e),
+                Ok(None) => Err(CaError::Shutdown),
                 Err(_) => Err(CaError::Timeout),
             };
             let is_local_error = matches!(decoded, Err(CaError::Timeout) | Err(CaError::Shutdown));
@@ -4162,7 +4176,7 @@ async fn run_coordinator(
                             });
                         }
                     }
-                    TransportEvent::MonitorData { subid, data_type, count, data } => {
+                    TransportEvent::MonitorData { subid, data_type, count, data, delivery } => {
                         use subscription::MonitorDeliveryOutcome;
                         match subscriptions.on_monitor_data(subid, data_type, count, &data) {
                             MonitorDeliveryOutcome::Queued => {}
@@ -4193,8 +4207,11 @@ async fn run_coordinator(
                             MonitorDeliveryOutcome::Filtered
                             | MonitorDeliveryOutcome::NotFound => {}
                         }
+                        // The update is in its subscription: a reply read
+                        // after it may now resolve.
+                        drop(delivery);
                     }
-                    TransportEvent::MonitorStatusError { subid, eca_status } => {
+                    TransportEvent::MonitorStatusError { subid, eca_status, delivery } => {
                         // libca `cac::eventAddRespAction`
                         // (`cac.cpp:971-975`) routes a monitor frame
                         // whose `m_cid` is non-NORMAL through the
@@ -4227,6 +4244,7 @@ async fn run_coordinator(
                             MonitorDeliveryOutcome::Filtered
                             | MonitorDeliveryOutcome::NotFound => {}
                         }
+                        drop(delivery);
                     }
                     TransportEvent::AccessRightsChanged { cid, access } => {
                         if let Some(ch) = channels.get_mut(&cid) {
@@ -4741,7 +4759,7 @@ pub(crate) fn drain_waiters_for_cids(cids: &HashSet<u32>, in_flight: &types::InF
         .collect();
     for ioid in stale_reads {
         if let Some((_, waiter)) = in_flight.reads.remove(&ioid) {
-            waiter.send(Err(CaError::Disconnected));
+            waiter.send(types::Answer::local(Err(CaError::Disconnected)));
         }
     }
     let stale_writes: Vec<u32> = in_flight
@@ -4752,7 +4770,7 @@ pub(crate) fn drain_waiters_for_cids(cids: &HashSet<u32>, in_flight: &types::InF
         .collect();
     for ioid in stale_writes {
         if let Some((_, (_, sender))) = in_flight.writes.remove(&ioid) {
-            let _ = sender.send(Err(CaError::Disconnected));
+            let _ = sender.send(types::Answer::local(Err(CaError::Disconnected)));
         }
     }
     // The recovery re-reads of a channel that just left the connected set
@@ -6023,8 +6041,14 @@ mod waiter_drain_tests {
         // cid=42 waiters: ioids removed from maps + Senders fired with Disconnected.
         assert!(!in_flight.reads.contains_key(&1001));
         assert!(!in_flight.writes.contains_key(&1002));
-        assert!(matches!(rrx_42.await, Ok(Err(CaError::Disconnected))));
-        assert!(matches!(wrx_42.await, Ok(Err(CaError::Disconnected))));
+        assert!(matches!(
+            rrx_42.await.expect("answered").settle().await,
+            Err(CaError::Disconnected)
+        ));
+        assert!(matches!(
+            wrx_42.await.expect("answered").settle().await,
+            Err(CaError::Disconnected)
+        ));
 
         // cid=99 waiters: untouched.
         assert!(in_flight.reads.contains_key(&2001));
@@ -6082,11 +6106,11 @@ mod waiter_drain_tests {
 
         // Transport delivers the response first.
         if let Some((_, waiter)) = in_flight.reads.remove(&100) {
-            waiter.send(Ok(types::ReadReply::Raw {
+            waiter.send(types::Answer::local(Ok(types::ReadReply::Raw {
                 data_type: 6,
                 count: 1,
                 data: vec![1, 0, 0, 0],
-            }));
+            })));
         }
 
         // Disconnect drain runs immediately after — should find nothing
@@ -6095,7 +6119,7 @@ mod waiter_drain_tests {
         affected.insert(7u32);
         drain_waiters_for_cids(&affected, &in_flight);
 
-        let result = rrx.await.expect("oneshot still alive");
+        let result = rrx.await.expect("oneshot still alive").settle().await;
         assert!(matches!(
             result,
             Ok(types::ReadReply::Raw {
@@ -6669,7 +6693,7 @@ mod disconnect_transition_tests {
 
         let io_order = order.clone();
         let io_task = tokio::spawn(async move {
-            let got = rrx.await.expect("read waiter must be woken");
+            let got = rrx.await.expect("read waiter must be woken").settle().await;
             assert!(matches!(got, Err(CaError::Disconnected)));
             io_order.lock().unwrap().push("io");
         });
@@ -6744,11 +6768,17 @@ mod disconnect_transition_tests {
             );
 
             assert!(
-                matches!(rrx.await, Ok(Err(CaError::Disconnected))),
+                matches!(
+                    rrx.await.expect("answered").settle().await,
+                    Err(CaError::Disconnected)
+                ),
                 "{kind:?}: pending read must fail with Disconnected"
             );
             assert!(
-                matches!(wrx.await, Ok(Err(CaError::Disconnected))),
+                matches!(
+                    wrx.await.expect("answered").settle().await,
+                    Err(CaError::Disconnected)
+                ),
                 "{kind:?}: pending write must fail with Disconnected"
             );
         }
@@ -6900,7 +6930,12 @@ mod deadline_tests {
             dbr_type: DbFieldType::Double,
             value: EpicsValue::Double(4.5),
         };
-        assert!(take_waiter(&ch).send(Ok(reply)).is_ok(), "the get waits");
+        assert!(
+            take_waiter(&ch)
+                .send(types::Answer::local(Ok(reply)))
+                .is_ok(),
+            "the get waits"
+        );
         let (_, value) = get.await.unwrap().expect("the answer");
         assert_eq!(value, EpicsValue::Double(4.5));
     }
@@ -6952,7 +6987,10 @@ mod deadline_tests {
             .expect("the put waits")
             .key();
         let (_, (_, reply_tx)) = ch.in_flight.writes.remove(&ioid).expect("the waiter");
-        assert!(reply_tx.send(Ok(())).is_ok(), "the put waits");
+        assert!(
+            reply_tx.send(types::Answer::local(Ok(()))).is_ok(),
+            "the put waits"
+        );
         let results = block.await.unwrap();
         assert!(results.status.is_ok(), "{:?}", results.status);
         assert!(matches!(results.puts[..], [Ok(())]), "{:?}", results.puts);

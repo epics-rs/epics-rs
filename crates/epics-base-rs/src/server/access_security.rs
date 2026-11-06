@@ -759,6 +759,7 @@ impl InpWatch {
                 self.targets[ix].reader = None;
                 (ix, InpEvent::Disconnected)
             }
+            CircuitEvent::Reply { .. } => unreachable!("ASG inputs post no replies"),
         };
         for (asg, index) in &self.targets[ix].inputs {
             if let Some(group) = config.asg.get(asg) {

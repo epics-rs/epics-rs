@@ -516,6 +516,9 @@ struct QueInner {
     /// yet: [`Self::take_ended`] scans the slab only while this is nonzero,
     /// not on every empty poll.
     unreported_ends: usize,
+    /// Entries [`Self::advance`] has retired since the queue was made: the
+    /// clock an [`OwedReply`]'s marks are read against.
+    taken: u64,
 }
 
 impl QueInner {
@@ -593,6 +596,7 @@ impl QueInner {
         let id = self.ring[at].as_ref().expect("occupied").id;
         self.getix = self.ix(1);
         self.used -= 1;
+        self.taken += 1;
         let live = self.release(id, retired);
         // C's drain loop ends at `EVENTQEMPTY`.
         self.draining = self.used > 0;
@@ -883,6 +887,7 @@ impl EvQue {
                 size,
                 replace_threshold,
                 unreported_ends: 0,
+                taken: 0,
             }),
         });
         // SAFETY: nothing moves `inner` out of a pinned `EvQue`.
@@ -1212,7 +1217,17 @@ pub enum CircuitEvent {
     },
     /// Monitor `id`'s producer is gone and its entries are delivered.
     Ended(AttachId),
+    /// A frame [`EventUser::post_reply`] queued, due now. The consumer drops
+    /// `hold` once the frame is staged for the wire.
+    Reply {
+        frame: Vec<u8>,
+        hold: Option<ReplyHold>,
+    },
 }
+
+/// What a reply's poster is released by: [`EventUser::post_reply`] hands it to
+/// the consumer with the frame, and dropping it is the release.
+pub type ReplyHold = Box<dyn std::any::Any + Send>;
 
 /// C `event_user` (`dbEvent.c:84-105`) — one per CA circuit. Owns the EVENTS_OFF
 /// flag and the chain of queues subscriptions attach to.
@@ -1231,6 +1246,43 @@ struct QueChain {
     /// The queue `event_task`'s loop is on: `event_read` empties it before
     /// the loop moves to `nextque`, and a new pass starts at `firstque`.
     reading: usize,
+    /// C `putNotifyQue`, the extra labor `event_task` runs: frames owed to
+    /// the circuit in the order they were posted.
+    replies: std::collections::VecDeque<OwedReply>,
+    /// [`EventUser::close_replies`] ran: the consumer is gone, and a frame
+    /// posted now could only wait forever.
+    closed: bool,
+}
+
+/// A frame [`EventUser::post_reply`] queued and the entries it waits for.
+struct OwedReply {
+    frame: Vec<u8>,
+    hold: Option<ReplyHold>,
+    /// Per queue that held entries at the post: its place in the chain, and
+    /// the [`QueInner::taken`] count at which the last of them has left.
+    /// Queues never leave the chain, so the place stays valid.
+    ahead: Vec<(usize, u64)>,
+}
+
+impl OwedReply {
+    fn into_event(self) -> CircuitEvent {
+        CircuitEvent::Reply {
+            frame: self.frame,
+            hold: self.hold,
+        }
+    }
+}
+
+impl QueChain {
+    /// Every entry the front reply waits for has left its queue.
+    fn reply_due(&self) -> bool {
+        self.replies.front().is_some_and(|reply| {
+            reply
+                .ahead
+                .iter()
+                .all(|&(at, mark)| self.ques[at].lock().taken >= mark)
+        })
+    }
 }
 
 impl Default for EventUser {
@@ -1248,6 +1300,8 @@ impl EventUser {
                 QueChain {
                     ques: vec![EvQue::new(flow.clone())],
                     reading: 0,
+                    replies: std::collections::VecDeque::new(),
+                    closed: false,
                 },
                 CMutex::EvUserLock,
             ),
@@ -1320,6 +1374,10 @@ impl EventUser {
             return std::task::Poll::Ready(());
         }
         let mut chain = self.ques.lock();
+        if chain.reply_due() {
+            *out = chain.replies.pop_front().map(OwedReply::into_event);
+            return std::task::Poll::Ready(());
+        }
         let n = chain.ques.len();
         for step in 0..n {
             // `reading < n`: no divide per poll.
@@ -1329,9 +1387,63 @@ impl EventUser {
                 return std::task::Poll::Ready(());
             }
         }
-        // Every queue is parked on `cx`; the next wake is a new pass.
+        // Every queue is parked on `cx`. An entry a reply still waits for is
+        // withheld by EVENTS_OFF, which C's extra labor does not wait on.
+        if let Some(reply) = chain.replies.pop_front() {
+            *out = Some(reply.into_event());
+            return std::task::Poll::Ready(());
+        }
+        // The next wake is a new pass.
         chain.reading = 0;
         std::task::Poll::Pending
+    }
+
+    /// C `db_post_extra_labor` for a frame the circuit owes, a put
+    /// callback's completion above all: [`Self::poll_next`] returns it as
+    /// [`CircuitEvent::Reply`] once every entry queued on the circuit now has
+    /// been taken, or is withheld by EVENTS_OFF.
+    ///
+    /// So a client that sees the reply has seen the monitor updates its put
+    /// posted. C runs extra labor ahead of `event_read` on each wake
+    /// (`dbEvent.c:1038-1053`) and keeps that order only when the event task
+    /// wins the race to the posts.
+    ///
+    /// After [`Self::close_replies`] the frame and `hold` are dropped here.
+    pub fn post_reply(&self, frame: Vec<u8>, hold: Option<ReplyHold>) {
+        {
+            let mut chain = self.ques.lock();
+            if chain.closed {
+                drop(chain);
+                return;
+            }
+            let ahead = chain
+                .ques
+                .iter()
+                .enumerate()
+                .filter_map(|(at, que)| {
+                    let q = que.lock();
+                    (q.used > 0).then(|| (at, q.taken + q.used as u64))
+                })
+                .collect();
+            chain.replies.push_back(OwedReply { frame, hold, ahead });
+        }
+        // After the chain lock: a consumer polling meanwhile parked under it.
+        let waker = self.flow.ppendsem().take();
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    /// The circuit's consumer is gone: drop every reply still owed, releasing
+    /// its hold, and every one posted from now on.
+    pub fn close_replies(&self) {
+        let owed = {
+            let mut chain = self.ques.lock();
+            chain.closed = true;
+            std::mem::take(&mut chain.replies)
+        };
+        // A hold's drop runs its poster's release; not under the chain lock.
+        drop(owed);
     }
 
     /// The context monitor `id` was attached with, for the consumer of its
@@ -3305,8 +3417,122 @@ mod tests {
         match circuit_now(user) {
             std::task::Poll::Ready(CircuitEvent::Event { sid, event, .. }) => (sid, val(&event)),
             std::task::Poll::Ready(CircuitEvent::Ended(id)) => panic!("{id:?} ended"),
+            std::task::Poll::Ready(CircuitEvent::Reply { frame, .. }) => {
+                panic!("reply {frame:?} came first")
+            }
             std::task::Poll::Pending => panic!("nothing to take"),
         }
+    }
+
+    /// The frame of the reply the circuit consumer takes now.
+    fn circuit_reply(user: &EventUser) -> Vec<u8> {
+        match circuit_now(user) {
+            std::task::Poll::Ready(CircuitEvent::Reply { frame, .. }) => frame,
+            std::task::Poll::Ready(_) => panic!("an entry came before the reply"),
+            std::task::Poll::Pending => panic!("no reply to take"),
+        }
+    }
+
+    /// Boundary: nothing queued at the post. The reply is due at once.
+    #[epics_macros_rs::epics_test]
+    async fn a_reply_with_nothing_queued_is_due_at_once() {
+        let user = EventUser::new();
+        let (a, _ra) = attach(&user, 1, LogKind::Val);
+        user.post_reply(vec![1], None);
+        a.post(ev(10));
+        assert_eq!(circuit_reply(&user), [1]);
+        assert_eq!(circuit_event(&user), (1, 10));
+        assert!(circuit_now(&user).is_pending());
+    }
+
+    /// Boundary: entries queued at the post. The reply goes out after them
+    /// and ahead of what was posted after it, and replies keep their order.
+    #[epics_macros_rs::epics_test]
+    async fn a_reply_follows_the_entries_queued_before_it() {
+        let user = EventUser::new();
+        let (a, _ra) = attach(&user, 1, LogKind::Val);
+        let (b, _rb) = attach(&user, 2, LogKind::Val);
+        a.post(ev(10));
+        b.post(ev(20));
+        user.post_reply(vec![1], None);
+        user.post_reply(vec![2], None);
+        a.post(ev(11));
+        assert_eq!(circuit_event(&user), (1, 10));
+        assert_eq!(circuit_event(&user), (2, 20));
+        assert_eq!(circuit_reply(&user), [1]);
+        assert_eq!(circuit_reply(&user), [2]);
+        assert_eq!(circuit_event(&user), (1, 11));
+        assert!(circuit_now(&user).is_pending());
+    }
+
+    /// An entry EVENTS_OFF withholds does not hold a reply back: C's extra
+    /// labor runs while `event_read` is off (`dbEvent.c:1038-1053`).
+    #[epics_macros_rs::epics_test]
+    async fn a_reply_passes_entries_withheld_by_events_off() {
+        let user = EventUser::new();
+        let (a, _ra) = attach(&user, 1, LogKind::Val);
+        user.flow_ctrl_on();
+        a.post(ev(10));
+        user.post_reply(vec![1], None);
+        assert_eq!(circuit_reply(&user), [1]);
+        assert!(circuit_now(&user).is_pending());
+        user.flow_ctrl_off();
+        assert_eq!(circuit_event(&user), (1, 10));
+    }
+
+    /// A reply waits for every queue of the chain that held entries at the
+    /// post, not only the one being read.
+    #[epics_macros_rs::epics_test]
+    async fn a_reply_waits_for_every_queue_of_the_chain() {
+        let user = EventUser::new();
+        let (cap, held) = two_queues(&user);
+        let (first, late) = (&held[0].0, &held[cap as usize].0);
+        first.post(ev(1));
+        late.post(ev(10));
+        user.post_reply(vec![1], None);
+        first.post(ev(2));
+        assert_eq!(circuit_event(&user), (0, 1));
+        assert_eq!(circuit_event(&user), (0, 2));
+        assert_eq!(circuit_event(&user), (cap, 10));
+        assert_eq!(circuit_reply(&user), [1]);
+        assert!(circuit_now(&user).is_pending());
+    }
+
+    /// A post wakes a parked consumer, and the hold travels with its frame.
+    #[epics_macros_rs::epics_test]
+    async fn a_reply_wakes_the_consumer_and_carries_its_hold() {
+        let user = EventUser::new();
+        let (count, waker) = count_waker();
+        assert!(circuit_now_with(&user, &waker).is_pending());
+        let hold = Arc::new(());
+        user.post_reply(vec![1], Some(Box::new(hold.clone())));
+        assert_eq!(count.0.load(Ordering::SeqCst), 1);
+        assert_eq!(Arc::strong_count(&hold), 2);
+        let std::task::Poll::Ready(CircuitEvent::Reply { hold: Some(h), .. }) = circuit_now(&user)
+        else {
+            panic!("the reply with its hold");
+        };
+        assert_eq!(Arc::strong_count(&hold), 2, "the consumer owns it now");
+        drop(h);
+        assert_eq!(Arc::strong_count(&hold), 1);
+    }
+
+    /// Boundary: replies owed when the consumer goes, and replies posted
+    /// after. Both drop with their holds, so no poster waits on a reply
+    /// nobody will send.
+    #[epics_macros_rs::epics_test]
+    async fn closing_drops_owed_and_later_replies_with_their_holds() {
+        let user = EventUser::new();
+        let (a, _ra) = attach(&user, 1, LogKind::Val);
+        a.post(ev(10));
+        let hold = Arc::new(());
+        user.post_reply(vec![1], Some(Box::new(hold.clone())));
+        user.close_replies();
+        assert_eq!(Arc::strong_count(&hold), 1, "an owed reply kept its hold");
+        user.post_reply(vec![2], Some(Box::new(hold.clone())));
+        assert_eq!(Arc::strong_count(&hold), 1, "a later reply kept its hold");
+        assert_eq!(circuit_event(&user), (1, 10));
+        assert!(circuit_now(&user).is_pending());
     }
 
     /// C `event_read` walks `evque[getix]` (`dbEvent.c:957-1006`): a circuit's
@@ -3524,6 +3750,7 @@ mod tests {
                     assert_eq!(id, ra.id());
                     taken.push((0, 0));
                 }
+                CircuitEvent::Reply { .. } => panic!("no reply was posted"),
             }
         }
         assert!(slot.is_none(), "Pending leaves the slot empty");

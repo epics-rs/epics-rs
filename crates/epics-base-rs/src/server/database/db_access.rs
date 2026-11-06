@@ -1078,6 +1078,7 @@ impl<D: EventDelivery> DrainTask<D> {
                         route.delivery.ended();
                     }
                 }
+                Some(CircuitEvent::Reply { .. }) => unreachable!("db access posts no replies"),
             }
         }
     }

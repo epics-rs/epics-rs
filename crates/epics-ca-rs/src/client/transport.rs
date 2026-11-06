@@ -40,13 +40,14 @@ use crate::protocol::*;
 use epics_libcom_rs::cfmt::CFloat;
 
 use super::types::{
-    CircuitKey, DirectServerWriter, DirectServerWriters, InFlightOps, ReadReply, ReadReplyMode,
-    ReadWaiter, SEND_BACKPRESSURE_FRAMES, TransportCommand, TransportEvent, WarmReplySlot,
+    Answer, CircuitKey, DirectServerWriter, DirectServerWriters, InFlightOps, ReadReply,
+    ReadReplyMode, ReadWaiter, SEND_BACKPRESSURE_FRAMES, TransportCommand, TransportEvent,
+    WarmReplySlot,
 };
 
-fn dispatch_read_reply_with<F>(in_flight: &InFlightOps, ioid: u32, make_result: F)
+fn dispatch_read_reply_with<F>(in_flight: &InFlightOps, ioid: u32, make_answer: F)
 where
-    F: FnOnce(ReadReplyMode) -> epics_base_rs::error::CaResult<ReadReply>,
+    F: FnOnce(ReadReplyMode) -> Answer<ReadReply>,
 {
     // Hot path: warm waiter — peek the entry, take the Sender from its
     // slot, leave the entry in place so the next call on the same
@@ -69,15 +70,15 @@ where
         }
     };
     if let Some((mode, slot)) = warm {
-        let result = make_result(mode);
+        let answer = make_answer(mode);
         if let Some(tx) = slot.lock().take() {
-            let _ = tx.send(result);
+            let _ = tx.send(answer);
         }
         return;
     }
     if let Some((_, waiter)) = in_flight.reads.remove(&ioid) {
-        let result = make_result(waiter.mode());
-        waiter.send(result);
+        let answer = make_answer(waiter.mode());
+        waiter.send(answer);
     }
 }
 
@@ -105,8 +106,8 @@ fn make_read_reply(
     }
 }
 
-fn dispatch_read_error(in_flight: &InFlightOps, ioid: u32, error: epics_base_rs::error::CaError) {
-    dispatch_read_reply_with(in_flight, ioid, |_| Err(error));
+fn dispatch_read_error(in_flight: &InFlightOps, ioid: u32, error: Answer<ReadReply>) {
+    dispatch_read_reply_with(in_flight, ioid, |_| error);
 }
 
 /// Optional client-side TLS handshaker. `None` means plaintext.
@@ -1802,7 +1803,11 @@ fn process_command(
             // client/mod.rs for the same boundary in the fast path.
             if count >= 0xFFFF {
                 if hdr.set_payload_size(0, count, peer_minor).is_err() {
-                    dispatch_read_error(in_flight, ioid, epics_base_rs::error::CaError::BadCount);
+                    dispatch_read_error(
+                        in_flight,
+                        ioid,
+                        Answer::local(Err(epics_base_rs::error::CaError::BadCount)),
+                    );
                     return;
                 }
             } else {
@@ -1881,7 +1886,8 @@ fn process_command(
                 peer_minor,
             ) else {
                 if let Some((_, (_, reply_tx))) = in_flight.writes.remove(&ioid) {
-                    let _ = reply_tx.send(Err(epics_base_rs::error::CaError::BadCount));
+                    let _ =
+                        reply_tx.send(Answer::local(Err(epics_base_rs::error::CaError::BadCount)));
                 }
                 return;
             };
@@ -2607,6 +2613,9 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
 
     let mut buf = vec![0u8; 8192];
     let mut accumulated = Vec::new();
+    // Every subscription update this circuit forwards, so a reply read after
+    // it waits for its delivery ([`super::types::Answer`]).
+    let fence = super::types::DeliveryFence::new();
     // C `tcpiiu::processIncoming`'s receive-side body limit and its
     // ignore-don't-close policy — see [`RecvBodyPolicy`], shared with the
     // name-service circuit's reader.
@@ -3049,17 +3058,22 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                                 data_type: hdr.data_type,
                                 count: hdr.actual_count(),
                                 data: accumulated[data_start..data_start + actual_post].to_vec(),
+                                delivery: fence.forward(),
                             }
                         } else {
                             TransportEvent::MonitorStatusError {
                                 subid,
                                 eca_status: hdr.cid,
+                                delivery: fence.forward(),
                             }
                         });
                     } else if hdr.cid == ECA_NORMAL {
                         let data = &accumulated[data_start..data_start + actual_post];
                         dispatch_read_reply_with(&in_flight, ioid, |mode| {
-                            make_read_reply(mode, hdr.data_type, hdr.actual_count(), data)
+                            Answer::new(
+                                make_read_reply(mode, hdr.data_type, hdr.actual_count(), data),
+                                fence.point(),
+                            )
                         });
                     } else {
                         // libca `cac::readNotifyRespAction`
@@ -3078,7 +3092,10 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                         dispatch_read_error(
                             &in_flight,
                             ioid,
-                            epics_base_rs::error::CaError::ServerError(hdr.cid),
+                            Answer::new(
+                                Err(epics_base_rs::error::CaError::ServerError(hdr.cid)),
+                                fence.point(),
+                            ),
                         );
                     }
                 }
@@ -3123,12 +3140,12 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                         // `ECA_NORMAL` is `defmsg(CA_K_SUCCESS, 0) == 1`, so
                         // the `status == 1` this used to test alongside it was
                         // the same test written twice.
-                        if status == ECA_NORMAL {
-                            let _ = reply_tx.send(Ok(()));
+                        let result = if status == ECA_NORMAL {
+                            Ok(())
                         } else {
-                            let _ = reply_tx
-                                .send(Err(epics_base_rs::error::CaError::WriteFailed(status)));
-                        }
+                            Err(epics_base_rs::error::CaError::WriteFailed(status))
+                        };
+                        let _ = reply_tx.send(Answer::new(result, fence.point()));
                     }
                 }
                 CA_PROTO_EVENT_ADD => {
@@ -3194,6 +3211,7 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                         let _ = event_tx.send(TransportEvent::MonitorStatusError {
                             subid: hdr.available,
                             eca_status: hdr.cid,
+                            delivery: fence.forward(),
                         });
                     } else {
                         let data = accumulated[data_start..data_start + actual_post].to_vec();
@@ -3202,6 +3220,7 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                             data_type: hdr.data_type,
                             count: hdr.actual_count(),
                             data,
+                            delivery: fence.forward(),
                         });
                     }
                 }
@@ -3287,13 +3306,17 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                             dispatch_read_error(
                                 &in_flight,
                                 ioid,
-                                epics_base_rs::error::CaError::ServerError(eca_status),
+                                Answer::new(
+                                    Err(epics_base_rs::error::CaError::ServerError(eca_status)),
+                                    fence.point(),
+                                ),
                             );
                         }
                         CA_PROTO_WRITE_NOTIFY => {
                             if let Some((_, (_, reply_tx))) = in_flight.writes.remove(&ioid) {
-                                let _ = reply_tx.send(Err(
-                                    epics_base_rs::error::CaError::ServerError(eca_status),
+                                let _ = reply_tx.send(Answer::new(
+                                    Err(epics_base_rs::error::CaError::ServerError(eca_status)),
+                                    fence.point(),
                                 ));
                             }
                         }
@@ -3320,6 +3343,7 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                             let _ = event_tx.send(TransportEvent::MonitorStatusError {
                                 subid: ioid,
                                 eca_status,
+                                delivery: fence.forward(),
                             });
                         }
                         // EVENT_CANCEL confirmations have no per-op waiter;
@@ -4415,7 +4439,9 @@ mod error_echo_dispatch_tests {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         while tokio::time::Instant::now() < deadline && !saw_status_error {
             match tokio::time::timeout_at(deadline, event_rx.recv()).await {
-                Ok(Some(TransportEvent::MonitorStatusError { subid, eca_status })) => {
+                Ok(Some(TransportEvent::MonitorStatusError {
+                    subid, eca_status, ..
+                })) => {
                     assert_eq!(subid, SUBID, "must carry the echoed subscription id");
                     assert_eq!(eca_status, ECA_TOLARGE, "must carry the ECA status");
                     saw_status_error = true;
@@ -4496,7 +4522,9 @@ mod error_echo_dispatch_tests {
         let got = tokio::time::timeout(Duration::from_secs(2), reply_rx)
             .await
             .expect("read waiter must be completed by the echoed READ_NOTIFY error")
-            .expect("waiter must not be dropped without a reply");
+            .expect("waiter must not be dropped without a reply")
+            .settle()
+            .await;
         assert!(
             matches!(
                 got,
@@ -5121,6 +5149,7 @@ mod recv_watchdog_tests {
                 data_type,
                 count,
                 data,
+                ..
             } => {
                 assert_eq!(subid, 7, "the reply belongs to the subscription");
                 assert_eq!((data_type, count), (6, 1));
@@ -7167,5 +7196,188 @@ mod write_failed_status_passthrough_tests {
     #[test]
     fn the_put_callback_timeout_status_reads_as_c_spells_it() {
         assert_eq!(eca_message(ECA_PUTCBINPROG), "Put callback timed out");
+    }
+}
+
+#[cfg(all(test, tokio_backend))]
+mod reply_fence_tests {
+    //! A read or write reply resolves only after the subscription updates the
+    //! circuit read before it are in their subscriptions, as libca runs both
+    //! callbacks on the receive thread in wire order (`tcpiiu.cpp:1263`).
+    use super::*;
+    use dashmap::DashMap;
+    use std::future::Future;
+    use std::pin::{Pin, pin};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::{AsyncWriteExt, DuplexStream};
+
+    const SUBID: u32 = 7;
+    const IOID: u32 = 9;
+
+    fn circuit() -> (
+        DuplexStream,
+        mpsc::UnboundedReceiver<TransportEvent>,
+        super::super::types::InFlightOps,
+    ) {
+        let (event_tx, event_rx) = mpsc::unbounded_channel::<TransportEvent>();
+        let (write_tx, _write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (_ba_tx, ba_rx) = mpsc::unbounded_channel::<bool>();
+        let in_flight = super::super::types::InFlightOps::new();
+        let (client_io, server_io) = tokio::io::duplex(1024);
+        tokio::spawn(read_loop(
+            server_io,
+            "127.0.0.1:5064".parse().unwrap(),
+            0,
+            event_tx,
+            write_tx,
+            ba_rx,
+            in_flight.clone(),
+            crate::client::types::CaExceptionSlot::default(),
+            Arc::new(DashMap::new()),
+            Arc::new(UnresponsiveGate::new()),
+            drained_socket_probe(),
+            Arc::new(std::sync::atomic::AtomicU16::new(0)),
+            CircuitWatchdog::new(),
+        ));
+        (client_io, event_rx, in_flight)
+    }
+
+    /// A one-element DBR_DOUBLE frame.
+    fn frame(command: u16, id: u32, value: Option<f64>) -> Vec<u8> {
+        let mut hdr = CaHeader::new(command);
+        hdr.data_type = 6;
+        hdr.count = 1;
+        hdr.cid = crate::protocol::ECA_NORMAL;
+        hdr.available = id;
+        hdr.postsize = if value.is_some() { 8 } else { 0 };
+        let mut frame = hdr.to_bytes().to_vec();
+        if let Some(value) = value {
+            frame.extend_from_slice(&value.to_be_bytes());
+        }
+        frame
+    }
+
+    async fn send(client: &mut DuplexStream, frames: &[Vec<u8>]) {
+        client.write_all(&frames.concat()).await.expect("write");
+        client.flush().await.expect("flush");
+    }
+
+    /// The output if `f` is ready on its first poll.
+    async fn now<F: Future>(f: Pin<&mut F>) -> Option<F::Output> {
+        tokio::select! {
+            biased;
+            out = f => Some(out),
+            () = std::future::ready(()) => None,
+        }
+    }
+
+    fn expect_update(event: TransportEvent) -> TransportEvent {
+        assert!(
+            matches!(event, TransportEvent::MonitorData { subid: SUBID, .. }),
+            "the update is forwarded as its subscription's MonitorData"
+        );
+        event
+    }
+
+    #[tokio::test]
+    async fn a_reply_waits_for_the_update_read_before_it() {
+        let (mut client, mut event_rx, in_flight) = circuit();
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        in_flight.writes.insert(IOID, (0x2A, reply_tx));
+
+        send(
+            &mut client,
+            &[
+                frame(CA_PROTO_EVENT_ADD, SUBID, Some(1.5)),
+                frame(CA_PROTO_WRITE_NOTIFY, IOID, None),
+            ],
+        )
+        .await;
+        let answer = tokio::time::timeout(Duration::from_secs(2), reply_rx)
+            .await
+            .expect("the write is answered")
+            .expect("answered, not dropped");
+        // The loop forwards the update before it answers the write.
+        let update = expect_update(event_rx.try_recv().expect("forwarded first"));
+
+        let mut settle = pin!(answer.settle());
+        assert!(
+            now(settle.as_mut()).await.is_none(),
+            "the reply must not resolve while the update read before it is undelivered"
+        );
+        drop(update);
+        let result = tokio::time::timeout(Duration::from_secs(2), settle)
+            .await
+            .expect("delivering the update releases the reply");
+        assert!(result.is_ok(), "the write succeeded: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn a_reply_after_delivered_updates_resolves_at_once() {
+        let (mut client, mut event_rx, in_flight) = circuit();
+        send(&mut client, &[frame(CA_PROTO_EVENT_ADD, SUBID, Some(1.5))]).await;
+        let update = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("the update is forwarded")
+            .expect("channel open");
+        drop(expect_update(update));
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        in_flight.reads.insert(
+            IOID,
+            super::super::types::ReadWaiter::OneShot {
+                cid: 0x2A,
+                mode: super::super::types::ReadReplyMode::Plain,
+                reply_tx,
+            },
+        );
+        send(&mut client, &[frame(CA_PROTO_READ_NOTIFY, IOID, Some(2.5))]).await;
+        let answer = tokio::time::timeout(Duration::from_secs(2), reply_rx)
+            .await
+            .expect("the read is answered")
+            .expect("answered, not dropped");
+
+        let settled = now(pin!(answer.settle())).await;
+        assert!(
+            matches!(settled, Some(Ok(_))),
+            "no update is outstanding, so the reply is ready on its first poll"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reply_is_released_when_its_updates_are_dropped_undelivered() {
+        let (mut client, event_rx, in_flight) = circuit();
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        in_flight.reads.insert(
+            IOID,
+            super::super::types::ReadWaiter::OneShot {
+                cid: 0x2A,
+                mode: super::super::types::ReadReplyMode::Plain,
+                reply_tx,
+            },
+        );
+
+        send(
+            &mut client,
+            &[
+                frame(CA_PROTO_EVENT_ADD, SUBID, Some(1.5)),
+                frame(CA_PROTO_READ_NOTIFY, IOID, Some(2.5)),
+            ],
+        )
+        .await;
+        let answer = tokio::time::timeout(Duration::from_secs(2), reply_rx)
+            .await
+            .expect("the read is answered")
+            .expect("answered, not dropped");
+
+        let mut settle = pin!(answer.settle());
+        assert!(now(settle.as_mut()).await.is_none(), "the update is queued");
+        // The coordinator exiting drops its queue, update and all.
+        drop(event_rx);
+        let result = tokio::time::timeout(Duration::from_secs(2), settle)
+            .await
+            .expect("a dropped update releases the reply, so it cannot hang");
+        assert!(result.is_ok(), "the read succeeded");
     }
 }

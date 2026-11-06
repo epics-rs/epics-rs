@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use dashmap::DashMap;
@@ -668,9 +668,112 @@ pub(crate) enum ReadReplyMode {
 }
 
 /// Reply channel type for reads.
-pub(crate) type ReadReplyTx = oneshot::Sender<CaResult<ReadReply>>;
+pub(crate) type ReadReplyTx = oneshot::Sender<Answer<ReadReply>>;
 /// Reply channel type for one-shot writes (write-notify completion).
-pub(crate) type WriteReplyTx = oneshot::Sender<CaResult<()>>;
+pub(crate) type WriteReplyTx = oneshot::Sender<Answer<()>>;
+
+/// A read or write reply, and the subscription updates its circuit read
+/// before it. libca runs each response's callback on the receive thread in
+/// wire order (`tcpiiu.cpp:1263`), so a put-callback completes after the
+/// monitor callbacks for the updates the put caused. Here a reply wakes its
+/// caller directly while an update reaches its subscription through the
+/// coordinator, so the reply waits for those updates ([`Self::settle`]).
+pub(crate) struct Answer<T> {
+    result: CaResult<T>,
+    after: FencePoint,
+}
+
+impl<T> Answer<T> {
+    /// A reply read off a circuit at `after`.
+    pub(crate) fn new(result: CaResult<T>, after: FencePoint) -> Self {
+        Self { result, after }
+    }
+
+    /// A reply made here rather than read off a circuit (a local refusal, a
+    /// disconnect): no update precedes it.
+    pub(crate) fn local(result: CaResult<T>) -> Self {
+        Self {
+            result,
+            after: FencePoint(None),
+        }
+    }
+
+    /// The result, once every update read before it is in its subscription.
+    pub(crate) async fn settle(self) -> CaResult<T> {
+        self.after.reached().await;
+        self.result
+    }
+}
+
+/// A circuit's subscription updates, counted as the read loop forwards them
+/// and as the coordinator delivers them. [`Self::forward`] is the only
+/// counter of the first and a [`Delivery`] dropping the only counter of the
+/// second, so each forwarded update is counted delivered exactly once,
+/// whether the coordinator handles its event or drops it unhandled. The
+/// coordinator takes events in order, so the delivered count is a position.
+pub(crate) struct DeliveryFence {
+    forwarded: AtomicU64,
+    delivered: AtomicU64,
+    progressed: tokio::sync::Notify,
+}
+
+impl DeliveryFence {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            forwarded: AtomicU64::new(0),
+            delivered: AtomicU64::new(0),
+            progressed: tokio::sync::Notify::new(),
+        })
+    }
+
+    /// One more update leaving the read loop; the ticket rides its event.
+    pub(crate) fn forward(self: &Arc<Self>) -> Delivery {
+        self.forwarded.fetch_add(1, Ordering::Relaxed);
+        Delivery(self.clone())
+    }
+
+    /// The position of a reply the read loop reads now: behind every update
+    /// it has forwarded.
+    pub(crate) fn point(self: &Arc<Self>) -> FencePoint {
+        let at = self.forwarded.load(Ordering::Relaxed);
+        if self.delivered.load(Ordering::Acquire) >= at {
+            return FencePoint(None);
+        }
+        FencePoint(Some((self.clone(), at)))
+    }
+}
+
+/// An update's place in its circuit's [`DeliveryFence`], dropped once the
+/// update is in its subscription's queue or slot.
+pub(crate) struct Delivery(Arc<DeliveryFence>);
+
+impl Drop for Delivery {
+    fn drop(&mut self) {
+        self.0.delivered.fetch_add(1, Ordering::Release);
+        self.0.progressed.notify_waiters();
+    }
+}
+
+/// A reply's position in its circuit's [`DeliveryFence`]; `None` when no
+/// update was outstanding.
+pub(crate) struct FencePoint(Option<(Arc<DeliveryFence>, u64)>);
+
+impl FencePoint {
+    async fn reached(self) {
+        let Some((fence, at)) = self.0 else {
+            return;
+        };
+        loop {
+            let progressed = fence.progressed.notified();
+            let mut progressed = std::pin::pin!(progressed);
+            progressed.as_mut().enable();
+            if fence.delivered.load(Ordering::Acquire) >= at {
+                return;
+            }
+            progressed.await;
+        }
+    }
+}
 
 /// Reusable Sender slot used by `ReadWaiter::Warm` — the channel-side
 /// caller refills it before each call, the dispatcher takes it on
@@ -713,17 +816,17 @@ impl ReadWaiter {
         }
     }
 
-    /// Consume the waiter and signal `result`. Used by the disconnect
+    /// Consume the waiter and signal `answer`. Used by the disconnect
     /// drain path (`drain_waiters_for_cids`) where we want both
     /// `OneShot` and `Warm` waiters notified-and-evicted.
-    pub(crate) fn send(self, result: CaResult<ReadReply>) {
+    pub(crate) fn send(self, answer: Answer<ReadReply>) {
         match self {
             Self::OneShot { reply_tx, .. } => {
-                let _ = reply_tx.send(result);
+                let _ = reply_tx.send(answer);
             }
             Self::Warm { slot, .. } => {
                 if let Some(tx) = slot.lock().take() {
-                    let _ = tx.send(result);
+                    let _ = tx.send(answer);
                 }
             }
         }
@@ -1458,6 +1561,7 @@ pub(crate) enum TransportEvent {
         data_type: u16,
         count: u32,
         data: Vec<u8>,
+        delivery: Delivery,
     },
     /// Server emitted a monitor frame with a non-NORMAL `m_cid` (ECA
     /// status), e.g. `no_read_access_event` after an ACF reload
@@ -1471,6 +1575,7 @@ pub(crate) enum TransportEvent {
     MonitorStatusError {
         subid: u32,
         eca_status: u32,
+        delivery: Delivery,
     },
     AccessRightsChanged {
         cid: u32,

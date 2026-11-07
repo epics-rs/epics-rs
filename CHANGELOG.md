@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.34.1 — 2026-11-07
+
+Patch release; the pinned toolchain stays at 1.99.1. A get after a waited
+CA or PVA put reads the value put: the put's reply now follows the monitor
+updates it caused, in the server and in the client.
+
+### Changed
+
+- base: `event_queue::CircuitEvent` gains a `Reply` variant, which an `EventUser` queues with `post_reply` behind the updates already queued and releases with `close_replies`; a `match` on `CircuitEvent` without a wildcard arm needs the new arm. `ReplyHold` is what the reply holds until it is sent.
+- PVA client: `ServerConn::register_ioid_twoshot`, `register_ioid_stream` and `register_ioid_reusable` deliver a `Reply` instead of a `Frame`; `Reply::settle` returns the frame once the monitor frames read before it have reached their subscriptions.
+
+### New
+
+- CA client: `CaChannel::subscribe_callback` calls its callback on the client coordinator as each update is read, so the callbacks of every subscription run in wire order and before the reply read after them, as libca runs them. It returns a `CallbackMonitor`; dropping it unsubscribes. The callback must return promptly, since the coordinator waits for it.
+- base: `PvDatabase::events_delivered` resolves once every database event drain has delivered what was queued on it before the call (C `db_post_extra_labor`).
+
+### Fixed
+
+- CA server: a record's WRITE_NOTIFY reply is sent from the event consumer behind the record's updates, as rsrv sends it.
+- CA client: a get or put reply settles after the monitor callbacks for the updates read before it, as libca runs it.
+- PVA server: an op reply is written after the updates posted before it, and a QSRV put replies only after the record and group monitor updates it posted have been delivered; C pvxs still races here.
+- PVA client: an op reply settles after the monitor frames read before it.
+- PVA client: the monitor callbacks of all subscriptions on one connection run one at a time in wire order, as on pvxs's client loop; a slow callback now delays the other subscriptions' callbacks on that connection.
+
 ## v0.34.0 — 2026-11-05
 
 Minor release; the pinned toolchain stays at 1.99.1. The motor record

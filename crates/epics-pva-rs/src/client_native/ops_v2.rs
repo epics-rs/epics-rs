@@ -3281,7 +3281,7 @@ where
                         // no-handle path converge on the same cleanup.
                         return Err(td.cancelled());
                     }
-                    f = stream.recv() => match f {
+                    f = stream.recv_in_turn() => match f {
                         Some(f) => f,
                         None => return Err(td.lost()),
                     },
@@ -3289,7 +3289,7 @@ where
             }
             // No handle: nothing can cancel this loop, so just await the
             // next frame.
-            None => match stream.recv().await {
+            None => match stream.recv_in_turn().await {
                 Some(f) => f,
                 None => return Err(td.lost()),
             },
@@ -3997,7 +3997,7 @@ where
                         // no-handle path converge on the same cleanup.
                         return Err(td.cancelled());
                     }
-                    f = stream.recv() => match f {
+                    f = stream.recv_in_turn() => match f {
                         Some(f) => f,
                         None => return Err(td.lost()),
                     },
@@ -4005,7 +4005,7 @@ where
             }
             // No handle: nothing can cancel this loop, so just await the
             // next frame.
-            None => match stream.recv().await {
+            None => match stream.recv_in_turn().await {
                 Some(f) => f,
                 None => return Err(td.lost()),
             },

@@ -522,8 +522,7 @@ enum CoordRequest {
         cid: u32,
         mask: u16,
         deadband: f64,
-        callback_tx: mpsc::Sender<CaResult<Snapshot>>,
-        coalesce_slot: std::sync::Arc<subscription::CoalesceSlot>,
+        consumer: subscription::Consumer,
         /// Requested element-count cap (`camonitor -#`), or `None` for the
         /// full native count. Carried onto the subscription record and
         /// clamped to the channel's native element count at connect-time by
@@ -3235,14 +3234,76 @@ impl CaChannel {
         let queue_size = resolve_monitor_queue_size(env);
         let (callback_tx, callback_rx) = mpsc::channel(queue_size);
         let coalesce_slot = subscription::CoalesceSlot::new();
+        let consumer = subscription::Consumer::Handle {
+            tx: callback_tx,
+            slot: coalesce_slot.clone(),
+        };
+        let subid = self
+            .subscribe_consumer(
+                deadband,
+                mask,
+                enum_readback,
+                float_as_string,
+                req_count,
+                consumer,
+            )
+            .await?;
+        Ok(MonitorHandle {
+            subid,
+            callback_rx,
+            coalesce_slot,
+            coord_tx: self.coord_tx.clone(),
+            channel: self.clone(),
+        })
+    }
 
+    /// Subscribe with `callback` called for each update, error and
+    /// disconnect (`Err` with ECA_DISCONN) of the native type at CA
+    /// autosize, as `ca_create_subscription` calls its handler.
+    ///
+    /// The callback runs on the client's coordinator as the update is read,
+    /// so the callbacks of every subscription of this client run in wire
+    /// order, and a get or put reply read after an update settles after its
+    /// callback has returned — libca's order (`tcpiiu.cpp:1263`). It holds
+    /// up every channel of the client while it runs, so it must return
+    /// promptly: hand the update off, never block on this client.
+    pub async fn subscribe_callback<F>(&self, mask: u16, callback: F) -> CaResult<CallbackMonitor>
+    where
+        F: FnMut(CaResult<Snapshot>) + Send + 'static,
+    {
+        // Built before the request, so a subscribe whose future is dropped
+        // still marks its callback gone and the coordinator cancels it.
+        let mut monitor = CallbackMonitor {
+            subid: 0,
+            gone: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            coord_tx: self.coord_tx.clone(),
+            _channel: self.clone(),
+        };
+        let consumer = subscription::Consumer::Callback {
+            callback: Box::new(callback),
+            gone: monitor.gone.clone(),
+        };
+        monitor.subid = self
+            .subscribe_consumer(0.0, mask, EnumReadback::Native, false, None, consumer)
+            .await?;
+        Ok(monitor)
+    }
+
+    async fn subscribe_consumer(
+        &self,
+        deadband: f64,
+        mask: u16,
+        enum_readback: EnumReadback,
+        float_as_string: bool,
+        req_count: Option<u32>,
+        consumer: subscription::Consumer,
+    ) -> CaResult<u32> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let _ = self.coord_tx.send(CoordRequest::Subscribe {
             cid: self.cid,
             mask,
             deadband,
-            callback_tx,
-            coalesce_slot: coalesce_slot.clone(),
+            consumer,
             req_count,
             enum_readback,
             float_as_string,
@@ -3251,15 +3312,7 @@ impl CaChannel {
 
         // the coordinator allocates the subid against its live
         // subscription table and returns it on success.
-        let subid = reply_rx.await.map_err(|_| CaError::Shutdown)??;
-
-        Ok(MonitorHandle {
-            subid,
-            callback_rx,
-            coalesce_slot,
-            coord_tx: self.coord_tx.clone(),
-            channel: self.clone(),
-        })
+        reply_rx.await.map_err(|_| CaError::Shutdown)?
     }
 
     /// Subscribe to per-channel lifecycle events:
@@ -3415,7 +3468,7 @@ impl MonitorHandle {
     /// 1. Anything buffered in the bounded channel (preserves FIFO
     ///    under normal load).
     /// 2. The coalesce slot, populated when the channel was full
-    ///    at delivery time (`SubscriptionRecord::coalesce_slot`).
+    ///    at delivery time (`subscription::Consumer::Handle`).
     /// 3. Block until either a new channel item lands or the
     ///    producer signals the slot via `Notify`.
     ///
@@ -3504,6 +3557,36 @@ impl Drop for MonitorHandle {
         let _ = self
             .coord_tx
             .send(CoordRequest::Unsubscribe { subid: self.subid });
+    }
+}
+
+/// A subscription made with [`CaChannel::subscribe_callback`]. Dropping it
+/// cancels the subscription; a call the coordinator had already begun when
+/// it dropped may still run.
+pub struct CallbackMonitor {
+    /// 0 until the coordinator answers; never a live subid.
+    subid: u32,
+    gone: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    coord_tx: mpsc::UnboundedSender<CoordRequest>,
+    /// Keeps the channel, and so the subscription, alive.
+    _channel: CaChannel,
+}
+
+impl CallbackMonitor {
+    /// Subscription identifier (matches the libca `evid` opaque).
+    pub fn subid(&self) -> u32 {
+        self.subid
+    }
+}
+
+impl Drop for CallbackMonitor {
+    fn drop(&mut self) {
+        self.gone.store(true, std::sync::atomic::Ordering::Release);
+        if self.subid != 0 {
+            let _ = self
+                .coord_tx
+                .send(CoordRequest::Unsubscribe { subid: self.subid });
+        }
     }
 }
 
@@ -3608,7 +3691,7 @@ async fn run_coordinator(
                                 .push(reply);
                         }
                     }
-                    CoordRequest::Subscribe { cid, mask, deadband, callback_tx, coalesce_slot, req_count, enum_readback, float_as_string, reply } => {
+                    CoordRequest::Subscribe { cid, mask, deadband, consumer, req_count, enum_readback, float_as_string, reply } => {
                         if let Some(ch) = channels.get(&cid) {
                             let server_addr = ch.server_addr.unwrap_or_else(|| {
                                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
@@ -3679,8 +3762,7 @@ async fn run_coordinator(
                                 server_addr,
                                 priority,
                                 deadband,
-                                callback_tx,
-                                coalesce_slot,
+                                consumer,
                                 needs_restore: !installed,
                                 last_value: None,
                                 nreplace: 0,
@@ -4179,7 +4261,7 @@ async fn run_coordinator(
                     TransportEvent::MonitorData { subid, data_type, count, data, delivery } => {
                         use subscription::MonitorDeliveryOutcome;
                         match subscriptions.on_monitor_data(subid, data_type, count, &data) {
-                            MonitorDeliveryOutcome::Queued => {}
+                            MonitorDeliveryOutcome::Delivered => {}
                             MonitorDeliveryOutcome::Slotted => {
                                 // Coalesced into the slot (overflow or
                                 // pause-held). Diagnostic only — flow
@@ -4225,7 +4307,7 @@ async fn run_coordinator(
                         // exception-callback semantics.
                         use subscription::MonitorDeliveryOutcome;
                         match subscriptions.on_monitor_error(subid, eca_status) {
-                            MonitorDeliveryOutcome::Queued => {}
+                            MonitorDeliveryOutcome::Delivered => {}
                             MonitorDeliveryOutcome::Slotted => {
                                 metrics::counter!(
                                     "ca_client_coalesced_monitors_total"

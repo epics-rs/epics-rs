@@ -325,6 +325,10 @@ const SCOPE_GATED: &[(&str, &str)] = &[
         "epics-ca-rs",
         "tests/softioc_prompt_ioc_init_starts_the_ca_server.rs",
     ),
+    (
+        "epics-ca-rs",
+        "tests/subscription_callbacks_run_in_wire_order.rs",
+    ),
     ("epics-ca-rs", "tests/swait_remote_input.rs"),
     (
         "epics-ca-rs",

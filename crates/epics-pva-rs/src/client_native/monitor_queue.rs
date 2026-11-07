@@ -34,8 +34,9 @@
 //! Each frame rides with its place in the connection's [`DeliveryFence`],
 //! which a reply routed after it waits on.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
+use std::task::{Poll, Waker};
 
 use parking_lot::Mutex;
 use tokio::sync::Notify;
@@ -231,6 +232,15 @@ impl MonitorBacklog {
         }
     }
 
+    /// [`Self::recv`], returned on the frame's [`Delivery::turn`]. Dropped
+    /// while it waits, it discards the popped frame, which is what a
+    /// cancelled drain loop wants.
+    pub(crate) async fn recv_in_turn(&self) -> Option<(Frame, Delivery)> {
+        let (frame, delivery) = self.recv().await?;
+        delivery.turn().await;
+        Some((frame, delivery))
+    }
+
     /// `(n_cli_squash, max_queue, n_queue)` — pvxs `nCliSquash`,
     /// `queueMax` and `nQueue`.
     pub(crate) fn counters(&self) -> (u64, u32, u32) {
@@ -284,11 +294,11 @@ impl Drop for MonitorStream {
 /// A connection's monitor frames, as tickets the reader issues when it
 /// routes one into a backlog and the drain loops release once the frame is
 /// handed to its callback or discarded. pvxs runs every op's callbacks on
-/// one loop thread in wire order, so a put's result follows the monitor
-/// callbacks for the updates read before it; here the subscriptions drain
-/// on their own tasks, so a reply waits for its [`FencePoint`] instead.
-/// Tickets release out of order across subscriptions, so the fence keeps
-/// the outstanding set rather than a count.
+/// one loop thread in wire order; here the subscriptions drain on their own
+/// tasks, so a drain loop calls back on its ticket's [`Delivery::turn`] and
+/// a reply waits for its [`FencePoint`]. A squash or an abandoned backlog
+/// releases tickets out of turn, so the fence keeps the outstanding set
+/// rather than a count.
 pub(crate) struct DeliveryFence {
     tickets: Mutex<Tickets>,
     released: Notify,
@@ -297,7 +307,8 @@ pub(crate) struct DeliveryFence {
 #[derive(Default)]
 struct Tickets {
     next: u64,
-    outstanding: BTreeSet<u64>,
+    /// Each outstanding ticket, with the waker of a loop awaiting its turn.
+    outstanding: BTreeMap<u64, Option<Waker>>,
 }
 
 impl DeliveryFence {
@@ -313,7 +324,7 @@ impl DeliveryFence {
         let mut t = self.tickets.lock();
         let seq = t.next;
         t.next += 1;
-        t.outstanding.insert(seq);
+        t.outstanding.insert(seq, None);
         Delivery {
             fence: self.clone(),
             seq,
@@ -337,16 +348,45 @@ pub(crate) struct Delivery {
     seq: u64,
 }
 
+impl Delivery {
+    /// Once this is the connection's oldest outstanding ticket: every frame
+    /// read before it has been handed on or discarded.
+    pub(crate) async fn turn(&self) {
+        std::future::poll_fn(|cx| {
+            let mut t = self.fence.tickets.lock();
+            if t.outstanding.first_key_value().map(|(&seq, _)| seq) == Some(self.seq) {
+                return Poll::Ready(());
+            }
+            let waiter = t
+                .outstanding
+                .get_mut(&self.seq)
+                .expect("a live ticket is outstanding");
+            *waiter = Some(cx.waker().clone());
+            Poll::Pending
+        })
+        .await
+    }
+}
+
 impl Drop for Delivery {
     fn drop(&mut self) {
         let mut t = self.fence.tickets.lock();
-        let oldest = t.outstanding.first() == Some(&self.seq);
+        let oldest = t.outstanding.first_key_value().map(|(&seq, _)| seq) == Some(self.seq);
         t.outstanding.remove(&self.seq);
-        drop(t);
-        // A point waits on the oldest outstanding ticket only.
-        if oldest {
-            self.fence.released.notify_waiters();
+        if !oldest {
+            return;
         }
+        // The turn passes to the new oldest ticket alone, and a point waits
+        // on the oldest only.
+        let next = t
+            .outstanding
+            .first_entry()
+            .and_then(|mut e| e.get_mut().take());
+        drop(t);
+        if let Some(next) = next {
+            next.wake();
+        }
+        self.fence.released.notify_waiters();
     }
 }
 
@@ -368,8 +408,8 @@ impl FencePoint {
                 .tickets
                 .lock()
                 .outstanding
-                .first()
-                .is_none_or(|&oldest| oldest >= at)
+                .first_key_value()
+                .is_none_or(|(&oldest, _)| oldest >= at)
             {
                 return;
             }
@@ -590,6 +630,41 @@ mod tests {
         assert!(!ready(reached.as_mut()));
         drop(older);
         assert!(ready(reached.as_mut()));
+    }
+
+    #[derive(Default)]
+    struct Woken(std::sync::atomic::AtomicBool);
+
+    impl std::task::Wake for Woken {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// A ticket's turn comes once every older ticket releases, in any
+    /// order, and the release that makes it the oldest wakes it; a younger
+    /// release does not. Revert-verify: waking only the points fails it.
+    #[test]
+    fn a_turn_comes_when_every_older_ticket_releases() {
+        let fence = DeliveryFence::new();
+        let older = fence.issue();
+        let middle = fence.issue();
+        let last = fence.issue();
+        let woken = Arc::new(Woken::default());
+        let waker = Waker::from(woken.clone());
+        let mut turn = std::pin::pin!(last.turn());
+        let mut poll = || {
+            turn.as_mut()
+                .poll(&mut std::task::Context::from_waker(&waker))
+                .is_ready()
+        };
+        assert!(!poll());
+        drop(middle);
+        assert!(!woken.0.swap(false, std::sync::atomic::Ordering::SeqCst));
+        assert!(!poll());
+        drop(older);
+        assert!(woken.0.swap(false, std::sync::atomic::Ordering::SeqCst));
+        assert!(poll());
     }
 
     /// A squash releases the merged frame's ticket and the tail keeps its

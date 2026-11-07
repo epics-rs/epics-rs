@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::SystemTime;
 
 use epics_base_rs::runtime::sync::mpsc;
@@ -233,19 +233,131 @@ impl CoalesceSlot {
 /// from socket occupancy in `transport::read_loop`, never from how far
 /// behind the application is.
 pub(crate) enum MonitorDeliveryOutcome {
-    /// Written to the bounded channel.
-    Queued,
+    /// Written to the bounded channel, or passed to the callback.
+    Delivered,
     /// Buffered in the coalesce slot (overflow `ready`, during-pause
     /// `gated`, or overflow error). Diagnostic only.
     Slotted,
     /// Nobody will read this subscription again: the application dropped
-    /// its `MonitorHandle`, or a cancelled subscribe never built one. Not
-    /// a lost update; the coordinator cancels the subscription.
+    /// its handle, a cancelled subscribe never built one, or its callback
+    /// panicked. Not a lost update; the coordinator cancels the subscription.
     ConsumerGone,
     /// Filtered by client-side deadband (no action).
     Filtered,
     /// Subscription not found.
     NotFound,
+}
+
+const ECA_DISCONN: u32 = 192; // protocol::ECA_DISCONN
+
+/// Where a subscription's updates go.
+pub(crate) enum Consumer {
+    /// A [`super::MonitorHandle`]: the bounded channel, then the coalesce
+    /// slot it drains after the channel.
+    Handle {
+        tx: mpsc::Sender<CaResult<Snapshot>>,
+        slot: Arc<CoalesceSlot>,
+    },
+    /// A [`super::CallbackMonitor`]: called on the coordinator as each
+    /// update is read, so the callbacks of every subscription run in wire
+    /// order and before a reply read after them settles.
+    Callback {
+        callback: Box<dyn FnMut(CaResult<Snapshot>) + Send>,
+        gone: Arc<AtomicBool>,
+    },
+}
+
+impl Consumer {
+    pub(crate) fn is_gone(&self) -> bool {
+        match self {
+            Consumer::Handle { tx, .. } => tx.is_closed(),
+            Consumer::Callback { gone, .. } => gone.load(Ordering::Acquire),
+        }
+    }
+
+    /// Value routing for a handle is computed atomically against the pause
+    /// flag; only a channel write counts as `Delivered`, every slot write is
+    /// `Slotted` and out of flow control (I1).
+    fn value(&mut self, snapshot: Snapshot) -> MonitorDeliveryOutcome {
+        match self {
+            Consumer::Handle { tx, slot } => match slot.route_value(snapshot) {
+                ValueRoute::Slotted => MonitorDeliveryOutcome::Slotted,
+                ValueRoute::TryChannel(snapshot) => match tx.try_send(Ok(*snapshot)) {
+                    Ok(()) => MonitorDeliveryOutcome::Delivered,
+                    Err(TrySendError::Full(rejected)) => {
+                        // Bounded channel full — coalesce into the slot
+                        // instead of the pre-fix silent drop (which lost
+                        // terminal transitions like DMOV 1→0 under load).
+                        // Mirrors C `db_queue_event_log`'s replace-last
+                        // (`dbEvent.c:812-827`), not `db_post_events`,
+                        // which only gates on the mask and calls out.
+                        slot.put_value(rejected.expect("route_value only boxes Ok values"));
+                        MonitorDeliveryOutcome::Slotted
+                    }
+                    Err(TrySendError::Closed(_)) => MonitorDeliveryOutcome::ConsumerGone,
+                },
+            },
+            Consumer::Callback { callback, gone } => call(callback, gone, Ok(snapshot)),
+        }
+    }
+
+    /// Errors bypass pause and use the dedicated error slot (I2): they go
+    /// to the bounded channel when there is room, otherwise the sticky
+    /// error slot, which a value can never overwrite. The error slot does
+    /// not displace a pending value — `take_deliverable` yields the error
+    /// first.
+    fn error(&mut self, err: CaError) -> MonitorDeliveryOutcome {
+        match self {
+            Consumer::Handle { tx, slot } => match tx.try_send(Err(err)) {
+                Ok(()) => MonitorDeliveryOutcome::Delivered,
+                Err(TrySendError::Full(rejected)) => {
+                    let Err(e) = rejected else {
+                        unreachable!("we just sent an Err")
+                    };
+                    slot.put_error(e);
+                    MonitorDeliveryOutcome::Slotted
+                }
+                Err(TrySendError::Closed(_)) => MonitorDeliveryOutcome::ConsumerGone,
+            },
+            Consumer::Callback { callback, gone } => call(callback, gone, Err(err)),
+        }
+    }
+
+    /// A handle's disconnect error goes ALWAYS into the error cell, never
+    /// the bounded channel: it is delivered with priority and bypasses
+    /// pause, and the items already in the channel stay there for the
+    /// consumer to drain.
+    fn disconnected(&mut self) {
+        match self {
+            Consumer::Handle { slot, .. } => {
+                slot.clear();
+                slot.put_error(CaError::ServerError(ECA_DISCONN));
+            }
+            Consumer::Callback { callback, gone } => {
+                call(callback, gone, Err(CaError::ServerError(ECA_DISCONN)));
+            }
+        }
+    }
+}
+
+/// The one place a subscription callback runs. A callback that panics is
+/// gone: the panic stays off the coordinator, which serves every channel.
+fn call(
+    callback: &mut Box<dyn FnMut(CaResult<Snapshot>) + Send>,
+    gone: &AtomicBool,
+    msg: CaResult<Snapshot>,
+) -> MonitorDeliveryOutcome {
+    if gone.load(Ordering::Acquire) {
+        return MonitorDeliveryOutcome::ConsumerGone;
+    }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback(msg))) {
+        Ok(()) => MonitorDeliveryOutcome::Delivered,
+        Err(_) => {
+            gone.store(true, Ordering::Release);
+            tracing::error!("CA monitor callback panicked; cancelling its subscription");
+            MonitorDeliveryOutcome::ConsumerGone
+        }
+    }
 }
 
 pub(crate) struct SubscriptionRecord {
@@ -296,11 +408,7 @@ pub(crate) struct SubscriptionRecord {
     /// `server_addr` can change). `(server_addr, priority)` is the
     /// circuit this subscription's flow control accounts against.
     pub priority: u8,
-    pub callback_tx: mpsc::Sender<CaResult<Snapshot>>,
-    /// "Latest pending" slot — see [`CoalesceSlot`]. Shared with the
-    /// [`super::MonitorHandle`] so the consumer drains it after the bounded
-    /// channel empties.
-    pub coalesce_slot: Arc<CoalesceSlot>,
+    pub consumer: Consumer,
     pub needs_restore: bool,
     /// Client-side deadband: suppress callback if |new - old| < deadband.
     pub deadband: f64,
@@ -390,18 +498,16 @@ impl SubscriptionRegistry {
     }
 
     /// Deliver a non-NORMAL monitor status (libca `pmiu->exception`
-    /// path, `cac.cpp:971-975`) to the per-subscription callback as
-    /// an `Err(CaError::ServerError(eca_status))`. Best-effort: the
-    /// existing `try_deliver_err` helper silently drops the error
-    /// if the receiver queue is full or closed.
+    /// path, `cac.cpp:971-975`) to the per-subscription consumer as
+    /// an `Err(CaError::ServerError(eca_status))`.
     pub fn on_monitor_error(&mut self, subid: u32, eca_status: u32) -> MonitorDeliveryOutcome {
         let Some(rec) = self.subscriptions.get_mut(&subid) else {
             return MonitorDeliveryOutcome::NotFound;
         };
-        if rec.callback_tx.is_closed() {
+        if rec.consumer.is_gone() {
             return MonitorDeliveryOutcome::ConsumerGone;
         }
-        try_deliver_err(rec, epics_base_rs::error::CaError::ServerError(eca_status))
+        rec.consumer.error(CaError::ServerError(eca_status))
     }
 
     pub fn on_monitor_data(
@@ -416,7 +522,7 @@ impl SubscriptionRegistry {
         };
         // Checked before routing: a pause-held value goes to the slot
         // without touching the channel and would never see it closed.
-        if rec.callback_tx.is_closed() {
+        if rec.consumer.is_gone() {
             return MonitorDeliveryOutcome::ConsumerGone;
         }
         let snapshot = if data_type <= 6 {
@@ -426,20 +532,20 @@ impl SubscriptionRegistry {
             let dbr_type = match DbFieldType::from_u16(data_type).map(DbFieldType::wire_carrier) {
                 Ok(t) => t,
                 Err(e) => {
-                    return try_deliver_err(rec, e);
+                    return rec.consumer.error(e);
                 }
             };
             match EpicsValue::from_bytes_array(dbr_type, data, count as usize) {
                 Ok(value) => Snapshot::new(value, 0, 0, SystemTime::now()),
                 Err(e) => {
-                    return try_deliver_err(rec, e);
+                    return rec.consumer.error(e);
                 }
             }
         } else {
             match decode_dbr(data_type, data, count as usize) {
                 Ok(s) => s,
                 Err(e) => {
-                    return try_deliver_err(rec, e);
+                    return rec.consumer.error(e);
                 }
             }
         };
@@ -456,36 +562,11 @@ impl SubscriptionRegistry {
             }
         }
 
-        // Value routing, computed atomically against the pause flag.
-        // Only a successful channel write counts toward flow control
-        // (I1); every slot write is `Slotted` and out of band.
-        match rec.coalesce_slot.route_value(snapshot) {
-            // Held during pause, or overflow-coalesced while active —
-            // either way the value is in the slot, not the channel.
-            ValueRoute::Slotted => {
-                rec.nreplace = rec.nreplace.saturating_add(1);
-                MonitorDeliveryOutcome::Slotted
-            }
-            ValueRoute::TryChannel(snapshot) => match rec.callback_tx.try_send(Ok(*snapshot)) {
-                Ok(()) => MonitorDeliveryOutcome::Queued,
-                Err(TrySendError::Full(rejected)) => {
-                    // Bounded channel full — coalesce into the slot
-                    // instead of the pre-fix silent drop (which lost
-                    // terminal transitions like DMOV 1→0 under load).
-                    // Mirrors C `db_queue_event_log`'s replace-last
-                    // (`dbEvent.c:812-827`), not `db_post_events`,
-                    // which only gates on the mask and calls out.
-                    // The slot is out of flow control (I1); EVENTS_OFF
-                    // already fired long ago (channel is full ≫ the
-                    // threshold), so no flow-control bump here.
-                    rec.nreplace = rec.nreplace.saturating_add(1);
-                    let snap = rejected.expect("route_value only boxes Ok values");
-                    rec.coalesce_slot.put_value(snap);
-                    MonitorDeliveryOutcome::Slotted
-                }
-                Err(TrySendError::Closed(_)) => MonitorDeliveryOutcome::ConsumerGone,
-            },
+        let outcome = rec.consumer.value(snapshot);
+        if let MonitorDeliveryOutcome::Slotted = outcome {
+            rec.nreplace = rec.nreplace.saturating_add(1);
         }
+        outcome
     }
 
     /// Mark all subscriptions for a given server's channels as needing restore.
@@ -499,20 +580,11 @@ impl SubscriptionRegistry {
     /// Pre-fix Rust silently flipped `needs_restore = true` and waited
     /// for reconnect, so a libca-style `MonitorHandle::recv()` saw
     /// nothing when the circuit died.
-    /// The disconnect error goes ALWAYS into the error cell, never the
-    /// bounded channel: it is delivered with priority and bypasses pause,
-    /// and any items already in the channel stay there for the consumer to
-    /// drain.
     pub fn mark_disconnected(&mut self, cids: &[u32]) {
-        const ECA_DISCONN: u32 = 192; // protocol::ECA_DISCONN
         for rec in self.subscriptions.values_mut() {
             if cids.contains(&rec.cid) {
                 rec.needs_restore = true;
-                // Drop stale value cells, then park ECA_DISCONN in the
-                // error cell.
-                rec.coalesce_slot.clear();
-                rec.coalesce_slot
-                    .put_error(CaError::ServerError(ECA_DISCONN));
+                rec.consumer.disconnected();
             }
         }
     }
@@ -550,7 +622,7 @@ impl SubscriptionRegistry {
         let stale: Vec<u32> = self
             .subscriptions
             .values()
-            .filter(|rec| rec.cid == cid && rec.needs_restore && rec.callback_tx.is_closed())
+            .filter(|rec| rec.cid == cid && rec.needs_restore && rec.consumer.is_gone())
             .map(|rec| rec.subid)
             .collect();
         for subid in &stale {
@@ -659,7 +731,7 @@ impl SubscriptionRegistry {
         let closed: Vec<u32> = self
             .subscriptions
             .iter()
-            .filter(|(_, rec)| rec.callback_tx.is_closed())
+            .filter(|(_, rec)| rec.consumer.is_gone())
             .map(|(&subid, _)| subid)
             .collect();
         for subid in &closed {
@@ -680,28 +752,6 @@ impl SubscriptionRegistry {
             .filter(|(_, rec)| rec.cid == cid)
             .map(|(&subid, _)| subid)
             .collect()
-    }
-}
-
-/// Deliver an error to the consumer. Errors bypass pause and use the
-/// dedicated error slot (I2): they go to the bounded channel when there
-/// is room, otherwise the sticky error slot, which a value can never
-/// overwrite. The error slot does not displace a pending value — both can
-/// be queued and the consumer's `take_deliverable` delivers the error first.
-fn try_deliver_err(rec: &mut SubscriptionRecord, err: CaError) -> MonitorDeliveryOutcome {
-    match rec.callback_tx.try_send(Err(err)) {
-        Ok(()) => MonitorDeliveryOutcome::Queued,
-        Err(TrySendError::Full(rejected)) => {
-            // Channel full — park the error in its own slot. Recover the
-            // rejected error rather than cloning.
-            let e = match rejected {
-                Err(e) => e,
-                Ok(_) => unreachable!("we just sent an Err"),
-            };
-            rec.coalesce_slot.put_error(e);
-            MonitorDeliveryOutcome::Slotted
-        }
-        Err(TrySendError::Closed(_)) => MonitorDeliveryOutcome::ConsumerGone,
     }
 }
 
@@ -734,8 +784,10 @@ mod tests {
             mask: 1,
             server_addr: addr(),
             priority: 0,
-            callback_tx,
-            coalesce_slot: CoalesceSlot::new(),
+            consumer: Consumer::Handle {
+                tx: callback_tx,
+                slot: CoalesceSlot::new(),
+            },
             needs_restore: true,
             deadband: 0.0,
             last_value: None,
@@ -1110,9 +1162,19 @@ mod tests {
         coalesce_slot: Arc<CoalesceSlot>,
         callback_tx: mpsc::Sender<CaResult<Snapshot>>,
     ) -> SubscriptionRecord {
+        long_record(
+            1,
+            Consumer::Handle {
+                tx: callback_tx,
+                slot: coalesce_slot,
+            },
+        )
+    }
+
+    fn long_record(subid: u32, consumer: Consumer) -> SubscriptionRecord {
         const DBR_TIME_LONG: u16 = 19;
         SubscriptionRecord {
-            subid: 1,
+            subid,
             cid: 100,
             data_type: Some(DBR_TIME_LONG),
             count: Some(1),
@@ -1123,8 +1185,7 @@ mod tests {
             mask: 1,
             server_addr: addr(),
             priority: 0,
-            callback_tx,
-            coalesce_slot,
+            consumer,
             needs_restore: false,
             deadband: 0.0,
             last_value: None,
@@ -1137,9 +1198,13 @@ mod tests {
     }
 
     fn post_long(reg: &mut SubscriptionRegistry, v: i32) -> MonitorDeliveryOutcome {
+        post_long_to(reg, 1, v)
+    }
+
+    fn post_long_to(reg: &mut SubscriptionRegistry, subid: u32, v: i32) -> MonitorDeliveryOutcome {
         const DBR_TIME_LONG: u16 = 19;
         let bytes = epics_base_rs::types::encode_dbr(DBR_TIME_LONG, &long_snap(v)).expect("encode");
-        reg.on_monitor_data(1, DBR_TIME_LONG, 1, &bytes)
+        reg.on_monitor_data(subid, DBR_TIME_LONG, 1, &bytes)
     }
 
     #[test]
@@ -1157,7 +1222,7 @@ mod tests {
             let outcome = post_long(&mut reg, *v);
             match (i, &outcome) {
                 // 1, 2 fill the channel.
-                (0..=1, MonitorDeliveryOutcome::Queued) => {}
+                (0..=1, MonitorDeliveryOutcome::Delivered) => {}
                 // 3, 4, 0 overflow into the slot (out of flow control).
                 (2..=4, MonitorDeliveryOutcome::Slotted) => {}
                 _ => panic!("unexpected outcome at i={i}"),
@@ -1205,11 +1270,11 @@ mod tests {
 
         assert!(matches!(
             post_long(&mut reg, 1),
-            MonitorDeliveryOutcome::Queued
+            MonitorDeliveryOutcome::Delivered
         ));
         assert!(matches!(
             post_long(&mut reg, 2),
-            MonitorDeliveryOutcome::Queued
+            MonitorDeliveryOutcome::Delivered
         ));
         assert!(matches!(
             post_long(&mut reg, 3),
@@ -1652,5 +1717,120 @@ mod tests {
         // native_changed = false → type stays at the first-connect value;
         // count stays autosize (0).
         assert_eq!(drained_type(&mut rx), (15, 0));
+    }
+
+    type CallLog = Arc<StdMutex<Vec<(u32, CaResult<i32>)>>>;
+
+    fn callback_record(subid: u32, log: &CallLog) -> (SubscriptionRecord, Arc<AtomicBool>) {
+        let gone = Arc::new(AtomicBool::new(false));
+        let log = log.clone();
+        let callback = move |msg: CaResult<Snapshot>| {
+            let msg = msg.map(|snap| match snap.value {
+                EpicsValue::Long(v) => v,
+                other => panic!("unexpected value {other:?}"),
+            });
+            log.lock().unwrap().push((subid, msg));
+        };
+        let consumer = Consumer::Callback {
+            callback: Box::new(callback),
+            gone: gone.clone(),
+        };
+        (long_record(subid, consumer), gone)
+    }
+
+    fn logged(log: &CallLog) -> Vec<(u32, i32)> {
+        log.lock()
+            .unwrap()
+            .iter()
+            .map(|(subid, msg)| (*subid, *msg.as_ref().expect("value")))
+            .collect()
+    }
+
+    /// Each update reaches its callback before `on_monitor_data` returns,
+    /// so the callbacks of different subscriptions run in wire order.
+    #[test]
+    fn callbacks_run_in_wire_order_across_subscriptions() {
+        let mut reg = SubscriptionRegistry::new();
+        let log = CallLog::default();
+        let (a, _) = callback_record(1, &log);
+        let (b, _) = callback_record(2, &log);
+        reg.add(a);
+        reg.add(b);
+        let mut expected = Vec::new();
+        for (subid, v) in [(1, 1), (2, 10), (1, 2), (2, 11)] {
+            assert!(matches!(
+                post_long_to(&mut reg, subid, v),
+                MonitorDeliveryOutcome::Delivered
+            ));
+            expected.push((subid, v));
+            assert_eq!(logged(&log), expected);
+        }
+    }
+
+    /// A dropped `CallbackMonitor` is gone on every route and its callback
+    /// is never called again, a disconnect included.
+    #[test]
+    fn a_gone_callback_is_never_called() {
+        let mut reg = SubscriptionRegistry::new();
+        let log = CallLog::default();
+        let (rec, gone) = callback_record(1, &log);
+        reg.add(rec);
+        gone.store(true, Ordering::Release);
+        assert!(matches!(
+            post_long(&mut reg, 1),
+            MonitorDeliveryOutcome::ConsumerGone
+        ));
+        assert!(matches!(
+            reg.on_monitor_error(1, 192),
+            MonitorDeliveryOutcome::ConsumerGone
+        ));
+        reg.mark_disconnected(&[100]);
+        assert!(log.lock().unwrap().is_empty());
+    }
+
+    /// A panicking callback is cancelled instead of unwinding through the
+    /// coordinator, and is not called again.
+    #[test]
+    fn a_panicking_callback_is_gone() {
+        let mut reg = SubscriptionRegistry::new();
+        let calls = Arc::new(AtomicU32::new(0));
+        let gone = Arc::new(AtomicBool::new(false));
+        let counted = calls.clone();
+        reg.add(long_record(
+            1,
+            Consumer::Callback {
+                callback: Box::new(move |_| {
+                    counted.fetch_add(1, Ordering::Relaxed);
+                    panic!("callback bug");
+                }),
+                gone: gone.clone(),
+            },
+        ));
+        assert!(matches!(
+            post_long(&mut reg, 1),
+            MonitorDeliveryOutcome::ConsumerGone
+        ));
+        assert!(gone.load(Ordering::Acquire));
+        assert!(matches!(
+            post_long(&mut reg, 2),
+            MonitorDeliveryOutcome::ConsumerGone
+        ));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    /// A disconnect calls a live callback with ECA_DISCONN, as libca's
+    /// `disconnectAllIO` calls the subscription's exception path.
+    #[test]
+    fn disconnect_calls_the_callback_with_eca_disconn() {
+        let mut reg = SubscriptionRegistry::new();
+        let log = CallLog::default();
+        let (rec, _gone) = callback_record(1, &log);
+        reg.add(rec);
+        reg.mark_disconnected(&[100]);
+        let log = log.lock().unwrap();
+        assert!(matches!(
+            log.as_slice(),
+            [(1, Err(CaError::ServerError(192)))]
+        ));
     }
 }

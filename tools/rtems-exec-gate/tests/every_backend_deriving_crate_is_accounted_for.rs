@@ -144,6 +144,10 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ),
     (
         "epics-bridge-rs",
+        "tests/a_qsrv_put_reply_follows_its_update.rs",
+    ),
+    (
+        "epics-bridge-rs",
         "tests/connected_pva_link_lset_calls_allocate_nothing.rs",
     ),
     (
@@ -338,6 +342,10 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ),
     ("epics-libcom-rs", "src/net/loopback_mcast.rs"),
     ("epics-pva-rs", "src/server/pva_server.rs"),
+    (
+        "epics-pva-rs",
+        "tests/a_put_resolves_after_its_monitor_callback.rs",
+    ),
     ("epics-pva-rs", "tests/create_channel_backpressure.rs"),
     ("epics-pva-rs", "tests/heartbeat_echo.rs"),
     ("epics-pva-rs", "tests/interop_pvxs_mods/access_denied.rs"),

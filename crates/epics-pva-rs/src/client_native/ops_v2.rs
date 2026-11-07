@@ -43,7 +43,7 @@ use super::channel::Channel;
 use super::decode::{
     Frame, GetFieldResponse, OpResponse, decode_get_field_response, decode_op_response,
 };
-use super::server_conn::ServerConn;
+use super::server_conn::{Reply, ServerConn};
 
 /// Decode a one-shot GET/PUT/RPC op-response frame, closing the virtual
 /// circuit on a wire-decode fault.
@@ -1939,7 +1939,7 @@ pub struct PutOp {
     server: Arc<super::server_conn::ServerConn>,
     sid: u32,
     ioid: u32,
-    stream: mpsc::UnboundedReceiver<super::decode::Frame>,
+    stream: mpsc::UnboundedReceiver<Reply>,
     ioid_guard: IoidGuard,
     codec: PvaCodec,
     order: ByteOrder,
@@ -2166,7 +2166,7 @@ pub struct PutSent {
     server: Arc<super::server_conn::ServerConn>,
     sid: u32,
     ioid: u32,
-    stream: mpsc::UnboundedReceiver<super::decode::Frame>,
+    stream: mpsc::UnboundedReceiver<Reply>,
     ioid_guard: IoidGuard,
     codec: PvaCodec,
     intro: Arc<FieldDesc>,
@@ -3262,7 +3262,7 @@ where
     loop {
         // Honour stop() — caller dropped the handle or called
         // stop_sync().
-        let frame = match &state {
+        let (frame, delivered) = match &state {
             // Handle present: race the next frame against an explicit
             // cancel so a stop issued while no server data is arriving
             // wakes the loop immediately instead of parking forever on an
@@ -3326,6 +3326,7 @@ where
         // broadcast fan-out shares this allocation refcount-style.
         let body = bytes::Bytes::copy_from_slice(&frame.payload[body_start..]);
         callback(&intro, body, order);
+        drop(delivered);
         events_since_ack += 1;
         if final_frame {
             // The relayed update was this stream's last; finish exactly as the
@@ -3977,7 +3978,7 @@ where
     // the cumulative state pvxs guarantees.
     let mut prior: Option<PvField> = None;
     loop {
-        let frame = match &state {
+        let (frame, delivered) = match &state {
             // Handle present: race the next frame against an explicit
             // cancel so a stop issued while no server data is arriving
             // wakes the loop immediately instead of parking forever on an
@@ -4046,6 +4047,7 @@ where
                 };
                 prior = Some(value.clone());
                 callback(&intro, &value, marked.as_ref());
+                drop(delivered);
                 events_since_ack += 1;
                 if let Some(s) = &state {
                     let (n_cli_squash, max_queue, n_queue) = stream.counters();
@@ -4297,25 +4299,33 @@ async fn op_rpc_attempt(
 /// channels, so the old "connection closed" text was wrong on its face.
 /// [`requeue_on_disconnect`] is what acts on this variant.
 async fn await_frame(
-    stream: &mut mpsc::UnboundedReceiver<super::decode::Frame>,
+    stream: &mut mpsc::UnboundedReceiver<Reply>,
     op_timeout: Duration,
 ) -> PvaResult<super::decode::Frame> {
-    let frame = timeout(op_timeout, stream.recv())
+    timeout(op_timeout, await_reply(stream))
         .await
         .map_err(|_| PvaError::Timeout)?
-        .ok_or(PvaError::Disconnected)?;
-    Ok(frame)
 }
 
 /// [`await_frame`], with no deadline when `op_timeout` is `None`.
 async fn await_frame_within(
-    stream: &mut mpsc::UnboundedReceiver<super::decode::Frame>,
+    stream: &mut mpsc::UnboundedReceiver<Reply>,
     op_timeout: Option<Duration>,
 ) -> PvaResult<super::decode::Frame> {
     match op_timeout {
         Some(op_timeout) => await_frame(stream, op_timeout).await,
-        None => stream.recv().await.ok_or(PvaError::Disconnected),
+        None => await_reply(stream).await,
     }
+}
+
+/// The next reply, settled behind the monitor frames read before it. The
+/// op's deadline covers the settle: pvxs runs the result callback on the
+/// same loop as the monitor callbacks, so a waiter times out the same way.
+async fn await_reply(
+    stream: &mut mpsc::UnboundedReceiver<Reply>,
+) -> PvaResult<super::decode::Frame> {
+    let reply = stream.recv().await.ok_or(PvaError::Disconnected)?;
+    Ok(reply.settle().await)
 }
 
 /// Outcome of [`recv_monitor_init`].
@@ -4356,13 +4366,13 @@ async fn recv_monitor_init(
                 biased;
                 _ = s.cancel.notified() => MonitorInit::Cancelled,
                 f = stream.recv() => match f {
-                    Some(f) => MonitorInit::Reply(f),
+                    Some((f, _)) => MonitorInit::Reply(f),
                     None => MonitorInit::Lost,
                 },
             }
         }
         None => match stream.recv().await {
-            Some(f) => MonitorInit::Reply(f),
+            Some((f, _)) => MonitorInit::Reply(f),
             None => MonitorInit::Lost,
         },
     }
@@ -4374,13 +4384,15 @@ async fn recv_monitor_init(
 /// VecDeque, so each pipelined GET / PUT response lands directly on
 /// a stack-allocated oneshot future.
 async fn await_oneshot_frame(
-    rx: tokio::sync::oneshot::Receiver<super::decode::Frame>,
+    rx: tokio::sync::oneshot::Receiver<Reply>,
     op_timeout: Duration,
 ) -> PvaResult<super::decode::Frame> {
-    timeout(op_timeout, rx)
-        .await
-        .map_err(|_| PvaError::Timeout)?
-        .map_err(|_| PvaError::Disconnected)
+    timeout(op_timeout, async {
+        let reply = rx.await.map_err(|_| PvaError::Disconnected)?;
+        Ok(reply.settle().await)
+    })
+    .await
+    .map_err(|_| PvaError::Timeout)?
 }
 
 fn sentinel_all_fields() -> &'static [u8] {
@@ -7481,7 +7493,10 @@ mod tests {
         state.stop.store(true, Ordering::Relaxed);
         let opt = Some(state.clone());
         let (tx, rx) = super::super::monitor_queue::MonitorSink::new(4, false);
-        tx.push(dummy_monitor_frame()); // a reply is even available
+        tx.push(
+            dummy_monitor_frame(),
+            super::super::monitor_queue::DeliveryFence::new().issue(),
+        ); // a reply is even available
         match recv_monitor_init(&opt, &rx).await {
             MonitorInit::Cancelled => {}
             _ => panic!("a preset stop must short-circuit to Cancelled"),
@@ -7498,7 +7513,10 @@ mod tests {
     async fn recv_monitor_init_returns_reply_when_frame_arrives() {
         let state = Some(idle_sub_state());
         let (tx, rx) = super::super::monitor_queue::MonitorSink::new(4, false);
-        tx.push(dummy_monitor_frame());
+        tx.push(
+            dummy_monitor_frame(),
+            super::super::monitor_queue::DeliveryFence::new().issue(),
+        );
         match recv_monitor_init(&state, &rx).await {
             MonitorInit::Reply(_) => {}
             _ => panic!("a queued INIT reply must yield Reply"),
@@ -7525,7 +7543,10 @@ mod tests {
     async fn recv_monitor_init_no_handle_awaits_reply() {
         let state: Option<Arc<SubscriptionState>> = None;
         let (tx, rx) = super::super::monitor_queue::MonitorSink::new(4, false);
-        tx.push(dummy_monitor_frame());
+        tx.push(
+            dummy_monitor_frame(),
+            super::super::monitor_queue::DeliveryFence::new().issue(),
+        );
         match recv_monitor_init(&state, &rx).await {
             MonitorInit::Reply(_) => {}
             _ => panic!("the no-handle path must still deliver the reply"),

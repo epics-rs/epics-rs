@@ -30,8 +30,11 @@
 //!
 //! The queue holds RAW frames so the raw-forward path (a gateway) never
 //! decodes in steady state; the merge decodes only on overflow.
+//!
+//! Each frame rides with its place in the connection's [`DeliveryFence`],
+//! which a reply routed after it waits on.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -57,7 +60,7 @@ fn is_data(frame: &Frame) -> bool {
 }
 
 struct Inner {
-    q: VecDeque<Frame>,
+    q: VecDeque<(Frame, Delivery)>,
     /// pvxs `MonitorOp::queueSize` (`clientmon.cpp:52`, set from
     /// `record._options.queueSize` at `:763-766`).
     limit: usize,
@@ -80,9 +83,11 @@ struct Inner {
 }
 
 impl Inner {
-    fn push(&mut self, frame: Frame) {
+    /// A squash drops the new frame's ticket: the tail keeps its own, which
+    /// is older, so a reply routed after either still waits for the merge.
+    fn push(&mut self, frame: Frame, delivery: Delivery) {
         if !is_data(&frame) || self.pipeline || self.q.len() < self.limit {
-            self.q.push_back(frame);
+            self.q.push_back((frame, delivery));
             return;
         }
         // Full. pvxs squashes onto `queue.back()` only when that entry
@@ -94,12 +99,12 @@ impl Inner {
         let mergeable = self
             .intro
             .clone()
-            .filter(|_| self.q.back().is_some_and(is_data));
+            .filter(|_| self.q.back().is_some_and(|(tail, _)| is_data(tail)));
         let Some(intro) = mergeable else {
-            self.q.push_back(frame);
+            self.q.push_back((frame, delivery));
             return;
         };
-        let tail = self.q.back().expect("filtered on `back().is_some_and`");
+        let (tail, _) = self.q.back().expect("filtered on `back().is_some_and`");
         let merged = squash_monitor_bodies(
             &intro,
             MonitorBody {
@@ -123,8 +128,8 @@ impl Inner {
                     frame.header.command,
                     payload.len() as u32,
                 );
-                self.q.pop_back();
-                self.q.push_back(Frame { header, payload });
+                let tail = self.q.back_mut().expect("filtered on `back().is_some_and`");
+                tail.0 = Frame { header, payload };
                 self.n_squash += 1;
             }
             Err(reason) => {
@@ -134,7 +139,7 @@ impl Inner {
                 // (`clientmon.cpp:596`). Swallowing it here would hide an
                 // upstream wire fault behind a squash.
                 tracing::debug!(%reason, "monitor squash skipped — malformed body");
-                self.q.push_back(frame);
+                self.q.push_back((frame, delivery));
             }
         }
     }
@@ -169,13 +174,13 @@ impl MonitorBacklog {
     }
 
     /// Producer side, called from the connection reader task.
-    fn push(&self, frame: Frame) {
+    fn push(&self, frame: Frame, delivery: Delivery) {
         {
             let mut g = self.inner.lock();
             if g.closed {
                 return;
             }
-            g.push(frame);
+            g.push(frame, delivery);
             let depth = g.q.len();
             if depth > g.max_queue {
                 g.max_queue = depth;
@@ -190,14 +195,26 @@ impl MonitorBacklog {
         self.notify.notify_one();
     }
 
+    /// The consumer is gone: what it never took, and what arrives later,
+    /// is discarded, releasing its tickets.
+    fn abandon(&self) {
+        let queued = {
+            let mut g = self.inner.lock();
+            g.closed = true;
+            std::mem::take(&mut g.q)
+        };
+        drop(queued);
+    }
+
     /// Pop the oldest frame, waiting for one. `None` once the backlog is
     /// closed AND drained, matching an `mpsc::UnboundedReceiver` whose
-    /// senders have dropped.
+    /// senders have dropped. The consumer drops the [`Delivery`] once it
+    /// has handed the frame on.
     ///
     /// Cancel-safe: the waiter is registered before the queue is
     /// inspected, so a frame pushed in between cannot be missed, and
     /// `Notify::notify_one` stores a permit when no waiter is parked.
-    pub(crate) async fn recv(&self) -> Option<Frame> {
+    pub(crate) async fn recv(&self) -> Option<(Frame, Delivery)> {
         loop {
             let notified = self.notify.notified();
             tokio::pin!(notified);
@@ -229,19 +246,135 @@ impl MonitorBacklog {
 pub(crate) struct MonitorSink(Arc<MonitorBacklog>);
 
 impl MonitorSink {
-    pub(crate) fn new(limit: usize, pipeline: bool) -> (Self, Arc<MonitorBacklog>) {
+    pub(crate) fn new(limit: usize, pipeline: bool) -> (Self, MonitorStream) {
         let q = Arc::new(MonitorBacklog::new(limit, pipeline));
-        (Self(q.clone()), q)
+        (Self(q.clone()), MonitorStream(q))
     }
 
-    pub(crate) fn push(&self, frame: Frame) {
-        self.0.push(frame);
+    pub(crate) fn push(&self, frame: Frame, delivery: Delivery) {
+        self.0.push(frame, delivery);
     }
 }
 
 impl Drop for MonitorSink {
     fn drop(&mut self) {
         self.0.close();
+    }
+}
+
+/// Consumer handle, owned by the subscription's drain loop. Dropping it
+/// abandons the backlog, so a loop that ends on any path cannot leave
+/// tickets behind for a reply to wait on while its slot stays registered.
+pub(crate) struct MonitorStream(Arc<MonitorBacklog>);
+
+impl std::ops::Deref for MonitorStream {
+    type Target = MonitorBacklog;
+
+    fn deref(&self) -> &MonitorBacklog {
+        &self.0
+    }
+}
+
+impl Drop for MonitorStream {
+    fn drop(&mut self) {
+        self.0.abandon();
+    }
+}
+
+/// A connection's monitor frames, as tickets the reader issues when it
+/// routes one into a backlog and the drain loops release once the frame is
+/// handed to its callback or discarded. pvxs runs every op's callbacks on
+/// one loop thread in wire order, so a put's result follows the monitor
+/// callbacks for the updates read before it; here the subscriptions drain
+/// on their own tasks, so a reply waits for its [`FencePoint`] instead.
+/// Tickets release out of order across subscriptions, so the fence keeps
+/// the outstanding set rather than a count.
+pub(crate) struct DeliveryFence {
+    tickets: Mutex<Tickets>,
+    released: Notify,
+}
+
+#[derive(Default)]
+struct Tickets {
+    next: u64,
+    outstanding: BTreeSet<u64>,
+}
+
+impl DeliveryFence {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            tickets: Mutex::new(Tickets::default()),
+            released: Notify::new(),
+        })
+    }
+
+    /// A ticket for a monitor frame the reader routes now.
+    pub(crate) fn issue(self: &Arc<Self>) -> Delivery {
+        let mut t = self.tickets.lock();
+        let seq = t.next;
+        t.next += 1;
+        t.outstanding.insert(seq);
+        Delivery {
+            fence: self.clone(),
+            seq,
+        }
+    }
+
+    /// The place of a reply the reader routes now: behind every ticket
+    /// issued so far.
+    pub(crate) fn point(self: &Arc<Self>) -> FencePoint {
+        let t = self.tickets.lock();
+        if t.outstanding.is_empty() {
+            return FencePoint(None);
+        }
+        FencePoint(Some((self.clone(), t.next)))
+    }
+}
+
+/// A monitor frame's ticket in its connection's [`DeliveryFence`].
+pub(crate) struct Delivery {
+    fence: Arc<DeliveryFence>,
+    seq: u64,
+}
+
+impl Drop for Delivery {
+    fn drop(&mut self) {
+        let mut t = self.fence.tickets.lock();
+        let oldest = t.outstanding.first() == Some(&self.seq);
+        t.outstanding.remove(&self.seq);
+        drop(t);
+        // A point waits on the oldest outstanding ticket only.
+        if oldest {
+            self.fence.released.notify_waiters();
+        }
+    }
+}
+
+/// A reply's place in its connection's [`DeliveryFence`]; `None` when no
+/// monitor frame was outstanding as it was routed.
+pub(crate) struct FencePoint(Option<(Arc<DeliveryFence>, u64)>);
+
+impl FencePoint {
+    /// Once every ticket issued before this point is released.
+    pub(crate) async fn reached(self) {
+        let Some((fence, at)) = self.0 else {
+            return;
+        };
+        loop {
+            let released = fence.released.notified();
+            let mut released = std::pin::pin!(released);
+            released.as_mut().enable();
+            if fence
+                .tickets
+                .lock()
+                .outstanding
+                .first()
+                .is_none_or(|&oldest| oldest >= at)
+            {
+                return;
+            }
+            released.await;
+        }
     }
 }
 
@@ -326,10 +459,21 @@ mod tests {
         )
     }
 
-    fn armed(limit: usize, pipeline: bool) -> (MonitorSink, Arc<MonitorBacklog>) {
+    fn armed(limit: usize, pipeline: bool) -> (MonitorSink, MonitorStream) {
         let (sink, q) = MonitorSink::new(limit, pipeline);
         q.arm(Arc::new(intro()));
         (sink, q)
+    }
+
+    /// A ticket no reply waits on.
+    fn untracked() -> Delivery {
+        DeliveryFence::new().issue()
+    }
+
+    /// Poll `f` once: is it ready?
+    fn ready<F: std::future::Future>(f: std::pin::Pin<&mut F>) -> bool {
+        f.poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+            .is_ready()
     }
 
     /// PVX-45: the backlog stops at `queueSize` however far the consumer
@@ -339,7 +483,7 @@ mod tests {
     fn backlog_bounds_at_queue_size_and_squashes_the_tail() {
         let (sink, q) = armed(4, false);
         for i in 1..=20 {
-            sink.push(data(&["a"], (i, 0, 0)));
+            sink.push(data(&["a"], (i, 0, 0)), untracked());
         }
         let (n_squash, max_queue, n_queue) = q.counters();
         assert_eq!(n_queue, 4, "the backlog must stop at queueSize");
@@ -353,11 +497,11 @@ mod tests {
     #[test]
     fn the_squashed_tail_carries_the_union_of_the_merged_leaves() {
         let (sink, q) = armed(1, false);
-        sink.push(data(&["a"], (1, 0, 0)));
-        sink.push(data(&["b"], (0, 2, 0)));
-        sink.push(data(&["c"], (0, 0, 3)));
+        sink.push(data(&["a"], (1, 0, 0)), untracked());
+        sink.push(data(&["b"], (0, 2, 0)), untracked());
+        sink.push(data(&["c"], (0, 0, 3)), untracked());
         assert_eq!(q.counters(), (2, 1, 1));
-        let f = q.inner.lock().q.pop_front().expect("one entry");
+        let (f, _) = q.inner.lock().q.pop_front().expect("one entry");
         let (changed, a, b, c) = read(&f);
         assert_eq!(
             changed,
@@ -372,13 +516,13 @@ mod tests {
     #[test]
     fn a_control_frame_is_appended_past_the_bound_and_never_squashed() {
         let (sink, q) = armed(2, false);
-        sink.push(data(&["a"], (1, 0, 0)));
-        sink.push(data(&["a"], (2, 0, 0)));
-        sink.push(frame(0x10, Vec::new())); // FINISH, queue already full
-        sink.push(data(&["a"], (3, 0, 0))); // tail is the FINISH
+        sink.push(data(&["a"], (1, 0, 0)), untracked());
+        sink.push(data(&["a"], (2, 0, 0)), untracked());
+        sink.push(frame(0x10, Vec::new()), untracked()); // FINISH, queue already full
+        sink.push(data(&["a"], (3, 0, 0)), untracked()); // tail is the FINISH
         let g = q.inner.lock();
         assert_eq!(g.q.len(), 4, "the FINISH and the post-FINISH DATA append");
-        assert_eq!(g.q[2].payload[4], 0x10, "the FINISH survives in place");
+        assert_eq!(g.q[2].0.payload[4], 0x10, "the FINISH survives in place");
         assert_eq!(g.n_squash, 0);
     }
 
@@ -389,7 +533,7 @@ mod tests {
     fn pipeline_disables_the_squash() {
         let (sink, q) = armed(2, true);
         for i in 1..=6 {
-            sink.push(data(&["a"], (i, 0, 0)));
+            sink.push(data(&["a"], (i, 0, 0)), untracked());
         }
         let (n_squash, _, n_queue) = q.counters();
         assert_eq!((n_squash, n_queue), (0, 6));
@@ -402,7 +546,7 @@ mod tests {
     #[epics_macros_rs::epics_test]
     async fn dropping_the_sink_drains_then_ends_recv() {
         let (sink, q) = armed(4, false);
-        sink.push(data(&["a"], (1, 0, 0)));
+        sink.push(data(&["a"], (1, 0, 0)), untracked());
         drop(sink);
         assert!(q.recv().await.is_some(), "queued frames drain first");
         assert!(q.recv().await.is_none(), "then the stream ends");
@@ -414,9 +558,72 @@ mod tests {
     #[test]
     fn an_unarmed_backlog_appends_rather_than_merging() {
         let (sink, q) = MonitorSink::new(1, false);
-        sink.push(data(&["a"], (1, 0, 0)));
-        sink.push(data(&["b"], (0, 2, 0)));
+        sink.push(data(&["a"], (1, 0, 0)), untracked());
+        sink.push(data(&["b"], (0, 2, 0)), untracked());
         let (n_squash, _, n_queue) = q.counters();
         assert_eq!((n_squash, n_queue), (0, 2));
+    }
+
+    /// A reply waits for the tickets issued before its point and for no
+    /// ticket issued after it.
+    #[test]
+    fn a_point_waits_for_the_tickets_issued_before_it_only() {
+        let fence = DeliveryFence::new();
+        let before = fence.issue();
+        let point = fence.point();
+        let _after = fence.issue();
+        let mut reached = std::pin::pin!(point.reached());
+        assert!(!ready(reached.as_mut()));
+        drop(before);
+        assert!(ready(reached.as_mut()));
+    }
+
+    /// Subscriptions drain on their own tasks, so tickets release out of
+    /// order; a younger release does not let the point past an older one.
+    #[test]
+    fn a_point_holds_until_its_oldest_ticket_releases() {
+        let fence = DeliveryFence::new();
+        let older = fence.issue();
+        let younger = fence.issue();
+        let mut reached = std::pin::pin!(fence.point().reached());
+        drop(younger);
+        assert!(!ready(reached.as_mut()));
+        drop(older);
+        assert!(ready(reached.as_mut()));
+    }
+
+    /// A squash releases the merged frame's ticket and the tail keeps its
+    /// own, the older, so a reply routed between the two still waits for
+    /// the tail. Revert-verify: putting the merged frame's ticket on the
+    /// tail fails it.
+    #[epics_macros_rs::epics_test]
+    async fn a_squash_keeps_the_tails_ticket() {
+        let fence = DeliveryFence::new();
+        let (sink, q) = armed(1, false);
+        sink.push(data(&["a"], (1, 0, 0)), fence.issue());
+        let mut reached = std::pin::pin!(fence.point().reached());
+        sink.push(data(&["b"], (0, 2, 0)), fence.issue());
+        assert_eq!(q.counters().0, 1, "the second frame squashed");
+        assert!(!ready(reached.as_mut()));
+        let (_, delivered) = q.recv().await.expect("the merged tail");
+        assert!(!ready(reached.as_mut()), "taken is not yet handed on");
+        drop(delivered);
+        assert!(ready(reached.as_mut()));
+    }
+
+    /// A drain loop that ends leaves nothing for a reply to wait on: what
+    /// it never took, and what is routed to its still-registered slot
+    /// afterwards, is discarded.
+    #[test]
+    fn dropping_the_stream_discards_its_tickets() {
+        let fence = DeliveryFence::new();
+        let (sink, q) = armed(4, false);
+        sink.push(data(&["a"], (1, 0, 0)), fence.issue());
+        let mut reached = std::pin::pin!(fence.point().reached());
+        assert!(!ready(reached.as_mut()));
+        drop(q);
+        assert!(ready(reached.as_mut()));
+        sink.push(data(&["a"], (2, 0, 0)), fence.issue());
+        assert!(fence.tickets.lock().outstanding.is_empty());
     }
 }

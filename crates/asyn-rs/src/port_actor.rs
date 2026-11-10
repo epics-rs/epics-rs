@@ -287,6 +287,11 @@ pub(crate) fn current_actor() -> Option<ActorId> {
 /// (asynPortDriver.cpp:3858) run on their caller. The actor reaches such a
 /// request in its queue like any other, parks itself here and sends the
 /// claimed request to its waiter, which holds it until it gives it back.
+///
+/// An actor with nothing to run waits here too ([`Self::idle`]), and on a
+/// synchronous port a caller whose request would be the next it runs takes
+/// it straight from the slot ([`Self::take_idle`]), as C's caller takes
+/// `synchronousLock` with no thread in between.
 pub(crate) struct Lend {
     port: Arc<str>,
     slot: std::sync::Mutex<LendSlot>,
@@ -296,12 +301,25 @@ pub(crate) struct Lend {
 enum LendSlot {
     /// On the actor's own thread.
     Home,
+    /// Waiting on its own thread with nothing to run.
+    Idle(Box<PortActor>, Parked),
     /// Parked for the thread the actor sent the claimed request to.
     Offered(Box<PortActor>),
-    /// That thread holds it; `None` while one of its steps is inside.
-    Held(Option<Box<PortActor>>),
+    /// That thread holds it; `None` while one of its steps is inside. The
+    /// actor's idle wait rides along when the thread took it idle.
+    Held(Option<Box<PortActor>>, Option<Parked>),
     /// Given back, for the actor to resume with.
     Back(Box<PortActor>),
+}
+
+/// The actor's idle wait while a caller holds the actor it parked.
+struct Parked {
+    waker: Option<std::task::Waker>,
+    /// Woken meanwhile, or given back with work: the actor's thread takes
+    /// it home.
+    wanted: bool,
+    /// The connect-retry deadline its timer was armed for.
+    retry: Option<Instant>,
 }
 
 impl Lend {
@@ -343,27 +361,123 @@ impl Lend {
         }
     }
 
+    /// The actor's side with nothing to run: wait for `wake`, a message or a
+    /// caller giving it back with work, parked where a synchronous caller can
+    /// take it. Says whether the request channel closed.
+    async fn idle(
+        &self,
+        actor: Box<PortActor>,
+        wake: impl std::future::Future<Output = ()>,
+    ) -> (Box<PortActor>, bool) {
+        let retry = actor.driver.base().connect_retry_at;
+        *self.slot() = LendSlot::Idle(
+            actor,
+            Parked {
+                waker: None,
+                wanted: false,
+                retry,
+            },
+        );
+        let mut wake = std::pin::pin!(wake);
+        let mut woke = false;
+        let (mut actor, received) = std::future::poll_fn(|cx| {
+            woke = woke || wake.as_mut().poll(cx).is_ready();
+            let mut slot = self.slot();
+            match &mut *slot {
+                LendSlot::Idle(actor, parked) => {
+                    let received = actor.rx.poll_recv(cx);
+                    if received.is_pending() && !woke && !parked.wanted {
+                        parked.waker = Some(cx.waker().clone());
+                        return std::task::Poll::Pending;
+                    }
+                    let LendSlot::Idle(actor, _) = std::mem::replace(&mut *slot, LendSlot::Home)
+                    else {
+                        unreachable!()
+                    };
+                    std::task::Poll::Ready((actor, received))
+                }
+                LendSlot::Held(_, Some(parked)) => {
+                    parked.wanted = true;
+                    parked.waker = Some(cx.waker().clone());
+                    std::task::Poll::Pending
+                }
+                _ => unreachable!("only a synchronous caller takes an idle actor"),
+            }
+        })
+        .await;
+        match received {
+            std::task::Poll::Ready(Some(msg)) => actor.enqueue_message(msg),
+            std::task::Poll::Ready(None) => return (actor, true),
+            std::task::Poll::Pending => {}
+        }
+        (actor, false)
+    }
+
+    /// A caller's side: take the idle actor if `op` would be the next
+    /// request it runs.
+    pub(crate) fn take_idle(&self, op: &RequestOp, scope: SectionScope) -> bool {
+        let mut slot = self.slot();
+        let LendSlot::Idle(actor, parked) = &mut *slot else {
+            return false;
+        };
+        // The timer `autoConnect` started on its caller (asynManager.c:2324-2326)
+        // is armed ahead of the next request, as the actor's next pass would.
+        actor.driver.base_mut().start_owed_connect_timer();
+        if parked.wanted || !actor.runs_next(op, scope) {
+            return false;
+        }
+        actor.arrived(op);
+        let LendSlot::Idle(actor, parked) = std::mem::replace(&mut *slot, LendSlot::Home) else {
+            unreachable!()
+        };
+        *slot = LendSlot::Held(Some(actor), Some(parked));
+        true
+    }
+
     /// The side of the thread the claimed request went to.
     pub(crate) fn take(&self) {
         let mut slot = self.slot();
         match std::mem::replace(&mut *slot, LendSlot::Home) {
-            LendSlot::Offered(actor) => *slot = LendSlot::Held(Some(actor)),
+            LendSlot::Offered(actor) => *slot = LendSlot::Held(Some(actor), None),
             _ => unreachable!("the actor sends a lend its request only once it is parked"),
         }
     }
 
     pub(crate) fn give_back(&self) {
-        {
-            let mut slot = self.slot();
-            match std::mem::replace(&mut *slot, LendSlot::Home) {
-                LendSlot::Held(Some(mut actor)) => {
-                    actor.dequeue_at_release();
-                    *slot = LendSlot::Back(actor);
-                }
-                _ => unreachable!("only the holder gives the actor back, between its steps"),
+        let took_idle = match &mut *self.slot() {
+            LendSlot::Held(Some(actor), parked) => {
+                actor.dequeue_at_release();
+                parked.is_some()
             }
+            _ => unreachable!("only the holder gives the actor back, between its steps"),
+        };
+        // The pass's tail, which the actor's loop runs after a hand-off.
+        if took_idle {
+            let _ = self.with(PortActor::port_thread_auto_connect);
         }
-        self.returned.notify_one();
+        let mut slot = self.slot();
+        match std::mem::replace(&mut *slot, LendSlot::Home) {
+            LendSlot::Held(Some(actor), None) => {
+                *slot = LendSlot::Back(actor);
+                drop(slot);
+                self.returned.notify_one();
+            }
+            LendSlot::Held(Some(actor), Some(mut parked)) => {
+                parked.wanted |=
+                    !actor.idle() || actor.driver.base().connect_retry_at != parked.retry;
+                let waker = if parked.wanted {
+                    parked.waker.take()
+                } else {
+                    None
+                };
+                *slot = LendSlot::Idle(actor, parked);
+                drop(slot);
+                if let Some(waker) = waker {
+                    waker.wake();
+                }
+            }
+            _ => unreachable!("only the holder gives the actor back, between its steps"),
+        }
     }
 
     /// One step of the holder on the actor. A step made from inside another
@@ -371,7 +485,7 @@ impl Lend {
     /// refused as it is on the port's own thread.
     pub(crate) fn with<R>(&self, f: impl FnOnce(&mut PortActor) -> R) -> AsynResult<R> {
         let actor = match &mut *self.slot() {
-            LendSlot::Held(actor) => actor.take(),
+            LendSlot::Held(actor, _) => actor.take(),
             _ => None,
         }
         .ok_or_else(|| AsynError::Status {
@@ -387,7 +501,7 @@ impl Lend {
         struct PutBack<'a>(&'a Lend, Option<Box<PortActor>>);
         impl Drop for PutBack<'_> {
             fn drop(&mut self) {
-                if let LendSlot::Held(slot) = &mut *self.0.slot() {
+                if let LendSlot::Held(slot, _) = &mut *self.0.slot() {
                     *slot = self.1.take();
                 }
             }
@@ -395,6 +509,18 @@ impl Lend {
         let mut back = PutBack(self, Some(actor));
         let actor = back.1.as_deref_mut().expect("set above");
         Ok(f(actor))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn state(&self) -> &'static str {
+        match &*self.slot() {
+            LendSlot::Home => "home",
+            LendSlot::Idle(..) => "idle",
+            LendSlot::Offered(_) => "offered",
+            LendSlot::Held(_, Some(_)) => "held idle",
+            LendSlot::Held(_, None) => "held",
+            LendSlot::Back(_) => "back",
+        }
     }
 
     /// The driver as the holder of the port reaches it.
@@ -1458,6 +1584,23 @@ impl PortActor {
         self.port_thread_auto_connect();
     }
 
+    /// [`Self::register`], then parked idle with no thread behind it: only a
+    /// caller that takes it idle runs anything on it.
+    #[cfg(test)]
+    pub(crate) fn parked(mut self) {
+        self.register();
+        let lend = Arc::clone(&self.lend);
+        let retry = self.driver.base().connect_retry_at;
+        *lend.slot() = LendSlot::Idle(
+            Box::new(self),
+            Parked {
+                waker: None,
+                wanted: false,
+                retry,
+            },
+        );
+    }
+
     /// [`Self::register`], then the test loop to spawn.
     #[cfg(test)]
     pub fn registered(mut self) -> impl FnOnce() + Send {
@@ -1486,12 +1629,10 @@ impl PortActor {
                 if actor.idle() {
                     // No work — wait for a message or a queued cell.
                     let cells = Arc::clone(&actor.cells);
-                    tokio::select! {
-                        msg = actor.rx.recv() => match msg {
-                            Some(msg) => actor.enqueue_message(msg),
-                            None => break,
-                        },
-                        _ = cells.pushed() => {}
+                    let closed;
+                    (actor, closed) = lend.idle(actor, cells.pushed()).await;
+                    if closed {
+                        break;
                     }
                     // Drain any more that arrived
                     actor.drain_channel();
@@ -1572,19 +1713,20 @@ impl PortActor {
                     // thread, so it wakes itself.
                     retarget(retry.as_mut(), actor.driver.base().connect_retry_at);
                     let cells = Arc::clone(&actor.cells);
-                    tokio::select! {
-                        msg = actor.rx.recv() => {
-                            match msg {
-                                Some(m) => actor.enqueue_message(m),
-                                // Unreachable: the last PortHandle is gone.
-                                None => break,
-                            }
+                    let wake = async {
+                        tokio::select! {
+                            // C `queueRequest`'s `epicsEventSignal`
+                            // (asynManager.c:1628) for a queued cell.
+                            _ = cells.pushed() => {}
+                            () = stop.arrived() => {}
+                            () = sleep_until_opt(retry.as_mut()) => {}
                         }
-                        // C `queueRequest`'s `epicsEventSignal`
-                        // (asynManager.c:1628) for a queued cell.
-                        _ = cells.pushed() => {}
-                        () = stop.arrived() => {}
-                        () = sleep_until_opt(retry.as_mut()) => {}
+                    };
+                    let closed;
+                    (actor, closed) = lend.idle(actor, wake).await;
+                    // Unreachable: the last PortHandle is gone.
+                    if closed {
+                        break;
                     }
                     // Drain any more that arrived
                     actor.drain_channel();
@@ -2339,7 +2481,8 @@ impl PortActor {
         Self::c_dispatch(op) != CDispatch::Queued
     }
 
-    fn enqueue_message(&mut self, mut msg: ActorMessage) {
+    /// A request reached the actor, queued or taken idle on its caller.
+    fn arrived(&mut self, op: &RequestOp) {
         // C `queueRequest` sets `pport->queueStateChange` and signals the port
         // thread (asynManager.c:1615, 1628) — the queue changed, so anything the
         // thread had skipped is looked at again.
@@ -2351,9 +2494,37 @@ impl PortActor {
         // ([`CDispatch::Direct`]). Those that nonetheless end in an exception
         // (`enable` → `exceptionOccurred`, :2249) wake the thread through the
         // exception count, not through here.
-        if Self::c_dispatch(&msg.op) != CDispatch::Direct {
+        if Self::c_dispatch(op) != CDispatch::Direct {
             self.woken = true;
         }
+    }
+
+    /// Whether a request `scope` sends now would be the next this actor
+    /// runs, so its caller may run it on the idle actor in place of queueing
+    /// it: on a synchronous port with nothing queued, no message or cell on
+    /// the way, no connect retry due, and no section holding it back.
+    fn runs_next(&self, op: &RequestOp, scope: SectionScope) -> bool {
+        let base = self.driver.base();
+        !base.flags.can_block
+            && self.idle()
+            && self.rx.is_empty()
+            && self.cells.is_empty()
+            && base.connect_retry_at.is_none_or(|at| at > Instant::now())
+            && self.section_admits(scope, op)
+    }
+
+    /// Whether a section holding the port's callbacks lets `scope`'s `op` run.
+    fn section_admits(&self, scope: SectionScope, op: &RequestOp) -> bool {
+        match &self.hold {
+            SectionHold::Held { scope: holder, .. } => {
+                scope == *holder || Self::runs_while_a_section_holds(op)
+            }
+            SectionHold::Free(_) => true,
+        }
+    }
+
+    fn enqueue_message(&mut self, mut msg: ActorMessage) {
+        self.arrived(&msg.op);
         // Ranked before a block can divert it: the release re-pushes it as is.
         msg.rank = if !self.driver.base().flags.can_block {
             Rank::Arrival
@@ -2418,9 +2589,8 @@ impl PortActor {
         if msg.is_gone() {
             return None;
         }
-        if let SectionHold::Held { scope, back, .. } = &mut self.hold
-            && msg.scope != *scope
-            && !Self::runs_while_a_section_holds(&msg.op)
+        if !self.section_admits(msg.scope, &msg.op)
+            && let SectionHold::Held { back, .. } = &mut self.hold
         {
             back.push(msg);
             return None;
@@ -3773,6 +3943,67 @@ mod tests {
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
         let result = send_and_wait(&tx, RequestOp::Int32Read, user).unwrap();
         assert_eq!(result.int_val, Some(42));
+    }
+
+    /// A caller takes the idle actor only with the request it would run next.
+    #[test]
+    fn a_caller_takes_the_idle_actor_only_for_what_runs_next() {
+        use crate::request::{CellBody, Unrun};
+        struct Nothing;
+        impl CellBody for Nothing {
+            fn process(&self, _: &mut dyn PortCalls) {}
+            fn unrun(&self, _: Unrun) {}
+            fn done(self: Arc<Self>) {}
+        }
+        let op = RequestOp::Int32Read;
+        let here = SectionScope::current();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut actor = PortActor::new(Box::new(TestDriver::new()), rx);
+        actor.register();
+        assert!(actor.runs_next(&op, here));
+
+        let write = RequestOp::Int32Write { value: 1 };
+        tx.send(ActorMessage::unanswered(write, AsynUser::new(0), here))
+            .unwrap();
+        assert!(!actor.runs_next(&op, here), "past a message on the way");
+        actor.drain_channel();
+        assert!(!actor.runs_next(&op, here), "past a queued request");
+        assert!(actor.process_one().is_none());
+        assert!(actor.runs_next(&op, here));
+
+        let cell = actor.cells.new_cell(Arc::new(Nothing));
+        cell.queue(&AsynUser::new(0)).unwrap();
+        assert!(!actor.runs_next(&op, here), "past a queued cell");
+        actor.drain_channel();
+        assert!(actor.process_one().is_none());
+        assert!(actor.runs_next(&op, here));
+
+        actor.driver.base_mut().connect_retry_at = Some(Instant::now());
+        assert!(!actor.runs_next(&op, here), "with a connect retry due");
+        actor.driver.base_mut().connect_retry_at = None;
+
+        let section = SectionScope::for_section(here);
+        actor.hold.hold(section);
+        assert!(!actor.runs_next(&op, here), "past another's section");
+        assert!(actor.runs_next(&op, section));
+        actor.hold = SectionHold::Free(Vec::new());
+
+        actor.driver.base_mut().flags.can_block = true;
+        assert!(!actor.runs_next(&op, here), "on a blocking port");
+        actor.driver.base_mut().flags.can_block = false;
+
+        let lend = Arc::clone(&actor.lend);
+        actor.parked();
+        let want = |wanted| {
+            if let LendSlot::Idle(_, parked) = &mut *lend.slot() {
+                parked.wanted = wanted;
+            }
+        };
+        want(true);
+        assert!(!lend.take_idle(&op, here), "once its own thread wants it");
+        want(false);
+        assert!(lend.take_idle(&op, here));
+        assert_eq!(lend.state(), "held idle");
     }
 
     /// A driver that writes the parameter at the address it is handed and

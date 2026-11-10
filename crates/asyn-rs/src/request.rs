@@ -581,6 +581,10 @@ impl CellQueue {
         self.inner.lock().cells.pop_front()
     }
 
+    pub(crate) fn is_empty(&self) -> bool {
+        self.inner.lock().cells.is_empty()
+    }
+
     /// Wake the actor with nothing queued — for a store it owes announces for.
     pub(crate) fn nudge(&self) {
         self.wake.notify_one();

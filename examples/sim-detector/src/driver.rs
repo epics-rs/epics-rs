@@ -327,7 +327,6 @@ pub fn create_sim_detector(
         publisher: ArrayPublisher::new(shared_output.clone()),
         dirty,
         ad: ad_params,
-        sim: sim_params,
         pool: pool.clone(),
     });
 

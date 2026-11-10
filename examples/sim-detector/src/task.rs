@@ -19,7 +19,7 @@ use ad_core_rs::roi::crop_roi;
 use ad_core_rs::timestamp::EpicsTimestamp;
 
 use crate::compute::{self, SineState};
-use crate::params::{SimConfigSnapshot, SimDetectorParams};
+use crate::params::SimConfigSnapshot;
 use crate::types::DirtyFlags;
 
 const MIN_DELAY_SECS: f64 = 1e-5;
@@ -37,7 +37,6 @@ pub(crate) struct AcquisitionContext {
     pub publisher: ArrayPublisher,
     pub dirty: Arc<parking_lot::Mutex<DirtyFlags>>,
     pub ad: ADBaseParams,
-    pub sim: SimDetectorParams,
     pub pool: DriverPool,
 }
 
@@ -249,11 +248,10 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             .unwrap_or(0);
 
         // Read initial config
-        let mut config =
-            match SimConfigSnapshot::read_via_handle(&ctx.port_handle, &ctx.ad, &ctx.sim).await {
-                Ok(cfg) => cfg,
-                Err(_) => continue,
-            };
+        let mut config = match SimConfigSnapshot::read_via_handle(&ctx.port_handle).await {
+            Ok(cfg) => cfg,
+            Err(_) => continue,
+        };
 
         loop {
             let start_time = std::time::Instant::now();
@@ -264,13 +262,10 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
 
             // Only re-read config when parameters changed
             if reset {
-                config =
-                    match SimConfigSnapshot::read_via_handle(&ctx.port_handle, &ctx.ad, &ctx.sim)
-                        .await
-                    {
-                        Ok(cfg) => cfg,
-                        Err(_) => break,
-                    };
+                config = match SimConfigSnapshot::read_via_handle(&ctx.port_handle).await {
+                    Ok(cfg) => cfg,
+                    Err(_) => break,
+                };
             }
             task_state.apply_dirty(&dirty_flags);
 

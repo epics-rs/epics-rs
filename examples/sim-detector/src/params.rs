@@ -7,9 +7,10 @@ use asyn_rs::param::ParamType;
 use asyn_rs::port::PortDriverBase;
 use asyn_rs::port_handle::PortHandle;
 
-use ad_core_rs::driver::{snapshot_float64, snapshot_int32, undefined_as_zero};
+use ad_core_rs::driver::undefined_as_zero;
 
 use crate::compute::{Gains, PeakParams, SineParams, SineWave};
+use crate::driver::SimDetector;
 use crate::types::{SimMode, SineOperation};
 
 /// SimDetector-specific parameter indices.
@@ -126,84 +127,15 @@ fn sim_color_mode(value: i32) -> ColorMode {
 }
 
 impl SimConfigSnapshot {
-    /// Read config via PortHandle (async). For use from the acquisition task thread.
-    pub async fn read_via_handle(
-        handle: &PortHandle,
-        ad: &ADBaseParams,
-        sim: &SimDetectorParams,
-    ) -> AsynResult<Self> {
-        let dt_ord = snapshot_int32(handle, ad.base.data_type, 0).await? as u8;
-        let data_type = NDDataType::from_ordinal(dt_ord).unwrap_or(NDDataType::UInt8);
-
-        let cm = snapshot_int32(handle, ad.base.color_mode, 0).await?;
-        let color_mode = sim_color_mode(cm);
-
-        Ok(Self {
-            sim_mode: SimMode::from_i32(snapshot_int32(handle, sim.sim_mode, 0).await?),
-            gains: Gains {
-                gain: snapshot_float64(handle, ad.gain, 0).await?,
-                gain_x: snapshot_float64(handle, sim.gain_x, 0).await?,
-                gain_y: snapshot_float64(handle, sim.gain_y, 0).await?,
-                gain_red: snapshot_float64(handle, sim.gain_red, 0).await?,
-                gain_green: snapshot_float64(handle, sim.gain_green, 0).await?,
-                gain_blue: snapshot_float64(handle, sim.gain_blue, 0).await?,
-            },
-            peak: PeakParams {
-                start_x: snapshot_int32(handle, sim.peak_start_x, 0).await?,
-                start_y: snapshot_int32(handle, sim.peak_start_y, 0).await?,
-                width_x: snapshot_int32(handle, sim.peak_width_x, 0).await?,
-                width_y: snapshot_int32(handle, sim.peak_width_y, 0).await?,
-                num_x: snapshot_int32(handle, sim.peak_num_x, 0).await?,
-                num_y: snapshot_int32(handle, sim.peak_num_y, 0).await?,
-                step_x: snapshot_int32(handle, sim.peak_step_x, 0).await?,
-                step_y: snapshot_int32(handle, sim.peak_step_y, 0).await?,
-                height_variation: snapshot_float64(handle, sim.peak_height_variation, 0).await?,
-            },
-            sine: SineParams {
-                x_sine1: SineWave {
-                    amplitude: snapshot_float64(handle, sim.x_sine1_amplitude, 0).await?,
-                    frequency: snapshot_float64(handle, sim.x_sine1_frequency, 0).await?,
-                    phase: snapshot_float64(handle, sim.x_sine1_phase, 0).await?,
-                },
-                x_sine2: SineWave {
-                    amplitude: snapshot_float64(handle, sim.x_sine2_amplitude, 0).await?,
-                    frequency: snapshot_float64(handle, sim.x_sine2_frequency, 0).await?,
-                    phase: snapshot_float64(handle, sim.x_sine2_phase, 0).await?,
-                },
-                y_sine1: SineWave {
-                    amplitude: snapshot_float64(handle, sim.y_sine1_amplitude, 0).await?,
-                    frequency: snapshot_float64(handle, sim.y_sine1_frequency, 0).await?,
-                    phase: snapshot_float64(handle, sim.y_sine1_phase, 0).await?,
-                },
-                y_sine2: SineWave {
-                    amplitude: snapshot_float64(handle, sim.y_sine2_amplitude, 0).await?,
-                    frequency: snapshot_float64(handle, sim.y_sine2_frequency, 0).await?,
-                    phase: snapshot_float64(handle, sim.y_sine2_phase, 0).await?,
-                },
-                x_op: SineOperation::from_i32(
-                    snapshot_int32(handle, sim.x_sine_operation, 0).await?,
-                ),
-                y_op: SineOperation::from_i32(
-                    snapshot_int32(handle, sim.y_sine_operation, 0).await?,
-                ),
-            },
-            offset: snapshot_float64(handle, sim.offset, 0).await?,
-            noise: snapshot_float64(handle, sim.noise, 0).await?,
-            data_type,
-            color_mode,
-            max_size_x: snapshot_int32(handle, ad.max_size_x, 0).await? as usize,
-            max_size_y: snapshot_int32(handle, ad.max_size_y, 0).await? as usize,
-            size_x: snapshot_int32(handle, ad.size_x, 0).await? as usize,
-            size_y: snapshot_int32(handle, ad.size_y, 0).await? as usize,
-            min_x: snapshot_int32(handle, ad.min_x, 0).await? as usize,
-            min_y: snapshot_int32(handle, ad.min_y, 0).await? as usize,
-            acquire_time: snapshot_float64(handle, ad.acquire_time, 0).await?,
-            acquire_period: snapshot_float64(handle, ad.acquire_period, 0).await?,
-            image_mode: ImageMode::from_i32(snapshot_int32(handle, ad.image_mode, 0).await?),
-            num_images: snapshot_int32(handle, ad.num_images, 0).await?,
-            array_callbacks: snapshot_int32(handle, ad.base.array_callbacks, 0).await? != 0,
-            wait_for_plugins: snapshot_int32(handle, ad.base.wait_for_plugins, 0).await? != 0,
-        })
+    /// [`Self::read_from`] under one hold of the port, as C `simTask` reads
+    /// its whole config with `getIntegerParam` between one `lock()` and
+    /// `unlock()`; a round trip per parameter kept Acquire busy for each one.
+    pub async fn read_via_handle(handle: &PortHandle) -> AsynResult<Self> {
+        handle
+            .with_driver(|d: &mut SimDetector| {
+                Self::read_from(&d.ad.port_base, &d.ad.params, &d.sim_params)
+            })
+            .await?
     }
 
     pub fn read_from(
@@ -276,21 +208,17 @@ impl SimConfigSnapshot {
             max_size_y: undefined_as_zero(base.get_int32_param(ad.max_size_y, 0))? as usize,
             size_x: undefined_as_zero(base.get_int32_param(ad.size_x, 0))? as usize,
             size_y: undefined_as_zero(base.get_int32_param(ad.size_y, 0))? as usize,
-            min_x: base.get_int32_param(ad.min_x, 0).unwrap_or(0) as usize,
-            min_y: base.get_int32_param(ad.min_y, 0).unwrap_or(0) as usize,
+            min_x: undefined_as_zero(base.get_int32_param(ad.min_x, 0))? as usize,
+            min_y: undefined_as_zero(base.get_int32_param(ad.min_y, 0))? as usize,
             acquire_time: undefined_as_zero(base.get_float64_param(ad.acquire_time, 0))?,
             acquire_period: undefined_as_zero(base.get_float64_param(ad.acquire_period, 0))?,
             image_mode: ImageMode::from_i32(undefined_as_zero(
                 base.get_int32_param(ad.image_mode, 0),
             )?),
             num_images: undefined_as_zero(base.get_int32_param(ad.num_images, 0))?,
-            array_callbacks: base
-                .get_int32_param(ad.base.array_callbacks, 0)
-                .unwrap_or(0)
+            array_callbacks: undefined_as_zero(base.get_int32_param(ad.base.array_callbacks, 0))?
                 != 0,
-            wait_for_plugins: base
-                .get_int32_param(ad.base.wait_for_plugins, 0)
-                .unwrap_or(0)
+            wait_for_plugins: undefined_as_zero(base.get_int32_param(ad.base.wait_for_plugins, 0))?
                 != 0,
         })
     }
@@ -317,5 +245,50 @@ mod tests {
         assert!(base.find_param("SIM_PEAK_WIDTH_X").is_some());
         assert!(base.find_param("SIM_YSINE2_PHASE").is_some());
         assert_eq!(params.gain_x, base.find_param("SIM_GAIN_X").unwrap());
+    }
+
+    /// C `simTask` reads its config between one `lock()` and `unlock()`, so a
+    /// write of two parameters under one lock is seen whole or not at all.
+    #[test]
+    fn a_config_read_never_sees_half_of_one_locked_write() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let rt = crate::driver::create_sim_detector(
+            &asyn_rs::registry::claim_port("SIM_CFG_ONE_LOCK").unwrap(),
+            64,
+            64,
+            NDDataType::UInt8 as i32,
+            1_000_000,
+            ad_core_rs::plugin::channel::NDArrayOutput::new(),
+        )
+        .unwrap();
+        let port = rt.port_handle().clone();
+        let (size_x, size_y) = (rt.ad_params.size_x, rt.ad_params.size_y);
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let (port, stop) = (port.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut k = 1;
+                while !stop.load(Ordering::Relaxed) {
+                    port.with_driver_blocking(move |d: &mut SimDetector| {
+                        d.ad.port_base.set_int32_param(size_x, 0, k).unwrap();
+                        d.ad.port_base.set_int32_param(size_y, 0, k).unwrap();
+                    })
+                    .unwrap();
+                    k = k % 64 + 1;
+                }
+            })
+        };
+        for _ in 0..200 {
+            let config = epics_libcom_rs::runtime::task::block_on_sync(
+                SimConfigSnapshot::read_via_handle(&port),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(config.size_x, config.size_y);
+        }
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
     }
 }

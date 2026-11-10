@@ -234,16 +234,20 @@ impl Holding {
 
 impl Drop for Holding {
     fn drop(&mut self) {
-        let last = HELD.with(|held| {
+        let last =
+            HELD.with(|held| held.borrow().iter().filter(|a| **a == self.actor).count() == 1);
+        // Still counted while given back: the pass's tail `give_back` runs on
+        // an actor taken idle reaches the driver, and a call from there into
+        // its own port is refused as one from inside a driver call is.
+        if last {
+            self.lend.give_back();
+        }
+        HELD.with(|held| {
             let mut held = held.borrow_mut();
             if let Some(at) = held.iter().rposition(|a| *a == self.actor) {
                 held.remove(at);
             }
-            !held.contains(&self.actor)
         });
-        if last {
-            self.lend.give_back();
-        }
     }
 }
 
@@ -815,11 +819,13 @@ impl PortHandle {
 
     /// `op` run on this thread with the actor lent to it ([`Lend`]): the
     /// actor reaches it in its queue, parks, and the caller runs it, holding
-    /// the port until the returned [`Holding`] drops. A thread that already
+    /// the port until the returned [`Holding`] drops. A synchronous port's
+    /// idle actor is taken straight from where it waits, as C's caller takes
+    /// `synchronousLock` (asynManager.c:1579-1581). A thread that already
     /// holds the port runs it in place under one more count of it, as C's
     /// recursive `synchronousLock` and `queueLockPort` count do
-    /// (asynManager.c:1579-1581, :1872-1876). The outer error is a request
-    /// that never ran; the inner one is the request's own.
+    /// (:1579-1581, :1872-1876). The outer error is a request that never
+    /// ran; the inner one is the request's own.
     fn lend_request(
         &self,
         what: &str,
@@ -842,6 +848,11 @@ impl PortHandle {
             return Ok((holding, ran.map_err(through)));
         }
         self.may_wait(what)?;
+        if self.lend.take_idle(&op, SectionScope::current()) {
+            let holding = Holding::enter(&self.lend, self.actor);
+            let ran = crate::port_actor::run_lent(&self.lend, Claimed::in_place(op, user));
+            return Ok((holding, ran.map_err(through)));
+        }
         let cancel = CancelToken::new();
         let queue_timeout = user.queue_timeout;
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -2393,6 +2404,71 @@ mod tests {
             actor_link,
             Arc::new(TraceManager::new()),
         )
+    }
+
+    /// A handle on `driver`'s actor parked idle, with no thread to run it.
+    fn make_parked_handle(driver: impl PortDriver) -> PortHandle {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let actor = PortActor::new(Box::new(driver), rx);
+        let actor_link = actor.link();
+        actor.parked();
+        PortHandle::new(
+            tx,
+            "handle_test".into(),
+            Arc::new(InterruptManager::new()),
+            actor_link,
+            Arc::new(TraceManager::new()),
+        )
+    }
+
+    /// C's caller runs a synchronous port's request under `synchronousLock`
+    /// with no thread in between (asynManager.c:1579-1581): a request on an
+    /// idle port runs with the port's thread not running at all.
+    #[test]
+    fn a_synchronous_request_on_an_idle_port_needs_no_port_thread() {
+        let handle = make_parked_handle(TestDriver::new());
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let read = handle
+                .write_int32_blocking(0, 0, 7)
+                .and_then(|()| handle.read_int32_blocking(0, 0));
+            let _ = done_tx.send((read, handle.lend.state()));
+        });
+        let (read, state) = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the request waited for a port thread");
+        assert_eq!(read.unwrap(), 7);
+        assert_eq!(state, "idle");
+    }
+
+    /// A caller finding the idle port held queues as before, and the holder's
+    /// release hands the actor home to run it.
+    #[test]
+    fn a_request_behind_the_holder_of_an_idle_port_runs_at_its_release() {
+        let handle = make_handle(TestDriver::new());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while handle.lend.state() != "idle" {
+            assert!(Instant::now() < deadline, "the actor never went idle");
+            std::thread::yield_now();
+        }
+        let hold = handle.hold_driver_blocking::<TestDriver>().unwrap();
+        assert_eq!(handle.lend.state(), "held idle");
+
+        let behind = handle.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done_tx.send(behind.write_int32_blocking(0, 0, 3));
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "ran while the port was held"
+        );
+        drop(hold);
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the queued request never ran")
+            .unwrap();
+        assert_eq!(handle.read_int32_blocking(0, 0).unwrap(), 3);
     }
 
     #[test]

@@ -10,6 +10,79 @@ use ad_core_rs::pixel_cast::PixelCast;
 
 const MAX_PEAK_SIGMA: i32 = 4;
 
+/// C's arithmetic on a simDetector `epicsType` element.
+pub trait SimPixel: PixelCast + PartialEq {
+    /// `(epicsType)v`: truncates toward zero; an integer out of range keeps
+    /// the low bits of its i64. C leaves that conversion undefined, and gcc's
+    /// x86-64 code for the narrow types differs past ±2^31.
+    fn cast(v: f64) -> Self;
+    /// `a += b`: integers wrap.
+    fn add(self, rhs: Self) -> Self;
+    /// `a * b` stored back to epicsType: integers wrap.
+    fn mul(self, rhs: Self) -> Self;
+}
+
+macro_rules! sim_pixel_int {
+    ($($t:ty),+) => {$(
+        impl SimPixel for $t {
+            #[inline]
+            fn cast(v: f64) -> Self {
+                v as i64 as $t
+            }
+            #[inline]
+            fn add(self, rhs: Self) -> Self {
+                self.wrapping_add(rhs)
+            }
+            #[inline]
+            fn mul(self, rhs: Self) -> Self {
+                self.wrapping_mul(rhs)
+            }
+        }
+    )+};
+}
+
+sim_pixel_int!(i8, u8, i16, u16, i32, u32, i64);
+
+impl SimPixel for u64 {
+    #[inline]
+    fn cast(v: f64) -> Self {
+        if v < 9_223_372_036_854_775_808.0 {
+            v as i64 as u64
+        } else {
+            v as u64
+        }
+    }
+    #[inline]
+    fn add(self, rhs: Self) -> Self {
+        self.wrapping_add(rhs)
+    }
+    #[inline]
+    fn mul(self, rhs: Self) -> Self {
+        self.wrapping_mul(rhs)
+    }
+}
+
+macro_rules! sim_pixel_float {
+    ($($t:ty),+) => {$(
+        impl SimPixel for $t {
+            #[inline]
+            fn cast(v: f64) -> Self {
+                v as $t
+            }
+            #[inline]
+            fn add(self, rhs: Self) -> Self {
+                self + rhs
+            }
+            #[inline]
+            fn mul(self, rhs: Self) -> Self {
+                self * rhs
+            }
+        }
+    )+};
+}
+
+sim_pixel_float!(f32, f64);
+
 #[derive(Debug, Clone)]
 pub struct Gains {
     pub gain: f64,
@@ -83,15 +156,14 @@ impl SineState {
 }
 
 /// Fill background buffer with offset + noise.
-pub fn fill_background<T: PixelCast>(v: &mut [T], offset: f64, noise: f64, rng: &mut StdRng) {
+pub fn fill_background<T: SimPixel>(v: &mut [T], offset: f64, noise: f64, rng: &mut StdRng) {
+    let offset = T::cast(offset);
     if noise == 0.0 {
-        for elem in v.iter_mut() {
-            *elem = T::from_f64(offset);
-        }
+        v.fill(offset);
     } else {
         for elem in v.iter_mut() {
             let n: f64 = rng.random::<f64>() * noise;
-            *elem = T::from_f64(n + offset);
+            *elem = T::cast(n + offset.to_f64());
         }
     }
 }
@@ -110,16 +182,14 @@ pub fn apply_background<T: Copy>(raw: &mut [T], background: &[T], rng: &mut StdR
 }
 
 /// Zero the raw buffer.
-pub fn zero_buffer<T: PixelCast>(v: &mut [T]) {
-    for elem in v.iter_mut() {
-        *elem = T::from_f64(0.0);
-    }
+pub fn zero_buffer<T: SimPixel>(v: &mut [T]) {
+    v.fill(T::default());
 }
 
 /// Accumulate linear ramp into raw/ramp buffer.
 /// If reset is true, recompute the base ramp pattern; otherwise, increment it.
 /// After computation, if use_background is true, add ramp_buf values to raw_buf.
-pub fn accumulate_linear_ramp<T: PixelCast>(
+pub fn accumulate_linear_ramp<T: SimPixel>(
     raw: &mut [T],
     ramp_buf: &mut [T],
     layout: &ColorLayout,
@@ -129,27 +199,26 @@ pub fn accumulate_linear_ramp<T: PixelCast>(
 ) {
     let size_x = layout.size_x;
     let size_y = layout.size_y;
-    let gain = gains.gain;
     let gain_x = gains.gain_x;
     let gain_y = gains.gain_y;
 
-    let inc_mono = gain;
-    let inc_red = gains.gain_red * gain;
-    let inc_green = gains.gain_green * gain;
-    let inc_blue = gains.gain_blue * gain;
+    let inc_mono = T::cast(gains.gain);
+    let inc_red = T::cast(gains.gain_red).mul(inc_mono);
+    let inc_green = T::cast(gains.gain_green).mul(inc_mono);
+    let inc_blue = T::cast(gains.gain_blue).mul(inc_mono);
 
     // Choose destination: if using background, write to ramp_buf, then add to raw.
     // Otherwise write directly to raw.
     // Helper: fill ramp pattern into a buffer
-    fn fill_ramp<T: PixelCast>(
+    fn fill_ramp<T: SimPixel>(
         data: &mut [T],
         layout: &ColorLayout,
         size_x: usize,
         size_y: usize,
-        inc_mono: f64,
-        inc_red: f64,
-        inc_green: f64,
-        inc_blue: f64,
+        inc_mono: T,
+        inc_red: T,
+        inc_green: T,
+        inc_blue: T,
         gain_x: f64,
         gain_y: f64,
         reset: bool,
@@ -159,16 +228,17 @@ pub fn accumulate_linear_ramp<T: PixelCast>(
                 match layout.color_mode {
                     ad_core_rs::driver::ColorMode::Mono => {
                         for x in 0..size_x {
-                            data[layout.index(x, y, 0)] =
-                                T::from_f64(inc_mono * (gain_x * x as f64 + gain_y * y as f64));
+                            data[layout.index(x, y, 0)] = T::cast(
+                                inc_mono.to_f64() * (gain_x * x as f64 + gain_y * y as f64),
+                            );
                         }
                     }
                     _ => {
                         for x in 0..size_x {
                             let base_val = gain_x * x as f64 + gain_y * y as f64;
-                            data[layout.index(x, y, 0)] = T::from_f64(inc_red * base_val);
-                            data[layout.index(x, y, 1)] = T::from_f64(inc_green * base_val);
-                            data[layout.index(x, y, 2)] = T::from_f64(inc_blue * base_val);
+                            data[layout.index(x, y, 0)] = T::cast(inc_red.to_f64() * base_val);
+                            data[layout.index(x, y, 1)] = T::cast(inc_green.to_f64() * base_val);
+                            data[layout.index(x, y, 2)] = T::cast(inc_blue.to_f64() * base_val);
                         }
                     }
                 }
@@ -177,7 +247,7 @@ pub fn accumulate_linear_ramp<T: PixelCast>(
             match layout.color_mode {
                 ad_core_rs::driver::ColorMode::Mono => {
                     for elem in data.iter_mut() {
-                        *elem = T::from_f64(T::to_f64(*elem) + inc_mono);
+                        *elem = elem.add(inc_mono);
                     }
                 }
                 _ => {
@@ -186,9 +256,9 @@ pub fn accumulate_linear_ramp<T: PixelCast>(
                             let ri = layout.index(x, y, 0);
                             let gi = layout.index(x, y, 1);
                             let bi = layout.index(x, y, 2);
-                            data[ri] = T::from_f64(T::to_f64(data[ri]) + inc_red);
-                            data[gi] = T::from_f64(T::to_f64(data[gi]) + inc_green);
-                            data[bi] = T::from_f64(T::to_f64(data[bi]) + inc_blue);
+                            data[ri] = data[ri].add(inc_red);
+                            data[gi] = data[gi].add(inc_green);
+                            data[bi] = data[bi].add(inc_blue);
                         }
                     }
                 }
@@ -202,7 +272,7 @@ pub fn accumulate_linear_ramp<T: PixelCast>(
             gain_y, reset,
         );
         for (elem, rv) in raw.iter_mut().zip(ramp_buf.iter()) {
-            *elem = T::from_f64(elem.to_f64() + rv.to_f64());
+            *elem = elem.add(*rv);
         }
     } else {
         fill_ramp(
@@ -214,7 +284,7 @@ pub fn accumulate_linear_ramp<T: PixelCast>(
 
 /// Accumulate Gaussian peaks into raw buffer.
 /// peak_buf is used as a cache for the 2D Gaussian template.
-pub fn accumulate_peaks<T: PixelCast>(
+pub fn accumulate_peaks<T: SimPixel>(
     raw: &mut [T],
     peak_buf: &mut [T],
     layout: &ColorLayout,
@@ -241,7 +311,7 @@ pub fn accumulate_peaks<T: PixelCast>(
                     / 2.0)
                     .exp();
                 if idx < peak_buf.len() {
-                    peak_buf[idx] = T::from_f64(gains.gain * gauss_x * gauss_y);
+                    peak_buf[idx] = T::cast(gains.gain * gauss_x * gauss_y);
                 }
             }
         }
@@ -275,21 +345,15 @@ pub fn accumulate_peaks<T: PixelCast>(
                     match layout.color_mode {
                         ad_core_rs::driver::ColorMode::Mono => {
                             let raw_idx = layout.index(x_out as usize, y_out as usize, 0);
-                            raw[raw_idx] = T::from_f64(raw[raw_idx].to_f64() + gain_variation * pv);
+                            raw[raw_idx] = T::cast(raw[raw_idx].to_f64() + gain_variation * pv);
                         }
                         _ => {
                             let ri = layout.index(x_out as usize, y_out as usize, 0);
                             let gi = layout.index(x_out as usize, y_out as usize, 1);
                             let bi = layout.index(x_out as usize, y_out as usize, 2);
-                            raw[ri] = T::from_f64(
-                                raw[ri].to_f64() + gains.gain_red * gain_variation * pv,
-                            );
-                            raw[gi] = T::from_f64(
-                                raw[gi].to_f64() + gains.gain_green * gain_variation * pv,
-                            );
-                            raw[bi] = T::from_f64(
-                                raw[bi].to_f64() + gains.gain_blue * gain_variation * pv,
-                            );
+                            raw[ri] = raw[ri].add(T::cast(gains.gain_red * gain_variation * pv));
+                            raw[gi] = raw[gi].add(T::cast(gains.gain_green * gain_variation * pv));
+                            raw[bi] = raw[bi].add(T::cast(gains.gain_blue * gain_variation * pv));
                         }
                     }
                 }
@@ -299,7 +363,7 @@ pub fn accumulate_peaks<T: PixelCast>(
 }
 
 /// Accumulate sine wave pattern into raw buffer.
-pub fn accumulate_sine<T: PixelCast>(
+pub fn accumulate_sine<T: SimPixel>(
     raw: &mut [T],
     layout: &ColorLayout,
     state: &mut SineState,
@@ -378,7 +442,7 @@ pub fn accumulate_sine<T: PixelCast>(
                 for x in 0..size_x {
                     let idx = layout.index(x, y, 0);
                     let val = gains.gain * (state.y_sine1[y] + state.x_sine1[x]);
-                    raw[idx] = T::from_f64(raw[idx].to_f64() + val);
+                    raw[idx] = raw[idx].add(T::cast(val));
                 }
             }
             _ => {
@@ -386,17 +450,12 @@ pub fn accumulate_sine<T: PixelCast>(
                     let ri = layout.index(x, y, 0);
                     let gi = layout.index(x, y, 1);
                     let bi = layout.index(x, y, 2);
-                    raw[ri] = T::from_f64(
-                        raw[ri].to_f64() + gains.gain * gains.gain_red * state.x_sine1[x],
-                    );
-                    raw[gi] = T::from_f64(
-                        raw[gi].to_f64() + gains.gain * gains.gain_green * state.y_sine1[y],
-                    );
-                    raw[bi] = T::from_f64(
-                        raw[bi].to_f64()
-                            + gains.gain * gains.gain_blue * (state.x_sine2[x] + state.y_sine2[y])
-                                / 2.0,
-                    );
+                    raw[ri] = raw[ri].add(T::cast(gains.gain * gains.gain_red * state.x_sine1[x]));
+                    raw[gi] =
+                        raw[gi].add(T::cast(gains.gain * gains.gain_green * state.y_sine1[y]));
+                    raw[bi] = raw[bi].add(T::cast(
+                        gains.gain * gains.gain_blue * (state.x_sine2[x] + state.y_sine2[y]) / 2.0,
+                    ));
                 }
             }
         }
@@ -422,7 +481,7 @@ pub fn compute_frame(
     sine: &SineParams,
     offset: f64,
     noise: f64,
-    use_background: bool,
+    use_background: &mut bool,
     reset: bool,
     rng: &mut StdRng,
 ) {
@@ -445,7 +504,7 @@ pub fn compute_frame(
     typed!(I8, U8, I16, U16, I32, U32, I64, U64, F32, F64)
 }
 
-fn compute_typed<T: PixelCast>(
+fn compute_typed<T: SimPixel>(
     raw: &mut [T],
     background: &mut [T],
     ramp_buf: &mut [T],
@@ -458,14 +517,19 @@ fn compute_typed<T: PixelCast>(
     sine: &SineParams,
     offset: f64,
     noise: f64,
-    use_background: bool,
+    use_background: &mut bool,
     reset: bool,
     rng: &mut StdRng,
 ) {
-    // Step 1: Rebuild background if needed
-    if reset && (noise != 0.0 || offset != 0.0) {
-        fill_background(background, offset, noise, rng);
+    // Step 1: Rebuild background if needed. C compares the offset after
+    // casting it to epicsType, so an offset that truncates to 0 uses none.
+    if reset {
+        *use_background = noise != 0.0 || T::cast(offset) != T::default();
+        if *use_background {
+            fill_background(background, offset, noise, rng);
+        }
     }
+    let use_background = *use_background;
 
     // Step 2: Apply background or zero
     if use_background {
@@ -574,6 +638,90 @@ mod tests {
         assert_eq!(raw[0], 3.0);
         // (1,0): reset=3, +3 = 6
         assert_eq!(raw[1], 6.0);
+    }
+
+    /// C adds `(epicsType)gain` in epicsType: a UInt8 ramp wraps past 255
+    /// and a fractional gain truncates.
+    #[test]
+    fn a_u8_ramp_wraps_and_truncates_as_c_does() {
+        let layout = mono_layout(4, 1);
+        let mut raw = [0u8; 4];
+        let mut ramp = [0u8; 4];
+        let gains = Gains {
+            gain: 100.0,
+            ..default_gains()
+        };
+        accumulate_linear_ramp(&mut raw, &mut ramp, &layout, &gains, true, false);
+        assert_eq!(raw, [0, 100, 200, 44]);
+        accumulate_linear_ramp(&mut raw, &mut ramp, &layout, &gains, false, false);
+        assert_eq!(raw, [100, 200, 44, 144]);
+
+        let gains = Gains {
+            gain: 2.5,
+            ..default_gains()
+        };
+        accumulate_linear_ramp(&mut raw, &mut ramp, &layout, &gains, true, false);
+        assert_eq!(raw, [0, 2, 4, 6]);
+        accumulate_linear_ramp(&mut raw, &mut ramp, &layout, &gains, false, false);
+        assert_eq!(raw, [2, 4, 6, 8]);
+    }
+
+    /// C casts the offset to epicsType before testing it: a UInt8 offset of
+    /// 0.5 leaves the background off, and 100.7 fills it with 100.
+    #[test]
+    fn the_background_uses_the_offset_cast_to_the_pixel_type() {
+        let layout = mono_layout(4, 1);
+        let still = || SineWave {
+            amplitude: 0.0,
+            frequency: 0.0,
+            phase: 0.0,
+        };
+        let sine = SineParams {
+            x_sine1: still(),
+            x_sine2: still(),
+            y_sine1: still(),
+            y_sine2: still(),
+            x_op: SineOperation::Add,
+            y_op: SineOperation::Add,
+        };
+        let peak = PeakParams {
+            start_x: 0,
+            start_y: 0,
+            width_x: 1,
+            width_y: 1,
+            num_x: 0,
+            num_y: 0,
+            step_x: 0,
+            step_y: 0,
+            height_variation: 0.0,
+        };
+        let frame = |offset: f64, use_background: &mut bool| {
+            let mut raw = [7u8; 4];
+            let [bg, ramp, peak_buf] = &mut [[0u8; 4]; 3];
+            compute_typed(
+                &mut raw,
+                bg,
+                ramp,
+                peak_buf,
+                &mut SineState::new(),
+                &layout,
+                SimMode::OffsetNoise,
+                &default_gains(),
+                &peak,
+                &sine,
+                offset,
+                0.0,
+                use_background,
+                true,
+                &mut StdRng::seed_from_u64(1),
+            );
+            raw
+        };
+        let mut use_background = true;
+        assert_eq!(frame(0.5, &mut use_background), [0; 4]);
+        assert!(!use_background);
+        assert_eq!(frame(100.7, &mut use_background), [100; 4]);
+        assert!(use_background);
     }
 
     #[test]
@@ -755,7 +903,7 @@ mod tests {
             &sine_p,
             10.0,
             5.0,
-            true,
+            &mut false,
             true,
             &mut rng,
         );
@@ -770,8 +918,8 @@ mod tests {
 
     /// FNV-1a over the little-endian bytes of every frame of each data type,
     /// mode, colour layout and background setting, from a fixed seed, with
-    /// float elements rounded to 1e-3; the constants were captured on
-    /// 65b35bc41b75, before compute_frame went typed.
+    /// float elements rounded to 1e-3; the constants were captured when the
+    /// integer frames moved to C's epicsType arithmetic.
     #[test]
     fn frame_output_is_pinned_for_a_fixed_seed() {
         use ad_core_rs::ndarray::NDDataType;
@@ -847,7 +995,7 @@ mod tests {
                         let mut peak_buf = NDDataBuffer::zeros(data_type, n);
                         let mut sine_state = SineState::new();
                         let mut rng = StdRng::seed_from_u64(7);
-                        let use_background = noise != 0.0 || offset != 0.0;
+                        let mut use_background = false;
                         for frame in 0..3 {
                             compute_frame(
                                 raw.view_mut(),
@@ -862,7 +1010,7 @@ mod tests {
                                 &sine,
                                 offset,
                                 noise,
-                                use_background,
+                                &mut use_background,
                                 frame == 0,
                                 &mut rng,
                             );
@@ -890,41 +1038,41 @@ mod tests {
             }
         }
         let want: [u64; 40] = [
-            0xc97b119a694258bd,
-            0xbbdf15884d5e9e80,
-            0x385c02c2d10c58f1,
-            0xaae31296df5f3e7f,
-            0x777602a3524536e0,
-            0xd92cc1873286d76c,
-            0xb90fa7459d871835,
-            0x1328dc445c3810e1,
-            0x4efd80c4f4f52a7a,
-            0xc439defc49616cc8,
-            0x4d96db12d50f2361,
-            0x5dc6777e6e1057cb,
-            0x4efd80c4f4f52a7a,
-            0xc439defc49616cc8,
-            0x2d6b3f1fe5d40c38,
-            0x5dc6777e6e1057cb,
-            0xb74ba4766fe9e502,
-            0x0a3a576d20708608,
-            0x9186c412ba4ad8b1,
-            0xe2c746cf5cd8ef73,
-            0xb74ba4766fe9e502,
-            0x0a3a576d20708608,
-            0x6f33abc825c6e4f8,
-            0xe2c746cf5cd8ef73,
-            0xcfe87e6f5208ff72,
-            0x53d95fa64d936de8,
-            0x95a4ed7692a46a39,
-            0x036b906df6c72c83,
-            0xcfe87e6f5208ff72,
-            0x53d95fa64d936de8,
-            0x7d1b2b6ed82b2fb8,
-            0x036b906df6c72c83,
+            0x130bbcf89df32604,
+            0x27529964c644de7f,
+            0xb1b1fe7c82f8f665,
+            0x7a6fb0931738ec8c,
+            0x130bbcf89df32604,
+            0xc7a4b9a72b1246ca,
+            0xb1b1fe7c82f8f665,
+            0x7a6fb0931738ec8c,
+            0x6cdbc52b53c39f14,
+            0xbdc2657b4b6f1518,
+            0xded64194baedd7c1,
+            0x12799a38a6501d74,
+            0x6cdbc52b53c39f14,
+            0xbdc2657b4b6f1518,
+            0xded64194baedd7c1,
+            0x12799a38a6501d74,
+            0xdf55fea4ae3124bc,
+            0x1146938fa107eca0,
+            0xb6c3cd16f0270949,
+            0xccdf05dd0a878664,
+            0xdf55fea4ae3124bc,
+            0x1146938fa107eca0,
+            0xb6c3cd16f0270949,
+            0xccdf05dd0a878664,
+            0x0d2f0054ff6a38ac,
+            0x9f2d3ff5911abb90,
+            0x0e52c36864324051,
+            0xb1be25cd8dd5c304,
+            0x0d2f0054ff6a38ac,
+            0x9f2d3ff5911abb90,
+            0x0e52c36864324051,
+            0xb1be25cd8dd5c304,
             0xca35e2f113a75a5f,
             0x5bf5ef9a8060787f,
-            0xd1af93081ac432c3,
+            0x6819981b823ff7c9,
             0xac16ce73fb1655d0,
             0x2c32ffc0d2f1c153,
             0xeea53f08450e5a1c,

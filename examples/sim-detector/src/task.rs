@@ -93,16 +93,10 @@ impl TaskState {
         }
     }
 
-    fn apply_dirty(&mut self, dirty: &DirtyFlags, config: &SimConfigSnapshot) {
+    fn apply_dirty(&mut self, dirty: &DirtyFlags) {
         if dirty.reallocate_buffers {
             // C releases the previous buffers before allocating the new ones.
             self.bufs = None;
-            self.use_background = false;
-        }
-
-        let needs_rebuild = dirty.rebuild_background || dirty.reallocate_buffers;
-        if needs_rebuild {
-            self.use_background = config.noise != 0.0 || config.offset != 0.0;
         }
     }
 
@@ -146,7 +140,7 @@ impl TaskState {
             &config.sine,
             config.offset,
             config.noise,
-            self.use_background,
+            &mut self.use_background,
             reset,
             &mut self.rng,
         );
@@ -273,7 +267,7 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                         Err(_) => break,
                     };
             }
-            task_state.apply_dirty(&dirty_flags, &config);
+            task_state.apply_dirty(&dirty_flags);
 
             // It stays in pArrays[0] through the exposure wait.
             let Some(frame) = task_state.compute_frame(&ctx.pool, &config, reset) else {
@@ -500,7 +494,7 @@ mod tests {
             let mut state = TaskState::new();
             let mut all = DirtyFlags::default();
             all.set_all();
-            state.apply_dirty(&all, &config);
+            state.apply_dirty(&all);
             let frame = state.compute_frame(&det.ad.pool, &config, true).unwrap();
             let got: Vec<usize> = frame.dims.iter().map(|d| d.size).collect();
             assert_eq!(got, dims, "{mode:?}");

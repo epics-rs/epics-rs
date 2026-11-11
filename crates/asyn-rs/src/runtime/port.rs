@@ -397,7 +397,7 @@ pub fn create_port_runtime_boxed(
     port_handle.set_callback_thread(callback_thread);
     port_handle.set_capabilities(multi_device, max_addr, get_address);
     for hook in runtime_hooks {
-        hook(&port_handle);
+        hook(&port_handle, &config);
     }
     let client = InProcessClient::new(port_handle.clone());
 
@@ -679,7 +679,7 @@ mod tests {
     fn a_runtime_hook_runs_once_with_a_live_handle() {
         let mut port = TestPort::new("rt_hook");
         let (tx, rx) = std::sync::mpsc::channel();
-        port.base.on_runtime(move |handle| {
+        port.base.on_runtime(move |handle, _| {
             tx.send(handle.clone()).unwrap();
         });
         let (_runtime, _jh) = create_port_runtime_unclaimed(port, RuntimeConfig::default())

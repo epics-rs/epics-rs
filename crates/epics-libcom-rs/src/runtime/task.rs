@@ -1727,6 +1727,14 @@ impl StackSpec {
     }
 }
 
+/// C's line for a `stackSize` `pthread_attr_setstacksize` refuses
+/// (`osdThread.c:213-214`); the thread is still created, on the default.
+fn report_refused_stack(stack: StackSpec) {
+    if stack.refused() {
+        crate::stderr_println!("{}", einval_status_line("pthread_attr_setstacksize"));
+    }
+}
+
 /// C's `checkStatusOnce(status, message)` line (`osdThread.c:116-118`), which
 /// C writes to stderr: `"%s error %s\n"` with `strerror(status)`. Every status
 /// the port reports is EINVAL, so the errno stays behind this one cfg boundary.
@@ -3539,8 +3547,8 @@ where
 }
 
 /// Spawn a **dedicated OS thread** that runs `f` at `priority` with a `stack`
-/// of [`StackSizeClass`], plus whatever ambient async context
-/// [`block_on_sync`] needs on this target.
+/// of a [`StackSizeClass`] or the bytes a C driver passed ([`StackSpec`]),
+/// plus whatever ambient async context [`block_on_sync`] needs on this target.
 ///
 /// # Why the stack class is a parameter and not a default
 ///
@@ -3614,13 +3622,13 @@ where
 pub fn spawn_dedicated_thread<F>(
     name: String,
     priority: ThreadPriority,
-    stack: StackSizeClass,
+    stack: impl Into<StackSpec>,
     f: F,
 ) -> std::io::Result<std::thread::JoinHandle<()>>
 where
     F: FnOnce() + Send + 'static,
 {
-    spawn_entered(InheritedRuntime::capture(), name, priority, stack, f)
+    spawn_entered(InheritedRuntime::capture(), name, priority, stack.into(), f)
 }
 
 /// [`spawn_dedicated_thread`] for a permanent worker that runs jobs from many
@@ -3636,7 +3644,7 @@ pub(crate) fn spawn_pool_worker<F>(
 where
     F: FnOnce() + Send + 'static,
 {
-    spawn_entered(InheritedRuntime(None), name, priority, stack, f)
+    spawn_entered(InheritedRuntime(None), name, priority, stack.into(), f)
 }
 
 #[cfg(tokio_backend)]
@@ -3644,12 +3652,13 @@ fn spawn_entered<F>(
     ambient: InheritedRuntime,
     name: String,
     priority: ThreadPriority,
-    stack: StackSizeClass,
+    stack: StackSpec,
     f: F,
 ) -> std::io::Result<std::thread::JoinHandle<()>>
 where
     F: FnOnce() + Send + 'static,
 {
+    report_refused_stack(stack);
     if let Some(refused) = fifo_attr_refusal(priority) {
         return Err(refused);
     }
@@ -3731,12 +3740,14 @@ impl InheritedRuntime {
 pub fn spawn_dedicated_thread<F>(
     name: String,
     priority: ThreadPriority,
-    stack: StackSizeClass,
+    stack: impl Into<StackSpec>,
     f: F,
 ) -> std::io::Result<std::thread::JoinHandle<()>>
 where
     F: FnOnce() + Send + 'static,
 {
+    let stack = stack.into();
+    report_refused_stack(stack);
     if let Some(refused) = fifo_attr_refusal(priority) {
         return Err(refused);
     }
@@ -3908,9 +3919,7 @@ impl MandatoryThread {
         F: FnOnce() + Send + 'static,
     {
         let priority = self.priority;
-        if stack.refused() {
-            crate::stderr_println!("{}", einval_status_line("pthread_attr_setstacksize"));
-        }
+        report_refused_stack(stack);
         if let Some(refused) = priority.and_then(fifo_attr_refusal) {
             return Err(refused);
         }

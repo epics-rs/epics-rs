@@ -87,7 +87,12 @@ async fn wait_for_stop(
 }
 
 pub(crate) fn start_acquisition_task(ctx: AcquisitionContext) -> std::thread::JoinHandle<()> {
-    rt::run_thread_named("XrtSimTask", move || acquisition_loop_async(ctx))
+    rt::run_thread_named(
+        "XrtSimTask",
+        rt::ThreadPriority::Medium,
+        rt::StackSizeClass::Medium,
+        move || acquisition_loop_async(ctx),
+    )
 }
 
 /// Convert accumulated intensity (`nx` columns of `nz`) to a u16 image

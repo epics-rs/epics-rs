@@ -596,8 +596,14 @@ impl OctetWriter {
 
 /// Runs once, when the port's first [`crate::port_handle::PortHandle`]
 /// exists: a C driver's own thread that holds `this` from the constructor
-/// on (asynNDArrayDriver.cpp:1012's `updateQueuedArrayCount`).
-pub type RuntimeHook = Box<dyn FnOnce(&crate::port_handle::PortHandle) + Send + Sync>;
+/// on (asynNDArrayDriver.cpp:1012's `updateQueuedArrayCount`). It gets the
+/// port's config too, whose `priority` and `stack_size` are the constructor
+/// arguments C creates that thread with (:877-879).
+pub type RuntimeHook = Box<
+    dyn FnOnce(&crate::port_handle::PortHandle, &crate::runtime::config::RuntimeConfig)
+        + Send
+        + Sync,
+>;
 
 pub struct PortDriverBase {
     pub port_name: Arc<str>,
@@ -2241,11 +2247,14 @@ impl PortDriverBase {
         result
     }
 
-    /// Run `hook` with the port's handle once its runtime exists. A port that
-    /// never gets a runtime never runs it.
+    /// Run `hook` with the port's handle and config once its runtime exists. A
+    /// port that never gets a runtime never runs it.
     pub fn on_runtime(
         &mut self,
-        hook: impl FnOnce(&crate::port_handle::PortHandle) + Send + Sync + 'static,
+        hook: impl FnOnce(&crate::port_handle::PortHandle, &crate::runtime::config::RuntimeConfig)
+        + Send
+        + Sync
+        + 'static,
     ) {
         self.runtime_hooks.push(Box::new(hook));
     }

@@ -1167,33 +1167,10 @@ impl<T> Drop for TaskSet<T> {
     }
 }
 
-/// The timer the *calling thread* can actually reach.
-///
-/// `tokio::time` reads a thread-local time driver and panics when there is
-/// none, but this process always has a second timer that needs no runtime at
-/// all: the delayed-callback timer [`sleep_background`] waits on (C
-/// `callbackRequestDelayed`). Which of the two to use is a property of the
-/// calling thread, not of the build, so it cannot be a `cfg`.
-///
-/// It is deliberately not "always the background timer". Under
-/// `#[tokio::test(start_paused = true)]` tokio's clock is virtual and only
-/// tokio's own timer advances with it, so a wall-clock sleep on a runtime
-/// thread would wait out a deadline the test means to skip. A thread with no
-/// runtime has no virtual clock to honour, so there the wall-clock timer is
-/// both the correct one and the only one — which is why this arms a timer
-/// where the seam used to panic instead.
-#[cfg(tokio_backend)]
-async fn sleep_on_reachable_timer(duration: Duration) {
-    if tokio::runtime::Handle::try_current().is_ok() {
-        tokio::time::sleep(duration).await;
-    } else {
-        sleep_background(duration).await;
-    }
-}
-
+/// On the timer the calling thread can reach; see [`Sleep::until`].
 #[cfg(tokio_backend)]
 pub async fn sleep(duration: Duration) {
-    sleep_on_reachable_timer(duration).await;
+    sleep_until(deadline_from_now(duration)).await;
 }
 
 /// RTEMS: see [`Reactor::spawn`] — this backend's only executor is the
@@ -1244,16 +1221,18 @@ pub fn deadline_from_now(d: Duration) -> Instant {
     deadline_after(Instant::now(), d)
 }
 
+/// On the timer the calling thread can reach; see [`Sleep::until`]. Both
+/// wheel entries are held inline; a wait allocates only at its first pending
+/// poll, for its hand-off to the wall-clock timer.
 #[cfg(tokio_backend)]
 pub async fn sleep_until(deadline: Instant) {
-    if tokio::runtime::Handle::try_current().is_ok() {
-        tokio::time::sleep_until(deadline).await;
-    } else {
-        // No runtime means no virtual clock, so `Instant::now()` here reads the
-        // same wall clock the background timer runs on and the subtraction
-        // loses nothing. See [`sleep_on_reachable_timer`].
-        sleep_on_reachable_timer(deadline.saturating_duration_since(Instant::now())).await;
+    if tokio::runtime::Handle::try_current().is_err() {
+        return wall_clock_wake(deadline).await;
     }
+    let mut stretch = FinalStretch::new(deadline);
+    let mut pace = std::pin::pin!(tokio::time::sleep_until(pace_at(deadline)));
+    let mut wheel = std::pin::pin!(tokio::time::sleep_until(deadline));
+    std::future::poll_fn(|cx| stretch.poll(pace.as_mut(), wheel.as_mut(), cx)).await;
 }
 
 /// RTEMS: sleep-until on the delayed-callback timer via the host-tested `Sleep`.
@@ -1268,7 +1247,7 @@ pub async fn sleep_until(deadline: Instant) {
 /// defaults: an immediate first tick and `MissedTickBehavior::Burst` catch-up.
 ///
 /// One body for both backends, on the timer the polling thread can reach (see
-/// `sleep_on_reachable_timer`): the hosted half wrapped
+/// `TickTimer`): the hosted half wrapped
 /// `tokio::time::Interval`, which panics on a thread with no runtime.
 pub struct Interval {
     period: Duration,
@@ -1282,9 +1261,26 @@ pub struct Interval {
 }
 
 /// One re-armable sleep on the timer the arming thread can reach.
+///
+/// `tokio::time` reads a thread-local time driver and panics when there is
+/// none, but this process always has a second timer that needs no runtime at
+/// all: the delayed-callback timer [`sleep_background`] waits on (C
+/// `callbackRequestDelayed`). Which of the two to use is a property of the
+/// calling thread, not of the build, so it cannot be a `cfg`.
+///
+/// It is deliberately not "always the background timer". Under
+/// `#[tokio::test(start_paused = true)]` tokio's clock is virtual and only
+/// tokio's own timer advances with it, so a wall-clock sleep on a runtime
+/// thread would wait out a deadline the test means to skip. A thread with no
+/// runtime has no virtual clock to honour, so there the wall-clock timer is
+/// both the correct one and the only one.
 enum TickTimer {
     #[cfg(tokio_backend)]
-    Runtime(std::pin::Pin<Box<tokio::time::Sleep>>),
+    Runtime {
+        stretch: FinalStretch,
+        pace: std::pin::Pin<Box<tokio::time::Sleep>>,
+        wheel: std::pin::Pin<Box<tokio::time::Sleep>>,
+    },
     Background(crate::runtime::background::Sleep),
 }
 
@@ -1292,18 +1288,23 @@ impl TickTimer {
     fn until(deadline: Instant) -> Self {
         #[cfg(tokio_backend)]
         if tokio::runtime::Handle::try_current().is_ok() {
-            return Self::Runtime(Box::pin(tokio::time::sleep_until(deadline)));
+            return Self::Runtime {
+                stretch: FinalStretch::new(deadline),
+                pace: Box::pin(tokio::time::sleep_until(pace_at(deadline))),
+                wheel: Box::pin(tokio::time::sleep_until(deadline)),
+            };
         }
-        Self::Background(crate::runtime::background::timer_sleep::sleep_until(
-            &background().timer().handle(),
-            std_instant(deadline),
-        ))
+        Self::Background(wall_clock_wake(deadline))
     }
 
     fn poll(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         match self {
             #[cfg(tokio_backend)]
-            Self::Runtime(s) => s.as_mut().poll(cx),
+            Self::Runtime {
+                stretch,
+                pace,
+                wheel,
+            } => stretch.poll(pace.as_mut(), wheel.as_mut(), cx),
             Self::Background(s) => std::pin::Pin::new(s).poll(cx),
         }
     }
@@ -1311,14 +1312,228 @@ impl TickTimer {
     fn reset(&mut self, deadline: Instant) {
         match self {
             #[cfg(tokio_backend)]
-            Self::Runtime(s) => s.as_mut().reset(deadline),
+            Self::Runtime {
+                stretch,
+                pace,
+                wheel,
+            } => {
+                *stretch = FinalStretch::new(deadline);
+                pace.as_mut().reset(pace_at(deadline));
+                wheel.as_mut().reset(deadline);
+            }
             Self::Background(s) => s.reset(std_instant(deadline)),
         }
     }
 }
 
-/// A deadline on the background timer's clock. Only a thread with no runtime
-/// arms that timer, and there tokio's clock is the wall clock.
+/// `deadline` on the delayed-callback timer, which waits on the OS clock to
+/// the nanosecond, as C's `epicsEventWaitWithTimeout` does.
+fn wall_clock_wake(deadline: Instant) -> crate::runtime::background::Sleep {
+    crate::runtime::background::timer_sleep::sleep_until(
+        &background().timer().handle(),
+        std_instant(deadline),
+    )
+}
+
+/// How late tokio's wheel fires: it rounds a deadline up to its next 1 ms
+/// tick (tokio `runtime/time/source.rs:17-20`), then parks in `epoll_wait`,
+/// whose timeout mio rounds up to whole ms (mio `selector/epoll.rs:46-56`).
+/// A 0.93 ms wait lasted 2.0 ms on it.
+#[cfg(tokio_backend)]
+const WHEEL_LATENESS: Duration = Duration::from_millis(2);
+
+/// Where the wheel stops pacing a wait for `deadline`.
+#[cfg(tokio_backend)]
+fn pace_at(deadline: Instant) -> Instant {
+    deadline.checked_sub(WHEEL_LATENESS).unwrap_or(deadline)
+}
+
+/// A runtime thread's wait: due when the runtime's clock reaches `deadline`,
+/// and woken once, then, with the OS clock's precision.
+///
+/// The wheel is up to [`WHEEL_LATENESS`] late, so its `pace` entry, at
+/// [`pace_at`], wakes the wait's [`Handoff`] instead of the task, and the
+/// handoff queues the rest on the wall-clock timer, which wakes the task. A
+/// wait cancelled before then never touches that shared queue. Completion is
+/// still read from the runtime's clock, which is the wall clock unless a test
+/// paused it; then the `wheel` entry, at the deadline itself, completes the
+/// wait in virtual time.
+///
+/// Both entries are the caller's, inline in a one-shot [`sleep_until`] and
+/// boxed in a re-armable [`Sleep`], which can outlive its wait; completed,
+/// dropped or re-armed, a stretch leaves nothing armed to wake the task.
+#[cfg(tokio_backend)]
+struct FinalStretch {
+    deadline: Instant,
+    /// Built at the first pending poll, with the waker `pace` is polled with.
+    handoff: Option<(Arc<Handoff>, Waker)>,
+}
+
+#[cfg(tokio_backend)]
+impl FinalStretch {
+    fn new(deadline: Instant) -> Self {
+        Self {
+            deadline,
+            handoff: None,
+        }
+    }
+
+    fn poll(
+        &mut self,
+        pace: std::pin::Pin<&mut tokio::time::Sleep>,
+        mut wheel: std::pin::Pin<&mut tokio::time::Sleep>,
+        cx: &mut Context<'_>,
+    ) -> Poll<()> {
+        let deadline = self.deadline;
+        if Instant::now() < deadline && wheel.as_mut().poll(cx).is_pending() {
+            let (handoff, paced) = self.handoff.get_or_insert_with(|| {
+                let handoff = Arc::new(Handoff::new(std_instant(deadline)));
+                let paced = Waker::from(Arc::clone(&handoff));
+                (handoff, paced)
+            });
+            if handoff.wait(cx.waker()) {
+                let near = deadline.saturating_duration_since(Instant::now()) <= WHEEL_LATENESS;
+                // Unconstrained: a spent coop budget would wake `paced` now.
+                let pace = std::pin::pin!(tokio::task::unconstrained(pace));
+                if near || pace.poll(&mut Context::from_waker(paced)).is_ready() {
+                    handoff.queue();
+                }
+                return Poll::Pending;
+            }
+            // Else the wall-clock wake may have landed before `wait` stored
+            // this waker.
+            if Instant::now() < deadline {
+                return Poll::Pending;
+            }
+        }
+        // A held `Sleep` stays armed past its wait: neither the wall-clock
+        // entry nor the task's waker on `wheel` may wake the task again.
+        if let Some((handoff, _)) = &self.handoff {
+            handoff.cancel();
+            let wheel = std::pin::pin!(tokio::task::unconstrained(wheel));
+            let _ = wheel.poll(&mut Context::from_waker(Waker::noop()));
+        }
+        Poll::Ready(())
+    }
+}
+
+#[cfg(tokio_backend)]
+impl Drop for FinalStretch {
+    fn drop(&mut self) {
+        if let Some((handoff, _)) = &self.handoff {
+            handoff.cancel();
+        }
+    }
+}
+
+/// One wait's hand-off from the wheel to the wall-clock timer: the waker the
+/// wheel's `pace` entry fires, which queues the wall-clock wake rather than
+/// waking the task.
+#[cfg(tokio_backend)]
+struct Handoff {
+    deadline: std::time::Instant,
+    state: parking_lot::Mutex<HandoffState>,
+}
+
+#[cfg(tokio_backend)]
+struct HandoffState {
+    /// The waiting task's waker, as of its last poll.
+    task: Option<Waker>,
+    leg: Leg,
+}
+
+/// Which timer holds a wait.
+#[cfg(tokio_backend)]
+enum Leg {
+    /// The wheel's `pace` entry; the wall-clock queue holds nothing.
+    Wheel,
+    /// The wall-clock queue, under this key (`None`: it had shut down).
+    Queued(
+        Option<(
+            crate::runtime::background::TimerHandle,
+            crate::runtime::background::delayed_timer::WakeKey,
+        )>,
+    ),
+    /// Woken, or the wait is gone: nothing is queued and nothing is owed.
+    Done,
+}
+
+#[cfg(tokio_backend)]
+impl Handoff {
+    fn new(deadline: std::time::Instant) -> Self {
+        Self {
+            deadline,
+            state: parking_lot::Mutex::new(HandoffState {
+                task: None,
+                leg: Leg::Wheel,
+            }),
+        }
+    }
+
+    /// Store the task's waker; whether the wheel still holds the wait.
+    fn wait(&self, task: &Waker) -> bool {
+        let mut st = self.state.lock();
+        if !st.task.as_ref().is_some_and(|w| w.will_wake(task)) {
+            st.task = Some(task.clone());
+        }
+        matches!(st.leg, Leg::Wheel)
+    }
+
+    /// Move the wait onto the wall-clock timer. The timer runs its callbacks
+    /// outside its queue lock, so queueing under this one cannot invert.
+    fn queue(self: &Arc<Self>) {
+        let mut st = self.state.lock();
+        if !matches!(st.leg, Leg::Wheel) {
+            return;
+        }
+        let timer = background().timer().handle();
+        let me = Arc::clone(self);
+        let delay = self
+            .deadline
+            .saturating_duration_since(std::time::Instant::now());
+        let key = timer.schedule_wake(delay, Box::new(move || me.fire()));
+        st.leg = Leg::Queued(key.map(|key| (timer, key)));
+    }
+
+    fn fire(&self) {
+        let task = {
+            let mut st = self.state.lock();
+            if !matches!(st.leg, Leg::Queued(_)) {
+                return;
+            }
+            st.leg = Leg::Done;
+            st.task.take()
+        };
+        if let Some(task) = task {
+            task.wake();
+        }
+    }
+
+    fn cancel(&self) {
+        let leg = {
+            let mut st = self.state.lock();
+            st.task = None;
+            std::mem::replace(&mut st.leg, Leg::Done)
+        };
+        if let Leg::Queued(Some((timer, key))) = leg {
+            timer.cancel_wake(key);
+        }
+    }
+}
+
+#[cfg(tokio_backend)]
+impl Wake for Handoff {
+    fn wake(self: Arc<Self>) {
+        self.queue();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.queue();
+    }
+}
+
+/// A deadline on the background timer's clock, the wall clock, which tokio's
+/// is unless a test paused it.
 #[cfg(tokio_backend)]
 fn std_instant(deadline: Instant) -> std::time::Instant {
     deadline.into_std()
@@ -1337,7 +1552,8 @@ pub struct Sleep {
 }
 
 impl Sleep {
-    /// Complete at `deadline`, on the timer the calling thread can reach.
+    /// Complete at `deadline`, on the timer the calling thread can reach, as
+    /// close to it as the OS clock allows.
     pub fn until(deadline: Instant) -> Self {
         Self {
             deadline,
@@ -5019,44 +5235,130 @@ mod tests {
         );
     }
 
-    /// The other half of the same boundary: a runtime thread must still take
-    /// tokio's timer, because that is the only one that moves with tokio's
-    /// clock — which `#[tokio::test(start_paused = true)]` makes virtual. The
-    /// discriminator is the background executor's `OnceLock`: it is untouched
-    /// unless something reached for the wall-clock timer. Relies on nextest's
-    /// process-per-test isolation for the "untouched" half.
+    /// The other half of the same boundary: a runtime thread's wait completes
+    /// on tokio's clock, the one `#[tokio::test(start_paused = true)]` makes
+    /// virtual. Its final stretch is also armed on the wall-clock timer, which
+    /// only wakes, so hours of virtual waiting still take no wall time.
     #[cfg(tokio_backend)]
-    #[tokio::test]
-    async fn a_bounded_wait_on_a_runtime_thread_keeps_the_runtime_s_timer() {
+    #[tokio::test(start_paused = true)]
+    async fn a_runtime_thread_s_wait_completes_on_the_runtime_s_clock() {
+        let (started, wall) = (Instant::now(), std::time::Instant::now());
+        let hour = Duration::from_secs(3600);
+        assert!(timeout(hour, std::future::pending::<()>()).await.is_err());
+        let mut every = interval(Period::new(hour).unwrap());
+        every.tick().await;
+        every.tick().await;
+        assert!(started.elapsed() >= 2 * hour);
         assert!(
-            BACKGROUND.get().is_none(),
-            "the premise: nothing has started the background facility yet"
-        );
-        let r = timeout(Duration::from_millis(10), std::future::pending::<()>()).await;
-        assert!(r.is_err());
-        assert!(
-            BACKGROUND.get().is_none(),
-            "a runtime thread armed tokio's timer, not the background one"
+            wall.elapsed() < Duration::from_secs(60),
+            "waited out a virtual deadline on the wall clock"
         );
     }
 
+    /// Only a wait's last [`WHEEL_LATENESS`] reaches the shared wall-clock
+    /// queue: a bounded wait whose future wins before then does not even start
+    /// the background facility, and one that runs out queues one entry.
+    /// Relies on nextest's process-per-test isolation for the first half.
     #[cfg(tokio_backend)]
     #[tokio::test]
-    async fn an_interval_on_a_runtime_thread_keeps_the_runtime_s_timer() {
+    async fn only_a_wait_s_final_stretch_reaches_the_wall_clock_timer() {
+        let won = timeout(
+            Duration::from_secs(30),
+            tokio::time::sleep(Duration::from_millis(5)),
+        )
+        .await;
+        assert!(won.is_ok());
         assert!(
             BACKGROUND.get().is_none(),
-            "the premise: nothing has started the background facility yet"
+            "a wait cancelled on the wheel started the background facility"
         );
-        let started = Instant::now();
-        let mut every = interval(Period::new(Duration::from_millis(10)).unwrap());
-        every.tick().await;
-        every.tick().await;
-        every.tick().await;
-        assert!(started.elapsed() >= Duration::from_millis(20));
-        assert!(
-            BACKGROUND.get().is_none(),
-            "a runtime thread armed tokio's timer, not the background one"
-        );
+        background();
+        let armed = background_timer_scheduled_total();
+        let lost = timeout(Duration::from_millis(5), std::future::pending::<()>()).await;
+        assert!(lost.is_err());
+        assert_eq!(background_timer_scheduled_total(), armed + 1);
+    }
+
+    /// A runtime thread's wait wakes its task once, at the deadline: the
+    /// wheel's early fire hands the wait to the wall-clock timer without a
+    /// poll of its own.
+    #[cfg(tokio_backend)]
+    #[tokio::test]
+    async fn a_runtime_thread_s_wait_wakes_its_task_once() {
+        let mut polls = 0;
+        let pending = std::future::poll_fn(|_| {
+            polls += 1;
+            Poll::<()>::Pending
+        });
+        assert!(timeout(Duration::from_millis(20), pending).await.is_err());
+        assert_eq!(polls, 2, "the first poll, then the deadline's wake");
+    }
+
+    /// The same once for a re-armable [`Sleep`] held past its wait, whose
+    /// wheel entry at the deadline stays armed until it is reset or dropped.
+    #[cfg(tokio_backend)]
+    #[tokio::test]
+    async fn a_held_sleep_wakes_nobody_after_its_wait() {
+        // Started first, or the hand-off starting it can outlast the deadline
+        // and leave the wheel to end the wait.
+        background();
+        let mut held = Sleep::until(deadline_from_now(Duration::from_millis(10)));
+        (&mut held).await;
+        let mut polls = 0;
+        let mut after = std::pin::pin!(tokio::time::sleep(Duration::from_millis(10)));
+        std::future::poll_fn(|cx| {
+            polls += 1;
+            after.as_mut().poll(cx)
+        })
+        .await;
+        assert_eq!(polls, 2, "a poll of its own, then its wake");
+        drop(held);
+    }
+
+    /// The median lateness of `n` waits of `period`.
+    #[cfg(tokio_backend)]
+    async fn median_lateness(
+        n: usize,
+        period: Duration,
+        mut wait: impl std::ops::AsyncFnMut(),
+    ) -> Duration {
+        let mut late = Vec::with_capacity(n);
+        for _ in 0..n {
+            let started = std::time::Instant::now();
+            wait().await;
+            late.push(started.elapsed().saturating_sub(period));
+        }
+        late.sort();
+        late[n / 2]
+    }
+
+    /// A runtime thread wakes at its deadline, not at the wheel's next whole
+    /// millisecond: a 0.93 ms wait on the wheel alone lasted 2.0 ms, where C's
+    /// `epicsEventWaitWithTimeout` waits on the OS clock. Both holders of the
+    /// wheel, the one-shot `sleep` and the re-armable `Sleep`, and a wait the
+    /// wheel paces first.
+    #[cfg(tokio_backend)]
+    #[tokio::test]
+    async fn a_runtime_thread_s_wait_wakes_at_its_deadline() {
+        let (short, long) = (Duration::from_micros(930), Duration::from_micros(5300));
+        let mut rearmed = Sleep::until(Instant::now());
+        let one_shot = median_lateness(21, short, async || sleep(short).await).await;
+        let re_armed = median_lateness(21, short, async || {
+            rearmed.reset(deadline_from_now(short));
+            (&mut rearmed).await;
+        })
+        .await;
+        let paced = median_lateness(11, long, async || sleep(long).await).await;
+        for (what, late) in [
+            ("sleep", one_shot),
+            ("Sleep", re_armed),
+            ("long sleep", paced),
+        ] {
+            assert!(
+                late < Duration::from_micros(500),
+                "{what}: median {late:?} late"
+            );
+        }
     }
 
     #[test]

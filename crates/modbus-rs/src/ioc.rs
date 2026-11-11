@@ -2637,7 +2637,8 @@ async fn read_poller(
         if !std::mem::take(&mut deliver) {
             match poll_period(f64::from_bits(poll_delay.load(Ordering::Relaxed))) {
                 Some(period) => {
-                    let _ = tokio::time::timeout(period, poll_wake.notified()).await;
+                    let _ =
+                        epics_base_rs::runtime::task::timeout(period, poll_wake.notified()).await;
                 }
                 None => poll_wake.notified().await,
             }

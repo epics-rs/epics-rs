@@ -102,6 +102,10 @@ serial_test = "3"
 # errlog sink stays silent when nothing is listening.
 tracing-subscriber = "0.3"
 
+# Test-only: `start_paused`, for the timer seam's virtual-clock test.
+[target.'cfg(not(target_os = "rtems"))'.dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+
 [features]
 # Linux PREEMPT_RT real-time deployment opt-in. Wires
 # `runtime::sync::PriorityInheritanceMutex` to a `pthread_mutex_t` configured

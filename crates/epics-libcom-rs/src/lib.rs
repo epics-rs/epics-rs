@@ -27,12 +27,10 @@
 //!
 //! # Features
 //!
-//! The task backend is not one: it is chosen by the
-//! `EPICS_RS_BUILD_EXEC_BACKEND` environment variable, read by `build.rs`. See
-//! [`EXEC_BACKEND`].
-//!
-//! * `linux-rt` — back [`runtime::sync::PriorityInheritanceMutex`] with a
-//!   `PTHREAD_PRIO_INHERIT` `pthread_mutex_t` on Linux.
+//! None. The task backend is chosen by the `EPICS_RS_BUILD_EXEC_BACKEND`
+//! environment variable, read by `build.rs`; see [`EXEC_BACKEND`]. Priority
+//! inheritance is not one either: [`runtime::sync::PriorityInheritanceMutex`]
+//! is a `PTHREAD_PRIO_INHERIT` mutex on Linux and RTEMS in every build.
 //!
 //! # C reference pins
 //!

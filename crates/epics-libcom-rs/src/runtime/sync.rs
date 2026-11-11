@@ -2,55 +2,38 @@
 pub use std::sync::Arc;
 pub use tokio::sync::{Mutex, Notify, RwLock, broadcast, mpsc, oneshot};
 
-/// Priority-inheritance mutex for real-time builds (epics-base 7-E
-/// `5a8b6e41` "epicsMutex priority inheritance"). On Linux with the
-/// `linux-rt` Cargo feature enabled this wraps a `pthread_mutex_t`
-/// configured with `PTHREAD_PRIO_INHERIT` so a low-priority holder
-/// inherits the priority of the highest-priority waiter — preventing
-/// the classic priority-inversion deadlock that bit C epicsMutex on
-/// PREEMPT_RT kernels.
+/// Priority-inheritance mutex (epics-base 7-E `5a8b6e41` "epicsMutex
+/// priority inheritance"). On Linux and RTEMS this wraps a `pthread_mutex_t`
+/// configured with `PTHREAD_PRIO_INHERIT`, so a low-priority holder inherits
+/// the priority of the highest-priority waiter.
 ///
-/// RTEMS gets the same `pthread_mutex_t` construction on its own arm
-/// below, unconditionally. On every other target — including a default
-/// (non-`linux-rt`) Linux build — this is a transparent type alias for
-/// [`parking_lot::Mutex`], which is
-/// already non-poisoning, smaller, and faster than `std::sync::Mutex`
-/// for typical IOC workloads. Callers see the same API surface — the
-/// PI variant only matters when the OS scheduler can preempt a thread
-/// holding the lock, i.e. when the runtime is configured for
-/// real-time scheduling.
+/// Not behind a Cargo feature, because C's is not: `posix/osdMutex.c:71-88`
+/// asks for `PTHREAD_PRIO_INHERIT` on every mutex, and real-time scheduling
+/// is on by default here as it is in C
+/// ([`crate::runtime::task::DEFAULT_POLICY`]). Without PI a SCHED_FIFO waiter
+/// on a lock held by a SCHED_OTHER thread waits for as long as any other load
+/// keeps the holder off the CPU. PI needs no privilege; where the kernel
+/// refuses it the mutex degrades as C's does, see `pi_mutex::protocol`.
+///
+/// The parity target is a POSIX PI mutex on RTEMS too, not a classic-API
+/// semaphore: base-on-RTEMS-6 compiles the POSIX arm
+/// (`configure/toolchain.c:31-35` selects `OS_API = posix` for
+/// `__RTEMS_MAJOR__ >= 5`, and `os/RTEMS-posix/osdMutex.c:8` is a single
+/// `#include "../posix/osdMutex.c"`).
 ///
 /// Note: tokio's async `Mutex` is unaffected — async tasks don't have
 /// OS-level priorities to invert. `PriorityInheritanceMutex` is for
-/// the rare blocking-Sync code paths (device-support callbacks, some
-/// tracing sinks) where we hold a mutex while running with
+/// the blocking-Sync code paths (record locks, device-support callbacks,
+/// some tracing sinks) where we hold a mutex while running with
 /// SCHED_FIFO / SCHED_RR.
-#[cfg(all(target_os = "linux", feature = "linux-rt"))]
+#[cfg(any(target_os = "linux", target_os = "rtems"))]
 type MutexBackend<T> = pi_mutex::PiMutex<T>;
 
-/// The RTEMS arm, and it is **not** behind a Cargo feature.
-///
-/// `linux-rt` exists because a desktop Linux build must opt in: the request
-/// can fail on a box without `CAP_SYS_NICE`, and a runaway RT band on a box
-/// that grants it wedges a developer's machine. Neither failure mode exists on
-/// RTEMS, which is the same reasoning that makes
-/// [`crate::runtime::task::DEFAULT_POLICY`] `AllowRealtime` there
-/// (`task.rs:591-603`) — the target has no way to set an env var and no
-/// privilege gate to fail.
-///
-/// The parity target is a POSIX PI mutex, not an RTEMS classic-API semaphore:
-/// base-on-RTEMS-6 compiles the POSIX arm (`configure/toolchain.c:31-35`
-/// selects `OS_API = posix` for `__RTEMS_MAJOR__ >= 5`, and
-/// `os/RTEMS-posix/osdMutex.c:8` is a single `#include "../posix/osdMutex.c"`).
-/// So this is the same construction on the same API as C — including C's
-/// probe-and-fall-back, see `pi_mutex::protocol` below.
-#[cfg(target_os = "rtems")]
-type MutexBackend<T> = pi_mutex::PiMutex<T>;
-
-/// Non-RT fallback — uses `parking_lot::Mutex` for the common case.
-/// PI semantics are not needed because the scheduler does not
-/// preempt the lock holder by priority.
-#[cfg(not(any(all(target_os = "linux", feature = "linux-rt"), target_os = "rtems")))]
+/// Every other target: `parking_lot::Mutex`. Real-time scheduling is not
+/// applied there ([`crate::runtime::task::apply_to_current_thread`] reports
+/// `Unsupported`), so every thread has one priority and PI would have
+/// nothing to inherit.
+#[cfg(not(any(target_os = "linux", target_os = "rtems")))]
 type MutexBackend<T> = parking_lot::Mutex<T>;
 
 /// C `epicsMutexId` — the mutex every EPICS lock in this port is built from,
@@ -156,12 +139,12 @@ c_mutexes! {
 /// would eventually call `pthread_mutex_unlock` from a non-owner. It is also
 /// what makes "no `.await` inside a lock window" a build error at every
 /// spawn site instead of a review convention.
-#[cfg(any(all(target_os = "linux", feature = "linux-rt"), target_os = "rtems"))]
+#[cfg(any(target_os = "linux", target_os = "rtems"))]
 pub type PriorityInheritanceMutexGuard<'a, T> = pi_mutex::PiMutexGuard<'a, T>;
 
 /// See [`PriorityInheritanceMutexGuard`] — `parking_lot`'s guard is already
 /// `!Send` for the same reason.
-#[cfg(not(any(all(target_os = "linux", feature = "linux-rt"), target_os = "rtems")))]
+#[cfg(not(any(target_os = "linux", target_os = "rtems")))]
 pub type PriorityInheritanceMutexGuard<'a, T> = parking_lot::MutexGuard<'a, T>;
 
 /// A priority-inheritance lock that is **not** on `epicsMutexShowAll`'s list,
@@ -198,19 +181,19 @@ impl<T: std::fmt::Debug> std::fmt::Debug for UnlistedPriorityInheritanceMutex<T>
     }
 }
 
-/// Diagnostic — `true` when the PI variant is active in this build.
+/// Diagnostic — `true` when the PI variant is active in this process.
 ///
-/// On RTEMS this is **not** a `cfg!`: PI there is a probe, exactly as it is in
-/// C (`posix/osdMutex.c:77-85`), so the answer is what the probe obtained
+/// Not a `cfg!`: PI is a probe, exactly as it is in C
+/// (`posix/osdMutex.c:77-85`), so the answer is what the probe obtained
 /// rather than what the build selected. See `pi_mutex::protocol` below.
 pub fn is_pi_mutex_active() -> bool {
-    #[cfg(target_os = "rtems")]
+    #[cfg(any(target_os = "linux", target_os = "rtems"))]
     {
-        pi_mutex::protocol() == rtems_pi::PTHREAD_PRIO_INHERIT
+        pi_mutex::inherits()
     }
-    #[cfg(not(target_os = "rtems"))]
+    #[cfg(not(any(target_os = "linux", target_os = "rtems")))]
     {
-        cfg!(all(target_os = "linux", feature = "linux-rt"))
+        false
     }
 }
 
@@ -263,7 +246,7 @@ mod rtems_pi {
 /// Linux and RTEMS differ in exactly one thing — where the protocol constant
 /// comes from (`protocol` below) — so they share the mutex, the guard and the
 /// `unsafe` rather than carrying two copies that must be fixed twice.
-#[cfg(any(all(target_os = "linux", feature = "linux-rt"), target_os = "rtems"))]
+#[cfg(any(target_os = "linux", target_os = "rtems"))]
 mod pi_mutex {
     use std::cell::UnsafeCell;
     use std::ffi::c_int;
@@ -272,20 +255,13 @@ mod pi_mutex {
     use crate::runtime::cant_proceed::cant_proceed;
 
     #[cfg(target_os = "rtems")]
-    use super::rtems_pi;
-    #[cfg(target_os = "rtems")]
-    use super::rtems_pi::pthread_mutexattr_setprotocol;
+    use super::rtems_pi::{PTHREAD_PRIO_INHERIT, PTHREAD_PRIO_NONE, pthread_mutexattr_setprotocol};
     #[cfg(not(target_os = "rtems"))]
-    use libc::pthread_mutexattr_setprotocol;
+    use libc::{PTHREAD_PRIO_INHERIT, PTHREAD_PRIO_NONE, pthread_mutexattr_setprotocol};
 
-    /// The protocol every mutex in this process is built with.
-    ///
-    /// On Linux this is `PTHREAD_PRIO_INHERIT` unconditionally: the caller
-    /// asked for `linux-rt`, glibc supports the protocol, and a failure is a
-    /// misconfiguration worth panicking on.
-    #[cfg(not(target_os = "rtems"))]
-    pub fn protocol() -> c_int {
-        libc::PTHREAD_PRIO_INHERIT
+    /// Whether the probe obtained priority inheritance.
+    pub fn inherits() -> bool {
+        protocol() == PTHREAD_PRIO_INHERIT
     }
 
     /// The protocol this process actually obtained, probed once.
@@ -298,36 +274,37 @@ mod pi_mutex {
     /// (`:199-205`).
     ///
     /// We match that probe rather than treating a PI-unavailable result as
-    /// fatal, and the reason is target-specific: the RTEMS IOC has no iocsh, so
-    /// a lock constructor that kills the boot thread leaves nobody to ask what
-    /// happened. Degrading to a plain mutex loses priority inheritance and says
-    /// so through [`is_pi_mutex_active`](super::is_pi_mutex_active); dying
-    /// loses the IOC. The ENOMEM class is the other half of that split and is
-    /// still fatal — see `new` below.
+    /// fatal: PI is on in every Linux build, and a Linux kernel or sandbox
+    /// without PI futexes runs a C IOC with plain mutexes, so it must run this
+    /// one too; the RTEMS IOC has no iocsh, so a lock constructor that kills
+    /// the boot thread leaves nobody to ask what happened. Degrading to a
+    /// plain mutex loses priority inheritance and says so through
+    /// [`is_pi_mutex_active`](super::is_pi_mutex_active); dying loses the IOC.
+    /// The ENOMEM class is the other half of that split and is still fatal —
+    /// see `new` below.
     ///
     /// Probed once per process, so the answer is one fact and not a per-mutex
     /// race — the `OnceLock` is this file's analogue of C's `pthread_once`.
-    #[cfg(target_os = "rtems")]
     pub fn protocol() -> c_int {
         static PROTOCOL: std::sync::OnceLock<c_int> = std::sync::OnceLock::new();
         *PROTOCOL.get_or_init(|| {
-            // SAFETY: `attr` and `probe` are stack locals of libc's own RTEMS
+            // SAFETY: `attr` and `probe` are stack locals of libc's own
             // widths, handed only to the pthread calls that own them, and each
             // is destroyed on every path that initialised it.
             unsafe {
                 let mut attr: libc::pthread_mutexattr_t = std::mem::zeroed();
                 if libc::pthread_mutexattr_init(&mut attr) != 0 {
-                    return rtems_pi::PTHREAD_PRIO_NONE;
+                    return PTHREAD_PRIO_NONE;
                 }
-                let mut obtained = rtems_pi::PTHREAD_PRIO_NONE;
+                let mut obtained = PTHREAD_PRIO_NONE;
                 // C probes only when `setprotocol` itself succeeded
                 // (`osdMutex.c:76`), and treats a failed temporary
                 // `pthread_mutex_init` as "PI does not work here" (`:81`).
-                if pthread_mutexattr_setprotocol(&mut attr, rtems_pi::PTHREAD_PRIO_INHERIT) == 0 {
+                if pthread_mutexattr_setprotocol(&mut attr, PTHREAD_PRIO_INHERIT) == 0 {
                     let mut probe: libc::pthread_mutex_t = std::mem::zeroed();
                     if libc::pthread_mutex_init(&mut probe, &attr) == 0 {
                         libc::pthread_mutex_destroy(&mut probe);
-                        obtained = rtems_pi::PTHREAD_PRIO_INHERIT;
+                        obtained = PTHREAD_PRIO_INHERIT;
                     }
                 }
                 libc::pthread_mutexattr_destroy(&mut attr);
@@ -387,7 +364,7 @@ mod pi_mutex {
                 if r != 0 {
                     cant_proceed(&format!("pthread_mutexattr_init failed: {r}"));
                 }
-                // On RTEMS `protocol()` is the probed value, so this call and
+                // `protocol()` is the probed value, so this call and
                 // the `pthread_mutex_init` below are being made with exactly
                 // the arguments the probe already proved acceptable. What
                 // remains fatal here is the ENOMEM class, which is C's
@@ -505,7 +482,7 @@ mod pi_mutex {
         /// the thread that locked the mutex (and an RTEMS PI mutex enforces
         /// ownership), so a guard that could be moved to another thread and
         /// dropped there would unlock from a non-owner. `parking_lot`'s
-        /// guard — the arm the host build compiles — is `!Send` for the same
+        /// guard — the fallback arm's — is `!Send` for the same
         /// reason, so this also keeps the two arms' auto traits identical
         /// and the "no `.await` under a lock" build error target-independent.
         _not_send: std::marker::PhantomData<*const ()>,
@@ -669,7 +646,7 @@ mod epics_mutex {
         /// The address `pthread_mutex_init` was called with — the one RTEMS
         /// validates every later operation against, and the one C's
         /// `epicsMutexOsdShow` prints as `uaddr`.
-        #[cfg(any(all(target_os = "linux", feature = "linux-rt"), target_os = "rtems"))]
+        #[cfg(any(target_os = "linux", target_os = "rtems"))]
         pub fn raw_addr(&self) -> usize {
             self.inner.raw_addr()
         }
@@ -764,7 +741,7 @@ mod epics_mutex {
         }
     }
 
-    #[cfg(any(all(target_os = "linux", feature = "linux-rt"), target_os = "rtems"))]
+    #[cfg(any(target_os = "linux", target_os = "rtems"))]
     fn osd_addr<T>(inner: &MutexBackend<T>) -> usize {
         inner.raw_addr()
     }
@@ -772,7 +749,7 @@ mod epics_mutex {
     /// The fallback backend has no OS object under it, so the address that
     /// stands in for C's `uaddr` is the lock's own — see [`super::MUTEX_OSD_LABEL`],
     /// which says which of the two this build printed.
-    #[cfg(not(any(all(target_os = "linux", feature = "linux-rt"), target_os = "rtems")))]
+    #[cfg(not(any(target_os = "linux", target_os = "rtems")))]
     fn osd_addr<T>(inner: &MutexBackend<T>) -> usize {
         inner as *const MutexBackend<T> as usize
     }
@@ -874,11 +851,11 @@ pub use epics_mutex::{MutexInfo, MutexReport};
 /// What this build's mutex actually is, for the `uaddr` line C prints from
 /// `epicsMutexOsdShow`. Naming it `pthread_mutex_t*` on the fallback arm would
 /// claim an OS object that arm does not create.
-#[cfg(any(all(target_os = "linux", feature = "linux-rt"), target_os = "rtems"))]
+#[cfg(any(target_os = "linux", target_os = "rtems"))]
 pub const MUTEX_OSD_LABEL: &str = "pthread_mutex_t*";
 
 /// See [`MUTEX_OSD_LABEL`].
-#[cfg(not(any(all(target_os = "linux", feature = "linux-rt"), target_os = "rtems")))]
+#[cfg(not(any(target_os = "linux", target_os = "rtems")))]
 pub const MUTEX_OSD_LABEL: &str = "parking_lot::Mutex*";
 
 /// Every EPICS mutex in the process, filtered as C's `onlyLocked` filters —
@@ -1848,15 +1825,17 @@ mod tests {
         assert_eq!(*g, 42);
     }
 
-    /// The report must follow the arm that was actually compiled, per target.
-    /// Host CI only ever executes the last branch, which is the point: the
-    /// default build must not claim PI it does not have.
+    /// The report must follow what each target actually obtained.
+    ///
+    /// On a Linux host the probe must obtain PI in the default build: a
+    /// SCHED_FIFO thread waiting on a record lock held by a SCHED_OTHER one
+    /// otherwise waits for as long as other load keeps the holder off the CPU.
     #[test]
-    fn is_pi_mutex_active_matches_the_cfg_arm() {
-        #[cfg(all(target_os = "linux", feature = "linux-rt"))]
+    fn is_pi_mutex_active_matches_the_target() {
+        #[cfg(target_os = "linux")]
         assert!(
             is_pi_mutex_active(),
-            "linux-rt selects the pthread PI arm unconditionally"
+            "a default Linux build must get PTHREAD_PRIO_INHERIT, as C does"
         );
 
         // On RTEMS the answer is the probe's, not the cfg's — C degrades to
@@ -1870,7 +1849,7 @@ mod tests {
             "the RTEMS report must be the probe result, not the cfg"
         );
 
-        #[cfg(not(any(all(target_os = "linux", feature = "linux-rt"), target_os = "rtems")))]
+        #[cfg(not(any(target_os = "linux", target_os = "rtems")))]
         assert!(
             !is_pi_mutex_active(),
             "the parking_lot fallback arm has no priority inheritance"
@@ -1882,12 +1861,12 @@ mod tests {
     /// RTEMS binds a POSIX mutex to its own address and returns `EINVAL` from
     /// every operation on a relocated one (`PiMutex`'s doc). Measured on
     /// target: with the mutex stored inline the IOC panicked on its first
-    /// `lock()` at boot. No host arm can reproduce *that* — glibc's mutex
-    /// survives the move and the default host build is `parking_lot` — so
+    /// `lock()` at boot. No host can reproduce *that* — glibc's mutex
+    /// survives the move — so
     /// what this pins is the property that makes it impossible: the address
     /// handed to `pthread_mutex_init` is stable across a move of the owner.
     /// Storing the mutex inline again fails here rather than on the next boot.
-    #[cfg(any(all(target_os = "linux", feature = "linux-rt"), target_os = "rtems"))]
+    #[cfg(any(target_os = "linux", target_os = "rtems"))]
     #[test]
     fn the_pthread_object_does_not_move_with_the_mutex() {
         let m: PriorityInheritanceMutex<i32> = PriorityInheritanceMutex::new(7, CMutex::LockSet);
@@ -1902,10 +1881,8 @@ mod tests {
         assert_eq!(*moved.lock(), 7);
     }
 
-    /// Whichever arm is compiled must be a mutex. On host CI this is the
-    /// `parking_lot` fallback — the arm the other two tests can only assert
-    /// *about* — so this is where the fallback's exclusion is actually
-    /// exercised.
+    /// Whichever arm is compiled must be a mutex: the pthread PI arm on a
+    /// Linux host, the `parking_lot` fallback on macOS and Windows.
     #[test]
     fn pi_mutex_serialises_concurrent_writers() {
         const THREADS: u64 = 8;

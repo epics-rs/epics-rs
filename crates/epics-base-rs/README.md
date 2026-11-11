@@ -138,14 +138,12 @@ Driver authors should use this facade instead of depending on tokio directly.
 
 ### Real-time deployment (Linux PREEMPT_RT)
 
-This crate owns the two real-time levers a Linux RT deployment uses:
+A Linux RT deployment needs no build flag:
 
-- **`--features linux-rt`** — wires `runtime::sync::PriorityInheritanceMutex`
-  to a `pthread_mutex_t` configured with `PTHREAD_PRIO_INHERIT`, so a
-  low-priority lock holder inherits its waiter's priority instead of inverting
-  it. Off by default (the default is a `parking_lot` fallback with no PI);
-  only meaningful on systems actually running SCHED_FIFO/SCHED_RR. No-op on
-  non-Linux.
+- **Priority inheritance** — `runtime::sync::PriorityInheritanceMutex` is a
+  `pthread_mutex_t` configured with `PTHREAD_PRIO_INHERIT` on Linux in every
+  build, as in C, so a low-priority lock holder inherits its waiter's
+  priority instead of inverting it.
 - **`EPICS_ALLOW_POSIX_THREAD_PRIORITY_SCHEDULING`** — C's switch for
   best-effort SCHED_FIFO banding of IOC threads, `YES` by default as in C;
   only `yes` (any case) turns it on. Where the OS refuses, threads fall back

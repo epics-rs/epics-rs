@@ -22,9 +22,8 @@
 //!     on `PvDatabase::lock_record` (the L1 record gate, a
 //!     `PriorityInheritanceMutex`). A low-priority holder keeps the gate, a
 //!     medium-priority hog burns the one pinned CPU, and a high-priority
-//!     waiter times how long it takes to acquire the gate. Build with
-//!     `--features linux-rt` for the PI-on arm and without it for the
-//!     PI-off arm; the two runs are the comparison.
+//!     waiter times how long it takes to acquire the gate. The gate carries
+//!     PI on Linux in every build; the run reports whether the probe got it.
 //!
 //! Absolute numbers are QEMU/KVM guest numbers, not bare metal — only the
 //! comparative results are load-bearing. Every subcommand prints its own

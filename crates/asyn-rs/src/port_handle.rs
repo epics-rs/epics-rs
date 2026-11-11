@@ -4261,10 +4261,10 @@ mod tests {
             base,
             connects: connects.clone(),
         });
-        // Registration's attempt and its pass's own (asynManager.c:2135,
-        // :858-863).
+        // Registration's attempt (asynManager.c:2134); a synchronous port has
+        // no port thread to make a second.
         let registered = connects.load(Ordering::SeqCst);
-        assert_eq!(registered, 2);
+        assert_eq!(registered, 1);
 
         // Down: the driver's error, not the gate's asynDisconnected.
         match handle

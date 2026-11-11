@@ -78,9 +78,8 @@ fn epics_runtime_path() -> proc_macro2::TokenStream {
 /// Resolve the path to `epics_base_rs`, supporting both direct dependency
 /// (`epics-base-rs`) and umbrella crate (`epics-rs`) usage.
 ///
-/// Still base-first, because its remaining caller — [`epics_main`] — needs
-/// `__tokio`, which only `epics-base-rs` re-exports. A path that answers two
-/// different questions is what let the `runtime` one above go wrong.
+/// Base-first, as [`epics_main`] has always resolved; [`epics_runtime_path`]
+/// falls back to it.
 fn epics_base_path() -> proc_macro2::TokenStream {
     if let Ok(found) = crate_name("epics-base-rs") {
         match found {
@@ -122,14 +121,48 @@ fn epics_base_path() -> proc_macro2::TokenStream {
     }
 }
 
+/// `#[epics_main]`'s arguments: none, or `worker_threads = N`.
+struct MainArgs {
+    worker_threads: Option<syn::LitInt>,
+}
+
+impl Parse for MainArgs {
+    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+        if input.is_empty() {
+            return Ok(Self {
+                worker_threads: None,
+            });
+        }
+        let key: syn::Ident = input.parse()?;
+        if key != "worker_threads" {
+            return Err(syn::Error::new_spanned(
+                key,
+                "#[epics_main] accepts only `worker_threads = N`",
+            ));
+        }
+        input.parse::<syn::Token![=]>()?;
+        let n: syn::LitInt = input.parse()?;
+        if n.base10_parse::<usize>()? == 0 {
+            return Err(syn::Error::new_spanned(n, "`worker_threads` must be > 0"));
+        }
+        if !input.is_empty() {
+            return Err(input.error("#[epics_main] accepts only `worker_threads = N`"));
+        }
+        Ok(Self {
+            worker_threads: Some(n),
+        })
+    }
+}
+
 /// Marks an `async fn main()` as an EPICS IOC entry point.
 ///
-/// Builds a multi-threaded tokio runtime (via `epics_base_rs::__tokio`)
+/// Builds the IOC runtime (`epics_base_rs::runtime::task::ioc_runtime_builder`)
 /// without requiring the downstream crate to depend on tokio directly.
 ///
 /// # Restrictions
 /// - Must be applied to `async fn main()` — no generics, no arguments.
-/// - Does not accept attribute arguments (e.g., `#[epics_main(flavor = ...)]` is a compile error).
+/// - The one attribute argument is `worker_threads = N` (N > 0); anything
+///   else, `flavor = ...` included, is a compile error.
 ///
 /// # Example
 /// ```ignore
@@ -140,14 +173,7 @@ fn epics_base_path() -> proc_macro2::TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn epics_main(attr: TokenStream, item: TokenStream) -> TokenStream {
-    if !attr.is_empty() {
-        return syn::Error::new(
-            proc_macro2::Span::call_site(),
-            "#[epics_main] does not accept arguments",
-        )
-        .to_compile_error()
-        .into();
-    }
+    let MainArgs { worker_threads } = parse_macro_input!(attr as MainArgs);
 
     let input = parse_macro_input!(item as ItemFn);
     let sig = &input.sig;
@@ -178,12 +204,13 @@ pub fn epics_main(attr: TokenStream, item: TokenStream) -> TokenStream {
     let ret = &sig.output;
     let body = &input.block;
     let base = epics_base_path();
+    let workers = worker_threads.map(|n| quote!(.worker_threads(#n)));
 
     quote! {
         #(#attrs)*
         #vis fn main() #ret {
-            #base::__tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
+            #base::runtime::task::ioc_runtime_builder()
+                #workers
                 .build()
                 .expect("failed to build tokio runtime")
                 .block_on(async move {

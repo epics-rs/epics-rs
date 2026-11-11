@@ -809,7 +809,6 @@ async fn pi_proof(
     Ok(())
 }
 
-#[tokio::main(flavor = "multi_thread")]
 pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     match cli.cmd {

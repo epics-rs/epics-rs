@@ -9,7 +9,7 @@
 use regression_ioc::RegressionIoc;
 
 #[cfg(tokio_backend)]
-#[tokio::main]
+#[epics_base_rs::epics_main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ioc = RegressionIoc::boot().await?;
     println!("regression IOC up:");

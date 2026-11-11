@@ -23,7 +23,7 @@ use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_ca_rs::server::CaServer;
 
 #[cfg(tokio_backend)]
-#[tokio::main]
+#[epics_base_rs::epics_main]
 async fn main() -> CaResult<()> {
     let mut args = std::env::args().skip(1);
     let usage = "usage: sscan_ab_ioc <file.db> <port>";

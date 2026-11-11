@@ -153,6 +153,3 @@ const _: () = assert!(
 
 pub use epics_macros_rs::epics_main;
 pub use epics_macros_rs::epics_test;
-
-#[doc(hidden)]
-pub use tokio as __tokio;

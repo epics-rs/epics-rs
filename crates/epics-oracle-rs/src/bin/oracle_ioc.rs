@@ -96,7 +96,7 @@ fn parse_macro(text: &str) -> Result<(String, String), String> {
 }
 
 #[cfg(tokio_backend)]
-#[tokio::main]
+#[epics_base_rs::epics_main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     run().await
 }

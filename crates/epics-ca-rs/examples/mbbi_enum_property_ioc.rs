@@ -102,7 +102,7 @@ impl DeviceSupport for EnumProp {
 }
 
 #[cfg(tokio_backend)]
-#[tokio::main]
+#[epics_base_rs::epics_main]
 async fn main() -> CaResult<()> {
     let port: u16 = std::env::var("RIG_PORT")
         .ok()

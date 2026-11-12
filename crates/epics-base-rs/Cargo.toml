@@ -121,14 +121,6 @@ criterion = { version = "0.5", features = ["html_reports"] }
 tracing-subscriber = "0.3"
 
 [features]
-# Linux PREEMPT_RT real-time deployment opt-in. Wires `runtime::sync::
-# PriorityInheritanceMutex` to a `pthread_mutex_t` configured with
-# `PTHREAD_PRIO_INHERIT` (epics-base 7-E `5a8b6e41`). No-op on
-# non-Linux. Off by default — only enable on systems running with
-# SCHED_FIFO / SCHED_RR where unbounded priority inversion is a risk.
-# The mutex lives in `epics-libcom-rs`; this is the forward that keeps
-# `--features epics-base-rs/linux-rt` meaning what it always did.
-linux-rt = ["epics-libcom-rs/linux-rt"]
 # Test-only: enables the `client_server` integration test, whose
 # `run_tcp_listener` call must match `epics-ca-rs`'s TLS/cap-token
 # signature. `run_tcp_listener` has `#[cfg]`-gated `tls` /

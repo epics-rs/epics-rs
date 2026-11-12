@@ -189,24 +189,19 @@
 //! function above is the single place that answers whether this process got
 //! it:
 //!
-//! * **RTEMS** — PI, and the answer is a *probe* result rather than a `cfg!`,
-//!   matching C's own degrade path (`os/posix/osdMutex.c:77-85`, reported by
-//!   `epicsMutexShowAll` at `:199-205`).
-//! * **Linux with the `linux-rt` Cargo feature** — PI unconditionally.
-//! * **every other build, including a default hosted Linux `cargo test`** —
-//!   `parking_lot::Mutex`, which has **no** priority inheritance and no
-//!   priority ordering. The host suite therefore verifies the *exclusion*
-//!   this module provides, never its ordering; ordering is on-target
-//!   territory.
+//! * **Linux and RTEMS** — PI, and the answer is a *probe* result rather than
+//!   a `cfg!`, matching C's own degrade path (`os/posix/osdMutex.c:77-85`,
+//!   reported by `epicsMutexShowAll` at `:199-205`).
+//! * **every other target** — `parking_lot::Mutex`, which has **no** priority
+//!   inheritance and no priority ordering; real-time scheduling is not
+//!   applied there either.
 //!
-//! Read as a claim about *this* gate: on the host, `lock_record` excludes and
-//! nothing more, and no host test can be written that would catch a lost
-//! inversion. Two further conditions have to hold on target before the
-//! ordering is real, and neither is this module's to enforce — the probe must
-//! have returned `PTHREAD_PRIO_INHERIT`, and the contending threads must
-//! actually carry distinct scheduling priorities, which requires
-//! `RtPolicy::AllowRealtime` in [`crate::runtime::task`]. With the RT switch
-//! off, every thread is one priority and PI has nothing to inherit.
+//! Two further conditions have to hold before the ordering is real, and
+//! neither is this module's to enforce — the probe must have returned
+//! `PTHREAD_PRIO_INHERIT`, and the contending threads must actually carry
+//! distinct scheduling priorities, which requires `RtPolicy::AllowRealtime`
+//! in [`crate::runtime::task`]. With the RT switch off, every thread is one
+//! priority and PI has nothing to inherit.
 //!
 //! Acquisition order — MUST
 //! ------------------------

@@ -2393,8 +2393,8 @@ pub fn set_thread_ok_to_block(ok: bool) {
 /// priority-inheritance mutexes, so the wait queue is the *kernel's* and it
 /// is ranked by the scheduling priority requested here. With
 /// [`RtPolicy::Disabled`] no scheduler call happens and there is no ordering
-/// to have — the hosted default, where the locks still exclude but do not
-/// prioritise ([`crate::runtime::sync::is_pi_mutex_active`]).
+/// to have: the locks still exclude but do not prioritise. Whether they carry
+/// PI at all is [`crate::runtime::sync::is_pi_mutex_active`].
 pub fn enter_ioc_thread(priority: ThreadPriority) -> PriorityApplied {
     prepare_current_thread();
     band_and_register(priority)

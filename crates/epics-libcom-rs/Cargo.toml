@@ -106,12 +106,3 @@ tracing-subscriber = "0.3"
 # Test-only: `start_paused`, for the timer seam's virtual-clock test.
 [target.'cfg(not(target_os = "rtems"))'.dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
-
-[features]
-# Linux PREEMPT_RT real-time deployment opt-in. Wires
-# `runtime::sync::PriorityInheritanceMutex` to a `pthread_mutex_t` configured
-# with `PTHREAD_PRIO_INHERIT` (epics-base 7-E `5a8b6e41`). No-op on non-Linux.
-# Off
-# by default — only enable on systems running with SCHED_FIFO / SCHED_RR where
-# unbounded priority inversion is a risk.
-linux-rt = []

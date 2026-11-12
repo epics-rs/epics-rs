@@ -60,17 +60,10 @@ chrt -f 80 target/release/rt-probe serve --ca-port 5164 &
 chrt -f 70 target/release/rt-probe watch --ca-port 5164 --samples 2000
 ```
 
-## Features
-
-- `linux-rt` — forwards to `epics-base-rs/linux-rt`, which makes
-  `PriorityInheritanceMutex` a `pthread_mutex_t` with `PTHREAD_PRIO_INHERIT`.
-  `pi-proof` prints `PI mutex active in this build = true|false`; run it once
-  with and once without the feature for the PI-on / PI-off arms:
-
-  ```sh
-  cargo run --release -p rt-probe --features linux-rt -- pi-proof
-  cargo run --release -p rt-probe -- pi-proof
-  ```
+`pi-proof` prints `PI mutex active in this build = true|false`, which is the
+PI probe's answer: `PriorityInheritanceMutex` is a `PTHREAD_PRIO_INHERIT`
+`pthread_mutex_t` on Linux in every build, so the PI-off arm exists only on a
+kernel that refuses PI.
 
 ## Not covered
 

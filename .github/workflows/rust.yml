@@ -287,31 +287,6 @@ jobs:
     - name: Type-check the RTEMS closure
       run: ./scripts/rtems-check.sh
 
-  # `linux-rt` swaps `PriorityInheritanceMutex` from the parking_lot fallback
-  # onto a real `PTHREAD_PRIO_INHERIT` pthread mutex
-  # (crates/epics-libcom-rs/src/runtime/sync.rs). No other job turns the
-  # feature on, so without this job the PI implementation would compile and
-  # test only on maintainer machines. The two crates below are the ones that
-  # declare (`epics-libcom-rs`) or forward (`epics-base-rs`) the feature.
-  # No RT kernel is needed to *run* PI mutexes — only to measure their
-  # latency effect, which happens off-CI (doc/rtlinux-rt-measurement.md).
-  linux-rt:
-    runs-on: ubuntu-latest
-
-    steps:
-    - uses: actions/checkout@v4
-    - uses: dtolnay/rust-toolchain@master
-      with:
-        toolchain: 1.99.0
-    - uses: taiki-e/install-action@nextest
-    - uses: Swatinem/rust-cache@v2
-      with:
-        key: linux-rt
-    - name: epics-libcom-rs (linux-rt)
-      run: cargo nextest run --profile ci -p epics-libcom-rs --features linux-rt
-    - name: epics-base-rs (linux-rt)
-      run: cargo nextest run --profile ci -p epics-base-rs --features linux-rt
-
   # Commit b7a6b0ab found the no-default-features debt was three masked *build
   # breaks*, not warnings — code that simply does not compile once the default
   # features come off, invisible to every other job here because they all build

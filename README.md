@@ -224,12 +224,11 @@ wired in `.cargo/config.toml`, so plain `cargo build` is the whole interface.
 
 ## Run on RT Linux (PREEMPT_RT)
 
-On a PREEMPT_RT kernel the ordinary host build is the whole build — real time
-is enabled at run/feature level, not by cross-compiling:
+On a PREEMPT_RT kernel the ordinary host build is the whole build, and its
+mutexes already carry priority inheritance (PTHREAD_PRIO_INHERIT), as C's do:
 
 ```bash
-# build with priority-inheritance mutexes (PTHREAD_PRIO_INHERIT)
-cargo build --release --features epics-base-rs/linux-rt
+cargo build --release
 
 # SCHED_FIFO thread banding is on by default, as in C; grant the privilege via
 # an RTPRIO rlimit, CAP_SYS_NICE, or chrt (without it threads stay SCHED_OTHER)

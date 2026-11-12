@@ -37,14 +37,14 @@ gate on a single uniform condition:
 own copy of the predicate to it with a `const _: () = assert!(…)` —
 `epics-base-rs` does exactly that.
 
-## Feature levers
+## Priority inheritance
 
-| feature | what it does |
-|---|---|
-| `linux-rt` | back `runtime::sync::PriorityInheritanceMutex` (and its inline form `PinnedPriorityInheritanceMutex`) with a `pthread_mutex_t` carrying `PTHREAD_PRIO_INHERIT` (epics-base 7-E `5a8b6e41`). No-op off Linux. Only enable where threads run `SCHED_FIFO`/`SCHED_RR` and unbounded priority inversion is a real risk. |
-
-`epics-base-rs` forwards it, so `--features epics-base-rs/linux-rt` means what
-it always did.
+`runtime::sync::PriorityInheritanceMutex` (and its inline form
+`PinnedPriorityInheritanceMutex`) is a `pthread_mutex_t` carrying
+`PTHREAD_PRIO_INHERIT` on Linux and RTEMS in every build, as C's
+`posix/osdMutex.c` builds every mutex (epics-base 7-E `5a8b6e41`). Where the
+kernel refuses PI it degrades to a plain mutex as C does, and
+`is_pi_mutex_active` reports which. Elsewhere it is `parking_lot::Mutex`.
 
 ## Backend lever
 

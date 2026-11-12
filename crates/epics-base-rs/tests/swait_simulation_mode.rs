@@ -79,7 +79,25 @@ async fn sim_db(siml: &str, simm: i16, sims: i16, siol: &str) -> PvDatabase {
         .await
         .unwrap();
     settle(&db, "W", "OUTV", 0.0).await;
+    if simm == 0 {
+        process_until_a(&db, 10.0).await;
+    }
     db
+}
+
+/// Process W until its A reads `want`. INAN searches on its own task and
+/// SRC's value reaches it on the link's first monitor, which only a fetching
+/// cycle shows — OUTV reading PV OK says nothing about either.
+async fn process_until_a(db: &PvDatabase, want: f64) {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
+        process(db).await;
+        if field(db, "W", "A").await == want {
+            return;
+        }
+        epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("W.A never read {want}: {}", field(db, "W", "A").await);
 }
 
 /// Wait until `rec.f` reads `want` — OUTV connects and the OUT write lands

@@ -5,7 +5,6 @@
 // exec backend (`EPICS_RS_BUILD_EXEC_BACKEND=thread`); no CA server is built.
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use epics_base_rs::server::database::{LinkRef, LinkSet, PvDatabase};
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -40,8 +39,6 @@ async fn put(db: &PvDatabase, field: &str, value: EpicsValue) {
     db.put_record_field_from_ca_no_notify("T", field, value)
         .await
         .unwrap();
-    // The put link's status is stored by the put and posted from a task.
-    tokio::time::sleep(Duration::from_millis(100)).await;
 }
 
 /// Re-points SINP at a CA link, so SIV reads `Ext PV NC` until the 0.5 s

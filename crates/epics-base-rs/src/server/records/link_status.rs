@@ -338,6 +338,10 @@ pub struct LinkCheckSpec {
 pub struct LinkCheckState {
     pub(crate) ca_links: bool,
     pub(crate) scheduled: bool,
+    /// Bit `i`: a link put's `special()` stored `spec.links[i]`'s status and
+    /// the put owes its post; only `RecordInstance::post_put_link_status_in`
+    /// takes it.
+    pub(crate) put_posts: u64,
 }
 
 /// What `checkLinks` reads and writes on one record: the status of
@@ -429,7 +433,7 @@ pub fn classify_link(
 /// whatever the target and nothing is classified.
 ///
 /// `links` pairs each status FIELD with the link string it describes and the
-/// link's role, classified under `rule`; every caller passes its complete
+/// link's role, classified under `spec.rule`; every caller passes its complete
 /// set, link `i` at index `i`. `posts` names the links C classifies, and
 /// posts even unchanged: `init_record` every one, `special()` the re-pointed
 /// link alone (`aCalcoutRecord.c:528-569`). The other statuses are left as
@@ -441,14 +445,16 @@ pub fn classify_link(
 /// `iocInit` returns; spawned at once on a complete database. No-op for a
 /// record with no async context.
 ///
-/// A put on a complete database is the exception: C's `special()` sets the
-/// status before the put returns, and acalcout's next `fetch_values` reads
-/// INAA..INLL by it (`aCalcoutRecord.c:1078`). So the put link is classified
-/// here, on the caller's thread under the record's write lock, and its status
-/// returned for the caller to store; the task only posts it. Otherwise `None`.
-/// `mask` is the record's own `db_post_events` mask, and it is a parameter
-/// because the four records that route through here do not agree. The three
-/// calcouts post a bare `DBE_VALUE` — `calcoutRecord.c:404`, `:752`, `:757`;
+/// A put on a complete database is the exception: C's `special()` sets and
+/// posts the status before the put returns, and acalcout's next
+/// `fetch_values` reads INAA..INLL by it (`aCalcoutRecord.c:1078`). So the
+/// put link is classified here, on the caller's thread under the record's
+/// write lock, stored at its `spec` slot of `statuses` and owed in `state`;
+/// the put path posts it and the task only arms the recheck.
+///
+/// `spec.mask` is the record's own `db_post_events` mask, since the four
+/// records that route through here do not agree on it. The three calcouts
+/// post a bare `DBE_VALUE` — `calcoutRecord.c:404`, `:752`, `:757`;
 /// `sCalcoutRecord.c:287`, `:569`, `:1015`, `:1045`; `aCalcoutRecord.c:242`,
 /// `:569`, `:1157` — while `transformRecord.c:741`, `:858`, `:863` post
 /// `DBE_VALUE|DBE_LOG`. Posting one mask for all four would have been correct
@@ -464,47 +470,60 @@ pub fn post_link_status(
     ctx: Option<&(crate::types::RecordName, AsyncDbHandle)>,
     generation: &LinkStatusGen,
     links: Vec<(&'static str, PvString, LinkRole)>,
-    rule: LinkRule,
-    mask: crate::server::recgbl::EventMask,
     posts: LinkStatusPosts,
-) -> Option<i16> {
-    let (name, handle) = ctx?;
+    spec: &'static LinkCheckSpec,
+    statuses: &mut [i16],
+    state: &mut LinkCheckState,
+) {
+    let Some((name, handle)) = ctx else {
+        return;
+    };
     let classified = posts.links(links.iter().map(|&(f, _, _)| f));
     if classified == 0 {
-        return None;
+        return;
     }
     let recheck = match posts {
-        LinkStatusPosts::All => rule.init_recheck(),
+        LinkStatusPosts::All => spec.rule.init_recheck(),
         LinkStatusPosts::Put(_) => Some(LINK_RECHECK),
     };
     // Stamp before the spawn, on the caller's thread, under the record's
-    // write lock (see `LinkStatusGen`).
+    // write lock (see `LinkStatusGen`): a put's supersedes an init still in
+    // flight even though the put posts its own.
     let token = generation.next_for(classified);
-    let now = (matches!(posts, LinkStatusPosts::Put(_)) && handle.classifies_links_at_once())
-        .then(|| classify_links(handle, &links, classified, rule));
-    let stored = now.as_ref().and_then(|now| now.first()).map(|&(_, _, s)| s);
     let name = name.clone();
     let handle = handle.clone();
     let sched = handle.clone();
     let init_key = name.clone();
+    if let LinkStatusPosts::Put(field) = posts
+        && handle.classifies_links_at_once()
+        && let Some(slot) = spec.links.iter().position(|&(_, s)| s == field)
+        && let Some(&(_, _, status)) =
+            classify_links(&handle, &links, classified, spec.rule).first()
+    {
+        statuses[slot] = status;
+        state.put_posts |= 1 << slot;
+        sched.schedule_record_init(&init_key, async move {
+            handle.link_check_classified(&name, recheck);
+        });
+        return;
+    }
     sched.schedule_record_init(&init_key, async move {
-        let (statuses, post) = match now {
-            Some(now) => (now, PostRule::Held),
-            None => (
-                classify_links(&handle, &links, classified, rule),
-                PostRule::Always,
-            ),
-        };
-        let fields = statuses
+        let fields = classify_links(&handle, &links, classified, spec.rule)
             .into_iter()
-            .map(|(i, field, status)| (i, field.to_string(), EpicsValue::Enum(status as u16), post))
+            .map(|(i, field, status)| {
+                (
+                    i,
+                    field.to_string(),
+                    EpicsValue::Enum(status as u16),
+                    PostRule::Always,
+                )
+            })
             .collect();
         #[cfg(test)]
         tests::hold_before_post().await;
-        token.post_each_ruled(&handle, &name, fields, mask);
+        token.post_each_ruled(&handle, &name, fields, spec.mask);
         handle.link_check_classified(&name, recheck);
     });
-    stored
 }
 
 /// `(i, field, status)` for each link `i` of `links` at a bit of `classified`.
@@ -589,22 +608,21 @@ mod tests {
         }
     }
 
-    /// Put 1 is held at its post until the test holds SC's write lock, then
-    /// released so it reaches its post — and its under-lock check — just as
-    /// put 2 issues the next token under that same lock. Returns what INAV,
-    /// INBV and INCV posted.
-    async fn superseded_put(put1: (&str, &str), put2: (&str, &str)) -> [Vec<EpicsValue>; 3] {
+    /// Boundary of the put's post: C's `special()` posts the put link's status
+    /// before `dbPut` returns, unchanged or not, and only that link's. Three
+    /// puts — `INPA ""` (Constant, unchanged), `INPA SRC`, `INPB SRC` — are
+    /// read back with nothing awaited after them.
+    #[epics_macros_rs::epics_test]
+    async fn a_link_put_posts_its_own_status_before_it_returns() {
         let db = PvDatabase::new();
         db.add_record("SRC", Box::new(AiRecord::new(3.0)))
             .await
             .unwrap();
+        db.ioc_init().await;
+        // Added after `iocInit`, `add_record` returns once init has posted.
         db.add_record("SC", Box::new(ScalcoutRecord::new()))
             .await
             .unwrap();
-        db.ioc_init().await;
-        // SC's init classification is spawned and may still be in flight; it
-        // must not be the task the hold catches.
-        crate::runtime::task::sleep(Duration::from_millis(100)).await;
 
         let rec = db.get_record("SC").unwrap();
         let mut rx: Vec<_> = ["INAV", "INBV", "INCV"]
@@ -615,35 +633,11 @@ mod tests {
                     .expect("subscriber")
             })
             .collect();
-
-        let (arrived_tx, arrived) = oneshot::channel();
-        let (release, release_rx) = oneshot::channel();
-        let (resumed_tx, resumed) = std::sync::mpsc::channel();
-        *HOLD.lock().unwrap() = Some((arrived_tx, release_rx, resumed_tx));
-        let v1 = EpicsValue::String(put1.1.into());
-        let held = db.lock_for_put("SC", put1.0, &v1);
-        db.put_record_field_from_ca_already_locked(held, v1)
-            .unwrap();
-        arrived.await.expect("put 1's task reached its post");
-        {
-            let mut guard = rec.write();
-            release.send(()).unwrap();
-            resumed
-                .recv_timeout(fact_budget::FACT_BUDGET)
-                .expect("put 1's task resumed");
-            // The few instructions from the hold to the post's lock.
-            std::thread::sleep(Duration::from_millis(50));
-            // Put 2, as the put path runs it under the record's hold.
-            guard
-                .record
-                .put_field(put2.0, EpicsValue::String(put2.1.into()))
-                .unwrap();
-            guard
-                .record
-                .special(put2.0, true, &Default::default())
-                .unwrap();
+        for (link, target) in [("INPA", ""), ("INPA", "SRC"), ("INPB", "SRC")] {
+            let v = EpicsValue::String(target.into());
+            let held = db.lock_for_put("SC", link, &v);
+            db.put_record_field_from_ca_already_locked(held, v).unwrap();
         }
-        crate::runtime::task::sleep(Duration::from_millis(100)).await;
 
         let mut drain = |i: usize| {
             let mut got = Vec::new();
@@ -652,29 +646,12 @@ mod tests {
             }
             got
         };
-        [drain(0), drain(1), drain(2)]
-    }
-
-    /// Boundary of the generation gate: put 1 (`INPA SRC`) classified Local
-    /// but is superseded by put 2 (`INPA ""`). Only put 2's Constant may post;
-    /// a check outside the lock also posts the stale Local, in either order.
-    /// The other links' statuses post nothing, as C's `special()`.
-    #[epics_macros_rs::epics_test]
-    async fn a_superseded_link_put_still_posts_its_status() {
-        let constant = vec![EpicsValue::Enum(super::LINK_CON as u16)];
-        let got = superseded_put(("INPA", "SRC"), ("INPA", "")).await;
-        assert_eq!(got, [constant, vec![], vec![]]);
-    }
-
-    /// Boundary of the per-link gate: put 1 (`INPA ""`, Constant, unchanged)
-    /// is followed by put 2 on another link, which leaves INAV alone. C posts
-    /// INAV from put 1's `special()` whatever its value.
-    #[epics_macros_rs::epics_test]
-    async fn an_unchanged_put_posts_past_a_put_to_another_link() {
-        let constant = vec![EpicsValue::Enum(super::LINK_CON as u16)];
-        let local = vec![EpicsValue::Enum(super::LINK_LOC as u16)];
-        let got = superseded_put(("INPA", ""), ("INPB", "SRC")).await;
-        assert_eq!(got, [constant, local, vec![]]);
+        let constant = EpicsValue::Enum(super::LINK_CON as u16);
+        let local = EpicsValue::Enum(super::LINK_LOC as u16);
+        assert_eq!(
+            [drain(0), drain(1), drain(2)],
+            [vec![constant, local.clone()], vec![local], vec![]]
+        );
     }
 
     /// Boundary of the per-link gate on a whole-record refresh: SC's
@@ -731,9 +708,9 @@ mod tests {
                 .record
                 .special("INPA", true, &Default::default())
                 .unwrap();
+            guard.post_put_link_status_in(&mut crate::server::event_queue::PostBurst::new());
         }
         added.await.expect("add_record returned");
-        crate::runtime::task::sleep(Duration::from_millis(100)).await;
 
         let mut drain = |i: usize| {
             let mut got = Vec::new();
@@ -752,8 +729,8 @@ mod tests {
 
     /// C `special()` stores a re-pointed link's status before the put
     /// returns, and acalcout reads INAA..INLL only while that status is EXT or
-    /// LOC (`aCalcoutRecord.c:1078`). With the put's post still in flight, a
-    /// process right after an INAA put reads the new link.
+    /// LOC (`aCalcoutRecord.c:1078`), so a process right after an INAA put
+    /// reads the new link.
     #[epics_macros_rs::epics_test]
     async fn a_process_right_after_an_array_link_put_reads_it() {
         use crate::server::record::Record;
@@ -766,18 +743,11 @@ mod tests {
         ac.put_field("NELM", EpicsValue::Long(4)).unwrap();
         db.add_record("AC", Box::new(ac)).await.unwrap();
         db.ioc_init().await;
-        // AC's init classification must not be the task the hold catches.
-        crate::runtime::task::sleep(Duration::from_millis(100)).await;
 
-        let (arrived_tx, arrived) = oneshot::channel();
-        let (release, release_rx) = oneshot::channel();
-        let (resumed_tx, resumed) = std::sync::mpsc::channel();
-        *HOLD.lock().unwrap() = Some((arrived_tx, release_rx, resumed_tx));
         let link = EpicsValue::String("SRC".into());
         let held = db.lock_for_put("AC", "INAA", &link);
         db.put_record_field_from_ca_already_locked(held, link)
             .unwrap();
-        arrived.await.expect("the put's task reached its post");
 
         let rec = db.get_record("AC").unwrap();
         let read = |f: &str| rec.read().record.get_field(f);
@@ -790,11 +760,6 @@ mod tests {
             other => panic!("AA is {other:?}"),
         };
         assert_eq!(aa.first(), Some(&3.0), "AA is {aa:?}");
-
-        release.send(()).unwrap();
-        resumed
-            .recv_timeout(fact_budget::FACT_BUDGET)
-            .expect("the put's task resumed");
     }
 
     /// C `init_record` classifies every link before any process

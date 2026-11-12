@@ -146,8 +146,6 @@ async fn streams(
         db.put_record_field_from_ca(rec, field, EpicsValue::String(value.into()))
             .await
             .unwrap();
-        // A link put's OV/SIV are posted from a task.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     streams.iter().map(|s| s.lock().unwrap().clone()).collect()
 }

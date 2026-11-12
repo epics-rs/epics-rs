@@ -784,8 +784,6 @@ pub enum PostRule {
     Silent,
     /// Neither write nor post.
     Skip,
-    /// Post the value the field holds; write nothing.
-    Held,
 }
 
 /// One field of an out-of-band post. A bare `(field, value)` posts
@@ -4824,9 +4822,7 @@ impl PvDatabase {
             {
                 continue;
             }
-            if rule != PostRule::Held {
-                self.put_internal_field_opening(&mut inst, &field, value, &mut links)?;
-            }
+            self.put_internal_field_opening(&mut inst, &field, value, &mut links)?;
             if rule != PostRule::Silent {
                 inst.notify_field(&field, mask);
                 posted.push(field);

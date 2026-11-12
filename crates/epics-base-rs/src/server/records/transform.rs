@@ -506,19 +506,15 @@ impl TransformRecord {
                 LinkRole::Output,
             ));
         }
-        let stored = post_link_status(
+        post_link_status(
             self.async_ctx.as_ref(),
             &self.link_gen,
             links,
-            LinkRule::Locality,
-            TRANSFORM_LINK_CHECK.mask,
             posts,
+            &TRANSFORM_LINK_CHECK,
+            &mut self.link_status,
+            &mut self.link_check,
         );
-        if let (LinkStatusPosts::Put(field), Some(status)) = (posts, stored)
-            && let Some(slot) = Self::link_status_slot(field)
-        {
-            self.link_status[slot] = status;
-        }
     }
 
     /// LA..LP — "Prev Value of A".."Prev Value of P"

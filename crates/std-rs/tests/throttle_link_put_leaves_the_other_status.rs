@@ -71,8 +71,6 @@ async fn put(db: &PvDatabase, field: &str, value: EpicsValue) {
     db.put_record_field_from_ca_no_notify("T", field, value)
         .await
         .unwrap();
-    // The put link's status is stored by the put and posted from a task.
-    tokio::time::sleep(Duration::from_millis(100)).await;
 }
 
 #[tokio::test]

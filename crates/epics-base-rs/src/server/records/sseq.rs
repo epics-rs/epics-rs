@@ -1076,8 +1076,8 @@ impl SseqRecord {
     /// `special` that sets `LINKS_NOT_OK` (:1018, :1073).
     ///
     /// On a complete database a `special` stores the put link's status and
-    /// type before the put returns, as C does (:1003-1018, :1044-1071); the
-    /// task only posts it.
+    /// type, and the put path posts the status, before the put returns, as C
+    /// does (:1003-1018, :1044-1071); the task only arms the recheck.
     fn refresh_link_status(&mut self, trigger: LinkPass) {
         let Some((name, handle)) = &self.async_ctx else {
             return;
@@ -1110,6 +1110,7 @@ impl SseqRecord {
                 let (status, dbf) = classify_link(&handle, link, role, rule);
                 let ix = link_ix(step, lnk);
                 self.link_status[ix] = status;
+                self.link_check.put_posts |= 1 << ix;
                 // C stores -1 for a named PV until the next checkLinks:
                 // special() runs before dbAddLink attaches the link
                 // (sseqRecord.c:1016, :1069; dbAccess.c:1181, :1208). That C
@@ -1164,10 +1165,7 @@ impl SseqRecord {
                         (DOLV_FIELDS[step], DT_FIELDS[step], ds, dt)
                     };
                     let put = match stored {
-                        Some(put) => {
-                            push(link, field, status(put), PostRule::Held);
-                            put
-                        }
+                        Some(put) => put,
                         None => {
                             push(link, field, status(put), PostRule::Always);
                             push(link, type_field, EpicsValue::Short(dbf), PostRule::Silent);

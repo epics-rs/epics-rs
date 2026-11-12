@@ -1141,19 +1141,15 @@ impl AcalcoutRecord {
         }
         links.push(("OUTV", self.out.clone(), LinkRole::Output));
         // C `aCalcoutRecord.c:242`, `:569`, `:1157`.
-        let stored = post_link_status(
+        post_link_status(
             self.async_ctx.as_ref(),
             &self.link_gen,
             links,
-            LinkRule::Locality,
-            ACALCOUT_LINK_CHECK.mask,
             posts,
+            &ACALCOUT_LINK_CHECK,
+            &mut self.link_status,
+            &mut self.link_check,
         );
-        if let (LinkStatusPosts::Put(field), Some(status)) = (posts, stored)
-            && let Some(idx) = Self::status_index(field)
-        {
-            self.link_status[idx] = status;
-        }
     }
 
     /// The `link_status` slot of a status field.

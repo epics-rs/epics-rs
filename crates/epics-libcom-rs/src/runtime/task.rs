@@ -12,6 +12,7 @@ use tokio::runtime::RuntimeFlavor;
 pub use tokio::runtime::Handle as RuntimeHandle;
 
 pub use crate::runtime::background::{CallbackPriority, OnBand};
+use crate::runtime::sync::Sleeper;
 
 /// A synchronous caller asked to block on an async operation from a thread
 /// where blocking cannot be made sound.
@@ -51,40 +52,40 @@ impl std::fmt::Display for NotBlockable {
 
 impl std::error::Error for NotBlockable {}
 
-/// A [`Waker`] that unparks the thread that built it — the wake half of every
+/// A [`Waker`] that wakes the thread that built it — the wake half of every
 /// "poll-then-park" driver ([`park_on`], asyn-rs's port reply wait). Get it
 /// through [`ThreadDrive`].
 ///
-/// `woken` is what the driver waits on, not the thread's unpark token: a
-/// `thread::park`-based wait inside the driven future (a std `mpsc` receive,
-/// an [`Event`](crate::runtime::sync::Event)) consumes that token, and a driver
-/// that trusted it would park through the wake it was owed.
+/// `woken` is what the driver waits on, not the sleeper's token: where that
+/// is the thread's unpark token, a `thread::park`-based wait inside the
+/// driven future (a std `mpsc` receive, an
+/// [`Event`](crate::runtime::sync::Event)) consumes it, and a driver that
+/// trusted it would park through the wake it was owed.
 struct ThreadWaker {
-    thread: std::thread::Thread,
+    sleeper: Sleeper,
     woken: std::sync::atomic::AtomicBool,
 }
 
 impl ThreadWaker {
     fn current() -> Self {
         Self {
-            thread: std::thread::current(),
+            sleeper: Sleeper::new(),
             woken: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
     /// Park until this waker fires, `deadline` passes, or `should_cancel`
-    /// holds after an unpark. Consumes the wake.
+    /// holds after a wake. Consumes the wake.
     fn wait(&self, deadline: Option<std::time::Instant>, mut should_cancel: impl FnMut() -> bool) {
         use std::sync::atomic::Ordering;
         while !self.woken.swap(false, Ordering::Acquire) {
             match deadline {
-                None => std::thread::park(),
+                None => self.sleeper.sleep(),
                 Some(deadline) => {
-                    let left = deadline.saturating_duration_since(std::time::Instant::now());
-                    if left.is_zero() {
+                    if std::time::Instant::now() >= deadline {
                         return;
                     }
-                    std::thread::park_timeout(left);
+                    self.sleeper.sleep_until(deadline);
                 }
             }
             if should_cancel() {
@@ -100,15 +101,6 @@ thread_local! {
     static DRIVE: Arc<ThreadWaker> = Arc::new(ThreadWaker::current());
 }
 
-/// The waker over the *current* thread. Drivers get it through
-/// [`ThreadDrive`], which owns the re-arm a nested drive needs.
-fn current_thread_waker() -> Waker {
-    // Only a park from another thread-local's destructor finds it gone.
-    DRIVE
-        .try_with(|drive| Waker::from(Arc::clone(drive)))
-        .unwrap_or_else(|_| Waker::from(Arc::new(ThreadWaker::current())))
-}
-
 /// One poll-then-park drive on this thread: the waker to poll with and the
 /// wait between polls.
 ///
@@ -117,14 +109,20 @@ fn current_thread_waker() -> Waker {
 /// completed inner drive never leaves the outer drive's wake consumed: drop
 /// re-arms the flag, which costs the outer drive at most one spurious re-poll.
 pub struct ThreadDrive {
+    drive: Arc<ThreadWaker>,
     waker: Waker,
 }
 
 impl ThreadDrive {
     /// Start a drive on the calling thread.
     pub fn enter() -> Self {
+        // Only a drive from another thread-local's destructor finds it gone.
+        let drive = DRIVE
+            .try_with(Arc::clone)
+            .unwrap_or_else(|_| Arc::new(ThreadWaker::current()));
         Self {
-            waker: current_thread_waker(),
+            waker: Waker::from(Arc::clone(&drive)),
+            drive,
         }
     }
 
@@ -136,32 +134,15 @@ impl ThreadDrive {
     /// Park until this thread's waker has been woken since the last return,
     /// or `deadline` passes. A spurious return only costs a re-poll.
     pub fn park(&self, deadline: Option<std::time::Instant>) {
-        wait_for_wake(deadline, || false);
+        self.drive.wait(deadline, || false);
     }
 }
 
 impl Drop for ThreadDrive {
     fn drop(&mut self) {
-        let _ = DRIVE.try_with(|drive| {
-            drive
-                .woken
-                .store(true, std::sync::atomic::Ordering::Release)
-        });
-    }
-}
-
-fn wait_for_wake(deadline: Option<std::time::Instant>, should_cancel: impl FnMut() -> bool) {
-    if DRIVE
-        .try_with(|drive| drive.wait(deadline, should_cancel))
-        .is_err()
-    {
-        // The fallback waker's flag is not reachable from here: one park.
-        match deadline {
-            None => std::thread::park(),
-            Some(deadline) => std::thread::park_timeout(
-                deadline.saturating_duration_since(std::time::Instant::now()),
-            ),
-        }
+        self.drive
+            .woken
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -171,7 +152,7 @@ impl Wake for ThreadWaker {
     }
     fn wake_by_ref(self: &Arc<Self>) {
         self.woken.store(true, std::sync::atomic::Ordering::Release);
-        self.thread.unpark();
+        self.sleeper.wake();
     }
 }
 
@@ -186,9 +167,10 @@ impl Wake for ThreadWaker {
 /// The future must only await runtime-agnostic primitives (`tokio::sync`
 /// locks/channels/notifies): nothing here drives a reactor or a timer wheel, so
 /// whoever wakes us must be running on some other thread. A cancel is observed
-/// on the next wake — the caller that flips `should_cancel` must also
-/// [`unpark`](std::thread::Thread::unpark) this thread so a *parked* driver
-/// re-checks promptly rather than sleeping until the future's own waker fires.
+/// on the next wake — the caller that flips `should_cancel` must also wake the
+/// waker the future was last polled with, so a *parked* driver re-checks
+/// promptly. A raw `unpark` is not that wake: on Windows the driver does not
+/// sleep in `thread::park`.
 pub(crate) fn park_on_interruptible<F: Future>(
     fut: F,
     mut should_cancel: impl FnMut() -> bool,
@@ -203,7 +185,7 @@ pub(crate) fn park_on_interruptible<F: Future>(
         if let Poll::Ready(value) = fut.as_mut().poll(&mut cx) {
             return Some(value);
         }
-        wait_for_wake(None, &mut should_cancel);
+        drive.drive.wait(None, &mut should_cancel);
     }
 }
 
@@ -1338,9 +1320,13 @@ fn wall_clock_wake(deadline: Instant) -> crate::runtime::background::Sleep {
 /// How late tokio's wheel fires: it rounds a deadline up to its next 1 ms
 /// tick (tokio `runtime/time/source.rs:17-20`), then parks in `epoll_wait`,
 /// whose timeout mio rounds up to whole ms (mio `selector/epoll.rs:46-56`).
-/// A 0.93 ms wait lasted 2.0 ms on it.
+/// A 0.93 ms wait lasted 2.0 ms on it. On Windows mio parks in
+/// `GetQueuedCompletionStatusEx` with that whole-ms timeout
+/// (`sys/windows/iocp.rs:107-116`), which the kernel ends on its scheduler
+/// tick, at most 15.625 ms.
 #[cfg(tokio_backend)]
-const WHEEL_LATENESS: Duration = Duration::from_millis(2);
+const WHEEL_LATENESS: Duration =
+    Duration::from_micros(if cfg!(windows) { 2_000 + 15_625 } else { 2_000 });
 
 /// Where the wheel stops pacing a wait for `deadline`.
 #[cfg(tokio_backend)]
@@ -2419,11 +2405,11 @@ fn build_park_state() {
 }
 
 /// A thread's first [`block_on_sync`] builds the thread-locals it reads: the
-/// [`current_thread_waker`] (an `Arc`) and tokio's runtime context, each with
+/// [`ThreadDrive`]'s waker (an `Arc`) and tokio's runtime context, each with
 /// the node glibc callocs to drop it at thread exit — inside a scan thread's
 /// first pass. Building them at entry keeps all three here.
 fn build_drive_state() {
-    drop(current_thread_waker());
+    let _ = DRIVE.try_with(|_| ());
     let _ = RuntimeHandle::try_current();
 }
 
@@ -4284,20 +4270,20 @@ mod tests {
         );
     }
 
-    /// A canceller that unparks the thread without waking the future ends the
-    /// wait, though the `woken` flag is clear (future_exec.rs and
-    /// timer_sleep.rs cancel this way).
+    /// A canceller that wakes the future's waker ends a parked drive with
+    /// `None`, though the future itself is still pending.
     #[test]
-    fn a_raw_unpark_with_cancel_ends_the_wait() {
+    fn a_cancel_with_a_wake_ends_the_wait() {
         use std::sync::atomic::{AtomicBool, Ordering};
         let cancel = Arc::new(AtomicBool::new(false));
+        let waker = Arc::new(std::sync::Mutex::new(None::<Waker>));
         let (polled_tx, polled_rx) = std::sync::mpsc::channel();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let c = cancel.clone();
-        let driver = std::thread::spawn(move || {
+        let (c, w) = (cancel.clone(), waker.clone());
+        std::thread::spawn(move || {
             let gate = Gate {
                 ready: Arc::new(AtomicBool::new(false)),
-                waker: Arc::new(std::sync::Mutex::new(None)),
+                waker: w,
                 polled: polled_tx,
             };
             let out = park_on_interruptible(gate, || c.load(Ordering::Acquire));
@@ -4305,11 +4291,11 @@ mod tests {
         });
         polled_rx.recv().unwrap();
         cancel.store(true, Ordering::Release);
-        driver.thread().unpark();
+        waker.lock().unwrap().take().unwrap().wake();
         assert_eq!(
             done_rx.recv_timeout(std::time::Duration::from_secs(5)),
             Ok(true),
-            "a cancelled, unparked drive must return None"
+            "a cancelled, woken drive must return None"
         );
     }
 
@@ -5340,7 +5326,9 @@ mod tests {
     #[cfg(tokio_backend)]
     #[tokio::test]
     async fn a_runtime_thread_s_wait_wakes_at_its_deadline() {
-        let (short, long) = (Duration::from_micros(930), Duration::from_micros(5300));
+        let short = Duration::from_micros(930);
+        // Long enough for the wheel to pace it first.
+        let long = WHEEL_LATENESS + Duration::from_micros(3300);
         let mut rearmed = Sleep::until(Instant::now());
         let one_shot = median_lateness(21, short, async || sleep(short).await).await;
         let re_armed = median_lateness(21, short, async || {

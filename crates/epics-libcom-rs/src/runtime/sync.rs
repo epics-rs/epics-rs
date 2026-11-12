@@ -903,12 +903,210 @@ pub fn osd_show_all_line() -> &'static str {
     }
 }
 
+/// C's WIN32 `epicsEvent` and its timed wait (`os/WIN32/osdEvent.c:95-144`):
+/// an auto-reset event, waited on beside a per-thread high-resolution
+/// waitable timer armed for the deadline (`osdThread.c:547-551`). std's
+/// timed waits take whole milliseconds, which Windows ends on the next
+/// scheduler tick — up to 15.6 ms past the deadline.
+#[cfg(windows)]
+mod win_event {
+    use std::time::Instant;
+
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::{
+        CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateEventW, CreateWaitableTimerExW,
+        CreateWaitableTimerW, INFINITE, SetEvent, SetWaitableTimer, TIMER_ALL_ACCESS,
+        WaitForMultipleObjects, WaitForSingleObject,
+    };
+
+    use crate::runtime::cant_proceed::cant_proceed;
+
+    /// A kernel handle this process owns and closes.
+    struct Owned(HANDLE);
+
+    // SAFETY: an event or timer handle names a process-wide kernel object,
+    // which any thread may wait on, signal or close.
+    unsafe impl Send for Owned {}
+    unsafe impl Sync for Owned {}
+
+    impl Owned {
+        fn new(handle: HANDLE, what: &str) -> Self {
+            if handle.is_null() {
+                cant_proceed(&format!(
+                    "{what} failed: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            Owned(handle)
+        }
+    }
+
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            // SAFETY: the handle is ours and open; nothing uses it after this.
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    /// `osdThreadGetTimer`'s timer: high resolution where Windows has it, the
+    /// tick-bound kind before that, as C falls back.
+    fn thread_timer() -> Owned {
+        // SAFETY: null attributes and name; documented flag and access.
+        let timer = unsafe {
+            CreateWaitableTimerExW(
+                std::ptr::null(),
+                std::ptr::null(),
+                CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                TIMER_ALL_ACCESS,
+            )
+        };
+        let timer = if timer.is_null() {
+            // SAFETY: null attributes and name, auto-reset.
+            unsafe { CreateWaitableTimerW(std::ptr::null(), 0, std::ptr::null()) }
+        } else {
+            timer
+        };
+        Owned::new(timer, "CreateWaitableTimer")
+    }
+
+    thread_local! {
+        static TIMER: Owned = thread_timer();
+    }
+
+    /// C's WIN32 `epicsEventId`: auto-reset, so a signal with no waiter is
+    /// kept for the next wait, and two signals before a wait are one.
+    pub(crate) struct WinEvent(Owned);
+
+    impl WinEvent {
+        pub(crate) fn new() -> Self {
+            // SAFETY: null attributes and name; auto-reset, initially empty.
+            let event = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
+            WinEvent(Owned::new(event, "CreateEvent"))
+        }
+
+        pub(crate) fn signal(&self) {
+            // SAFETY: the handle is an open event.
+            if unsafe { SetEvent(self.0.0) } == 0 {
+                cant_proceed(&format!(
+                    "SetEvent failed: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+        }
+
+        pub(crate) fn wait(&self) {
+            // SAFETY: the handle is an open event.
+            let waited = unsafe { WaitForSingleObject(self.0.0, INFINITE) };
+            if waited != WAIT_OBJECT_0 {
+                cant_proceed(&format!(
+                    "WaitForSingleObject failed: {waited:#x}, {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+        }
+
+        /// `true` when signalled, consuming the signal; `false` once
+        /// `deadline` has passed. A deadline already past polls.
+        pub(crate) fn wait_until(&self, deadline: Instant) -> bool {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                // SAFETY: the handle is an open event.
+                return answer(unsafe { WaitForSingleObject(self.0.0, 0) });
+            }
+            // Relative, in 100 ns units rounded up, as C's `nIvals`.
+            let due = -i64::try_from(left.as_nanos().div_ceil(100)).unwrap_or(i64::MAX);
+            let wait = |timer: &Owned| {
+                // SAFETY: an open timer, no completion routine; `due` outlives
+                // the call.
+                if unsafe { SetWaitableTimer(timer.0, &due, 0, None, std::ptr::null(), 0) } == 0 {
+                    cant_proceed(&format!(
+                        "SetWaitableTimer failed: {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+                let handles = [self.0.0, timer.0];
+                // SAFETY: both handles are open and the count is the array's.
+                answer(unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE) })
+            };
+            // Only a wait from another thread-local's destructor finds the
+            // timer gone.
+            TIMER
+                .try_with(|timer| wait(timer))
+                .unwrap_or_else(|_| wait(&thread_timer()))
+        }
+    }
+
+    /// C's outcomes: the event, then the timer or a poll's timeout, then a
+    /// failed wait.
+    fn answer(waited: u32) -> bool {
+        match waited {
+            WAIT_OBJECT_0 => true,
+            w if w == WAIT_OBJECT_0 + 1 || w == WAIT_TIMEOUT => false,
+            _ => cant_proceed(&format!(
+                "WaitForMultipleObjects failed: {waited:#x}, {}",
+                std::io::Error::last_os_error()
+            )),
+        }
+    }
+}
+
+/// One thread's sleep and the wake that ends it, as a binary token: a wake
+/// with nobody asleep is kept for the next sleep, and a sleep may also end
+/// with no wake at all. Only the thread that made it may sleep on it.
+///
+/// std's thread parker, except on Windows, where std's timed park ends on
+/// the scheduler tick; there it is C's own event wait ([`win_event`]).
+#[cfg(not(windows))]
+pub(crate) struct Sleeper(std::thread::Thread);
+
+#[cfg(not(windows))]
+impl Sleeper {
+    pub(crate) fn new() -> Self {
+        Sleeper(std::thread::current())
+    }
+
+    pub(crate) fn wake(&self) {
+        self.0.unpark();
+    }
+
+    pub(crate) fn sleep(&self) {
+        std::thread::park();
+    }
+
+    pub(crate) fn sleep_until(&self, deadline: std::time::Instant) {
+        std::thread::park_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
+    }
+}
+
+/// See the non-Windows [`Sleeper`].
+#[cfg(windows)]
+pub(crate) struct Sleeper(win_event::WinEvent);
+
+#[cfg(windows)]
+impl Sleeper {
+    pub(crate) fn new() -> Self {
+        Sleeper(win_event::WinEvent::new())
+    }
+
+    pub(crate) fn wake(&self) {
+        self.0.signal();
+    }
+
+    pub(crate) fn sleep(&self) {
+        self.0.wait();
+    }
+
+    pub(crate) fn sleep_until(&self, deadline: std::time::Instant) {
+        let _ = self.0.wait_until(deadline);
+    }
+}
+
 /// A one-shot "this thread has started" latch, C's `startStopEvent`
 /// handshake (`callback.c:216`, `:333`; `dbCa.c:355-357`): the spawner
 /// [`wait`](StartWait::wait)s until the started thread drops its
 /// [`StartSignal`], which a panic in its startup does too.
 ///
-/// An [`EpicsEvent`] rather than [`Event`] or a channel, because those
+/// An [`EpicsEvent`] rather than [`Event`] or a channel, because those can
 /// sleep in `thread::park`, which swallows any unpark meant for the
 /// spawner's own future — a spawner inside a `park_on` poll would lose
 /// that wake and park for good.
@@ -944,10 +1142,16 @@ impl StartWait {
 /// threads may wait; each signal releases one.
 ///
 /// The lock is held only to flip the latch. It is std's, not the
-/// priority-inheriting mutex C's is (`osdEvent.c:54`).
+/// priority-inheriting mutex C's is (`osdEvent.c:54`). On Windows it is C's
+/// WIN32 event instead, whose timed wait is not bound to the scheduler tick.
 pub struct EpicsEvent {
+    #[cfg(not(windows))]
     full: std::sync::Mutex<bool>,
+    #[cfg(not(windows))]
     cv: std::sync::Condvar,
+    /// Made on first use, so [`new`](Self::new) stays `const`.
+    #[cfg(windows)]
+    event: std::sync::OnceLock<win_event::WinEvent>,
 }
 
 /// A C `epicsEventWaitWithTimeout` timeout as posix `convertDoubleToWakeTime`
@@ -963,6 +1167,26 @@ pub fn event_wait_timeout(secs: f64) -> std::time::Duration {
     }
 }
 
+impl EpicsEvent {
+    /// `epicsEventWaitWithTimeout`: true when signalled, consuming the
+    /// signal; false at the timeout, with a signal that lands with it left
+    /// for the next wait, as C (`osdEvent.c:134-138`). `secs` at or below 0, or NaN, polls; above
+    /// ten years it is ten years, as C caps it.
+    pub fn wait_timeout(&self, secs: f64) -> bool {
+        let Some(deadline) = std::time::Instant::now().checked_add(event_wait_timeout(secs)) else {
+            self.wait();
+            return true;
+        };
+        self.wait_until(deadline)
+    }
+
+    /// `epicsEventTryWait`: [`wait_timeout`](Self::wait_timeout) with 0.
+    pub fn try_wait(&self) -> bool {
+        self.wait_timeout(0.0)
+    }
+}
+
+#[cfg(not(windows))]
 impl EpicsEvent {
     /// `epicsEventCreate(epicsEventEmpty)`.
     pub const fn new() -> Self {
@@ -996,15 +1220,7 @@ impl EpicsEvent {
         *full = false;
     }
 
-    /// `epicsEventWaitWithTimeout`: true when signalled, consuming the
-    /// signal; false at the timeout, with a signal that lands with it left
-    /// for the next wait, as C (`osdEvent.c:134-138`). `secs` at or below 0, or NaN, polls; above
-    /// ten years it is ten years, as C caps it.
-    pub fn wait_timeout(&self, secs: f64) -> bool {
-        let Some(deadline) = std::time::Instant::now().checked_add(event_wait_timeout(secs)) else {
-            self.wait();
-            return true;
-        };
+    fn wait_until(&self, deadline: std::time::Instant) -> bool {
         let mut full = self.lock();
         while !*full {
             let now = std::time::Instant::now();
@@ -1017,9 +1233,9 @@ impl EpicsEvent {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             full = guard;
             // C's ETIMEDOUT branch: a wait that reached the deadline is a
-            // timeout even when the event filled with it. Windows' ms
-            // granularity can report timed out before the deadline, and
-            // `pthread_cond_timedwait` never does, so that wait goes on.
+            // timeout even when the event filled with it. A timed-out report
+            // the clock does not yet agree with is not a timeout, so that
+            // wait goes on.
             if wait.timed_out() && std::time::Instant::now() >= deadline {
                 return false;
             }
@@ -1027,10 +1243,33 @@ impl EpicsEvent {
         *full = false;
         true
     }
+}
 
-    /// `epicsEventTryWait`: [`wait_timeout`](Self::wait_timeout) with 0.
-    pub fn try_wait(&self) -> bool {
-        self.wait_timeout(0.0)
+#[cfg(windows)]
+impl EpicsEvent {
+    /// `epicsEventCreate(epicsEventEmpty)`.
+    pub const fn new() -> Self {
+        EpicsEvent {
+            event: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn event(&self) -> &win_event::WinEvent {
+        self.event.get_or_init(win_event::WinEvent::new)
+    }
+
+    /// `epicsEventSignal`.
+    pub fn signal(&self) {
+        self.event().signal();
+    }
+
+    /// `epicsEventMustWait`: until signalled, consuming the signal.
+    pub fn wait(&self) {
+        self.event().wait();
+    }
+
+    fn wait_until(&self, deadline: std::time::Instant) -> bool {
+        self.event().wait_until(deadline)
     }
 }
 
@@ -1041,10 +1280,17 @@ impl Default for EpicsEvent {
 }
 
 impl std::fmt::Debug for EpicsEvent {
+    #[cfg(not(windows))]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EpicsEvent")
             .field("full", &*self.lock())
             .finish()
+    }
+
+    /// A WIN32 event's state can only be read by consuming it.
+    #[cfg(windows)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EpicsEvent").finish_non_exhaustive()
     }
 }
 
@@ -1064,9 +1310,9 @@ impl std::fmt::Debug for EpicsEvent {
 /// long as anything in between cares to run.
 ///
 /// Keeping the two apart is what lets the state lock be the PI one. The wake
-/// then needs no lock at all: this is one latch plus the waiter's thread
-/// handle, so a signaller touches the waiter's parker and nothing any other
-/// requester shares. C's `epicsEvent` is itself a PI mutex and a condvar
+/// then needs no lock at all: this is one latch plus the waiter's
+/// [`Sleeper`], so a signaller touches that and nothing any other requester
+/// shares. C's `epicsEvent` is itself a PI mutex and a condvar
 /// (`osdEvent.c:29-31`, `:54` through `globalAttrDefault`,
 /// `osdMutex.c:71-73`); this has no mutex of its own to invert. PR #996 reaches
 /// the same conclusion for Linux and replaces that pair with a futex
@@ -1095,14 +1341,14 @@ pub struct Event {
     /// and the wake that releases it, so a signaller's compare-exchange is
     /// itself the test for whether anyone is there to wake.
     state: std::sync::atomic::AtomicU32,
-    /// The waiting thread, published by [`Event::waiter`] before the state can
-    /// ever read `SLEEPING` — a signaller that finds the event sleeping finds
-    /// a handle in it.
-    thread: std::sync::OnceLock<std::thread::Thread>,
+    /// The waiter's sleep, published by [`Event::waiter`] before the state
+    /// can ever read `SLEEPING` — a signaller that finds the event sleeping
+    /// finds a sleeper in it.
+    sleeper: std::sync::OnceLock<Sleeper>,
 }
 
 /// Nobody is parked: either the waiter is running, or it has not claimed the
-/// event yet. The two are told apart by [`Event::thread`], which is the only
+/// event yet. The two are told apart by [`Event::sleeper`], which is the only
 /// thing a wake needs from either.
 const EVENT_AWAKE: u32 = 0;
 /// The waiter has announced that its next step is to park.
@@ -1134,14 +1380,14 @@ impl Event {
     pub const fn new() -> Self {
         Event {
             state: std::sync::atomic::AtomicU32::new(EVENT_AWAKE),
-            thread: std::sync::OnceLock::new(),
+            sleeper: std::sync::OnceLock::new(),
         }
     }
 
     /// Claim the waiting side of this event.
     ///
     /// The returned token is the only thing that can wait, which is how
-    /// "the thread handle is published before the first park" holds by
+    /// "the sleeper is published before the first park" holds by
     /// construction instead of by a call-order rule the next caller has to
     /// know about.
     ///
@@ -1150,8 +1396,10 @@ impl Event {
     /// release only one. A facility that needs N waiters owns N events — that
     /// is what the callback band's `Parking` is.
     pub fn waiter(&self) -> EventWaiter<'_> {
-        let _ = self.thread.set(std::thread::current());
-        EventWaiter { event: self }
+        EventWaiter {
+            event: self,
+            sleeper: self.sleeper.get_or_init(Sleeper::new),
+        }
     }
 
     /// Put this event in the state a parked waiter leaves behind, with no
@@ -1229,8 +1477,8 @@ impl Event {
             // work this signal is for is already published.
             Err(_) => return Signalled::Running,
         };
-        if let Some(t) = self.thread.get() {
-            t.unpark();
+        if let Some(s) = self.sleeper.get() {
+            s.wake();
         }
         answer
     }
@@ -1241,8 +1489,8 @@ impl Event {
     pub fn wake(&self) {
         use std::sync::atomic::Ordering;
         self.state.store(EVENT_AWAKE, Ordering::SeqCst);
-        if let Some(t) = self.thread.get() {
-            t.unpark();
+        if let Some(s) = self.sleeper.get() {
+            s.wake();
         }
     }
 }
@@ -1260,7 +1508,7 @@ impl std::fmt::Debug for Event {
                 "sleeping",
                 &(self.state.load(std::sync::atomic::Ordering::Relaxed) != EVENT_AWAKE),
             )
-            .field("claimed", &self.thread.get().is_some())
+            .field("claimed", &self.sleeper.get().is_some())
             .finish()
     }
 }
@@ -1268,6 +1516,7 @@ impl std::fmt::Debug for Event {
 /// The waiting side of one [`Event`] — see [`Event::waiter`].
 pub struct EventWaiter<'a> {
     event: &'a Event,
+    sleeper: &'a Sleeper,
 }
 
 impl EventWaiter<'_> {
@@ -1282,7 +1531,7 @@ impl EventWaiter<'_> {
             if ready() {
                 break;
             }
-            std::thread::park();
+            self.sleeper.sleep();
         }
         self.event.state.store(EVENT_AWAKE, Ordering::SeqCst);
     }
@@ -1301,12 +1550,12 @@ impl EventWaiter<'_> {
             if ready() {
                 break true;
             }
-            // `park_timeout` may return early for any reason, which is why the
-            // deadline is re-derived from the clock rather than counted down.
-            let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
+            // A sleep may end early for any reason, which is why the
+            // deadline is re-tested against the clock rather than counted down.
+            if std::time::Instant::now() >= deadline {
                 break false;
-            };
-            std::thread::park_timeout(left);
+            }
+            self.sleeper.sleep_until(deadline);
         };
         self.event.state.store(EVENT_AWAKE, Ordering::SeqCst);
         answered
@@ -1799,9 +2048,9 @@ mod tests {
              that takes no credit for a sleep it did not end"
         );
 
-        // Both signals unparked this thread, so the park below returns on a
-        // token instead of blocking: one extra poll of the condition is the
-        // whole cost of the redundant wake.
+        // Both signals woke the waiter's sleeper, so the sleep below returns
+        // on a token instead of blocking: one extra poll of the condition is
+        // the whole cost of the redundant wake.
         let mut polls = 0usize;
         waiter.wait_until(|| {
             polls += 1;

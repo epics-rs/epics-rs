@@ -2264,8 +2264,8 @@ impl RtPolicy {
 /// the runtime's worker threads at startup — not for individual async
 /// tasks.
 ///
-/// Platform support: the OS-scheduler change is wired on Linux, via the
-/// range-probed linear map of `os/posix/osdThread.c`, and on RTEMS, via the
+/// Platform support: the OS-scheduler change is wired on Linux and macOS, via
+/// the range-probed linear map of `os/posix/osdThread.c`, and on RTEMS, via the
 /// fixed map of `os/RTEMS-score/osdThread.c` inverted into POSIX space (see
 /// `map_epics_priority_rtems` — the two maps differ in shape, deliberately).
 /// On other targets the priority enum + API surface still exist but `apply`
@@ -3193,7 +3193,7 @@ pub fn osd_priority_range_line() -> String {
     format!("OSD priority range min: {min} max {max}, memory not locked")
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn osd_priority_range() -> (i32, i32) {
     match RtPolicy::current() {
         RtPolicy::Disabled => (0, 0),
@@ -3223,7 +3223,7 @@ fn osd_priority_range() -> (i32, i32) {
     }
 }
 
-#[cfg(not(any(target_os = "linux", epics_embedded_target)))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", epics_embedded_target)))]
 fn osd_priority_range() -> (i32, i32) {
     // No OS-scheduler priority API is wired here, so there is no band and no
     // range — the same `Unsupported` this target reports from `apply`.
@@ -3237,7 +3237,7 @@ fn osd_priority_range() -> (i32, i32) {
 /// `RLIMIT_RTPRIO`, so on an RT box with a restricted limit the nominal
 /// range is wider than the usable one; C binary-searches for the real
 /// ceiling and so do we.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RtRange {
     /// The kernel does not report a SCHED_FIFO range at all.
@@ -3254,13 +3254,33 @@ enum RtRange {
 /// Probe once per process and cache. Only reachable on the
 /// [`RtPolicy::AllowRealtime`] path, so a default (switch-off) process
 /// never runs the probe and never makes a scheduler call.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn permitted_fifo_range() -> RtRange {
     static RANGE: std::sync::OnceLock<RtRange> = std::sync::OnceLock::new();
     *RANGE.get_or_init(probe_fifo_range)
 }
 
 #[cfg(target_os = "linux")]
+use libc::pthread_attr_setstack;
+
+#[cfg(target_os = "linux")]
+const PROBE_STACK_MAP: libc::c_int = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_STACK;
+
+/// Darwin has no `MAP_STACK`.
+#[cfg(target_os = "macos")]
+const PROBE_STACK_MAP: libc::c_int = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
+
+// `libc` binds this POSIX call for Linux but not for Darwin.
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn pthread_attr_setstack(
+        attr: *mut libc::pthread_attr_t,
+        stackaddr: *mut libc::c_void,
+        stacksize: libc::size_t,
+    ) -> libc::c_int;
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn probe_fifo_range() -> RtRange {
     // SAFETY: sched_get_priority_min/max take only an int policy and have
     // no preconditions.
@@ -3289,7 +3309,7 @@ fn probe_fifo_range() -> RtRange {
             std::ptr::null_mut(),
             bytes,
             libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_STACK,
+            PROBE_STACK_MAP,
             -1,
             0,
         )
@@ -3307,7 +3327,7 @@ fn probe_fifo_range() -> RtRange {
     // joined; `probe` outlives the joined thread.
     unsafe {
         if libc::pthread_attr_init(attr.as_mut_ptr()) == 0 {
-            if libc::pthread_attr_setstack(attr.as_mut_ptr(), stack, bytes) == 0
+            if pthread_attr_setstack(attr.as_mut_ptr(), stack, bytes) == 0
                 && libc::pthread_create(
                     &mut tid,
                     attr.as_ptr(),
@@ -3327,7 +3347,7 @@ fn probe_fifo_range() -> RtRange {
 
 /// C `find_pri_range` (`osdThread.c:270-312`): the thread body of
 /// `probe_fifo_range`, which passes `(min, max, out)`.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 extern "C" fn probe_thread(arg: *mut libc::c_void) -> *mut libc::c_void {
     // SAFETY: `probe_fifo_range` joins this thread before touching the tuple.
     let (min, max, out) = unsafe { &mut *arg.cast::<(i32, i32, RtRange)>() };
@@ -3368,7 +3388,7 @@ extern "C" fn probe_thread(arg: *mut libc::c_void) -> *mut libc::c_void {
 /// `map_epics_priority_rtems` for the shape and the reason. The `test`
 /// arm of the cfg exists so the two maps can be compared in one process
 /// on the host; without it the divergence test would silently vanish.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn map_epics_priority(epics_priority: u32, min: i32, max: i32) -> i32 {
     // `osdThread.c:133-134`: a degenerate range collapses to one level.
     if max == min {
@@ -3487,7 +3507,9 @@ fn fifo_attr_refusal(priority: ThreadPriority) -> Option<std::io::Error> {
     Some(std::io::Error::from_raw_os_error(libc::EINVAL))
 }
 
-/// No target but Linux maps a priority outside its settable range.
+/// C refuses nothing off Linux: Darwin's attr calls and `pthread_create` take
+/// a FIFO priority past the range (oss 48 and 79 on 15..47, measured on the
+/// macOS runners), and no other wired target maps past its range.
 #[cfg(not(target_os = "linux"))]
 fn fifo_attr_refusal(_priority: ThreadPriority) -> Option<std::io::Error> {
     None
@@ -3497,7 +3519,7 @@ fn fifo_attr_refusal(_priority: ThreadPriority) -> Option<std::io::Error> {
 /// place this crate touches the scheduler; returns the raw `pthread_*`
 /// status (0 on success). Counting lives here so the "switch off ⟹ no
 /// scheduler call" guarantee is observable on every target that has one.
-#[cfg(any(target_os = "linux", epics_embedded_target))]
+#[cfg(any(target_os = "linux", target_os = "macos", epics_embedded_target))]
 fn set_fifo_priority(oss: i32) -> i32 {
     SCHED_CALLS_MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     #[cfg(test)]
@@ -3505,11 +3527,11 @@ fn set_fifo_priority(oss: i32) -> i32 {
     set_fifo_priority_raw(oss)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn set_fifo_priority_raw(oss: i32) -> i32 {
-    let param = libc::sched_param {
-        sched_priority: oss,
-    };
+    // SAFETY: plain-integer struct, valid zeroed; Darwin's has a private tail.
+    let mut param: libc::sched_param = unsafe { std::mem::zeroed() };
+    param.sched_priority = oss;
     // SAFETY: pthread_setschedparam operates on the calling thread with a
     // stack-local sched_param and a valid policy constant.
     unsafe { libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_FIFO, &param) }
@@ -3604,7 +3626,7 @@ fn set_fifo_priority_raw(oss: i32) -> i32 {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn apply_priority_impl(epics_priority: u32) -> PriorityApplied {
     let (min, max) = match permitted_fifo_range() {
         RtRange::Unsupported => return PriorityApplied::Unsupported,
@@ -3666,13 +3688,13 @@ fn apply_priority_impl(epics_priority: u32) -> PriorityApplied {
     }
 }
 
-#[cfg(not(any(target_os = "linux", epics_embedded_target)))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", epics_embedded_target)))]
 fn apply_priority_impl(_epics_priority: u32) -> PriorityApplied {
-    // No OS-scheduler priority API is wired on other targets. The two that
+    // No OS-scheduler priority API is wired on other targets. The ones that
     // are wired each needed a *measured* target band before they could be:
-    // Linux probes for its settable ceiling at runtime, and RTEMS's map is
-    // pinned against libbsd's network-thread band measured on the bring-up
-    // guest. No number here is guessable, so a
+    // Linux and macOS probe for their settable ceiling at runtime, and
+    // RTEMS's map is pinned against libbsd's network-thread band measured on
+    // the bring-up guest. No number here is guessable, so a
     // new target gets `Unsupported` until somebody measures it rather than a
     // plausible-looking range.
     PriorityApplied::Unsupported
@@ -3685,14 +3707,17 @@ fn apply_priority_impl(_epics_priority: u32) -> PriorityApplied {
 /// process can run its whole life and this stays `0`. Also answers
 /// "did this IOC ever actually try to go real-time?" from a log line.
 ///
-/// Always `0` off Linux, where no scheduler call is wired at all.
+/// Always `0` off Linux, macOS and RTEMS, where no scheduler call is wired.
 pub fn sched_calls_made() -> usize {
     SCHED_CALLS_MADE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 static SCHED_CALLS_MADE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-#[cfg(all(test, any(target_os = "linux", epics_embedded_target)))]
+#[cfg(all(
+    test,
+    any(target_os = "linux", target_os = "macos", epics_embedded_target)
+))]
 thread_local! {
     /// Every scheduler call this crate makes passes through
     /// [`set_fifo_priority`], which bumps this. Tests assert the delta is
@@ -5790,7 +5815,7 @@ mod tests {
     /// Mutation check: deleting the `RtPolicy::Disabled` arm in
     /// `apply_to_current_thread_under` (so it always calls
     /// `apply_priority_impl`) makes the `SCHED_CALLS` assertion fail.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn switch_off_makes_no_scheduler_calls() {
         let before = SCHED_CALLS.with(std::cell::Cell::get);
@@ -5820,7 +5845,7 @@ mod tests {
     ///
     /// Runs on its own thread: on a host that *does* grant RT, leaving the
     /// test-harness thread in a real-time band would outlive the test.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn switch_on_either_sticks_or_falls_back_without_killing_the_thread() {
         let outcome = std::thread::spawn(|| {

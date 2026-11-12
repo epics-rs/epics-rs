@@ -444,16 +444,11 @@ impl Lend {
     }
 
     pub(crate) fn give_back(&self) {
-        let took_idle = match &mut *self.slot() {
-            LendSlot::Held(Some(actor), parked) => {
-                actor.dequeue_at_release();
-                parked.is_some()
-            }
+        // A port taken idle is synchronous ([`PortActor::runs_next`]), so no
+        // port-thread pass, and no auto-connect tail, follows its request.
+        match &mut *self.slot() {
+            LendSlot::Held(Some(actor), _) => actor.dequeue_at_release(),
             _ => unreachable!("only the holder gives the actor back, between its steps"),
-        };
-        // The pass's tail, which the actor's loop runs after a hand-off.
-        if took_idle {
-            let _ = self.with(PortActor::port_thread_auto_connect);
         }
         let mut slot = self.slot();
         match std::mem::replace(&mut *slot, LendSlot::Home) {
@@ -1577,8 +1572,8 @@ impl PortActor {
     }
 
     /// The port thread's first pass: the connect registration queued (`new`),
-    /// then the post-drain `autoConnectDevice(pport,0)` the same wake reaches
-    /// (asynManager.c:858-863).
+    /// then, on a CANBLOCK port, the post-drain `autoConnectDevice(pport,0)`
+    /// the same wake reaches (asynManager.c:858-863).
     fn registration_pass(&mut self) {
         self.service_connect_timer();
         self.port_thread_auto_connect();
@@ -1818,9 +1813,10 @@ impl PortActor {
         // address — prologix branches on it exactly as C's `prologixConnect`
         // does — must not see this as a device 0 connect.
         // Unstamped and unreported: `portConnectProcessCallback` touches
-        // neither `lastConnectDisconnect` nor `previousConnectStatus`, so the
-        // `autoConnectDevice(pport,0)` the same wake reaches (:858-863) makes a
-        // second attempt, and that one reports (`connectAttempt`, :778-786).
+        // neither `lastConnectDisconnect` nor `previousConnectStatus`, so on a
+        // CANBLOCK port the `autoConnectDevice(pport,0)` the same wake reaches
+        // (:858-863) makes a second attempt, and that one reports
+        // (`connectAttempt`, :778-786).
         let held = self.sync_lock.hold();
         let _ = self.driver.connect(&AsynUser::default().with_addr(-1));
         drop(held);
@@ -1874,11 +1870,17 @@ impl PortActor {
     ///
     /// Like C's binary event, a burst collapses: N requests queued between two
     /// passes are one wake, and one port-level auto-connect attempt.
+    ///
+    /// A synchronous port is never woken: C creates the event and its thread
+    /// only for a CANBLOCK port (:2074-2076), and its signal sites skip the
+    /// rest (:637-638). Such a port connects only from the retry timer and the
+    /// request's own `autoConnectDevice` (:1569-1575).
     fn take_port_thread_wake(&mut self) -> bool {
         let announced = self.driver.base().exceptions_announced();
         let exception = announced != self.seen_exceptions;
         self.seen_exceptions = announced;
-        std::mem::take(&mut self.woken) || exception
+        let woken = std::mem::take(&mut self.woken) || exception;
+        woken && self.driver.base().flags.can_block
     }
 
     fn drain_channel(&mut self) {
@@ -5075,8 +5077,8 @@ mod tests {
         }
     }
 
-    /// A connection-waived request is followed by the port auto-connect C's
-    /// `portThread` performs.
+    /// A connection-waived request on a CANBLOCK port is followed by the port
+    /// auto-connect C's `portThread` performs.
     ///
     /// C queues the waived requests — `asynSetOption`/`asynSetEos` from
     /// `st.cmd`, the record's HOSTINFO repoint (asynRecord.c:566-569) — at
@@ -5111,7 +5113,9 @@ mod tests {
                 self.connect_calls.fetch_add(1, Ordering::SeqCst);
                 // The line comes up on the configuration the waived request
                 // just wrote — a real driver reopens its transport here.
-                self.base.set_connected(true);
+                if !self.options.lock().is_empty() {
+                    self.base.set_connected(true);
+                }
                 Ok(())
             }
             fn set_option(
@@ -5132,17 +5136,24 @@ mod tests {
         let mut base = PortDriverBase::new(
             "waived_test",
             1,
-            PortFlags::default(),
+            PortFlags {
+                can_block: true,
+                ..PortFlags::default()
+            },
             InterfaceMask::OPTION | InterfaceMask::INT32,
             InterfaceMask::NONE,
         );
         base.init_connected(false);
         base.init_auto_connect(true);
-        let tx = spawn_actor(WaivedDriver {
+        let tx = spawn_actor_past_registration(WaivedDriver {
             base,
             connect_calls: connect_calls.clone(),
             options: options.clone(),
         });
+        // Registration's attempt and its pass's own (asynManager.c:2135,
+        // :858-863), both on the dead line.
+        let registered = connect_calls.load(Ordering::SeqCst);
+        assert_eq!(registered, 2);
 
         // The `asynSetOption` user: Connect priority + the reason that waives
         // the connected refusal (asynShellCommands.c:121,127).
@@ -5186,7 +5197,7 @@ mod tests {
         // ...and C's portThread tried exactly one connect to get there.
         assert_eq!(
             connect_calls.load(Ordering::SeqCst),
-            1,
+            registered + 1,
             "C portThread runs autoConnectDevice(pport,0) once the Connect \
              queue has drained (asynManager.c:858-862)"
         );
@@ -5227,7 +5238,10 @@ mod tests {
         let mut base = PortDriverBase::new(
             "disconnect_test",
             1,
-            PortFlags::default(),
+            PortFlags {
+                can_block: true,
+                ..PortFlags::default()
+            },
             InterfaceMask::NONE,
             InterfaceMask::NONE,
         );
@@ -5253,6 +5267,94 @@ mod tests {
             "the transition the Disconnect just stamped keeps the auto-connect \
              inside its 2 s window (asynManager.c:714-715)"
         );
+    }
+
+    /// A synchronous port has no port thread, so nothing follows a request but
+    /// the request: C creates `notifyPortThread` and `portThread` only for a
+    /// CANBLOCK port (asynManager.c:2074-2076). Registration's
+    /// `portConnectTimerCallback` connects inline (:2134), a waived request
+    /// skips `autoConnectDevice` (:1569-1570), and an exception signals no one
+    /// (:637-638).
+    ///
+    /// One case per boundary, each the synchronous side of a CANBLOCK test
+    /// above: registration (one attempt), a waived request (none), and
+    /// re-enable (none).
+    #[test]
+    fn a_synchronous_port_makes_no_port_thread_connect_attempt() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct DeadLineDriver {
+            base: PortDriverBase,
+            connect_calls: Arc<AtomicUsize>,
+        }
+        impl PortDriver for DeadLineDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
+                self.connect_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            fn set_option(
+                &mut self,
+                _user: &mut AsynUser,
+                _key: &str,
+                _value: &str,
+            ) -> AsynResult<()> {
+                Ok(())
+            }
+        }
+
+        // A down auto-connect port, its throttle window run out, so each case
+        // starts where any attempt a wake wanted would be permitted.
+        let spawn = || {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut base = PortDriverBase::new(
+                "sync_dead_line",
+                1,
+                PortFlags::default(),
+                InterfaceMask::OPTION,
+                InterfaceMask::NONE,
+            );
+            base.init_connected(false);
+            base.init_auto_connect(true);
+            let tx = spawn_actor_past_registration(DeadLineDriver {
+                base,
+                connect_calls: calls.clone(),
+            });
+            (tx, calls)
+        };
+        // Each reply is sent before the pass's tail; a plain read after it is
+        // the barrier that lets the tail run first.
+        let barrier = |tx: &mpsc::UnboundedSender<ActorMessage>| {
+            send_and_wait(tx, RequestOp::GetEnable, AsynUser::default()).unwrap();
+        };
+
+        let (_tx, calls) = spawn();
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "registration");
+
+        let (tx, calls) = spawn();
+        send_and_wait(
+            &tx,
+            RequestOp::SetOption {
+                key: "baud".to_string(),
+                value: "9600".to_string(),
+            },
+            AsynUser::default().queue_even_if_not_connected(),
+        )
+        .expect("a waived request runs on a disconnected port");
+        barrier(&tx);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "a waived request");
+
+        let (tx, calls) = spawn();
+        for yes in [false, true] {
+            send_and_wait(&tx, RequestOp::SetEnable { yes }, AsynUser::default()).unwrap();
+        }
+        barrier(&tx);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "re-enable");
     }
 
     /// C's **port-level** auto-connect reaches the driver with `addr == -1`:
@@ -6199,7 +6301,10 @@ mod tests {
             let mut base = PortDriverBase::new(
                 "enable_test",
                 1,
-                PortFlags::default(),
+                PortFlags {
+                    can_block: true,
+                    ..PortFlags::default()
+                },
                 InterfaceMask::NONE,
                 InterfaceMask::NONE,
             );
@@ -6315,7 +6420,10 @@ mod tests {
         let mut base = PortDriverBase::new(
             "status_test",
             1,
-            PortFlags::default(),
+            PortFlags {
+                can_block: true,
+                ..PortFlags::default()
+            },
             InterfaceMask::NONE,
             InterfaceMask::NONE,
         );

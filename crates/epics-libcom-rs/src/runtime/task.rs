@@ -5349,15 +5349,49 @@ mod tests {
         late[n / 2]
     }
 
+    /// The wall-clock timer waking a thread blocked on a condvar, the shape
+    /// of C's timer queue signalling an `epicsEvent`: what a wake from another
+    /// thread costs on this host, 0.66 ms on one macOS arm64 runner and
+    /// 0.15 ms on another.
+    #[cfg(tokio_backend)]
+    fn condvar_lateness(n: usize, period: Duration) -> Duration {
+        let timer = background().timer().handle();
+        let event = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let mut late = Vec::with_capacity(n);
+        for _ in 0..n {
+            let started = std::time::Instant::now();
+            let signal = Arc::clone(&event);
+            let _key = timer
+                .schedule_wake(
+                    period,
+                    Box::new(move || {
+                        *signal.0.lock().unwrap() = true;
+                        signal.1.notify_one();
+                    }),
+                )
+                .expect("the wall-clock timer runs");
+            let mut full = event.0.lock().unwrap();
+            while !*full {
+                full = event.1.wait(full).unwrap();
+            }
+            *full = false;
+            late.push(started.elapsed().saturating_sub(period));
+        }
+        late.sort();
+        late[n / 2]
+    }
+
     /// A runtime thread wakes at its deadline, not at the wheel's next whole
     /// millisecond: a 0.93 ms wait on the wheel alone lasted 2.0 ms, where C's
     /// `epicsEventWaitWithTimeout` waits on the OS clock. Both holders of the
     /// wheel, the one-shot `sleep` and the re-armable `Sleep`, and a wait the
-    /// wheel paces first.
+    /// wheel paces first, each within 0.5 ms of [`condvar_lateness`], which
+    /// C's hand-off pays too.
     #[cfg(tokio_backend)]
     #[tokio::test]
     async fn a_runtime_thread_s_wait_wakes_at_its_deadline() {
         let short = Duration::from_micros(930);
+        let floor = condvar_lateness(21, short);
         // Long enough for the wheel to pace it first.
         let long = HANDOFF_LEAD + Duration::from_micros(3300);
         let mut rearmed = Sleep::until(Instant::now());
@@ -5374,8 +5408,8 @@ mod tests {
             ("long sleep", paced),
         ] {
             assert!(
-                late < Duration::from_micros(500),
-                "{what}: median {late:?} late"
+                late < floor + Duration::from_micros(500),
+                "{what}: median {late:?} late, a condvar waiter {floor:?}"
             );
         }
     }

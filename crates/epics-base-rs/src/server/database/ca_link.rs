@@ -445,7 +445,13 @@ impl LinkSet for CaLinks {
             // With no network half the link can never connect; dropping
             // `init` releases `dbCaRun` rather than holding it forever.
             None => match self.network() {
-                Some(net) => net.connect_link(link, init).await,
+                // `dbCaTask` services no `CA_CONNECT` before `dbCaRun`
+                // (`dbCa.c:1171-1173`), and by then `dbInitServers` has bound
+                // this IOC's own server: an earlier first search could be lost.
+                Some(net) => {
+                    self.ca_run.reached().await;
+                    net.connect_link(link, init).await
+                }
                 None => drop(init),
             },
         }
@@ -1979,6 +1985,67 @@ record(ao, "OUT") { field(OUT, "SRC CA") }
         }
         opener.join().unwrap();
         assert_eq!(monitors(), 1);
+    }
+
+    /// C `dbCaTask` services no `CA_CONNECT` before `dbCaRun`
+    /// (`dbCa.c:1171-1173`): a network link staged at iocInit opens only
+    /// after it, so its first search finds the IOC's own server bound.
+    #[cfg(tokio_backend)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_network_link_opens_only_after_ca_run() {
+        struct Opens {
+            gate: Arc<super::super::processing::CaRunGate>,
+            ran: Arc<parking_lot::Mutex<Vec<bool>>>,
+        }
+        #[async_trait::async_trait]
+        impl LinkSet for Opens {
+            fn is_connected(&self, _: LinkRef<'_>) -> bool {
+                false
+            }
+            fn get_cached_value(&self, _: LinkRef<'_>) -> Option<EpicsValue> {
+                None
+            }
+            async fn get_value(&self, _: LinkRef<'_>) -> Option<EpicsValue> {
+                None
+            }
+            async fn put_value(
+                &self,
+                _: LinkRef<'_>,
+                _: EpicsValue,
+                _: LinkPutOp,
+            ) -> Result<(), String> {
+                Err("no puts here".into())
+            }
+            async fn connect_link(&self, _: LinkRef<'_>, _: Option<CaLinkInit>) {
+                self.ran.lock().push(self.gate.has_run());
+            }
+        }
+        let db = crate::server::ioc_builder::IocBuilder::new()
+            .db_string(
+                r#"record(ai, "H") { field(INP, "REMOTE:PV") }"#,
+                &HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap()
+            .0;
+        let ran = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let opens = Opens {
+            gate: db.inner.ca_run.clone(),
+            ran: ran.clone(),
+        };
+        db.register_link_set("ca", Arc::new(opens)).await;
+        db.initialize_link_locality().await;
+        db.setup_external_link_opens().await;
+        // An open serviced before `dbCaRun` has finished by the time this
+        // returns; a held one keeps it waiting.
+        let _ =
+            crate::runtime::task::timeout(Duration::from_millis(200), db.inner.link_puts.sync())
+                .await;
+        db.process_cp_links_on_connect().await;
+        db.inner.link_puts.sync().await;
+        assert_eq!(*ran.lock(), [true]);
     }
 
     /// `H1` and `H2`, both CP on `SRC` in that order, after iocInit's

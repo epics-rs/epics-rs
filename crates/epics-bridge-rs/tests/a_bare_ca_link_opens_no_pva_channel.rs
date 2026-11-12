@@ -41,6 +41,7 @@ async fn a_down_ca_link_opens_no_pva_channel() {
         .await
         .unwrap();
     db.ioc_init().await;
+    db.process_cp_links_on_connect().await;
     let r = R.get().unwrap();
     for _ in 0..3 {
         db.process_record("N").await.unwrap();

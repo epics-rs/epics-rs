@@ -1328,10 +1328,16 @@ fn wall_clock_wake(deadline: Instant) -> crate::runtime::background::Sleep {
 const WHEEL_LATENESS: Duration =
     Duration::from_micros(if cfg!(windows) { 2_000 + 15_625 } else { 2_000 });
 
+/// How far ahead of its deadline the wheel hands a wait over: its lateness,
+/// plus the hand-off's own wake of the wall-clock timer's thread, which took
+/// up to 0.84 ms on a macOS arm64 runner.
+#[cfg(tokio_backend)]
+const HANDOFF_LEAD: Duration = WHEEL_LATENESS.saturating_add(Duration::from_millis(1));
+
 /// Where the wheel stops pacing a wait for `deadline`.
 #[cfg(tokio_backend)]
 fn pace_at(deadline: Instant) -> Instant {
-    deadline.checked_sub(WHEEL_LATENESS).unwrap_or(deadline)
+    deadline.checked_sub(HANDOFF_LEAD).unwrap_or(deadline)
 }
 
 /// A runtime thread's wait: due when the runtime's clock reaches `deadline`,
@@ -1378,7 +1384,7 @@ impl FinalStretch {
                 (handoff, paced)
             });
             if handoff.wait(cx.waker()) {
-                let near = deadline.saturating_duration_since(Instant::now()) <= WHEEL_LATENESS;
+                let near = deadline.saturating_duration_since(Instant::now()) <= HANDOFF_LEAD;
                 // Unconstrained: a spent coop budget would wake `paced` now.
                 let pace = std::pin::pin!(tokio::task::unconstrained(pace));
                 if near || pace.poll(&mut Context::from_waker(paced)).is_ready() {
@@ -5266,7 +5272,7 @@ mod tests {
         );
     }
 
-    /// Only a wait's last [`WHEEL_LATENESS`] reaches the shared wall-clock
+    /// Only a wait's last [`HANDOFF_LEAD`] reaches the shared wall-clock
     /// queue: a bounded wait whose future wins before then does not even start
     /// the background facility, and one that runs out queues one entry.
     /// Relies on nextest's process-per-test isolation for the first half.
@@ -5353,7 +5359,7 @@ mod tests {
     async fn a_runtime_thread_s_wait_wakes_at_its_deadline() {
         let short = Duration::from_micros(930);
         // Long enough for the wheel to pace it first.
-        let long = WHEEL_LATENESS + Duration::from_micros(3300);
+        let long = HANDOFF_LEAD + Duration::from_micros(3300);
         let mut rearmed = Sleep::until(Instant::now());
         let one_shot = median_lateness(21, short, async || sleep(short).await).await;
         let re_armed = median_lateness(21, short, async || {

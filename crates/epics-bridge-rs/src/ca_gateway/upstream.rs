@@ -284,6 +284,27 @@ async fn offer_first_event(
     }
 }
 
+/// Wait for an armed life other than `lived`: `None` once the owner is gone.
+/// Life 0's `monitor` is dropped on reading any other life, in the same read
+/// that decides; held through the death it stayed on the channel and was
+/// re-installed with it, a monitor C `death` clears (gatePv.cc:658-661).
+#[cfg(tokio_backend)]
+async fn next_life(
+    life: &mut tokio::sync::watch::Receiver<ShadowLife>,
+    lived: Option<u64>,
+    monitor: &mut Option<MonitorHandle>,
+) -> Option<u64> {
+    life.wait_for(|l| {
+        if l.armed() != Some(0) {
+            *monitor = None;
+        }
+        l.armed().is_some_and(|n| Some(n) != lived)
+    })
+    .await
+    .ok()?
+    .armed()
+}
+
 /// One registration of the shadow PV: C `gatePvData` between `life()` and
 /// `death()`. The number counts the lives, so a follower can tell a revival
 /// from the life it already served.
@@ -1387,20 +1408,16 @@ impl UpstreamManager {
             let max_backoff = Duration::from_secs(30);
             // The monitor the caller subscribed (cached mode) belongs to the
             // first life; `None` (no-cache, or any later life) subscribes at
-            // the loop top, the one subscribe site. A task that starts after
-            // life 0 ended drops it.
-            let mut next_monitor = initial_monitor.filter(|_| life.borrow().armed() == Some(0));
+            // the loop top, the one subscribe site. [`next_life`] drops it
+            // once life 0 ended.
+            let mut next_monitor = initial_monitor;
             // The life the live subscription belongs to.
             let mut lived = None;
             loop {
-                let Ok(now) = life
-                    .wait_for(|l| l.armed().is_some_and(|n| Some(n) != lived))
-                    .await
-                    .map(|l| l.armed())
-                else {
+                let Some(now) = next_life(&mut life, lived, &mut next_monitor).await else {
                     return;
                 };
-                let seeded = next_monitor.take().filter(|_| now == Some(0));
+                let seeded = next_monitor.take();
                 let mut monitor = match seeded {
                     Some(m) => m,
                     None => match channel.subscribe_with_mask_autosize(0.0, event_mask).await {
@@ -1431,7 +1448,7 @@ impl UpstreamManager {
                         }
                     },
                 };
-                lived = now;
+                lived = Some(now);
                 let ended = loop {
                     let result = tokio::select! {
                         biased;
@@ -1575,21 +1592,17 @@ impl UpstreamManager {
             // 0's initial event has passed.
             let mut initial = Some(0);
             // Life 0's monitor, as in `spawn_forward_task`.
-            let mut next_monitor = initial_monitor.filter(|_| life.borrow().armed() == Some(0));
+            let mut next_monitor = initial_monitor;
             // The life the live subscription belongs to. C `death` clears the
             // property monitor with the PV (gatePv.cc:661) and `getCB` re-arms
             // it with the value monitor (gatePv.cc:1703-1705); one kept across
             // the death refreshed a shadow PV that was not there.
             let mut lived = None;
             loop {
-                let Ok(now) = life
-                    .wait_for(|l| l.armed().is_some_and(|n| Some(n) != lived))
-                    .await
-                    .map(|l| l.armed())
-                else {
+                let Some(now) = next_life(&mut life, lived, &mut next_monitor).await else {
                     return;
                 };
-                let subscribed = match next_monitor.take().filter(|_| now == Some(0)) {
+                let subscribed = match next_monitor.take() {
                     Some(m) => Ok(m),
                     None => {
                         channel
@@ -1617,7 +1630,7 @@ impl UpstreamManager {
                         continue;
                     }
                 };
-                lived = now;
+                lived = Some(now);
                 let ended = loop {
                     let result = tokio::select! {
                         biased;

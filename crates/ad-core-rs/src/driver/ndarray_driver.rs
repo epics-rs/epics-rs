@@ -8,6 +8,9 @@ use asyn_rs::port::{PortDriverBase, PortFlags};
 use asyn_rs::request::ParamSetValue;
 use asyn_rs::trace::TraceMask;
 use asyn_rs::user::AsynUser;
+use epics_libcom_rs::runtime::task::{
+    StackSizeClass, StackSpec, ThreadPriority, spawn_dedicated_thread,
+};
 
 use crate::attributes::{
     EpicsPvAttributeSource, FunctionAttributeSource, NDAttrSource, NDAttrValue, NDAttribute,
@@ -1288,7 +1291,7 @@ fn queued_count_updater(
     queued: &Arc<QueuedArrayCounter>,
 ) {
     let counter = Arc::downgrade(queued);
-    port_base.on_runtime(move |handle| {
+    port_base.on_runtime(move |handle, config| {
         let Some(queued) = counter.upgrade() else {
             return;
         };
@@ -1296,9 +1299,22 @@ fn queued_count_updater(
         let trace = handle.trace().clone();
         // Weak, so the updater never keeps its own port running.
         let port_handle = handle.downgrade();
-        let spawned = std::thread::Builder::new()
-            .name(format!("{port}_updateQueuedArrayCount"))
-            .spawn(move || {
+        // The constructor's priority and stackSize, 0 read as Medium
+        // (asynNDArrayDriver.cpp:877-879); unlike the port thread's, whatever
+        // the port's ASYN_CANBLOCK.
+        let priority = match config.priority {
+            0 => ThreadPriority::Medium,
+            p => ThreadPriority::Custom(p),
+        };
+        let stack = match config.stack_size {
+            0 => StackSpec::Class(StackSizeClass::Medium),
+            raw => StackSpec::from_c(raw),
+        };
+        let spawned = spawn_dedicated_thread(
+            format!("{port}_updateQueuedArrayCount"),
+            priority,
+            stack,
+            move || {
                 loop {
                     std::thread::park();
                     let Some(queued) = counter.upgrade() else {
@@ -1317,7 +1333,8 @@ fn queued_count_updater(
                         break;
                     }
                 }
-            });
+            },
+        );
         match spawned {
             Ok(thread) => queued.set_updater(thread.thread().clone()),
             Err(_) => trace.print(
@@ -1411,7 +1428,7 @@ impl ArrayOwner {
     /// Fill in the port handle once the port being built runs.
     pub(crate) fn bind_port(self: &Arc<Self>, port_base: &mut PortDriverBase) {
         let weak = Arc::downgrade(self);
-        port_base.on_runtime(move |handle| {
+        port_base.on_runtime(move |handle, _| {
             if let Some(owner) = weak.upgrade() {
                 let _ = owner.port.set(handle.downgrade());
             }
@@ -2506,6 +2523,59 @@ pub(crate) mod tests {
         queued.decrement();
         assert_eq!(settle(p.num_queued_arrays, 0), 0);
         assert_eq!(read(p.acquire_busy), 0);
+    }
+
+    /// The updater is created at the constructor's priority, 0 read as Medium
+    /// (asynNDArrayDriver.cpp:877-879), on a synchronous port as well.
+    #[test]
+    fn the_queued_count_updater_takes_the_constructors_band() {
+        use asyn_rs::registry::PortRegistry;
+        use asyn_rs::runtime::config::RuntimeConfig;
+        use asyn_rs::runtime::port::create_port_runtime;
+
+        struct Port(NDArrayDriverBase);
+        impl asyn_rs::port::PortDriver for Port {
+            fn base(&self) -> &PortDriverBase {
+                &self.0.port_base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0.port_base
+            }
+        }
+        for (port, priority, want) in [
+            ("NDUPDBAND0", 0, ThreadPriority::Medium.value()),
+            ("NDUPDBAND60", 60, 60),
+        ] {
+            let drv = NDArrayDriverBase::new(
+                port,
+                1,
+                1_000_000,
+                PortFlags::default(),
+                InterfaceMask::NONE,
+                InterfaceMask::NONE,
+            )
+            .unwrap();
+            let claim = PortRegistry::new().claim(port).unwrap();
+            let config = RuntimeConfig {
+                priority,
+                ..RuntimeConfig::default()
+            };
+            let (runtime, _actor) = create_port_runtime(&claim, Port(drv), config).unwrap();
+            // The thread lists itself once it runs.
+            let name = format!("{port}_updateQueuedArrayCount");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let row = loop {
+                match epics_libcom_rs::runtime::task::thread_by_name(&name) {
+                    Some(row) => break row,
+                    None if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(1))
+                    }
+                    None => panic!("{name} is never listed"),
+                }
+            };
+            assert_eq!(row.epics_priority(), want, "{name}");
+            drop(runtime);
+        }
     }
 
     /// The updater must not hold the port up: dropping every handle stops the

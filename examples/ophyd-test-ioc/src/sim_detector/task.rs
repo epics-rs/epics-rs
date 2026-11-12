@@ -94,7 +94,12 @@ async fn wait_for_stop(
 
 /// Start the acquisition task thread.
 pub(crate) fn start_acquisition_task(ctx: AcquisitionContext) -> std::thread::JoinHandle<()> {
-    rt::run_thread_named("MovingDotTask", move || acquisition_loop_async(ctx))
+    rt::run_thread_named(
+        "MovingDotTask",
+        rt::ThreadPriority::Medium,
+        rt::StackSizeClass::Medium,
+        move || acquisition_loop_async(ctx),
+    )
 }
 
 /// The image is computed into `raw`, C simDetector's pRaw_, with the slot's

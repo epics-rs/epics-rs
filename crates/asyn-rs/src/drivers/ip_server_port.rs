@@ -1805,7 +1805,7 @@ impl DrvAsynIPSubport {
         // (drvAsynIPServerPort.c:372-375).
         base.share_connection(slot.connection_cell());
         let owner = Arc::clone(&slot);
-        base.on_runtime(move |handle| owner.bind_child(handle.downgrade()));
+        base.on_runtime(move |handle, _| owner.bind_child(handle.downgrade()));
         // C's child IS a `drvAsynIPPortConfigure`d port — the listener creates it
         // with exactly that call (drvAsynIPServerPort.c:709-715), passing
         // noAutoConnect=1 and the server's own noProcessEos. So it gets the

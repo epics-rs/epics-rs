@@ -18,7 +18,8 @@
 //! }
 //!
 //! pub fn spawn_task(ctx: AcquisitionContext) -> std::thread::JoinHandle<()> {
-//!     rt::run_thread_named("MyDetTask", move || async move {
+//!     let (band, stack) = (rt::ThreadPriority::Medium, rt::StackSizeClass::Medium);
+//!     rt::run_thread_named("MyDetTask", band, stack, move || async move {
 //!         acquisition_loop(ctx).await;
 //!     })
 //! }
@@ -38,6 +39,8 @@
 use std::fmt;
 use std::future::Future;
 use std::time::Duration;
+
+pub use epics_libcom_rs::runtime::task::{StackSizeClass, ThreadPriority};
 
 // ──────────────────────────────────────────────────────────────────────────
 // Command channel (bounded MPSC, async)
@@ -165,26 +168,30 @@ pub(crate) fn block_on_for_thread<Fut: Future>(fut: Fut) -> Fut::Output {
     epics_libcom_rs::runtime::task::block_on_thread_loop(&rt, fut)
 }
 
-/// Spawn a dedicated OS thread that runs the given async closure inside an
-/// async runtime. Returns the OS-thread `JoinHandle`.
-pub fn run_thread<F, Fut>(make_fut: F) -> std::thread::JoinHandle<()>
+/// The driver thread C starts with `epicsThreadCreate(name, priority,
+/// stackSize, ...)`, running `make_fut`'s future on a runtime of its own.
+///
+/// The band and stack class are the caller's because they are in C: a
+/// detector task is `epicsThreadPriorityMedium` with a medium stack
+/// (`simDetector.cpp:1147-1150`), and a bare `std::thread` would run it
+/// time-shared below the scan and callback threads it feeds.
+pub fn run_thread_named<F, Fut>(
+    name: &str,
+    priority: ThreadPriority,
+    stack: StackSizeClass,
+    make_fut: F,
+) -> std::thread::JoinHandle<()>
 where
     F: FnOnce() -> Fut + Send + 'static,
     Fut: Future<Output = ()> + 'static,
 {
-    std::thread::spawn(move || block_on_for_thread(make_fut()))
-}
-
-/// Same as [`run_thread`], but with a thread name (useful in `ps`, crash dumps).
-pub fn run_thread_named<F, Fut>(name: &str, make_fut: F) -> std::thread::JoinHandle<()>
-where
-    F: FnOnce() -> Fut + Send + 'static,
-    Fut: Future<Output = ()> + 'static,
-{
-    std::thread::Builder::new()
-        .name(name.to_string())
-        .spawn(move || block_on_for_thread(make_fut()))
-        .expect("failed to spawn driver thread")
+    epics_libcom_rs::runtime::task::spawn_dedicated_thread(
+        name.to_string(),
+        priority,
+        stack,
+        move || block_on_for_thread(make_fut()),
+    )
+    .expect("failed to spawn driver thread")
 }
 
 #[cfg(test)]
@@ -208,5 +215,24 @@ mod tests {
         })
         .join()
         .expect("sleep and timeout need no runtime");
+    }
+
+    /// A driver thread is listed at the band it was created with, as C's
+    /// `epicsThreadCreate` lists it.
+    #[test]
+    fn a_driver_thread_is_listed_at_its_band() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        run_thread_named(
+            "adDrvBand",
+            ThreadPriority::Medium,
+            StackSizeClass::Medium,
+            move || async move {
+                let row = epics_libcom_rs::runtime::task::thread_by_name("adDrvBand");
+                tx.send(row.map(|row| row.epics_priority())).unwrap();
+            },
+        )
+        .join()
+        .unwrap();
+        assert_eq!(rx.recv().unwrap(), Some(ThreadPriority::Medium.value()));
     }
 }

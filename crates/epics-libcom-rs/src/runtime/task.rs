@@ -12,6 +12,7 @@ use tokio::runtime::RuntimeFlavor;
 pub use tokio::runtime::Handle as RuntimeHandle;
 
 pub use crate::runtime::background::{CallbackPriority, OnBand};
+use crate::runtime::sync::Sleeper;
 
 /// A synchronous caller asked to block on an async operation from a thread
 /// where blocking cannot be made sound.
@@ -51,40 +52,40 @@ impl std::fmt::Display for NotBlockable {
 
 impl std::error::Error for NotBlockable {}
 
-/// A [`Waker`] that unparks the thread that built it — the wake half of every
+/// A [`Waker`] that wakes the thread that built it — the wake half of every
 /// "poll-then-park" driver ([`park_on`], asyn-rs's port reply wait). Get it
 /// through [`ThreadDrive`].
 ///
-/// `woken` is what the driver waits on, not the thread's unpark token: a
-/// `thread::park`-based wait inside the driven future (a std `mpsc` receive,
-/// an [`Event`](crate::runtime::sync::Event)) consumes that token, and a driver
-/// that trusted it would park through the wake it was owed.
+/// `woken` is what the driver waits on, not the sleeper's token: where that
+/// is the thread's unpark token, a `thread::park`-based wait inside the
+/// driven future (a std `mpsc` receive, an
+/// [`Event`](crate::runtime::sync::Event)) consumes it, and a driver that
+/// trusted it would park through the wake it was owed.
 struct ThreadWaker {
-    thread: std::thread::Thread,
+    sleeper: Sleeper,
     woken: std::sync::atomic::AtomicBool,
 }
 
 impl ThreadWaker {
     fn current() -> Self {
         Self {
-            thread: std::thread::current(),
+            sleeper: Sleeper::new(),
             woken: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
     /// Park until this waker fires, `deadline` passes, or `should_cancel`
-    /// holds after an unpark. Consumes the wake.
+    /// holds after a wake. Consumes the wake.
     fn wait(&self, deadline: Option<std::time::Instant>, mut should_cancel: impl FnMut() -> bool) {
         use std::sync::atomic::Ordering;
         while !self.woken.swap(false, Ordering::Acquire) {
             match deadline {
-                None => std::thread::park(),
+                None => self.sleeper.sleep(),
                 Some(deadline) => {
-                    let left = deadline.saturating_duration_since(std::time::Instant::now());
-                    if left.is_zero() {
+                    if std::time::Instant::now() >= deadline {
                         return;
                     }
-                    std::thread::park_timeout(left);
+                    self.sleeper.sleep_until(deadline);
                 }
             }
             if should_cancel() {
@@ -100,15 +101,6 @@ thread_local! {
     static DRIVE: Arc<ThreadWaker> = Arc::new(ThreadWaker::current());
 }
 
-/// The waker over the *current* thread. Drivers get it through
-/// [`ThreadDrive`], which owns the re-arm a nested drive needs.
-fn current_thread_waker() -> Waker {
-    // Only a park from another thread-local's destructor finds it gone.
-    DRIVE
-        .try_with(|drive| Waker::from(Arc::clone(drive)))
-        .unwrap_or_else(|_| Waker::from(Arc::new(ThreadWaker::current())))
-}
-
 /// One poll-then-park drive on this thread: the waker to poll with and the
 /// wait between polls.
 ///
@@ -117,14 +109,20 @@ fn current_thread_waker() -> Waker {
 /// completed inner drive never leaves the outer drive's wake consumed: drop
 /// re-arms the flag, which costs the outer drive at most one spurious re-poll.
 pub struct ThreadDrive {
+    drive: Arc<ThreadWaker>,
     waker: Waker,
 }
 
 impl ThreadDrive {
     /// Start a drive on the calling thread.
     pub fn enter() -> Self {
+        // Only a drive from another thread-local's destructor finds it gone.
+        let drive = DRIVE
+            .try_with(Arc::clone)
+            .unwrap_or_else(|_| Arc::new(ThreadWaker::current()));
         Self {
-            waker: current_thread_waker(),
+            waker: Waker::from(Arc::clone(&drive)),
+            drive,
         }
     }
 
@@ -136,32 +134,15 @@ impl ThreadDrive {
     /// Park until this thread's waker has been woken since the last return,
     /// or `deadline` passes. A spurious return only costs a re-poll.
     pub fn park(&self, deadline: Option<std::time::Instant>) {
-        wait_for_wake(deadline, || false);
+        self.drive.wait(deadline, || false);
     }
 }
 
 impl Drop for ThreadDrive {
     fn drop(&mut self) {
-        let _ = DRIVE.try_with(|drive| {
-            drive
-                .woken
-                .store(true, std::sync::atomic::Ordering::Release)
-        });
-    }
-}
-
-fn wait_for_wake(deadline: Option<std::time::Instant>, should_cancel: impl FnMut() -> bool) {
-    if DRIVE
-        .try_with(|drive| drive.wait(deadline, should_cancel))
-        .is_err()
-    {
-        // The fallback waker's flag is not reachable from here: one park.
-        match deadline {
-            None => std::thread::park(),
-            Some(deadline) => std::thread::park_timeout(
-                deadline.saturating_duration_since(std::time::Instant::now()),
-            ),
-        }
+        self.drive
+            .woken
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -171,7 +152,7 @@ impl Wake for ThreadWaker {
     }
     fn wake_by_ref(self: &Arc<Self>) {
         self.woken.store(true, std::sync::atomic::Ordering::Release);
-        self.thread.unpark();
+        self.sleeper.wake();
     }
 }
 
@@ -186,9 +167,10 @@ impl Wake for ThreadWaker {
 /// The future must only await runtime-agnostic primitives (`tokio::sync`
 /// locks/channels/notifies): nothing here drives a reactor or a timer wheel, so
 /// whoever wakes us must be running on some other thread. A cancel is observed
-/// on the next wake — the caller that flips `should_cancel` must also
-/// [`unpark`](std::thread::Thread::unpark) this thread so a *parked* driver
-/// re-checks promptly rather than sleeping until the future's own waker fires.
+/// on the next wake — the caller that flips `should_cancel` must also wake the
+/// waker the future was last polled with, so a *parked* driver re-checks
+/// promptly. A raw `unpark` is not that wake: on Windows the driver does not
+/// sleep in `thread::park`.
 pub(crate) fn park_on_interruptible<F: Future>(
     fut: F,
     mut should_cancel: impl FnMut() -> bool,
@@ -203,7 +185,7 @@ pub(crate) fn park_on_interruptible<F: Future>(
         if let Poll::Ready(value) = fut.as_mut().poll(&mut cx) {
             return Some(value);
         }
-        wait_for_wake(None, &mut should_cancel);
+        drive.drive.wait(None, &mut should_cancel);
     }
 }
 
@@ -1185,33 +1167,10 @@ impl<T> Drop for TaskSet<T> {
     }
 }
 
-/// The timer the *calling thread* can actually reach.
-///
-/// `tokio::time` reads a thread-local time driver and panics when there is
-/// none, but this process always has a second timer that needs no runtime at
-/// all: the delayed-callback timer [`sleep_background`] waits on (C
-/// `callbackRequestDelayed`). Which of the two to use is a property of the
-/// calling thread, not of the build, so it cannot be a `cfg`.
-///
-/// It is deliberately not "always the background timer". Under
-/// `#[tokio::test(start_paused = true)]` tokio's clock is virtual and only
-/// tokio's own timer advances with it, so a wall-clock sleep on a runtime
-/// thread would wait out a deadline the test means to skip. A thread with no
-/// runtime has no virtual clock to honour, so there the wall-clock timer is
-/// both the correct one and the only one — which is why this arms a timer
-/// where the seam used to panic instead.
-#[cfg(tokio_backend)]
-async fn sleep_on_reachable_timer(duration: Duration) {
-    if tokio::runtime::Handle::try_current().is_ok() {
-        tokio::time::sleep(duration).await;
-    } else {
-        sleep_background(duration).await;
-    }
-}
-
+/// On the timer the calling thread can reach; see [`Sleep::until`].
 #[cfg(tokio_backend)]
 pub async fn sleep(duration: Duration) {
-    sleep_on_reachable_timer(duration).await;
+    sleep_until(deadline_from_now(duration)).await;
 }
 
 /// RTEMS: see [`Reactor::spawn`] — this backend's only executor is the
@@ -1262,16 +1221,18 @@ pub fn deadline_from_now(d: Duration) -> Instant {
     deadline_after(Instant::now(), d)
 }
 
+/// On the timer the calling thread can reach; see [`Sleep::until`]. Both
+/// wheel entries are held inline; a wait allocates only at its first pending
+/// poll, for its hand-off to the wall-clock timer.
 #[cfg(tokio_backend)]
 pub async fn sleep_until(deadline: Instant) {
-    if tokio::runtime::Handle::try_current().is_ok() {
-        tokio::time::sleep_until(deadline).await;
-    } else {
-        // No runtime means no virtual clock, so `Instant::now()` here reads the
-        // same wall clock the background timer runs on and the subtraction
-        // loses nothing. See [`sleep_on_reachable_timer`].
-        sleep_on_reachable_timer(deadline.saturating_duration_since(Instant::now())).await;
+    if tokio::runtime::Handle::try_current().is_err() {
+        return wall_clock_wake(deadline).await;
     }
+    let mut stretch = FinalStretch::new(deadline);
+    let mut pace = std::pin::pin!(tokio::time::sleep_until(pace_at(deadline)));
+    let mut wheel = std::pin::pin!(tokio::time::sleep_until(deadline));
+    std::future::poll_fn(|cx| stretch.poll(pace.as_mut(), wheel.as_mut(), cx)).await;
 }
 
 /// RTEMS: sleep-until on the delayed-callback timer via the host-tested `Sleep`.
@@ -1286,7 +1247,7 @@ pub async fn sleep_until(deadline: Instant) {
 /// defaults: an immediate first tick and `MissedTickBehavior::Burst` catch-up.
 ///
 /// One body for both backends, on the timer the polling thread can reach (see
-/// `sleep_on_reachable_timer`): the hosted half wrapped
+/// `TickTimer`): the hosted half wrapped
 /// `tokio::time::Interval`, which panics on a thread with no runtime.
 pub struct Interval {
     period: Duration,
@@ -1300,9 +1261,26 @@ pub struct Interval {
 }
 
 /// One re-armable sleep on the timer the arming thread can reach.
+///
+/// `tokio::time` reads a thread-local time driver and panics when there is
+/// none, but this process always has a second timer that needs no runtime at
+/// all: the delayed-callback timer [`sleep_background`] waits on (C
+/// `callbackRequestDelayed`). Which of the two to use is a property of the
+/// calling thread, not of the build, so it cannot be a `cfg`.
+///
+/// It is deliberately not "always the background timer". Under
+/// `#[tokio::test(start_paused = true)]` tokio's clock is virtual and only
+/// tokio's own timer advances with it, so a wall-clock sleep on a runtime
+/// thread would wait out a deadline the test means to skip. A thread with no
+/// runtime has no virtual clock to honour, so there the wall-clock timer is
+/// both the correct one and the only one.
 enum TickTimer {
     #[cfg(tokio_backend)]
-    Runtime(std::pin::Pin<Box<tokio::time::Sleep>>),
+    Runtime {
+        stretch: FinalStretch,
+        pace: std::pin::Pin<Box<tokio::time::Sleep>>,
+        wheel: std::pin::Pin<Box<tokio::time::Sleep>>,
+    },
     Background(crate::runtime::background::Sleep),
 }
 
@@ -1310,18 +1288,23 @@ impl TickTimer {
     fn until(deadline: Instant) -> Self {
         #[cfg(tokio_backend)]
         if tokio::runtime::Handle::try_current().is_ok() {
-            return Self::Runtime(Box::pin(tokio::time::sleep_until(deadline)));
+            return Self::Runtime {
+                stretch: FinalStretch::new(deadline),
+                pace: Box::pin(tokio::time::sleep_until(pace_at(deadline))),
+                wheel: Box::pin(tokio::time::sleep_until(deadline)),
+            };
         }
-        Self::Background(crate::runtime::background::timer_sleep::sleep_until(
-            &background().timer().handle(),
-            std_instant(deadline),
-        ))
+        Self::Background(wall_clock_wake(deadline))
     }
 
     fn poll(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         match self {
             #[cfg(tokio_backend)]
-            Self::Runtime(s) => s.as_mut().poll(cx),
+            Self::Runtime {
+                stretch,
+                pace,
+                wheel,
+            } => stretch.poll(pace.as_mut(), wheel.as_mut(), cx),
             Self::Background(s) => std::pin::Pin::new(s).poll(cx),
         }
     }
@@ -1329,14 +1312,238 @@ impl TickTimer {
     fn reset(&mut self, deadline: Instant) {
         match self {
             #[cfg(tokio_backend)]
-            Self::Runtime(s) => s.as_mut().reset(deadline),
+            Self::Runtime {
+                stretch,
+                pace,
+                wheel,
+            } => {
+                *stretch = FinalStretch::new(deadline);
+                pace.as_mut().reset(pace_at(deadline));
+                wheel.as_mut().reset(deadline);
+            }
             Self::Background(s) => s.reset(std_instant(deadline)),
         }
     }
 }
 
-/// A deadline on the background timer's clock. Only a thread with no runtime
-/// arms that timer, and there tokio's clock is the wall clock.
+/// `deadline` on the delayed-callback timer, which waits on the OS clock to
+/// the nanosecond, as C's `epicsEventWaitWithTimeout` does.
+fn wall_clock_wake(deadline: Instant) -> crate::runtime::background::Sleep {
+    crate::runtime::background::timer_sleep::sleep_until(
+        &background().timer().handle(),
+        std_instant(deadline),
+    )
+}
+
+/// How late tokio's wheel fires: it rounds a deadline up to its next 1 ms
+/// tick (tokio `runtime/time/source.rs:17-20`), then parks in `epoll_wait`,
+/// whose timeout mio rounds up to whole ms (mio `selector/epoll.rs:46-56`).
+/// A 0.93 ms wait lasted 2.0 ms on it. On Windows mio parks in
+/// `GetQueuedCompletionStatusEx` with that whole-ms timeout
+/// (`sys/windows/iocp.rs:107-116`), which the kernel ends on its scheduler
+/// tick, at most 15.625 ms.
+#[cfg(tokio_backend)]
+const WHEEL_LATENESS: Duration =
+    Duration::from_micros(if cfg!(windows) { 2_000 + 15_625 } else { 2_000 });
+
+/// How far ahead of its deadline the wheel hands a wait over: its lateness,
+/// plus the hand-off's own wake of the wall-clock timer's thread, which took
+/// up to 0.84 ms on a macOS arm64 runner.
+#[cfg(tokio_backend)]
+const HANDOFF_LEAD: Duration = WHEEL_LATENESS.saturating_add(Duration::from_millis(1));
+
+/// Where the wheel stops pacing a wait for `deadline`.
+#[cfg(tokio_backend)]
+fn pace_at(deadline: Instant) -> Instant {
+    deadline.checked_sub(HANDOFF_LEAD).unwrap_or(deadline)
+}
+
+/// A runtime thread's wait: due when the runtime's clock reaches `deadline`,
+/// and woken once, then, with the OS clock's precision.
+///
+/// The wheel is up to [`WHEEL_LATENESS`] late, so its `pace` entry, at
+/// [`pace_at`], wakes the wait's [`Handoff`] instead of the task, and the
+/// handoff queues the rest on the wall-clock timer, which wakes the task. A
+/// wait cancelled before then never touches that shared queue. Completion is
+/// still read from the runtime's clock, which is the wall clock unless a test
+/// paused it; then the `wheel` entry, at the deadline itself, completes the
+/// wait in virtual time.
+///
+/// Both entries are the caller's, inline in a one-shot [`sleep_until`] and
+/// boxed in a re-armable [`Sleep`], which can outlive its wait; completed,
+/// dropped or re-armed, a stretch leaves nothing armed to wake the task.
+#[cfg(tokio_backend)]
+struct FinalStretch {
+    deadline: Instant,
+    /// Built at the first pending poll, with the waker `pace` is polled with.
+    handoff: Option<(Arc<Handoff>, Waker)>,
+}
+
+#[cfg(tokio_backend)]
+impl FinalStretch {
+    fn new(deadline: Instant) -> Self {
+        Self {
+            deadline,
+            handoff: None,
+        }
+    }
+
+    fn poll(
+        &mut self,
+        pace: std::pin::Pin<&mut tokio::time::Sleep>,
+        mut wheel: std::pin::Pin<&mut tokio::time::Sleep>,
+        cx: &mut Context<'_>,
+    ) -> Poll<()> {
+        let deadline = self.deadline;
+        if Instant::now() < deadline && wheel.as_mut().poll(cx).is_pending() {
+            let (handoff, paced) = self.handoff.get_or_insert_with(|| {
+                let handoff = Arc::new(Handoff::new(std_instant(deadline)));
+                let paced = Waker::from(Arc::clone(&handoff));
+                (handoff, paced)
+            });
+            if handoff.wait(cx.waker()) {
+                let near = deadline.saturating_duration_since(Instant::now()) <= HANDOFF_LEAD;
+                // Unconstrained: a spent coop budget would wake `paced` now.
+                let pace = std::pin::pin!(tokio::task::unconstrained(pace));
+                if near || pace.poll(&mut Context::from_waker(paced)).is_ready() {
+                    handoff.queue();
+                }
+                return Poll::Pending;
+            }
+            // Else the wall-clock wake may have landed before `wait` stored
+            // this waker.
+            if Instant::now() < deadline {
+                return Poll::Pending;
+            }
+        }
+        // A held `Sleep` stays armed past its wait: neither the wall-clock
+        // entry nor the task's waker on `wheel` may wake the task again.
+        if let Some((handoff, _)) = &self.handoff {
+            handoff.cancel();
+            let wheel = std::pin::pin!(tokio::task::unconstrained(wheel));
+            let _ = wheel.poll(&mut Context::from_waker(Waker::noop()));
+        }
+        Poll::Ready(())
+    }
+}
+
+#[cfg(tokio_backend)]
+impl Drop for FinalStretch {
+    fn drop(&mut self) {
+        if let Some((handoff, _)) = &self.handoff {
+            handoff.cancel();
+        }
+    }
+}
+
+/// One wait's hand-off from the wheel to the wall-clock timer: the waker the
+/// wheel's `pace` entry fires, which queues the wall-clock wake rather than
+/// waking the task.
+#[cfg(tokio_backend)]
+struct Handoff {
+    deadline: std::time::Instant,
+    state: parking_lot::Mutex<HandoffState>,
+}
+
+#[cfg(tokio_backend)]
+struct HandoffState {
+    /// The waiting task's waker, as of its last poll.
+    task: Option<Waker>,
+    leg: Leg,
+}
+
+/// Which timer holds a wait.
+#[cfg(tokio_backend)]
+enum Leg {
+    /// The wheel's `pace` entry; the wall-clock queue holds nothing.
+    Wheel,
+    /// The wall-clock queue, under this key (`None`: it had shut down).
+    Queued(
+        Option<(
+            crate::runtime::background::TimerHandle,
+            crate::runtime::background::delayed_timer::WakeKey,
+        )>,
+    ),
+    /// Woken, or the wait is gone: nothing is queued and nothing is owed.
+    Done,
+}
+
+#[cfg(tokio_backend)]
+impl Handoff {
+    fn new(deadline: std::time::Instant) -> Self {
+        Self {
+            deadline,
+            state: parking_lot::Mutex::new(HandoffState {
+                task: None,
+                leg: Leg::Wheel,
+            }),
+        }
+    }
+
+    /// Store the task's waker; whether the wheel still holds the wait.
+    fn wait(&self, task: &Waker) -> bool {
+        let mut st = self.state.lock();
+        if !st.task.as_ref().is_some_and(|w| w.will_wake(task)) {
+            st.task = Some(task.clone());
+        }
+        matches!(st.leg, Leg::Wheel)
+    }
+
+    /// Move the wait onto the wall-clock timer. The timer runs its callbacks
+    /// outside its queue lock, so queueing under this one cannot invert.
+    fn queue(self: &Arc<Self>) {
+        let mut st = self.state.lock();
+        if !matches!(st.leg, Leg::Wheel) {
+            return;
+        }
+        let timer = background().timer().handle();
+        let me = Arc::clone(self);
+        let delay = self
+            .deadline
+            .saturating_duration_since(std::time::Instant::now());
+        let key = timer.schedule_wake(delay, Box::new(move || me.fire()));
+        st.leg = Leg::Queued(key.map(|key| (timer, key)));
+    }
+
+    fn fire(&self) {
+        let task = {
+            let mut st = self.state.lock();
+            if !matches!(st.leg, Leg::Queued(_)) {
+                return;
+            }
+            st.leg = Leg::Done;
+            st.task.take()
+        };
+        if let Some(task) = task {
+            task.wake();
+        }
+    }
+
+    fn cancel(&self) {
+        let leg = {
+            let mut st = self.state.lock();
+            st.task = None;
+            std::mem::replace(&mut st.leg, Leg::Done)
+        };
+        if let Leg::Queued(Some((timer, key))) = leg {
+            timer.cancel_wake(key);
+        }
+    }
+}
+
+#[cfg(tokio_backend)]
+impl Wake for Handoff {
+    fn wake(self: Arc<Self>) {
+        self.queue();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.queue();
+    }
+}
+
+/// A deadline on the background timer's clock, the wall clock, which tokio's
+/// is unless a test paused it.
 #[cfg(tokio_backend)]
 fn std_instant(deadline: Instant) -> std::time::Instant {
     deadline.into_std()
@@ -1355,7 +1562,8 @@ pub struct Sleep {
 }
 
 impl Sleep {
-    /// Complete at `deadline`, on the timer the calling thread can reach.
+    /// Complete at `deadline`, on the timer the calling thread can reach, as
+    /// close to it as the OS clock allows.
     pub fn until(deadline: Instant) -> Self {
         Self {
             deadline,
@@ -2088,8 +2296,8 @@ impl RtPolicy {
 /// the runtime's worker threads at startup — not for individual async
 /// tasks.
 ///
-/// Platform support: the OS-scheduler change is wired on Linux, via the
-/// range-probed linear map of `os/posix/osdThread.c`, and on RTEMS, via the
+/// Platform support: the OS-scheduler change is wired on Linux and macOS, via
+/// the range-probed linear map of `os/posix/osdThread.c`, and on RTEMS, via the
 /// fixed map of `os/RTEMS-score/osdThread.c` inverted into POSIX space (see
 /// `map_epics_priority_rtems` — the two maps differ in shape, deliberately).
 /// On other targets the priority enum + API surface still exist but `apply`
@@ -2229,11 +2437,11 @@ fn build_park_state() {
 }
 
 /// A thread's first [`block_on_sync`] builds the thread-locals it reads: the
-/// [`current_thread_waker`] (an `Arc`) and tokio's runtime context, each with
+/// [`ThreadDrive`]'s waker (an `Arc`) and tokio's runtime context, each with
 /// the node glibc callocs to drop it at thread exit — inside a scan thread's
 /// first pass. Building them at entry keeps all three here.
 fn build_drive_state() {
-    drop(current_thread_waker());
+    let _ = DRIVE.try_with(|_| ());
     let _ = RuntimeHandle::try_current();
 }
 
@@ -3017,7 +3225,7 @@ pub fn osd_priority_range_line() -> String {
     format!("OSD priority range min: {min} max {max}, memory not locked")
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn osd_priority_range() -> (i32, i32) {
     match RtPolicy::current() {
         RtPolicy::Disabled => (0, 0),
@@ -3047,7 +3255,7 @@ fn osd_priority_range() -> (i32, i32) {
     }
 }
 
-#[cfg(not(any(target_os = "linux", epics_embedded_target)))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", epics_embedded_target)))]
 fn osd_priority_range() -> (i32, i32) {
     // No OS-scheduler priority API is wired here, so there is no band and no
     // range — the same `Unsupported` this target reports from `apply`.
@@ -3061,7 +3269,7 @@ fn osd_priority_range() -> (i32, i32) {
 /// `RLIMIT_RTPRIO`, so on an RT box with a restricted limit the nominal
 /// range is wider than the usable one; C binary-searches for the real
 /// ceiling and so do we.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RtRange {
     /// The kernel does not report a SCHED_FIFO range at all.
@@ -3078,13 +3286,33 @@ enum RtRange {
 /// Probe once per process and cache. Only reachable on the
 /// [`RtPolicy::AllowRealtime`] path, so a default (switch-off) process
 /// never runs the probe and never makes a scheduler call.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn permitted_fifo_range() -> RtRange {
     static RANGE: std::sync::OnceLock<RtRange> = std::sync::OnceLock::new();
     *RANGE.get_or_init(probe_fifo_range)
 }
 
 #[cfg(target_os = "linux")]
+use libc::pthread_attr_setstack;
+
+#[cfg(target_os = "linux")]
+const PROBE_STACK_MAP: libc::c_int = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_STACK;
+
+/// Darwin has no `MAP_STACK`.
+#[cfg(target_os = "macos")]
+const PROBE_STACK_MAP: libc::c_int = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
+
+// `libc` binds this POSIX call for Linux but not for Darwin.
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn pthread_attr_setstack(
+        attr: *mut libc::pthread_attr_t,
+        stackaddr: *mut libc::c_void,
+        stacksize: libc::size_t,
+    ) -> libc::c_int;
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn probe_fifo_range() -> RtRange {
     // SAFETY: sched_get_priority_min/max take only an int policy and have
     // no preconditions.
@@ -3113,7 +3341,7 @@ fn probe_fifo_range() -> RtRange {
             std::ptr::null_mut(),
             bytes,
             libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_STACK,
+            PROBE_STACK_MAP,
             -1,
             0,
         )
@@ -3131,7 +3359,7 @@ fn probe_fifo_range() -> RtRange {
     // joined; `probe` outlives the joined thread.
     unsafe {
         if libc::pthread_attr_init(attr.as_mut_ptr()) == 0 {
-            if libc::pthread_attr_setstack(attr.as_mut_ptr(), stack, bytes) == 0
+            if pthread_attr_setstack(attr.as_mut_ptr(), stack, bytes) == 0
                 && libc::pthread_create(
                     &mut tid,
                     attr.as_ptr(),
@@ -3151,7 +3379,7 @@ fn probe_fifo_range() -> RtRange {
 
 /// C `find_pri_range` (`osdThread.c:270-312`): the thread body of
 /// `probe_fifo_range`, which passes `(min, max, out)`.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 extern "C" fn probe_thread(arg: *mut libc::c_void) -> *mut libc::c_void {
     // SAFETY: `probe_fifo_range` joins this thread before touching the tuple.
     let (min, max, out) = unsafe { &mut *arg.cast::<(i32, i32, RtRange)>() };
@@ -3192,7 +3420,7 @@ extern "C" fn probe_thread(arg: *mut libc::c_void) -> *mut libc::c_void {
 /// `map_epics_priority_rtems` for the shape and the reason. The `test`
 /// arm of the cfg exists so the two maps can be compared in one process
 /// on the host; without it the divergence test would silently vanish.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn map_epics_priority(epics_priority: u32, min: i32, max: i32) -> i32 {
     // `osdThread.c:133-134`: a degenerate range collapses to one level.
     if max == min {
@@ -3311,7 +3539,9 @@ fn fifo_attr_refusal(priority: ThreadPriority) -> Option<std::io::Error> {
     Some(std::io::Error::from_raw_os_error(libc::EINVAL))
 }
 
-/// No target but Linux maps a priority outside its settable range.
+/// C refuses nothing off Linux: Darwin's attr calls and `pthread_create` take
+/// a FIFO priority past the range (oss 48 and 79 on 15..47, measured on the
+/// macOS runners), and no other wired target maps past its range.
 #[cfg(not(target_os = "linux"))]
 fn fifo_attr_refusal(_priority: ThreadPriority) -> Option<std::io::Error> {
     None
@@ -3321,7 +3551,7 @@ fn fifo_attr_refusal(_priority: ThreadPriority) -> Option<std::io::Error> {
 /// place this crate touches the scheduler; returns the raw `pthread_*`
 /// status (0 on success). Counting lives here so the "switch off ⟹ no
 /// scheduler call" guarantee is observable on every target that has one.
-#[cfg(any(target_os = "linux", epics_embedded_target))]
+#[cfg(any(target_os = "linux", target_os = "macos", epics_embedded_target))]
 fn set_fifo_priority(oss: i32) -> i32 {
     SCHED_CALLS_MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     #[cfg(test)]
@@ -3329,11 +3559,11 @@ fn set_fifo_priority(oss: i32) -> i32 {
     set_fifo_priority_raw(oss)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn set_fifo_priority_raw(oss: i32) -> i32 {
-    let param = libc::sched_param {
-        sched_priority: oss,
-    };
+    // SAFETY: plain-integer struct, valid zeroed; Darwin's has a private tail.
+    let mut param: libc::sched_param = unsafe { std::mem::zeroed() };
+    param.sched_priority = oss;
     // SAFETY: pthread_setschedparam operates on the calling thread with a
     // stack-local sched_param and a valid policy constant.
     unsafe { libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_FIFO, &param) }
@@ -3428,7 +3658,7 @@ fn set_fifo_priority_raw(oss: i32) -> i32 {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn apply_priority_impl(epics_priority: u32) -> PriorityApplied {
     let (min, max) = match permitted_fifo_range() {
         RtRange::Unsupported => return PriorityApplied::Unsupported,
@@ -3490,13 +3720,13 @@ fn apply_priority_impl(epics_priority: u32) -> PriorityApplied {
     }
 }
 
-#[cfg(not(any(target_os = "linux", epics_embedded_target)))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", epics_embedded_target)))]
 fn apply_priority_impl(_epics_priority: u32) -> PriorityApplied {
-    // No OS-scheduler priority API is wired on other targets. The two that
+    // No OS-scheduler priority API is wired on other targets. The ones that
     // are wired each needed a *measured* target band before they could be:
-    // Linux probes for its settable ceiling at runtime, and RTEMS's map is
-    // pinned against libbsd's network-thread band measured on the bring-up
-    // guest. No number here is guessable, so a
+    // Linux and macOS probe for their settable ceiling at runtime, and
+    // RTEMS's map is pinned against libbsd's network-thread band measured on
+    // the bring-up guest. No number here is guessable, so a
     // new target gets `Unsupported` until somebody measures it rather than a
     // plausible-looking range.
     PriorityApplied::Unsupported
@@ -3509,14 +3739,17 @@ fn apply_priority_impl(_epics_priority: u32) -> PriorityApplied {
 /// process can run its whole life and this stays `0`. Also answers
 /// "did this IOC ever actually try to go real-time?" from a log line.
 ///
-/// Always `0` off Linux, where no scheduler call is wired at all.
+/// Always `0` off Linux, macOS and RTEMS, where no scheduler call is wired.
 pub fn sched_calls_made() -> usize {
     SCHED_CALLS_MADE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 static SCHED_CALLS_MADE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-#[cfg(all(test, any(target_os = "linux", epics_embedded_target)))]
+#[cfg(all(
+    test,
+    any(target_os = "linux", target_os = "macos", epics_embedded_target)
+))]
 thread_local! {
     /// Every scheduler call this crate makes passes through
     /// [`set_fifo_priority`], which bumps this. Tests assert the delta is
@@ -4095,20 +4328,20 @@ mod tests {
         );
     }
 
-    /// A canceller that unparks the thread without waking the future ends the
-    /// wait, though the `woken` flag is clear (future_exec.rs and
-    /// timer_sleep.rs cancel this way).
+    /// A canceller that wakes the future's waker ends a parked drive with
+    /// `None`, though the future itself is still pending.
     #[test]
-    fn a_raw_unpark_with_cancel_ends_the_wait() {
+    fn a_cancel_with_a_wake_ends_the_wait() {
         use std::sync::atomic::{AtomicBool, Ordering};
         let cancel = Arc::new(AtomicBool::new(false));
+        let waker = Arc::new(std::sync::Mutex::new(None::<Waker>));
         let (polled_tx, polled_rx) = std::sync::mpsc::channel();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let c = cancel.clone();
-        let driver = std::thread::spawn(move || {
+        let (c, w) = (cancel.clone(), waker.clone());
+        std::thread::spawn(move || {
             let gate = Gate {
                 ready: Arc::new(AtomicBool::new(false)),
-                waker: Arc::new(std::sync::Mutex::new(None)),
+                waker: w,
                 polled: polled_tx,
             };
             let out = park_on_interruptible(gate, || c.load(Ordering::Acquire));
@@ -4116,11 +4349,11 @@ mod tests {
         });
         polled_rx.recv().unwrap();
         cancel.store(true, Ordering::Release);
-        driver.thread().unpark();
+        waker.lock().unwrap().take().unwrap().wake();
         assert_eq!(
             done_rx.recv_timeout(std::time::Duration::from_secs(5)),
             Ok(true),
-            "a cancelled, unparked drive must return None"
+            "a cancelled, woken drive must return None"
         );
     }
 
@@ -5046,44 +5279,166 @@ mod tests {
         );
     }
 
-    /// The other half of the same boundary: a runtime thread must still take
-    /// tokio's timer, because that is the only one that moves with tokio's
-    /// clock — which `#[tokio::test(start_paused = true)]` makes virtual. The
-    /// discriminator is the background executor's `OnceLock`: it is untouched
-    /// unless something reached for the wall-clock timer. Relies on nextest's
-    /// process-per-test isolation for the "untouched" half.
+    /// The other half of the same boundary: a runtime thread's wait completes
+    /// on tokio's clock, the one `#[tokio::test(start_paused = true)]` makes
+    /// virtual. Its final stretch is also armed on the wall-clock timer, which
+    /// only wakes, so hours of virtual waiting still take no wall time.
     #[cfg(tokio_backend)]
-    #[tokio::test]
-    async fn a_bounded_wait_on_a_runtime_thread_keeps_the_runtime_s_timer() {
+    #[tokio::test(start_paused = true)]
+    async fn a_runtime_thread_s_wait_completes_on_the_runtime_s_clock() {
+        let (started, wall) = (Instant::now(), std::time::Instant::now());
+        let hour = Duration::from_secs(3600);
+        assert!(timeout(hour, std::future::pending::<()>()).await.is_err());
+        let mut every = interval(Period::new(hour).unwrap());
+        every.tick().await;
+        every.tick().await;
+        assert!(started.elapsed() >= 2 * hour);
         assert!(
-            BACKGROUND.get().is_none(),
-            "the premise: nothing has started the background facility yet"
-        );
-        let r = timeout(Duration::from_millis(10), std::future::pending::<()>()).await;
-        assert!(r.is_err());
-        assert!(
-            BACKGROUND.get().is_none(),
-            "a runtime thread armed tokio's timer, not the background one"
+            wall.elapsed() < Duration::from_secs(60),
+            "waited out a virtual deadline on the wall clock"
         );
     }
 
+    /// Only a wait's last [`HANDOFF_LEAD`] reaches the shared wall-clock
+    /// queue: a bounded wait whose future wins before then does not even start
+    /// the background facility, and one that runs out queues one entry.
+    /// Relies on nextest's process-per-test isolation for the first half.
     #[cfg(tokio_backend)]
     #[tokio::test]
-    async fn an_interval_on_a_runtime_thread_keeps_the_runtime_s_timer() {
+    async fn only_a_wait_s_final_stretch_reaches_the_wall_clock_timer() {
+        let won = timeout(
+            Duration::from_secs(30),
+            tokio::time::sleep(Duration::from_millis(5)),
+        )
+        .await;
+        assert!(won.is_ok());
         assert!(
             BACKGROUND.get().is_none(),
-            "the premise: nothing has started the background facility yet"
+            "a wait cancelled on the wheel started the background facility"
         );
-        let started = Instant::now();
-        let mut every = interval(Period::new(Duration::from_millis(10)).unwrap());
-        every.tick().await;
-        every.tick().await;
-        every.tick().await;
-        assert!(started.elapsed() >= Duration::from_millis(20));
-        assert!(
-            BACKGROUND.get().is_none(),
-            "a runtime thread armed tokio's timer, not the background one"
-        );
+        background();
+        let armed = background_timer_scheduled_total();
+        let lost = timeout(Duration::from_millis(5), std::future::pending::<()>()).await;
+        assert!(lost.is_err());
+        assert_eq!(background_timer_scheduled_total(), armed + 1);
+    }
+
+    /// A runtime thread's wait wakes its task once, at the deadline: the
+    /// wheel's early fire hands the wait to the wall-clock timer without a
+    /// poll of its own.
+    #[cfg(tokio_backend)]
+    #[tokio::test]
+    async fn a_runtime_thread_s_wait_wakes_its_task_once() {
+        let mut polls = 0;
+        let pending = std::future::poll_fn(|_| {
+            polls += 1;
+            Poll::<()>::Pending
+        });
+        assert!(timeout(Duration::from_millis(20), pending).await.is_err());
+        assert_eq!(polls, 2, "the first poll, then the deadline's wake");
+    }
+
+    /// The same once for a re-armable [`Sleep`] held past its wait, whose
+    /// wheel entry at the deadline stays armed until it is reset or dropped.
+    #[cfg(tokio_backend)]
+    #[tokio::test]
+    async fn a_held_sleep_wakes_nobody_after_its_wait() {
+        // Started first, or the hand-off starting it can outlast the deadline
+        // and leave the wheel to end the wait.
+        background();
+        let mut held = Sleep::until(deadline_from_now(Duration::from_millis(10)));
+        (&mut held).await;
+        let mut polls = 0;
+        let mut after = std::pin::pin!(tokio::time::sleep(Duration::from_millis(10)));
+        std::future::poll_fn(|cx| {
+            polls += 1;
+            after.as_mut().poll(cx)
+        })
+        .await;
+        assert_eq!(polls, 2, "a poll of its own, then its wake");
+        drop(held);
+    }
+
+    /// The median lateness of `n` waits of `period`.
+    #[cfg(tokio_backend)]
+    async fn median_lateness(
+        n: usize,
+        period: Duration,
+        mut wait: impl std::ops::AsyncFnMut(),
+    ) -> Duration {
+        let mut late = Vec::with_capacity(n);
+        for _ in 0..n {
+            let started = std::time::Instant::now();
+            wait().await;
+            late.push(started.elapsed().saturating_sub(period));
+        }
+        late.sort();
+        late[n / 2]
+    }
+
+    /// The wall-clock timer waking a thread blocked on a condvar, the shape
+    /// of C's timer queue signalling an `epicsEvent`: what a wake from another
+    /// thread costs on this host, 0.66 ms on one macOS arm64 runner and
+    /// 0.15 ms on another.
+    #[cfg(tokio_backend)]
+    fn condvar_lateness(n: usize, period: Duration) -> Duration {
+        let timer = background().timer().handle();
+        let event = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let mut late = Vec::with_capacity(n);
+        for _ in 0..n {
+            let started = std::time::Instant::now();
+            let signal = Arc::clone(&event);
+            let _key = timer
+                .schedule_wake(
+                    period,
+                    Box::new(move || {
+                        *signal.0.lock().unwrap() = true;
+                        signal.1.notify_one();
+                    }),
+                )
+                .expect("the wall-clock timer runs");
+            let mut full = event.0.lock().unwrap();
+            while !*full {
+                full = event.1.wait(full).unwrap();
+            }
+            *full = false;
+            late.push(started.elapsed().saturating_sub(period));
+        }
+        late.sort();
+        late[n / 2]
+    }
+
+    /// A runtime thread wakes at its deadline, not at the wheel's next whole
+    /// millisecond: a 0.93 ms wait on the wheel alone lasted 2.0 ms, where C's
+    /// `epicsEventWaitWithTimeout` waits on the OS clock. Both holders of the
+    /// wheel, the one-shot `sleep` and the re-armable `Sleep`, and a wait the
+    /// wheel paces first, each within 0.5 ms of [`condvar_lateness`], which
+    /// C's hand-off pays too.
+    #[cfg(tokio_backend)]
+    #[tokio::test]
+    async fn a_runtime_thread_s_wait_wakes_at_its_deadline() {
+        let short = Duration::from_micros(930);
+        let floor = condvar_lateness(21, short);
+        // Long enough for the wheel to pace it first.
+        let long = HANDOFF_LEAD + Duration::from_micros(3300);
+        let mut rearmed = Sleep::until(Instant::now());
+        let one_shot = median_lateness(21, short, async || sleep(short).await).await;
+        let re_armed = median_lateness(21, short, async || {
+            rearmed.reset(deadline_from_now(short));
+            (&mut rearmed).await;
+        })
+        .await;
+        let paced = median_lateness(11, long, async || sleep(long).await).await;
+        for (what, late) in [
+            ("sleep", one_shot),
+            ("Sleep", re_armed),
+            ("long sleep", paced),
+        ] {
+            assert!(
+                late < floor + Duration::from_micros(500),
+                "{what}: median {late:?} late, a condvar waiter {floor:?}"
+            );
+        }
     }
 
     #[test]
@@ -5527,7 +5882,7 @@ mod tests {
     /// Mutation check: deleting the `RtPolicy::Disabled` arm in
     /// `apply_to_current_thread_under` (so it always calls
     /// `apply_priority_impl`) makes the `SCHED_CALLS` assertion fail.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn switch_off_makes_no_scheduler_calls() {
         let before = SCHED_CALLS.with(std::cell::Cell::get);
@@ -5557,7 +5912,7 @@ mod tests {
     ///
     /// Runs on its own thread: on a host that *does* grant RT, leaving the
     /// test-harness thread in a real-time band would outlive the test.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn switch_on_either_sticks_or_falls_back_without_killing_the_thread() {
         let outcome = std::thread::spawn(|| {

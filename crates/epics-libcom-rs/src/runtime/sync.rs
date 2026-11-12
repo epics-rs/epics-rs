@@ -1055,7 +1055,7 @@ mod win_event {
 /// with no wake at all. Only the thread that made it may sleep on it.
 ///
 /// std's thread parker, except on Windows, where std's timed park ends on
-/// the scheduler tick; there it is C's own event wait ([`win_event`]).
+/// the scheduler tick; there it is C's own event wait (`win_event`).
 #[cfg(not(windows))]
 pub(crate) struct Sleeper(std::thread::Thread);
 
@@ -1078,7 +1078,7 @@ impl Sleeper {
     }
 }
 
-/// See the non-Windows [`Sleeper`].
+/// See the non-Windows `Sleeper`.
 #[cfg(windows)]
 pub(crate) struct Sleeper(win_event::WinEvent);
 
@@ -1311,7 +1311,7 @@ impl std::fmt::Debug for EpicsEvent {
 ///
 /// Keeping the two apart is what lets the state lock be the PI one. The wake
 /// then needs no lock at all: this is one latch plus the waiter's
-/// [`Sleeper`], so a signaller touches that and nothing any other requester
+/// `Sleeper`, so a signaller touches that and nothing any other requester
 /// shares. C's `epicsEvent` is itself a PI mutex and a condvar
 /// (`osdEvent.c:29-31`, `:54` through `globalAttrDefault`,
 /// `osdMutex.c:71-73`); this has no mutex of its own to invert. PR #996 reaches

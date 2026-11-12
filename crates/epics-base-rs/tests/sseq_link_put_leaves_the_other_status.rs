@@ -45,7 +45,6 @@ async fn puts_under_one_lock(puts: &[(&str, EpicsValue)]) -> PvDatabase {
                 .unwrap();
         }
     }
-    epics_base_rs::runtime::task::sleep(Duration::from_millis(100)).await;
     db
 }
 

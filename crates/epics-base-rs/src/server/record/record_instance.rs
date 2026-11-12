@@ -13788,6 +13788,25 @@ impl RecordInstance {
         );
     }
 
+    /// Post the link statuses a link put's `special()` stored
+    /// ([`crate::server::records::link_status::post_link_status`]) at the
+    /// record's own mask: C's `special()` posts them before `dbPut` returns.
+    /// The only taker of `LinkCheckState::put_posts`, called by both routes
+    /// that put a record's own link field: `special_after_put` and
+    /// `set_link_text_held`. `put_common` never sees one, as no
+    /// `LinkCheckSpec` names a `dbCommon` field.
+    pub(crate) fn post_put_link_status_in(&mut self, burst: &mut PostBurst) {
+        let Some(check) = self.record.link_check() else {
+            return;
+        };
+        let (spec, owed) = (check.spec, std::mem::take(&mut check.state.put_posts));
+        for (i, &(_, status)) in spec.links.iter().enumerate() {
+            if owed & 1 << i != 0 {
+                self.notify_field_in(burst, status, spec.mask);
+            }
+        }
+    }
+
     /// [`Self::notify_field`] posting into the caller's `burst`.
     pub fn notify_field_in(
         &mut self,

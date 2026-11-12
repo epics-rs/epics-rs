@@ -98,8 +98,6 @@ async fn repoint(db: &Db, rec: &str, field: &str) {
     db.put_record_field_from_ca_no_notify(rec, field, EpicsValue::String("SRC".into()))
         .await
         .unwrap();
-    // The classification is scheduled onto the executor, not run inline.
-    epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(50)).await;
 }
 
 /// The three calcouts: `DBE_VALUE` only, so a LOG-only subscription is silent.

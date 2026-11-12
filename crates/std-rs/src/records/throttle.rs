@@ -242,24 +242,22 @@ impl ThrottleRecord {
     /// (throttleRecord.c:222, :370). C classifies, and posts whatever its
     /// value, both at init and the put link's alone on an OUT/SINP
     /// `special()`, which leaves the other status as it stands. A put's
-    /// status is stored before the put returns: the SYNC arm reads SIV
-    /// (throttleRecord.c:381). A no-op when the record is not registered (no
-    /// handle).
+    /// status is stored and posted before the put returns: the SYNC arm reads
+    /// SIV (throttleRecord.c:381). A no-op when the record is not registered
+    /// (no handle).
     fn refresh_link_status(&mut self, posts: LinkStatusPosts) {
-        let stored = post_link_status(
+        post_link_status(
             self.async_ctx.as_ref(),
             &self.link_gen,
             vec![
                 ("OV", self.out.clone(), LinkRole::Output),
                 ("SIV", self.sinp.clone(), LinkRole::Input),
             ],
-            THROTTLE_LINK_CHECK.rule,
-            THROTTLE_LINK_CHECK.mask,
             posts,
+            &THROTTLE_LINK_CHECK,
+            &mut self.link_status,
+            &mut self.link_check,
         );
-        if let (LinkStatusPosts::Put(field), Some(status)) = (posts, stored) {
-            self.link_status[usize::from(field == "SIV")] = status;
-        }
     }
 
     /// C `valueSync` (throttleRecord.c:616-656) — the single entry to a

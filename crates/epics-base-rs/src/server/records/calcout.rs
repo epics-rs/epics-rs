@@ -663,7 +663,7 @@ impl CalcoutRecord {
     /// `checkLinksCallback` re-poll. Runs at record init only
     /// (`set_async_context`, `init_links`): a runtime link put is `special()`'s,
     /// which C answers without classifying. No-op without an async context.
-    fn refresh_link_status(&self) {
+    fn refresh_link_status(&mut self) {
         let mut links: Vec<(&'static str, PvString, LinkRole)> = self
             .input_links()
             .into_iter()
@@ -676,9 +676,10 @@ impl CalcoutRecord {
             self.async_ctx.as_ref(),
             &self.link_gen,
             links,
-            LinkRule::Volatile,
-            CALCOUT_LINK_CHECK.mask,
             LinkStatusPosts::All,
+            &CALCOUT_LINK_CHECK,
+            &mut self.link_status,
+            &mut self.link_check,
         );
     }
 }

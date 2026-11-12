@@ -929,7 +929,10 @@ fn special_after_put(
     // NUSE arm posts the clamped value and only then `return (-1)`
     // (`aCalcoutRecord.c:495-499`), and `goto done` skips only dbPut's post.
     emit_cycle_posts_in(instance, burst);
-    status?;
+    if let Err(err) = status {
+        instance.post_put_link_status_in(burst);
+        return Err(err);
+    }
 
     // C `special()`'s CONSTANT-link re-seed (`calcoutRecord.c:373-378`,
     // `sCalcoutRecord.c:513-518`, `aCalcoutRecord.c:533-538`,
@@ -968,6 +971,9 @@ fn special_after_put(
             instance.notify_field_in(burst, value_field, mask);
         }
     }
+    // After the re-seed's value post, as C's `special()` posts them
+    // (`sCalcoutRecord.c:516`, `:569`).
+    instance.post_put_link_status_in(burst);
 
     // C `special(SPC_MOD)` pass 1 on SIMM (`longinRecord.c:171-177` and the
     // identical arm in all 21 SSCN-bearing records):

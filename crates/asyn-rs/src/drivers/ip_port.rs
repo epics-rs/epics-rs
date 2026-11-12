@@ -4142,17 +4142,23 @@ mod tests {
     fn a_dual_stack_name_reaches_its_ipv4_address() {
         use std::net::Ipv6Addr;
 
-        let (tcp4, tcp6, udp4, udp6) = (0..named_port::ATTEMPTS)
-            .find_map(|_| {
-                let tcp4 = TcpListener::bind("127.0.0.1:0").ok()?;
-                let port = tcp4.local_addr().ok()?.port();
-                let tcp6 = TcpListener::bind((Ipv6Addr::LOCALHOST, port)).ok()?;
-                let udp4 = UdpSocket::bind(("127.0.0.1", port)).ok()?;
-                let udp6 = UdpSocket::bind((Ipv6Addr::LOCALHOST, port)).ok()?;
-                Some((tcp4, tcp6, udp4, udp6))
-            })
-            .expect("one number free on both loopbacks for TCP and UDP");
-        let port = tcp4.local_addr().unwrap().port();
+        // A drawn number, not a `bind(0)` one: Windows hands those out in
+        // sequence, through blocks other tests hold on UDP or `::1`.
+        let (port, tcp4, tcp6, udp4, udp6) = named_port::on_a_named_port(|port| {
+            let bind = || -> std::io::Result<_> {
+                Ok((
+                    TcpListener::bind(("127.0.0.1", port))?,
+                    TcpListener::bind((Ipv6Addr::LOCALHOST, port))?,
+                    UdpSocket::bind(("127.0.0.1", port))?,
+                    UdpSocket::bind((Ipv6Addr::LOCALHOST, port))?,
+                ))
+            };
+            match bind() {
+                Ok((tcp4, tcp6, udp4, udp6)) => Some((port, tcp4, tcp6, udp4, udp6)),
+                Err(e) if epics_libcom_rs::net::port_held(&e) => None,
+                Err(e) => panic!("bind {port} on both loopbacks: {e}"),
+            }
+        });
 
         let mut drv = DrvAsynIPPort::new("iptest", &format!("localhost:{port}")).unwrap();
         drv.connect(&AsynUser::default()).unwrap();

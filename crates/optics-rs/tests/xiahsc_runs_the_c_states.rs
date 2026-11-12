@@ -518,6 +518,9 @@ async fn an_idle_program_polls_every_five_seconds() {
 #[epics_base_rs::epics_test]
 async fn a_read_timeout_is_a_communications_error_until_init() {
     let rig = boot(|_| {}).await;
+    // The program's response wait (15 x 0.02 s) outlasts its own 0.25 s TMOT
+    // by only 50 ms, in C too; a shorter TMOT makes SEVR land first.
+    put(&rig.db, "T:asyn.TMOT", "0.05").await;
     rig.hsc.set_silent(true);
     put_hsc(&rig, "locate", "1").await;
     assert!(eventually(|| v(&rig, "error") == 18.0).await);

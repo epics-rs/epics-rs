@@ -103,24 +103,23 @@ async fn dbcarun_returns_after_a_local_links_first_process() {
     assert_eq!(db.get_pv("H").unwrap().to_f64(), Some(4.0));
 }
 
-/// The report at the earliest point it can exist: the open drops its init
-/// as it reaches the network half, so `dbCaRun` waits on `H`'s local link
-/// alone.
+/// The report at the earliest point it can exist: the open `dbCaRun`
+/// releases drops its init as it reaches the network half, so nothing
+/// holds `dbCaRun` past it.
 #[epics_macros_rs::epics_test]
 async fn a_link_ready_as_it_opens_leaves_dbcarun_nothing_to_wait_for() {
     let (db, lset) = ioc(true).await;
-    calink_ioc::until("X.VAL$x opened", || lset.opened("X.VAL$x").is_some()).await;
-    assert_eq!(
-        lset.opened("X.VAL$x"),
-        Some(true),
-        "dbChannelTest accepts X.VAL$x: dbCaRun counts it"
-    );
     epics_base_rs::runtime::task::timeout(
         fact_budget::FACT_BUDGET,
         db.process_cp_links_on_connect(),
     )
     .await
     .expect("dbCaRun returns with the network init dropped");
+    assert_eq!(
+        lset.opened("X.VAL$x"),
+        Some(true),
+        "dbChannelTest accepts X.VAL$x: dbCaRun counts it"
+    );
 }
 
 /// Held by the network half, the init keeps `dbCaRun` waiting; its drop
@@ -128,13 +127,15 @@ async fn a_link_ready_as_it_opens_leaves_dbcarun_nothing_to_wait_for() {
 #[epics_macros_rs::epics_test]
 async fn dbcarun_waits_until_the_open_drops_its_init() {
     let (db, lset) = ioc(false).await;
-    calink_ioc::until("X.VAL$x's init held", || !lset.held.lock().is_empty()).await;
-    calink_ioc::until("H processed", || {
-        db.get_pv("H").unwrap().to_f64() == Some(0.0) && lset.opened("NOPE").is_some()
-    })
-    .await;
     let run = db.process_cp_links_on_connect();
     let mut run = std::pin::pin!(run);
+    calink_ioc::until("X.VAL$x's init held and H processed", || {
+        assert!(poll_once(run.as_mut()).is_pending());
+        !lset.held.lock().is_empty()
+            && db.get_pv("H").unwrap().to_f64() == Some(0.0)
+            && lset.opened("NOPE").is_some()
+    })
+    .await;
     assert!(poll_once(run.as_mut()).is_pending());
     lset.held.lock().clear();
     epics_base_rs::runtime::task::timeout(fact_budget::FACT_BUDGET, run)
@@ -147,9 +148,9 @@ async fn dbcarun_waits_until_the_open_drops_its_init() {
 #[epics_macros_rs::epics_test]
 async fn only_a_local_link_staged_before_dbcarun_carries_an_init() {
     let (db, lset) = ioc(true).await;
+    db.process_cp_links_on_connect().await;
     calink_ioc::until("NOPE opened", || lset.opened("NOPE").is_some()).await;
     assert_eq!(lset.opened("NOPE"), Some(false));
-    db.process_cp_links_on_connect().await;
     db.put_record_field_from_ca(
         "H",
         "INPA",

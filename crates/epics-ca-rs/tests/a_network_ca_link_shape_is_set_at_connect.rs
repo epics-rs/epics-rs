@@ -211,6 +211,7 @@ async fn a_network_ca_link_shape_is_set_at_connect() {
         .unwrap();
     db.ioc_init().await;
     db.setup_external_link_opens().await;
+    db.process_cp_links_on_connect().await;
     assert!(
         resolver
             .wait_for_link_connected(SRC, fact_budget::FACT_BUDGET)

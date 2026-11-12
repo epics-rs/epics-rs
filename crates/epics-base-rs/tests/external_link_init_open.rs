@@ -205,6 +205,7 @@ async fn out_only_external_link_is_opened_at_init() {
 
     let staged = db.setup_external_link_opens().await;
     assert_eq!(staged, 1, "an OUT-only external link must be staged");
+    db.process_cp_links_on_connect().await;
     db.sync_external_link_puts().await;
     assert_eq!(
         lset.opened_names(),
@@ -242,6 +243,7 @@ async fn record_specific_input_link_fields_are_opened_at_init() {
 
     let staged = db.setup_external_link_opens().await;
     assert_eq!(staged, 2, "both INPA and INPB must be staged");
+    db.process_cp_links_on_connect().await;
     db.sync_external_link_puts().await;
     assert_eq!(
         lset.opened_names(),
@@ -348,6 +350,7 @@ async fn plain_non_local_db_link_keeps_its_field_in_the_channel_name() {
 
     assert_eq!(db.initialize_link_locality().await, 1);
     db.setup_external_link_opens().await;
+    db.process_cp_links_on_connect().await;
     db.sync_external_link_puts().await;
     assert_eq!(lset.opened_names(), vec!["OTHER:PV.SEVR".to_string()]);
 }
@@ -509,6 +512,7 @@ async fn external_forward_link_is_opened_at_init() {
 
     let staged = db.setup_external_link_opens().await;
     assert_eq!(staged, 1, "an external FLNK must be staged at init");
+    db.process_cp_links_on_connect().await;
     db.sync_external_link_puts().await;
     assert_eq!(
         lset.opened_names(),
@@ -606,6 +610,7 @@ async fn external_cp_link_already_warmed_is_not_staged_again() {
         "the CP pass already staged this link's open; the init pass must not \
          stage a second one"
     );
+    db.process_cp_links_on_connect().await;
     db.sync_external_link_puts().await;
 
     assert_eq!(
@@ -644,6 +649,7 @@ async fn no_link_set_registered_stages_nothing_and_leaves_the_link_openable() {
     let lset = CountingLset::new(&reads);
     db.register_link_set("ca", lset.clone()).await;
     assert_eq!(db.setup_external_link_opens().await, 1);
+    db.process_cp_links_on_connect().await;
     db.sync_external_link_puts().await;
     assert_eq!(lset.opened_names(), vec!["REMOTE:IN".to_string()]);
 }

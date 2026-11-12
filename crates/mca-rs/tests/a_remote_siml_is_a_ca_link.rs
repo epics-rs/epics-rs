@@ -68,6 +68,7 @@ record(mca, "MA") {
     )
     .await;
     db.setup_external_link_opens().await;
+    db.process_cp_links_on_connect().await;
 
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {

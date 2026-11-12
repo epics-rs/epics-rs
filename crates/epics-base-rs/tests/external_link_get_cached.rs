@@ -174,6 +174,7 @@ async fn a_cache_miss_stages_the_open_instead_of_opening_inline() {
         "cycle 1 reads a cold cache, so the record keeps its prior value"
     );
 
+    db.process_cp_links_on_connect().await;
     db.sync_external_link_puts().await;
     assert_eq!(
         db.external_link_opens_completed(),
@@ -241,6 +242,7 @@ async fn a_permanently_cold_link_is_opened_once_not_once_per_scan() {
         .await;
 
     add_ai_with_inp(&db, "AI_COLD", "DEAD:IN CA").await;
+    db.process_cp_links_on_connect().await;
     for _ in 0..8 {
         process(&db, "AI_COLD").await;
         db.sync_external_link_puts().await;
@@ -273,6 +275,7 @@ async fn distinct_links_are_each_opened_once() {
     add_ai_with_inp(&db, "AI_B", "B:IN CA").await;
     process(&db, "AI_A").await;
     process(&db, "AI_B").await;
+    db.process_cp_links_on_connect().await;
     db.sync_external_link_puts().await;
 
     assert_eq!(

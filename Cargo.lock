@@ -3399,9 +3399,9 @@ dependencies = [
 
 [[package]]
 name = "rust-hdf5"
-version = "0.7.9"
+version = "0.7.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "36e40088823964d69fc4f6012fcce5f6e7a9a83404301f937d6149b5984daf54"
+checksum = "5ca38ae195212034cbe82f2ec702f3a348346d0e27626fbd8e7d6aa6cf3d8f66"
 dependencies = [
  "bzip2",
  "fearless_simd 1.0.0",

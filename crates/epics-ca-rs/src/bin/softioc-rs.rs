@@ -1121,7 +1121,7 @@ impl Failure {
 // extra CPU per put on a 96-core host. Multi-thread flavor is kept so
 // `block_on_sync` works from runtime tasks.
 #[cfg(tokio_backend)]
-#[tokio::main(worker_threads = 1)]
+#[epics_base_rs::epics_main(worker_threads = 1)]
 async fn main() -> std::process::ExitCode {
     let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
     // C's `case 'h'` (`softMain.cpp:165-168`) is the one arm that returns

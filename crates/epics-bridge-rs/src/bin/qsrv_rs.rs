@@ -62,7 +62,7 @@ fn parse_macro(raw: &str) -> Result<(String, String), String> {
 // 96-core host. Multi-thread flavor is kept: current_thread would refuse
 // `block_on_sync` from runtime tasks.
 #[cfg(tokio_backend)]
-#[tokio::main(worker_threads = 1)]
+#[epics_base_rs::epics_main(worker_threads = 1)]
 async fn main() -> ExitCode {
     // softIocPVX's console is errlog's stderr; an application subscriber
     // would keep errlog lines as its own records on stdout instead.

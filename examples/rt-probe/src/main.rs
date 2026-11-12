@@ -11,8 +11,9 @@
 mod probe;
 
 #[cfg(all(target_os = "linux", tokio_backend))]
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    probe::run()
+#[epics_base_rs::epics_main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    probe::run().await
 }
 
 /// The `exec_backend` arm on Linux: the measurement targets are the async CA

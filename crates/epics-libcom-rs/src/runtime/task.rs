@@ -1026,6 +1026,24 @@ pub fn adopt_current_runtime() {
     }
 }
 
+/// The runtime an IOC serves from: every thread it starts enters the IOC at
+/// C's `CAS-client` band, `epicsThreadPriorityCAServerLow`
+/// (`caservertask.c:109`).
+///
+/// The hosted CA server is not thread-per-client; its connections are tasks
+/// on these threads, so the band C gives each client's thread is theirs. Left
+/// on the default policy they queue a CA put behind any time-shared load, and
+/// hold record locks that FIFO scan threads wait on. tokio runs
+/// `on_thread_start` on its blocking-pool threads too, so those take the
+/// band as well.
+pub fn ioc_runtime_builder() -> tokio::runtime::Builder {
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.enable_all().on_thread_start(|| {
+        let _ = enter_ioc_thread(ThreadPriority::CaServerLow);
+    });
+    builder
+}
+
 /// The current runtime; else the adopted one; else, when nothing has adopted
 /// one, the first runtime a call was made on; else a runtime of this crate's
 /// own, kept for blocking work only, so the seam never panics.
@@ -5976,6 +5994,24 @@ mod tests {
             thread_by_name(name).is_none(),
             "the row must be reaped with the thread, not left for the next reader"
         );
+    }
+
+    /// The IOC runtime's worker is entered at the `CAS-client` band before it
+    /// runs a task, as C's per-client thread is (`caservertask.c:109`).
+    #[test]
+    fn an_ioc_runtime_worker_takes_the_ca_server_band() {
+        let name = "iocRtBand";
+        assert!(thread_by_name(name).is_none(), "name must start unused");
+        let rt = ioc_runtime_builder()
+            .worker_threads(1)
+            .thread_name(name)
+            .build()
+            .unwrap();
+
+        let ran_on = rt.block_on(rt.spawn(async { thread_name_self() })).unwrap();
+        assert_eq!(ran_on, name, "the task ran on a listed worker");
+        let row = thread_by_name(name).expect("the worker is listed");
+        assert_eq!(row.epics_priority(), ThreadPriority::CaServerLow.value());
     }
 
     /// C's `_main_`: every job runs on one thread, which is listed once, at

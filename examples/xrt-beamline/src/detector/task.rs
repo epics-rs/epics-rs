@@ -163,11 +163,10 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             .unwrap_or(0);
 
         // Read initial config
-        let mut config =
-            match XrtConfigSnapshot::read_via_handle(&ctx.port_handle, &ctx.ad, &ctx.xrt).await {
-                Ok(cfg) => cfg,
-                Err(_) => continue,
-            };
+        let mut config = match XrtConfigSnapshot::read_via_handle(&ctx.port_handle).await {
+            Ok(cfg) => cfg,
+            Err(_) => continue,
+        };
 
         loop {
             let start_time = std::time::Instant::now();
@@ -175,9 +174,7 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             // Take dirty flags
             let dirty_flags = ctx.dirty.lock().take();
             if dirty_flags.any {
-                if let Ok(cfg) =
-                    XrtConfigSnapshot::read_via_handle(&ctx.port_handle, &ctx.ad, &ctx.xrt).await
-                {
+                if let Ok(cfg) = XrtConfigSnapshot::read_via_handle(&ctx.port_handle).await {
                     config = cfg;
                 }
             }
@@ -219,10 +216,7 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                 // Check dirty flags for motor changes
                 let dirty_flags = ctx.dirty.lock().take();
                 if dirty_flags.any {
-                    if let Ok(cfg) =
-                        XrtConfigSnapshot::read_via_handle(&ctx.port_handle, &ctx.ad, &ctx.xrt)
-                            .await
-                    {
+                    if let Ok(cfg) = XrtConfigSnapshot::read_via_handle(&ctx.port_handle).await {
                         config = cfg;
                     }
                     // Reset accumulator on motor change

@@ -268,7 +268,6 @@ pub fn create_moving_dot_with_config(
         publisher: ArrayPublisher::new(shared_output.clone()),
         dirty,
         ad: ad_params,
-        dot: dot_params,
         image_config,
         pool: pool.clone(),
     });

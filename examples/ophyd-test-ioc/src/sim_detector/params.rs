@@ -3,10 +3,12 @@ use asyn_rs::param::ParamType;
 use asyn_rs::port::PortDriverBase;
 use asyn_rs::port_handle::PortHandle;
 
-use ad_core_rs::driver::{snapshot_float64, snapshot_int32};
+use ad_core_rs::driver::undefined_as_zero;
 
 use ad_core_rs::driver::ImageMode;
 use ad_core_rs::params::ADBaseParams;
+
+use crate::sim_detector::driver::MovingDotDetector;
 
 /// MovingDot-specific parameter indices (beyond ADBase).
 #[derive(Clone, Copy)]
@@ -45,25 +47,39 @@ pub struct MovingDotConfigSnapshot {
 }
 
 impl MovingDotConfigSnapshot {
-    /// Read config via PortHandle (async). For use from the acquisition task thread.
-    pub async fn read_via_handle(
-        handle: &PortHandle,
+    /// [`Self::read_from`] under one hold of the port, as a C driver task
+    /// reads its config with `getIntegerParam` between one `lock()` and
+    /// `unlock()`; a round trip per parameter kept Acquire busy for each one.
+    pub async fn read_via_handle(handle: &PortHandle) -> AsynResult<Self> {
+        handle
+            .with_driver(|d: &mut MovingDotDetector| {
+                Self::read_from(&d.ad.port_base, &d.ad.params, &d.dot_params)
+            })
+            .await?
+    }
+
+    pub fn read_from(
+        base: &PortDriverBase,
         ad: &ADBaseParams,
         dot: &MovingDotParams,
     ) -> AsynResult<Self> {
         Ok(Self {
-            motor_x: snapshot_float64(handle, dot.motor_x_pos, 0).await?,
-            motor_y: snapshot_float64(handle, dot.motor_y_pos, 0).await?,
-            beam_current: snapshot_float64(handle, dot.beam_current, 0).await?,
-            shutter_open: snapshot_int32(handle, dot.shutter_open, 0).await? != 0,
-            acquire_time: snapshot_float64(handle, ad.acquire_time, 0).await?,
-            acquire_period: snapshot_float64(handle, ad.acquire_period, 0).await?,
-            image_mode: ImageMode::from_i32(snapshot_int32(handle, ad.image_mode, 0).await?),
-            num_images: snapshot_int32(handle, ad.num_images, 0).await?,
-            array_callbacks: snapshot_int32(handle, ad.base.array_callbacks, 0).await? != 0,
-            wait_for_plugins: snapshot_int32(handle, ad.base.wait_for_plugins, 0).await? != 0,
-            size_x: snapshot_int32(handle, ad.size_x, 0).await? as usize,
-            size_y: snapshot_int32(handle, ad.size_y, 0).await? as usize,
+            motor_x: undefined_as_zero(base.get_float64_param(dot.motor_x_pos, 0))?,
+            motor_y: undefined_as_zero(base.get_float64_param(dot.motor_y_pos, 0))?,
+            beam_current: undefined_as_zero(base.get_float64_param(dot.beam_current, 0))?,
+            shutter_open: undefined_as_zero(base.get_int32_param(dot.shutter_open, 0))? != 0,
+            acquire_time: undefined_as_zero(base.get_float64_param(ad.acquire_time, 0))?,
+            acquire_period: undefined_as_zero(base.get_float64_param(ad.acquire_period, 0))?,
+            image_mode: ImageMode::from_i32(undefined_as_zero(
+                base.get_int32_param(ad.image_mode, 0),
+            )?),
+            num_images: undefined_as_zero(base.get_int32_param(ad.num_images, 0))?,
+            array_callbacks: undefined_as_zero(base.get_int32_param(ad.base.array_callbacks, 0))?
+                != 0,
+            wait_for_plugins: undefined_as_zero(base.get_int32_param(ad.base.wait_for_plugins, 0))?
+                != 0,
+            size_x: undefined_as_zero(base.get_int32_param(ad.size_x, 0))? as usize,
+            size_y: undefined_as_zero(base.get_int32_param(ad.size_y, 0))? as usize,
         })
     }
 }

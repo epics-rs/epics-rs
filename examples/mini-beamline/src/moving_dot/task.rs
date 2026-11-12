@@ -17,7 +17,7 @@ use ad_core_rs::timestamp::EpicsTimestamp;
 
 use crate::physics::{self, MovingDotImageConfig};
 
-use super::params::{MovingDotConfigSnapshot, MovingDotParams};
+use super::params::MovingDotConfigSnapshot;
 use super::types::DirtyFlags;
 
 const MIN_DELAY_SECS: f64 = 1e-5;
@@ -35,7 +35,6 @@ pub(crate) struct AcquisitionContext {
     pub publisher: ArrayPublisher,
     pub dirty: Arc<parking_lot::Mutex<DirtyFlags>>,
     pub ad: ADBaseParams,
-    pub dot: MovingDotParams,
     pub image_config: MovingDotImageConfig,
     pub pool: DriverPool,
 }
@@ -166,13 +165,10 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             .unwrap_or(0);
 
         // Read initial config
-        let mut config =
-            match MovingDotConfigSnapshot::read_via_handle(&ctx.port_handle, &ctx.ad, &ctx.dot)
-                .await
-            {
-                Ok(cfg) => cfg,
-                Err(_) => continue,
-            };
+        let mut config = match MovingDotConfigSnapshot::read_via_handle(&ctx.port_handle).await {
+            Ok(cfg) => cfg,
+            Err(_) => continue,
+        };
 
         loop {
             let start_time = std::time::Instant::now();
@@ -184,10 +180,7 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             if reset {
                 // If the read fails (e.g. port busy with CP link writes during motor move),
                 // keep the previous config rather than aborting acquisition.
-                if let Ok(cfg) =
-                    MovingDotConfigSnapshot::read_via_handle(&ctx.port_handle, &ctx.ad, &ctx.dot)
-                        .await
-                {
+                if let Ok(cfg) = MovingDotConfigSnapshot::read_via_handle(&ctx.port_handle).await {
                     config = cfg;
                 }
             }

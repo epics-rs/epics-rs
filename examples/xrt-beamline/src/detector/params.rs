@@ -3,12 +3,13 @@ use asyn_rs::param::ParamType;
 use asyn_rs::port::PortDriverBase;
 use asyn_rs::port_handle::PortHandle;
 
-use ad_core_rs::driver::{snapshot_float64, snapshot_int32};
+use ad_core_rs::driver::undefined_as_zero;
 
 use ad_core_rs::driver::ImageMode;
 use ad_core_rs::params::ADBaseParams;
 
 use crate::beamline_sim::MotorPositions;
+use crate::detector::XrtDetector;
 
 /// XRT detector parameter indices (beyond ADBase).
 #[derive(Clone, Copy)]
@@ -150,45 +151,60 @@ pub struct XrtConfigSnapshot {
 }
 
 impl XrtConfigSnapshot {
-    pub async fn read_via_handle(
-        handle: &PortHandle,
+    /// [`Self::read_from`] under one hold of the port, as a C driver task
+    /// reads its config with `getIntegerParam` between one `lock()` and
+    /// `unlock()`; a round trip per parameter kept Acquire busy for each one.
+    pub async fn read_via_handle(handle: &PortHandle) -> AsynResult<Self> {
+        handle
+            .with_driver(|d: &mut XrtDetector| {
+                Self::read_from(&d.ad.port_base, &d.ad.params, &d.xrt_params)
+            })
+            .await?
+    }
+
+    pub fn read_from(
+        base: &PortDriverBase,
         ad: &ADBaseParams,
         xrt: &XrtDetectorParams,
     ) -> AsynResult<Self> {
         Ok(Self {
             motors: MotorPositions {
-                und_gap: snapshot_float64(handle, xrt.und_gap, 0).await?,
-                und_x: snapshot_float64(handle, xrt.und_x, 0).await?,
-                und_z: snapshot_float64(handle, xrt.und_z, 0).await?,
-                dcm_theta: snapshot_float64(handle, xrt.dcm_theta, 0).await?,
-                dcm_theta2: snapshot_float64(handle, xrt.dcm_theta2, 0).await?,
-                dcm_y: snapshot_float64(handle, xrt.dcm_y, 0).await?,
-                dcm_chi1: snapshot_float64(handle, xrt.dcm_chi1, 0).await?,
-                dcm_chi2: snapshot_float64(handle, xrt.dcm_chi2, 0).await?,
-                dcm_z: snapshot_float64(handle, xrt.dcm_z, 0).await?,
-                hfm_pitch: snapshot_float64(handle, xrt.hfm_pitch, 0).await?,
-                hfm_roll: snapshot_float64(handle, xrt.hfm_roll, 0).await?,
-                hfm_yaw: snapshot_float64(handle, xrt.hfm_yaw, 0).await?,
-                hfm_x: snapshot_float64(handle, xrt.hfm_x, 0).await?,
-                hfm_y: snapshot_float64(handle, xrt.hfm_y, 0).await?,
-                hfm_z: snapshot_float64(handle, xrt.hfm_z, 0).await?,
-                hfm_r_major: snapshot_float64(handle, xrt.hfm_r_major, 0).await?,
-                hfm_r_minor: snapshot_float64(handle, xrt.hfm_r_minor, 0).await?,
-                vfm_pitch: snapshot_float64(handle, xrt.vfm_pitch, 0).await?,
-                vfm_roll: snapshot_float64(handle, xrt.vfm_roll, 0).await?,
-                vfm_yaw: snapshot_float64(handle, xrt.vfm_yaw, 0).await?,
-                vfm_x: snapshot_float64(handle, xrt.vfm_x, 0).await?,
-                vfm_y: snapshot_float64(handle, xrt.vfm_y, 0).await?,
-                vfm_z: snapshot_float64(handle, xrt.vfm_z, 0).await?,
-                vfm_r_major: snapshot_float64(handle, xrt.vfm_r_major, 0).await?,
-                vfm_r_minor: snapshot_float64(handle, xrt.vfm_r_minor, 0).await?,
+                und_gap: undefined_as_zero(base.get_float64_param(xrt.und_gap, 0))?,
+                und_x: undefined_as_zero(base.get_float64_param(xrt.und_x, 0))?,
+                und_z: undefined_as_zero(base.get_float64_param(xrt.und_z, 0))?,
+                dcm_theta: undefined_as_zero(base.get_float64_param(xrt.dcm_theta, 0))?,
+                dcm_theta2: undefined_as_zero(base.get_float64_param(xrt.dcm_theta2, 0))?,
+                dcm_y: undefined_as_zero(base.get_float64_param(xrt.dcm_y, 0))?,
+                dcm_chi1: undefined_as_zero(base.get_float64_param(xrt.dcm_chi1, 0))?,
+                dcm_chi2: undefined_as_zero(base.get_float64_param(xrt.dcm_chi2, 0))?,
+                dcm_z: undefined_as_zero(base.get_float64_param(xrt.dcm_z, 0))?,
+                hfm_pitch: undefined_as_zero(base.get_float64_param(xrt.hfm_pitch, 0))?,
+                hfm_roll: undefined_as_zero(base.get_float64_param(xrt.hfm_roll, 0))?,
+                hfm_yaw: undefined_as_zero(base.get_float64_param(xrt.hfm_yaw, 0))?,
+                hfm_x: undefined_as_zero(base.get_float64_param(xrt.hfm_x, 0))?,
+                hfm_y: undefined_as_zero(base.get_float64_param(xrt.hfm_y, 0))?,
+                hfm_z: undefined_as_zero(base.get_float64_param(xrt.hfm_z, 0))?,
+                hfm_r_major: undefined_as_zero(base.get_float64_param(xrt.hfm_r_major, 0))?,
+                hfm_r_minor: undefined_as_zero(base.get_float64_param(xrt.hfm_r_minor, 0))?,
+                vfm_pitch: undefined_as_zero(base.get_float64_param(xrt.vfm_pitch, 0))?,
+                vfm_roll: undefined_as_zero(base.get_float64_param(xrt.vfm_roll, 0))?,
+                vfm_yaw: undefined_as_zero(base.get_float64_param(xrt.vfm_yaw, 0))?,
+                vfm_x: undefined_as_zero(base.get_float64_param(xrt.vfm_x, 0))?,
+                vfm_y: undefined_as_zero(base.get_float64_param(xrt.vfm_y, 0))?,
+                vfm_z: undefined_as_zero(base.get_float64_param(xrt.vfm_z, 0))?,
+                vfm_r_major: undefined_as_zero(base.get_float64_param(xrt.vfm_r_major, 0))?,
+                vfm_r_minor: undefined_as_zero(base.get_float64_param(xrt.vfm_r_minor, 0))?,
             },
-            acquire_time: snapshot_float64(handle, ad.acquire_time, 0).await?,
-            acquire_period: snapshot_float64(handle, ad.acquire_period, 0).await?,
-            image_mode: ImageMode::from_i32(snapshot_int32(handle, ad.image_mode, 0).await?),
-            num_images: snapshot_int32(handle, ad.num_images, 0).await?,
-            array_callbacks: snapshot_int32(handle, ad.base.array_callbacks, 0).await? != 0,
-            wait_for_plugins: snapshot_int32(handle, ad.base.wait_for_plugins, 0).await? != 0,
+            acquire_time: undefined_as_zero(base.get_float64_param(ad.acquire_time, 0))?,
+            acquire_period: undefined_as_zero(base.get_float64_param(ad.acquire_period, 0))?,
+            image_mode: ImageMode::from_i32(undefined_as_zero(
+                base.get_int32_param(ad.image_mode, 0),
+            )?),
+            num_images: undefined_as_zero(base.get_int32_param(ad.num_images, 0))?,
+            array_callbacks: undefined_as_zero(base.get_int32_param(ad.base.array_callbacks, 0))?
+                != 0,
+            wait_for_plugins: undefined_as_zero(base.get_int32_param(ad.base.wait_for_plugins, 0))?
+                != 0,
         })
     }
 }

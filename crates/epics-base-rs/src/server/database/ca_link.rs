@@ -28,7 +28,6 @@ use super::link_set::{
 };
 use super::{CaLinkInit, ExternalCpProcess, LinkHolder, PvDatabase, PvDatabaseInner};
 use crate::runtime::sync::oneshot;
-use crate::runtime::task::TaskHandle;
 use crate::server::event_queue::{CircuitEvent, DeliveryContext, EventReader, EventUser};
 use crate::server::pv::{MonitorEvent, PutStarted, SubscribeRefused, WriteContext, WriteEnd};
 use crate::server::record::{ProcessCompletion, RecordCell};
@@ -77,7 +76,7 @@ pub(crate) struct CaLinks {
     /// The local links' monitors' one event user, and its event task,
     /// started with the first local link.
     events: Arc<LocalEvents>,
-    consumer: OnceLock<AbortOnDrop>,
+    consumer: OnceLock<EventTask>,
 }
 
 impl CaLinks {
@@ -243,7 +242,7 @@ impl CaLinks {
                 let opened = match channel {
                     Some(channel) => {
                         let local = LocalLink::open(&db, channel, link, &self.actions)?;
-                        self.start_events(&db);
+                        self.start_events();
                         Route::Local(local)
                     }
                     None => Route::Network,
@@ -386,11 +385,9 @@ impl CaLinks {
 
     /// `db_start_events` for the database's one `dbContext`, with its first
     /// local link.
-    fn start_events(&self, db: &PvDatabase) {
-        if let Some(bridge) = db.inner.link_puts.network() {
-            self.consumer
-                .get_or_init(|| AbortOnDrop(bridge.spawn(deliver_events(self.events.clone()))));
-        }
+    fn start_events(&self) {
+        self.consumer
+            .get_or_init(|| EventTask::start(self.events.clone()));
     }
 }
 
@@ -752,15 +749,6 @@ struct LocalLink {
     native: OnceLock<EventReader>,
     string: OnceLock<EventReader>,
     _process: super::CpWorker,
-}
-
-/// Abort the wrapped task when dropped; a bare handle detaches.
-struct AbortOnDrop(TaskHandle<()>);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
 }
 
 impl LocalLink {
@@ -1188,6 +1176,58 @@ struct LocalEvents {
     /// Held while an event is taken off the queue, handed on and counted,
     /// so a [`CaLinks::sync`] mark never sees one taken but not counted.
     delivery: parking_lot::Mutex<()>,
+}
+
+/// The `CAC-event` thread C `db_start_events` gives the `dbContext`
+/// (`dbContext.cpp:229-236`, `dbEvent.c:1117-1137`), one band above the
+/// `dbCaLink` thread that subscribes. On a shared runtime worker a CP
+/// link's hand-off waited for that worker, milliseconds under CPU load.
+struct EventTask {
+    /// C `pendexit` and its `ppendsem` signal (`dbEvent.c:378-383`).
+    exit: Arc<tokio::sync::Notify>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl EventTask {
+    fn start(events: Arc<LocalEvents>) -> Self {
+        use crate::runtime::task::{MandatoryThread, StackSizeClass, ThreadPriority};
+        let exit = Arc::new(tokio::sync::Notify::new());
+        let told = exit.clone();
+        let thread = MandatoryThread::new(
+            "CAC-event",
+            ThreadPriority::Custom(ThreadPriority::Medium.value() + 1),
+            StackSizeClass::Medium,
+        )
+        .spawn(move || {
+            let run = async {
+                tokio::select! {
+                    () = deliver_events(events) => {}
+                    () = told.notified() => {}
+                }
+            };
+            if let Err(e) = crate::runtime::task::block_on_sync(run) {
+                unreachable!("a fresh CAC-event thread can always block: {e:?}");
+            }
+        });
+        Self {
+            exit,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for EventTask {
+    /// C `db_close_events` (`dbEvent.c:378-386`). Not joined from the
+    /// thread itself: `StateNotify` holds the database while it delivers,
+    /// so the last handle can drop there.
+    fn drop(&mut self) {
+        self.exit.notify_one();
+        if let Some(thread) = self.thread.take()
+            && thread.thread().id() != std::thread::current().id()
+        {
+            let _ = thread.join();
+        }
+    }
 }
 
 /// C `event_task` for [`LocalEvents`] (`dbEvent.c:1056-1061`): each event
@@ -2153,6 +2193,48 @@ record(calc, "H2") { field(INPA, "SRC CP") field(CALC, "A") }
         db.ca_sync().await;
         *BEFORE_REQUEST.lock().unwrap() = None;
         assert_eq!(*log.lock(), ["H1", "H2"]);
+    }
+
+    /// C hands a `dbContext`'s events to dbCa on its own `CAC-event`
+    /// thread (`dbContext.cpp:235`), never on a thread other work shares.
+    #[cfg(tokio_backend)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_events_are_delivered_on_cac_event() {
+        let (db, h1, _h2) = two_cp_holders().await;
+        db.process_cp_links_on_connect().await;
+        db.ca_sync().await;
+        let on = Arc::new(parking_lot::Mutex::new(None));
+        *BEFORE_REQUEST.lock().unwrap() = Some(Arc::new({
+            let (h1, on) = (h1.state.clone(), on.clone());
+            move |state: &LocalState| {
+                if std::ptr::eq(state, &*h1) {
+                    *on.lock() = std::thread::current().name().map(str::to_owned);
+                }
+            }
+        }));
+        db.put_pv_and_post("SRC", EpicsValue::Double(1.0))
+            .await
+            .unwrap();
+        db.ca_sync().await;
+        *BEFORE_REQUEST.lock().unwrap() = None;
+        assert_eq!(on.lock().as_deref(), Some("CAC-event"));
+    }
+
+    /// C `db_close_events` (`dbEvent.c:378-386`): the event task exits,
+    /// and is joined, when its owner goes.
+    #[test]
+    fn dropping_the_event_task_ends_its_thread() {
+        let task = EventTask::start(Arc::new(LocalEvents {
+            user: EventUser::new(),
+            delivery: parking_lot::Mutex::new(()),
+        }));
+        let (dropped, done) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(task);
+            let _ = dropped.send(());
+        });
+        done.recv_timeout(fact_budget::FACT_BUDGET)
+            .expect("the CAC-event thread never exited");
     }
 
     /// C makes a connect's `db_add_event` and first event in one action

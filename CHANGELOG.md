@@ -1,5 +1,40 @@
 # Changelog
 
+## v0.34.2 — 2026-11-13
+
+Patch release; the pinned toolchain stays at 1.99.1. IOC threads run at
+the bands, scheduling policy and priority inheritance C gives them, a
+runtime wait wakes at its deadline instead of the next tick, and a
+synchronous asyn port runs a request on its caller.
+
+### Changed
+
+- areaDetector: `runtime::run_thread_named(name, make_fut)` → `run_thread_named(name, priority, stack, make_fut)`, with `ThreadPriority` and `StackSizeClass` re-exported beside it; `run_thread` removed.
+- asyn: a `RuntimeHook`, and so a `PortDriverBase::on_runtime` hook, takes the port's `&RuntimeConfig` after its `&PortHandle`.
+- libcom, base: the `linux-rt` feature is removed; `runtime::sync::PriorityInheritanceMutex` is a `PTHREAD_PRIO_INHERIT` mutex on Linux in every build, as on RTEMS. A build that names the feature must drop it.
+
+### New
+
+- libcom: `runtime::task::ioc_runtime_builder` builds the IOC runtime, whose threads start at C's CAS-client band; `#[epics_main]` uses it and accepts `worker_threads = N`.
+
+### Fixed
+
+- libcom: an `#[epics_main]` IOC's runtime threads run at CAServerLow, the band C serves each CA client at, where they ran time-shared.
+- libcom: a CA worker holding a lockset no longer stalls the scan thread waiting on it, since every Linux mutex has priority inheritance, as C's osdMutex does.
+- libcom: a runtime thread's timed wait wakes at its deadline; tokio's timer wheel and the epoll timeout each rounded it up to the next millisecond, so a 0.93 ms sleep lasted 2.0 ms.
+- libcom: on Windows a wait runs on a high-resolution timer, as C's osdEvent does, where it ended on the 15.6 ms system tick.
+- libcom: on macOS IOC threads run under SCHED_FIFO, as C's osdThread runs them there.
+- asyn: a synchronous port runs a request on its caller, as C's `queueRequest` does; the hand-off to the port's actor added up to 5 ms per request under CPU contention.
+- asyn: a synchronous port makes no autoconnect attempt after registration, re-enable or a waived request; C creates no port thread for it to make one.
+- areaDetector: driver threads and the queued-array-count updater run at the priority and stack size C creates them with.
+- areaDetector: `ad-plugins-rs` requires rust-hdf5 0.7.13, so the SWMR writer appends past chunk index 131,059, where 0.7.9 refused, and a live reader never finds an index entry for a chunk the file does not hold yet.
+- base: a network CA link opens only after `dbCaRun`, as C's `dbCaTask` does, so a link to a name this IOC serves no longer misses and waits out the client's 10 s first retry.
+- base: a CA link's local events are delivered on a CAC-event thread of the link's context, as C's `db_start_events` delivers them; on a shared runtime worker a CP link's hand-off lagged by 5.6 ms at p99 under CPU load, against 0.06 ms in C.
+- base, std: a put that re-points a calcout, acalcout, scalcout, sseq, transform or throttle link posts the link's status before the put returns, as C's `special()` does; it was posted later from the record-init task.
+- CA gateway: a dead first life's monitor is dropped when that life ends; a death landing between the value and property tasks' check of it and their first wait kept it held, and the channel re-installed it on reconnect ahead of the revival.
+- Examples: `sim-detector` computes frames in the pixel type, as C simDetector does: integer pixels wrap and casts truncate, where the f64 round trip gave other pixels for every integer type.
+- Examples: the detector examples read their config under one hold of the port, as C's simTask reads it under one lock; about 40 round trips kept Acquire busy for 14 ms and a write between two reads could tear the snapshot.
+
 ## v0.34.1 — 2026-11-07
 
 Patch release; the pinned toolchain stays at 1.99.1. A get after a waited

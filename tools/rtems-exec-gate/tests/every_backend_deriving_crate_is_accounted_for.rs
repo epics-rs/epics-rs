@@ -350,6 +350,10 @@ const SCOPE_GATED: &[(&str, &str)] = &[
         "epics-pva-rs",
         "tests/a_put_resolves_after_its_monitor_callback.rs",
     ),
+    (
+        "epics-pva-rs",
+        "tests/a_put_resolves_beside_its_own_monitor_future.rs",
+    ),
     ("epics-pva-rs", "tests/create_channel_backpressure.rs"),
     ("epics-pva-rs", "tests/heartbeat_echo.rs"),
     ("epics-pva-rs", "tests/interop_pvxs_mods/access_denied.rs"),

@@ -156,7 +156,8 @@ async fn main() {
             // lifecycle goes to stderr (pvxs `tools/monitor.cpp:140-163`:
             // `std::cout` for the value, `std::cerr` for Connected /
             // Disconnected / Finished, the last only when verbose).
-            let on_event = |event: MonitorEvent| match event {
+            let name = pv_name.clone();
+            let on_event = move |event: MonitorEvent| match event {
                 MonitorEvent::Data {
                     intro,
                     value,
@@ -220,11 +221,11 @@ async fn main() {
                 mask_disconnected: false,
             };
             let result = client
-                .pvmonitor_events(&pv_name, request.as_ref(), mask, on_event)
+                .pvmonitor_events(&name, request.as_ref(), mask, on_event)
                 .await;
 
             if let Err(e) = result {
-                epics_libcom_rs::stderr_println!("{pv_name}: {e}");
+                epics_libcom_rs::stderr_println!("{name}: {e}");
             }
         });
         handles.push(handle);

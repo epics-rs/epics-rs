@@ -38,6 +38,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::task::{Poll, Waker};
 
+use epics_base_rs::runtime::task::{Reactor, TaskHandle};
 use parking_lot::Mutex;
 use tokio::sync::Notify;
 
@@ -234,8 +235,9 @@ impl MonitorBacklog {
 
     /// [`Self::recv`], returned on the frame's [`Delivery::turn`]. Dropped
     /// while it waits, it discards the popped frame, which is what a
-    /// cancelled drain loop wants.
-    pub(crate) async fn recv_in_turn(&self) -> Option<(Frame, Delivery)> {
+    /// cancelled drain loop wants. The turn is held until the caller drops
+    /// the `Delivery`, hence the [`DeliveryTask`] proof.
+    pub(crate) async fn recv_in_turn(&self, _on: &DeliveryTask) -> Option<(Frame, Delivery)> {
         let (frame, delivery) = self.recv().await?;
         delivery.turn().await;
         Some((frame, delivery))
@@ -288,6 +290,25 @@ impl std::ops::Deref for MonitorStream {
 impl Drop for MonitorStream {
     fn drop(&mut self) {
         self.0.abandon();
+    }
+}
+
+/// Proof that its holder runs on a client-owned task, the only place a
+/// monitor frame may hold its [`Delivery::turn`] through a user callback.
+/// Replies wait on those turns, so a drain polled by the caller's own future
+/// would stall every reply that caller awaits; pvxs runs the callbacks on
+/// its client worker for the same reason.
+pub(crate) struct DeliveryTask(());
+
+impl DeliveryTask {
+    /// Spawn `drain` on `reactor`, handing it the proof.
+    pub(crate) fn spawn<D, Fut>(reactor: Reactor, drain: D) -> TaskHandle<Fut::Output>
+    where
+        D: FnOnce(DeliveryTask) -> Fut,
+        Fut: std::future::Future + Send + 'static,
+        Fut::Output: Send + 'static,
+    {
+        reactor.spawn(drain(DeliveryTask(())))
     }
 }
 

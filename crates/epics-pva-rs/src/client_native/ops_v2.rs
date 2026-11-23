@@ -43,6 +43,7 @@ use super::channel::Channel;
 use super::decode::{
     Frame, GetFieldResponse, OpResponse, decode_get_field_response, decode_op_response,
 };
+use super::monitor_queue::DeliveryTask;
 use super::server_conn::{Reply, ServerConn};
 
 /// Decode a one-shot GET/PUT/RPC op-response frame, closing the virtual
@@ -2871,6 +2872,31 @@ fn record_options_from_request(req: &PvField) -> Vec<(String, crate::pvdata::Sca
         .collect()
 }
 
+/// Run a callback monitor's drain on a client-owned task and await its end,
+/// so a reply the caller awaits beside this future never waits on the
+/// caller to poll it. Dropping the future aborts the task, which ends the
+/// subscription as dropping the inline drain did.
+async fn drain_on_client_task<D, Fut>(channel: &Channel, drain: D) -> PvaResult<()>
+where
+    D: FnOnce(DeliveryTask) -> Fut,
+    Fut: std::future::Future<Output = PvaResult<()>> + Send + 'static,
+{
+    struct AbortOnDrop(epics_base_rs::runtime::task::TaskHandle<PvaResult<()>>);
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let mut task = AbortOnDrop(DeliveryTask::spawn(channel.reactor().clone(), drain));
+    match (&mut task.0).await {
+        Ok(end) => end,
+        Err(e) if e.is_cancelled() => Err(PvaError::Protocol("monitor task cancelled".into())),
+        // The callback panicked on the client task; raise it in the caller,
+        // where it surfaced when the drain ran inline.
+        Err(e) => panic!("monitor callback: {e}"),
+    }
+}
+
 /// Raw-frame monitor entry: like [`op_monitor`] but the
 /// callback receives the **raw MONITOR DATA body bytes** (the
 /// `changed | value | overrun` triplet from the wire) instead of a
@@ -2884,12 +2910,29 @@ pub async fn op_monitor_raw_frames<F>(
     channel: &Arc<Channel>,
     fields: &[&str],
     pipeline_size: u32,
+    callback: F,
+) -> PvaResult<()>
+where
+    F: FnMut(&FieldDesc, bytes::Bytes, ByteOrder) + Send + 'static,
+{
+    let fields_owned: Vec<String> = fields.iter().map(|s| s.to_string()).collect();
+    let ch = channel.clone();
+    drain_on_client_task(channel, move |on| {
+        raw_frames_drain(ch, fields_owned, pipeline_size, callback, on)
+    })
+    .await
+}
+
+async fn raw_frames_drain<F>(
+    channel: Arc<Channel>,
+    fields_owned: Vec<String>,
+    pipeline_size: u32,
     mut callback: F,
+    on: DeliveryTask,
 ) -> PvaResult<()>
 where
     F: FnMut(&FieldDesc, bytes::Bytes, ByteOrder) + Send,
 {
-    let fields_owned: Vec<String> = fields.iter().map(|s| s.to_string()).collect();
     loop {
         let (server, sid) = match channel.ensure_active().await {
             Ok(p) => p,
@@ -2912,7 +2955,10 @@ where
             &fields_owned,
             None,
             MonitorFlow::window(pipeline_size),
-            &mut callback,
+            Deliver {
+                callback: &mut callback,
+                on: &on,
+            },
             None,
         )
         .await
@@ -3042,7 +3088,7 @@ where
     });
     let state_for_task = state.clone();
 
-    let task = channel.reactor().clone().spawn(async move {
+    let task = DeliveryTask::spawn(channel.reactor().clone(), move |on| async move {
         // Single owner of this subscription's connection-state transitions.
         let mut conn = ConnEventOwner::new(on_conn);
         loop {
@@ -3075,7 +3121,10 @@ where
                 &fields_owned,
                 pv_request.as_ref(),
                 flow,
-                &mut callback,
+                Deliver {
+                    callback: &mut callback,
+                    on: &on,
+                },
                 Some(state_for_task.clone()),
             )
             .await
@@ -3124,18 +3173,26 @@ where
     }
 }
 
+/// A drain loop's callback, with the proof that it runs on a client-owned
+/// task, where a frame may hold its delivery turn through the callback.
+struct Deliver<'a, F> {
+    callback: &'a mut F,
+    on: &'a DeliveryTask,
+}
+
 async fn run_raw_monitor_loop<F>(
     server: Arc<super::server_conn::ServerConn>,
     sid: u32,
     fields: &[String],
     pv_request: Option<&PvField>,
     flow: MonitorFlow,
-    callback: &mut F,
+    deliver: Deliver<'_, F>,
     state: Option<Arc<SubscriptionState>>,
 ) -> Result<(), MonitorEnd>
 where
     F: FnMut(&FieldDesc, bytes::Bytes, ByteOrder) + Send,
 {
+    let Deliver { callback, on } = deliver;
     let order = server.byte_order();
     let big_endian = matches!(order, ByteOrder::Big);
     let codec = PvaCodec { big_endian };
@@ -3281,7 +3338,7 @@ where
                         // no-handle path converge on the same cleanup.
                         return Err(td.cancelled());
                     }
-                    f = stream.recv_in_turn() => match f {
+                    f = stream.recv_in_turn(on) => match f {
                         Some(f) => f,
                         None => return Err(td.lost()),
                     },
@@ -3289,7 +3346,7 @@ where
             }
             // No handle: nothing can cancel this loop, so just await the
             // next frame.
-            None => match stream.recv_in_turn().await {
+            None => match stream.recv_in_turn(on).await {
                 Some(f) => f,
                 None => return Err(td.lost()),
             },
@@ -3375,16 +3432,20 @@ pub async fn op_monitor<F>(
     callback: F,
 ) -> PvaResult<()>
 where
-    F: FnMut(&FieldDesc, &PvField) + Send,
+    F: FnMut(&FieldDesc, &PvField) + Send + 'static,
 {
     let fields_owned: Vec<String> = fields.iter().map(|s| s.to_string()).collect();
-    op_monitor_inner(
-        channel,
-        fields_owned,
-        None,
-        MonitorFlow::window(pipeline_size),
-        callback,
-    )
+    let ch = channel.clone();
+    drain_on_client_task(channel, move |on| {
+        op_monitor_inner(
+            ch,
+            fields_owned,
+            None,
+            MonitorFlow::window(pipeline_size),
+            callback,
+            on,
+        )
+    })
     .await
 }
 
@@ -3401,17 +3462,22 @@ pub async fn op_monitor_raw<F>(
     callback: F,
 ) -> PvaResult<()>
 where
-    F: FnMut(&FieldDesc, &PvField) + Send,
+    F: FnMut(&FieldDesc, &PvField) + Send + 'static,
 {
-    op_monitor_inner(channel, Vec::new(), Some(pv_req), flow, callback).await
+    let ch = channel.clone();
+    drain_on_client_task(channel, move |on| {
+        op_monitor_inner(ch, Vec::new(), Some(pv_req), flow, callback, on)
+    })
+    .await
 }
 
 async fn op_monitor_inner<F>(
-    channel: &Arc<Channel>,
+    channel: Arc<Channel>,
     fields_owned: Vec<String>,
     raw_pv_req: Option<Vec<u8>>,
     flow: MonitorFlow,
     mut callback: F,
+    on: DeliveryTask,
 ) -> PvaResult<()>
 where
     F: FnMut(&FieldDesc, &PvField) + Send,
@@ -3444,7 +3510,10 @@ where
             &fields_owned,
             raw_pv_req.as_deref(),
             flow,
-            &mut adapter,
+            Deliver {
+                callback: &mut adapter,
+                on: &on,
+            },
             None,
         )
         .await
@@ -3505,7 +3574,7 @@ where
     });
     let state_for_task = state.clone();
 
-    let task = channel.reactor().clone().spawn(async move {
+    let task = DeliveryTask::spawn(channel.reactor().clone(), move |on| async move {
         // Single owner of this subscription's connection-state transitions.
         let mut conn = ConnEventOwner::new(on_conn);
         loop {
@@ -3546,7 +3615,10 @@ where
                 &fields_owned,
                 None,
                 flow,
-                &mut adapter,
+                Deliver {
+                    callback: &mut adapter,
+                    on: &on,
+                },
                 Some(state_for_task.clone()),
             )
             .await
@@ -3609,7 +3681,25 @@ pub async fn op_monitor_events<F>(
     raw_pv_req: Option<Vec<u8>>,
     flow: MonitorFlow,
     mask: MonitorEventMask,
+    callback: F,
+) -> PvaResult<()>
+where
+    F: FnMut(MonitorEvent) + Send + 'static,
+{
+    let ch = channel.clone();
+    drain_on_client_task(channel, move |on| {
+        monitor_events_drain(ch, raw_pv_req, flow, mask, callback, on)
+    })
+    .await
+}
+
+async fn monitor_events_drain<F>(
+    channel: Arc<Channel>,
+    raw_pv_req: Option<Vec<u8>>,
+    flow: MonitorFlow,
+    mask: MonitorEventMask,
     mut callback: F,
+    on: DeliveryTask,
 ) -> PvaResult<()>
 where
     F: FnMut(MonitorEvent) + Send,
@@ -3649,7 +3739,10 @@ where
             no_fields,
             raw_pv_req.as_deref(),
             flow,
-            &mut data_callback,
+            Deliver {
+                callback: &mut data_callback,
+                on: &on,
+            },
             None,
         )
         .await;
@@ -3848,12 +3941,13 @@ async fn run_monitor_loop<F>(
     fields: &[String],
     raw_pv_req: Option<&[u8]>,
     flow: MonitorFlow,
-    callback: &mut F,
+    deliver: Deliver<'_, F>,
     state: Option<Arc<SubscriptionState>>,
 ) -> Result<(), MonitorEnd>
 where
     F: FnMut(&FieldDesc, &PvField, Option<&std::collections::HashSet<String>>) + Send,
 {
+    let Deliver { callback, on } = deliver;
     let order = server.byte_order();
     let big_endian = matches!(order, ByteOrder::Big);
     let codec = PvaCodec { big_endian };
@@ -3997,7 +4091,7 @@ where
                         // no-handle path converge on the same cleanup.
                         return Err(td.cancelled());
                     }
-                    f = stream.recv_in_turn() => match f {
+                    f = stream.recv_in_turn(on) => match f {
                         Some(f) => f,
                         None => return Err(td.lost()),
                     },
@@ -4005,7 +4099,7 @@ where
             }
             // No handle: nothing can cancel this loop, so just await the
             // next frame.
-            None => match stream.recv_in_turn().await {
+            None => match stream.recv_in_turn(on).await {
                 Some(f) => f,
                 None => return Err(td.lost()),
             },

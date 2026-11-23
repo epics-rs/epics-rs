@@ -1048,7 +1048,7 @@ impl PvaClient {
     pub async fn pvmonitor_typed<T, F>(&self, pv_name: &str, mut callback: F) -> PvaResult<()>
     where
         T: crate::nt::TypedNT,
-        F: FnMut(T) + Send,
+        F: FnMut(T) + Send + 'static,
     {
         let ch = self.channel(pv_name).await?;
         crate::client_native::ops_v2::op_monitor(
@@ -1820,7 +1820,7 @@ impl PvaClient {
 
     pub async fn pvmonitor<F>(&self, pv_name: &str, mut callback: F) -> PvaResult<()>
     where
-        F: FnMut(&PvField) + Send,
+        F: FnMut(&PvField) + Send + 'static,
     {
         let ch = self.channel(pv_name).await?;
         op_monitor(&ch, &[], self.inner.pipeline_size, move |_desc, value| {
@@ -1836,7 +1836,7 @@ impl PvaClient {
     /// events out to many downstream subscribers.
     pub async fn pvmonitor_raw_frames<F>(&self, pv_name: &str, mut callback: F) -> PvaResult<()>
     where
-        F: FnMut(&FieldDesc, bytes::Bytes, crate::proto::ByteOrder) + Send,
+        F: FnMut(&FieldDesc, bytes::Bytes, crate::proto::ByteOrder) + Send + 'static,
     {
         let ch = self.channel(pv_name).await?;
         crate::client_native::ops_v2::op_monitor_raw_frames(
@@ -1923,7 +1923,7 @@ impl PvaClient {
         mut callback: F,
     ) -> PvaResult<()>
     where
-        F: FnMut(&PvField) + Send,
+        F: FnMut(&PvField) + Send + 'static,
     {
         let ch = self.channel(pv_name).await?;
         // Distinct from the one-shot pre-reads: a monitor's
@@ -1963,7 +1963,7 @@ impl PvaClient {
     /// directly.
     pub async fn pvmonitor_with_descriptor<F>(&self, pv_name: &str, callback: F) -> PvaResult<()>
     where
-        F: FnMut(&FieldDesc, &PvField) + Send,
+        F: FnMut(&FieldDesc, &PvField) + Send + 'static,
     {
         let ch = self.channel(pv_name).await?;
         op_monitor(&ch, &[], self.inner.pipeline_size, callback).await
@@ -2041,7 +2041,7 @@ impl PvaClient {
         callback: F,
     ) -> PvaResult<()>
     where
-        F: FnMut(MonitorEvent) + Send,
+        F: FnMut(MonitorEvent) + Send + 'static,
     {
         let ch = self.channel(pv_name).await?;
         let (raw_pv_req, flow) = match request {

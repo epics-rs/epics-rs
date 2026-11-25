@@ -14,12 +14,12 @@ use std::time::Duration;
 
 use epics_base_rs::error::eca::ECA_TIMEOUT;
 use epics_base_rs::runtime::log::errlog_vprintf;
-use epics_base_rs::runtime::sync::{Notify, mpsc};
+use epics_base_rs::runtime::sync::mpsc;
 use epics_base_rs::runtime::task::{
-    BlockingBridge, StackSizeClass, ThreadPriority, block_on_sync, spawn_dedicated_thread, timeout,
+    BlockingBridge, StackSizeClass, ThreadPriority, spawn_dedicated_thread, timeout,
 };
 use epics_base_rs::server::database::{
-    CaClientContext, ClientChannel, ClientSubscription, Connection, PvDatabase,
+    CaClientContext, ClientChannel, Connection, PvDatabase, QueuedSubscription,
 };
 use epics_base_rs::server::iocsh::registry::*;
 use epics_base_rs::server::snapshot::Snapshot;
@@ -121,71 +121,20 @@ impl Ca {
         ch: &Chan,
         dbr_type: u16,
         f: impl Fn(Snapshot) -> Msg + Send + Sync + 'static,
-    ) -> Option<Monitor> {
+    ) -> Option<QueuedSubscription> {
         let tx = self.tx.clone();
-        let cleared = Arc::new(Cleared::default());
-        let gone = cleared.clone();
-        let callback = Box::new(move |s| {
-            // The wait for room holds the context's delivering thread, until
-            // the monitor drops.
-            if let Err(mpsc::error::TrySendError::Full(msg)) = tx.try_send(f(s)) {
-                let _ = block_on_sync(async {
-                    epics_base_rs::runtime::select! {
-                        _ = tx.send(msg) => {}
-                        () = gone.wait() => {}
-                    }
-                });
-            }
+        let sub = QueuedSubscription::new(&**ch, dbr_type, 1, DBE_DEFAULT, tx, move |s, queue| {
+            queue.send(f(s));
         });
         // C answers a failed ca_add_event with ca_task_exit and then goes on
         // searching on the context it destroyed; only this monitor is lost.
-        let sub = self
-            .run(ch.subscribe(dbr_type, 1, DBE_DEFAULT, callback))
-            .ok()?;
-        Some(Monitor { cleared, _sub: sub })
+        self.run(sub).ok()
     }
 
     /// `ca_put`, issued and not waited on.
     fn put(&self, ch: Option<&Chan>, v: EpicsValue) {
         if let Some(ch) = ch {
             let _ = self.run(ch.put(v, false));
-        }
-    }
-}
-
-/// A [`Ca::monitor`] subscription (C's `evid`). Its drop ends the
-/// callback's wait for room, and the value waiting goes unqueued, before
-/// the subscription's drop waits for that callback: the task thread that
-/// drops the monitors, as it unwinds, is the queue's only reader.
-struct Monitor {
-    cleared: Arc<Cleared>,
-    _sub: ClientSubscription,
-}
-
-impl Drop for Monitor {
-    fn drop(&mut self) {
-        self.cleared.set();
-    }
-}
-
-/// Set when its [`Monitor`] drops.
-#[derive(Default)]
-struct Cleared {
-    set: AtomicBool,
-    notify: Notify,
-}
-
-impl Cleared {
-    fn set(&self) {
-        self.set.store(true, Ordering::SeqCst);
-        self.notify.notify_waiters();
-    }
-
-    async fn wait(&self) {
-        // Made before the load, so a `set` between the two still wakes it.
-        let notified = self.notify.notified();
-        if !self.set.load(Ordering::SeqCst) {
-            notified.await;
         }
     }
 }

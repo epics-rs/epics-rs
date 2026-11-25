@@ -12,17 +12,17 @@
 //! `ca_context_create`; any other goes to the network.
 
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use epics_base_rs::runtime::sync::{Notify, mpsc};
+use epics_base_rs::runtime::sync::mpsc;
 use epics_base_rs::runtime::task::{
-    BlockingBridge, ThreadPriority, apply_to_current_thread, block_on_sync, timeout,
+    BlockingBridge, ThreadPriority, apply_to_current_thread, timeout,
 };
 use epics_base_rs::server::builtin_devices::timestamp::epics_time_to_strftime;
 use epics_base_rs::server::database::{
-    CaClientContext, ClientChannel, ClientSubscription, Connection,
+    CaClientContext, ClientChannel, Connection, QueuedSubscription, SubscriptionQueue,
 };
 use epics_base_rs::server::iocsh::register_command;
 use epics_base_rs::server::iocsh::registry::{
@@ -190,6 +190,10 @@ fn extra_value(dbr_type: u16, s: &Snapshot) -> ExtraValue {
 }
 
 type Chan = Arc<dyn ClientChannel>;
+/// A [`Ca::monitor`] subscription (C's `evid`).
+type Monitor = QueuedSubscription;
+/// The queue as a monitor's handler sends to it.
+type Queue = SubscriptionQueue<Msg>;
 
 /// A channel and the subscription on it (C's `cpxds`/`crxds`/`cdxds` with
 /// their `descMonitor`).
@@ -368,16 +372,9 @@ impl Ca {
         mask: u16,
         f: impl Fn(Snapshot, &Queue) + Send + Sync + 'static,
     ) -> Option<Monitor> {
-        let cleared = Arc::new(Cleared::default());
-        let queue = Queue {
-            tx: self.tx.clone(),
-            gone: cleared.clone(),
-        };
-        let callback = Box::new(move |s: Snapshot| f(s, &queue));
-        let sub = self
-            .run(ch.subscribe(dbr_type, count, mask, callback))
-            .ok()?;
-        Some(Monitor { cleared, _sub: sub })
+        let tx = self.tx.clone();
+        self.run(Monitor::new(&**ch, dbr_type, count, mask, tx, f))
+            .ok()
     }
 }
 
@@ -409,75 +406,6 @@ fn cpt_monitor(
         };
         if matches!(policy, 2 | 3) && queued {
             *cpt_time.lock() = now;
-        }
-    }
-}
-
-/// The queue as a monitor's handler sends to it.
-struct Queue {
-    tx: mpsc::Sender<Msg>,
-    /// The handler's monitor dropped.
-    gone: Arc<Cleared>,
-}
-
-impl Queue {
-    /// `epicsMessageQueueSend`: whether `msg` was queued. The wait for room
-    /// holds the context's delivering thread, as C's does, until the
-    /// monitor drops.
-    fn send(&self, msg: Msg) -> bool {
-        match self.tx.try_send(msg) {
-            Ok(()) => true,
-            Err(mpsc::error::TrySendError::Full(msg)) => block_on_sync(async {
-                epics_base_rs::runtime::select! {
-                    sent = self.tx.send(msg) => sent.is_ok(),
-                    () = self.gone.wait() => false,
-                }
-            })
-            .unwrap_or(false),
-            Err(mpsc::error::TrySendError::Closed(_)) => false,
-        }
-    }
-
-    /// `epicsMessageQueueTrySend`: whether `msg` was queued.
-    fn try_send(&self, msg: Msg) -> bool {
-        self.tx.try_send(msg).is_ok()
-    }
-}
-
-/// A [`Ca::monitor`] subscription (C's `evid`). Its drop ends the
-/// callback's wait for room, and the value waiting goes unqueued, before
-/// the subscription's drop waits for that callback: the task thread that
-/// drops it is the queue's only reader. C's `ca_clear_subscription` waits
-/// there for good.
-struct Monitor {
-    cleared: Arc<Cleared>,
-    _sub: ClientSubscription,
-}
-
-impl Drop for Monitor {
-    fn drop(&mut self) {
-        self.cleared.set();
-    }
-}
-
-/// Set when its [`Monitor`] drops.
-#[derive(Default)]
-struct Cleared {
-    set: AtomicBool,
-    notify: Notify,
-}
-
-impl Cleared {
-    fn set(&self) {
-        self.set.store(true, Ordering::SeqCst);
-        self.notify.notify_waiters();
-    }
-
-    async fn wait(&self) {
-        // Made before the load, so a `set` between the two still wakes it.
-        let notified = self.notify.notified();
-        if !self.set.load(Ordering::SeqCst) {
-            notified.await;
         }
     }
 }

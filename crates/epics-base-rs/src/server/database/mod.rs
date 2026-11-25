@@ -15,6 +15,7 @@ mod link_put_queue;
 mod link_set;
 mod links;
 mod processing;
+mod queued_subscription;
 #[cfg(test)]
 mod reads_leak_tests;
 pub(crate) use processing::{AlarmPosts, alarm_field_posts};
@@ -58,6 +59,7 @@ pub use processing::{
 pub(crate) use processing::{
     DelayedCallbackTimers, NotifiedRead, ReadPolicy, seed_record_constants,
 };
+pub use queued_subscription::{QueuedSubscription, SubscriptionQueue};
 #[cfg(feature = "test-hooks")]
 pub use record_lock::fresh_hold_hook;
 

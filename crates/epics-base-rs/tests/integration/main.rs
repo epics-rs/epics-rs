@@ -534,6 +534,7 @@ mod dollar_address_takes_only_a_string_or_link;
 mod dollar_addresses_the_char_view;
 mod dollar_link_field_reads_its_text;
 mod double_to_float_convert;
+mod dropping_a_queued_subscription_ends_its_wait_for_room;
 mod dset_init_status_zero_converts;
 mod dtyp_is_a_device_menu_index;
 mod dtyp_with_no_device_menu_is_refused;

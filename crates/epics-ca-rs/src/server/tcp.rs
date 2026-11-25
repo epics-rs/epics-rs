@@ -750,6 +750,8 @@ impl PutNotifySlot {
 
 struct ChannelEntry {
     target: ChannelTarget,
+    /// This channel's asLib client; each of its monitors holds a clone.
+    rights: Arc<ChannelRights>,
     cid: u32,
     /// PV name as the client originally requested it (with any
     /// `.FIELD` suffix). Retained so the `ChannelCleared` lifecycle
@@ -919,27 +921,10 @@ pub(crate) struct ClientState {
     /// still naming one crossed that frame, and gets [`answer_pcas_refusal`];
     /// every other unknown sid keeps rsrv's answer. Freed with the circuit.
     retired: HashMap<u32, u32>,
-    /// This circuit's access-security host identity. See [`HostIdentity`]
-    /// — the variant, not a runtime check at the write site, decides
-    /// whether `CA_PROTO_HOST_NAME` may replace it.
-    hostname: HostIdentity,
-    /// C `client_name_action` keeps the `CLIENT_NAME` bytes as sent.
-    username: Vec<u8>,
-    /// Authentication method for ACF `METHOD()` clause matching.
-    /// `"x509"` for mTLS-authenticated peers (epics-base PR #641);
-    /// `"ca"` (or empty for backwards compat) for plaintext peers.
-    /// ACF rules without a `METHOD()` clause ignore this field
-    /// — the legacy `check_access_asl()` codepath continues to work.
-    auth_method: String,
-    /// Authority for ACF `AUTHORITY()` clause matching. mTLS peers
-    /// carry their cert's *issuer* DN here so rules like
-    /// `RULE(1, WRITE) { METHOD("x509") AUTHORITY("CN=ops-ca, …") }`
-    /// can pin write access to certs minted by a specific CA.
-    /// Empty for plaintext peers.
-    auth_authority: String,
-    acf: epics_base_rs::server::access_security::AcfCell,
-    /// record database, for resolving ACF `INP*` links to live
-    /// values when evaluating CALC-gated rules in `compute_access`.
+    /// Who the peer is and the ACF in force; each channel's
+    /// [`ChannelRights`] holds a clone.
+    rights: Arc<CircuitRights>,
+    /// The record database.
     db: Arc<PvDatabase>,
     tcp_port: u16,
     minor: CircuitMinor,
@@ -1052,6 +1037,230 @@ impl HostIdentity {
     }
 }
 
+/// Who the peer is to access security: the arguments of C `asAddClient`
+/// and `asChangeClient`.
+#[derive(Debug, Clone)]
+struct ClientIdentity {
+    /// See [`HostIdentity`] — the variant, not a runtime check at the write
+    /// site, decides whether `CA_PROTO_HOST_NAME` may replace it.
+    hostname: HostIdentity,
+    /// C `client_name_action` keeps the `CLIENT_NAME` bytes as sent.
+    username: Vec<u8>,
+    /// Authentication method for ACF `METHOD()` clause matching.
+    /// `"x509"` for mTLS-authenticated peers (epics-base PR #641);
+    /// `"ca"` (or empty for backwards compat) for plaintext peers.
+    /// ACF rules without a `METHOD()` clause ignore this field
+    /// — the legacy `check_access_asl()` codepath continues to work.
+    auth_method: String,
+    /// Authority for ACF `AUTHORITY()` clause matching. mTLS peers
+    /// carry their cert's *issuer* DN here so rules like
+    /// `RULE(1, WRITE) { METHOD("x509") AUTHORITY("CN=ops-ca, …") }`
+    /// can pin write access to certs minted by a specific CA.
+    /// Empty for plaintext peers.
+    auth_authority: String,
+}
+
+/// The circuit's asLib identity and policy, which every channel's
+/// [`ChannelRights`] computes from.
+pub(crate) struct CircuitRights {
+    /// Written only through [`ClientState::update_identity`], whose `&mut`
+    /// receiver makes the circuit's client loop its single writer. Each
+    /// change stores a new `Arc`, which is what [`ChannelRights`] keys on.
+    identity: arc_swap::ArcSwap<ClientIdentity>,
+    acf: epics_base_rs::server::access_security::AcfCell,
+}
+
+impl CircuitRights {
+    /// C's default identity: `""` for host and user until the client
+    /// names them.
+    pub(crate) fn new(acf: epics_base_rs::server::access_security::AcfCell) -> Self {
+        Self {
+            identity: arc_swap::ArcSwap::from_pointee(ClientIdentity {
+                hostname: HostIdentity::Claimed(Vec::new()),
+                username: Vec::new(),
+                auth_method: String::new(),
+                auth_authority: String::new(),
+            }),
+            acf,
+        }
+    }
+
+    /// Evaluate `cfg`'s rules for `asg_name`.
+    ///
+    /// The rule walk and the CALC results both belong to `epics-base-rs`:
+    /// `AccessSecurityConfig::compute_rules` reads the results its `INP*`
+    /// watcher published, as C's `asComputePvt` reads `pasgrule->result`.
+    /// This server used to carry its own evaluator, and then its own link
+    /// reads; both drifted from C.
+    fn access_for_asg(
+        cfg: &AccessSecurityConfig,
+        asg_name: &str,
+        asl: u8,
+        id: &ClientIdentity,
+    ) -> (AccessLevel, bool) {
+        cfg.compute_for_name(
+            asg_name,
+            id.hostname.as_bytes(),
+            &id.username,
+            &[],
+            asl,
+            &id.auth_method,
+            &id.auth_authority,
+        )
+    }
+
+    /// C `asComputePvt`: the level the ACF grants `id` on `target`, with the
+    /// write-trap mask of the rule that resolved it. The trap flag is `false`
+    /// when no `TRAPWRITE` rule resolved the level, including the no-ACF
+    /// permissive fallback.
+    fn compute(&self, target: &ChannelTarget, id: &ClientIdentity) -> (AccessLevel, bool) {
+        let (asg, asl) = match target {
+            // Simple PVs have no per-record ASL field; treat them as ASL=0
+            // so the most-restrictive rule applies. Matches the C IOC's
+            // behaviour for names that never went through `dbAddMember`.
+            ChannelTarget::SimplePv(_) => ("DEFAULT".to_owned(), 0),
+            ChannelTarget::RecordField { record, .. } => {
+                let instance = record.read();
+                (
+                    instance.common.access_group().to_string(),
+                    instance.common.asl,
+                )
+            }
+        };
+        match self.acf.load_full() {
+            // PR #641: method/authority for mTLS rules. CALC rules are
+            // evaluated against resolved INP* links.
+            Some(cfg) => Self::access_for_asg(&cfg, &asg, asl, id),
+            // No ACF attached: permissive ReadWrite, no rule resolved
+            // access, so no TRAPWRITE applies.
+            None => (AccessLevel::ReadWrite, false),
+        }
+    }
+}
+
+/// One channel's asLib client, C `ASGCLIENT` (`pciu->asClientPVT`).
+///
+/// C `asCheckGet`/`asCheckPut` read the access `asComputePvt` cached in it
+/// (`asLib.h:46-49`), recomputed by `asChangeClient` on a new identity, by
+/// `asComputeAsg` on an `INP*` event and by `asComputeAllAsg`/`asChangeGroup`
+/// on a load or an ASG put (`asLibRoutines.c:411`, `asCa.c:161`, `:205`,
+/// `asDbLib.c:109`). Here those last three bump the policy generation
+/// after publishing, and an identity change stores a new snapshot, so a
+/// check recomputes exactly when either moved since the cached result.
+pub(crate) struct ChannelRights {
+    circuit: Arc<CircuitRights>,
+    target: ChannelTarget,
+    computed: parking_lot::Mutex<Option<Computed>>,
+}
+
+/// What [`CircuitRights::compute`] returned, with what it was computed from.
+struct Computed {
+    policy: u64,
+    /// Held, so a later identity cannot reuse its address.
+    identity: Arc<ClientIdentity>,
+    level: AccessLevel,
+    rule_was_trap: bool,
+}
+
+impl ChannelRights {
+    pub(crate) fn new(circuit: Arc<CircuitRights>, target: ChannelTarget) -> Self {
+        Self {
+            circuit,
+            target,
+            computed: parking_lot::Mutex::new(None),
+        }
+    }
+
+    /// C `asCheckGet`, which `read_reply` calls per event
+    /// (`camessage.c:498`).
+    pub(crate) fn can_read(&self) -> bool {
+        matches!(self.level().0, AccessLevel::Read | AccessLevel::ReadWrite)
+    }
+
+    /// C `asCheckGet` and `rsrvCheckPut` together, as `access_rights_reply`
+    /// and every request handler see them.
+    pub(crate) fn access(&self) -> crate::server::access_token::CaAccessChecked {
+        let (level, rule_was_trap) = self.level();
+        let level = match (level, &self.target) {
+            // C `rsrvCheckPut` (rsrv/camessage.c:2540-2551):
+            //
+            //     /* SPC_NOMOD fields are always unwritable */
+            //     if (dbChannelSpecial(pciu->dbch) == SPC_NOMOD) return 0;
+            //
+            // and its `0` clears the ACCESS_RIGHTS write bit at
+            // camessage.c:1123-1125. The declaration has one owner
+            // (`RecordInstance::is_no_mod`), shared with the `dbPut`
+            // gate — reading `field_list().read_only` alone here saw
+            // neither the dbCommon NOMOD set (NAME/STAT/SEVR/ACKS/…,
+            // which no record's field_list declares) nor the
+            // state-raised NOMOD of `Record::field_no_mod` (compress
+            // VAL under BALG=LIFO), so the server advertised WRITE on
+            // fields it would then refuse. It strips only the WRITE bit
+            // and leaves the trap mask of the rule that matched; being
+            // state-raised, it is read live rather than cached.
+            (AccessLevel::ReadWrite, ChannelTarget::RecordField { record, field })
+                if record.read().is_no_mod(field) =>
+            {
+                AccessLevel::Read
+            }
+            (level, _) => level,
+        };
+        crate::server::access_token::CaAccessChecked::from_level(level, rule_was_trap)
+    }
+
+    /// The `CA_PROTO_ACCESS_RIGHTS` word for `level`: read bit 0, write
+    /// bit 1 (`access_rights_reply`, camessage.c:1117-1127).
+    fn wire_bits(level: AccessLevel) -> u32 {
+        match level {
+            AccessLevel::ReadWrite => 3,
+            AccessLevel::Read => 1,
+            AccessLevel::NoAccess => 0,
+        }
+    }
+
+    fn level(&self) -> (AccessLevel, bool) {
+        let identity = self.circuit.identity.load();
+        if let ChannelTarget::SimplePv(pv) = &self.target
+            && let Some(hook) = pv.access_hook()
+        {
+            // a gateway shadow PV carries an access hook routing the
+            // decision through the gateway's own ACF (`.pvlist` ASG +
+            // `AccessConfig::can_read/write`) for this downstream
+            // `(user, host)`. When present it is authoritative for this PV
+            // — the server's own ACF never saw the `.pvlist` ASG. It reads
+            // the gateway's ACL and the upstream's rights, which move under
+            // no generation here, so it is asked every time. The gateway
+            // audits/traps writes in its own write hook, so no TRAPWRITE
+            // rule resolves here.
+            let decision = hook(&identity.username, identity.hostname.as_bytes());
+            let level = match (decision.read, decision.write) {
+                (_, true) => AccessLevel::ReadWrite,
+                (true, false) => AccessLevel::Read,
+                (false, false) => AccessLevel::NoAccess,
+            };
+            return (level, false);
+        }
+        // Read before the policy: a change published after this read
+        // leaves a newer generation, so its result is never kept as current.
+        let policy = epics_base_rs::server::access_security::asg_change_generation();
+        if let Some(c) = &*self.computed.lock()
+            && c.policy == policy
+            && Arc::ptr_eq(&c.identity, &identity)
+        {
+            return (c.level, c.rule_was_trap);
+        }
+        let identity = arc_swap::Guard::into_inner(identity);
+        let (level, rule_was_trap) = self.circuit.compute(&self.target, &identity);
+        *self.computed.lock() = Some(Computed {
+            policy,
+            identity,
+            level,
+            rule_was_trap,
+        });
+        (level, rule_was_trap)
+    }
+}
+
 impl ClientState {
     /// Link a new subscription onto its channel — C `event_add_action`
     /// appending the `event_ext` to `pciu->eventq` (`camessage.c:1846`).
@@ -1120,11 +1329,7 @@ impl ClientState {
             advertised_access: HashMap::new(),
             retired_subscriptions: Vec::new(),
             retired: HashMap::new(),
-            hostname: HostIdentity::Claimed(Vec::new()),
-            username: Vec::new(),
-            auth_method: String::new(),
-            auth_authority: String::new(),
-            acf,
+            rights: Arc::new(CircuitRights::new(acf)),
             db,
             tcp_port,
             minor: CircuitMinor::new(0),
@@ -1201,7 +1406,7 @@ impl ClientState {
         initial_hostname: Option<String>,
         tls_authority: Option<String>,
     ) {
-        self.hostname = match initial_hostname {
+        let hostname = match initial_hostname {
             // Port extension, no C counterpart: an mTLS-verified cert identity
             // outranks both of C's modes and no client-supplied name replaces
             // it.
@@ -1218,10 +1423,13 @@ impl ClientState {
         // PR #641: surface the mTLS authentication context to the ACF
         // check. Plaintext peers stay with empty fields — every legacy
         // rule (no METHOD/AUTHORITY clause) ignores them.
-        if let Some(authority) = tls_authority {
-            self.auth_method = "x509".to_string();
-            self.auth_authority = authority;
-        }
+        self.update_identity(|id| {
+            id.hostname = hostname;
+            if let Some(authority) = tls_authority {
+                id.auth_method = "x509".to_string();
+                id.auth_authority = authority;
+            }
+        });
         self.peer = peer.to_string();
     }
 
@@ -1282,12 +1490,13 @@ impl ClientState {
 
     fn audit(&self, event: &str, pv: impl AsRef<[u8]>, value: &str, result: &str) {
         if let Some(ref logger) = self.audit {
+            let id = self.identity();
             logger.log(crate::audit::AuditEvent {
                 event,
                 peer: &self.peer,
                 // The audit log is Rust-only JSON, which needs text.
-                user: &String::from_utf8_lossy(&self.username),
-                host: &String::from_utf8_lossy(self.hostname.as_bytes()),
+                user: &String::from_utf8_lossy(&id.username),
+                host: &String::from_utf8_lossy(id.hostname.as_bytes()),
                 pv: &String::from_utf8_lossy(pv.as_ref()),
                 value,
                 result,
@@ -1309,156 +1518,28 @@ impl ClientState {
     }
 
     /// The type-state-wrapped access token for a SID, which every op
-    /// handler checks through. Computed from the ACF as it stands, as C
-    /// `asCheckGet`/`rsrvCheckPut` read the `pasgclient->access` asLib
-    /// updates before it notifies anyone (`asLibRoutines.c:1056-1059`,
-    /// `camessage.c:2608-2617`), so a revoked right is refused even while
-    /// the change's notice is still unsent. A SID with no channel is denied.
+    /// handler checks through: [`ChannelRights::access`] for its channel
+    /// (`camessage.c:2608-2617`). A SID with no channel is denied.
     async fn current_access(&self, sid: u32) -> crate::server::access_token::CaAccessChecked {
         use crate::server::access_token::CaAccessChecked;
         let Some(entry) = self.channels.get(&sid) else {
             return CaAccessChecked::denied();
         };
-        let (bits, rule_was_trap) = self.compute_access(&entry.target).await;
-        let level = match bits {
-            3 => AccessLevel::ReadWrite,
-            1 => AccessLevel::Read,
-            _ => AccessLevel::NoAccess,
-        };
-        CaAccessChecked::from_level(level, rule_was_trap)
+        entry.rights.access()
     }
 
-    /// Evaluate `cfg`'s rules for `asg_name`.
-    ///
-    /// The rule walk and the CALC results both belong to `epics-base-rs`:
-    /// `AccessSecurityConfig::compute_rules` reads the results its `INP*`
-    /// watcher published, as C's `asComputePvt` reads `pasgrule->result`.
-    /// This server used to carry its own evaluator, and then its own link
-    /// reads; both drifted from C.
-    fn access_for_asg(
-        &self,
-        cfg: &AccessSecurityConfig,
-        asg_name: &str,
-        asl: u8,
-    ) -> (AccessLevel, bool) {
-        cfg.compute_for_name(
-            asg_name,
-            self.hostname.as_bytes(),
-            &self.username,
-            &[],
-            asl,
-            &self.auth_method,
-            &self.auth_authority,
-        )
+    /// C `asChangeClient`, run by the client thread alone: the `&mut`
+    /// receiver is what keeps the circuit's client loop the identity's
+    /// single writer while its monitors read it.
+    fn update_identity<R>(&mut self, change: impl FnOnce(&mut ClientIdentity) -> R) -> R {
+        let mut identity = ClientIdentity::clone(&self.rights.identity.load());
+        let out = change(&mut identity);
+        self.rights.identity.store(Arc::new(identity));
+        out
     }
 
-    /// Compute access rights bits for a channel target, together with
-    /// the write-trap mask of the ACF rule that resolved the level
-    ///. The trap flag is `false` for `SimplePv`/`RecordField`
-    /// targets whose access was not resolved through a `TRAPWRITE`
-    /// rule — including the no-ACF permissive fallback.
-    async fn compute_access(&self, target: &ChannelTarget) -> (u32, bool) {
-        match target {
-            ChannelTarget::SimplePv(pv) => {
-                // a gateway shadow PV carries an access
-                // hook routing the decision through the gateway's own
-                // ACF (`.pvlist` ASG + `AccessConfig::can_read/write`)
-                // for this downstream `(user, host)`. When present it
-                // is authoritative for this PV — the server's own ACF
-                // never saw the `.pvlist` ASG, so consulting `self.acf`
-                // with a hardcoded "DEFAULT" would mis-report read
-                // access. The gateway audits/traps writes in its own
-                // write hook, so no TRAPWRITE rule resolves here.
-                if let Some(hook) = pv.access_hook() {
-                    let decision = hook(&self.username, self.hostname.as_bytes());
-                    let bits = match (decision.read, decision.write) {
-                        (_, true) => 3,
-                        (true, false) => 1,
-                        (false, false) => 0,
-                    };
-                    return (bits, false);
-                }
-                let policy = self.acf.load_full();
-                if let Some(ref acf_cfg) = policy {
-                    // Simple PVs have no per-record ASL field; treat
-                    // them as ASL=0 so the most-restrictive rule
-                    // applies. Matches the C IOC's behaviour for
-                    // names that never went through `dbAddMember`.
-                    // PR #641: pass auth method/authority so
-                    // METHOD("x509") / AUTHORITY(<issuer>) rules
-                    // can gate mTLS-authenticated peers. CALC
-                    // rules are evaluated against resolved INP* links.
-                    let (level, rule_was_trap) = self.access_for_asg(acf_cfg, "DEFAULT", 0);
-                    let bits = match level {
-                        AccessLevel::ReadWrite => 3,
-                        AccessLevel::Read => 1,
-                        AccessLevel::NoAccess => 0,
-                    };
-                    (bits, rule_was_trap)
-                } else {
-                    // No ACF attached: permissive ReadWrite, no rule
-                    // resolved access, so no TRAPWRITE applies.
-                    (3, false)
-                }
-            }
-            ChannelTarget::RecordField { record, field: f } => {
-                // extract is_ro/asg/asl and DROP the record
-                // read-guard before resolving ACF INP* links, so a CALC
-                // input pointing back at this record can't re-acquire the
-                // same lock.
-                let (is_ro, asg, asl) = {
-                    let instance = record.read();
-                    // C `rsrvCheckPut` (rsrv/camessage.c:2540-2551):
-                    //
-                    //     /* SPC_NOMOD fields are always unwritable */
-                    //     if (dbChannelSpecial(pciu->dbch) == SPC_NOMOD) return 0;
-                    //
-                    // and its `0` clears the ACCESS_RIGHTS write bit at
-                    // camessage.c:1123-1125. The declaration has one owner
-                    // (`RecordInstance::is_no_mod`), shared with the `dbPut`
-                    // gate — reading `field_list().read_only` alone here saw
-                    // neither the dbCommon NOMOD set (NAME/STAT/SEVR/ACKS/…,
-                    // which no record's field_list declares) nor the
-                    // state-raised NOMOD of `Record::field_no_mod` (compress
-                    // VAL under BALG=LIFO), so the server advertised WRITE on
-                    // fields it would then refuse.
-                    let is_ro = instance.is_no_mod(f);
-                    (
-                        is_ro,
-                        instance.common.access_group().to_string(),
-                        instance.common.asl,
-                    )
-                };
-                // Read-only field-ness must AND
-                // with ACF, never replace it. Pre-fix the read-only
-                // branch returned `Read`(1) unconditionally — a
-                // peer whose ACF resolved to `NoAccess` could still
-                // READ / EVENT_ADD on every read-only field because
-                // the cached access_rights skipped the ACF check
-                // entirely. Now ACF runs first; the read-only flag
-                // only strips the WRITE bit from the result.
-                let policy = self.acf.load_full();
-                let (acf_level, rule_was_trap) = if let Some(ref acf_cfg) = policy {
-                    // Thread the per-record ASL so
-                    // `RULE(N, …)` gates correctly. PR #641: method/
-                    // authority for mTLS rules. CALC rules are
-                    // evaluated against resolved INP* links.
-                    self.access_for_asg(acf_cfg, &asg, asl)
-                } else {
-                    (AccessLevel::ReadWrite, false)
-                };
-                let bits = match (acf_level, is_ro) {
-                    (AccessLevel::NoAccess, _) => 0,
-                    (AccessLevel::Read, _) => 1,
-                    (AccessLevel::ReadWrite, true) => 1,
-                    (AccessLevel::ReadWrite, false) => 3,
-                };
-                // The trap mask reflects the rule that granted access;
-                // a read-only field stripping the WRITE bit does not
-                // change which rule matched.
-                (bits, rule_was_trap)
-            }
-        }
+    fn identity(&self) -> Arc<ClientIdentity> {
+        self.rights.identity.load_full()
     }
 }
 
@@ -3049,7 +3130,7 @@ pub(crate) async fn dispatch_message(
             // exists anywhere in epics-base), so a `HOST(node)` HAG that
             // granted WRITE under C granted nothing here.
             let claimed = payload[..end].to_vec();
-            if state.hostname.claim(claimed.clone()) {
+            if state.update_identity(|id| id.hostname.claim(claimed.clone())) {
                 // Re-evaluate access rights for all existing channels.
                 reeval_access_rights(state, writer).await?;
             } else {
@@ -3057,7 +3138,7 @@ pub(crate) async fn dispatch_message(
                 tracing::debug!(
                     peer = %peer,
                     claimed_host = %claimed,
-                    identity = %String::from_utf8_lossy(state.hostname.as_bytes()),
+                    identity = %String::from_utf8_lossy(state.identity().hostname.as_bytes()),
                     "HOST_NAME ignored: identity is pinned (asCheckClientIP or mTLS)"
                 );
                 state.audit("host_name", "", &claimed, "ignored_pinned");
@@ -3121,7 +3202,7 @@ pub(crate) async fn dispatch_message(
                 // The previous double-strip yielded MissingPrefix on
                 // every well-formed token; cap-tokens was non-
                 // functional whenever a verifier was configured.
-                state.username = match (&state.cap_token_verifier, raw.starts_with(b"cap:")) {
+                let username = match (&state.cap_token_verifier, raw.starts_with(b"cap:")) {
                     // A token is base64 after the prefix, so non-UTF-8 bytes
                     // fail verification like any other malformed token.
                     (Some(v), true) => match std::str::from_utf8(&raw)
@@ -3141,8 +3222,10 @@ pub(crate) async fn dispatch_message(
                             // empty (or `"x509"` if mTLS is also active),
                             // so cap-token METHOD/AUTHORITY clauses
                             // could not match a verified token.
-                            state.auth_method = "cap-token".to_string();
-                            state.auth_authority = claims.iss.clone();
+                            state.update_identity(|id| {
+                                id.auth_method = "cap-token".to_string();
+                                id.auth_authority = claims.iss.clone();
+                            });
                             claims.sub.into_bytes()
                         }
                         Err(e) => {
@@ -3161,10 +3244,11 @@ pub(crate) async fn dispatch_message(
                     },
                     _ => raw,
                 };
+                state.update_identity(|id| id.username = username);
             }
             #[cfg(not(feature = "cap-tokens"))]
             {
-                state.username = raw;
+                state.update_identity(|id| id.username = raw);
             }
             // Re-evaluate access rights for all existing channels
             reeval_access_rights(state, writer).await?;
@@ -3325,18 +3409,16 @@ pub(crate) async fn dispatch_message(
                 }
             }
 
-            let (access, _) = state.compute_access(&target).await;
-            let access_level = match access {
-                3 => AccessLevel::ReadWrite,
-                1 => AccessLevel::Read,
-                _ => AccessLevel::NoAccess,
-            };
+            let rights = Arc::new(ChannelRights::new(state.rights.clone(), target.clone()));
+            let access_level = rights.access().level();
+            let access = ChannelRights::wire_bits(access_level);
 
             let shared_name: Arc<[u8]> = pv_name.into();
             state.channels.insert(
                 sid,
                 ChannelEntry {
                     target,
+                    rights,
                     cid: client_cid,
                     pv_name: shared_name.clone(),
                     filter_suffix: filter_suffix.clone(),
@@ -4984,6 +5066,7 @@ async fn write_admitted(
     // (RecordField pre-rejections happen inside the called
     // function) without a deeper refactor.
     let mut trap_guard = trap_listeners_active.then(|| {
+        let id = state.identity();
         epics_base_rs::server::access_security::TrapWriteGuard::begin(
             epics_base_rs::server::access_security::TrapWriteFields {
                 pv_name: state
@@ -4991,8 +5074,8 @@ async fn write_admitted(
                     .get(&sid)
                     .map(|e| e.target.audit_name())
                     .unwrap_or_default(),
-                user: state.username.clone(),
-                host: state.hostname.as_bytes().to_vec(),
+                user: id.username.clone(),
+                host: id.hostname.as_bytes().to_vec(),
                 peer: state.peer.clone(),
                 value_str: display_value.clone(),
                 // C `asTrapWriteWithData` (`camessage.c:768-771`) logs
@@ -5036,6 +5119,7 @@ async fn write_admitted(
             "dbr-type-not-puttable",
         ),
         PutPlan::Write { write } => {
+            let id = state.identity();
             let put = epics_base_rs::server::database::channel_io::put(
                 db,
                 &entry.target,
@@ -5043,17 +5127,14 @@ async fn write_admitted(
                 write,
                 is_notify,
                 || epics_base_rs::server::pv::WriteContext {
-                    user: state.username.clone(),
-                    host: state.hostname.as_bytes().to_vec(),
+                    user: id.username.clone(),
+                    host: id.hostname.as_bytes().to_vec(),
                     peer: state.peer.clone(),
                 },
             );
-            let result = crate::server::current_client::attached(
-                &state.username,
-                state.hostname.as_bytes(),
-                put,
-            )
-            .await;
+            let result =
+                crate::server::current_client::attached(&id.username, id.hostname.as_bytes(), put)
+                    .await;
             let (tail, result) = match result {
                 Ok(PutStarted::Started(completion)) => (WriteTail::chain(completion), Ok(())),
                 Ok(PutStarted::Posted(end)) => (WriteTail::posted(end), Ok(())),
@@ -5938,11 +6019,9 @@ pub(crate) async fn register_subscription(
     // Rust returned `ECA_NORDACCESS` here without installing —
     // a subscription opened while denied was permanently
     // absent, so a later ACF reload that granted access could
-    // not re-arm anything. Capture access as a flag and let
-    // the install path below populate the `denied` gate so
-    // `reeval_access_rights` can flip it later (Bug 4 parity).
-    let access_denied = state.current_access(sid).await.require_read().is_err();
-
+    // not re-arm anything. Each delivery asks the channel's
+    // [`ChannelRights`] instead, so a later grant reaches this
+    // monitor too (Bug 4 parity).
     let target = entry.target.clone();
     // C `pevext`, handed to `db_add_event` as `user_arg`: every entry of this
     // monitor, the initial one included, is framed from it. C stores the
@@ -5952,7 +6031,7 @@ pub(crate) async fn register_subscription(
     // (C `db_cancel_event`).
     let monitor = Arc::new(CircuitMonitor {
         gate: crate::server::outbox::MonitorGate::open(),
-        denied: AtomicBool::new(access_denied),
+        rights: entry.rights.clone(),
         ended: AtomicBool::new(false),
         data_type: requested_type,
         sub_id,
@@ -6826,10 +6905,10 @@ async fn reeval_access_rights(state: &mut ClientState, writer: &Outbox) -> CaRes
     if state.channels.is_empty() {
         return Ok(());
     }
-    let chan_info: Vec<(u32, u32, ChannelTarget)> = state
+    let chan_info: Vec<(u32, u32, Arc<ChannelRights>)> = state
         .channels
         .iter()
-        .map(|(&sid, entry)| (sid, entry.cid, entry.target.clone()))
+        .map(|(&sid, entry)| (sid, entry.cid, entry.rights.clone()))
         .collect();
 
     // (sid, old_level, new_level) — old defaults to NoAccess for a
@@ -6847,13 +6926,8 @@ async fn reeval_access_rights(state: &mut ClientState, writer: &Outbox) -> CaRes
     // reloads (typo fix, new UAG that doesn't intersect, etc.).
     // Mirror C: only emit on actual transition.
     let mut transitions: Vec<(u32, AccessLevel, AccessLevel)> = Vec::new();
-    for (sid, cid, target) in chan_info {
-        let (new_access, _) = state.compute_access(&target).await;
-        let new_level = match new_access {
-            3 => AccessLevel::ReadWrite,
-            1 => AccessLevel::Read,
-            _ => AccessLevel::NoAccess,
-        };
+    for (sid, cid, rights) in chan_info {
+        let new_level = rights.access().level();
         let old_level = state
             .advertised_access
             .insert(sid, new_level)
@@ -6866,7 +6940,7 @@ async fn reeval_access_rights(state: &mut ClientState, writer: &Outbox) -> CaRes
         // into the outbox for the connection loop to drain and flush.
         let mut ar = CaHeader::new(CA_PROTO_ACCESS_RIGHTS);
         ar.cid = cid;
-        ar.available = new_access;
+        ar.available = ChannelRights::wire_bits(new_level);
         writer.push(ar.to_bytes().to_vec());
     }
 
@@ -6894,7 +6968,6 @@ async fn reeval_access_rights(state: &mut ClientState, writer: &Outbox) -> CaRes
         // enabled and then posts the current value. Both posts take the
         // monitor's pre-chain and ring like any update.
         for monitor in &entry.subscriptions {
-            monitor.monitor.denied.store(!new_read, Ordering::Release);
             let id = monitor.id;
             match &entry.target {
                 ChannelTarget::SimplePv(pv) => {
@@ -7493,17 +7566,14 @@ pub(crate) struct ReplyContext {
 /// to the circuit's event task with each queued entry
 /// ([`attach_with`](epics_base_rs::server::event_queue::attach_with)).
 ///
-/// The one owner of the subscription's gate and access flag: the channel, the
-/// circuit's registry and the cancel path hold this `Arc`, not copies of them.
-/// Every field an update reads comes first, on one 64-byte line (C's
+/// The one owner of the subscription's gate: the channel, the circuit's
+/// registry and the cancel path hold this `Arc`, not copies of it. Every
+/// field an update frames from comes first, on one 64-byte line (C's
 /// `event_ext` is freelist-allocated and walked in order instead); see the
 /// `circuit_monitor_layout` test.
 #[repr(C, align(64))]
 pub(crate) struct CircuitMonitor {
     pub(crate) gate: crate::server::outbox::MonitorGate,
-    /// C `asCheckGet` as `read_reply` sees it; flipped by
-    /// [`reeval_access_rights`].
-    pub(crate) denied: AtomicBool,
     /// The monitor's frame could not be built; its later entries are dropped.
     /// Only the event task touches it.
     pub(crate) ended: AtomicBool,
@@ -7513,6 +7583,11 @@ pub(crate) struct CircuitMonitor {
     pub(crate) stats: Option<Arc<super::stats::ServerStats>>,
     pub(crate) stage: super::DeliveryStage,
     pub(crate) target: ChannelTarget,
+    /// The channel's, asked per update as C `read_reply` calls `asCheckGet`
+    /// per event (`camessage.c:498`). Off the first line: the check reads
+    /// the circuit's identity and the policy generation from lines of their
+    /// own anyway.
+    pub(crate) rights: Arc<ChannelRights>,
     // Cold: read only to refuse an update or by an option read.
     /// The EVENT_ADD request, echoed by a refusal.
     pub(crate) req_hdr: CaHeader,
@@ -7527,6 +7602,11 @@ pub(crate) static LIVE_OPTION_READS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 impl CircuitMonitor {
+    /// Whether this update goes out as `no_read_access_event`.
+    pub(crate) fn read_denied(&self) -> bool {
+        !self.rights.can_read()
+    }
+
     /// The channel's options at delivery, through the door the monitor's
     /// initial value takes; a monitor never reads through a gateway read
     /// hook (`SimplePv::read_snapshot`). CLASS_NAME is the record's type.
@@ -7565,14 +7645,13 @@ mod circuit_monitor_layout {
     use std::mem::{align_of, offset_of, size_of};
 
     #[test]
-    fn every_field_an_update_reads_is_on_the_first_line() {
+    fn every_field_an_update_frames_from_is_on_the_first_line() {
         assert_eq!(align_of::<CircuitMonitor>(), 64);
         let ends = [
             (
                 "gate",
                 offset_of!(CircuitMonitor, gate) + size_of::<crate::server::outbox::MonitorGate>(),
             ),
-            ("denied", offset_of!(CircuitMonitor, denied) + 1),
             ("ended", offset_of!(CircuitMonitor, ended) + 1),
             ("data_type", offset_of!(CircuitMonitor, data_type) + 2),
             ("sub_id", offset_of!(CircuitMonitor, sub_id) + 4),
@@ -7686,7 +7765,7 @@ async fn deliver_record_field_event(
     if let Some(ref s) = m.stats {
         s.subscription_events_posted.fetch_add(1, Ordering::Relaxed);
     }
-    if m.denied.load(Ordering::Acquire) {
+    if m.read_denied() {
         m.gate.deliver(|| send_denied_event(m, outbox, minor));
         return;
     }
@@ -7885,13 +7964,18 @@ mod delivery_reads_options {
         data_type: u16,
     ) -> CircuitMonitor {
         CircuitMonitor {
+            rights: Arc::new(ChannelRights::new(
+                Arc::new(CircuitRights::new(
+                    epics_base_rs::server::access_security::new_acf_cell(None),
+                )),
+                target.clone(),
+            )),
             target,
             db: db.clone(),
             cid: 0,
             sub_id: 1,
             data_type,
             data_count: 0,
-            denied: AtomicBool::new(false),
             gate: crate::server::outbox::MonitorGate::open(),
             stage: super::super::DeliveryStage::plain(),
             req_hdr: CaHeader::new(CA_PROTO_EVENT_ADD),
@@ -8411,7 +8495,7 @@ fn deliver_update(
             s.subscription_events_posted.fetch_add(1, Ordering::Relaxed);
         }
         let to = StageNow::new(sink);
-        let denied = m.denied.load(Ordering::Acquire);
+        let denied = m.read_denied();
         if denied {
             send_denied_event(m, &to, client_minor);
         } else if let Some(update) = source {
@@ -9160,10 +9244,11 @@ fn pcas_log_bad_id(
         "CAS: bad resource id in \"{FILE}\" at line {line}\n"
     ));
     // `caServerI::dumpMsg` (`caServerI.cc:312-321`) puts this one on stderr.
+    let id = state.identity();
     let mut request = b"CAS Request: ".to_vec();
-    request.extend_from_slice(&state.username);
+    request.extend_from_slice(&id.username);
     request.extend_from_slice(b" on ");
-    request.extend_from_slice(state.hostname.as_bytes());
+    request.extend_from_slice(id.hostname.as_bytes());
     let _ = writeln!(
         request,
         ": cmd={} cid={} typ={} cnt={} psz={} avail={:x}",
@@ -18338,9 +18423,7 @@ mod access_change_walk_tests {
                         .downcast_ref::<CircuitMonitor>()
                         .expect("a CA monitor");
                     match event.value() {
-                        LogValue::Val(EpicsValue::Double(v)) => {
-                            (m.denied.load(Ordering::Acquire), v)
-                        }
+                        LogValue::Val(EpicsValue::Double(v)) => (m.read_denied(), v),
                         v => panic!("unexpected value {v:?}"),
                     }
                 }
@@ -18374,7 +18457,7 @@ mod access_change_walk_tests {
             epics_base_rs::server::access_security::parse_acf(ACF).unwrap(),
         ));
         let mut state = ClientState::new(acf, 5064, db.clone());
-        state.username = "ops".into();
+        state.update_identity(|id| id.username = "ops".into());
         let (outbox, mut drain) = crate::server::outbox::channel();
         let peer: SocketAddr = "127.0.0.1:55990".parse().unwrap();
 
@@ -18433,7 +18516,7 @@ mod access_change_walk_tests {
         assert_eq!(next_event(&state), Some((false, 1.5)), "initial value");
 
         // Revoke: AR 0, then one post, delivered as `no_read_access_event`.
-        state.username = "nobody".into();
+        state.update_identity(|id| id.username = "nobody".into());
         reeval_access_rights(&mut state, &outbox).await.unwrap();
         let out = frames(&mut drain);
         assert_eq!(out.len(), 1);
@@ -18445,7 +18528,7 @@ mod access_change_walk_tests {
         );
 
         // Restore: AR 3, then the current value.
-        state.username = "ops".into();
+        state.update_identity(|id| id.username = "ops".into());
         reeval_access_rights(&mut state, &outbox).await.unwrap();
         let out = frames(&mut drain);
         assert_eq!(out.len(), 1);
@@ -18476,10 +18559,9 @@ mod access_change_walk_tests {
         )
         .await
         .unwrap();
-        assert_eq!(state.hostname.as_bytes(), b"h\xff");
+        assert_eq!(state.identity().hostname.as_bytes(), b"h\xff");
         let access = |acf: &[u8]| {
-            state
-                .access_for_asg(&parse_acf(acf).unwrap(), "DEFAULT", 0)
+            CircuitRights::access_for_asg(&parse_acf(acf).unwrap(), "DEFAULT", 0, &state.identity())
                 .0
         };
         let rule = b"ASG(DEFAULT) {\n    RULE(1, WRITE) { HAG(hs) }\n}\n";
@@ -18559,20 +18641,28 @@ mod access_change_walk_tests {
         )
         .await
         .unwrap();
-        assert_eq!(state.username, b"op\xff");
+        assert_eq!(state.identity().username, b"op\xff");
         assert_eq!(
-            state
-                .access_for_asg(&parse_acf(acf).unwrap(), "DEFAULT", 0)
-                .0,
+            CircuitRights::access_for_asg(
+                &parse_acf(acf).unwrap(),
+                "DEFAULT",
+                0,
+                &state.identity()
+            )
+            .0,
             AccessLevel::NoAccess
         );
         // The member spelled with the same bytes is the one that matches.
         let exact: &[u8] =
             b"UAG(ops) { \"op\xff\" }\nASG(DEFAULT) {\n    RULE(1, WRITE) { UAG(ops) }\n}\n";
         assert_eq!(
-            state
-                .access_for_asg(&parse_acf(exact).unwrap(), "DEFAULT", 0)
-                .0,
+            CircuitRights::access_for_asg(
+                &parse_acf(exact).unwrap(),
+                "DEFAULT",
+                0,
+                &state.identity()
+            )
+            .0,
             AccessLevel::ReadWrite
         );
     }
@@ -18887,6 +18977,292 @@ mod access_change_tests {
         );
         drop(task_tx);
         task.await;
+    }
+
+    /// Every frame read until `done` holds, as (command, cid word).
+    #[cfg(tokio_backend)]
+    async fn read_until(
+        client: &mut tokio::io::DuplexStream,
+        acc: &mut Vec<u8>,
+        seen: &mut Vec<(u16, u32)>,
+        done: impl Fn(&[(u16, u32)]) -> bool,
+    ) {
+        use tokio::io::AsyncReadExt;
+        let mut buf = [0u8; 256];
+        while !done(seen) {
+            let n = tokio::time::timeout(fact_budget::FACT_BUDGET, client.read(&mut buf))
+                .await
+                .expect("a frame within the budget")
+                .expect("read ok");
+            assert!(n > 0, "server closed: {seen:?}");
+            acc.extend_from_slice(&buf[..n]);
+            let mut at = 0;
+            while at + CaHeader::SIZE <= acc.len() {
+                let (hdr, size) = CaHeader::from_bytes_extended(&acc[at..]).unwrap();
+                if at + size + hdr.actual_postsize() > acc.len() {
+                    break;
+                }
+                seen.push((hdr.cmmd, hdr.cid));
+                at += size + hdr.actual_postsize();
+            }
+            acc.drain(..at);
+        }
+    }
+
+    /// A circuit whose loop is parked writing to a client that stopped
+    /// reading cannot take an ACF change's notice; a value posted after the
+    /// revoke still reaches that client only as a no-read-access event, as C
+    /// `read_reply` checks `asCheckGet` per event (`camessage.c:498`).
+    #[cfg(tokio_backend)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_value_posted_after_a_revoke_is_withheld_while_the_loop_is_parked() {
+        use super::non_graceful_disconnect_teardown_tests::{
+            create_chan_frame, event_add_frame, read_create_chan_sid, version_frame,
+        };
+        use crate::protocol::{CA_PROTO_ACCESS_RIGHTS, CA_PROTO_ECHO};
+        use std::time::Duration;
+        use tokio::io::AsyncWriteExt;
+
+        let db = Arc::new(PvDatabase::new());
+        let (acf, _, _, _, _) = open(&db).await;
+        let pv = db.find_pv("AR:LIVE").unwrap();
+        let stats = Arc::new(super::super::stats::ServerStats::default());
+        let (acf_tx, acf_rx) = broadcast::channel(4);
+        // Room for two 16-byte echo replies each way.
+        let (mut client, server_io) = tokio::io::duplex(32);
+        let server = tokio::spawn(handle_client(
+            server_io,
+            PEER.parse().unwrap(),
+            db.clone(),
+            acf.clone(),
+            acf_rx,
+            5064,
+            None,
+            None,
+            None,
+            None,
+            Some(stats.clone()),
+            #[cfg(feature = "cap-tokens")]
+            None,
+            #[cfg(feature = "cap-tokens")]
+            None,
+        ));
+
+        let (mut acc, mut seen) = (Vec::new(), Vec::new());
+        for frame in [version_frame(), create_chan_frame(1, "AR:LIVE")] {
+            client.write_all(&frame).await.unwrap();
+        }
+        let sid = read_create_chan_sid(&mut client, fact_budget::FACT_BUDGET).await;
+        client.write_all(&event_add_frame(sid, 0xAB)).await.unwrap();
+        read_until(&mut client, &mut acc, &mut seen, |s| {
+            s.iter().any(|&(c, _)| c == CA_PROTO_EVENT_ADD)
+        })
+        .await;
+        seen.clear();
+
+        // Stop reading and keep sending echoes: once the server no longer
+        // takes them, its loop is parked in a write to this client.
+        let echo = CaHeader::new(CA_PROTO_ECHO).to_bytes();
+        'park: loop {
+            let mut rest = &echo[..];
+            while !rest.is_empty() {
+                // absence-window: a parked loop takes nothing, so no reply can
+                // mark it parked.
+                match tokio::time::timeout(Duration::from_millis(300), client.write(rest)).await {
+                    Ok(n) => rest = &rest[n.unwrap()..],
+                    Err(_) => break 'park,
+                }
+            }
+        }
+
+        acf.install_async(parse_acf(NO_ACCESS).unwrap()).await;
+        acf_tx.send(()).unwrap();
+        let posted = stats.subscription_events_posted.load(Ordering::Relaxed);
+        pv.set(EpicsValue::Double(2.0));
+        // The delivery counts the post right before it checks read access.
+        let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+        while stats.subscription_events_posted.load(Ordering::Relaxed) == posted {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the post was never delivered"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // The loop, unparked, takes the notice and posts the denial too.
+        read_until(&mut client, &mut acc, &mut seen, |s| {
+            s.iter()
+                .skip_while(|&&(c, _)| c != CA_PROTO_ACCESS_RIGHTS)
+                .any(|&(c, _)| c == CA_PROTO_EVENT_ADD)
+        })
+        .await;
+        let events: Vec<u32> = seen
+            .iter()
+            .filter(|&&(c, _)| c == CA_PROTO_EVENT_ADD)
+            .map(|&(_, status)| status)
+            .collect();
+        assert!(
+            events.len() >= 2 && events.iter().all(|&s| s == ECA_NORDACCESS),
+            "every update after the revoke is a denial: {seen:?}"
+        );
+        server.abort();
+    }
+
+    /// An `INP*` value that turns a CALC rule off reaches the monitor's next
+    /// update, as C `asComputeAsg` recomputes the group's clients on the
+    /// event (`asCa.c:161`) that `read_reply`'s `asCheckGet` then reads.
+    #[cfg(tokio_backend)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_inp_change_that_revokes_read_reaches_the_next_update() {
+        use super::non_graceful_disconnect_teardown_tests::{
+            create_chan_frame, event_add_frame, read_create_chan_sid, version_frame,
+        };
+        use epics_base_rs::server::access_security::new_acf_cell_watching;
+        use epics_base_rs::server::records::ai::AiRecord;
+        use tokio::io::AsyncWriteExt;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_pv("AR:LIVE", EpicsValue::Double(1.5)).await.unwrap();
+        db.add_record("AR:GATE", Box::new(AiRecord::new(1.0)))
+            .await
+            .unwrap();
+        db.put_record_field_from_ca("AR:GATE", "VAL", EpicsValue::Double(1.0))
+            .await
+            .unwrap();
+        let acf = new_acf_cell_watching(None, &db);
+        acf.install_async(
+            parse_acf(r#"ASG(DEFAULT) { INPA("AR:GATE") RULE(1, READ) { CALC("A=1") } }"#).unwrap(),
+        )
+        .await;
+        let (_acf_tx, acf_rx) = broadcast::channel(4);
+        let (mut client, server_io) = tokio::io::duplex(4096);
+        let server = tokio::spawn(handle_client(
+            server_io,
+            PEER.parse().unwrap(),
+            db.clone(),
+            acf.clone(),
+            acf_rx,
+            5064,
+            None,
+            None,
+            None,
+            None,
+            None,
+            #[cfg(feature = "cap-tokens")]
+            None,
+            #[cfg(feature = "cap-tokens")]
+            None,
+        ));
+        for frame in [version_frame(), create_chan_frame(1, "AR:LIVE")] {
+            client.write_all(&frame).await.unwrap();
+        }
+        let sid = read_create_chan_sid(&mut client, fact_budget::FACT_BUDGET).await;
+        client.write_all(&event_add_frame(sid, 0xAB)).await.unwrap();
+        let (mut acc, mut seen) = (Vec::new(), Vec::new());
+        let updates = |s: &[(u16, u32)]| {
+            s.iter()
+                .filter(|&&(c, _)| c == CA_PROTO_EVENT_ADD)
+                .map(|&(_, status)| status)
+                .collect::<Vec<_>>()
+        };
+        read_until(&mut client, &mut acc, &mut seen, |s| !updates(s).is_empty()).await;
+        assert_eq!(updates(&seen), [ECA_NORMAL], "the initial value");
+
+        db.put_record_field_from_ca("AR:GATE", "VAL", EpicsValue::Double(0.0))
+            .await
+            .unwrap();
+        // The watcher takes the value on its own task, so post until an
+        // update carries the denial.
+        let pv = db.find_pv("AR:LIVE").unwrap();
+        let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+        for value in 2.. {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "none of {} updates after the INP change was a denial",
+                updates(&seen).len()
+            );
+            let before = updates(&seen).len();
+            pv.set(EpicsValue::Double(value as f64));
+            read_until(&mut client, &mut acc, &mut seen, |s| {
+                updates(s).len() > before
+            })
+            .await;
+            if updates(&seen).last() == Some(&ECA_NORDACCESS) {
+                break;
+            }
+        }
+        server.abort();
+    }
+
+    /// A `dbPut` of the record's ASG reaches the monitor's next update, as C
+    /// `asChangeGroup` recomputes the record's clients (`asDbLib.c:109`).
+    #[cfg(tokio_backend)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_asg_put_that_revokes_read_reaches_the_next_update() {
+        use super::non_graceful_disconnect_teardown_tests::{
+            create_chan_frame, event_add_frame, read_create_chan_sid, version_frame,
+        };
+        use epics_base_rs::server::records::ai::AiRecord;
+        use tokio::io::AsyncWriteExt;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("AR:REC", Box::new(AiRecord::new(1.0)))
+            .await
+            .unwrap();
+        let acf = new_acf_cell(Some(
+            parse_acf(
+                "ASG(DEFAULT) {\n    RULE(1, READ)\n}\nASG(LOCKED) {\n    RULE(1, NONE)\n}\n",
+            )
+            .unwrap(),
+        ));
+        let (_acf_tx, acf_rx) = broadcast::channel(4);
+        let (mut client, server_io) = tokio::io::duplex(4096);
+        let server = tokio::spawn(handle_client(
+            server_io,
+            PEER.parse().unwrap(),
+            db.clone(),
+            acf,
+            acf_rx,
+            5064,
+            None,
+            None,
+            None,
+            None,
+            None,
+            #[cfg(feature = "cap-tokens")]
+            None,
+            #[cfg(feature = "cap-tokens")]
+            None,
+        ));
+        for frame in [version_frame(), create_chan_frame(1, "AR:REC")] {
+            client.write_all(&frame).await.unwrap();
+        }
+        let sid = read_create_chan_sid(&mut client, fact_budget::FACT_BUDGET).await;
+        client.write_all(&event_add_frame(sid, 0xAB)).await.unwrap();
+        let (mut acc, mut seen) = (Vec::new(), Vec::new());
+        let updates = |s: &[(u16, u32)]| {
+            s.iter()
+                .filter(|&&(c, _)| c == CA_PROTO_EVENT_ADD)
+                .map(|&(_, status)| status)
+                .collect::<Vec<_>>()
+        };
+        read_until(&mut client, &mut acc, &mut seen, |s| !updates(s).is_empty()).await;
+        assert_eq!(updates(&seen), [ECA_NORMAL], "the initial value");
+        seen.clear();
+
+        db.put_record_field_from_ca("AR:REC", "ASG", EpicsValue::String("LOCKED".into()))
+            .await
+            .unwrap();
+        db.put_record_field_from_ca("AR:REC", "VAL", EpicsValue::Double(2.0))
+            .await
+            .unwrap();
+        read_until(&mut client, &mut acc, &mut seen, |s| !updates(s).is_empty()).await;
+        assert_eq!(
+            updates(&seen)[0],
+            ECA_NORDACCESS,
+            "the first update after the ASG put"
+        );
+        server.abort();
     }
 }
 

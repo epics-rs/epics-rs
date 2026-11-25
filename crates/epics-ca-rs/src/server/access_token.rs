@@ -150,7 +150,7 @@ impl CaAccessChecked {
         }
     }
 
-    /// Raw level — exposed for diagnostics (compute_access wire
+    /// Raw level — exposed for diagnostics (the ACCESS_RIGHTS
     /// frame builder needs the integer mask 0/1/3). Should NOT be
     /// used as a substitute for `require_*` in op handlers.
     pub fn level(&self) -> AccessLevel {

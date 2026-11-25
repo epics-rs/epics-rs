@@ -374,16 +374,22 @@ fn gated_circuit_monitored_pvs(
                 format!("CIRCUIT:{cid}"),
                 EpicsValue::Double(0.0),
             ));
+            let target = ChannelTarget::SimplePv(pv.clone());
             let monitor = Arc::new(crate::server::tcp::CircuitMonitor {
                 gate: crate::server::outbox::MonitorGate::open(),
-                denied: AtomicBool::new(false),
+                rights: Arc::new(crate::server::tcp::ChannelRights::new(
+                    Arc::new(crate::server::tcp::CircuitRights::new(
+                        epics_base_rs::server::access_security::new_acf_cell(None),
+                    )),
+                    target.clone(),
+                )),
                 ended: AtomicBool::new(false),
                 data_type: DBR_DOUBLE,
                 sub_id: cid + 1,
                 data_count: 0,
                 stats: None,
                 stage: crate::server::DeliveryStage::plain(),
-                target: ChannelTarget::SimplePv(pv.clone()),
+                target,
                 req_hdr: CaHeader::new(CA_PROTO_EVENT_ADD),
                 cid,
                 db: db.clone(),

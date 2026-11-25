@@ -614,6 +614,10 @@ enum Hdf5Handle {
         /// C `detDataMap`. Created at open; one entry for the
         /// common single-`<dataset source="detector">` layout.
         detectors: std::collections::HashMap<String, DetectorDataset>,
+        /// The fixed leading axes the datasets were created with, outermost
+        /// first, or `None` when the one frame axis extends: C's
+        /// `virtualdims`, set with `detectors` and fixed until close.
+        leading: Option<Vec<usize>>,
     },
     Swmr {
         // Boxed: `SwmrFileWriter` is much larger than the `Standard` variant.
@@ -1915,10 +1919,13 @@ impl Hdf5Writer {
         let Some(frame_dims) = self.open_frame_dims.clone() else {
             return Ok(());
         };
-        let (_, chunk, leading) = self.standard_layout(&frame_dims);
+        let chunk = self.open_chunk.clone();
         let elem_size = self.stored_elem_size;
         let fc = Self::frames_per_chunk(&chunk, chunk.len() - frame_dims.len());
-        let Some(Hdf5Handle::Standard { detectors, .. }) = self.handle.as_mut() else {
+        let Some(Hdf5Handle::Standard {
+            detectors, leading, ..
+        }) = self.handle.as_mut()
+        else {
             return Ok(());
         };
         for det in detectors.values_mut() {
@@ -2633,8 +2640,14 @@ impl Hdf5Writer {
             );
         }
 
-        if let Some(Hdf5Handle::Standard { detectors: d, .. }) = self.handle.as_mut() {
+        if let Some(Hdf5Handle::Standard {
+            detectors: d,
+            leading: l,
+            ..
+        }) = self.handle.as_mut()
+        {
             *d = detectors;
+            *l = leading;
         }
         self.open_data_type = Some(ds_data_type);
         self.stored_elem_size = stored_elem_size;
@@ -2718,8 +2731,6 @@ impl Hdf5Writer {
         }
         let chunk = self.open_chunk.clone();
         let chunk_bytes = self.direct_chunk(array, &frame_dims)?;
-
-        let (_shape, _, leading) = self.standard_layout(&frame_dims);
         let fc = Self::frames_per_chunk(&chunk, chunk.len() - frame_dims.len());
 
         // An uncompressed frame becomes little-endian pixel bytes for band
@@ -2736,7 +2747,10 @@ impl Hdf5Writer {
         };
 
         {
-            let Some(Hdf5Handle::Standard { detectors, .. }) = self.handle.as_mut() else {
+            let Some(Hdf5Handle::Standard {
+                detectors, leading, ..
+            }) = self.handle.as_mut()
+            else {
                 return Err(ADError::UnsupportedConversion(
                     "HDF5 detector datasets not initialised".into(),
                 )
@@ -3652,7 +3666,10 @@ impl Hdf5Writer {
                 if let Some(Hdf5Handle::Standard { ref file, .. }) = self.handle {
                     self.build_layout_hardlinks(file).map_err(|x| e(&x))?;
                 }
-                if let Some(Hdf5Handle::Standard { file, detectors }) = self.handle.take() {
+                if let Some(Hdf5Handle::Standard {
+                    file, detectors, ..
+                }) = self.handle.take()
+                {
                     let closed = if self.fsync_on_close {
                         file.close()
                     } else {
@@ -4572,6 +4589,7 @@ impl NDFileWriter for Hdf5Writer {
             self.handle = Some(Hdf5Handle::Standard {
                 file: h5file,
                 detectors: std::collections::HashMap::new(),
+                leading: None,
             });
             // A failed open closes the file it built, which stays on disk as
             // C's does; C holds it open until the next openFile (:221).
@@ -4687,6 +4705,7 @@ impl NDFileWriter for Hdf5Writer {
                         Some(Hdf5Handle::Standard {
                             ref file,
                             ref detectors,
+                            ..
                         }) => {
                             w.build_layout_hardlinks(file)?;
                             // Every group and dataset now exists, so layout
@@ -4701,7 +4720,10 @@ impl NDFileWriter for Hdf5Writer {
                     // no-fsync fast close instead (rust-hdf5 0.3.2 `close_no_sync`).
                     // Detector dataset handles are released only after finalize,
                     // preserving the prior file-before-datasets drop order.
-                    if let Some(Hdf5Handle::Standard { file, detectors }) = w.handle.take() {
+                    if let Some(Hdf5Handle::Standard {
+                        file, detectors, ..
+                    }) = w.handle.take()
+                    {
                         if w.fsync_on_close {
                             drop(file);
                         } else {
@@ -7742,6 +7764,59 @@ mod tests {
             assert_eq!(posted, [want.0, want.1], "case {n}");
             std::fs::remove_file(&path).ok();
         }
+    }
+
+    /// C writes a stream through the chunk dims `configureDims` fixed at
+    /// open (NDFileHDF5.cpp:3248-3273); HDF5_chunkSizeAuto, which writeInt32
+    /// still takes while the file is open, does not reach that file.
+    #[test]
+    fn a_stream_closes_in_the_chunk_layout_it_opened_with() {
+        use crate::test_util::{auto_save_to, publish, running, wait_saved};
+        let (handle, _rx, _jh) = running("HDF5_OPEN_LAYOUT", Hdf5FileProcessor::new());
+        let port = handle.port_runtime().port_handle();
+        let reason = |name: &str| {
+            port.drv_user_create_blocking(&asyn_rs::port::DrvUserRequest::new(name, 0))
+                .unwrap()
+                .reason
+        };
+        let frame = |f: u16| {
+            NDArray::with_data(
+                vec![NDDimension::new(4), NDDimension::new(5)],
+                NDDataBuffer::from_vec::<u16>((0..20).map(|i| f * 100 + i).collect()),
+            )
+        };
+        let path = temp_path("hdf5_open_layout");
+        auto_save_to(&handle, &path);
+        // A Single save leaves the frame a Stream capture opens on.
+        publish(&handle, &frame(9));
+        wait_saved(&handle, 1);
+        for (name, value) in [
+            ("HDF5_chunkSizeAuto", 0),
+            ("HDF5_nColChunks", 2),
+            ("HDF5_nRowChunks", 2),
+            ("HDF5_nFramesChunks", 3),
+            ("WRITE_MODE", 2),
+            ("NUM_CAPTURE", 0),
+            ("CAPTURE", 1),
+        ] {
+            port.write_int32_blocking(reason(name), 0, value).unwrap();
+        }
+        // Two frames leave a partial three-frame band for the close.
+        for f in 0..2 {
+            publish(&handle, &frame(f));
+            wait_saved(&handle, 2 + i32::from(f));
+        }
+        port.write_int32_blocking(reason("HDF5_chunkSizeAuto"), 0, 1)
+            .unwrap();
+        port.write_int32_blocking(reason("CAPTURE"), 0, 0).unwrap();
+
+        let h5 = H5File::open(&path).unwrap();
+        let ds = h5.dataset("entry/instrument/detector/data").unwrap();
+        assert_eq!(ds.shape(), vec![2, 5, 4]);
+        assert_eq!(ds.chunk_dims(), Some(vec![3, 2, 2]));
+        let want: Vec<u16> = [frame(0), frame(1)].iter().flat_map(u16_pixels).collect();
+        assert_eq!(ds.read_raw::<u16>().unwrap(), want);
+        std::fs::remove_file(&path).ok();
     }
 
     /// C `openFile`/`writeFile` fill `pFileAttributes` from `getAttributes`

@@ -929,9 +929,9 @@ mod tests {
 
     /// SPC_LINCONV parity (aiRecord.c:187): writing LINR / EGUF / EGUL re-arms
     /// the INIT phase, so the next process takes the retuned conversion as its
-    /// initial condition instead of blending it into the SMOO history. This
-    /// C serves `INIT = 1` while initial. See tests/integration/init_phase.rs for the
-    /// whole phase.
+    /// initial condition instead of blending it into the SMOO history. This C
+    /// serves `INIT = 1` while initial. See tests/integration/init_phase.rs for
+    /// the whole phase.
     #[test]
     fn linr_put_re_arms_the_init_phase_for_smoothing() {
         let mut rec = AiRecord::default();

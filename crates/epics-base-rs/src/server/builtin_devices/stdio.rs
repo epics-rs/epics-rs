@@ -206,8 +206,8 @@ mod tests {
     }
 
     /// A resolved stream prints VAL; assert the call path runs cleanly (the
-    /// printed bytes go to the process stream — the `errlog` stream is
-    /// asserted end-to-end via tracing capture in `tests/integration/stdio_device.rs`).
+    /// printed bytes go to the process stream — the `errlog` stream is asserted
+    /// end-to-end via tracing capture in `tests/integration/stdio_device.rs`).
     #[test]
     fn write_to_resolved_stream_succeeds() {
         let mut dev = StdioDeviceSupport::new("@stderr");

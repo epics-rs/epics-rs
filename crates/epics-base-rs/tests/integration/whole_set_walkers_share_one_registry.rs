@@ -1,5 +1,6 @@
 //! A test that walks every entry of `RECORD_TYPES` must build its records
-//! through `tests/integration/module_records`, not through `db_loader::create_record`.
+//! through `tests/integration/module_records`, not through
+//! `db_loader::create_record`.
 //!
 //! `RECORD_TYPES` has 37 entries; Base's default registry claims only the 30
 //! that `stdRecords.dbd` declares. The other seven — acalcout, asyn, busy,

@@ -530,12 +530,13 @@ mod tests {
         }
     }
 
-    /// Neither init hook seeds MLST/ALST/LALM: C reaches
-    /// `subRecord.c:130-132` only past `init_record`'s INAM and SNAM early
-    /// returns, so the seed belongs to the SNAM resolution owner
-    /// (`ioc_app::wire_subroutine`, covered by
-    /// `tests/integration/snam_is_resolved_only_where_c_resolves_it.rs`). Seeding here
-    /// gave an unresolved-SNAM record `MLST: 5` where softIoc reads `MLST: 0`.
+    /// Neither init hook seeds MLST/ALST/LALM: C reaches `subRecord.c:130-132`
+    /// only past `init_record`'s INAM and SNAM early returns, so the seed
+    /// belongs to the SNAM resolution owner (`ioc_app::wire_subroutine`,
+    /// covered by
+    /// `tests/integration/snam_is_resolved_only_where_c_resolves_it.rs`).
+    /// Seeding here gave an unresolved-SNAM record `MLST: 5` where softIoc
+    /// reads `MLST: 0`.
     #[test]
     fn the_record_itself_seeds_no_tracker() {
         let mut rec = SubRecord::default();

@@ -470,7 +470,8 @@ fn test_keyword_and_or() {
 /// neither: `postfix("")` is `CALC_ERR_NULL_ARG` (-1, `postfix.c:235-241`), and
 /// the empty program it leaves in RPCL makes `calcPerform` return -1 — which is
 /// how a calc record with an empty CALC alarms on every process instead of
-/// quietly reading 0. tests/integration/calc_empty_program.rs covers the rule in full.
+/// quietly reading 0. tests/integration/calc_empty_program.rs covers the rule
+/// in full.
 #[test]
 fn test_empty_expression() {
     assert_eq!(compile("").err(), Some(CalcError::NullArg));

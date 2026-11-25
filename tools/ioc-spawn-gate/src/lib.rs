@@ -2105,9 +2105,9 @@ mod tests {
         assert!(spawn_evidence(&src, &tokens()).is_some());
     }
 
-    /// No `use` item at all. `epics-oracle-rs/tests/integration/oracle.rs` spells the path
-    /// in full, and a module probe that demanded nothing precede `process`
-    /// would refuse the commonest spelling there is.
+    /// No `use` item at all. `epics-oracle-rs/tests/integration/oracle.rs`
+    /// spells the path in full, and a module probe that demanded nothing
+    /// precede `process` would refuse the commonest spelling there is.
     #[test]
     fn a_fully_qualified_path_needs_no_import() {
         let src = format!(

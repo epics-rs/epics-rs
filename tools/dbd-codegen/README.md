@@ -80,8 +80,8 @@ Both rules are pinned against compiled C:
 `crates/epics-base-rs/tests/fixtures/c_native_types.tsv` records the native type
 the real `softIoc` serves for every CA-visible field of the 34 base record
 types, and `generated_types_match_the_c_oracle`
-(`crates/epics-base-rs/tests/integration/dbd_generated_c_oracle.rs`) asserts the generated
-tables reproduce it.
+(`crates/epics-base-rs/tests/integration/dbd_generated_c_oracle.rs`) asserts the
+generated tables reproduce it.
 
 ## Regenerating the C oracle fixture
 

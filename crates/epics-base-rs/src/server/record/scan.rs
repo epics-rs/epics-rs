@@ -294,8 +294,8 @@ mod sim_mode_scan_tests {
 
     /// The labels this type renders are the loaded `menuScan`'s, so the one
     /// menu converter (which owns every string→menu-index put, see
-    /// `tests/integration/menu_common_field_scan_pini.rs`) and this type agree on every
-    /// choice — including the `".5 second"` spellings that the deleted
+    /// `tests/integration/menu_common_field_scan_pini.rs`) and this type agree
+    /// on every choice — including the `".5 second"` spellings that the deleted
     /// `ScanType::from_str` used to accept a `"0.5 second"` alias for.
     #[test]
     fn labels_match_the_loaded_menu() {

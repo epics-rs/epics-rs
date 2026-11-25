@@ -85,8 +85,8 @@ fn armed_records() -> [Armed; 5] {
 ///
 /// `busy` is module-owned and is not in Base's default registry, so this is an
 /// application that opts in for the row it is about to load — the shape
-/// `tests/integration/module_records` documents. The other four rows are Base types and the
-/// lookup finds nothing for them.
+/// `tests/integration/module_records` documents. The other four rows are Base
+/// types and the lookup finds nothing for them.
 async fn one_cycle(
     kind: &str,
     db_text: &str,

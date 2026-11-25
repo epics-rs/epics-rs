@@ -23,8 +23,9 @@
 //!   and runs at pass 0 — BEFORE `doResolveLinks` (`iocInit.c::initDatabase`),
 //!   when every link still reads as a constant — so it fires on every aao.
 //!
-//! The full link-shape table is `tests/integration/array_nord_at_init.rs`; this file keeps
-//! the NELM boundary (NELM==1 vs NELM>1) per kind, with no record processed.
+//! The full link-shape table is `tests/integration/array_nord_at_init.rs`; this
+//! file keeps the NELM boundary (NELM==1 vs NELM>1) per kind, with no record
+//! processed.
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;

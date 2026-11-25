@@ -111,12 +111,13 @@ port defect. Nothing is ever skipped when a prerequisite is absent — a silentl
 skipped oracle is the false-clean we are escaping.
 
 `cargo nextest run -p epics-oracle-rs` runs 248 tests, and every one of them
-tests the **harness**, never the port — nothing in them asserts a value the
-port reports, so they keep passing while its field tables are regenerated
-underneath them. The unit half (dbd parsing, case generation, adjudication,
-allowlist staleness) needs no C tree. `tests/integration/oracle.rs` and
-`tests/integration/pva_oracle.rs` boot the real pair, so they need the trees above and fail
-loudly rather than skipping when one is absent, on either backend.
+tests the **harness**, never the port — nothing in them asserts a value the port
+reports, so they keep passing while its field tables are regenerated underneath
+them. The unit half (dbd parsing, case generation, adjudication, allowlist
+staleness) needs no C tree. `tests/integration/oracle.rs` and
+`tests/integration/pva_oracle.rs` boot the real pair, so they need the trees
+above and fail loudly rather than skipping when one is absent, on either
+backend.
 
 **The PVA ground truth is pinned to pvxs 1.5.3**, and both halves of it have to
 be that version: the client tools under `PVXS_BIN` and the `libpvxs`/`libpvxsIoc`
@@ -131,11 +132,11 @@ DEVIATION to AGREED and retired an allowlist row. Run the lane against an older
 ### Features
 
 `scaler` (default) adds scaler-rs's `scaler` record and its `Asyn Scaler` soft
-port to `oracle-ioc` (`--scaler-soft`), and builds `tests/integration/scaler_oracle.rs`,
-which diffs the control scaler of `scaler-c8.db` against the C
-`oracleScalerIoc` — `EPICS_ORACLE_SCALER_IOC_BIN`, such as
-`$EPICS_MODULES/oracle-ioc/bin/linux-x86_64/oracleScalerIoc`.
-Without it, `oracle-ioc` has neither. `oracle-ioc` also registers `swait` and
+port to `oracle-ioc` (`--scaler-soft`), and builds
+`tests/integration/scaler_oracle.rs`, which diffs the control scaler of
+`scaler-c8.db` against the C `oracleScalerIoc` — `EPICS_ORACLE_SCALER_IOC_BIN`,
+such as `$EPICS_MODULES/oracle-ioc/bin/linux-x86_64/oracleScalerIoc`. Without
+it, `oracle-ioc` has neither. `oracle-ioc` also registers `swait` and
 optics-rs's `table`, which the fat dbd does not declare.
 
 ## Port discipline (this has bitten the repo before)

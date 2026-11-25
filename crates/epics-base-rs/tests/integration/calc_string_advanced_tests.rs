@@ -759,8 +759,8 @@ fn test_until_count_ceiling_is_nine() {
 // an unescape/escape — TR_ESC and ESC under another name. Their own comment
 // recorded that C's READ/WRITE are 2-operand and called the gap an open
 // finding. It is now closed: READ/WRITE are the binary field conversions they
-// are in C, and tests/integration/calc_string_bin_read_write.rs owns them, byte for byte
-// against the compiled engine.
+// are in C, and tests/integration/calc_string_bin_read_write.rs owns them, byte
+// for byte against the compiled engine.
 
 // --- Edge cases ---
 

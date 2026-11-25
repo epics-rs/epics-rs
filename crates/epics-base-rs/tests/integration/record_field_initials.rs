@@ -1,10 +1,11 @@
 //! Every record-own field starts at the value its `.dbd` declares.
 //!
-//! The `dbCommon` half of this rule is `tests/integration/common_field_initials.rs`. This is
-//! the other ~2,200 fields: the generated per-record tables carry each field's
-//! `initial()`, so a default the port picked by hand instead of reading off the
-//! declaration is checkable for all record types at once rather than one
-//! oracle-reported field at a time.
+//! The `dbCommon` half of this rule is
+//! `tests/integration/common_field_initials.rs`. This is the other ~2,200
+//! fields: the generated per-record tables carry each field's `initial()`, so a
+//! default the port picked by hand instead of reading off the declaration is
+//! checkable for all record types at once rather than one oracle-reported field
+//! at a time.
 //!
 //! C applies the initial in `dbStaticLib` at load: the record is calloc'd, then
 //! every field with an `initial()` is put through the same converter a `.db`

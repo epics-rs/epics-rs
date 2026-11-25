@@ -105,11 +105,11 @@ run-time type this crate does not have yet. An array or `string` parameter
 of a function definition, which C passes as a pointer, is refused the same
 way.
 
-`EXPECTED_FAILURES` in `tests/integration/reference_gen_code.rs` pins every upstream
-program that does not build, with its first error; every other program
+`EXPECTED_FAILURES` in `tests/integration/reference_gen_code.rs` pins every
+upstream program that does not build, with its first error; every other program
 type-checks or is rejected by analysis as C snc rejects it. Besides the
-refusals, sequencer `examples/parallel/control.st` calls
-`pvPutCompleteArray`, which is defined nowhere, so C cannot link it either.
+refusals, sequencer `examples/parallel/control.st` calls `pvPutCompleteArray`,
+which is defined nowhere, so C cannot link it either.
 
 ## Tests
 

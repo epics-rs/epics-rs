@@ -565,9 +565,9 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ("mca-rs", "tests/integration/a_remote_siml_is_a_ca_link.rs"),
     ("optics-rs", "tests/integration/integration_tests.rs"),
     ("optics-rs", "tests/integration/table_link_kind.rs"),
-    ("regression-ioc", "tests/families.rs"),
-    ("regression-ioc", "tests/motor.rs"),
-    ("regression-ioc", "tests/smoke.rs"),
+    ("regression-ioc", "tests/integration/families.rs"),
+    ("regression-ioc", "tests/integration/motor.rs"),
+    ("regression-ioc", "tests/integration/smoke.rs"),
     (
         "scaler-rs",
         "tests/integration/cnt_abort_cancels_delayed_start.rs",

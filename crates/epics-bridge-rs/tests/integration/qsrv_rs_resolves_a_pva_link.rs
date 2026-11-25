@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use epics_pva_rs::client::PvaClient;
 use epics_pva_rs::pvdata::{PvField, ScalarValue};
+use fact_budget::FACT_BUDGET;
 
 use crate::qsrv_named_ports;
 
@@ -64,7 +65,7 @@ async fn qsrv_rs_resolves_a_pva_link_as_soft_ioc_pva() {
                 .server_addr(std::net::SocketAddr::from(([127, 0, 0, 1], tcp)))
                 .timeout(Duration::from_secs(2))
                 .build();
-            let deadline = Instant::now() + Duration::from_secs(10);
+            let deadline = Instant::now() + FACT_BUDGET;
             while Instant::now() < deadline {
                 if let got @ Some((5.0, 0)) = value_and_severity(&client, "DST").await {
                     return got;

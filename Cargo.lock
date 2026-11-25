@@ -2488,6 +2488,7 @@ name = "named-port"
 version = "0.34.2"
 dependencies = [
  "epics-libcom-rs",
+ "fact-budget",
  "libc",
  "socket2 0.5.10",
  "windows-sys 0.59.0",

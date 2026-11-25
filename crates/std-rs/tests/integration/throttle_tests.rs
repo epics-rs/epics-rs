@@ -624,8 +624,9 @@ fn test_real_out_link_reports_success_and_writes() {
 // ============================================================
 // C stores any DLY verbatim (throttleRecord.c `special()` :392-409 only
 // clamps a negative one to 0), and `callbackRequestDelayed` takes it as
-// is. A delay past `Duration`'s range — +inf, NaN, 1e300 — converts
-// through `duration_from_secs` to `FAR_FUTURE`: armed, never fires.
+// is; its epicsTimer wraps a delay that large in `epicsTimeAddSeconds`
+// and fires at once. Here +inf, NaN and 1e300 convert through
+// `duration_from_secs` to `FAR_FUTURE`: armed, and Rust waits.
 // ============================================================
 
 /// The cooldown `actions` armed, if any.

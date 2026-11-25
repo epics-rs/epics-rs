@@ -5,15 +5,15 @@
 //! `epicsParseDouble` accepts — `1e308`, `1e39` and `inf` all SUCCEED (a finite
 //! overflow like `1e400` is the only refusal). SDEL only arms a monitor
 //! watchdog (`wdogInit`: `if (prec->sdel > 0)` schedule a callback of `sdel`
-//! seconds); an enormous or infinite SDEL simply schedules a callback that never
-//! fires.
+//! seconds); C's epicsTimer wraps an enormous or infinite SDEL in
+//! `epicsTimeAddSeconds` and the callback fires at once.
 //!
 //! The port's `watchdog_interval` converted SDEL with `Duration::from_secs_f64`,
 //! which PANICS on a non-finite or Duration-overflowing value — so arming the
 //! watchdog after the store aborted the whole put, and the oracle saw the put
-//! REFUSED. `try_from_secs_f64` maps every such value to `None` (no watchdog
-//! arms, behaviourally identical to C's never-firing callback), so the store
-//! itself is accepted across the whole double range.
+//! REFUSED. `duration_from_secs` maps every such value to `FAR_FUTURE` (the
+//! watchdog arms and Rust waits), so the store itself is accepted across the
+//! whole double range.
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::Record;

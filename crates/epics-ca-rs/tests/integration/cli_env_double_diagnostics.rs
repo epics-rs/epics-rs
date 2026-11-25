@@ -88,15 +88,16 @@ fn conn_tmo_inf_parses_but_is_refused_like_c() {
     );
 }
 
-/// Finite and enormous passes C's `finite()` guard, so C obeys it: the
-/// watchdog simply never fires. No diagnostic, no panic, no overflow when
-/// the deadline is built from the far-future cap.
+/// Finite and enormous passes C's `finite()` guard, so C accepts it; its
+/// epicsTimer wraps the delay and fires at once, where Rust waits. No
+/// diagnostic, no panic, no overflow when the deadline is built from the
+/// far-future cap.
 #[test]
 fn conn_tmo_finite_enormous_is_obeyed_silently() {
     let err = caget_stderr("EPICS_CA_CONN_TMO", "1e300");
     assert!(
         !err.contains("was not a positive real number"),
-        "1e300 is finite and positive, so C obeys it:\n{err}"
+        "1e300 is finite and positive, so C accepts it:\n{err}"
     );
     assert!(
         !err.contains("overflow when adding duration to instant"),

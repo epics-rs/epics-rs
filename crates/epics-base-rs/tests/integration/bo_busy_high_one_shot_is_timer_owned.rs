@@ -281,14 +281,14 @@ fn the_timer_body_matches_my_callback_func() {
 
 /// The HIGH boundary that `Duration` cannot represent. HIGH is `DBF_DOUBLE`
 /// (`boRecord.dbd.pod`, `busyRecord.dbd.pod`) and C stores the whole range —
-/// `caput B.HIGH 1e300` succeeds, and `callbackRequestDelayed(cb, 1e300)`
-/// schedules a callback past any run's lifetime rather than failing. The port's
+/// `caput B.HIGH 1e300` succeeds, and `callbackRequestDelayed(cb, 1e300)` does
+/// not fail: its epicsTimer wraps the delay and fires at once. The port's
 /// re-arm converted that HIGH with `Duration::from_secs_f64`, which PANICS
 /// above `u64::MAX` seconds, so a value C accepts aborted the timer thread.
 /// The re-arm now takes `runtime::time::duration_from_secs`, the converter the
 /// arming path in `after_write_actions` already uses, so such a HIGH re-arms at
-/// `FAR_FUTURE` — C's queued callback that no comparison reaches — rather
-/// than returning `Drop`. `Drop` is reserved for the one-shot that is no
+/// `FAR_FUTURE`, where Rust waits, rather than returning `Drop`. `Drop` is
+/// reserved for the one-shot that is no
 /// longer live. The representable neighbour is pinned beside it so the rule is
 /// a boundary and not a blanket `FAR_FUTURE`.
 #[test]

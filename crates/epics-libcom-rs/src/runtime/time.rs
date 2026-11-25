@@ -199,9 +199,9 @@ fn c_long_cast(f: f64) -> i64 {
 /// * negative, including `-inf` → [`Duration::ZERO`] — C's
 ///   already-expired deadline, which fires at once.
 /// * `+inf`, `NaN`, or anything past [`FAR_FUTURE`] → [`FAR_FUTURE`] —
-///   a deadline that never fires. NaN lands here because in C every
-///   `now < expire` test against NaN is false, which is the same "never
-///   fires". C's event waits and thread sleeps cap at ten years
+///   Rust waits. C's epicsTimer instead wraps these in
+///   `epicsTimeAddSeconds` and fires at once (measured for `1e300`, `inf`
+///   and `nan`). C's event waits and thread sleeps cap at ten years
 ///   (`convertDoubleToWakeTime`, posix `osdTime.cpp:97-100`); this cap is
 ///   tokio's thirty, and a caller may double or pad it without overflow,
 ///   which `Duration::MAX` and a representable `1e19` s both refuse.

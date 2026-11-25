@@ -292,6 +292,9 @@ impl InProcessEvents {
     /// lock a callback takes. Inside one of this context's callbacks it does
     /// nothing: an in-process callback's thread is already delivering, as
     /// C's `CAC-event` is, and a network callback's never takes an entry.
+    /// Inside a put of any client context, in its record's processing or
+    /// [`InProcessChannel::put_callback`]'s `issued`, it does nothing as
+    /// well: `CAC-event` may be waiting on that put, and delivers after it.
     pub fn deliver(&self) {
         self.0.0.deliver();
     }
@@ -438,6 +441,9 @@ thread_local! {
     /// The event context whose callbacks, of either kind, this thread is
     /// delivering.
     static DELIVERING: Cell<*const Events> = const { Cell::new(std::ptr::null()) };
+
+    /// How many runs of client contexts' puts this thread is in.
+    static IN_RUNS: Cell<usize> = const { Cell::new(0) };
 }
 
 /// [`DELIVERING`] for one delivery pass, restored on every exit.
@@ -485,7 +491,9 @@ impl Events {
         let Some(waker) = self.cac_event.waker() else {
             return;
         };
-        if std::ptr::eq(DELIVERING.get(), self) {
+        // A thread in a run never waits for the turn: its holder may be
+        // waiting on that run.
+        if std::ptr::eq(DELIVERING.get(), self) || IN_RUNS.get() > 0 {
             return;
         }
         let _consumer = self.consumer.lock();
@@ -589,12 +597,14 @@ impl<'a> Run<'a> {
         let number = runs.0;
         runs.0 += 1;
         runs.1.push((number, record));
+        IN_RUNS.set(IN_RUNS.get() + 1);
         Run { running, number }
     }
 }
 
 impl Drop for Run<'_> {
     fn drop(&mut self) {
+        IN_RUNS.set(IN_RUNS.get() - 1);
         let mut runs = self.running.runs.lock();
         if let Some(at) = runs.1.iter().position(|&(run, _)| run == self.number) {
             runs.1.swap_remove(at);

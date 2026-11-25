@@ -189,3 +189,35 @@ async fn a_create_channel_puts_own_record_monitor_waits_for_the_put() {
         assert_eq!(a_values.recv_timeout(fact_budget::FACT_BUDGET), Ok(1.0));
     });
 }
+
+/// A put callback whose `issued` delivers the context's events, its own
+/// record's value queued, returns, and that value lands after it.
+#[epics_macros_rs::epics_test]
+async fn delivering_inside_a_put_callbacks_issued_returns() {
+    let gate = Arc::new(Gate::default());
+    let db = ioc(&gate).await;
+    let ctx = db.ca_client();
+    let (values, b_values) = mpsc::channel();
+    let b = monitor(&open(&ctx, "B"), move |v| values.send(v).unwrap());
+    let put = open(&ctx, "B");
+    let events = ctx.events().clone();
+    let (returned, put_returned) = mpsc::channel();
+    std::thread::spawn(move || {
+        let put = put.put_callback(EpicsValue::Double(1.0), |done| {
+            events.deliver();
+            done
+        });
+        let _ = returned.send(put.is_ok());
+    });
+    let returned = put_returned.recv_timeout(fact_budget::FACT_BUDGET);
+    if returned.is_err() {
+        // The putter and `CAC-event` wait on each other; nothing may join them.
+        std::mem::forget((b, ctx, db));
+    }
+    assert_eq!(returned, Ok(true), "put_callback whose issued delivers");
+    assert_eq!(
+        b_values.recv_timeout(fact_budget::FACT_BUDGET),
+        Ok(1.0),
+        "B's monitor after the put"
+    );
+}

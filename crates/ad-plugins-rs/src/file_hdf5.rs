@@ -1140,6 +1140,9 @@ pub struct Hdf5Writer {
     dataset_codec: Option<Codec>,
     /// Chunk geometry of the open detector dataset(s), leading axes first.
     open_chunk: Vec<usize>,
+    /// Rows per chunk of the open file's attribute and `timestamp`
+    /// datasets: C's `calculateAttributeChunking` at open.
+    open_attr_chunk: usize,
     /// What `configure_compression` left for the port to post and print;
     /// shared so the port drains it without the writer's lock.
     open_posts: Arc<Mutex<OpenPosts>>,
@@ -1218,6 +1221,7 @@ impl Hdf5Writer {
             open_frame_dims: None,
             dataset_codec: None,
             open_chunk: Vec::new(),
+            open_attr_chunk: 1,
             open_posts: Arc::default(),
             cfg: WriterSettings::new(Hdf5Settings::default()),
             multi_frame: false,
@@ -2906,7 +2910,7 @@ impl Hdf5Writer {
                 let (shape, axes) = match self.attribute_index(&attr.name) {
                     Some(i) if self.cfg.dim_att_datasets && self.cfg.pos_running => (
                         AttrShape::Series {
-                            chunk: self.attribute_chunking(),
+                            chunk: self.open_attr_chunk,
                         },
                         vec![i],
                     ),
@@ -2962,7 +2966,7 @@ impl Hdf5Writer {
     fn attribute_shape(&self) -> AttrShape {
         if !self.cfg.dim_att_datasets {
             return AttrShape::Series {
-                chunk: self.attribute_chunking(),
+                chunk: self.open_attr_chunk,
             };
         }
         if !self.multi_frame {
@@ -3185,7 +3189,7 @@ impl Hdf5Writer {
         } else {
             format!("{group}/timestamp")
         };
-        let chunk = self.attribute_chunking() as u64;
+        let chunk = self.open_attr_chunk as u64;
         swmr.create_grid_dataset_with_max(
             &path,
             f64::hdf5_type(),
@@ -3386,7 +3390,7 @@ impl Hdf5Writer {
             .ok()?
             .new_dataset::<f64>()
             .shape([1, 5])
-            .chunk(&[self.attribute_chunking(), 5])
+            .chunk(&[self.open_attr_chunk, 5])
             // C `maxdims = {H5S_UNLIMITED, H5S_UNLIMITED}` (NDFileHDF5.cpp:2600).
             .max_shape(&[None, None])
             .create("timestamp")
@@ -3416,7 +3420,7 @@ impl Hdf5Writer {
     /// C's two-unlimited-axis dataset (NDFileHDF5.cpp:2600, :2645-2647), a
     /// v2 B-tree written by grid coordinate; the last is zero-padded.
     fn performance_chunks(&self) -> Vec<Vec<u8>> {
-        let band = self.attribute_chunking() * 5 * 8;
+        let band = self.open_attr_chunk * 5 * 8;
         let raw: Vec<u8> = self
             .perf_rows
             .iter()
@@ -4571,6 +4575,7 @@ impl NDFileWriter for Hdf5Writer {
         set.copy_from(&self.plugin_attributes);
         self.file_attributes.open(&set, array);
         self.configure_chunking(array);
+        self.open_attr_chunk = self.attribute_chunking();
         if let Err(e) = self.load_layout() {
             // C creates the file before it loads the layout (NDFileHDF5.cpp:
             // 271, :279), so a failed layout leaves the empty file behind.
@@ -10464,6 +10469,58 @@ mod tests {
         let vals: Vec<f64> = ts.read_raw().unwrap();
         assert_eq!(vals.len(), 15);
         assert!(vals[10..].iter().any(|&v| v != 0.0), "swmr={swmr} {vals:?}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// C sizes `timestamp`'s chunk at open (NDFileHDF5.cpp:2645-2647) and
+    /// writes it at close by hyperslab, so an `HDF5_NDAttributeChunk` taken
+    /// mid-capture reaches neither.
+    #[test]
+    fn the_performance_dataset_closes_in_the_chunk_it_opened_with() {
+        assert_performance_dataset_closes_in_the_chunk_it_opened_with(false);
+    }
+
+    #[test]
+    fn swmr_performance_dataset_closes_in_the_chunk_it_opened_with() {
+        assert_performance_dataset_closes_in_the_chunk_it_opened_with(true);
+    }
+
+    fn assert_performance_dataset_closes_in_the_chunk_it_opened_with(swmr: bool) {
+        let path = temp_path("hdf5_perf_open_chunk");
+        let mut writer = Hdf5Writer::new();
+        writer.set_swmr_mode(swmr);
+        writer.set_store_performance(true);
+        writer.set_num_capture(0);
+        writer.set_ndattr_chunk(4);
+        let arr = Arc::new(NDArray::new(
+            vec![NDDimension::new(8), NDDimension::new(8)],
+            NDDataType::UInt16,
+        ));
+        writer
+            .open_file(
+                &path,
+                NDFileOpenMode::WRITE | NDFileOpenMode::MULTIPLE,
+                &arr,
+            )
+            .unwrap();
+        for _ in 0..3 {
+            writer.write_file(&arr).unwrap();
+        }
+        writer.set_ndattr_chunk(2);
+        writer.close_file().unwrap();
+
+        let h5 = H5File::open(&path).unwrap();
+        let ts = h5
+            .dataset("entry/instrument/performance/timestamp")
+            .unwrap();
+        assert_eq!(ts.chunk_dims(), Some(vec![4, 5]), "swmr={swmr}");
+        assert_eq!(ts.shape(), vec![3, 5], "swmr={swmr}");
+        let vals: Vec<f64> = ts.read_raw().unwrap();
+        // Column 0 is the write time, positive on every row written.
+        assert!(
+            vals.chunks(5).all(|row| row[0] > 0.0),
+            "swmr={swmr} {vals:?}"
+        );
         std::fs::remove_file(&path).ok();
     }
 

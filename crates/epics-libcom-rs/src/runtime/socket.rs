@@ -337,6 +337,37 @@ pub fn tcp_connect(
     sys::tcp_connect(remote, local, opts, timeout)
 }
 
+/// A dial held ready to wake an `accept()` blocked on one listener, the
+/// self-connect a server's stop wakes its accept loop with.
+///
+/// The socket is opened and bound by [`new`](Self::new), when the listener
+/// starts serving, so [`wake`](Self::wake) opens nothing — a process out of
+/// descriptors still wakes its accept — and, non-blocking, never waits on
+/// a backlog nobody drains. Hold it until the woken accept has returned:
+/// closing it first may withdraw the dial.
+pub struct AcceptWaker(sys::AcceptWaker);
+
+impl AcceptWaker {
+    /// A waker for the listener bound at `listener`, its `local_addr`. A
+    /// wildcard address, which not every stack can dial, is dialled at the
+    /// loopback of its family.
+    pub fn new(listener: SocketAddr) -> io::Result<Self> {
+        let mut target = listener;
+        if target.ip().is_unspecified() {
+            target.set_ip(match target {
+                SocketAddr::V4(_) => Ipv4Addr::LOCALHOST.into(),
+                SocketAddr::V6(_) => std::net::Ipv6Addr::LOCALHOST.into(),
+            });
+        }
+        sys::AcceptWaker::new(target).map(Self)
+    }
+
+    /// Dial the listener once, without waiting for the handshake.
+    pub fn wake(&self) -> io::Result<()> {
+        self.0.wake()
+    }
+}
+
 /// Enable `SO_KEEPALIVE` on an already-accepted TCP connection.
 ///
 /// The one option here applied *after* the socket exists rather than before it
@@ -705,6 +736,41 @@ mod sys {
     pub(super) fn enable_keepalive(sock: &TcpStream) -> io::Result<()> {
         socket2::SockRef::from(sock).set_keepalive(true)
     }
+
+    pub(super) struct AcceptWaker {
+        socket: socket2::Socket,
+        target: SocketAddr,
+    }
+
+    impl AcceptWaker {
+        pub(super) fn new(target: SocketAddr) -> io::Result<Self> {
+            let socket = new_socket(
+                target.is_ipv6(),
+                socket2::Type::STREAM,
+                socket2::Protocol::TCP,
+                SocketOptions::default(),
+            )?;
+            socket.set_nonblocking(true)?;
+            // Closed after the accept loop has closed its end, a reset spares
+            // the listener's port the TIME_WAIT a FIN would leave on it.
+            socket.set_linger(Some(Duration::ZERO))?;
+            // Bound now, so the dial needs no ephemeral port later.
+            bind(&socket, SocketAddr::new(target.ip(), 0))?;
+            Ok(Self { socket, target })
+        }
+
+        pub(super) fn wake(&self) -> io::Result<()> {
+            match self.socket.connect(&self.target.into()) {
+                Err(e)
+                    if e.kind() != io::ErrorKind::WouldBlock
+                        && e.raw_os_error() != Some(EINPROGRESS) =>
+                {
+                    Err(e)
+                }
+                _ => Ok(()),
+            }
+        }
+    }
 }
 
 #[cfg(epics_embedded_target)]
@@ -715,7 +781,7 @@ mod sys {
 
     use super::{SetupError, SetupStep, SocketOptions, TcpConnectError};
     use std::io;
-    use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV6, TcpListener, TcpStream, UdpSocket};
     use std::os::fd::{FromRawFd, RawFd};
     use std::time::Duration;
 
@@ -955,6 +1021,113 @@ mod sys {
             return Err(TcpConnectError::Connect(last_error()));
         }
         Ok(())
+    }
+
+    /// Marshal an IPv6 `SocketAddr` into a `sockaddr_in6`, `sin6_len` left
+    /// zero as [`sockaddr_in`] leaves `sin_len`.
+    fn sockaddr_in6(v6: SocketAddrV6) -> libc::sockaddr_in6 {
+        // SAFETY: `sockaddr_in6` is a plain-old-data C struct for which
+        // all-zero is a valid initial value.
+        let mut sin6: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+        sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+        sin6.sin6_port = v6.port().to_be();
+        sin6.sin6_flowinfo = v6.flowinfo();
+        sin6.sin6_addr = libc::in6_addr {
+            s6_addr: v6.ip().octets(),
+        };
+        sin6.sin6_scope_id = v6.scope_id();
+        sin6
+    }
+
+    /// `call` with `addr` as the `sockaddr` of its family and its length.
+    fn with_sockaddr(
+        addr: SocketAddr,
+        call: impl FnOnce(*const libc::sockaddr, libc::socklen_t) -> libc::c_int,
+    ) -> io::Result<()> {
+        let rc = match addr {
+            SocketAddr::V4(_) => {
+                let sin = sockaddr_in(addr)?;
+                call(
+                    &sin as *const libc::sockaddr_in as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                )
+            }
+            SocketAddr::V6(v6) => {
+                let sin6 = sockaddr_in6(v6);
+                call(
+                    &sin6 as *const libc::sockaddr_in6 as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                )
+            }
+        };
+        if rc != 0 {
+            return Err(last_error());
+        }
+        Ok(())
+    }
+
+    /// The hosted waker's socket, in raw `libc`.
+    pub(super) struct AcceptWaker {
+        fd: OwnedFd,
+        target: SocketAddr,
+    }
+
+    impl AcceptWaker {
+        pub(super) fn new(target: SocketAddr) -> io::Result<Self> {
+            let family = match target {
+                SocketAddr::V4(_) => libc::AF_INET,
+                SocketAddr::V6(_) => libc::AF_INET6,
+            };
+            // SAFETY: `socket()` returns a fresh owned descriptor or -1.
+            let fd = unsafe { libc::socket(family, libc::SOCK_STREAM, libc::IPPROTO_TCP) };
+            if fd < 0 {
+                return Err(last_error());
+            }
+            let fd = OwnedFd(fd);
+            // SAFETY: `fd.0` is a valid open socket.
+            let flags = unsafe { libc::fcntl(fd.0, libc::F_GETFL) };
+            // SAFETY: as above.
+            if flags < 0
+                || unsafe { libc::fcntl(fd.0, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+            {
+                return Err(last_error());
+            }
+            let linger = libc::linger {
+                l_onoff: 1,
+                l_linger: 0,
+            };
+            // SAFETY: `fd.0` is a valid open socket; `linger` outlives the
+            // call and its size is the one passed.
+            let rc = unsafe {
+                libc::setsockopt(
+                    fd.0,
+                    libc::SOL_SOCKET,
+                    libc::SO_LINGER,
+                    &linger as *const libc::linger as *const libc::c_void,
+                    std::mem::size_of::<libc::linger>() as libc::socklen_t,
+                )
+            };
+            if rc != 0 {
+                return Err(last_error());
+            }
+            // SAFETY: `with_sockaddr` passes an initialised address of the
+            // length it gives.
+            with_sockaddr(SocketAddr::new(target.ip(), 0), |sa, len| unsafe {
+                libc::bind(fd.0, sa, len)
+            })?;
+            Ok(Self { fd, target })
+        }
+
+        pub(super) fn wake(&self) -> io::Result<()> {
+            // SAFETY: as the bind in `new`.
+            let dialled = with_sockaddr(self.target, |sa, len| unsafe {
+                libc::connect(self.fd.0, sa, len)
+            });
+            match dialled {
+                Err(e) if e.raw_os_error() != Some(libc::EINPROGRESS) => Err(e),
+                _ => Ok(()),
+            }
+        }
     }
 }
 
@@ -1337,6 +1510,75 @@ mod tests {
         assert_eq!(
             accepted.peer_addr().unwrap().port(),
             client.local_addr().unwrap().port()
+        );
+    }
+
+    /// The peer `listener`'s accept returns, the accept parked on its own
+    /// thread before `wake` runs.
+    fn woken_accept(listener: TcpListener, wake: impl FnOnce()) -> SocketAddr {
+        use fact_budget::FACT_BUDGET;
+        let (peer_tx, peer) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = peer_tx.send(listener.accept().map(|(_, from)| from));
+        });
+        wake();
+        peer.recv_timeout(FACT_BUDGET)
+            .expect("the accept never woke")
+            .expect("accept")
+    }
+
+    /// Windows cannot dial `0.0.0.0`; a wildcard listener is reached at the
+    /// loopback of its family.
+    #[test]
+    fn an_accept_waker_wakes_a_wildcard_listener_from_its_loopback() {
+        use std::net::{IpAddr, Ipv6Addr};
+        let mut wildcards = vec![IpAddr::from(Ipv4Addr::UNSPECIFIED)];
+        if TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).is_ok() {
+            wildcards.push(Ipv6Addr::UNSPECIFIED.into());
+        }
+        for wildcard in wildcards {
+            let listener = TcpListener::bind((wildcard, 0)).unwrap();
+            let waker = AcceptWaker::new(listener.local_addr().unwrap()).unwrap();
+            let peer = woken_accept(listener, || waker.wake().expect("wake"));
+            assert!(peer.ip().is_loopback(), "{wildcard}: woken from {peer}");
+        }
+    }
+
+    /// A process out of descriptors cannot open the socket a stop would
+    /// wake its accept with; a waker opened while it could still wakes it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_accept_waker_wakes_an_accept_with_no_descriptor_left() {
+        super::super::fresh_process::with_a_process_of_its_own(
+            "runtime::socket::tests::an_accept_waker_wakes_an_accept_with_no_descriptor_left",
+            || {
+                let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+                let addr = listener.local_addr().unwrap();
+                let waker = AcceptWaker::new(addr).unwrap();
+
+                let limit = libc::rlimit {
+                    rlim_cur: 64,
+                    rlim_max: 64,
+                };
+                // SAFETY: a valid `rlimit` for the call; this process is the
+                // test's own, so the limit binds nothing else.
+                assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+                let mut hogs = Vec::new();
+                let full = loop {
+                    match std::fs::File::open("/dev/null") {
+                        Ok(f) => hogs.push(f),
+                        Err(e) => break e,
+                    }
+                };
+                assert_eq!(full.raw_os_error(), Some(libc::EMFILE));
+                let dial = TcpStream::connect(addr).map(drop);
+                assert_eq!(dial.map_err(|e| e.raw_os_error()), Err(Some(libc::EMFILE)));
+                waker.wake().expect("wake with no descriptor left");
+                drop(hogs);
+
+                let peer = woken_accept(listener, || {});
+                assert_eq!(peer.ip(), Ipv4Addr::LOCALHOST);
+            },
         );
     }
 }

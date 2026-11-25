@@ -232,9 +232,9 @@ c-ca-tools = { path = "../c-ca-tools" }
 raw-ca = { path = "../raw-ca" }
 # Dev-only, path-only (no `version`, so `cargo publish` strips the entry
 # entirely): the shared exec-backend test-gating census, called by
-# `tests/rtems_exec_model_gate.rs`. Shared rather than copied because every
-# crate that derives the backend has the same hole, and a 300-line audit
-# copied once per crate is how copies of a rule come to disagree.
+# `tests/integration/rtems_exec_model_gate.rs`. Shared rather than copied
+# because every crate that derives the backend has the same hole, and a 300-line
+# audit copied once per crate is how copies of a rule come to disagree.
 rtems-exec-gate = { path = "../../tools/rtems-exec-gate" }
 # Dev-only: `#[epics_test]` — the backend-selected test driver — for this
 # crate's own suite.

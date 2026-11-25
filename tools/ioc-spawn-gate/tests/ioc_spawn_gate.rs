@@ -37,13 +37,13 @@ fn the_shared_helper_spawners_stay_in_the_census() {
         .iter()
         .map(ioc_spawn_gate::Spawner::label)
         .collect();
-    for binary in [
+    for module in [
         "cli_monitor_separator",
         "interop_c_client_rust_ioc",
         "interop_rust_client_c_ioc",
         "stress_load",
     ] {
-        let label = format!("epics-ca-rs::{binary}");
+        let label = format!("epics-ca-rs::integration {module}::");
         assert!(
             census.contains(&label),
             "{label} left the census: {census:#?}"

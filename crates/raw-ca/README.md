@@ -11,7 +11,7 @@ drops from the uploaded manifest.
 
 ## Usage
 
-From `epics-ca-rs/tests/blocking_raw_client_e2e.rs`:
+From `epics-ca-rs/tests/integration/blocking_raw_client_e2e.rs`:
 
 ```rust
 use epics_ca_rs::protocol::CA_PROTO_READ_NOTIFY;

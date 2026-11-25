@@ -179,8 +179,8 @@ fn filter_lines(heard: &[String]) -> usize {
 fn ca_create_with_an_unknown_filter_prints_the_line_once() {
     let heard = named_port::on_a_named_port(|port| {
         let ioc = Ioc::start("record(ai, \"Y\") { field(VAL, \"2\") }\n", port)?;
-        // SAFETY: the only test in this binary that sets the environment,
-        // before `CaClient::new` snapshots it.
+        // SAFETY: under nextest, the repo's runner, each test runs in its own
+        // process, and this is before `CaClient::new` snapshots it.
         unsafe {
             std::env::set_var("EPICS_CA_ADDR_LIST", format!("127.0.0.1:{port}"));
             std::env::set_var("EPICS_CA_AUTO_ADDR_LIST", "NO");

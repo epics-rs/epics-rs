@@ -67,7 +67,8 @@ async fn a_plain_get_and_monitor_read_val_past_len_to_its_nul() {
             None
         });
     }
-    // SAFETY: the only test in this binary; set before `CaClient::new()`.
+    // SAFETY: under nextest, the repo's runner, each test runs in its own
+    // process; set before `CaClient::new()`.
     unsafe {
         std::env::set_var("EPICS_CA_ADDR_LIST", format!("127.0.0.1:{port}"));
         std::env::set_var("EPICS_CA_AUTO_ADDR_LIST", "NO");

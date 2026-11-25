@@ -71,7 +71,7 @@ there.
 ## Using it
 
 ```rust
-// crates/<crate>/tests/rtems_exec_model_gate.rs
+// crates/<crate>/tests/integration/rtems_exec_model_gate.rs
 #[test]
 fn the_crate_is_accounted_for() {
     rtems_exec_gate::assert_crate_is_accounted_for(env!("CARGO_MANIFEST_DIR"));

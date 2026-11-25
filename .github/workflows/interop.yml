@@ -66,7 +66,7 @@ jobs:
             - 'crates/epics-ca-rs/src/server/**'
             - 'crates/epics-ca-rs/tests/wire_golden*.rs'
             - 'crates/epics-ca-rs/tests/interop_*.rs'
-            - 'crates/epics-ca-rs/tests/cases/**'
+            - 'crates/epics-ca-rs/tests/integration/cases/**'
             - 'crates/epics-pva-rs/src/codec.rs'
             - 'crates/epics-pva-rs/src/proto/**'
             - 'crates/epics-pva-rs/src/pvdata/**'

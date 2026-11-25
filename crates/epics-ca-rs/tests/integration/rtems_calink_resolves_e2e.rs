@@ -129,10 +129,10 @@ fn a_ca_link_resolves_end_to_end_on_the_exec_backend() {
     // The client the resolver lazily builds reads these once at
     // construction, so they go in before the resolver exists.
     //
-    // SAFETY (edition 2024): this file holds a single test, so no other
-    // thread in this process reads or writes the environment concurrently
-    // (the background executor's workers touch it only through the client
-    // construction this test itself triggers, later).
+    // SAFETY (edition 2024): under nextest, the repo's runner, each test runs
+    // in its own process, so no other thread in it reads or writes the
+    // environment concurrently (the background executor's workers touch it
+    // only through the client construction this test itself triggers, later).
     unsafe {
         std::env::set_var(
             "EPICS_CA_NAME_SERVERS",

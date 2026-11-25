@@ -165,9 +165,10 @@ jobs:
   # migration exists to remove and would be worse here than before: a green
   # job reporting on a backend it never built. So the name appears once, at
   # `env:` on the job rather than on each step, and the first step is a run
-  # that CANNOT pass on the hosted backend. Every `tests/rtems_exec_model_gate.rs`
-  # is `#![cfg(exec_backend)]`, so on the wrong backend nextest matches no test
-  # and exits non-zero rather than reporting "0 passed".
+  # that CANNOT pass on the hosted backend. Every
+  # `tests/integration/rtems_exec_model_gate.rs` is `#![cfg(exec_backend)]`, so
+  # on the wrong backend nextest matches no test and exits non-zero rather than
+  # reporting "0 passed".
   #
   # The doc row lives here too, for the same one-name reason. It was previously
   # covered by the `rustdoc` job's `--all-features` row, which turned on
@@ -206,7 +207,7 @@ jobs:
         python3 -c 'import socket; s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM); s.bind(("::1", 0)); s.sendto(b"x", s.getsockname())'
         ip -4 -o addr show scope global up | grep -q .
     - name: The exec backend is what this job actually built
-      run: cargo nextest run --profile ci --workspace -E 'binary(rtems_exec_model_gate) | (binary(integration) & test(/^rtems_exec_model_gate::/))'
+      run: cargo nextest run --profile ci --workspace -E 'binary(integration) & test(/^rtems_exec_model_gate::/)'
     - name: Workspace on the exec backend
       run: cargo nextest run --profile ci --workspace
     - name: Clippy on the exec backend

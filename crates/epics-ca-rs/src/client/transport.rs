@@ -7179,7 +7179,7 @@ mod write_failed_status_passthrough_tests {
     //! `CaError::WriteFailed` returns whatever status it was given, and that
     //! `eca_message` spells it as C does. The decode itself — the reply path
     //! that produces the `CaError` — is covered by the frame-level tests in
-    //! `tests/protocol_tests.rs` and `server/blocking.rs`.
+    //! `tests/integration/protocol_tests.rs` and `server/blocking.rs`.
     use crate::protocol::{ECA_PUTCBINPROG, eca_message};
     use epics_base_rs::error::{CaError, CaOp};
 

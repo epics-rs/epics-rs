@@ -4,7 +4,8 @@
 //! exercise the Rust client against it. Skipped when softIoc is not
 //! available (e.g. CI without EPICS install).
 //!
-//! Run with: `cargo test -p epics-ca-rs --test interop_rust_client_c_ioc`
+//! Run with: `cargo test -p epics-ca-rs --test integration
+//! interop_rust_client_c_ioc::`
 //!
 //! Both backends: the "no reactor running" this file used to record came from
 //! the CA stack minting its spawn capability from the seam `Reactor` on a

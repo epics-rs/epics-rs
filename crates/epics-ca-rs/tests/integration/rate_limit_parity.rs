@@ -8,9 +8,10 @@
 //! which both loops parse through; this file measures that on both rather than
 //! reasoning from the shared type.
 //!
-//! The policy is read from the process environment per connection, which is
-//! why these tests live in their own binary: a suite that sets a server-wide
-//! rate cap must not be able to cap another suite's servers.
+//! The policy is read from the process environment per connection, so a test
+//! that sets a server-wide rate cap must not share a process with another
+//! test's servers; under nextest, the repo's runner, each test runs in its
+//! own process.
 //!
 //! Ports are always ephemeral (`:0`) — never the real 5064, per the
 //! `build() ⟹ listening` port-ownership rule.
@@ -152,10 +153,10 @@ fn against_async(script: &[Vec<u8>]) -> Outcome {
     outcome
 }
 
-/// SAFETY: every test in this file is `#[serial]` and this is the only
-/// binary that touches these three variables, so nothing reads them
-/// concurrently. The policy is read per connection, so setting them before
-/// the client connects is what takes effect.
+/// SAFETY: under nextest, the repo's runner, each test runs in its own
+/// process, so nothing reads these three variables concurrently. The policy
+/// is read per connection, so setting them before the client connects is
+/// what takes effect.
 fn set_policy(msgs_per_sec: Option<&str>, burst: &str, strikes: &str) {
     unsafe {
         match msgs_per_sec {

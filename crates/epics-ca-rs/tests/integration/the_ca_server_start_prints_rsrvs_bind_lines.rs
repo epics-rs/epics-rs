@@ -38,7 +38,11 @@ fn skip_restart_and_missing_broadcast_lines_are_rsrvs() {
         l.local_addr().unwrap().port()
     };
     let out = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "child_builds_the_server", "--nocapture"])
+        .args([
+            "--exact",
+            "the_ca_server_start_prints_rsrvs_bind_lines::child_builds_the_server",
+            "--nocapture",
+        ])
         .env(CHILD, requested.to_string())
         .env("EPICS_CAS_INTF_ADDR_LIST", "192.0.2.1 127.0.0.2")
         .env_remove("TERM")

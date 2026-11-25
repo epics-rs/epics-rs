@@ -97,7 +97,7 @@ fn ca_env(port: u16) -> [(&'static str, String); 5] {
 /// [`ioc_child`] serving `db` on `port`.
 fn ioc_child_on(db: &std::path::Path, port: u16) -> Command {
     let mut cmd = Command::new(std::env::current_exe().unwrap());
-    cmd.args(["ioc_child", "--exact", "--nocapture"])
+    cmd.args(["run_ca_ioc_serves::ioc_child", "--exact", "--nocapture"])
         .env(CHILD, db)
         .envs(ca_env(port))
         .env_remove("EPICS_CA_NAME_SERVERS");

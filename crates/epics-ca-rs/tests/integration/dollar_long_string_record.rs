@@ -63,7 +63,8 @@ async fn dollar_channels_serve_the_dbr_char_address() {
         .expect("build CA server");
     let port = server.udp_port();
     let _h = tokio::spawn(async move { server.run().await });
-    // SAFETY: the only test in this binary; set before `CaClient::new()`.
+    // SAFETY: under nextest, the repo's runner, each test runs in its own
+    // process; set before `CaClient::new()`.
     unsafe {
         std::env::set_var("EPICS_CA_ADDR_LIST", format!("127.0.0.1:{port}"));
         std::env::set_var("EPICS_CA_AUTO_ADDR_LIST", "NO");

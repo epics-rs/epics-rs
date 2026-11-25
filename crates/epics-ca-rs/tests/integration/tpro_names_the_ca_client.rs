@@ -149,7 +149,7 @@ fn trace_of(test: &str) -> Vec<String> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_ca_put_traces_with_the_client_s_name() {
     if std::env::var_os(CHILD).is_none() {
-        let trace = trace_of("a_ca_put_traces_with_the_client_s_name");
+        let trace = trace_of("tpro_names_the_ca_client::a_ca_put_traces_with_the_client_s_name");
         assert_eq!(
             trace,
             [

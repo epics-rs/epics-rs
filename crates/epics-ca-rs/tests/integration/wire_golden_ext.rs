@@ -2,7 +2,7 @@
 //!
 //! Pure-Rust hex-byte comparisons of `encode_*` output against
 //! captured C reference (`epics-base` 7.0.x). Mirrors the pattern in
-//! `tests/wire_golden.rs` but covers byte shapes whose divergence
+//! `tests/integration/wire_golden.rs` but covers byte shapes whose divergence
 //! historically surfaced as parity findings — admission-failure
 //! frames, ACCESS_RIGHTS coalescing semantics, extended-form
 //! `CLIENT_NAME` / `HOST_NAME`, etc.
@@ -14,4 +14,5 @@
 
 #![allow(clippy::needless_range_loop)]
 
+#[path = "cases/mod.rs"]
 mod cases;

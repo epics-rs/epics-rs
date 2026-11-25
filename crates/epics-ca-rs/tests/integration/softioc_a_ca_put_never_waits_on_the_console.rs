@@ -59,7 +59,8 @@ fn puts_past_a_stalled_console(
     }
     // From here nothing reads the console.
 
-    // SAFETY: the only test in this binary, before `CaClient::new` reads them.
+    // SAFETY: under nextest, the repo's runner, each test runs in its own
+    // process; this is before `CaClient::new` reads them.
     unsafe {
         std::env::set_var("EPICS_CA_ADDR_LIST", format!("127.0.0.1:{port}"));
         std::env::set_var("EPICS_CA_AUTO_ADDR_LIST", "NO");

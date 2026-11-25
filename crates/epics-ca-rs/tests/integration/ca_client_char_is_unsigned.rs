@@ -49,9 +49,9 @@ const LONGS_PV: &str = "CLI:LONGS";
 /// Point a soon-to-be-constructed `CaClient` at exactly this server so it
 /// skips UDP search.
 ///
-/// SAFETY: every test in this file is `#[serial]`, so nothing else mutates
-/// the environment concurrently, and the env is set before `CaClient::new`
-/// snapshots its resolver configuration.
+/// SAFETY: under nextest, the repo's runner, each test runs in its own
+/// process, and the env is set before `CaClient::new` snapshots its
+/// resolver configuration.
 fn point_client_at(port: u16) {
     unsafe {
         std::env::set_var("EPICS_CA_ADDR_LIST", format!("127.0.0.1:{port}"));

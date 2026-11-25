@@ -40,7 +40,7 @@ use epics_base_rs::server::record::{RecordInstance, dbd_generated};
 /// the way C's `cvt_dbaddr` does.
 ///
 /// * `compress` `VAL` under `BALG=LIFO` (`compressRecord.c:404-405`) — covered
-///   by `epics-ca-rs/tests/access_rights_spc_nomod.rs`.
+///   by `epics-ca-rs/tests/integration/access_rights_spc_nomod.rs`.
 /// * `scalcout` PAA..PLL — calc#42 makes the previous-string fields
 ///   `special(SPC_NOMOD)`, which the released-C `.dbd` this port mirrors still
 ///   ships as `SPC_DBADDR`; the refusal is covered by

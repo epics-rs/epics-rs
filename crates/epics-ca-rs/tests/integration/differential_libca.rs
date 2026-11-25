@@ -10,7 +10,7 @@
 //! machines without `epics-base` installed. To run:
 //!
 //! ```bash
-//! cargo test -p epics-ca-rs --test differential_libca -- --ignored --test-threads=1
+//! cargo test -p epics-ca-rs --test integration differential_libca:: -- --ignored --test-threads=1
 //! ```
 //!
 //! The Rust server binds port 0 and the C IOC takes a probed candidate

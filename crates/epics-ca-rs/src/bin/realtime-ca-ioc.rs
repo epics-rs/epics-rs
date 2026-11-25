@@ -898,12 +898,12 @@ mod ioc {
         // shut the broadcast path off so a resolution can only have come over
         // TCP.
         //
-        // Defaults, not overrides: a variable that is already set stays as
-        // set. That now means the same thing on the target as on a host —
-        // step (0-env) above has already applied the boot command line, so an
+        // Defaults, not overrides: a variable that is already set stays as set.
+        // That now means the same thing on the target as on a host — step
+        // (0-env) above has already applied the boot command line, so an
         // `EPICS_CA_NAME_SERVERS=...` boot argument wins over the value
-        // compiled in here, and `tests/realtime_ca_ioc_boots.rs` points the
-        // dial at its own closed port the same way.
+        // compiled in here, and `tests/integration/realtime_ca_ioc_boots.rs`
+        // points the dial at its own closed port the same way.
         //
         // Set before `install_calink_resolver`, because the client the
         // resolver lazily builds reads them once at construction.

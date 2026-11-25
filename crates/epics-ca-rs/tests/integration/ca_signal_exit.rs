@@ -160,7 +160,7 @@ async fn standalone_sigterm_without_drain_ends_at_once() {
         return standalone().await;
     }
     standalone_stopped_by(
-        "standalone_sigterm_without_drain_ends_at_once",
+        "ca_signal_exit::standalone_sigterm_without_drain_ends_at_once",
         libc::SIGTERM,
     );
 }
@@ -170,7 +170,10 @@ async fn standalone_sigint_ends_at_once() {
     if std::env::var_os(CHILD).is_some() {
         return standalone().await;
     }
-    standalone_stopped_by("standalone_sigint_ends_at_once", libc::SIGINT);
+    standalone_stopped_by(
+        "ca_signal_exit::standalone_sigint_ends_at_once",
+        libc::SIGINT,
+    );
 }
 
 /// Drain set to 1 s: the server outlives the SIGTERM for the grace, then
@@ -189,7 +192,7 @@ async fn standalone_sigterm_with_drain_waits_the_grace() {
         return standalone().await;
     }
     let (child, rx) = spawn_child(
-        "standalone_sigterm_with_drain_waits_the_grace",
+        "ca_signal_exit::standalone_sigterm_with_drain_waits_the_grace",
         Some("1"),
         None,
     );
@@ -202,7 +205,7 @@ async fn standalone_sigint_with_drain_ends_at_once() {
         return standalone().await;
     }
     let (child, rx) = spawn_child(
-        "standalone_sigint_with_drain_ends_at_once",
+        "ca_signal_exit::standalone_sigint_with_drain_ends_at_once",
         Some("30"),
         None,
     );
@@ -217,7 +220,7 @@ async fn standalone_keeps_an_inherited_sig_ign() {
         return standalone().await;
     }
     let (mut child, rx) = spawn_child(
-        "standalone_keeps_an_inherited_sig_ign",
+        "ca_signal_exit::standalone_keeps_an_inherited_sig_ign",
         None,
         Some(libc::SIGINT),
     );
@@ -245,7 +248,11 @@ async fn ioc_sigterm_without_drain_ends_at_once() {
     if std::env::var_os(CHILD).is_some() {
         return ioc().await;
     }
-    let (child, rx) = spawn_child("ioc_sigterm_without_drain_ends_at_once", None, None);
+    let (child, rx) = spawn_child(
+        "ca_signal_exit::ioc_sigterm_without_drain_ends_at_once",
+        None,
+        None,
+    );
     wait_caught(&child, libc::SIGTERM);
     kill(&child, libc::SIGTERM);
     killed_by(child, &rx, libc::SIGTERM, Duration::from_secs(5));
@@ -256,7 +263,11 @@ async fn ioc_sigterm_with_drain_waits_the_grace() {
     if std::env::var_os(CHILD).is_some() {
         return ioc().await;
     }
-    let (child, rx) = spawn_child("ioc_sigterm_with_drain_waits_the_grace", Some("1"), None);
+    let (child, rx) = spawn_child(
+        "ca_signal_exit::ioc_sigterm_with_drain_waits_the_grace",
+        Some("1"),
+        None,
+    );
     drains_then_ends(child, rx);
 }
 
@@ -265,7 +276,11 @@ async fn ioc_sigint_with_drain_ends_at_once() {
     if std::env::var_os(CHILD).is_some() {
         return ioc().await;
     }
-    let (child, rx) = spawn_child("ioc_sigint_with_drain_ends_at_once", Some("30"), None);
+    let (child, rx) = spawn_child(
+        "ca_signal_exit::ioc_sigint_with_drain_ends_at_once",
+        Some("30"),
+        None,
+    );
     wait_caught(&child, libc::SIGINT);
     kill(&child, libc::SIGINT);
     killed_by(child, &rx, libc::SIGINT, Duration::from_secs(5));

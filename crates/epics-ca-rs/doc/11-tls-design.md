@@ -347,7 +347,7 @@ For an existing C-based facility:
 - mTLS identity → ACF: ✅ complete — `run_tcp_listener` extracts the
   client cert after handshake and passes the derived identity as
   `initial_hostname`, taking precedence over `peer.ip()`
-- End-to-end TLS interop: ✅ verified by `tests/tls_end_to_end.rs`
+- End-to-end TLS interop: ✅ verified by `tests/integration/tls_end_to_end.rs`
   (Rust client + Rust IOC, self-signed cert, get round-trip)
 - Port-based plaintext/TLS coexistence: 🚧 minor — currently a server
   is either plaintext OR TLS. Running both simultaneously requires

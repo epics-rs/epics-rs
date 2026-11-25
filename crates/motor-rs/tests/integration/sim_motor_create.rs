@@ -37,7 +37,12 @@ fn create_child() {
 #[test]
 fn creating_a_sim_motor_prints_the_config_axis_line() {
     let out = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "create_child", "--nocapture", "--test-threads=1"])
+        .args([
+            "--exact",
+            "sim_motor_create::create_child",
+            "--nocapture",
+            "--test-threads=1",
+        ])
         .env(CHILD, "1")
         .output()
         .unwrap();
@@ -45,7 +50,7 @@ fn creating_a_sim_motor_prints_the_config_axis_line() {
     assert!(out.status.success(), "{stdout}");
     let lines: Vec<_> = stdout
         .lines()
-        .map(|l| l.trim_start_matches("test create_child ... "))
+        .map(|l| l.trim_start_matches("test sim_motor_create::create_child ... "))
         .filter(|l| l.contains("SIMCREATE"))
         .collect();
     assert_eq!(

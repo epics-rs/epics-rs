@@ -12,7 +12,7 @@ use motor_rs::builder::{ControllerAxes, ControllerAxis, ControllerBuilder};
 use motor_rs::poll_loop::PollCommand;
 use motor_rs::trace::TraceUser;
 
-mod passes;
+use crate::passes;
 
 type Log = Arc<Mutex<Vec<(&'static str, Instant)>>>;
 

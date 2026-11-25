@@ -5,7 +5,7 @@
 //! they are the controller port's MOTOR_VELOCITY / MOTOR_VEL_BASE /
 //! MOTOR_ACCEL, which the speed writes set through the port. A model-1 card
 //! stores none here: each SET_* reaches its driver in the record's order
-//! (tests/model1_speed_writes.rs).
+//! (tests/integration/model1_speed_writes.rs).
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

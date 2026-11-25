@@ -14,7 +14,7 @@
 //! One case per boundary: MDEL = 0 (post on any change) and MDEL > 0 (post on a
 //! crossing).
 
-mod common;
+use crate::common;
 
 use common::{MotorFixture, drain};
 use epics_base_rs::server::recgbl::EventMask;

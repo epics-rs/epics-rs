@@ -27,7 +27,12 @@ fn refusals_stay_on_the_console() {
         return;
     }
     let out = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "init_child", "--nocapture", "--test-threads=1"])
+        .args([
+            "--exact",
+            "motor_util_init::init_child",
+            "--nocapture",
+            "--test-threads=1",
+        ])
         .env(CHILD, "1")
         .output()
         .unwrap();

@@ -12,7 +12,7 @@ use motor_rs::flags::*;
 use motor_rs::poll_loop::PollCommand;
 use motor_rs::sim_motor::SimMotor;
 
-mod passes;
+use crate::passes;
 
 /// The status `motor` writes polled from the default.
 fn polled(

@@ -16,7 +16,7 @@ use motor_rs::poll_loop::{CommandBatch, MotorPollLoop, PollerInbox};
 use motor_rs::trace::{MotorTrace, TraceUser};
 use tokio::sync::mpsc;
 
-mod passes;
+use crate::passes;
 
 /// A done axis at 1.0 whose encoder-ratio write sets the encoder position
 /// to `encoder`, as phytron's `setEncoderRatio` does, and whose move sets

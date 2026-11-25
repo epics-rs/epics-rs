@@ -1,8 +1,9 @@
 //! [`empty_dtyp_out_put_keeps_the_first_device`]'s put where row 0's dset
 //! extends with a dsxt of its own: `dbPutFieldLink` runs that dsxt's
 //! `add_record` (`dbAccess.c:1196`), so a record with no DTYP gets row 0's
-//! device for its new link as one naming the choice does. Its own binary, as
-//! the device menu is process-wide and row 0 differs.
+//! device for its new link as one naming the choice does. The device menu is
+//! process-wide and row 0 differs from that test's; under nextest, the repo's
+//! runner, each test runs in its own process.
 //!
 //! [`empty_dtyp_out_put_keeps_the_first_device`]: ./empty_dtyp_out_put_keeps_the_first_device.rs
 

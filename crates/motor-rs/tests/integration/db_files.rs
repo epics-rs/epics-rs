@@ -77,7 +77,7 @@ fn the_db_dir_is_the_c_install_set() {
 #[test]
 fn every_database_loads_the_records_c_lists() {
     let mut c: Vec<(String, BTreeSet<String>)> = Vec::new();
-    for line in include_str!("db_files.dbl").lines() {
+    for line in include_str!("../db_files.dbl").lines() {
         if line.starts_with('#') {
             continue;
         }

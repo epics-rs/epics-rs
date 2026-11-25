@@ -6,7 +6,7 @@
 //! and the connect values cut, compared per PV; the move's cross-field order is
 //! compared on one client's merged stream.
 
-mod common;
+use crate::common;
 
 use common::{MotorFixture, drain};
 use epics_base_rs::server::database::ProcStack;

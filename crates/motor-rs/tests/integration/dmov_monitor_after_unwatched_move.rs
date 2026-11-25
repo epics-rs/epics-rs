@@ -5,7 +5,7 @@
 //! C posts both halves on an empty `mlis` too (`motorRecord.cc:2603-2606`,
 //! `:3628-3629`), so a later subscriber sees them.
 
-mod common;
+use crate::common;
 
 use common::{MotorFixture, drain};
 use epics_base_rs::server::recgbl::EventMask;

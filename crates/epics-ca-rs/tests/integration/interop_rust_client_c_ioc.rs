@@ -157,11 +157,12 @@ async fn rust_client_monitors_softioc_changes() {
 async fn rust_client_handles_softioc_restart() {
     require_tool("softIoc");
 
-    // First IOC instance.
-    let ioc1 = spawn_softioc(TEST_DB);
-    let addr = ioc1.ca_addr_list();
-    let port = ioc1.udp_port;
-    set_client_env(&addr, port);
+    // Held across both IOCs: released between them, the number is any
+    // socket's, and the second IOC loses it.
+    let held = named_port::HeldPort::tcp_and_udp();
+    let port = held.port;
+    let ioc1 = spawn_softioc_on(TEST_DB, port);
+    set_client_env(&ioc1.ca_addr_list(), port);
 
     let client = epics_ca_rs::client::CaClient::new()
         .await
@@ -175,7 +176,6 @@ async fn rust_client_handles_softioc_restart() {
     // same UDP port. The client should re-search and reconnect via
     // beacon-anomaly + reconnect logic.
     drop(ioc1);
-    std::thread::sleep(Duration::from_secs(1));
 
     // Spawning a *new* IOC on the same port simulates a process restart, so
     // the number IS the subject here and a fresh candidate would be a

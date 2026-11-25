@@ -380,9 +380,13 @@ async fn p2_auto_reconnect_after_server_restart() {
     // own cross-abort logic, so the listener task is silently detached
     // and keeps holding the port. `stop()` + awaiting `wait()` to
     // completion is the API's actual shutdown contract.
+    //
+    // Held across both servers: released between them, a number is any
+    // socket's, and the second server loses it.
+    let (tcp_held, udp_held) = (named_port::HeldPort::tcp(), named_port::HeldPort::udp());
     let cfg1 = PvaServerConfig {
-        tcp_port: 0,
-        udp_port: 0,
+        tcp_port: tcp_held.port,
+        udp_port: udp_held.port,
         idle_timeout: Duration::from_secs(60),
         max_connections: 16,
         monitor_queue_depth: 8,
@@ -406,7 +410,6 @@ async fn p2_auto_reconnect_after_server_restart() {
         .await
         .expect("server1.wait() timed out — stop did not complete")
         .expect("server1.wait() returned Err");
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Reuse the same source — but we need to re-bind on the same port.
     // `PvaServer::start` requests the exact port `client` is already wired

@@ -265,7 +265,8 @@ fn probe_bind(ty: Type, port: u16) -> std::io::Result<()> {
 /// `bind(0)` or by `connect()`; what else may bind beside it is the
 /// constructor's choice.
 pub struct HeldPort {
-    /// The hold, then any socket that keeps it in place (its peer).
+    /// The holds on the number, and any socket that keeps one in place (its
+    /// peer).
     holds: Vec<Socket>,
     pub port: u16,
 }
@@ -286,16 +287,43 @@ impl HeldPort {
     /// Darwin and the BSDs would drop its SYN, so there the hold is
     /// connected to a loopback peer it keeps (`BSD_PCB_LOOKUP`).
     pub fn tcp() -> Self {
-        let hold = Socket::new(Domain::IPV4, Type::STREAM, None).expect("open a TCP hold");
+        Self::tcp_on(0).expect("bind the TCP hold")
+    }
+
+    /// [`HeldPort::tcp`] on `port` (0: the kernel's pick).
+    fn tcp_on(port: u16) -> std::io::Result<Self> {
+        let hold = Socket::new(Domain::IPV4, Type::STREAM, None)?;
         #[cfg(unix)]
-        hold.set_reuse_address(true)
-            .expect("SO_REUSEADDR on the hold");
-        let held = Self::bind(hold);
-        if BSD_PCB_LOOKUP {
+        hold.set_reuse_address(true)?;
+        hold.bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)).into())?;
+        let held = Self::of(vec![hold]);
+        Ok(if BSD_PCB_LOOKUP {
             held.connected()
         } else {
             held
+        })
+    }
+
+    /// A number for C's CA server, which binds it on TCP and UDP and
+    /// restarts on it: [`HeldPort::tcp`] and [`HeldPort::udp`] on one
+    /// number. rsrv binds its listener beside them with `SO_REUSEADDR`
+    /// (`rsrv_grab_tcp`) and its UDP socket with the datagram fanout options
+    /// (`epicsSocketEnableAddressUseForDatagramFanout`), both on its
+    /// interface address, which a search sent there matches before the
+    /// wildcard hold.
+    pub fn tcp_and_udp() -> Self {
+        for _ in 0..ATTEMPTS {
+            let mut udp = Self::udp();
+            match Self::tcp_on(udp.port) {
+                Ok(mut held) => {
+                    held.holds.append(&mut udp.holds);
+                    return held;
+                }
+                Err(e) if port_held(&e) => {}
+                Err(e) => panic!("bind the TCP hold on {}: {e}", udp.port),
+            }
         }
+        panic!("the number of each of {ATTEMPTS} UDP holds was taken on TCP");
     }
 
     /// A UDP number for a socket under test that sets the datagram fanout
@@ -752,6 +780,42 @@ mod tests {
             .bind(&SocketAddr::from(([127, 0, 0, 1], held.port)).into())
             .unwrap();
         assert!(plain_bind(Type::DGRAM, [0, 0, 0, 0], held.port).is_err());
+    }
+
+    /// A CA server binds both its sockets beside the hold each time it
+    /// starts on the number and is reached there, and while none runs a
+    /// plain bind takes the number on neither protocol.
+    #[test]
+    fn a_tcp_and_udp_hold_keeps_the_number_across_a_ca_server_restart() {
+        let held = HeldPort::tcp_and_udp();
+        let at = SocketAddr::from(([127, 0, 0, 1], held.port));
+        for _ in 0..2 {
+            for ty in [Type::STREAM, Type::DGRAM] {
+                assert!(plain_bind(ty, [0, 0, 0, 0], held.port).is_err(), "{ty:?}");
+            }
+            // As caservertask.c binds them on EPICS_CAS_INTF_ADDR_LIST.
+            let listener = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+            #[cfg(unix)]
+            listener.set_reuse_address(true).unwrap();
+            listener.bind(&at.into()).unwrap();
+            listener.listen(20).unwrap();
+            let search = Socket::new(Domain::IPV4, Type::DGRAM, None).unwrap();
+            #[cfg(unix)]
+            search.set_reuse_port(true).unwrap();
+            search.set_reuse_address(true).unwrap();
+            search.bind(&at.into()).unwrap();
+
+            std::net::TcpStream::connect(at).unwrap();
+            let search = UdpSocket::from(search);
+            search
+                .set_read_timeout(Some(fact_budget::FACT_BUDGET))
+                .unwrap();
+            UdpSocket::bind("127.0.0.1:0")
+                .unwrap()
+                .send_to(b"x", at)
+                .unwrap();
+            search.recv(&mut [0; 1]).unwrap();
+        }
     }
 
     /// A closed hold refuses a connect and every plain bind; a listener's

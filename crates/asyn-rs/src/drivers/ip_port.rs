@@ -303,18 +303,13 @@ const SEND_DONTWAIT: libc::c_int = 0x0080;
 #[cfg(all(unix, not(target_os = "rtems")))]
 const SEND_DONTWAIT: libc::c_int = libc::MSG_DONTWAIT;
 
-/// Wait until the socket will take bytes, or the poll interval expires
-/// (`Ok(false)`).
+/// Wait until the socket will take bytes, or `deadline` passes (`Ok(false)`,
+/// C's `asynTimeout`).
 ///
-/// `Ok(false)` is C's `asynTimeout`; it does NOT prove `deadline` has passed.
-/// The interval given to `poll` is [`socket::poll_ready`]'s whole
-/// milliseconds of the budget still left, so its sub-millisecond part
-/// truncates and the wait can end up to 1 ms early. That is C's own
-/// arithmetic — `writePollmsec = (int)(timeout * 1000.0)`
-/// (`drvAsynIPPort.c:662-664`) — and C likewise returns `asynTimeout`
-/// straight off `pollstatus == 0` without re-reading any deadline (`:697`).
-/// Reproducing the early edge is deliberate; a caller needing the deadline
-/// held exactly must re-check it, not this trait.
+/// [`socket::poll_ready`] ends only on the clock. C returns `asynTimeout`
+/// straight off `pollstatus == 0` (`drvAsynIPPort.c:697`) after truncating
+/// `writePollmsec = (int)(timeout * 1000.0)` (:662-664), so its wait ends up
+/// to 1 ms early.
 ///
 /// C parity, and why the write bound is not `SO_SNDTIMEO`: `drvAsynIPPort.c`
 /// compiles the `setsockopt(SO_SNDTIMEO)` block only under `USE_SOCKTIMEOUT`,
@@ -3570,6 +3565,36 @@ mod tests {
             took >= Duration::from_millis(1),
             "a 900 us write deadline must poll, not probe: took {took:?}"
         );
+    }
+
+    /// A read bound and a write deadline end at their budget, not at the last
+    /// whole millisecond before it.
+    #[test]
+    fn a_fractional_millisecond_bound_is_waited_out() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let _accepted = listener.accept().unwrap();
+
+        let budget = Duration::from_micros(1900);
+        for _ in 0..20 {
+            let start = std::time::Instant::now();
+            client.bound_next_read(Some(budget));
+            let took = start.elapsed();
+            assert!(took >= budget, "a 1.9 ms read bound ended after {took:?}");
+        }
+
+        fill_until_refused(&client);
+        for _ in 0..20 {
+            let start = std::time::Instant::now();
+            let deadline = epics_libcom_rs::runtime::time::deadline_after(start, budget);
+            let ready = client.wait_writable(Some(deadline)).unwrap();
+            let took = start.elapsed();
+            assert!(!ready, "a filled socket must not turn writable");
+            assert!(
+                took >= budget,
+                "a 1.9 ms write deadline ended after {took:?}"
+            );
+        }
     }
 
     #[test]

@@ -26,6 +26,7 @@ libc = "0.2"
 parking_lot = "0.12"
 
 [dev-dependencies]
+fact-budget = { path = "../fact-budget" }
 # The C PCRE, the oracle the tests/pcre rigs hold crate::pcre to.
 stream-pcre-sys = { workspace = true }
 tempfile = "3"

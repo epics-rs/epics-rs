@@ -59,16 +59,18 @@ impl PvDatabase {
     /// it. Unlike [`crate::server::record::ProcessAction::ScanOnce`] there is
     /// no Passive gate, because no put of the caller's processes the record.
     ///
-    /// Queued on the libcom `scanOnce` ring and processed on its one thread.
+    /// Queued on the libcom `scanOnce` queue and processed on its one thread.
     /// The frame runs to its end on that thread, as C's `onceTask` holds
     /// `dbScanLock` through `dbProcess`: the next request cannot start
     /// before it.
     ///
-    /// A record already waiting on the ring is not queued again. C queues
-    /// every request (`dbScan.c:660-694`); here two made before the record
-    /// runs process it once, and one record asked for faster than it runs
-    /// cannot fill the ring and drop every other record's request. A request
-    /// made once its process has started queues another.
+    /// A record already waiting is not queued again. C queues every request
+    /// (`dbScan.c:660-694`); here two made before the record runs process it
+    /// once, and one record asked for faster than it runs cannot fill the
+    /// ring and drop every other record's request. A request made once its
+    /// process has started queues another. That bounds these requests by the
+    /// record count, so they are queued in order with the ring's but never
+    /// refused, where C drops them once `onceQueueSize` are waiting.
     ///
     /// A request once the scan has stopped is never run, as C `scanStop`
     /// ends `onceTask` behind what was queued before it (`dbScan.c:179-181`,
@@ -84,14 +86,11 @@ impl PvDatabase {
             return;
         };
         let db = self.clone();
-        let _ = crate::runtime::task::background_scan_once(
-            &String::from_utf8_lossy(name),
-            Box::new(move || {
-                drop(ticket);
-                let mut visited = ProcStack::new();
-                let _ = db.process_record_with_links_sync(record.as_bytes(), &mut visited);
-            }),
-        );
+        crate::runtime::task::background_scan_once_record(Box::new(move || {
+            drop(ticket);
+            let mut visited = ProcStack::new();
+            let _ = db.process_record_with_links_sync(record.as_bytes(), &mut visited);
+        }));
     }
 }
 

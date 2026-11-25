@@ -57,7 +57,11 @@ pub const DEFAULT_ONCE_QUEUE_SIZE: usize = 1000;
 pub struct ScanOnceOverflow;
 
 struct OnceState {
-    queue: VecDeque<OnceCallback>,
+    /// Every request in C's one FIFO order, and whether it holds a place
+    /// on the ring.
+    queue: VecDeque<(OnceCallback, bool)>,
+    /// The requests queued on the ring, the ones `capacity` bounds.
+    on_ring: usize,
     /// C `epicsRingBytesHighWaterMark(onceQ)` — the deepest the ring has
     /// been since the last reset. `scanOnceQueueShow` reports it and
     /// `scanOnceQueueStatus(reset=1)` clears it (`dbScan.c:734-751`), so
@@ -175,7 +179,7 @@ impl Inner {
             return Ok(());
         }
         let mut report = false;
-        let result = if st.queue.len() >= self.capacity {
+        let result = if st.on_ring >= self.capacity {
             // dbScan.c:682-687 — ring full: log once per episode, then count.
             report = st.new_overflow;
             st.new_overflow = false; // dbScan.c:686
@@ -183,8 +187,7 @@ impl Inner {
             Err(ScanOnceOverflow)
         } else {
             st.new_overflow = true; // dbScan.c:689 — re-arm on a good push.
-            st.queue.push_back(cb);
-            st.high_water = st.high_water.max(st.queue.len());
+            st.push(cb, true);
             Ok(())
         };
         let wake = Arc::clone(&st.wake);
@@ -201,6 +204,25 @@ impl Inner {
         result
     }
 
+    /// [`Self::scan_once`] for a caller that queues a record at most once
+    /// until its tail starts, so these requests are bounded by the record
+    /// count and never refused. C counts them against `onceQueueSize`.
+    fn scan_once_record(&self, cb: OnceCallback) {
+        let mut st = self.state.lock();
+        if st.shutdown {
+            drop(st);
+            tracing::trace!(
+                target: "epics_base_rs::runtime::scan_once",
+                "scanOnce after shutdown dropped"
+            );
+            return;
+        }
+        st.push(cb, false);
+        let wake = Arc::clone(&st.wake);
+        drop(st);
+        wake.signal();
+    }
+
     /// Port of `scanOnceQueueStatus` (`dbScan.c:734-751`).
     ///
     /// A reset leaves the mark at the entries still queued, not at zero:
@@ -212,14 +234,30 @@ impl Inner {
         let mut st = self.state.lock();
         let out = ScanOnceQueueStats {
             size: self.capacity,
-            num_used: st.queue.len(),
+            num_used: st.on_ring,
             max_used: st.high_water,
             num_overflow: st.overflows,
         };
         if reset {
-            st.high_water = st.queue.len();
+            st.high_water = st.on_ring;
         }
         out
+    }
+}
+
+impl OnceState {
+    fn push(&mut self, cb: OnceCallback, on_ring: bool) {
+        self.queue.push_back((cb, on_ring));
+        if on_ring {
+            self.on_ring += 1;
+            self.high_water = self.high_water.max(self.on_ring);
+        }
+    }
+
+    fn pop(&mut self) -> Option<OnceCallback> {
+        let (cb, on_ring) = self.queue.pop_front()?;
+        self.on_ring -= usize::from(on_ring);
+        Some(cb)
     }
 }
 
@@ -273,7 +311,7 @@ fn once_loop(inner: &Inner, wake: &Event) {
     loop {
         let next = {
             let mut st = inner.state.lock();
-            match st.queue.pop_front() {
+            match st.pop() {
                 Some(cb) => Some(cb),
                 // Empty and stopping is the only way out, as in C: a shutdown
                 // with entries left drains them first.
@@ -322,7 +360,8 @@ impl ScanOnceHandle {
 }
 
 /// The `scanOnce` ring as `scanOnceQueueShow` prints it — C
-/// `scanOnceQueueStats` (`dbScan.h`).
+/// `scanOnceQueueStats` (`dbScan.h`). A record's own request
+/// ([`ScanOnceQueue::scan_once_record`]) is not on the ring and not counted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScanOnceQueueStats {
     /// Ring capacity — C `stats.size`.
@@ -366,6 +405,7 @@ impl ScanOnceQueue {
             capacity: capacity.max(1),
             state: UnlistedPriorityInheritanceMutex::new(OnceState {
                 queue: VecDeque::new(),
+                on_ring: 0,
                 high_water: 0,
                 overflows: 0,
                 new_overflow: true,
@@ -404,6 +444,15 @@ impl ScanOnceQueue {
     pub fn scan_once(&self, name: &str, cb: OnceCallback) -> Result<(), ScanOnceOverflow> {
         self.inner.ensure_worker();
         self.inner.scan_once(name, cb)
+    }
+
+    /// Enqueue a record's one-shot process, in order with
+    /// [`Self::scan_once`] but never refused. The caller queues each record
+    /// at most once until its `cb` starts; that is the bound the ring's
+    /// capacity gives the other requests.
+    pub fn scan_once_record(&self, cb: OnceCallback) {
+        self.inner.ensure_worker();
+        self.inner.scan_once_record(cb)
     }
 
     /// Lifetime overflow count — C `onceQOverruns` (`dbScan.c:67`).
@@ -682,5 +731,36 @@ mod tests {
             "the reset put the mark below the entries already queued"
         );
         gate_tx.send(()).unwrap();
+    }
+
+    /// Record requests past the ring's capacity are all taken, leave the
+    /// ring's one place free, are not shown as ring entries, and run in
+    /// order with the ring's.
+    #[test]
+    fn record_requests_take_no_place_on_the_ring_and_keep_its_order() {
+        let q = ScanOnceQueue::with_capacity(1);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (gate_tx, gate_rx) = mpsc::channel::<()>();
+        q.scan_once(
+            "REC",
+            Box::new(move || {
+                started_tx.send(()).unwrap();
+                gate_rx.recv().unwrap();
+            }),
+        )
+        .unwrap();
+        started_rx.recv_timeout(T).unwrap();
+        let (ran_tx, ran) = mpsc::channel();
+        for i in 0..3 {
+            let ran_tx = ran_tx.clone();
+            q.scan_once_record(Box::new(move || ran_tx.send(i).unwrap()));
+        }
+        q.scan_once("REC", Box::new(move || ran_tx.send(3).unwrap()))
+            .expect("the record requests took the ring's place");
+        let st = q.stats(false);
+        assert_eq!((st.num_used, st.max_used), (1, 1));
+        gate_tx.send(()).unwrap();
+        let order: Vec<i32> = (0..4).map(|_| ran.recv_timeout(T).unwrap()).collect();
+        assert_eq!(order, [0, 1, 2, 3]);
     }
 }

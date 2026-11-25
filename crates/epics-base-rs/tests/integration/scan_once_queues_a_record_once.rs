@@ -2,7 +2,8 @@
 //! requested faster than `onceTask` processes it fills `onceQ`, and every
 //! other record's request is dropped until it drains. The port does not
 //! queue a record that is already waiting: the process queued for it starts
-//! after every request made meanwhile, and serves them all.
+//! after every request made meanwhile, and serves them all. That bounds a
+//! record's requests by the record count, so the ring never refuses one.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -137,10 +138,9 @@ async fn a_request_made_while_the_record_processes_gives_another_process() {
     assert_eq!(RUNS.load(Ordering::SeqCst), 3);
 }
 
-/// A request the full ring refuses does not keep the record from being
-/// queued again.
+/// The ring full of other callers' requests does not refuse a record's.
 #[epics_macros_rs::epics_test]
-async fn a_request_the_full_ring_refused_leaves_the_record_requestable() {
+async fn a_full_ring_does_not_refuse_a_records_request() {
     let db = ioc(A_AND_B).await;
     let hold = hold_scan_once();
     let size = background_scan_once_stats(false).unwrap().size;
@@ -150,8 +150,40 @@ async fn a_request_the_full_ring_refused_leaves_the_record_requestable() {
     db.scan_once(b"A");
     drop(hold);
     ring_drained().await;
-    assert_eq!(val(&db, "A"), 0.0, "the full ring took A's request");
+    assert_eq!(val(&db, "A"), 1.0, "the full ring dropped A's request");
+}
+
+/// A waiting record's request takes no place another caller's needs.
+#[epics_macros_rs::epics_test]
+async fn a_waiting_records_request_leaves_the_whole_ring_to_other_callers() {
+    let db = ioc(A_AND_B).await;
+    let hold = hold_scan_once();
     db.scan_once(b"A");
+    let size = background_scan_once_stats(false).unwrap().size;
+    let refused = (0..size)
+        .filter(|_| background_scan_once("FILL", Box::new(|| {})).is_err())
+        .count();
+    drop(hold);
     ring_drained().await;
+    assert_eq!(refused, 0, "A's request took a place on the ring");
     assert_eq!(val(&db, "A"), 1.0);
+}
+
+/// A record's request and another caller's run in the order they were made,
+/// as both go on C's one `onceQ`.
+#[epics_macros_rs::epics_test]
+async fn a_records_request_runs_before_a_later_callers_request() {
+    let db = ioc(A_AND_B).await;
+    let hold = hold_scan_once();
+    db.scan_once(b"A");
+    let (seen_tx, seen) = channel();
+    let reader = db.clone();
+    background_scan_once(
+        "READ",
+        Box::new(move || seen_tx.send(val(&reader, "A")).unwrap()),
+    )
+    .unwrap();
+    drop(hold);
+    let a_when_read = seen.recv_timeout(fact_budget::FACT_BUDGET).unwrap();
+    assert_eq!(a_when_read, 1.0, "the later request ran before A's");
 }

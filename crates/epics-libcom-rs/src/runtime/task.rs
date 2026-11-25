@@ -627,6 +627,13 @@ pub fn background_scan_once(
     background().scan_once().scan_once(name, cb)
 }
 
+/// Queue a record's one-shot process behind the requests already queued,
+/// never refused — see
+/// [`ScanOnceQueue::scan_once_record`](crate::runtime::background::ScanOnceQueue::scan_once_record).
+pub fn background_scan_once_record(cb: crate::runtime::background::OnceCallback) {
+    background().scan_once().scan_once_record(cb)
+}
+
 /// Ring statistics for the `scanOnce` facility, or `None` before the
 /// background executor exists — C `scanOnceQueueStatus` (`dbScan.c:734-757`)
 /// and its `if (!onceQ) return -1` guard.

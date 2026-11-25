@@ -279,6 +279,10 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ),
     (
         "epics-ca-rs",
+        "tests/integration/a_reconnected_ca_link_serves_no_old_attributes.rs",
+    ),
+    (
+        "epics-ca-rs",
         "tests/integration/a_string_put_to_an_enum_link_goes_as_dbr_string.rs",
     ),
     (

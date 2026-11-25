@@ -13,6 +13,7 @@ mod a_network_ca_link_shape_is_set_at_connect;
 mod a_put_callback_resolves_after_its_update;
 mod a_put_the_task_cannot_send_is_dropped;
 mod a_put_to_an_unopened_remote_link_is_refused;
+mod a_reconnected_ca_link_serves_no_old_attributes;
 mod a_remote_link_put_that_does_not_convert_alarms;
 mod a_string_put_to_an_enum_link_goes_as_dbr_string;
 mod absence_barrier;

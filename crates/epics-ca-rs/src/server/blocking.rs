@@ -233,40 +233,54 @@ pub(crate) fn serve_beacons(
     )
 }
 
+/// Descriptors the target gives the process: `CONFIGURE_MAXIMUM_FILE_DESCRIPTORS`
+/// (`crates/epics-rtems-boot/csrc/rtems_config.c` §F).
+const TARGET_DESCRIPTORS: usize = 150;
+
+/// What the IOC held at idle on the target, serving one listener, before
+/// [`RunControl`] held a wake socket: `FD_FREE = 142` of `FD_MAX = 150` at
+/// zero connections.
+const IOC_IDLE_DESCRIPTORS: usize = 8;
+
+/// The [`AcceptWaker`] [`RunControl`] holds for each listener it serves, for
+/// as long as the server lives; the measured IOC serves one.
+const ACCEPT_WAKER_DESCRIPTORS: usize = 1;
+
+/// The descriptor a full server accepts the next client on to refuse it.
+const REFUSAL_DESCRIPTORS: usize = 1;
+
 /// The most CA clients this **process** can serve at once, and therefore the
 /// most two-thread sets [`CAS_CLIENT_POOL`] may ever create.
 ///
-/// **One below the target's fd wall, and the "one below" is the whole point.**
-/// Every term is read out of a source file or out of a measurement: the fd
-/// wall, and this driver's own ramp to it (142 established and held 140 s at
-/// the wall, the 143rd's `accept` failing with nothing said to the peer —
-/// which is what forced the "one below").
+/// **Every descriptor the process has, less each part held without a client,
+/// less one to refuse on.** A part that comes to hold a descriptor for the
+/// life of the server adds its term to this sum, and the capacity moves with
+/// it. Every term is read out of a source file or out of a measurement: this
+/// driver's own ramp to the wall before the wake socket (142 established and
+/// held 140 s, the 143rd's `accept` failing with nothing said to the peer —
+/// which is what forced the refusal term).
 ///
-/// * **fd wall = 142.** `CONFIGURE_MAXIMUM_FILE_DESCRIPTORS` is 150
-///   (`crates/epics-rtems-boot/csrc/rtems_config.c` §F) and the IOC holds 8
-///   descriptors at idle, so 142 client sockets fit. Measured on this driver:
-///   `FD_CNT = FD_MAX = 150`, `CA_CONN_CNT = 142`, zero descriptors free.
-/// * **memory wall ≈ 145.** A set is `Big` + `Medium` = 1,048,576 + 524,288 =
-///   1,572,864 B of stack on `armv7-rtems-eabihf` (`StackSizeClass::bytes` is
-///   `f × 0x10000 × size_of::<usize>()`, and `usize` is 4 there); the measured
-///   cost of a whole client set at the wall is **1,591,854 B**, and this image
-///   has **231,289,888 B** free at idle, so 231,289,888 / 1,591,854 ≈ 145.
-/// * **capacity = fd wall − 1 = 141**, *not* `min(142, 145) = 142`.
+/// The descriptor wall binds, not memory. A set is `Big` + `Medium` =
+/// 1,048,576 + 524,288 = 1,572,864 B of stack on `armv7-rtems-eabihf`
+/// (`StackSizeClass::bytes` is `f × 0x10000 × size_of::<usize>()`, and `usize`
+/// is 4 there); the measured cost of a whole client set at the wall is
+/// **1,591,854 B**, and this image has **231,289,888 B** free at idle, so
+/// memory runs out at 231,289,888 / 1,591,854 ≈ 145 sets.
 ///
 /// # Why one below, and not the wall itself
 ///
-/// At capacity 142 the pool's refusal is **unreachable**, and this is measured
-/// rather than argued: at the wall `REFUSED` stayed **0** for the whole run
-/// while `SETS = CAP = 142`. Set #143 would have been refused with `WouldBlock`
-/// — but client #143's `accept` fails `ENFILE` first, because 142 clients hold
-/// every descriptor the process has. The peer receives *nothing*: the guest
-/// accepted nothing and sent nothing, so a client at the wall sees the socket
-/// close with zero bytes on it.
+/// At capacity 142, the wall before the wake socket, the pool's refusal is
+/// **unreachable**, and this is measured rather than argued: at the wall
+/// `REFUSED` stayed **0** for the whole run while `SETS = CAP = 142`. Set #143
+/// would have been refused with `WouldBlock` — but client #143's `accept`
+/// fails `ENFILE` first, because 142 clients hold every descriptor the process
+/// has. The peer receives *nothing*: the guest accepted nothing and sent
+/// nothing, so a client at the wall sees the socket close with zero bytes on it.
 ///
 /// That is the silent close [`refuse_client`] exists to remove. **A refusal
 /// after `accept` needs a descriptor to refuse on**, so the server must keep
-/// one in hand: at 141 clients the process holds 149 of 150 descriptors, client
-/// #142's `accept` succeeds on the last one, `acquire` refuses it with
+/// one in hand: at capacity the process holds all but one descriptor, the next
+/// client's `accept` succeeds on the last one, `acquire` refuses it with
 /// `WouldBlock`, [`refuse_client`] tells it why with `ECA_ALLOCMEM` and closes
 /// — returning the descriptor for the next one. The accept loop is single
 /// threaded, so a burst of refusals is served one at a time through that one
@@ -277,14 +291,15 @@ pub(crate) fn serve_beacons(
 ///
 /// # What this is still not
 ///
-/// Not a connection-count limit of the kind C `rsrv` lacks. 141 is derived from
-/// the descriptor budget, not chosen as a policy on clients, and it moves with
-/// the fd cap; §9's rejected option 2 was a limit *independent* of the
-/// resource. The client that would have been #142 is not turned away — it is
+/// Not a connection-count limit of the kind C `rsrv` lacks. The capacity is
+/// derived from the descriptor budget, not chosen as a policy on clients, and
+/// it moves with the fd cap; §9's rejected option 2 was a limit *independent*
+/// of the resource. The client past capacity is not turned away — it is
 /// accepted and answered, which is strictly more than it got before. And a
 /// capacity *above* the wall (§9's rejected 256) remains unreachable for the
 /// same reason, now with a measurement behind it.
-const CAS_CLIENT_POOL_CAPACITY: usize = 141;
+const CAS_CLIENT_POOL_CAPACITY: usize =
+    TARGET_DESCRIPTORS - (IOC_IDLE_DESCRIPTORS + ACCEPT_WAKER_DESCRIPTORS + REFUSAL_DESCRIPTORS);
 
 /// The two roles one CA client borrows together, in the order
 /// [`CAS_CLIENT_POOL`] hands them out: `[client, event]`.
@@ -367,7 +382,8 @@ fn client_roster() -> [WorkerRole; 2] {
 /// there is no such ordering to state.
 ///
 /// `CAS`: RTEMS truncates thread names at 16 bytes and the pool appends
-/// `-{suffix} {index}`, so the longest name here is `CAS-client 141` — 14.
+/// `-{suffix} {index}`, so the longest name here, `CAS-client` and a
+/// three-digit index, is 14.
 static CAS_CLIENT_POOL: LazyLock<WorkerPool<2>> =
     LazyLock::new(|| WorkerPool::new("CAS", client_roster(), CAS_CLIENT_POOL_CAPACITY));
 
@@ -610,8 +626,9 @@ impl BlockingCaServer {
     /// so the number can be *reported*. It is the number the bring-up box
     /// measured the ceiling in: 142 concurrent, connection 143 refused by the
     /// libbsd socket zone with `ENFILE` and told nothing at all. This driver
-    /// now stops one short of that, at `CAS_CLIENT_POOL_CAPACITY` = 141, so
-    /// the descriptor client #142 needs to *hear why* is still there. Watching
+    /// now stops at `CAS_CLIENT_POOL_CAPACITY`, one descriptor short of the
+    /// wall, so the descriptor the next client needs to *hear why* is still
+    /// there. Watching
     /// this climb is how an operator sees the wall coming.
     pub fn active_connections(&self) -> usize {
         self.stats.active_clients() as usize
@@ -2786,52 +2803,34 @@ mod tests {
 
     /// The pool's capacity leaves exactly one descriptor for the refusal.
     ///
-    /// The number is a decision, so it is pinned here with its derivation rather
-    /// than left as a literal somebody rounds later:
+    /// Memory is measured at ≈145 sets (1,591,854 B per client set, 231,289,888 B
+    /// free at idle) — not the 151 the first derivation used, which came from a
+    /// different image's idle heap — so the descriptor wall binds first.
     ///
-    /// * 150 descriptors configured minus the 8 the IOC holds at idle = **142**
-    ///   client sockets; measured on this driver as `FD_CNT = FD_MAX = 150`
-    ///   with `CA_CONN_CNT = 142` and zero free.
-    /// * memory: a client set costs a measured 1,591,854 B and the image has
-    ///   231,289,888 B free at idle, so **≈145** sets — not the 151 the first
-    ///   derivation used, which came from a different image's idle heap.
-    /// * capacity = **fd wall − 1 = 141**, so the client that cannot be served
-    ///   can still be *accepted* and told why.
-    ///
-    /// The last line is the one the target forced. At capacity = the wall the
-    /// pool's refusal is unreachable — `REFUSED` stayed 0 through a full ramp
-    /// while `SETS = CAP = 142`, because client #143's `accept` fails `ENFILE`
-    /// before `acquire` is ever called, and the peer is sent nothing at all.
-    /// Refusing after `accept` needs a descriptor to refuse on; this keeps one.
+    /// At capacity = the wall the pool's refusal is unreachable — `REFUSED`
+    /// stayed 0 through a full ramp while `SETS = CAP = 142`, because client
+    /// #143's `accept` fails `ENFILE` before `acquire` is ever called, and the
+    /// peer is sent nothing at all. Refusing after `accept` needs a descriptor
+    /// to refuse on; this keeps one.
     #[test]
     fn the_client_pool_capacity_leaves_one_descriptor_for_the_refusal() {
-        const CONFIGURED_DESCRIPTORS: usize = 150;
-        const IOC_HELD_AT_IDLE: usize = 8;
         /// 231,289,888 B free at idle / 1,591,854 B measured per client set.
         const MEMORY_WALL_CONNECTIONS: usize = 145;
 
-        let fd_wall = CONFIGURED_DESCRIPTORS - IOC_HELD_AT_IDLE;
-        assert_eq!(fd_wall, 142, "the fd wall is the cap minus the idle hold");
+        let held_without_clients = IOC_IDLE_DESCRIPTORS + ACCEPT_WAKER_DESCRIPTORS;
+        let fd_wall = TARGET_DESCRIPTORS - held_without_clients;
         assert!(
             fd_wall <= MEMORY_WALL_CONNECTIONS,
             "the fd wall is the binding one; if memory ever binds first, the \
              spare descriptor this capacity reserves no longer buys a refusal"
         );
         assert_eq!(
-            CAS_CLIENT_POOL_CAPACITY,
-            fd_wall - 1,
-            "capacity must sit one below the fd wall: at the wall itself the \
-             pool's WouldBlock arm is unreachable (measured REFUSED=0 with \
-             SETS=CAP) because accept fails ENFILE first, and the peer is told \
-             nothing"
-        );
-        // The property that spare descriptor exists for: at capacity, one more
-        // client can still be accepted, which is what `refuse_client` needs.
-        assert_eq!(
-            CONFIGURED_DESCRIPTORS - (IOC_HELD_AT_IDLE + CAS_CLIENT_POOL_CAPACITY),
+            TARGET_DESCRIPTORS - (held_without_clients + CAS_CLIENT_POOL_CAPACITY),
             1,
             "a full server must still be able to accept the client it is about \
-             to refuse"
+             to refuse: at the wall itself the pool's WouldBlock arm is \
+             unreachable (measured REFUSED=0 with SETS=CAP) because accept \
+             fails ENFILE first, and the peer is told nothing"
         );
     }
 
@@ -3022,7 +3021,7 @@ mod tests {
     /// This is the number the bring-up box measured the ceiling in (142
     /// concurrent, the 143rd's `accept` failing `ENFILE` with nothing said to
     /// the peer), so it is the one an operator watches climb — now to
-    /// [`CAS_CLIENT_POOL_CAPACITY`] = 141, one below that wall. It is a count
+    /// [`CAS_CLIENT_POOL_CAPACITY`], one descriptor short of the wall. It is a count
     /// and never a limit — nothing in this file reads it to decide anything.
     #[test]
     fn a_served_client_is_counted_and_gives_the_slot_back() {

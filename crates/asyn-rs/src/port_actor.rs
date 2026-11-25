@@ -2739,7 +2739,13 @@ impl PortActor {
         // on its caller's thread. A port disabled or down since then is the
         // port thread's to answer, and it answers by leaving the request
         // queued until the state changes back or its timer fires (:808-810,
-        // :858-863).
+        // :858-863). Its waiver is spent: the thread asks a down port nothing
+        // before it drains the Connect queue (:811-857).
+        let connect = if msg.priority == QueuePriority::Connect {
+            ConnectCheck::Waived
+        } else {
+            connect
+        };
         if base.queue_gate().check(connect).is_err() {
             return Scan::Settle(Settle::Park);
         }
@@ -6569,6 +6575,84 @@ mod tests {
             calls.lock().clone(),
             vec![("disconnect", 1)],
             "no connect attempt before either request"
+        );
+    }
+
+    /// C `portThread` asks a down port nothing before it drains the
+    /// Connect-priority queue (asynManager.c:808-857), and only below it
+    /// waits for the port (:858-863). A device connect queued while the port
+    /// was up answers with the driver's failure once the port is down, with
+    /// autoconnect off; a read of an up device queued with it waits for the
+    /// port.
+    #[test]
+    fn a_connect_queued_before_the_port_dropped_answers_with_the_failed_connect() {
+        struct DownLine {
+            base: PortDriverBase,
+            calls: Log<(&'static str, i32)>,
+        }
+        impl PortDriver for DownLine {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn connect(&mut self, user: &AsynUser) -> AsynResult<()> {
+                self.calls.lock().push(("connect", user.addr));
+                self.base.set_connected(true);
+                Ok(())
+            }
+            fn connect_addr(&mut self, user: &AsynUser) -> AsynResult<()> {
+                self.calls.lock().push(("connect", user.addr));
+                if !self.base.is_connected() {
+                    return Err(AsynError::Status {
+                        status: AsynStatus::Disconnected,
+                        message: "the line is down".into(),
+                    });
+                }
+                self.base.connect_addr(user.addr);
+                Ok(())
+            }
+            fn read_int32(&mut self, user: &AsynUser) -> AsynResult<i32> {
+                self.calls.lock().push(("read", user.addr));
+                self.base.read_int32_param(user)
+            }
+        }
+        let mut base = multi_device_driver(true).base;
+        base.init_auto_connect(false);
+        base.device_state(0).put_connected(true);
+        base.set_connected(false);
+        let calls: Log<(&'static str, i32)> = Default::default();
+        let tx = spawn_actor(DownLine {
+            base,
+            calls: calls.clone(),
+        });
+
+        let read = send(&tx, RequestOp::Int32Read, AsynUser::new(0).with_addr(0));
+        let mut connect = send(&tx, RequestOp::ConnectAddr, AsynUser::new(0).with_addr(1));
+        let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+        let err = loop {
+            match connect.try_recv() {
+                Ok(r) => break r.expect_err("the device connect fails on a down port"),
+                Err(oneshot::error::TryRecvError::Empty) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => panic!("the connect queued before the port dropped never answered: {e}"),
+            }
+        };
+        assert!(!err.is_queue_refused(), "the driver answered it: {err:?}");
+        assert_eq!(err.status(), AsynStatus::Disconnected);
+
+        send_and_wait(&tx, RequestOp::Connect, AsynUser::default()).unwrap();
+        let r = read
+            .blocking_recv()
+            .expect("actor dropped the read's reply")
+            .expect("the read runs once the port is up");
+        assert_eq!(r.int_val, Some(7));
+        assert_eq!(
+            calls.lock().clone(),
+            vec![("connect", 1), ("connect", -1), ("read", 0)],
+            "the read waited for the port"
         );
     }
 

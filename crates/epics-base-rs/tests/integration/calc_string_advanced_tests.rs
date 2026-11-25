@@ -327,7 +327,7 @@ fn test_sscanf_matches_glibc_with_gnu_source() {
     );
     assert_eq!(
         eval_str(r#"SSCANF("99999999999999999999", "%d")"#),
-        StackValue::Double(std::ffi::c_long::MAX as i32 as f64)
+        StackValue::Double(std::ffi::c_long::MAX as std::ffi::c_int as f64)
     );
 }
 

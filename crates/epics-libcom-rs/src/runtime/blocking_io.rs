@@ -785,8 +785,39 @@ fn own_blocking_mode(_sock: &TcpStream) -> io::Result<()> {
 /// waiting reader now that no `read` is parked for it to interrupt.
 #[cfg(unix)]
 fn wait_readable(sock: &TcpStream, deadline: Option<Instant>) -> io::Result<bool> {
+    poll_until(deadline, |ms| poll_once(sock, POLLIN_EVENT, ms))
+}
+
+/// One `poll` of `sock` for `events`: `Ok(true)` ready, `Ok(false)` the
+/// interval ran out with nothing ready.
+#[cfg(unix)]
+fn poll_once(sock: &TcpStream, events: libc::c_short, ms: libc::c_int) -> io::Result<bool> {
     use std::os::fd::AsRawFd;
 
+    let mut fds = libc::pollfd {
+        fd: sock.as_raw_fd(),
+        events,
+        revents: 0,
+    };
+    // SAFETY: one initialised `pollfd` whose `fd` is this borrowed socket's
+    // and stays open for the call; `poll` reads `fd`/`events` and writes
+    // only `revents`.
+    match unsafe { libc::poll(&mut fds, 1, ms) } {
+        rc if rc < 0 => Err(io::Error::last_os_error()),
+        rc => Ok(rc > 0),
+    }
+}
+
+/// The deadline loop both unix waits share; `None` waits with no deadline.
+/// Only the clock ends the wait: an empty `poll` loops back as `EINTR` does,
+/// since its interval is clamped to `c_int` milliseconds (24.8 days), and the
+/// interval is rounded up so a fractional remainder sleeps to the deadline
+/// rather than short of it.
+#[cfg(unix)]
+fn poll_until(
+    deadline: Option<Instant>,
+    mut poll: impl FnMut(libc::c_int) -> io::Result<bool>,
+) -> io::Result<bool> {
     loop {
         let ms = match deadline {
             Some(d) => {
@@ -794,31 +825,19 @@ fn wait_readable(sock: &TcpStream, deadline: Option<Instant>) -> io::Result<bool
                 if remaining.is_zero() {
                     return Ok(false);
                 }
-                remaining.as_millis().max(1).min(libc::c_int::MAX as u128) as libc::c_int
+                remaining
+                    .as_nanos()
+                    .div_ceil(1_000_000)
+                    .min(libc::c_int::MAX as u128) as libc::c_int
             }
             None => -1,
         };
-        let mut fds = libc::pollfd {
-            fd: sock.as_raw_fd(),
-            events: POLLIN_EVENT,
-            revents: 0,
-        };
-        // SAFETY: one initialised `pollfd` whose `fd` is this borrowed socket's
-        // and stays open for the call; `poll` reads `fd`/`events` and writes
-        // only `revents`.
-        let rc = unsafe { libc::poll(&mut fds, 1, ms) };
-        if rc > 0 {
-            return Ok(true);
+        match poll(ms) {
+            Ok(true) => return Ok(true),
+            Ok(false) => {}
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
         }
-        if rc == 0 {
-            return Ok(false);
-        }
-        let e = io::Error::last_os_error();
-        if e.kind() != io::ErrorKind::Interrupted {
-            return Err(e);
-        }
-        // `EINTR`: the remaining time is recomputed at the top, so a signal
-        // storm cannot extend the bound.
     }
 }
 
@@ -866,39 +885,7 @@ fn wait_readable(sock: &TcpStream, deadline: Option<Instant>) -> io::Result<bool
 /// that follows reports the real errno instead of this function inventing one.
 #[cfg(unix)]
 fn wait_writable(sock: &TcpStream, deadline: Instant) -> io::Result<bool> {
-    use std::os::fd::AsRawFd;
-
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Ok(false);
-        }
-        // Rounded up to 1 ms so a sub-millisecond remainder waits instead of
-        // spinning, and clamped so a very long deadline still fits `poll`'s
-        // `c_int` milliseconds.
-        let ms = remaining.as_millis().max(1).min(libc::c_int::MAX as u128) as libc::c_int;
-        let mut fds = libc::pollfd {
-            fd: sock.as_raw_fd(),
-            events: POLLOUT_EVENT,
-            revents: 0,
-        };
-        // SAFETY: one initialised `pollfd` whose `fd` is this borrowed socket's
-        // and stays open for the call; `poll` reads `fd`/`events` and writes
-        // only `revents`.
-        let rc = unsafe { libc::poll(&mut fds, 1, ms) };
-        if rc > 0 {
-            return Ok(true);
-        }
-        if rc == 0 {
-            return Ok(false);
-        }
-        let e = io::Error::last_os_error();
-        if e.kind() != io::ErrorKind::Interrupted {
-            return Err(e);
-        }
-        // `EINTR`: the remaining time is recomputed at the top, so a signal
-        // storm cannot extend the bound.
-    }
+    poll_until(Some(deadline), |ms| poll_once(sock, POLLOUT_EVENT, ms))
 }
 
 /// Hand as much of `buf` to the socket as it will take **without parking**,
@@ -1654,6 +1641,45 @@ mod tests {
         });
         write_frame_deadline(&client, b"hello", send_timeout).expect("delivered");
         assert_eq!(reader.join().expect("reader"), b"hello");
+    }
+
+    /// A wait that reports expiry does so with the clock past its deadline,
+    /// also when what is left is a fraction of a millisecond above a whole one.
+    #[cfg(unix)]
+    #[test]
+    fn a_sub_millisecond_remainder_is_waited_out() {
+        let left = Duration::from_micros(1900);
+        let (idle, _peer) = socket_pair();
+        for _ in 0..20 {
+            let deadline = deadline_from_now(left);
+            assert!(
+                !wait_readable(&idle, Some(deadline)).expect("wait"),
+                "nothing was sent"
+            );
+            let now = Instant::now();
+            assert!(
+                now >= deadline,
+                "the read wait expired {:?} early",
+                deadline - now
+            );
+        }
+
+        let (client, server) = socket_pair();
+        // Never read from `server`; write until the send buffer refuses more.
+        client.set_nonblocking(true).expect("nonblocking");
+        let big = vec![0u8; 8 * 1024 * 1024];
+        while (&client).write(&big).is_ok() {}
+        for _ in 0..20 {
+            let started = Instant::now();
+            let err = write_frame_deadline(&client, &big, left).expect_err("the buffer is full");
+            assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+            assert!(
+                started.elapsed() >= left,
+                "the send deadline expired after {:?}",
+                started.elapsed()
+            );
+        }
+        drop(server);
     }
 
     // ── guards ──────────────────────────────────────────────────────────

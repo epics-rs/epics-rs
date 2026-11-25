@@ -543,7 +543,11 @@ mod tests {
     fn default_timeout_saturates_past_duration() {
         for huge in ["1e300", "inf"] {
             let cfg = Vxi11Config::from_positional("h", 0, huge, "inst0", 0);
-            assert_eq!(cfg.default_timeout, Duration::MAX, "{huge}");
+            assert_eq!(
+                cfg.default_timeout,
+                epics_libcom_rs::runtime::time::FAR_FUTURE,
+                "{huge}"
+            );
         }
     }
 

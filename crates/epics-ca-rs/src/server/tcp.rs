@@ -14228,7 +14228,7 @@ mod send_tmo_env_tests {
             (Some(" 2.5 "), Duration::from_millis(2500)),
             (Some("0x10"), Duration::from_secs(16)),
             // Never-expiring send deadline instead of an abort.
-            (Some("inf"), Duration::MAX),
+            (Some("inf"), epics_base_rs::runtime::time::FAR_FUTURE),
             // Rejected by `epicsScanDouble` → default.
             (Some("1e400"), default),
             (Some("abc"), default),
@@ -14266,7 +14266,7 @@ mod send_tmo_env_tests {
             (Some("60"), Some(Duration::from_secs(60))),
             (Some("1"), Some(Duration::from_secs(30))),
             (Some("0x40"), Some(Duration::from_secs(64))),
-            (Some("inf"), Some(Duration::MAX)),
+            (Some("inf"), Some(epics_base_rs::runtime::time::FAR_FUTURE)),
         ];
         for (raw, want) in cases {
             with_env("EPICS_CAS_INACTIVITY_TMO", *raw, || {

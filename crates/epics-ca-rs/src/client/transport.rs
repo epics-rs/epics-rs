@@ -1276,10 +1276,8 @@ fn resolve_connection_timeout() -> Duration {
     // lines on top of whatever `envGetDoubleConfigParam` printed. Before it, C
     // stored a non-positive period and its connection watchdog fired on every
     // check: the compiled `camonitor` wrote 177_182 stderr lines in 3 s with
-    // `=-5`. A huge finite period such as `1e300` is obeyed, as in C; it is
-    // `Duration::MAX` here, which is why every deadline built from it goes
-    // through `runtime::task::deadline_from_now` rather than a bare
-    // `Instant + Duration`, which panics instead of never firing.
+    // `=-5`. A huge finite period such as `1e300` is obeyed, as in C, and
+    // saturates to `FAR_FUTURE` here.
     match EPICS_CA_CONN_TMO.double() {
         Ok(secs) if secs > 0.0 && secs.is_finite() => crate::estdlib::duration_from_secs(secs),
         _ => {
@@ -6775,8 +6773,8 @@ mod conn_tmo_env_tests {
             (Some("inf"), default),
             (Some("-inf"), default),
             // Finite and enormous passes `finite()`, so C obeys it and so
-            // do we: a deadline that never fires, i.e. `Duration::MAX`.
-            (Some("1e300"), Duration::MAX),
+            // do we: a deadline that never fires, i.e. `FAR_FUTURE`.
+            (Some("1e300"), epics_base_rs::runtime::time::FAR_FUTURE),
             // ERANGE / no-conversion / extraneous → C's default branch.
             (Some("1e400"), default),
             (Some("abc"), default),
@@ -6800,12 +6798,10 @@ mod conn_tmo_env_tests {
         }
     }
 
-    /// The obeyed-but-enormous period is `Duration::MAX`, and
-    /// `echo_idle_secs` widens it to `u64::MAX` seconds. Every deadline
-    /// the circuit watchdog builds from it must saturate: `Instant +
-    /// Duration::MAX` panics with "overflow when adding duration to
-    /// instant", which killed the client task outright where C simply
-    /// never fires the watchdog.
+    /// A watchdog deadline built from an idle of `u64::MAX` seconds must
+    /// saturate: `Instant + Duration::MAX` panics with "overflow when
+    /// adding duration to instant", which killed the client task outright
+    /// where C simply never fires the watchdog.
     #[test]
     fn a_never_firing_period_saturates_instead_of_panicking() {
         let idle = Duration::from_secs(Duration::MAX.as_secs().max(1));

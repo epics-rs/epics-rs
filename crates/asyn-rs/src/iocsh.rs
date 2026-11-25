@@ -3077,10 +3077,12 @@ mod tests {
         // so the user's own timeout is the deadline.
         set(-1.0);
         assert_eq!(deadline(200), Some(Duration::from_millis(200)));
-        // A floor past `Duration` is a deadline that never fires, held in the
-        // port's u64 of nanoseconds.
+        // A floor past `Duration` is a deadline that never fires.
         set(1e300);
-        assert_eq!(deadline(200), Some(Duration::from_nanos(u64::MAX)));
+        assert_eq!(
+            deadline(200),
+            Some(epics_libcom_rs::runtime::time::FAR_FUTURE)
+        );
     }
 
     /// R19-120: `asynShowOption` prints `key=value` for a driver option

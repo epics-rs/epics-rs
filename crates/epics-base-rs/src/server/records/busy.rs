@@ -381,7 +381,7 @@ impl Record for BusyRecord {
         // The conversion is `runtime::time::duration_from_secs`, the same one
         // `process()` arms with, so `self.high` cannot mean two deadlines in
         // two adjacent functions: a HIGH past `Duration`'s range (`caput
-        // REC.HIGH 1e300`, which C ACCEPTS) becomes `Duration::MAX`, C's
+        // REC.HIGH 1e300`, which C ACCEPTS) becomes `FAR_FUTURE`, C's
         // queued callback that no comparison ever reaches. `Drop` is then left
         // with its one meaning — the one-shot is no longer live — instead of
         // also standing for "the delay would not fit".

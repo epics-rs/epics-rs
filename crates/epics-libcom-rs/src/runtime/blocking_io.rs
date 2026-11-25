@@ -1938,8 +1938,8 @@ mod tests {
         assert_eq!(peer.join().expect("peer"), b"ping");
     }
 
-    /// `EPICS_CA_CONN_TMO=1e300` parses to `Duration::MAX`: a circuit that
-    /// never times out, which must still carry frames both ways.
+    /// A caller's own `Duration::MAX` "no bound": a circuit that never
+    /// times out, which must still carry frames both ways.
     #[epics_macros_rs::epics_test]
     async fn an_unbounded_timeout_still_moves_bytes_both_ways() {
         let (client, mut server) = socket_pair();

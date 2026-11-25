@@ -73,9 +73,8 @@ fn a_high_the_network_can_set_never_unwinds_process() {
                 .unwrap_or_else(|| panic!("{kind} HIGH={high} must still arm the one-shot"));
             assert_eq!(
                 delay,
-                std::time::Duration::MAX,
-                "{kind} HIGH={high} is a deadline no comparison reaches — C's \
-                 garbage deadline that never fires"
+                epics_base_rs::runtime::time::FAR_FUTURE,
+                "{kind} HIGH={high} must arm the never-firing deadline"
             );
         }
 

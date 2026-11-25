@@ -363,9 +363,8 @@ mod tests {
 
     /// `callbackRequestDelayed` with a delay past `Duration`'s range must
     /// file a deadline that never arrives, not unwind the caller.
-    /// `duration_from_secs` maps `+inf`, `NaN` and `1e300` to
-    /// `Duration::MAX` because a record delay field is network-settable,
-    /// and `Instant + Duration::MAX` panics.
+    /// A caller may pass `Duration::MAX` as its own "no bound", and
+    /// `Instant + Duration::MAX` panics.
     #[test]
     fn an_unrepresentable_delay_schedules_instead_of_panicking() {
         let pool = CallbackPool::new();

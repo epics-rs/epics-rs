@@ -287,10 +287,10 @@ fn the_timer_body_matches_my_callback_func() {
 /// above `u64::MAX` seconds, so a value C accepts aborted the timer thread.
 /// The re-arm now takes `runtime::time::duration_from_secs`, the converter the
 /// arming path in `after_write_actions` already uses, so such a HIGH re-arms at
-/// `Duration::MAX` — C's queued callback that no comparison reaches — rather
+/// `FAR_FUTURE` — C's queued callback that no comparison reaches — rather
 /// than returning `Drop`. `Drop` is reserved for the one-shot that is no
 /// longer live. The representable neighbour is pinned beside it so the rule is
-/// a boundary and not a blanket `Duration::MAX`.
+/// a boundary and not a blanket `FAR_FUTURE`.
 #[test]
 fn a_high_beyond_duration_rearms_at_the_unreachable_deadline() {
     for label in ["bo", "busy"] {
@@ -308,20 +308,17 @@ fn a_high_beyond_duration_rearms_at_the_unreachable_deadline() {
 
         // Representable: still re-arms.
         assert_eq!(
-            build(1e18).delayed_callback_fire(DelayedCallback::ONLY, true),
-            DelayedCallbackOutcome::Rearm(Duration::from_secs_f64(1e18)),
-            "{label}: 1e18 s is inside Duration and must still re-arm"
+            build(1e8).delayed_callback_fire(DelayedCallback::ONLY, true),
+            DelayedCallbackOutcome::Rearm(Duration::from_secs_f64(1e8)),
+            "{label}: 1e8 s is inside the cap and must still re-arm"
         );
-        // Past u64::MAX seconds: the deadline no comparison reaches.
-        assert_eq!(
-            build(1e300).delayed_callback_fire(DelayedCallback::ONLY, true),
-            DelayedCallbackOutcome::Rearm(Duration::MAX),
-            "{label}: HIGH=1e300 must re-arm at Duration::MAX, not panic"
-        );
-        assert_eq!(
-            build(f64::INFINITY).delayed_callback_fire(DelayedCallback::ONLY, true),
-            DelayedCallbackOutcome::Rearm(Duration::MAX),
-            "{label}: HIGH=inf must re-arm at Duration::MAX, not panic"
-        );
+        // Past the runtime's "never", inside `Duration` or not.
+        for high in [1e18, 1e300, f64::INFINITY] {
+            assert_eq!(
+                build(high).delayed_callback_fire(DelayedCallback::ONLY, true),
+                DelayedCallbackOutcome::Rearm(epics_base_rs::runtime::time::FAR_FUTURE),
+                "{label}: HIGH={high} must re-arm at FAR_FUTURE, not panic"
+            );
+        }
     }
 }

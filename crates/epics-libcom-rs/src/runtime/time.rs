@@ -14,9 +14,7 @@ pub fn now_mono() -> Instant {
 /// The instant `base + d`, saturating where `Instant + Duration` would
 /// panic — the single owner of "turn a delay into a deadline".
 ///
-/// [`duration_from_secs`] deliberately maps `+inf`, `NaN` and any
-/// magnitude past `Duration`'s range to [`Duration::MAX`], so a deadline
-/// computed from a record delay field can be exactly that sum and
+/// A caller's own "no bound" timeout can be [`Duration::MAX`], and
 /// `Instant`'s `Add` panics on it. tokio's `sleep()` does not: it takes
 /// `Instant::now().checked_add(dur)` and falls back to
 /// `Instant::far_future()`, about thirty years out. The hosted build
@@ -26,8 +24,9 @@ pub fn now_mono() -> Instant {
 ///
 /// Measured on `armv7-rtems-eabihf` (QEMU `xilinx-zynq-a9`,
 /// `realtime-ca-ioc`), which is where the panic was filed: `caput
-/// RTEMS:BO.HIGH 1e300` then `caput RTEMS:BO 1` makes `bo::process` arm
-/// `DelayedCallbackAfter(Duration::MAX)`. With this fallback the guest
+/// RTEMS:BO.HIGH 1e300` then `caput RTEMS:BO 1` made `bo::process` arm
+/// `DelayedCallbackAfter(Duration::MAX)`, which [`duration_from_secs`]
+/// returned for `1e300` at the time. With this fallback the guest
 /// takes it silently and the one-shot simply never fires — the record
 /// still reads `On` eight seconds later, and a 0.5 s one-shot armed
 /// afterwards still reverts it. Rebuilding the same image with `base + d`
@@ -45,10 +44,11 @@ pub fn deadline_from_now(d: Duration) -> Instant {
 }
 
 /// Roughly thirty years — the offset in tokio's `Instant::far_future()`,
-/// the "never fires" deadline an unrepresentable one collapses to.
+/// and this seam's one "never": the deadline an unrepresentable one
+/// collapses to, and the most [`duration_from_secs`] returns.
 /// Shared with [`crate::runtime::task::deadline_after`], which applies
 /// the same rule to the runtime's own `Instant` alias.
-pub(crate) const FAR_FUTURE: Duration = Duration::from_secs(86_400 * 365 * 30);
+pub const FAR_FUTURE: Duration = Duration::from_secs(86_400 * 365 * 30);
 
 /// See [`FAR_FUTURE`].
 fn far_future() -> Instant {
@@ -198,16 +198,19 @@ fn c_long_cast(f: f64) -> i64 {
 ///
 /// * negative, including `-inf` → [`Duration::ZERO`] — C's
 ///   already-expired deadline, which fires at once.
-/// * `+inf`, `NaN`, or a magnitude beyond `Duration` → [`Duration::MAX`]
-///   — a deadline no comparison ever reaches, i.e. it never fires.
-///   NaN lands here because in C every `now < expire` test against NaN
-///   is false, which is the same "never fires".
+/// * `+inf`, `NaN`, or anything past [`FAR_FUTURE`] → [`FAR_FUTURE`] —
+///   a deadline that never fires. NaN lands here because in C every
+///   `now < expire` test against NaN is false, which is the same "never
+///   fires". C's event waits and thread sleeps cap at ten years
+///   (`convertDoubleToWakeTime`, posix `osdTime.cpp:97-100`); this cap is
+///   tokio's thirty, and a caller may double or pad it without overflow,
+///   which `Duration::MAX` and a representable `1e19` s both refuse.
 pub fn duration_from_secs(secs: f64) -> Duration {
-    Duration::try_from_secs_f64(secs).unwrap_or(if secs < 0.0 {
-        Duration::ZERO
-    } else {
-        Duration::MAX
-    })
+    match Duration::try_from_secs_f64(secs) {
+        Ok(d) => d.min(FAR_FUTURE),
+        Err(_) if secs < 0.0 => Duration::ZERO,
+        Err(_) => FAR_FUTURE,
+    }
 }
 
 /// Block the calling thread for `secs` — C `epicsThreadSleep`, and the
@@ -223,9 +226,9 @@ pub fn duration_from_secs(secs: f64) -> Duration {
 /// is not slept at all.
 ///
 /// Deliberately NOT [`duration_from_secs`]. That owner saturates to
-/// [`Duration::MAX`] because a *deadline* built from an absurd delay
-/// must never fire; sleeping on [`Duration::MAX`] would park the caller
-/// for 584 billion years exactly where C returns at once, and
+/// [`FAR_FUTURE`] because a *deadline* built from an absurd delay
+/// must never fire; sleeping on it would park the caller for thirty
+/// years exactly where C returns at once, and
 /// `Duration::from_secs_f64` would panic. The two meanings need two
 /// owners, not one conversion reused on both sides.
 pub fn sleep_secs(secs: f64) {
@@ -241,7 +244,7 @@ mod tests {
 
     /// The sleep owner's boundaries are the *opposite* of the deadline
     /// owner's, which is the whole reason it exists: everything
-    /// `duration_from_secs` saturates to [`Duration::MAX`] is a delay
+    /// `duration_from_secs` saturates to [`FAR_FUTURE`] is a delay
     /// `nanosleep` refuses, so C returns from it at once and so must we.
     ///
     /// The pairs measured against `softIoc`: `1e300`, `inf`, `nan`, `-5`
@@ -276,21 +279,25 @@ mod tests {
 
     /// Boundaries of the one rule, not scenarios: every input
     /// `Duration::from_secs_f64` would panic on has a defined answer
-    /// here, and the representable ones convert unchanged.
+    /// here, the representable ones up to [`FAR_FUTURE`] convert
+    /// unchanged, and nothing comes back larger than [`FAR_FUTURE`].
     #[test]
     fn duration_from_secs_covers_every_panic_boundary() {
-        assert_eq!(duration_from_secs(f64::INFINITY), Duration::MAX);
+        assert_eq!(duration_from_secs(f64::INFINITY), FAR_FUTURE);
         assert_eq!(duration_from_secs(f64::NEG_INFINITY), Duration::ZERO);
-        assert_eq!(duration_from_secs(f64::NAN), Duration::MAX);
+        assert_eq!(duration_from_secs(f64::NAN), FAR_FUTURE);
         // Finite and far too large — the case an `is_finite()` guard
         // lets through and `from_secs_f64` still panics on.
-        assert_eq!(duration_from_secs(1e300), Duration::MAX);
-        // The representable edge: `u64::MAX` seconds is out of range,
-        // one below the power of two above it is not.
-        assert_eq!(duration_from_secs(u64::MAX as f64), Duration::MAX);
+        assert_eq!(duration_from_secs(1e300), FAR_FUTURE);
+        assert_eq!(duration_from_secs(u64::MAX as f64), FAR_FUTURE);
+        // Representable, but doubling it overflows a `Duration`.
+        assert_eq!(duration_from_secs(1e19), FAR_FUTURE);
+        // The cap's own edge.
+        let cap = FAR_FUTURE.as_secs();
+        assert_eq!(duration_from_secs((cap + 1) as f64), FAR_FUTURE);
         assert_eq!(
-            duration_from_secs(9.0e18),
-            Duration::try_from_secs_f64(9.0e18).unwrap()
+            duration_from_secs((cap - 1) as f64),
+            Duration::from_secs(cap - 1)
         );
         assert_eq!(duration_from_secs(-1.0), Duration::ZERO);
         assert_eq!(duration_from_secs(-0.0), Duration::ZERO);
@@ -363,8 +370,7 @@ mod tests {
 
     /// Boundaries of the deadline owner: a representable delay converts
     /// unchanged, and the one `Instant + Duration` panics on —
-    /// `Duration::MAX`, which is exactly what `duration_from_secs`
-    /// returns for `+inf`, `NaN` and `1e300` — saturates instead.
+    /// `Duration::MAX`, a caller's own "no bound" — saturates instead.
     #[test]
     fn deadline_saturates_where_instant_add_would_panic() {
         let base = Instant::now();

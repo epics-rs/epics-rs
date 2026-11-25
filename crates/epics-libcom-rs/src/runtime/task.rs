@@ -1205,10 +1205,8 @@ pub type Instant = std::time::Instant;
 /// the alias above.
 ///
 /// The alias exists so a deadline cannot be built in the wrong timeline;
-/// this exists so it cannot be built by a panicking add. Any `Duration`
-/// that came from a `double` — a record field, an `EPICS_*` env var, a
-/// caller-supplied timeout — can be [`Duration::MAX`] by the rule in
-/// [`crate::runtime::time::duration_from_secs`], and `Instant + MAX`
+/// this exists so it cannot be built by a panicking add. A caller's own
+/// "no bound" timeout can be [`Duration::MAX`], and `Instant + MAX`
 /// aborts the task rather than never firing. Both concrete `Instant`
 /// types offer `checked_add`, so one body covers both backends.
 pub fn deadline_after(base: Instant, d: Duration) -> Instant {

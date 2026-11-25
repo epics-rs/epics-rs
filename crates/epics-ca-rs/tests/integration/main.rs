@@ -7,6 +7,7 @@ mod a_ca_link_waits_on_its_put_callback;
 mod a_cancelled_subscribe_is_cancelled_on_the_server;
 mod a_dead_circuits_sub_id_spares_another_circuits_monitor;
 mod a_held_udp_search_port_fails_the_server_start;
+mod a_huge_beacon_period_keeps_the_beacons_coming;
 mod a_loopback_interface_binds_two_responder_sockets;
 mod a_network_ca_link_shape_is_set_at_connect;
 mod a_put_callback_resolves_after_its_update;

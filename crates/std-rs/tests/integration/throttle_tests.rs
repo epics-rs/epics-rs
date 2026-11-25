@@ -625,7 +625,7 @@ fn test_real_out_link_reports_success_and_writes() {
 // C stores any DLY verbatim (throttleRecord.c `special()` :392-409 only
 // clamps a negative one to 0), and `callbackRequestDelayed` takes it as
 // is. A delay past `Duration`'s range — +inf, NaN, 1e300 — converts
-// through `duration_from_secs` to `Duration::MAX`: armed, never fires.
+// through `duration_from_secs` to `FAR_FUTURE`: armed, never fires.
 // ============================================================
 
 /// The cooldown `actions` armed, if any.
@@ -649,7 +649,10 @@ fn an_unrepresentable_dly_is_stored_and_arms_a_cooldown_that_never_fires() {
         let actions = process_ok(&mut rec);
         assert_eq!(rec.sent, 1.0, "DLY={dly}: the first value goes out");
         assert_eq!(rec.wait, 0);
-        assert_eq!(cooldown(&actions), Some(std::time::Duration::MAX));
+        assert_eq!(
+            cooldown(&actions),
+            Some(epics_base_rs::runtime::time::FAR_FUTURE)
+        );
     }
 }
 
@@ -669,7 +672,10 @@ fn a_negative_infinite_dly_is_clamped_to_zero() {
 fn an_unrepresentable_dly_put_during_a_cooldown_re_arms_it_never_firing() {
     let mut rec = armed(1.0);
     let actions = put_dly(&mut rec, 1e300);
-    assert_eq!(cooldown(&actions), Some(std::time::Duration::MAX));
+    assert_eq!(
+        cooldown(&actions),
+        Some(epics_base_rs::runtime::time::FAR_FUTURE)
+    );
 }
 
 // ============================================================

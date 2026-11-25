@@ -281,9 +281,8 @@ mod tests {
     }
 
     /// A delay past `Duration`'s representable range must never fire
-    /// rather than unwind the task. `duration_from_secs` maps `+inf`,
-    /// `NaN` and `1e300` to `Duration::MAX` — a record `HIGH` field is
-    /// network-settable — and `Instant + Duration::MAX` panics, where
+    /// rather than unwind the task. A caller may pass `Duration::MAX` as
+    /// its own "no bound", and `Instant + Duration::MAX` panics, where
     /// `tokio::time::sleep` saturates to `far_future()`. The two
     /// backends disagreeing is the defect, so this pins the exec side to
     /// tokio's answer.

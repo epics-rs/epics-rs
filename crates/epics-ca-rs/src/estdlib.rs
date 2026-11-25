@@ -228,9 +228,10 @@ mod tests {
     fn duration_conversion_is_total() {
         assert_eq!(duration_from_secs(2.5), Duration::from_millis(2500));
         assert_eq!(duration_from_secs(0.0), Duration::ZERO);
-        assert_eq!(duration_from_secs(f64::INFINITY), Duration::MAX);
-        assert_eq!(duration_from_secs(f64::NAN), Duration::MAX);
-        assert_eq!(duration_from_secs(1e300), Duration::MAX);
+        let never = epics_base_rs::runtime::time::FAR_FUTURE;
+        assert_eq!(duration_from_secs(f64::INFINITY), never);
+        assert_eq!(duration_from_secs(f64::NAN), never);
+        assert_eq!(duration_from_secs(1e300), never);
         assert_eq!(duration_from_secs(-1.0), Duration::ZERO);
         assert_eq!(duration_from_secs(f64::NEG_INFINITY), Duration::ZERO);
     }

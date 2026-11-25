@@ -547,7 +547,7 @@ impl Record for HistogramRecord {
     /// PANICS on a non-finite or Duration-overflowing value, so it cannot be the
     /// converter here: a store of `1e308`/`1e39`/`inf` would abort the put the
     /// oracle expects to succeed. `runtime::time::duration_from_secs` — the
-    /// seam's one converter for a record field — maps them to `Duration::MAX`,
+    /// seam's one converter for a record field — maps them to `FAR_FUTURE`,
     /// C's never-firing deadline, so `None` here keeps its single meaning:
     /// C's `sdel > 0` test said there is no watchdog.
     fn watchdog_interval(&self) -> Option<std::time::Duration> {

@@ -90,7 +90,7 @@ fn conn_tmo_inf_parses_but_is_refused_like_c() {
 
 /// Finite and enormous passes C's `finite()` guard, so C obeys it: the
 /// watchdog simply never fires. No diagnostic, no panic, no overflow when
-/// the deadline is built from `Duration::MAX`.
+/// the deadline is built from the far-future cap.
 #[test]
 fn conn_tmo_finite_enormous_is_obeyed_silently() {
     let err = caget_stderr("EPICS_CA_CONN_TMO", "1e300");
@@ -100,7 +100,7 @@ fn conn_tmo_finite_enormous_is_obeyed_silently() {
     );
     assert!(
         !err.contains("overflow when adding duration to instant"),
-        "the deadline built from Duration::MAX must saturate:\n{err}"
+        "the deadline built from a huge CONN_TMO must not overflow:\n{err}"
     );
 }
 

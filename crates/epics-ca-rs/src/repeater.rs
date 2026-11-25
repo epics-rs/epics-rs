@@ -890,6 +890,8 @@ mod tests {
             !daemon.exists(),
             "a sibling {daemon:?} would take the daemon arm"
         );
+        // RTEMS-EXEC-MODEL-ALLOW(1): the module is tokio_backend-only
+        // (lib.rs), so it never builds on the exec backend.
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()

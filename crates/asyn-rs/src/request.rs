@@ -385,6 +385,13 @@ impl RequestCell {
         self.end_callback();
     }
 
+    /// A request [`Self::claim`] took whose port stopped before running it.
+    pub(crate) fn abandon(&self, e: AsynError) {
+        self.body.unrun(Unrun::Refused(e));
+        self.token.finish();
+        self.end_callback();
+    }
+
     /// C `processUser` run by `queueRequest` itself, on a port without
     /// `ASYN_CANBLOCK` ([`crate::port_handle::PortHandle::queue_request`]).
     pub(crate) fn run_inline(&self, port: &mut dyn PortCalls) {

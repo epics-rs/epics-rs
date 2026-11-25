@@ -3938,6 +3938,10 @@ mod tests {
         handle.set_can_block(true);
         handle.set_capabilities(true, 2, crate::port::port_get_address);
         let dev = |addr| AsynUser::new(0).with_addr(addr);
+        // A device connect is the port thread's, never the release's.
+        handle
+            .submit_blocking(RequestOp::ConnectAddr, dev(0))
+            .unwrap();
         handle
             .submit_blocking(RequestOp::SetEnable { yes: false }, dev(1))
             .unwrap();

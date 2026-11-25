@@ -84,11 +84,11 @@ pub trait ClientChannel: Send + Sync {
     -> Result<Option<PutCompletion>, String>;
 }
 
-/// One `evid`: dropping it is `ca_clear_subscription`. The drop waits for
-/// the subscription's callback if one is running, unless it drops inside
-/// that callback, and no callback runs after it. On a context's
-/// `CAC-callback` thread it waits for none: a callback whose delivery had
-/// begun may still run after it, and no later delivery reaches one.
+/// One `evid`: dropping it is `ca_clear_subscription`. Outside every
+/// subscription's callback the drop waits for this one's running callback,
+/// and none runs after it. Inside a callback, of any context, it waits for
+/// none: a callback whose delivery had begun may still run after it, and
+/// no later delivery reaches one.
 pub struct ClientSubscription {
     _held: Box<dyn Send>,
 }
@@ -447,9 +447,24 @@ thread_local! {
     /// How many runs of client contexts' puts this thread is in.
     static IN_RUNS: Cell<usize> = const { Cell::new(0) };
 
-    /// Whether this thread is a context's `CAC-callback`, which no drop of
-    /// a subscription on it waits on; only that thread's body sets it.
-    static CAC_CALLBACK: Cell<bool> = const { Cell::new(false) };
+    /// Whether this thread is inside a subscription's callback, where no
+    /// drop of a subscription waits.
+    static IN_CALLBACK: Cell<bool> = const { Cell::new(false) };
+}
+
+/// [`IN_CALLBACK`] across one callback, restored on every exit.
+struct InCallback(bool);
+
+impl InCallback {
+    fn enter() -> Self {
+        Self(IN_CALLBACK.replace(true))
+    }
+}
+
+impl Drop for InCallback {
+    fn drop(&mut self) {
+        IN_CALLBACK.set(self.0);
+    }
 }
 
 /// [`DELIVERING`] for one delivery pass, restored on every exit.
@@ -488,7 +503,6 @@ impl Events {
         self.network
             .thread
             .start("CAC-callback", below, StackSizeClass::Big, move || {
-                CAC_CALLBACK.set(true);
                 let _delivering = Delivering::enter(&events);
                 events.network.deliver();
             })
@@ -620,10 +634,10 @@ impl Drop for Run<'_> {
     }
 }
 
-/// A subscription's callback, which its drop cancels: `db_cancel_event`
-/// waits for one running except on its own thread, and none runs after.
-/// On `CAC-callback` the cancel waits for none, so a network callback's
-/// drop never waits on another thread's callback.
+/// A subscription's callback, which its drop cancels: the cancel waits for
+/// one running, and none runs after. Inside a callback it waits for none,
+/// so a waiter holds no callback's lock and nothing waits on it; C's
+/// `db_cancel_event` skips the wait only on its own event task.
 struct Callback {
     /// Held across each call, and taken by the cancel.
     running: parking_lot::ReentrantMutex<()>,
@@ -647,13 +661,14 @@ impl Callback {
     fn call(&self, snapshot: Snapshot) {
         let _running = self.running.lock();
         if !self.canceled() {
+            let _in = InCallback::enter();
             (self.call)(snapshot);
         }
     }
 
     /// Returns only once no call can pass its check.
     fn cancel(&self) {
-        let _running = (!CAC_CALLBACK.get()).then(|| self.running.lock());
+        let _running = (!IN_CALLBACK.get()).then(|| self.running.lock());
         self.canceled.store(true, Ordering::Release);
     }
 }

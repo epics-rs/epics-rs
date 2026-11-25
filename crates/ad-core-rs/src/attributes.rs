@@ -639,11 +639,17 @@ pub fn spawn_ca_monitor(
         else {
             return;
         };
-        // C skips an event whose status is not ECA_NORMAL, a disconnect among
-        // them, and keeps the subscription (PVAttribute.cpp:125-130).
         while let Some(update) = monitor.recv().await {
-            if let Ok(snapshot) = update {
-                cell.set(decode_pv_value(data_type, &snapshot.value));
+            match update {
+                Ok(snapshot) => cell.set(decode_pv_value(data_type, &snapshot.value)),
+                // C keeps the value from before the outage; no IOC vouches
+                // for it until the first value after the reconnect.
+                Err(epics_ca_rs::CaError::ServerError(epics_ca_rs::protocol::ECA_DISCONN)) => {
+                    cell.set(NDAttrValue::Undefined)
+                }
+                // C skips an event whose status is not ECA_NORMAL and keeps
+                // the subscription (PVAttribute.cpp:125-130).
+                Err(_) => {}
             }
         }
     })

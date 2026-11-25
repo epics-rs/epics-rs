@@ -41,14 +41,14 @@ fn attribute_value(drv: &NDArrayDriverBase, name: &str) -> NDAttrValue {
         .evaluate()
 }
 
-/// The attribute's value once it is no longer `old`. The budget is the
-/// workspace's `FACT_BUDGET`: the client's re-search after an outage alone
-/// takes about 10 s.
+/// The attribute's first value that is neither `old` nor the `Undefined` an
+/// outage leaves. The budget is the workspace's `FACT_BUDGET`: the client's
+/// re-search after an outage alone takes about 10 s.
 async fn value_other_than(drv: &NDArrayDriverBase, name: &str, old: &NDAttrValue) -> NDAttrValue {
     let deadline = Instant::now() + FACT_BUDGET;
     loop {
         let value = attribute_value(drv, name);
-        if value != *old {
+        if value != *old && value != NDAttrValue::Undefined {
             return value;
         }
         assert!(

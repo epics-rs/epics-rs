@@ -249,7 +249,12 @@ fn create_attr_var(
 /// `defined`'s type.
 fn append_attr(ds: &H5Dataset, defined: &NDAttrValue, value: &NDAttrValue) -> ADResult<()> {
     let i = value.as_i64().unwrap_or(0);
-    let f = value.as_f64().unwrap_or(0.0);
+    // A frame without a value is NaN in a float variable, where C writes a
+    // 0 byte (NDFileNetCDF.cpp:470-473).
+    let f = match value {
+        NDAttrValue::Undefined => f64::NAN,
+        value => value.as_f64().unwrap_or(0.0),
+    };
     match defined {
         NDAttrValue::Int8(_) => ds.append(&[i as i8]),
         NDAttrValue::UInt8(_) => ds.append(&[i as u8]),
@@ -1078,6 +1083,49 @@ mod tests {
                 .read_raw::<f64>()
                 .unwrap(),
             vec![0.5, 0.75, 0.75]
+        );
+        drop(file);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A record whose frame carries the attribute without a value is NaN in a
+    /// float variable and 0 in an integer one, which has no NaN.
+    #[test]
+    fn a_frame_without_a_value_is_nan_in_a_float_variable() {
+        let mk = |exposure: NDAttrValue, gain: NDAttrValue| {
+            let mut arr = make_u8(&[4], |_| 0);
+            for (name, value) in [("exposure", exposure), ("gain", gain)] {
+                arr.attributes.add(NDAttribute::new_static(
+                    name,
+                    "",
+                    NDAttrSource::Driver,
+                    value,
+                ));
+            }
+            arr
+        };
+        let path = write_frames(
+            "nc_attr_undefined_frame",
+            NDFileMode::Stream,
+            &[
+                mk(NDAttrValue::Float64(0.5), NDAttrValue::Int32(42)),
+                mk(NDAttrValue::Undefined, NDAttrValue::Undefined),
+                mk(NDAttrValue::Float64(0.75), NDAttrValue::Int32(43)),
+            ],
+        );
+
+        let file = H5File::open(&path).unwrap();
+        let exposure: Vec<f64> = file.dataset("Attr_exposure").unwrap().read_raw().unwrap();
+        assert_eq!(exposure.len(), 3);
+        assert_eq!(exposure[0], 0.5);
+        assert!(exposure[1].is_nan(), "record 1 is {}", exposure[1]);
+        assert_eq!(exposure[2], 0.75);
+        assert_eq!(
+            file.dataset("Attr_gain")
+                .unwrap()
+                .read_raw::<i32>()
+                .unwrap(),
+            vec![42, 0, 43]
         );
         drop(file);
         std::fs::remove_file(&path).ok();

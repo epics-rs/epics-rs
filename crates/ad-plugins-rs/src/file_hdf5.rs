@@ -518,6 +518,12 @@ impl AttributeDataset {
         }
         let es = self.element_size();
         let mut bytes = vec![0u8; es];
+        // A frame without a value is NaN in a float dataset, where C writes
+        // the 0 its `memset` leaves (NDFileHDF5AttributeDataset.cpp:149-151).
+        let float = match value {
+            NDAttrValue::Undefined => f64::NAN,
+            value => value.as_f64().unwrap_or(0.0),
+        };
         match self.data_type {
             NDAttrDataType::Int8 => bytes[0] = value.as_i64().unwrap_or(0) as i8 as u8,
             NDAttrDataType::UInt8 => bytes[0] = value.as_i64().unwrap_or(0) as u8,
@@ -539,12 +545,8 @@ impl AttributeDataset {
             NDAttrDataType::UInt64 => {
                 bytes.copy_from_slice(&(value.as_i64().unwrap_or(0) as u64).to_le_bytes())
             }
-            NDAttrDataType::Float32 => {
-                bytes.copy_from_slice(&(value.as_f64().unwrap_or(0.0) as f32).to_le_bytes())
-            }
-            NDAttrDataType::Float64 => {
-                bytes.copy_from_slice(&(value.as_f64().unwrap_or(0.0)).to_le_bytes())
-            }
+            NDAttrDataType::Float32 => bytes.copy_from_slice(&(float as f32).to_le_bytes()),
+            NDAttrDataType::Float64 => bytes.copy_from_slice(&float.to_le_bytes()),
             NDAttrDataType::String => {
                 let s = value.as_string();
                 let src = s.as_bytes();
@@ -9517,6 +9519,77 @@ mod tests {
                 v
             );
         }
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_frame_without_a_value_is_nan_in_a_float_attribute_dataset() {
+        assert_frame_without_a_value_is_nan_in_a_float_dataset(false);
+    }
+
+    #[test]
+    fn swmr_frame_without_a_value_is_nan_in_a_float_attribute_dataset() {
+        assert_frame_without_a_value_is_nan_in_a_float_dataset(true);
+    }
+
+    /// A frame that carries a defined attribute without a value is NaN in a
+    /// float dataset and 0 in an integer one, which has no NaN.
+    fn assert_frame_without_a_value_is_nan_in_a_float_dataset(swmr: bool) {
+        let path = temp_path("hdf5_attr_undefined_frame");
+        let mut writer = Hdf5Writer::new();
+        writer.set_swmr_mode(swmr);
+        writer.set_num_capture(0);
+
+        let mk = |f64v: NDAttrValue, f32v: NDAttrValue, i32v: NDAttrValue| {
+            let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
+            for (name, value) in [("f64", f64v), ("f32", f32v), ("i32", i32v)] {
+                arr.attributes.add(NDAttribute::new_static(
+                    name,
+                    "",
+                    NDAttrSource::Driver,
+                    value,
+                ));
+            }
+            arr
+        };
+        let defined = || {
+            mk(
+                NDAttrValue::Float64(1.5),
+                NDAttrValue::Float32(2.5),
+                NDAttrValue::Int32(7),
+            )
+        };
+
+        let a0 = defined();
+        writer
+            .open_file(&path, NDFileOpenMode::WRITE | NDFileOpenMode::MULTIPLE, &a0)
+            .unwrap();
+        writer.write_file(&Arc::new(a0)).unwrap();
+        writer
+            .write_file(&Arc::new(mk(
+                NDAttrValue::Undefined,
+                NDAttrValue::Undefined,
+                NDAttrValue::Undefined,
+            )))
+            .unwrap();
+        writer.write_file(&Arc::new(defined())).unwrap();
+        writer.close_file().unwrap();
+
+        let h5 = H5File::open(&path).unwrap();
+        let read = |name: &str| {
+            h5.dataset(&format!("entry/instrument/NDAttributes/{name}"))
+                .unwrap()
+        };
+        let f64s: Vec<f64> = read("f64").read_raw().unwrap();
+        assert_eq!(f64s.len(), 3);
+        assert_eq!((f64s[0], f64s[2]), (1.5, 1.5));
+        assert!(f64s[1].is_nan(), "f64 element 1 is {}", f64s[1]);
+        let f32s: Vec<f32> = read("f32").read_raw().unwrap();
+        assert_eq!(f32s.len(), 3);
+        assert_eq!((f32s[0], f32s[2]), (2.5, 2.5));
+        assert!(f32s[1].is_nan(), "f32 element 1 is {}", f32s[1]);
+        assert_eq!(read("i32").read_raw::<i32>().unwrap(), vec![7, 0, 7]);
 
         std::fs::remove_file(&path).ok();
     }

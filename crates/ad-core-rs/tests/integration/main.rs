@@ -8,6 +8,7 @@ mod common_plugins_c_plugin_set;
 mod common_plugins_config_menu;
 mod common_plugins_reads_only_c_macros;
 mod common_plugins_request_paths;
+mod epics_pv_attribute_disconnect;
 mod epics_pv_attribute_monitor_mask;
 mod epics_pv_attribute_native_types;
 mod epics_pv_attribute_wire_type;

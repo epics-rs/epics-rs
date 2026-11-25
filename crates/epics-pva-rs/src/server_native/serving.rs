@@ -944,6 +944,249 @@ mod tests {
         assert_nothing_listens(&TWO_INTERFACES, port);
     }
 
+    /// More connects to `port` than std's listen backlog of 128 holds.
+    #[cfg(target_os = "linux")]
+    fn overflow(port: u16) -> Vec<socket2::Socket> {
+        (0..300)
+            .map(|_| {
+                let s = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)
+                    .unwrap();
+                s.set_nonblocking(true).unwrap();
+                let _ = s.connect(&SocketAddr::from((Ipv4Addr::LOCALHOST, port)).into());
+                s
+            })
+            .collect()
+    }
+
+    /// A server none of whose listeners is being accepted on — bound and
+    /// dropped unserved, failed in its start, or already stopped — shuts
+    /// down at once while 300 clients overflow the listen backlog, where a
+    /// connect to its own listener would wait out every SYN retry.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_server_nobody_accepts_on_shuts_down_with_a_full_backlog() {
+        use fact_budget::FACT_BUDGET;
+        let within_budget = |what: &str, op: Box<dyn FnOnce() + Send>| {
+            let (done, ended) = std::sync::mpsc::channel();
+            thread::spawn(move || {
+                op();
+                let _ = done.send(());
+            });
+            ended
+                .recv_timeout(FACT_BUDGET)
+                .unwrap_or_else(|_| panic!("{what}: still shutting down after {FACT_BUDGET:?}"));
+        };
+        let config = || on_interfaces(&["127.0.0.1"]);
+
+        let bound = BoundPva::bind(test_source(), config()).expect("bind");
+        let _clients = overflow(bound.server().tcp_port());
+        within_budget("never served", Box::new(move || drop(bound)));
+
+        let bound = BoundPva::bind(test_source(), config()).expect("bind");
+        let port = bound.server().tcp_port();
+        within_budget(
+            "failed start",
+            Box::new(move || {
+                let mut clients = Vec::new();
+                let started = bound.serve_with(&harness_reactor(), &mut |name| {
+                    if name == "PVAS-beacon" {
+                        clients = overflow(port);
+                        return Err(io::ErrorKind::WouldBlock.into());
+                    }
+                    Ok(())
+                });
+                assert!(matches!(started, Err(ServeError::Thread("PVAS-beacon", _))));
+            }),
+        );
+
+        let serving = BoundPva::bind(test_source(), config())
+            .expect("bind")
+            .serve(&harness_reactor())
+            .expect("serve");
+        let handle = serving.report_handle();
+        serving.server().shutdown();
+        let deadline = Instant::now() + FACT_BUDGET;
+        while handle.report().tcp_alive {
+            assert!(
+                Instant::now() < deadline,
+                "the accept loop outlived shutdown"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        let _clients = overflow(serving.server().tcp_port());
+        within_budget("already stopped", Box::new(move || drop(serving)));
+    }
+
+    /// A serving server whose accept loop is busy — held on its refusal
+    /// line, as a slow console holds it — while 300 clients overflow the
+    /// listen backlog shuts down at once, and the loop, once freed, ends.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_busy_accept_loop_shuts_down_with_a_full_backlog() {
+        use fact_budget::FACT_BUDGET;
+        use std::sync::mpsc::{Receiver, SyncSender, channel, sync_channel};
+        use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+        /// Once armed, parks the next WARN line until released.
+        struct HoldOnWarn {
+            armed: Arc<AtomicBool>,
+            held: SyncSender<()>,
+            release: Mutex<Receiver<()>>,
+        }
+        impl<S: tracing::Subscriber> Layer<S> for HoldOnWarn {
+            fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
+                if *event.metadata().level() == tracing::Level::WARN
+                    && self.armed.swap(false, Ordering::SeqCst)
+                {
+                    let _ = self.held.send(());
+                    let _ = self.release.lock().unwrap().recv();
+                }
+            }
+        }
+
+        let config = PvaServerConfig {
+            max_connections: 1,
+            ..on_interfaces(&["127.0.0.1"])
+        };
+        let bound = BoundPva::bind(test_source(), config).expect("bind");
+        let server = bound.server().clone();
+        let port = server.tcp_port();
+        let armed = Arc::new(AtomicBool::new(false));
+        let (held_tx, held) = sync_channel(1);
+        let (release, release_rx) = channel();
+        let hold = HoldOnWarn {
+            armed: armed.clone(),
+            held: held_tx,
+            release: Mutex::new(release_rx),
+        };
+        let (ended_tx, ended) = channel();
+        let (srv, reactor) = (server.clone(), harness_reactor());
+        let accepting = thread::spawn(move || {
+            tracing::subscriber::with_default(tracing_subscriber::registry().with(hold), || {
+                srv.serve(&reactor, Box::new(|| true)).expect("serve")
+            });
+            let _ = ended_tx.send(());
+        });
+
+        let _occupant = std::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+        let deadline = Instant::now() + FACT_BUDGET;
+        while server.active_connections() == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the first client was never served"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        armed.store(true, Ordering::SeqCst);
+        let _refused = std::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+        held.recv_timeout(FACT_BUDGET)
+            .expect("the accept loop never refused the client past max_connections");
+        let _storm = overflow(port);
+
+        let (stopped_tx, stopped) = channel();
+        let stopping = server.clone();
+        thread::spawn(move || {
+            stopping.shutdown();
+            let _ = stopped_tx.send(());
+        });
+        stopped
+            .recv_timeout(FACT_BUDGET)
+            .unwrap_or_else(|_| panic!("still shutting down after {FACT_BUDGET:?}"));
+        release.send(()).unwrap();
+        ended
+            .recv_timeout(FACT_BUDGET)
+            .unwrap_or_else(|_| panic!("still accepting {FACT_BUDGET:?} after shutdown"));
+        accepting.join().unwrap();
+    }
+
+    /// A stop made with no descriptor left wakes the parked accept on
+    /// either driver, so the port is free to bind again once the process
+    /// has descriptors back; nothing dials after the stop.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stop_with_no_descriptor_left_frees_the_port_on_either_driver() {
+        use fact_budget::FACT_BUDGET;
+        use std::net::{TcpListener, TcpStream};
+        const TEST: &str = "server_native::serving::tests::\
+                            a_stop_with_no_descriptor_left_frees_the_port_on_either_driver";
+        const CHILD: &str = "EPICS_PVA_RS_TEST_CHILD";
+        // The descriptor limit is the process's, so this runs in one alone.
+        if std::env::var(CHILD).as_deref() != Ok(TEST) {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD, TEST)
+                .output()
+                .expect("re-exec the test binary");
+            assert!(
+                out.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        let set_limit = |limit: &libc::rlimit| {
+            // SAFETY: setrlimit reads one initialised rlimit.
+            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, limit) }, 0);
+        };
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit writes one rlimit we own.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        for kind in [DriverKind::Blocking, DriverKind::Reactor] {
+            let config = isolated_config();
+            let listeners = ServListeners::bind((Ipv4Addr::LOCALHOST, 0), &config).expect("bind");
+            let builtin = Arc::new(SharedSource::new());
+            let server = driver::from_listeners(kind, listeners, test_source(), builtin, config)
+                .expect("driver");
+            let port = server.tcp_port();
+            let (srv, reactor) = (server.clone(), harness_reactor());
+            let serving = thread::spawn(move || srv.serve(&reactor, Box::new(|| true)));
+            // A client served shows the accept loop running; it parks again.
+            let _client = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+            let deadline = Instant::now() + FACT_BUDGET;
+            while server.active_connections() == 0 {
+                assert!(
+                    Instant::now() < deadline,
+                    "{kind:?}: the client was never served"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+
+            set_limit(&libc::rlimit {
+                rlim_cur: 64,
+                ..limit
+            });
+            let hogs: Vec<_> =
+                std::iter::from_fn(|| std::fs::File::open("/dev/null").ok()).collect();
+            let dial = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).map(drop);
+            assert_eq!(
+                dial.map_err(|e| e.raw_os_error()),
+                Err(Some(libc::EMFILE)),
+                "{kind:?}: descriptors exhausted"
+            );
+            server.shutdown();
+            drop(hogs);
+            set_limit(&limit);
+            drop(server);
+
+            let deadline = Instant::now() + FACT_BUDGET;
+            while let Err(e) = TcpListener::bind((Ipv4Addr::LOCALHOST, port)) {
+                assert!(
+                    Instant::now() < deadline,
+                    "{kind:?}: port {port} still held {FACT_BUDGET:?} after shutdown: {e}"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+            serving.join().unwrap().expect("serve");
+        }
+    }
+
     /// pvxs makes every serving thread in the `Server` constructor and turns
     /// its listeners, search answers and beacons on in turn in
     /// `Server::Pvt::start`, only logging an error between them

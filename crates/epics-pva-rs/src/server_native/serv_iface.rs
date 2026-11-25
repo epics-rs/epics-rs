@@ -3,9 +3,11 @@
 //! std sockets so every driver — tokio, blocking, reactor — binds the same set.
 
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, ToSocketAddrs};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU8, Ordering};
 
+use epics_libcom_rs::runtime::socket::AcceptWaker;
 use tracing::{error, warn};
 
 use super::config::PvaServerConfig;
@@ -203,11 +205,23 @@ fn bind_serv_iface(addr: SocketAddr, mut fallback: bool) -> PvaResult<(TcpListen
     }
 }
 
+/// [`ServListeners::state`]: no accept loop yet, accept loops running, and
+/// stopped for good.
+const IDLE: u8 = 0;
+const SERVING: u8 = 1;
+const STOPPED: u8 = 2;
+
 /// A driver's bound listeners, one accept loop each, as rsrv runs one
 /// `CAS-TCP` per interface.
 pub(crate) struct ServListeners {
     listeners: Vec<TcpListener>,
+    /// One per listener, opened with it, so [`Self::stop`] needs no
+    /// descriptor to wake a parked accept.
+    wakers: Vec<AcceptWaker>,
     port: u16,
+    /// [`IDLE`], [`SERVING`] or [`STOPPED`]; only [`Self::stop`] out of
+    /// `SERVING` dials a listener.
+    state: AtomicU8,
     /// [`Self::serve`] is refused the further accept thread at this index.
     #[cfg(test)]
     pub(crate) refuse_thread: Option<usize>,
@@ -232,9 +246,15 @@ impl ServListeners {
             PvaError::Io(e) => e,
             e => io::Error::other(e),
         })?;
+        let wakers = listeners
+            .iter()
+            .map(|l| AcceptWaker::new(l.local_addr()?))
+            .collect::<io::Result<_>>()?;
         Ok(Self {
             listeners,
+            wakers,
             port,
+            state: AtomicU8::new(IDLE),
             #[cfg(test)]
             refuse_thread: None,
         })
@@ -253,9 +273,10 @@ impl ServListeners {
     /// Run `accept` on every listener until each returns: the first on the
     /// calling thread, each further one on a thread of its own. `started`
     /// runs once every thread exists, and the listeners accept only if it
-    /// returns `true`. A thread that cannot be created is the `Err`, and then
-    /// no listener has accepted: pvxs's `Server` throws on a listener it
-    /// cannot set up (`serverconn.cpp:426-449`).
+    /// returns `true` and [`Self::stop`] has not run. A thread that cannot be
+    /// created is the `Err`, and then no listener has accepted: pvxs's
+    /// `Server` throws on a listener it cannot set up
+    /// (`serverconn.cpp:426-449`). `accept` returns once [`Self::stopped`].
     pub(crate) fn serve(
         &self,
         accept: impl Fn(&TcpListener) + Sync,
@@ -288,7 +309,13 @@ impl ServListeners {
                     return Err(e);
                 }
             }
-            let run = started();
+            let run = started()
+                && self
+                    .state
+                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |s| {
+                        (s != STOPPED).then_some(SERVING)
+                    })
+                    .is_ok();
             let _ = all_created.set(run);
             if run {
                 accept(first);
@@ -308,13 +335,22 @@ impl ServListeners {
         (self.refuse_thread == Some(thread)).then(|| io::ErrorKind::WouldBlock.into())
     }
 
-    /// Wake every accept parked in [`Self::serve`] by dialling it.
-    pub(crate) fn wake(&self) {
-        for listener in &self.listeners {
-            if let Ok(addr) = listener.local_addr() {
-                let _ = TcpStream::connect(addr);
+    /// End accepting for good, waking any accept parked in [`Self::serve`]
+    /// with its listener's waker. Only a served listener is dialled, and the
+    /// dial never waits: one that meets a full backlog finds that listener's
+    /// accept loop not parked, and it sees [`Self::stopped`] at its next
+    /// accept.
+    pub(crate) fn stop(&self) {
+        if self.state.swap(STOPPED, Ordering::SeqCst) == SERVING {
+            for waker in &self.wakers {
+                let _ = waker.wake();
             }
         }
+    }
+
+    /// Whether [`Self::stop`] has run: an accept loop's exit condition.
+    pub(crate) fn stopped(&self) -> bool {
+        self.state.load(Ordering::SeqCst) == STOPPED
     }
 }
 
@@ -412,6 +448,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn the_default_listener_takes_v4_and_v6_peers() {
+        use std::net::TcpStream;
+
         if !can_ipv6() {
             return;
         }

@@ -938,8 +938,8 @@ impl BlockingPvaServer {
                     backoff.accepted();
                     // `shutdown` wakes this parked `accept` by dialling our own
                     // socket; that throwaway connection arrives here and is
-                    // dropped with the flag already set.
-                    if self.shutdown.load(Ordering::Acquire) {
+                    // dropped with the listeners already stopped.
+                    if self.listeners.stopped() {
                         break;
                     }
                     let peer = match stream.peer_addr() {
@@ -954,7 +954,7 @@ impl BlockingPvaServer {
                     }
                 }
                 Err(e) => {
-                    if self.shutdown.load(Ordering::Acquire) {
+                    if self.listeners.stopped() {
                         break;
                     }
                     warn!(error = %e, "blocking PVA server: accept failed");
@@ -965,7 +965,7 @@ impl BlockingPvaServer {
                     thread::sleep(backoff.failed());
                     // `shutdown()` may have been asked for while we slept, and
                     // its self-dial cannot wake an `accept()` that is failing.
-                    if self.shutdown.load(Ordering::Acquire) {
+                    if self.listeners.stopped() {
                         break;
                     }
                 }
@@ -1097,22 +1097,22 @@ impl BlockingPvaServer {
     /// already running. Idempotent.
     ///
     /// Two operations because there are two things to stop, and neither
-    /// implies the other: the flag plus a self-connect returns the parked
+    /// implies the other: stopping the listeners returns the parked
     /// `accept`, and [`ConnRegistry::stop`] shuts every live connection's
     /// socket. Without the second, a peer that never speaks and never hangs up
     /// would hold three threads until the process exits — the semantic CA's
     /// blocking server still has, and the reason the registry exists.
     ///
     /// [`serve_udp_search`](Self::serve_udp_search) needs no third operation:
-    /// nothing parks it for longer than its 200 ms read timeout, so the flag
-    /// alone retires it within one tick.
+    /// nothing parks it for longer than its 200 ms read timeout, so the
+    /// `shutdown` flag alone retires it within one tick.
     ///
     /// Returns once the wakes are issued; each connection retires on its own
     /// pool worker. Nobody joins those connections, so a caller that must
     /// observe them gone watches [`active_connections`](Self::active_connections).
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
-        self.listeners.wake();
+        self.listeners.stop();
         self.connections.stop();
     }
 }
@@ -1127,8 +1127,7 @@ impl Drop for BlockingPvaServer {
     /// never ends. [`shutdown`](Self::shutdown) shuts every live connection's
     /// socket, which unwinds its body down the existing EOF path; running it
     /// here — before the `conn_pool` field drops — is what makes the pool's
-    /// join terminate. Idempotent, so a caller that already called `shutdown`
-    /// pays only a redundant self-dial.
+    /// join terminate. Idempotent, and a repeat dials nothing.
     fn drop(&mut self) {
         self.shutdown();
     }

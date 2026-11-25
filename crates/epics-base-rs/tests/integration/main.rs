@@ -666,6 +666,7 @@ mod lcnt_counts_a_refused_cascade_entry;
 mod link_backed_metadata_follows_the_link;
 mod link_backed_metadata_is_read_live;
 mod link_chain_has_no_depth_bound;
+mod link_check_runs_on_the_record_band;
 mod link_constant_is_epics_parse_double;
 mod link_constant_test_precedes_modifier_split;
 mod link_filter_target_stays_local;

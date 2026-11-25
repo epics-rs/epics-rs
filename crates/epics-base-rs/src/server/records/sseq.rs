@@ -1,7 +1,7 @@
 use super::link_status::{
-    DBF_NOACCESS, DBF_UNKNOWN, LINK_CON as LNKV_CON, LINK_EXT_NC as LNKV_EXT_NC, LINK_RECHECK,
-    LINK_STATUS_CHOICES as SSEQ_LNKV_CHOICES, LinkCheckSpec, LinkCheckState, LinkCheckTail,
-    LinkRole, LinkRule, LinkStatusGen, classify_link,
+    CheckBand, DBF_NOACCESS, DBF_UNKNOWN, LINK_CON as LNKV_CON, LINK_EXT_NC as LNKV_EXT_NC,
+    LINK_RECHECK, LINK_STATUS_CHOICES as SSEQ_LNKV_CHOICES, LinkCheckSpec, LinkCheckState,
+    LinkCheckTail, LinkRole, LinkRule, LinkStatusGen, classify_link,
 };
 use crate::error::{CaError, CaResult};
 use crate::server::database::{AsyncDbHandle, PostRule};
@@ -157,6 +157,7 @@ static SSEQ_LINK_CHECK: LinkCheckSpec = LinkCheckSpec {
     mask: crate::server::recgbl::EventMask::VALUE,
     repost_local: true,
     in_cycle: false,
+    band: CheckBand::Prio,
 };
 
 /// Index of step `step`'s DOL (`lnk` false) or LNK in [`SSEQ_LINK_CHECK`].

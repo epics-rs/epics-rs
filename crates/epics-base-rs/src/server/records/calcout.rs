@@ -3,8 +3,8 @@ use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
 use super::calc_compile;
 use super::link_status::{
-    LINK_CON, LINK_STATUS_CHOICES, LinkCheck, LinkCheckSpec, LinkCheckState, LinkRole, LinkRule,
-    LinkStatusGen, LinkStatusPosts, post_link_status,
+    CheckBand, LINK_CON, LINK_STATUS_CHOICES, LinkCheck, LinkCheckSpec, LinkCheckState, LinkRole,
+    LinkRule, LinkStatusGen, LinkStatusPosts, post_link_status,
 };
 use crate::error::{CaError, CaResult};
 use crate::server::database::AsyncDbHandle;
@@ -66,6 +66,7 @@ static CALCOUT_LINK_CHECK: LinkCheckSpec = LinkCheckSpec {
     mask: crate::server::recgbl::EventMask::VALUE,
     repost_local: false,
     in_cycle: true,
+    band: CheckBand::Low,
 };
 
 /// Where CLCV's post sits in calcout's put-post table, after every link's.

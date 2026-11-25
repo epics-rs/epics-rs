@@ -8,8 +8,8 @@ use epics_base_rs::server::record::{
     parse_output_link_v2,
 };
 use epics_base_rs::server::records::link_status::{
-    LINK_EXT_NC, LinkCheck, LinkCheckSpec, LinkCheckState, LinkRole, LinkRule, LinkStatusGen,
-    LinkStatusPosts, link_is_external, post_link_status,
+    CheckBand, LINK_EXT_NC, LinkCheck, LinkCheckSpec, LinkCheckState, LinkRole, LinkRule,
+    LinkStatusGen, LinkStatusPosts, link_is_external, post_link_status,
 };
 use epics_base_rs::types::{EpicsValue, PvString};
 
@@ -224,6 +224,7 @@ static THROTTLE_LINK_CHECK: LinkCheckSpec = LinkCheckSpec {
     mask: EventMask::from_bits(EventMask::VALUE.bits() | EventMask::LOG.bits()),
     repost_local: false,
     in_cycle: true,
+    band: CheckBand::Prio,
 };
 
 impl ThrottleRecord {

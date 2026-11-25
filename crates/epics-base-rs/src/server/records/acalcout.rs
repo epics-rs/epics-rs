@@ -106,8 +106,8 @@ use crate::calc::{ArrayInputs, Rpcl, acalc_eval};
 // `LINK_CON` (= 3, the `Constant` link-status index) is the value C
 // `init_record` writes for an unconfigured link; shared with `calcout`.
 use super::link_status::{
-    LINK_CON, LINK_EXT_OK, LINK_LOC, LinkCheck, LinkCheckSpec, LinkCheckState, LinkRole, LinkRule,
-    LinkStatusGen, LinkStatusPosts, post_link_status,
+    CheckBand, LINK_CON, LINK_EXT_OK, LINK_LOC, LinkCheck, LinkCheckSpec, LinkCheckState, LinkRole,
+    LinkRule, LinkStatusGen, LinkStatusPosts, post_link_status,
 };
 use crate::server::database::AsyncDbHandle;
 use crate::server::recgbl::PutReport;
@@ -228,6 +228,7 @@ static ACALCOUT_LINK_CHECK: LinkCheckSpec = LinkCheckSpec {
     mask: crate::server::recgbl::EventMask::VALUE,
     repost_local: false,
     in_cycle: true,
+    band: CheckBand::Low,
 };
 const PA_NAMES: [&str; 12] = [
     "PA", "PB", "PC", "PD", "PE", "PF", "PG", "PH", "PI", "PJ", "PK", "PL",

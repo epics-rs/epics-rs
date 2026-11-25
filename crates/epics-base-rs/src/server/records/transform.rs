@@ -10,8 +10,8 @@ use crate::calc::{Rpcl, StringInputs, scalc_perform};
 
 use super::calc_compile;
 use super::link_status::{
-    LINK_CON, LINK_STATUS_CHOICES, LinkCheck, LinkCheckSpec, LinkCheckState, LinkRole, LinkRule,
-    LinkStatusGen, LinkStatusPosts, post_link_status,
+    CheckBand, LINK_CON, LINK_STATUS_CHOICES, LinkCheck, LinkCheckSpec, LinkCheckState, LinkRole,
+    LinkRule, LinkStatusGen, LinkStatusPosts, post_link_status,
 };
 use crate::server::database::AsyncDbHandle;
 use crate::server::recgbl::PutReport;
@@ -63,6 +63,7 @@ static TRANSFORM_LINK_CHECK: LinkCheckSpec = LinkCheckSpec {
     ),
     repost_local: false,
     in_cycle: true,
+    band: CheckBand::Prio,
 };
 
 /// `transformRecord.c:208` `POSTFIX_SIZE`, `SCALC_INFIX_TO_POSTFIX_SIZE(120)`.

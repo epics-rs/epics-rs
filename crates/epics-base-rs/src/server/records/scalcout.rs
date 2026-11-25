@@ -8,8 +8,8 @@ use crate::server::record::{
 use crate::types::{DbfCode, EpicsValue, PvString};
 
 use super::link_status::{
-    LINK_CON, LINK_STATUS_CHOICES, LinkCheck, LinkCheckSpec, LinkCheckState, LinkRole, LinkRule,
-    LinkStatusGen, LinkStatusPosts, post_link_status,
+    CheckBand, LINK_CON, LINK_STATUS_CHOICES, LinkCheck, LinkCheckSpec, LinkCheckState, LinkRole,
+    LinkRule, LinkStatusGen, LinkStatusPosts, post_link_status,
 };
 use crate::calc::StringInputs;
 use crate::calc::engine::value::{SCALC_STRING_SIZE, ScalcString};
@@ -717,6 +717,7 @@ static SCALCOUT_LINK_CHECK: LinkCheckSpec = LinkCheckSpec {
     mask: crate::server::recgbl::EventMask::VALUE,
     repost_local: false,
     in_cycle: true,
+    band: CheckBand::Low,
 };
 
 /// INAV..INLV — numeric-input connection-status field names (channel A..L).

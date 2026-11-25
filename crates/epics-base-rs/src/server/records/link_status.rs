@@ -331,6 +331,34 @@ pub struct LinkCheckSpec {
     /// it takes `CycleHooks::LINK_CHECK`; sseq's runs it only from its
     /// callback.
     pub in_cycle: bool,
+    /// The band `checkLinksCallback` is requested on.
+    pub band: CheckBand,
+}
+
+/// The `callbackSetPriority` a type's `init_record` gives `checkLinksCallback`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckBand {
+    /// `callbackSetPriority(0, ...)`: `calcoutRecord.c:209`,
+    /// `sCalcoutRecord.c:307`, `aCalcoutRecord.c:264`.
+    Low,
+    /// `callbackSetPriority(prec->prio, ...)`: `throttleRecord.c:214`,
+    /// `sseqRecord.c:182`, `transformRecord.c:494`. C reads PRIO once at
+    /// `init_record`; each request here reads it then.
+    Prio,
+}
+
+impl CheckBand {
+    /// The band a request made now goes on, for a record whose `PRIO` is
+    /// `band`.
+    pub(crate) fn priority(
+        self,
+        band: &crate::server::database::RecordBand,
+    ) -> crate::runtime::task::CallbackPriority {
+        match self {
+            Self::Low => crate::runtime::task::CallbackPriority::Low,
+            Self::Prio => band.priority(),
+        }
+    }
 }
 
 /// C's `caLinkStat != NO_CA_LINKS` and `cbScheduled`.

@@ -9,8 +9,8 @@ plus `pcre_version`.
 
 It is the C oracle for the PCRE port in
 [`epics-stream-rs`](../stream-rs). The tests in `stream-rs/tests/pcre/` and
-`stream-rs/tests/pcre_internal.rs` hold `stream_rs::pcre` to this library:
-the same compiled bytecode or error, the same `pcre_exec` result and
+`stream-rs/tests/integration/pcre_internal.rs` hold `stream_rs::pcre` to this
+library: the same compiled bytecode or error, the same `pcre_exec` result and
 ovector, the same `pcre_fullinfo` answers and tables, over PCRE's own
 testinput corpus.
 

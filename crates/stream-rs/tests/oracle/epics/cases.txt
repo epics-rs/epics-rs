@@ -1,4 +1,5 @@
-# StreamEpics cases for run-epics.sh and tests/epics.rs, tab separated:
+# StreamEpics cases for run-epics.sh and tests/integration/epics.rs, tab
+# separated:
 # case  record  link  VAL  device-table  options
 # The device table is request=>reply pairs (Python escapes), '-' for no
 # device listening; pairs are separated by ';;'.

@@ -1,4 +1,4 @@
-# Runtime cases for run-rt.sh and tests/runtime.rs, tab separated:
+# Runtime cases for run-rt.sh and tests/integration/runtime.rs, tab separated:
 # case  record  VAL  device-table  options
 # The device table is request=>reply pairs (Python escapes), '-' for no
 # device listening; pairs are separated by ';;'. Options: '-' or a comma list the rs bus mock reads.

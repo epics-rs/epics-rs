@@ -7,8 +7,8 @@ set -euo pipefail
 : "${STREAM_TOP:?set STREAM_TOP to a built StreamDevice}"
 : "${EPICS_BASE:?set EPICS_BASE}"
 ARCH=${EPICS_HOST_ARCH:-linux-x86_64}
-# TimestampConverter prints and scans local time; tests/timestamp_converter.rs
-# sets the same zone.
+# TimestampConverter prints and scans local time;
+# tests/integration/timestamp_converter.rs sets the same zone.
 export TZ=CET-1CEST,M3.5.0,M10.5.0/3
 # and a scan takes the fields its format leaves out from "today" (oracle.cc)
 export ORACLE_NOW=1700000000

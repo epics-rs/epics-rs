@@ -178,20 +178,32 @@ pub(crate) fn call_back(
     }
 }
 
-/// C `callbackRequestDelayed` on one of the record's callbacks: through its
-/// database's gate once bound, so a request made after that database's
-/// `scanStop` never runs. A record bound to no database has no scan to stop.
+/// C `callbackRequestDelayed` on one of the record's callbacks: its expiry's
+/// `callbackRequest` through the gate of the database bound by then, so none
+/// made after that database's `scanStop` runs. A record bound to no database
+/// has no scan to stop.
 pub(crate) fn request_callback_after(
     state: &SharedDeviceState,
     priority: epics_base_rs::runtime::task::CallbackPriority,
     delay: Duration,
     task: impl std::future::Future<Output = ()> + Send + 'static,
 ) {
-    match state.lock().ok().and_then(|ds| ds.callbacks.db.clone()) {
+    let bound =
+        |state: &SharedDeviceState| state.lock().ok().and_then(|ds| ds.callbacks.db.clone());
+    match bound(state) {
         Some(db) => db.0.spawn_callback_after(priority, delay, task),
-        None => drop(epics_base_rs::runtime::task::spawn_background_after(
-            priority, delay, task,
-        )),
+        None => {
+            let state = state.clone();
+            let expiry = async move {
+                match bound(&state) {
+                    Some(db) => db.0.spawn_callback(priority, task),
+                    None => task.await,
+                }
+            };
+            drop(epics_base_rs::runtime::task::spawn_background_after(
+                priority, delay, expiry,
+            ));
+        }
     }
 }
 

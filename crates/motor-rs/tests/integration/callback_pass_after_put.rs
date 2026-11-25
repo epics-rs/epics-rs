@@ -59,6 +59,17 @@ impl Rig {
     /// [`Self::new`] with a settle delay of `dly`, and with a post between
     /// the startup pass and `finishDevSup` when `post_before_init`.
     async fn build(user: TraceUser, rtry: i16, dly: f64, post_before_init: bool) -> Self {
+        Self::assemble(user, rtry, dly, post_before_init, true).await
+    }
+
+    /// [`Self::build`], its callbacks bound to the database only if `bound`.
+    async fn assemble(
+        user: TraceUser,
+        rtry: i16,
+        dly: f64,
+        post_before_init: bool,
+        bound: bool,
+    ) -> Self {
         let trace = Arc::new(MotorTrace::with_user(user));
         let state = motor_rs::device_state::new_shared_state();
         // As MotorAxis::attach binds a model-1 record.
@@ -96,7 +107,9 @@ impl Rig {
         );
         let db = Arc::new(PvDatabase::new());
         dev.set_record_info("M1", ScanType::Passive);
-        dev.bind_database(db.async_handle());
+        if bound {
+            dev.bind_database(db.async_handle());
+        }
         dev.bind_dev_sup_gate(db.scan_control().dev_sup_gate());
         dev.init(&mut rec as &mut dyn Record).unwrap();
         let delay_pulse = dev.io_intr_receiver().unwrap();
@@ -410,6 +423,52 @@ async fn the_settle_delay_expires_while_the_ioc_runs() {
 async fn a_settle_delay_expiring_after_shutdown_never_runs() {
     assert_eq!(
         the_settle_delay_expiry(true).await,
+        (false, EpicsValue::UShort(0x420))
+    );
+}
+
+/// [`the_settle_delay_expiry`] for a delay requested before the record's
+/// callbacks are bound to its database, then bound: the expiry's
+/// `callbackRequest` is judged against that database as any other's.
+async fn the_settle_delay_requested_before_binding(stop: bool) -> (bool, EpicsValue) {
+    let mut rig = Rig::assemble(controller(), 10, 0.3, false, false).await;
+    rig.put_val(10.0).await;
+    let mv = rig.commands().into_iter().find(|c| c.is_move()).unwrap();
+    rig.post(at(10000.0));
+    rig.axis.move_done(rig.record, &mv);
+    rig.pass().await;
+    assert_eq!(rig.field("MIP"), EpicsValue::UShort(0x420));
+    rig.state
+        .lock()
+        .unwrap()
+        .bind_database(rig.db.async_handle());
+    let pulsed = if stop {
+        rig.db.scan_control().stop();
+        // absence-window: an expiry refused after the stop sends no pulse.
+        tokio::time::timeout(Duration::from_millis(600), rig.delay_pulse.recv())
+            .await
+            .is_ok()
+    } else {
+        tokio::time::timeout(fact_budget::FACT_BUDGET, rig.delay_pulse.recv())
+            .await
+            .is_ok()
+    };
+    rig.pass().await;
+    (pulsed, rig.field("MIP"))
+}
+
+#[tokio::test]
+async fn a_settle_delay_requested_before_binding_expires_while_the_ioc_runs() {
+    assert_eq!(
+        the_settle_delay_requested_before_binding(false).await,
+        (true, EpicsValue::UShort(0x820))
+    );
+}
+
+#[tokio::test]
+async fn a_settle_delay_requested_before_binding_never_runs_after_shutdown() {
+    assert_eq!(
+        the_settle_delay_requested_before_binding(true).await,
         (false, EpicsValue::UShort(0x420))
     );
 }

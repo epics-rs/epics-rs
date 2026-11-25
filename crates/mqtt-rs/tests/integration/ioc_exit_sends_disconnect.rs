@@ -37,7 +37,7 @@ const SCRIPT: &str = "MQ4_SCRIPT";
 
 /// Must match the `#[test]` function's name — it is what the child is told to
 /// run with `--exact`.
-const TEST_NAME: &str = "an_ioc_exit_puts_a_disconnect_on_the_wire";
+const TEST_NAME: &str = "ioc_exit_sends_disconnect::an_ioc_exit_puts_a_disconnect_on_the_wire";
 
 /// MQTT control packet types (v5 §2.1.2), the two this test names.
 const CONNECT: u8 = 1;

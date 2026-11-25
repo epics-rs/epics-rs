@@ -10,7 +10,7 @@ const SCRIPT: &str = "MQ5_SCRIPT";
 #[test]
 fn a_connected_pv_configure_prints_only_what_dbl_lists() {
     let out = run_ioc(
-        "a_connected_pv_configure_prints_only_what_dbl_lists",
+        "configure_prints_nothing::a_connected_pv_configure_prints_only_what_dbl_lists",
         "mqttDriverConfigure(\"MQ5\", \"tcp://127.0.0.1:1\", \"mq5-client\", 0, \"MQ5:CONNECTED\")\ndbl\n",
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -31,7 +31,7 @@ fn a_connected_pv_configure_prints_only_what_dbl_lists() {
 #[test]
 fn a_refused_connected_pv_name_is_reported_once() {
     let out = run_ioc(
-        "a_refused_connected_pv_name_is_reported_once",
+        "configure_prints_nothing::a_refused_connected_pv_name_is_reported_once",
         "mqttDriverConfigure(\"MQ6\", \"tcp://127.0.0.1:1\", \"mq6-client\", 0, \"MQ6 CONNECTED\")\n",
     );
     let stderr = String::from_utf8_lossy(&out.stderr);

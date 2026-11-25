@@ -1380,7 +1380,7 @@ mod tests {
         // marker and returns 0 (caput.c:239) → caput exits 0.
         assert!(matches!(
             classify_readback(
-                Err(CaError::ServerError(0x178)), // ECA_NORDACCESS
+                Err(CaError::ServerError(epics_ca_rs::protocol::ECA_NORDACCESS)),
                 DbFieldType::Double,
                 false,
                 1,

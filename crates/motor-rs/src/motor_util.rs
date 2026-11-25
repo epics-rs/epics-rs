@@ -124,8 +124,7 @@ impl Ca {
     ) -> Option<ClientSubscription> {
         let tx = self.tx.clone();
         let callback = Box::new(move |s| {
-            // The wait for room holds the delivering thread; a reactor
-            // worker that may not block drops the value.
+            // The wait for room holds the context's delivering thread.
             if let Err(mpsc::error::TrySendError::Full(msg)) = tx.try_send(f(s)) {
                 let _ = block_on_sync(tx.send(msg));
             }

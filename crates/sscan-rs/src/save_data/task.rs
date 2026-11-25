@@ -351,8 +351,8 @@ impl Ca {
         let tx = self.tx.clone();
         let callback = Box::new(move |s: Snapshot| match f(s) {
             Some((msg, true)) => {
-                // The wait for room holds the delivering thread, as C's
-                // does; a reactor worker that may not block drops it.
+                // The wait for room holds the context's delivering thread,
+                // as C's does.
                 if let Err(mpsc::error::TrySendError::Full(msg)) = tx.try_send(msg) {
                     let _ = block_on_sync(tx.send(msg));
                 }

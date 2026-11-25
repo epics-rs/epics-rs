@@ -67,7 +67,8 @@ pub trait ClientChannel: Send + Sync {
 
     /// `ca_add_masked_array_event` of `count` elements of `dbr_type`: each
     /// value reaches `callback` until the subscription drops, one callback
-    /// at a time per context.
+    /// at a time with the context's others of the channel's kind, in-process
+    /// or network; neither kind waits on the other.
     async fn subscribe(
         &self,
         dbr_type: u16,
@@ -101,9 +102,14 @@ impl ClientSubscription {
 /// The network context's half of [`CaClientContext::create_channel`].
 #[async_trait::async_trait]
 pub trait CaClientService: Send + Sync {
-    /// `ca_create_channel` of a name this database does not serve; `None`
-    /// when the client cannot start.
-    async fn create_channel(&self, name: &str) -> Option<Arc<dyn ClientChannel>>;
+    /// `ca_create_channel` of a name this database does not serve, for the
+    /// context whose event context is `events`; `None` when the client
+    /// cannot start.
+    async fn create_channel(
+        &self,
+        name: &str,
+        events: &InProcessEvents,
+    ) -> Option<Arc<dyn ClientChannel>>;
 }
 
 /// libca's context with `dbContext` installed as its service. Its clones
@@ -156,7 +162,7 @@ impl CaClientContext {
             }));
         }
         let service = db.inner.ca_links.client_service()?;
-        service.create_channel(name).await
+        service.create_channel(name, &self.events).await
     }
 
     /// `dbContext::createChannel`'s `dbChannel_create`, on the calling
@@ -177,7 +183,7 @@ impl CaClientContext {
     /// [`Self::create_in_process`] did not find.
     pub async fn create_network(&self, name: &str) -> Option<Arc<dyn ClientChannel>> {
         let service = self.db()?.inner.ca_links.client_service()?;
-        service.create_channel(name).await
+        service.create_channel(name, &self.events).await
     }
 
     /// Run `future` on the reactor the database's CA links run on. `None`
@@ -298,18 +304,45 @@ impl InProcessChannel {
 /// lowest priority above its own thread's. Entries reach their callbacks
 /// one at a time in post order, on that thread or in [`Self::deliver`],
 /// each after the runs of the context's puts on its record going when it
-/// is taken (`Running`). The thread returns when the last clone
-/// drops (`db_close_events`).
+/// is taken (`Running`). The context's network subscriptions
+/// ([`Self::subscribe_network`]) are delivered apart, on their own thread.
+/// The threads return when the last clone drops (`db_close_events`).
 #[derive(Clone, Default)]
 pub struct InProcessEvents(Arc<EventsOwner>);
 
 impl InProcessEvents {
-    /// What is queued now, delivered on the calling thread in its turn
-    /// with what `CAC-event` delivers. The caller holds no lock a callback
-    /// takes. Inside one of this context's callbacks it does nothing, as
-    /// C's callbacks run on the one thread that is already delivering.
+    /// The in-process entries queued now, delivered on the calling thread
+    /// in their turn with what `CAC-event` delivers. The caller holds no
+    /// lock a callback takes. Inside one of this context's callbacks it does
+    /// nothing: an in-process callback's thread is already delivering, as
+    /// C's `CAC-event` is, and a network callback's never takes an entry.
     pub fn deliver(&self) {
         self.0.0.deliver();
+    }
+
+    /// A network subscription of this context: each value `values` yields
+    /// (`None` once it ends) reaches `callback` on the context's
+    /// `CAC-callback` thread, one at a time with its other network
+    /// callbacks, as libca's receive thread calls them under the context's
+    /// `cbMutex` (`tcpiiu.cpp:498-519`). The thread starts at the highest
+    /// priority below the first network subscriber's, as the receive thread
+    /// is below the context creator's (`tcpiiu.cpp:676-678`). A callback
+    /// that waits holds up the context's network delivery only.
+    pub fn subscribe_network(
+        &self,
+        values: Box<dyn FnMut(&mut Context<'_>) -> Poll<Option<Snapshot>> + Send>,
+        callback: Box<dyn Fn(Snapshot) + Send + Sync>,
+    ) -> Result<ClientSubscription, String> {
+        let events = &self.0.0;
+        events.start_network()?;
+        let route = Arc::new(NetworkRoute {
+            values: parking_lot::Mutex::new(Some(values)),
+            callback,
+        });
+        events.network.routes.lock().push(Arc::downgrade(&route));
+        // Its first poll is what registers the waker its values wake.
+        events.network.thread.wake();
+        Ok(ClientSubscription::new(NetworkSubscription(route)))
     }
 }
 
@@ -318,10 +351,8 @@ struct EventsOwner(Arc<Events>);
 
 impl Drop for EventsOwner {
     fn drop(&mut self) {
-        self.0.stop.store(true, Ordering::Release);
-        if let Some(started) = self.0.started.get() {
-            started.thread.unpark();
-        }
+        self.0.cac_event.stop();
+        self.0.network.thread.stop();
     }
 }
 
@@ -332,17 +363,91 @@ struct Events {
     /// callbacks in post order whichever thread takes them.
     consumer: parking_lot::Mutex<()>,
     running: Running,
-    starting: parking_lot::Mutex<()>,
-    started: OnceLock<Started>,
-    stop: AtomicBool,
+    cac_event: Deliverer,
+    network: Network,
 }
 
-/// `CAC-event`, and the waker every take parks the chain on: the chain has
-/// one `ppendsem`, so a take with any other waker would leave the thread
-/// asleep on the next post.
+/// The context's network subscriptions, which only their own thread
+/// delivers.
+#[derive(Default)]
+struct Network {
+    routes: parking_lot::Mutex<Vec<Weak<NetworkRoute>>>,
+    thread: Deliverer,
+}
+
+/// One of a context's delivery threads, started by the first subscription
+/// it delivers and parked between passes.
+#[derive(Default)]
+struct Deliverer {
+    starting: parking_lot::Mutex<()>,
+    started: OnceLock<Started>,
+    stop: Arc<AtomicBool>,
+}
+
+/// The thread, and the waker every take it delivers parks on: the event
+/// chain has one `ppendsem`, so a take with any other waker would leave the
+/// thread asleep on the next post.
 struct Started {
     thread: std::thread::Thread,
     waker: Waker,
+}
+
+impl Deliverer {
+    /// `name` at `priority`, each pass `pass`, unless it is started.
+    fn start(
+        &self,
+        name: &str,
+        priority: u32,
+        stack: StackSizeClass,
+        pass: impl Fn() + Send + 'static,
+    ) -> Result<(), String> {
+        let _starting = self.starting.lock();
+        if self.started.get().is_some() {
+            return Ok(());
+        }
+        let stop = self.stop.clone();
+        let handle = spawn_dedicated_thread(
+            name.into(),
+            ThreadPriority::Custom(priority),
+            stack,
+            move || {
+                while !stop.load(Ordering::Acquire) {
+                    pass();
+                    std::thread::park();
+                }
+            },
+        )
+        .map_err(|e| format!("{name} thread could not be created: {e}"))?;
+        let thread = handle.thread().clone();
+        let waker = Waker::from(Arc::new(Unpark(thread.clone())));
+        let _ = self.started.set(Started {
+            thread: thread.clone(),
+            waker,
+        });
+        // Its first pass may have run before it had the waker to park on.
+        thread.unpark();
+        Ok(())
+    }
+
+    fn waker(&self) -> Option<&Waker> {
+        self.started.get().map(|started| &started.waker)
+    }
+
+    fn wake(&self) {
+        if let Some(started) = self.started.get() {
+            started.thread.unpark();
+        }
+    }
+
+    fn stop(&self) {
+        self.stop.store(true, Ordering::Release);
+        self.wake();
+    }
+}
+
+/// The calling thread's EPICS priority.
+fn own_priority() -> u32 {
+    thread_by_id(current_thread_id()).map_or(ThreadPriority::Medium.value(), |t| t.epics_priority())
 }
 
 struct Unpark(std::thread::Thread);
@@ -354,7 +459,8 @@ impl Wake for Unpark {
 }
 
 thread_local! {
-    /// The event context whose entry this thread is delivering.
+    /// The event context whose callbacks, of either kind, this thread is
+    /// delivering.
     static DELIVERING: Cell<*const Events> = const { Cell::new(std::ptr::null()) };
 }
 
@@ -376,40 +482,31 @@ impl Drop for Delivering {
 impl Events {
     /// `db_start_events` for `dbContext::subscribe`'s first call.
     fn start(self: &Arc<Self>) -> Result<(), String> {
-        let _starting = self.starting.lock();
-        if self.started.get().is_some() {
-            return Ok(());
-        }
-        let own = thread_by_id(current_thread_id())
-            .map_or(ThreadPriority::Medium.value(), |t| t.epics_priority());
+        let own = own_priority();
         // `epicsThreadLowestPriorityLevelAbove`, or the caller's own at 99.
         let above = if own < 99 { own + 1 } else { own };
         let events = self.clone();
-        let handle = spawn_dedicated_thread(
-            "CAC-event".into(),
-            ThreadPriority::Custom(above),
-            StackSizeClass::Medium,
-            move || {
-                while !events.stop.load(Ordering::Acquire) {
-                    events.deliver();
-                    std::thread::park();
-                }
-            },
-        )
-        .map_err(|e| format!("CAC-event thread could not be created: {e}"))?;
-        let thread = handle.thread().clone();
-        let waker = Waker::from(Arc::new(Unpark(thread.clone())));
-        let _ = self.started.set(Started {
-            thread: thread.clone(),
-            waker,
-        });
-        // Its first pass may have run before it had the waker to park on.
-        thread.unpark();
-        Ok(())
+        self.cac_event
+            .start("CAC-event", above, StackSizeClass::Medium, move || {
+                events.deliver()
+            })
+    }
+
+    /// The network thread, for the first network subscription.
+    fn start_network(self: &Arc<Self>) -> Result<(), String> {
+        // `cac::highestPriorityLevelBelow`, or the caller's own at 0.
+        let below = own_priority().saturating_sub(1);
+        let events = self.clone();
+        self.network
+            .thread
+            .start("CAC-callback", below, StackSizeClass::Big, move || {
+                let _delivering = Delivering::enter(&events);
+                events.network.deliver();
+            })
     }
 
     fn deliver(&self) {
-        let Some(started) = self.started.get() else {
+        let Some(waker) = self.cac_event.waker() else {
             return;
         };
         if std::ptr::eq(DELIVERING.get(), self) {
@@ -417,7 +514,7 @@ impl Events {
         }
         let _consumer = self.consumer.lock();
         let _delivering = Delivering::enter(self);
-        let mut cx = Context::from_waker(&started.waker);
+        let mut cx = Context::from_waker(waker);
         while let Poll::Ready(entry) = self.user.poll_next(&mut cx) {
             // An ended producer's subscription ends when the client drops it.
             if let CircuitEvent::Event { context, event, .. } = entry
@@ -430,6 +527,33 @@ impl Events {
     }
 }
 
+impl Network {
+    /// Each value ready now to its callback, the subscriptions in turn.
+    fn deliver(&self) {
+        let Some(waker) = self.thread.waker() else {
+            return;
+        };
+        let mut cx = Context::from_waker(waker);
+        let routes = self.routes();
+        loop {
+            let mut taken = false;
+            for route in &routes {
+                taken |= route.deliver(&mut cx);
+            }
+            if !taken {
+                break;
+            }
+        }
+    }
+
+    /// The routes whose subscriptions live.
+    fn routes(&self) -> Vec<Arc<NetworkRoute>> {
+        let mut routes = self.routes.lock();
+        routes.retain(|route| route.strong_count() > 0);
+        routes.iter().filter_map(Weak::upgrade).collect()
+    }
+}
+
 /// The puts of a client context while they run on their callers, each poll
 /// of one a run; what a run posts on its own record reaches its callback
 /// after the run. C's `CAC-event` must be woken and scheduled before it
@@ -437,11 +561,11 @@ impl Events {
 /// (MM4005_trajectoryScan's `pvPut(motorMDVS[j])` then
 /// `efClear(motorMDVSMon)` sees the event after the clear on 287 of 300 C
 /// boots). An entry waits only for runs on its own record, whose value is
-/// the one still changing; C's `CAC-event` waits on the record's whole
-/// lockset only because it reads under `dbScanLock` (`db_access.c:158`). A
-/// put parked between polls (`dbPutNotifyBlocker`, a postponed write) runs
-/// nothing and holds up no one, as C's blocked caller does not, and no put
-/// waits for another.
+/// the one still changing, and a network value, on its own thread, for
+/// none; C's `CAC-event` waits on the record's whole lockset only because
+/// it reads under `dbScanLock` (`db_access.c:158`). A put parked between
+/// polls (`dbPutNotifyBlocker`, a postponed write) runs nothing and holds up
+/// no one, as C's blocked caller does not, and no put waits for another.
 #[derive(Default)]
 struct Running {
     /// The next run's number, and the number and record of each run not
@@ -531,6 +655,48 @@ impl Route {
         if let Some(snapshot) = self.notify.state_notify(event, self.count) {
             (self.callback)(snapshot);
         }
+    }
+}
+
+/// A network subscription's values, as a stream's `poll_next`.
+type NetworkValues = Box<dyn FnMut(&mut Context<'_>) -> Poll<Option<Snapshot>> + Send>;
+
+/// One network subscription's way from its values to its callback.
+struct NetworkRoute {
+    /// `None` once they end or the subscription drops.
+    values: parking_lot::Mutex<Option<NetworkValues>>,
+    callback: Box<dyn Fn(Snapshot) + Send + Sync>,
+}
+
+impl NetworkRoute {
+    /// Its next value to its callback, if one is there; whether one was.
+    fn deliver(&self, cx: &mut Context<'_>) -> bool {
+        let next = {
+            let mut values = self.values.lock();
+            let Some(poll_next) = values.as_mut() else {
+                return false;
+            };
+            let next = poll_next(cx);
+            if let Poll::Ready(None) = next {
+                *values = None;
+            }
+            next
+        };
+        let Poll::Ready(Some(snapshot)) = next else {
+            return false;
+        };
+        (self.callback)(snapshot);
+        true
+    }
+}
+
+/// Dropping it takes no value after; a callback already running goes on.
+struct NetworkSubscription(Arc<NetworkRoute>);
+
+impl Drop for NetworkSubscription {
+    fn drop(&mut self) {
+        let values = self.0.values.lock().take();
+        drop(values);
     }
 }
 

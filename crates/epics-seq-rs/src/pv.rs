@@ -16,10 +16,12 @@
 //! goes to the system's one request queue, which issues each in the order
 //! made, whatever its channel, as libca queues each on its circuit when it
 //! is called; its completion runs on the database reactor, where C's runs
-//! on a CA auxiliary thread. A network channel's monitor events and
-//! connection changes come from the reactor too; an in-process channel's
-//! monitor events come from the system's one queue, in post order, each
-//! after the system's puts running on their callers when it is taken, on its
+//! on a CA auxiliary thread. A network channel's connection changes come
+//! from the reactor too, and its monitor events, in the order they arrive,
+//! from the system context's `CAC-callback` thread, as C's come from
+//! libca's receive thread. An in-process channel's monitor events come
+//! from the system's one queue, in post order, each after the system's
+//! puts on its record running on their callers when it is taken, on its
 //! `CAC-event` thread or at an [`EventGate`] point of a state set. None
 //! runs inside a call, so a caller may hold seq's locks across
 //! [`PvVar::monitor_on`], as C's connection handler holds `sp->lock` across
@@ -154,8 +156,8 @@ impl PvSystem {
 
 /// The points where a state set's thread takes in the in-process monitor
 /// events queued: its waits. Each event is otherwise delivered by the
-/// thread that takes it, `CAC-event` or the reactor, while state sets run,
-/// as C's `seq_mon_handler` writes the shared buffer on `CAC-event`
+/// context's `CAC-event` thread while state sets run, as C's
+/// `seq_mon_handler` writes the shared buffer on `CAC-event`
 /// (`seq_ca.c:180-303`); under `+s` a state set sees it at its own reads
 /// of that buffer. What is queued when a state set waits has landed when
 /// it goes on, as `CAC-event` delivers within microseconds; a get or a put

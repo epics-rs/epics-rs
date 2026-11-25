@@ -143,7 +143,8 @@ impl PvSystem {
     /// The in-process monitor events queued now, delivered on the calling
     /// thread, which holds no lock a monitor callback takes.
     pub fn deliver(&self) {
-        self.ctx.events().deliver();
+        // Only a program's own thread calls this, never inside a callback.
+        let _ = self.ctx.events().deliver();
     }
 
     /// A new [`EventGate`] over this system's queue.
@@ -173,13 +174,15 @@ impl EventGate {
     /// `wait`, a block of a state set.
     pub fn block<R>(&self, _ss: usize, wait: impl FnOnce() -> R) -> R {
         let r = wait();
-        self.events.deliver();
+        // A state set's thread blocks here, never inside a callback.
+        let _ = self.events.deliver();
         r
     }
 
     /// A wait of a state set that does not block.
     pub fn pass(&self, _ss: usize) {
-        self.events.deliver();
+        // A state set's thread passes here, never inside a callback.
+        let _ = self.events.deliver();
     }
 }
 

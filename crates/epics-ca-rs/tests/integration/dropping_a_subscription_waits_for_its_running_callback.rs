@@ -533,7 +533,7 @@ impl Caller {
                 while !posted.load(Ordering::SeqCst) && Instant::now() < end {
                     v += 1.0;
                     post(&db, trigger, v);
-                    events.deliver();
+                    events.deliver().unwrap();
                 }
             })
             .expect("spawn the caller");

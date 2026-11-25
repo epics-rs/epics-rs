@@ -204,7 +204,7 @@ async fn delivering_inside_a_put_callbacks_issued_returns() {
     let (returned, put_returned) = mpsc::channel();
     std::thread::spawn(move || {
         let put = put.put_callback(EpicsValue::Double(1.0), |done| {
-            events.deliver();
+            events.deliver().unwrap();
             done
         });
         let _ = returned.send(put.is_ok());

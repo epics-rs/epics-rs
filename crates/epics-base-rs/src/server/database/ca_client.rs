@@ -20,6 +20,7 @@ use std::task::{Context, Poll, Wake, Waker};
 use super::ca_link::StateNotify;
 use super::{PvDatabase, PvDatabaseInner};
 use crate::error::CaError;
+use crate::error::eca::{ECA_EVDISALLOW, eca_message};
 use crate::runtime::task::{
     BlockingBridge, NotBlockable, StackSizeClass, TaskHandle, ThreadPriority, block_on_sync,
     current_thread_id, spawn_dedicated_thread, thread_by_id,
@@ -291,14 +292,19 @@ pub struct InProcessEvents(Arc<EventsOwner>);
 impl InProcessEvents {
     /// The in-process entries queued now, delivered on the calling thread
     /// in their turn with what `CAC-event` delivers. The caller holds no
-    /// lock a callback takes. Inside one of this context's callbacks it does
-    /// nothing: an in-process callback's thread is already delivering, as
-    /// C's `CAC-event` is, and a network callback's never takes an entry.
+    /// lock a callback takes. Inside a subscription's callback, of any
+    /// context, it is refused, as libca refuses `ca_pend_event` on a
+    /// callback thread (`ca_client_context.cpp:529-532`): a callback
+    /// delivering another context could wait on one delivering its own.
     /// Inside a put of any client context, in its record's processing or
-    /// [`InProcessChannel::put_callback`]'s `issued`, it does nothing as
-    /// well: `CAC-event` may be waiting on that put, and delivers after it.
-    pub fn deliver(&self) {
+    /// [`InProcessChannel::put_callback`]'s `issued`, it does nothing:
+    /// `CAC-event` may be waiting on that put, and delivers after it.
+    pub fn deliver(&self) -> Result<(), EvDisallow> {
+        if IN_CALLBACK.get() {
+            return Err(EvDisallow);
+        }
         self.0.0.deliver();
+        Ok(())
     }
 
     /// A network subscription of this context: each value `values` yields
@@ -326,6 +332,12 @@ impl InProcessEvents {
         Ok(ClientSubscription::new(NetworkSubscription(route)))
     }
 }
+
+/// `ECA_EVDISALLOW`: [`InProcessEvents::deliver`] inside a subscription's
+/// callback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("{}", eca_message(ECA_EVDISALLOW))]
+pub struct EvDisallow;
 
 #[derive(Default)]
 struct EventsOwner(Arc<Events>);
@@ -448,7 +460,8 @@ thread_local! {
     static IN_RUNS: Cell<usize> = const { Cell::new(0) };
 
     /// Whether this thread is inside a subscription's callback, where no
-    /// drop of a subscription waits.
+    /// drop of a subscription waits and [`InProcessEvents::deliver`] is
+    /// refused.
     static IN_CALLBACK: Cell<bool> = const { Cell::new(false) };
 }
 

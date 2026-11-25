@@ -1,6 +1,7 @@
 use asyn_rs::error::{AsynError, AsynResult, AsynStatus};
 use asyn_rs::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
 use asyn_rs::user::AsynUser;
+use epics_base_rs::runtime::time::deadline_after;
 use std::time::{Duration, Instant};
 
 mod route;
@@ -130,7 +131,7 @@ impl SimMotor {
         for _ in 0..run {
             self.process(delta);
         }
-        self.last_step += PERIOD * steps;
+        self.last_step = deadline_after(self.last_step, PERIOD * steps);
     }
 
     /// Stopped on its endpoint with nothing pending: a step moves only

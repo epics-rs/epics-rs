@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::runtime::time::deadline_after;
 use crate::server::database::PvDatabase;
 use crate::types::{DbFieldType, EpicsValue};
 use epics_libcom_rs::cfmt::CFloat;
@@ -1712,12 +1713,12 @@ impl ListState {
         }
 
         if self.save_state & SaveStrategy::PERIODIC != 0 {
-            self.periodic_due = Some(now + self.set.period());
+            self.periodic_due = Some(deadline_after(now, self.set.period()));
             self.callback_time = now;
         }
         self.save_state &= !SINGLE_EVENTS;
         if self.save_state & SaveStrategy::MONITORED == SaveStrategy::MONITORED {
-            self.monitor_due = Some(now + self.set.monitor_period());
+            self.monitor_due = Some(deadline_after(now, self.set.monitor_period()));
             self.save_state &= !SaveStrategy::MONITORED;
             self.callback_time = now;
         }
@@ -1828,7 +1829,7 @@ impl ListState {
         }
         self.set.set_status_text("Enabling list...");
         if method & SaveStrategy::PERIODIC != 0 && self.enabled & SaveStrategy::PERIODIC == 0 {
-            self.periodic_due = Some(now + self.set.period());
+            self.periodic_due = Some(deadline_after(now, self.set.period()));
             self.enabled |= SaveStrategy::PERIODIC;
             self.callback_time = now;
         }
@@ -1900,7 +1901,7 @@ impl ListState {
                     "save_restore:enable_list: done calling ca_add_event for list channels"
                 );
             }
-            self.monitor_due = Some(now + self.set.monitor_period());
+            self.monitor_due = Some(deadline_after(now, self.set.monitor_period()));
             self.enabled |= SaveStrategy::MONITORED;
             self.callback_time = now;
         }

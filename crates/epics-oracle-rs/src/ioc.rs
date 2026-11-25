@@ -776,7 +776,7 @@ fn watch_boot(
     spawn_watcher(stdout, tx.clone(), tail.clone());
     spawn_watcher(stderr, tx, tail.clone());
 
-    let deadline = Instant::now() + timeout;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(timeout);
     let mut ready = false;
     loop {
         let left = deadline.saturating_duration_since(Instant::now());

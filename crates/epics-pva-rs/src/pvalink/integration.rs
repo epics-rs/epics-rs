@@ -705,7 +705,7 @@ impl PvaLinkResolver {
         };
         // Poll the link's read() — succeeds once the monitor has
         // delivered at least one event.
-        let deadline = std::time::Instant::now() + timeout;
+        let deadline = epics_base_rs::runtime::time::deadline_from_now(timeout);
         loop {
             if link.read().await.is_ok() {
                 return true;

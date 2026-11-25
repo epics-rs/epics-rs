@@ -271,6 +271,7 @@ use epics_base_rs::server::database::channel_io::{
 // builds reach the same primitive from `server::blocking`.
 #[cfg(tokio_backend)]
 use epics_base_rs::runtime::accept::AcceptBackoff;
+use epics_base_rs::runtime::time::deadline_after;
 use epics_base_rs::server::access_security::{AccessLevel, AccessSecurityConfig};
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::database::filters::ChannelCreateError;
@@ -697,7 +698,7 @@ impl PutNotifySlot {
                 {
                     let wait = PutNotifyWait {
                         settled: reg.settled.clone(),
-                        deadline: reg.busy_since + PUT_NOTIFY_BLOCK_TIMEOUT,
+                        deadline: deadline_after(reg.busy_since, PUT_NOTIFY_BLOCK_TIMEOUT),
                     };
                     *slot = Some(reg);
                     return Ok(Some(wait));

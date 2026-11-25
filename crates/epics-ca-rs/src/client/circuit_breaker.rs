@@ -33,6 +33,8 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
+use epics_base_rs::runtime::time::deadline_after;
+
 /// Per-server failure-pattern tracker and state machine.
 #[derive(Debug, Clone)]
 pub struct CircuitBreaker {
@@ -216,7 +218,7 @@ impl CircuitBreakerRegistry {
                 // Probe failed → open with double the previous cooldown.
                 breaker.current_cooldown =
                     (breaker.current_cooldown * 2).min(self.config.max_cooldown);
-                breaker.cooldown_until = Some(now + breaker.current_cooldown);
+                breaker.cooldown_until = Some(deadline_after(now, breaker.current_cooldown));
                 breaker.state = BreakerState::Open;
                 breaker.failures.clear();
             }
@@ -234,7 +236,7 @@ impl CircuitBreakerRegistry {
                     .retain(|t| now.saturating_duration_since(*t) <= self.config.window);
                 breaker.failures.push(now);
                 if breaker.failures.len() >= self.config.failure_threshold {
-                    breaker.cooldown_until = Some(now + breaker.current_cooldown);
+                    breaker.cooldown_until = Some(deadline_after(now, breaker.current_cooldown));
                     breaker.state = BreakerState::Open;
                     breaker.failures.clear();
                 }

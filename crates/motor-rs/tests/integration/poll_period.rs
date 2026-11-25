@@ -151,3 +151,44 @@ fn set_idle_poll_period_reaches_a_one_axis_controller() {
     rt.spawn(setup.poll_loop.start());
     ten_after(port, motor_rs::ioc::set_idle_poll_period_command(), &polls);
 }
+
+/// C clamps an event wait to ten years (convertDoubleToWakeTime,
+/// osdTime.cpp:97-100), so a period past the clock's range is a poller that
+/// waits on its wakeup alone, still there to take the next period.
+#[test]
+fn an_unbounded_poll_period_leaves_the_poller_running() {
+    let port = "POLLUNBOUNDED";
+    register_controller_port(&open_owner(), port, 1, ()).unwrap();
+    let polls = Arc::new(AtomicUsize::new(0));
+    let mut controller = ControllerBuilder::new().port(port);
+    let ControllerAxis { axis, .. } = controller.axis(
+        Arc::new(Mutex::new(Counting(polls.clone()))),
+        TraceUser::Asyn {
+            port: port.into(),
+            addr: 0,
+        },
+    );
+    register_axis(axis).unwrap();
+    let hour = Duration::from_secs(3600);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _rt = rt.enter();
+    rt.spawn(controller.build(hour, hour, 0).start());
+
+    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    while polls.load(Ordering::Relaxed) < 1 {
+        assert!(Instant::now() < deadline, "no startup pass");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let before = polls.load(Ordering::Relaxed);
+    let args = [ArgValue::String(port.into()), ArgValue::Double(1e19)];
+    motor_rs::ioc::set_idle_poll_period_command()
+        .handler
+        .call(&args, &context())
+        .unwrap();
+    // The wakeup's pass, which then picks the unbounded wait.
+    while polls.load(Ordering::Relaxed) <= before {
+        assert!(Instant::now() < deadline, "no pass after the wakeup");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    ten_after(port, motor_rs::ioc::set_idle_poll_period_command(), &polls);
+}

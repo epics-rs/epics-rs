@@ -21,6 +21,7 @@ use crate::runtime::background::facility::{recover, run_isolated};
 use crate::runtime::sync::{Event, Signalled};
 use crate::runtime::task::{MandatoryThread, StackSizeClass, ThreadPriority};
 use crate::runtime::taskwd::{CheckIn, TASKWD_DELAY, taskwd_insert};
+use crate::runtime::time::{deadline_after, deadline_from_now};
 use crate::server::database::PvDatabase;
 use crate::server::database::scan_index::ScanPassSnapshot;
 use crate::server::record::ScanType;
@@ -522,7 +523,7 @@ impl OverrunTracker {
     /// resets to `now + penalty` — the sleeper at the head of the loop waits
     /// until `next`, so C's separate `delay` needs no counterpart here.
     fn after_scan(&mut self, next: &mut Instant, now: Instant) -> TickOutcome {
-        *next += self.period;
+        *next = deadline_after(*next, self.period);
         if now < *next {
             // C `dbScan.c:846-850`. `over_min`/`over_max` are deliberately left
             // alone; the `overtime == 0.0` test below is what reseeds them.
@@ -545,7 +546,7 @@ impl OverrunTracker {
             self.over_min = self.over_min.min(over);
             self.over_max = self.over_max.max(over);
         }
-        *next = now + self.penalty;
+        *next = deadline_after(now, self.penalty);
         self.consecutive += 1;
 
         let warning =
@@ -1491,7 +1492,7 @@ fn periodic_loop(db: Arc<PvDatabase>, duty: PeriodicDuty, stop: Arc<ScanStop>, d
         CheckIn::Every(period * 2 + TASKWD_DELAY),
         None,
     );
-    let mut next = Instant::now() + period;
+    let mut next = deadline_from_now(period);
     let mut overrun = OverrunTracker::new(
         scan_type,
         period,

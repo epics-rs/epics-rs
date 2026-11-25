@@ -5,9 +5,10 @@ to happen, and `barrier`, the way a test claims that something did *not*
 happen. It ports no C module.
 
 Never published (`publish = false`). `epics-base-rs`, `epics-ca-rs`,
-`epics-pva-rs` and `epics-seq-rs` take it as a `path`-only dev-dependency,
-which `cargo package` drops from the uploaded manifest; the unpublished test
-helpers `raw-ca` and `c-ca-tools` take it as a plain one. No feature flags.
+`epics-pva-rs`, `epics-seq-rs` and `motor-rs` take it as a `path`-only
+dev-dependency, which `cargo package` drops from the uploaded manifest; the
+unpublished test helpers `raw-ca` and `c-ca-tools` take it as a plain one. No
+feature flags.
 
 ## `FACT_BUDGET`
 

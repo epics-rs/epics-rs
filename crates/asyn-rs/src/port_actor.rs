@@ -1824,7 +1824,8 @@ impl PortActor {
         if !self.driver.base().is_connected() {
             // Still down — back off and try again (C :3312).
             let retry = self.driver.base().seconds_between_port_connect;
-            self.driver.base_mut().connect_retry_at = Some(Instant::now() + retry);
+            self.driver.base_mut().connect_retry_at =
+                Some(epics_libcom_rs::runtime::time::deadline_from_now(retry));
         }
     }
 

@@ -89,7 +89,7 @@ impl Backend for DnsSdBackend {
         // one in-flight lookup. `discover()` runs during `CaClient::new()`,
         // so this bounds how long an untrusted/slow zone can stall client
         // construction. Whatever resolved before the deadline is returned.
-        let deadline = Instant::now() + RESOLVE_BUDGET;
+        let deadline = epics_base_rs::runtime::time::deadline_from_now(RESOLVE_BUDGET);
         // Per-lookup timeout clamped to the remaining aggregate budget,
         // so a lookup started late in the phase cannot overshoot it.
         let lookup_timeout =

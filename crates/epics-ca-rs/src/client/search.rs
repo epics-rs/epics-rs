@@ -1746,7 +1746,7 @@ fn handle_request(state: &mut SearchEngineState, req: SearchRequest) -> Option<u
                 state.penalty.insert(
                     server_addr,
                     PenaltyEntry {
-                        until: Instant::now() + PENALTY_DURATION,
+                        until: epics_base_rs::runtime::time::deadline_from_now(PENALTY_DURATION),
                     },
                 );
                 let was_open = state.breakers.is_open(server_addr);

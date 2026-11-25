@@ -562,6 +562,7 @@ const SCOPE_GATED: &[(&str, &str)] = &[
         "epics-pva-rs",
         "tests/integration/ui25_same_process_discovery.rs",
     ),
+    ("epics-pva-rs", "tests/integration/unbounded_op_timeout.rs"),
     ("mca-rs", "tests/integration/a_remote_siml_is_a_ca_link.rs"),
     ("optics-rs", "tests/integration/integration_tests.rs"),
     ("optics-rs", "tests/integration/table_link_kind.rs"),

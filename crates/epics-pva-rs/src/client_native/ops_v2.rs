@@ -555,7 +555,7 @@ where
     F: Fn(Duration) -> Fut,
     Fut: std::future::Future<Output = PvaResult<T>>,
 {
-    let deadline = std::time::Instant::now() + op_timeout;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(op_timeout);
     loop {
         let budget = deadline.saturating_duration_since(std::time::Instant::now());
         if budget.is_zero() {

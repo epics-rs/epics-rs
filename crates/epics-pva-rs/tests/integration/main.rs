@@ -43,6 +43,7 @@ mod testudpfwd;
 mod tls;
 mod typed_nt;
 mod ui25_same_process_discovery;
+mod unbounded_op_timeout;
 mod wire_golden_complex_types;
 mod wire_golden_decode_roundtrip;
 mod wire_golden_pvxs;

@@ -10,6 +10,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
 use epics_base_rs::runtime::task::spawn_blocking_background;
+use epics_base_rs::runtime::time::deadline_from_now;
 use epics_base_rs::server::record::OwnFrame;
 use epics_base_rs::server::snapshot::Snapshot;
 use epics_libcom_rs::cfmt::CFloat;
@@ -115,7 +116,7 @@ impl SscanRecord {
             if !busy(self) {
                 return;
             }
-            let second = Instant::now() + std::time::Duration::from_secs(1);
+            let second = deadline_from_now(std::time::Duration::from_secs(1));
             while self.inbox.wait(second) {
                 self.drain_inbox(own);
             }

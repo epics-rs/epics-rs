@@ -1093,7 +1093,7 @@ mod ioc {
         // 4 and 1 while this reads 4.
         let declared = block_on_sync(db_for_names.external_link_pv_names())
             .expect("the RTEMS entry point runs on a plain thread with no runtime entered");
-        let deadline = std::time::Instant::now() + LINK_SETTLE_TIMEOUT;
+        let deadline = epics_base_rs::runtime::time::deadline_from_now(LINK_SETTLE_TIMEOUT);
         while resolver.link_count() < declared.len() && std::time::Instant::now() < deadline {
             std::thread::sleep(LINK_SETTLE_POLL);
         }

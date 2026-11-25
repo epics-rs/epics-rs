@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
+use epics_base_rs::runtime::time::{deadline_after, deadline_from_now};
 use epics_base_rs::types::EpicsValue;
 use epics_ca_rs::client::CaClient;
 use epics_libcom_rs::cfmt::CFloat;
@@ -57,7 +58,7 @@ async fn main() {
     let stop_at = if args.duration == 0 {
         None
     } else {
-        Some(start + Duration::from_secs(args.duration))
+        Some(deadline_after(start, Duration::from_secs(args.duration)))
     };
 
     // One subscriber + one reader/writer per PV.
@@ -152,7 +153,7 @@ async fn main() {
     // of spawning a separate task so we can keep client.diagnostics()
     // accessible without restructuring ownership.
     let report_interval = Duration::from_secs(args.report_interval);
-    let mut next = epics_base_rs::runtime::time::deadline_from_now(report_interval);
+    let mut next = deadline_from_now(report_interval);
     let interrupted = tokio::signal::ctrl_c();
     tokio::pin!(interrupted);
     loop {
@@ -160,7 +161,7 @@ async fn main() {
         tokio::pin!(sleep);
         tokio::select! {
             _ = &mut sleep => {
-                next += report_interval;
+                next = deadline_after(next, report_interval);
                 let elapsed = start.elapsed().as_secs_f64();
                 let snap = client.diagnostics();
                 epics_libcom_rs::stderr_println!(

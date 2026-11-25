@@ -20,6 +20,7 @@ use epics_base_rs::net::{AsyncUdpV4, PortUse};
 // `EPICS_RS_BUILD_EXEC_BACKEND=thread`, and this module is compiled into one
 // — its gate is `not(epics_embedded_target)`, which is a different question.
 use epics_base_rs::runtime::task::timeout;
+use epics_base_rs::runtime::time::{deadline_after, deadline_from_now};
 use tracing::debug;
 
 use crate::codec::PvaCodec;
@@ -122,7 +123,7 @@ pub async fn search(pv_name: &str, total_timeout: Duration) -> PvaResult<SocketA
     }
 
     let search_id = 1u32;
-    let deadline = Instant::now() + total_timeout;
+    let deadline = deadline_from_now(total_timeout);
     let mut sequence = 0u32;
     let mut attempt: u32 = 0;
 
@@ -168,7 +169,7 @@ pub async fn search(pv_name: &str, total_timeout: Duration) -> PvaResult<SocketA
             Duration::from_millis(100 << attempt.min(5)),
             Duration::from_secs(2),
         );
-        let next_send = now + backoff;
+        let next_send = deadline_after(now, backoff);
         let wait = std::cmp::min(next_send, deadline).saturating_duration_since(now);
 
         let mut buf = vec![0u8; 1500];

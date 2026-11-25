@@ -71,7 +71,9 @@ use tokio::sync::{mpsc, oneshot};
 // actually runs on — hosted that is tokio's, which is virtual under
 // `start_paused`. Taking `Instant` from the seam alongside the timer is what
 // keeps the two from being different timelines.
-use epics_base_rs::runtime::task::{Instant, Period, Sleep, interval, sleep, timeout};
+use epics_base_rs::runtime::task::{
+    Instant, Period, Sleep, deadline_after, deadline_from_now, interval, sleep, timeout,
+};
 use tracing::debug;
 use tracing::warn;
 
@@ -1499,7 +1501,7 @@ async fn run_engine(
     // One-shot search timer, re-armed by each tick and pulled in by a poke.
     // Its first tick is one period after start, as pvxs arms `searchTimer`
     // (src/client.cpp:658).
-    let mut next_tick = Instant::now() + BUCKET_INTERVAL;
+    let mut next_tick = deadline_from_now(BUCKET_INTERVAL);
     // The loop's sleeps, held across passes so one that moves no deadline
     // arms no timer. `hold_until` brings each to its deadline before the
     // `select!`; with no deadline none is held and its arm parks.
@@ -1569,7 +1571,7 @@ async fn run_engine(
                         // batched SEARCH on flush (pvxs initialSearcher).
                         initial_pending.push(sid);
                         if initial_deadline.is_none() {
-                            initial_deadline = Some(Instant::now() + INITIAL_SEARCH_DELAY);
+                            initial_deadline = Some(deadline_from_now(INITIAL_SEARCH_DELAY));
                         }
                         None
                     } else {
@@ -1602,7 +1604,7 @@ async fn run_engine(
                         // window (see the Find branch above).
                         initial_pending.push(sid);
                         if initial_deadline.is_none() {
-                            initial_deadline = Some(Instant::now() + INITIAL_SEARCH_DELAY);
+                            initial_deadline = Some(deadline_from_now(INITIAL_SEARCH_DELAY));
                         }
                         None
                     } else {
@@ -1983,7 +1985,7 @@ async fn run_engine(
 
                     if let Some(p) = pending.get_mut(&sid) {
                         if let Responder::Multi { ref mut deadline, .. } = p.responder {
-                            deadline.get_or_insert(now + MULTI_SERVER_WINDOW);
+                            deadline.get_or_insert(deadline_after(now, MULTI_SERVER_WINDOW));
                         }
                         to_send.push((sid, p.pv_name.clone()));
                         rearm_ids.push(sid);
@@ -2033,8 +2035,8 @@ async fn run_engine(
                 if poked {
                     fast_ticks_remaining -= 1;
                 }
-                next_tick = Instant::now()
-                    + if poked { BUCKET_INTERVAL_FAST } else { BUCKET_INTERVAL };
+                next_tick =
+                    deadline_from_now(if poked { BUCKET_INTERVAL_FAST } else { BUCKET_INTERVAL });
             }
         }
     }
@@ -2276,7 +2278,7 @@ fn flush_initial_searches(
             Responder::Multi { responder, .. } if responder.is_closed() => continue,
             Responder::Single(_) => {}
             Responder::Multi { deadline, .. } => {
-                deadline.get_or_insert(now + MULTI_SERVER_WINDOW);
+                deadline.get_or_insert(deadline_after(now, MULTI_SERVER_WINDOW));
             }
         }
         p.bucket = Some(bucket);

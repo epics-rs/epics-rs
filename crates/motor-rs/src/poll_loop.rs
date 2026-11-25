@@ -10,7 +10,7 @@ use asyn_rs::user::AsynUser;
 use epics_base_rs::runtime::task::{
     StackSizeClass, ThreadPriority, block_on_sync, sleep_background, spawn_dedicated_thread,
 };
-use epics_base_rs::runtime::time::thread_sleep_quantum;
+use epics_base_rs::runtime::time::{deadline_after, deadline_from_now, thread_sleep_quantum};
 use epics_libcom_rs::cfmt::CFloat;
 use tokio::sync::{mpsc, oneshot};
 
@@ -2089,9 +2089,9 @@ impl MotorPollLoop {
     /// period after `tick` (motordrvCom.cc:216-238).
     fn task_due(&self, tick: Instant, stale: Duration) -> Option<Instant> {
         match self.schedule {
-            Schedule::MotorTask { scan } if self.axes.iter().any(Axis::holds_move) => {
-                Some(tick + if stale.is_zero() { scan } else { stale })
-            }
+            Schedule::MotorTask { scan } if self.axes.iter().any(Axis::holds_move) => Some(
+                deadline_after(tick, if stale.is_zero() { scan } else { stale }),
+            ),
             _ => None,
         }
     }
@@ -2180,7 +2180,7 @@ impl MotorPollLoop {
         } else {
             periods.idle
         };
-        (!timeout.is_zero()).then(|| Instant::now() + timeout)
+        (!timeout.is_zero()).then(|| deadline_from_now(timeout))
     }
 
     /// Start the poll loop on a dedicated `motorPoller` thread, which serves
@@ -2338,7 +2338,7 @@ impl MotorPollLoop {
                 Wake::Join(join) => {
                     let moving = self.controller_poll.state().periods.moving;
                     if self.join(*join) && !moving.is_zero() {
-                        let soon = Instant::now() + moving;
+                        let soon = deadline_from_now(moving);
                         due = Some(due.map_or(soon, |at| at.min(soon)));
                     }
                 }

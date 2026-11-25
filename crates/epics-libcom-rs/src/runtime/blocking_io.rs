@@ -123,6 +123,7 @@ use tracing::debug;
 
 use crate::runtime::offload::{MAX_OFFLOAD_WORKERS, OffloadPool};
 use crate::runtime::task::{StackSizeClass, ThreadPriority, block_on_sync};
+use crate::runtime::time::deadline_from_now;
 use crate::runtime::worker_pool::{Job, SetLease, Worker, WorkerPool, WorkerRole};
 
 /// One blocking read, sized to match the frame readers that consume it so the
@@ -480,7 +481,7 @@ fn reader_pump(
     let mut chunk = vec![0u8; chunk_size];
     // One deadline per read, held across the empty returns below, so a wait
     // that re-arms after one re-arms the bound that is left, not a fresh one.
-    let mut deadline = read_timeout.map(|t| Instant::now() + t);
+    let mut deadline = read_timeout.map(deadline_from_now);
     loop {
         match wait_readable(sock, deadline) {
             Ok(true) => {}
@@ -507,7 +508,7 @@ fn reader_pump(
                 break;
             }
         };
-        deadline = read_timeout.map(|t| Instant::now() + t);
+        deadline = read_timeout.map(deadline_from_now);
         // The house sync-over-async primitive: parks this thread (no runtime
         // entered) or hands the worker off (hosted). NOT `blocking_send`.
         if !matches!(block_on_sync(tx.send(chunk[..n].to_vec())), Ok(Ok(()))) {
@@ -1034,7 +1035,7 @@ pub fn write_frame_deadline(
     // `impl Write for &TcpStream`: rebind so `write`/`flush` have a mutable
     // place to borrow, without needing `&mut TcpStream` from the caller.
     let mut sock = sock;
-    let deadline = Instant::now() + send_timeout;
+    let deadline = deadline_from_now(send_timeout);
     let mut off = 0;
     while off < frame.len() {
         // The one gate, ahead of every syscall, so every way round the loop is
@@ -1892,6 +1893,40 @@ mod tests {
             &PumpConfig {
                 read_timeout: Duration::from_secs(5),
                 send_timeout: Duration::from_secs(5),
+                ..PumpConfig::default()
+            },
+        )
+        .expect("pumps started");
+
+        let peer = thread::spawn(move || {
+            let mut got = vec![0u8; 4];
+            server.read_exact(&mut got).expect("peer read");
+            server.write_all(b"pong").expect("peer write");
+            got
+        });
+
+        writer.write_all(b"ping").await.expect("wrote");
+        let mut got = [0u8; 4];
+        reader.read_exact(&mut got).await.expect("read back");
+        assert_eq!(&got, b"pong");
+        assert_eq!(peer.join().expect("peer"), b"ping");
+    }
+
+    /// `EPICS_CA_CONN_TMO=1e300` parses to `Duration::MAX`: a circuit that
+    /// never times out, which must still carry frames both ways.
+    #[epics_macros_rs::epics_test]
+    async fn an_unbounded_timeout_still_moves_bytes_both_ways() {
+        let (client, mut server) = socket_pair();
+        server
+            .set_read_timeout(Some(fact_budget::FACT_BUDGET))
+            .expect("rcvtimeo");
+        let (mut reader, mut writer) = drive_socket_blocking(
+            &TEST_POOL,
+            client,
+            "127.0.0.1:0",
+            &PumpConfig {
+                read_timeout: Duration::MAX,
+                send_timeout: Duration::MAX,
                 ..PumpConfig::default()
             },
         )

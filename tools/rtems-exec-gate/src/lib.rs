@@ -1010,8 +1010,9 @@ fn crate_rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
 /// Residual, stated rather than papered over: a `tests/` directory that is
 /// DELETED outright contributes zero legitimately — a crate need not have
 /// integration tests — and only `min_files` stands behind that. The census
-/// added by `tests/every_backend_deriving_crate_is_accounted_for.rs` is what keeps a
-/// crate from dropping out of the scan entirely.
+/// added by
+/// `tests/integration/every_backend_deriving_crate_is_accounted_for.rs` is what
+/// keeps a crate from dropping out of the scan entirely.
 ///
 /// Call it from a `tests/integration/rtems_exec_model_gate.rs` that is itself
 /// gated to `#![cfg(exec_backend)]`, so the census is checked in exactly the
@@ -1316,7 +1317,7 @@ fn repo_path(root: &Path, path: &Path) -> String {
 
 /// The path, from a workspace root, of the file holding the `SCOPE_GATED` pin.
 pub const PIN_FILE: &str =
-    "tools/rtems-exec-gate/tests/every_backend_deriving_crate_is_accounted_for.rs";
+    "tools/rtems-exec-gate/tests/integration/every_backend_deriving_crate_is_accounted_for.rs";
 
 /// Every workspace member directory, from the root manifest's own `members`
 /// globs rather than from a list repeated here.

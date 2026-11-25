@@ -2,7 +2,7 @@
 //! — which is every configuration anyone runs by default.
 //!
 //! Each backend-deriving crate already carries its own
-//! `tests/rtems_exec_model_gate.rs`, and each of those is
+//! `tests/integration/rtems_exec_model_gate.rs`, and each of those is
 //! `#![cfg(exec_backend)]`. That gating is deliberate and stays:
 //! it is what puts the census in the configuration whose reactor it reasons
 //! about, and what makes a site vouched for by a bumped `ALLOW(N)` count still

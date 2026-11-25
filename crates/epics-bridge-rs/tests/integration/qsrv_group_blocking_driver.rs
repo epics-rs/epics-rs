@@ -133,7 +133,7 @@ async fn group_flood_starves_neither_the_scalar_monitor_nor_a_fresh_get() {
         .expect("the exec backend's executor is process-global");
     let serve_thread = std::thread::Builder::new()
         .name("PVAS-TCP-test".into())
-        .spawn(move || srv.serve(&serve_reactor, || ()).expect("accept threads"))
+        .spawn(move || srv.serve(&serve_reactor, || true).expect("accept threads"))
         .expect("spawn the accept thread");
 
     // ── Two subscriptions on two circuits (the target evidence shape) ───

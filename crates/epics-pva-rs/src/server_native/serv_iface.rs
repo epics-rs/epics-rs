@@ -252,14 +252,14 @@ impl ServListeners {
 
     /// Run `accept` on every listener until each returns: the first on the
     /// calling thread, each further one on a thread of its own. `started`
-    /// runs once every thread exists, before any listener accepts. A thread
-    /// that cannot be created is the `Err`, and then no listener has
-    /// accepted: pvxs's `Server` throws on a listener it cannot set up
-    /// (`serverconn.cpp:426-449`).
+    /// runs once every thread exists, and the listeners accept only if it
+    /// returns `true`. A thread that cannot be created is the `Err`, and then
+    /// no listener has accepted: pvxs's `Server` throws on a listener it
+    /// cannot set up (`serverconn.cpp:426-449`).
     pub(crate) fn serve(
         &self,
         accept: impl Fn(&TcpListener) + Sync,
-        started: impl FnOnce(),
+        started: impl FnOnce() -> bool,
     ) -> io::Result<()> {
         use epics_base_rs::runtime::task::{StackSizeClass, spawn_dedicated_thread_scoped};
         let (first, rest) = self.listeners.split_first().expect("bind leaves one");
@@ -288,9 +288,11 @@ impl ServListeners {
                     return Err(e);
                 }
             }
-            started();
-            let _ = all_created.set(true);
-            accept(first);
+            let run = started();
+            let _ = all_created.set(run);
+            if run {
+                accept(first);
+            }
             Ok(())
         })
     }

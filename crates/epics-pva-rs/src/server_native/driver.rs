@@ -98,9 +98,10 @@ pub trait PvaServerDriver: Send + Sync {
     fn active_connections(&self) -> usize;
 
     /// Run the accept loop on the calling thread until [`shutdown`](Self::shutdown).
-    /// `started` runs once every listener's accept thread exists; an `Err`
-    /// is one that could not be created, and then no listener has accepted.
-    fn serve(&self, reactor: &Reactor, started: Box<dyn FnOnce() + '_>) -> io::Result<()>;
+    /// `started` runs once every listener's accept thread exists, and the
+    /// listeners accept only if it returns `true`; an `Err` is a thread that
+    /// could not be created, and then no listener has accepted.
+    fn serve(&self, reactor: &Reactor, started: Box<dyn FnOnce() -> bool + '_>) -> io::Result<()>;
 
     /// Stop the accept loop and end every live connection.
     fn shutdown(&self);
@@ -137,7 +138,7 @@ impl PvaServerDriver for BlockingPvaServer {
         BlockingPvaServer::active_connections(self)
     }
 
-    fn serve(&self, reactor: &Reactor, started: Box<dyn FnOnce() + '_>) -> io::Result<()> {
+    fn serve(&self, reactor: &Reactor, started: Box<dyn FnOnce() -> bool + '_>) -> io::Result<()> {
         BlockingPvaServer::serve(self, reactor, started)
     }
 
@@ -180,7 +181,7 @@ impl PvaServerDriver for ReactorPvaServer {
         ReactorPvaServer::active_connections(self)
     }
 
-    fn serve(&self, reactor: &Reactor, started: Box<dyn FnOnce() + '_>) -> io::Result<()> {
+    fn serve(&self, reactor: &Reactor, started: Box<dyn FnOnce() -> bool + '_>) -> io::Result<()> {
         ReactorPvaServer::serve(self, reactor, started)
     }
 

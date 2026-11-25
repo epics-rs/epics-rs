@@ -161,7 +161,7 @@ use std::net::{
     UdpSocket,
 };
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -860,17 +860,17 @@ impl BlockingPvaServer {
         let udp_port = socket
             .local_addr()
             .map_or(self.config.udp_port, |a| a.port());
-        let replier = OnceLock::from(SearchReplier {
+        let replier = SearchReplier {
             source: self.source.clone(),
             tcp_port: self.config.tcp_port,
             guid: self.config.guid,
             protocol: "tcp",
-        });
+        };
         handle_udp_search_blocking(
             socket,
             &self.config.ignore_addrs,
             udp_port,
-            &replier,
+            || Some(&replier),
             &self.shutdown,
         )
     }
@@ -912,12 +912,13 @@ impl BlockingPvaServer {
     ///
     /// Blocks the calling thread and takes it to `PVA_SERVER_PRIORITY`, so
     /// give it a thread of its own rather than calling it on a thread that has
-    /// other work. `started` runs once every listener's accept thread exists;
-    /// an `Err` is one that could not be created, with nothing accepted.
+    /// other work. `started` runs once every listener's accept thread exists,
+    /// and the listeners accept only if it returns `true`; an `Err` is a
+    /// thread that could not be created, with nothing accepted.
     pub fn serve(
         &self,
         reactor: &epics_base_rs::runtime::task::Reactor,
-        started: impl FnOnce(),
+        started: impl FnOnce() -> bool,
     ) -> io::Result<()> {
         // From here down `reactor` is the server's own — see the reactor
         // driver's `serve`. It carries the per-connection writer task, which
@@ -1452,8 +1453,8 @@ fn send_search_reply(
 }
 
 /// Read UDP SEARCHes on one socket until `shutdown` is set, answering them
-/// once `replier` is set: before that it only forwards a local unicast one,
-/// as pvxs's collector does between its bind and `Server::start`.
+/// while `replier` names who answers: before that it only forwards a local
+/// unicast one, as pvxs's collector does between its bind and `Server::start`.
 ///
 /// The decode is [`process_search_datagram`] — the same function the hosted
 /// responder drives, moved onto neutral ground by stage D part 1 — so replies
@@ -1471,11 +1472,11 @@ fn send_search_reply(
 /// * `origin` — `Direct` for what arrives on the socket, `FromOriginTag` for a
 ///   datagram peeled out of an ORIGIN_TAG prefix. A [`SearchSocket`] is joined
 ///   to the group, so it receives the tagged copies of its own forwards.
-pub(super) fn handle_udp_search_blocking(
+pub(super) fn handle_udp_search_blocking<'r>(
     socket: SearchSocket,
     ignore_addrs: &[(IpAddr, u16)],
     udp_port: u16,
-    replier: &OnceLock<SearchReplier>,
+    replier: impl Fn() -> Option<&'r SearchReplier>,
     shutdown: &AtomicBool,
 ) -> PvaResult<()> {
     let want_pktinfo = socket.pktinfo();
@@ -1536,7 +1537,7 @@ pub(super) fn handle_udp_search_blocking(
         // RTEMS `block_on_sync` parks this thread; on a host test it does the
         // same, since this loop owns its thread outright.
         let outputs = match block_on_sync(process_search_datagram(
-            replier.get(),
+            replier(),
             forward,
             udp_port,
             frame,
@@ -3312,7 +3313,7 @@ pub(super) mod tests {
             StackSizeClass::Medium,
             move || {
                 serving
-                    .serve(&harness_reactor(), || ())
+                    .serve(&harness_reactor(), || true)
                     .expect("accept threads")
             },
         )
@@ -3595,7 +3596,7 @@ pub(super) mod tests {
             StackSizeClass::Medium,
             move || {
                 serving
-                    .serve(&harness_reactor(), || ())
+                    .serve(&harness_reactor(), || true)
                     .expect("accept threads")
             },
         )
@@ -3637,7 +3638,7 @@ pub(super) mod tests {
             StackSizeClass::Medium,
             move || {
                 serving
-                    .serve(&harness_reactor(), || ())
+                    .serve(&harness_reactor(), || true)
                     .expect("accept threads")
             },
         )

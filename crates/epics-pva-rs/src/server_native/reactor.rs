@@ -85,7 +85,7 @@
 use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use epics_base_rs::runtime::accept::AcceptBackoff;
@@ -432,17 +432,17 @@ impl ReactorPvaServer {
         let udp_port = socket
             .local_addr()
             .map_or(self.config.udp_port, |a| a.port());
-        let replier = OnceLock::from(SearchReplier {
+        let replier = SearchReplier {
             source: self.source.clone(),
             tcp_port: self.config.tcp_port,
             guid: self.config.guid,
             protocol: "tcp",
-        });
+        };
         handle_udp_search_blocking(
             socket,
             &self.config.ignore_addrs,
             udp_port,
-            &replier,
+            || Some(&replier),
             &self.shutdown,
         )
     }
@@ -460,9 +460,9 @@ impl ReactorPvaServer {
     /// than joining the poller: an accept loop that parks in `accept()` is
     /// woken by [`shutdown`](Self::shutdown)'s self-connect, which is one
     /// mechanism instead of two. `started` runs once every listener's accept
-    /// thread exists; an `Err` is one that could not be created, with nothing
-    /// accepted.
-    pub fn serve(&self, reactor: &Reactor, started: impl FnOnce()) -> io::Result<()> {
+    /// thread exists, and the listeners accept only if it returns `true`; an
+    /// `Err` is a thread that could not be created, with nothing accepted.
+    pub fn serve(&self, reactor: &Reactor, started: impl FnOnce() -> bool) -> io::Result<()> {
         // From here down `reactor` is the server's own: every connection
         // future, and every task those futures go on to spawn through their
         // clone of it, runs on this server's band rather than the callback
@@ -653,7 +653,7 @@ mod tests {
             StackSizeClass::Medium,
             move || {
                 serving
-                    .serve(&harness_reactor(), || ())
+                    .serve(&harness_reactor(), || true)
                     .expect("accept threads")
             },
         )
@@ -749,7 +749,7 @@ mod tests {
             StackSizeClass::Medium,
             move || {
                 serving
-                    .serve(&harness_reactor(), || ())
+                    .serve(&harness_reactor(), || true)
                     .expect("accept threads")
             },
         )

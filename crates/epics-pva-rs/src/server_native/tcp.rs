@@ -23658,7 +23658,7 @@ mod hosted_subscriber_tests {
             StackSizeClass::Medium,
             move || {
                 serving
-                    .serve(&harness_reactor(), || ())
+                    .serve(&harness_reactor(), || true)
                     .expect("accept threads")
             },
         )

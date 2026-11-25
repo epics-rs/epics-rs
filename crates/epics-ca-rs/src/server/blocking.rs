@@ -141,6 +141,7 @@ use std::time::Duration;
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::runtime::accept::AcceptBackoff;
 use epics_base_rs::runtime::blocking_io;
+use epics_base_rs::runtime::socket::AcceptWaker;
 use epics_base_rs::runtime::task::{
     StackSizeClass, ThreadPriority, block_on_sync, enter_ioc_thread,
 };
@@ -401,16 +402,13 @@ enum Run {
     /// Started, showing nothing: no accept, no search reply, no beacon.
     Held,
     Running,
-    /// Final: a stop before the run wins over it. `ran` is whether the run
-    /// came first, the only way a listener can be parked in `accept`.
-    Stopped {
-        ran: bool,
-    },
+    /// Final: a stop before the run wins over it.
+    Stopped,
 }
 
 impl Run {
     fn is_stopped(self) -> bool {
-        matches!(self, Run::Stopped { .. })
+        self == Run::Stopped
     }
 }
 
@@ -419,6 +417,9 @@ impl Run {
 pub(crate) struct RunControl {
     state: Mutex<Run>,
     changed: Condvar,
+    /// One per listener served under this run, opened with it, so the stop
+    /// that ends the run opens nothing to wake its `accept`.
+    wakers: Mutex<Vec<AcceptWaker>>,
 }
 
 impl RunControl {
@@ -435,6 +436,7 @@ impl RunControl {
         Self {
             state: Mutex::new(state),
             changed: Condvar::new(),
+            wakers: Mutex::new(Vec::new()),
         }
     }
 
@@ -455,14 +457,23 @@ impl RunControl {
         self.changed.notify_all();
     }
 
-    /// Stop for good; `true` if the serving ran first, every later stop
-    /// answering the same.
-    pub(crate) fn stop(&self) -> bool {
-        let mut state = self.lock();
-        let ran = matches!(*state, Run::Running | Run::Stopped { ran: true });
-        *state = Run::Stopped { ran };
-        self.changed.notify_all();
-        ran
+    /// Stop for good. Only the stop that ends a run dials its listeners,
+    /// waking any `accept` parked in [`BlockingCaServer::serve`]: before the
+    /// run nothing accepts. The dial neither opens a descriptor nor waits.
+    pub(crate) fn stop(&self) {
+        let ran = {
+            let mut state = self.lock();
+            let ran = *state == Run::Running;
+            *state = Run::Stopped;
+            self.changed.notify_all();
+            ran
+        };
+        if ran {
+            let wakers = self.wakers.lock().unwrap_or_else(|e| e.into_inner());
+            for waker in wakers.iter() {
+                let _ = waker.wake();
+            }
+        }
     }
 
     /// Wait out [`Run::Held`]; `true` once running, `false` once stopped.
@@ -559,15 +570,23 @@ impl BlockingCaServer {
         // `local_addr` returns InvalidInput, because the target's libc omits
         // the BSD `sin_len` byte. Reporting that as a bind failure sends the
         // reader after the wrong syscall.
-        let tcp_port = listener
-            .local_addr()
-            .map_err(|e| {
-                std::io::Error::new(
-                    e.kind(),
-                    format!("bind() succeeded; local_addr() on the listener failed: {e}"),
-                )
-            })?
-            .port();
+        let addr = listener.local_addr().map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("bind() succeeded; local_addr() on the listener failed: {e}"),
+            )
+        })?;
+        let waker = AcceptWaker::new(addr).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("cannot open the socket that wakes accept() on {addr}: {e}"),
+            )
+        })?;
+        run.wakers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(waker);
+        let tcp_port = addr.port();
         Ok(Self {
             listener,
             db,
@@ -647,7 +666,8 @@ impl BlockingCaServer {
                 Ok(mut stream) => {
                     backoff.accepted();
                     // A `shutdown()` wakes the blocking accept by dialing our
-                    // own socket; the throwaway connection is dropped here.
+                    // own socket; the throwaway connection, or the queued
+                    // client a full backlog hands over first, is dropped here.
                     if self.run.state().is_stopped() {
                         break;
                     }
@@ -753,15 +773,7 @@ impl BlockingCaServer {
     /// which reads the same run state between its short-capped `recv_from`
     /// calls.
     pub fn shutdown(&self) {
-        // Wake the blocking `accept()` by connecting to ourselves; the loop
-        // then observes the flag and returns. A serving that never ran has no
-        // `accept()` to wake, and nothing drains its backlog: the dial would
-        // block for as long as clients fill it.
-        if self.run.stop()
-            && let Ok(addr) = self.listener.local_addr()
-        {
-            let _ = TcpStream::connect(addr);
-        }
+        self.run.stop();
     }
 
     /// The advertised CA TCP port — the value SEARCH replies carry so a
@@ -3051,6 +3063,103 @@ mod tests {
 
         server.shutdown();
         let _ = accept.join();
+    }
+
+    /// A stop that lands while a running server's accept loop is away from
+    /// `accept()`, busy, and clients fill its backlog, returns; the loop,
+    /// back at its accept, leaves.
+    #[test]
+    fn a_stop_behind_a_full_backlog_returns_while_the_loop_is_busy() {
+        use fact_budget::FACT_BUDGET;
+
+        let server =
+            Arc::new(BlockingCaServer::bind("127.0.0.1:0", seed_db(&[]), new_acf()).unwrap());
+        let addr = server.local_addr().unwrap();
+        // Up to the first connect the full backlog leaves unanswered.
+        let waiting: Vec<TcpStream> = std::iter::from_fn(|| {
+            // absence-window: a full backlog drops the SYN, so no reply can
+            // mark it full.
+            TcpStream::connect_timeout(&addr, Duration::from_millis(200)).ok()
+        })
+        .take(4096)
+        .collect();
+        assert!(waiting.len() < 4096, "the backlog never filled");
+
+        let (done, ended) = std::sync::mpsc::channel();
+        let srv = server.clone();
+        thread::spawn(move || {
+            srv.shutdown();
+            let _ = done.send(());
+        });
+        assert!(
+            ended.recv_timeout(FACT_BUDGET).is_ok(),
+            "the stop did not return within {FACT_BUDGET:?} ({} clients waiting)",
+            waiting.len()
+        );
+
+        let (done, ended) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            server.serve();
+            let _ = done.send(());
+        });
+        assert!(
+            ended.recv_timeout(FACT_BUDGET).is_ok(),
+            "the accept loop did not leave"
+        );
+    }
+
+    /// A stop in a process out of descriptors still wakes the parked accept,
+    /// and the port is free to bind again once the server goes. The limit is
+    /// lowered in a child process, so no other test runs under it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stop_with_no_descriptor_left_frees_the_port() {
+        use fact_budget::FACT_BUDGET;
+
+        crate::fresh_process::with_a_process_of_its_own(
+            "server::blocking::tests::a_stop_with_no_descriptor_left_frees_the_port",
+            || {
+                let server = Arc::new(
+                    BlockingCaServer::bind("127.0.0.1:0", seed_db(&[]), new_acf()).unwrap(),
+                );
+                let addr = server.local_addr().unwrap();
+                let (done, ended) = std::sync::mpsc::channel();
+                let srv = server.clone();
+                thread::spawn(move || {
+                    srv.serve();
+                    drop(srv);
+                    let _ = done.send(());
+                });
+                // Greeted, so the loop has been through `accept` and parks in the next.
+                let mut c = TcpStream::connect(addr).unwrap();
+                c.set_read_timeout(Some(FACT_BUDGET)).unwrap();
+                let _ = read_until_cmmd(&mut c, CA_PROTO_VERSION);
+
+                let limit = libc::rlimit {
+                    rlim_cur: 64,
+                    rlim_max: 64,
+                };
+                // SAFETY: a valid `rlimit`; this process runs this test alone.
+                assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+                let mut hogs = Vec::new();
+                let full = loop {
+                    match std::fs::File::open("/dev/null") {
+                        Ok(f) => hogs.push(f),
+                        Err(e) => break e,
+                    }
+                };
+                assert_eq!(full.raw_os_error(), Some(libc::EMFILE));
+                server.shutdown();
+                drop(hogs);
+
+                assert!(
+                    ended.recv_timeout(FACT_BUDGET).is_ok(),
+                    "the accept loop stayed parked after the stop"
+                );
+                drop(server);
+                TcpListener::bind(addr).expect("the stopped server's port is free to bind");
+            },
+        );
     }
 
     /// The placement that makes the count survivable: the slot is a guard, so

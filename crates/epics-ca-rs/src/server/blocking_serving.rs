@@ -320,9 +320,6 @@ impl BlockingCaServing {
     /// Stop accepting on every listener, and beaconing.
     pub fn shutdown(&self) {
         self.run.stop();
-        for server in &self.servers {
-            server.shutdown();
-        }
     }
 
     /// Wait for the serving threads; the first name-search failure is the
@@ -690,6 +687,66 @@ mod tests {
                 Err(e) => panic!("{at}: {e}"),
             }
         }
+    }
+
+    /// A stop wakes the accept loop of every interface, each back in
+    /// `accept()` after serving a client.
+    #[test]
+    fn a_stop_wakes_the_accept_loop_of_every_interface() {
+        use super::*;
+        use crate::protocol::CaHeader;
+        use fact_budget::FACT_BUDGET;
+        use std::io::Read;
+        use std::net::{TcpStream, UdpSocket};
+
+        let beacon_sink = UdpSocket::bind("127.0.0.1:0").unwrap();
+        // SAFETY: nextest runs this test alone in its process, before the
+        // memoized `addr_list::from_env` first reads these.
+        unsafe {
+            std::env::set_var("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1 127.0.0.2");
+            std::env::set_var(
+                "EPICS_CAS_BEACON_ADDR_LIST",
+                beacon_sink.local_addr().unwrap().to_string(),
+            );
+            std::env::set_var("EPICS_CAS_AUTO_BEACON_ADDR_LIST", "NO");
+        }
+        let sockets = BlockingRsrvSockets::bind(0, 0).expect("bind both interfaces");
+        let tcp: Vec<SocketAddr> = sockets
+            .listeners
+            .iter()
+            .map(|l| l.local_addr().unwrap())
+            .collect();
+        assert_eq!(tcp.len(), 2, "two interfaces");
+        let serving = BlockingCaServing::serve_with(
+            sockets,
+            Arc::new(PvDatabase::new()),
+            epics_base_rs::server::access_security::new_acf_cell(None),
+            Arc::new(ServerStats::default()),
+            &mut |_| Ok(()),
+        )
+        .expect("serve");
+        // A greeting is sent by a client thread its listener's loop accepted.
+        let _clients: Vec<TcpStream> = tcp
+            .iter()
+            .map(|addr| {
+                let mut c = TcpStream::connect(addr).unwrap();
+                c.set_read_timeout(Some(FACT_BUDGET)).unwrap();
+                c.read_exact(&mut [0u8; CaHeader::SIZE])
+                    .unwrap_or_else(|e| panic!("{addr} not served: {e}"));
+                c
+            })
+            .collect();
+
+        let (done, ended) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            serving.shutdown();
+            let _ = done.send(serving.join().is_ok());
+        });
+        assert_eq!(
+            ended.recv_timeout(FACT_BUDGET),
+            Ok(true),
+            "an accept loop was left parked"
+        );
     }
 
     /// A start that fails returns while clients fill the backlog of the

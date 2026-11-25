@@ -50,6 +50,7 @@ mod put_failed_line;
 mod raw_converter;
 mod raw_float_converter;
 mod regexp_converter;
+mod reload_drops_the_bus_after_the_record;
 mod reload_stale_reply;
 mod runtime;
 mod std_converters;

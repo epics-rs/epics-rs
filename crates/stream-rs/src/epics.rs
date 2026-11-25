@@ -61,7 +61,7 @@ use epics_libcom_rs::cfmt::CFloat;
 use parking_lot::{Condvar, Mutex};
 
 use crate::StreamBuffer;
-use crate::bus::{OwnedReadInput, StreamIoStatus};
+use crate::bus::{BusInterface, OwnedReadInput, StreamIoStatus};
 use crate::core::{
     ABORTED, ACCEPT_INPUT, Dispatch, Entry, INIT_RUN, Parsed, ProtocolResult, RunId, SCAN_TRIED,
     StartMode, StreamCore, StreamCoreHooks, StreamCoreLock, ValueMatch,
@@ -1981,6 +1981,16 @@ pub struct Stream {
     shared: Arc<Shared>,
 }
 
+/// One `streamInitRecord` at a time, keeping the bus its `attachBus` may
+/// replace until the pass ends, past its holds: the bus's drop waits for its
+/// running callback (cancelRequest, asynManager.c:1647-1655), which may be
+/// waiting for the record. C's streamReload holds no record lock
+/// (StreamEpics.cc:193) and deletes it inside attachBus.
+struct InitPass<'a> {
+    _replaced: Option<Arc<BusInterface>>,
+    _pass: parking_lot::MutexGuard<'a, ()>,
+}
+
 /// Every stream, in creation order: C's `first` / `next`.
 fn streams() -> &'static Mutex<Vec<Weak<StreamCoreLock<StreamHooks>>>> {
     static STREAMS: OnceLock<Mutex<Vec<Weak<StreamCoreLock<StreamHooks>>>>> = OnceLock::new();
@@ -2305,6 +2315,15 @@ impl Stream {
         self.lock.lock().hooks.run.get() == Run::Active
     }
 
+    /// A whole `streamInitRecord`, taken outside its holds.
+    fn init_pass(&self) -> InitPass<'_> {
+        let pass = self.shared.init_pass.lock();
+        InitPass {
+            _replaced: self.lock.lock().bus(),
+            _pass: pass,
+        }
+    }
+
     /// `streamInitRecord`'s start for a record that has its stream.
     fn stop_running_protocol(&self, held: &HeldInstance<'_>) {
         // stop any running protocol
@@ -2330,7 +2349,7 @@ impl Stream {
     fn reinit_record(&self, db: &AsyncDbHandle) -> Option<i64> {
         let name = self.name();
         let record_type = self.shared.record_type.get()?;
-        let _pass = self.shared.init_pass.lock();
+        let _pass = self.init_pass();
         let status = db.with_init_hold(name, |hold| {
             let (args, staged) = hold.held(|held| {
                 let args = held.with(|record, common| {
@@ -2605,7 +2624,7 @@ impl DeviceSupport for StreamDevice {
         let stream = self.stream.get_or_insert_with(|| {
             Stream::new(&name, 0, self.db.clone(), self.record_type.clone())
         });
-        let _pass = stream.shared.init_pass.lock();
+        let _pass = stream.init_pass();
         let record_type = &self.record_type;
         let (args, staged) = hold.held(|held| {
             let (args, prio) = held.with(|record, common| {

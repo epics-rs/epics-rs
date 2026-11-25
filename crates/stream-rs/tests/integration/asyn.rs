@@ -793,6 +793,38 @@ fn dropping_an_interface_that_holds_the_lock_frees_the_port() {
     assert_eq!(rx.recv_timeout(WAIT), Ok(true));
 }
 
+/// releaseBus deletes the interface (StreamBusInterface.h:151), whose
+/// destructor first cancels its interrupts (AsynDriverInterface.cc:285-305):
+/// a released interface, even one still kept, hears neither the port's
+/// input nor its reconnecting, while one not released on the port does.
+#[test]
+fn a_released_interface_hears_the_port_no_more() {
+    let _switches = SWITCHES.lock().unwrap_or_else(|e| e.into_inner());
+    stream_rs::asyn::register();
+    let (handle, book, _kept, kept, _client) =
+        intr_rec_on(script_with("RL", true, false), "RL", None);
+    let (gone_client, gone) = rec_terminated("gone", None, None);
+    let (released, _) = attach(&gone_client, "RL");
+    let released = released.unwrap();
+    assert!(released.bus().supports_async_read());
+    released.bus().release();
+
+    handle
+        .submit_blocking(RequestOp::Disconnect, AsynUser::new(0))
+        .unwrap();
+    handle
+        .submit_blocking(RequestOp::Connect, AsynUser::new(0))
+        .unwrap();
+    assert_eq!(
+        kept.connects.recv_timeout(fact_budget::FACT_BUDGET),
+        Ok(StreamIoStatus::StreamIoSuccess)
+    );
+    input(&handle, &book, b"12", EomReason::empty());
+    assert_ne!(reads_now(&kept), []);
+    assert_eq!(gone.connects.try_recv().ok(), None);
+    assert_eq!(reads_now(&gone), []);
+}
+
 /// `rt/dev.py` on a port of its own: it sends `greeting`
 /// on connecting and, whenever what it received since its last answer ends
 /// with a request of `table`, that request's reply. Returns its address.

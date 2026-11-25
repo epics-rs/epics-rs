@@ -1754,8 +1754,6 @@ struct SharedProcessorInner {
     /// here only as a working copy that is kept in sync with the param so a
     /// control-plane write of `ARRAY_COUNTER` resets it (B12).
     array_counter: i32,
-    /// Param index for STD_ARRAY_DATA (if this is a StdArrays plugin).
-    std_array_data_param: Option<usize>,
     /// NDArrayCallbacks (C++ `NDArrayCallbacks`): when `false`, the plugin
     /// still processes and updates its metadata params but does NOT deliver the
     /// output array downstream — `endProcessCallbacks` (NDPluginDriver.cpp:
@@ -2023,10 +2021,9 @@ impl SharedProcessorInner {
         // NDPluginStdArrays is the exception: it sets NDArrayCallbacks=0 yet
         // still serves its typed-array waveforms (STD_ARRAY_DATA). Those are
         // NOT the `doCallbacksGenericPointer` downstream path — they fire
-        // regardless of NDArrayCallbacks and ARE subject to the MaxByteRate
-        // throttle (NDPluginStdArrays.cpp:58 per-interface `throttled()`), but
-        // never wait in the sort buffer.
-        let produced = result.output_arrays.len();
+        // regardless of NDArrayCallbacks and pay the MaxByteRate throttle per
+        // receiver (NDPluginStdArrays.cpp:58 `throttled()`), but never wait
+        // in the sort buffer.
         // `getAttributes` only past the NDArrayCallbacks return (:289).
         let evaluated = self.array_callbacks.get()
             && self.read_attributes
@@ -2041,12 +2038,6 @@ impl SharedProcessorInner {
             evaluated.then_some(&self.attribute_set),
             CopyArray::IfInput(array),
         );
-        // A StdArrays frame that produced a waveform which the MaxByteRate
-        // throttle then dropped must not advance ArrayCounter — C nets it
-        // back out (NDPluginStdArrays.cpp:202-211).
-        if self.std_array_data_param.is_some() && produced > 0 && routed.served.is_none() {
-            self.array_counter -= 1;
-        }
         if !result.counted {
             self.array_counter -= 1;
         }
@@ -2118,6 +2109,7 @@ impl SharedProcessorInner {
             scatter: false,
             batch,
             addressed: Frame::new(),
+            std_arrays: None,
         }
     }
 
@@ -2204,7 +2196,7 @@ impl SharedProcessorInner {
     /// `deliver` is the NDArrayCallbacks gate (C++ `endProcessCallbacks`,
     /// NDPluginDriver.cpp:257-265): when `false`, the returned
     /// `ProcessOutput.arrays` are suppressed, while the `begin` params and
-    /// `routed.served`'s STD_ARRAY_DATA waveform are still posted.
+    /// `routed.waveforms` are still posted.
     ///
     /// `elapsed_ms` is `None` off the input-array path: C sets ExecutionTime
     /// only around `processCallbacks` (NDPluginDriver.cpp:422, :521).
@@ -2224,6 +2216,7 @@ impl SharedProcessorInner {
     ) -> ProcessOutput {
         use asyn_rs::request::ParamSetValue;
 
+        let mut std_arrays = None;
         let sets = &mut batch.sets;
         if let Some((input, begin_sets)) = begin {
             let counter = self.ndarray_params.array_counter;
@@ -2240,29 +2233,19 @@ impl SharedProcessorInner {
             ));
             // `setTimeStamp(&pArray->epicsTS)` (:232), which the dimensions
             // post and every callback until the next frame carry.
-            batch.time_stamp = Some(input.timestamp.to_system_time());
+            let time_stamp = input.timestamp.to_system_time();
+            batch.time_stamp = Some(time_stamp);
             sets.extend(self.dimensions(input));
-        }
-
-        // NDPluginStdArrays' `arrayInterruptCallback`s (NDPluginStdArrays.cpp:
-        // 170-197), between the dims post and the frame's params. Not gated by
-        // `deliver`: C posts at NDArrayCallbacks 0, StdArrays' default. Only
-        // the served output posts, so a throttled frame posts nothing (:58).
-        if let (Some(param), Some(served)) = (self.std_array_data_param, &routed.served) {
-            let interrupts = self.port_handle.interrupts();
-            let data = served.data();
-            sets.extend(
-                [
-                    std_array_post::<i8>(interrupts, param, data),
-                    std_array_post::<i16>(interrupts, param, data),
-                    std_array_post::<i32>(interrupts, param, data),
-                    std_array_post::<i64>(interrupts, param, data),
-                    std_array_post::<f32>(interrupts, param, data),
-                    std_array_post::<f64>(interrupts, param, data),
-                ]
-                .into_iter()
-                .flatten(),
-            );
+            // Not gated by `deliver`: C posts at NDArrayCallbacks 0,
+            // StdArrays' default.
+            if !routed.waveforms.is_empty() {
+                std_arrays = Some(StdArrayPosts {
+                    posts: routed.waveforms,
+                    time_stamp,
+                    array_counter: (counter, self.array_counter),
+                    dropped_output_arrays: self.plugin_params.dropped_output_arrays,
+                });
+            }
         }
 
         // ArrayRate_RBV is computed by a calc record in the DB template
@@ -2287,6 +2270,7 @@ impl SharedProcessorInner {
             scatter: false,
             batch,
             addressed: Frame::new(),
+            std_arrays,
         }
     }
 }
@@ -2298,6 +2282,8 @@ struct ProcessOutput {
     batch: ParamBatch,
     /// `ProcessResult::addressed`, published before `arrays`.
     addressed: Frame<(usize, PublishedArray)>,
+    /// NDPluginStdArrays' posts, fired once the batch is stored.
+    std_arrays: Option<StdArrayPosts>,
 }
 
 impl ProcessOutput {
@@ -2308,11 +2294,18 @@ impl ProcessOutput {
     /// frame's, and the delivery carries the section's to a blocking
     /// consumer, whose requests carry it back to the port.
     ///
+    /// StdArrays' waveforms fire between the store and the delivery, as C
+    /// posts them between `beginProcessCallbacks` and `endProcessCallbacks`
+    /// (NDPluginStdArrays.cpp:162-212). A pass that throttled a receiver
+    /// takes the frame back out of `shared`'s ArrayCounter once the section
+    /// has ended.
+    ///
     /// Broadcast frames are published to each sender in turn. Scatter frames
     /// are routed to a single consumer via `scatter_publish`, which advances
     /// the persistent `scatter_cursor`.
     async fn complete(
         self,
+        shared: &parking_lot::Mutex<SharedProcessorInner>,
         callbacks_gate: &mut CallbacksGate,
         delivery: &Delivery,
         scatter_cursor: &mut usize,
@@ -2320,6 +2313,10 @@ impl ProcessOutput {
     ) {
         let callbacks = self.batch.store(callbacks_gate, scope);
         let scope = callbacks.as_ref().map_or(scope, CallbacksAfter::scope);
+        let throttled = match self.std_arrays {
+            Some(posts) => delivery.post_std_arrays(posts, scope).await,
+            None => false,
+        };
         for (addr, arr) in &self.addressed {
             if let Some(subscribers) = delivery.senders(*addr) {
                 publish_each(&subscribers, arr.clone(), scope).await;
@@ -2336,6 +2333,9 @@ impl ProcessOutput {
         }
         if let Some(callbacks) = callbacks {
             flush_failed(callbacks.end());
+        }
+        if throttled {
+            shared.lock().array_counter -= 1;
         }
     }
 
@@ -3161,24 +3161,64 @@ impl_std_array_element!(
     convert: [I8, U8, I16, U16, I32, U32, I64, U64, F32]
 );
 
+/// One interface's STD_ARRAY_DATA post, and what the MaxByteRate throttle
+/// charges each receiver it reaches.
+struct StdArrayPost {
+    iface: asyn_rs::interfaces::InterfaceType,
+    value: ParamValue,
+    /// The converted array's size, C `throttled(pOutput)`'s cost.
+    bytes: usize,
+}
+
+/// A frame's NDPluginStdArrays posts, and the counters a pass that throttled
+/// a receiver re-sets (NDPluginStdArrays.cpp:167-212).
+struct StdArrayPosts {
+    posts: Vec<StdArrayPost>,
+    /// `pArray->epicsTS`, which every post carries (`:68`).
+    time_stamp: std::time::SystemTime,
+    /// ArrayCounter, and the value the frame's batch sets it to.
+    array_counter: (usize, i32),
+    dropped_output_arrays: usize,
+}
+
+/// NDPluginStdArrays' `arrayInterruptCallback`s, in its order
+/// (NDPluginStdArrays.cpp:167-197), for the interfaces a client is bound to.
+fn std_array_waveforms(
+    interrupts: &asyn_rs::interrupt::InterruptManager,
+    param: usize,
+    data: &crate::ndarray::NDDataBuffer,
+) -> Vec<StdArrayPost> {
+    [
+        std_array_post::<i8>(interrupts, param, data),
+        std_array_post::<i16>(interrupts, param, data),
+        std_array_post::<i32>(interrupts, param, data),
+        std_array_post::<i64>(interrupts, param, data),
+        std_array_post::<f32>(interrupts, param, data),
+        std_array_post::<f64>(interrupts, param, data),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
 /// One `arrayInterruptCallback` (NDPluginStdArrays.cpp:22-80): `data`
-/// converted into `T`'s interface and posted there, only when a client is
-/// bound to it — C converts for the first node on the list.
+/// converted into `T`'s interface, only when a client is bound to it — C
+/// converts for the first node on the list.
 fn std_array_post<T: StdArrayElement>(
     interrupts: &asyn_rs::interrupt::InterruptManager,
     param: usize,
     data: &crate::ndarray::NDDataBuffer,
-) -> Option<asyn_rs::request::ParamSetValue> {
+) -> Option<StdArrayPost> {
     if !interrupts.has_subscriber(param, 0, T::IFACE) {
         return None;
     }
     let mut elements = vec![T::default(); data.len()];
     T::convert(data, &mut elements);
-    Some(asyn_rs::request::ParamSetValue::array(
-        param,
-        0,
-        T::param(elements),
-    ))
+    Some(StdArrayPost {
+        iface: T::IFACE,
+        bytes: std::mem::size_of_val(elements.as_slice()),
+        value: T::param(elements),
+    })
 }
 
 impl PortDriver for PluginPortDriver {
@@ -3770,7 +3810,7 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
         array_outputs.clone(),
         plugin_pool.clone(),
         array_callbacks.clone(),
-        std_array_data_param.is_some(),
+        std_array_data_param,
         port_handle.clone(),
     ));
     let shared = Arc::new(parking_lot::Mutex::new(SharedProcessorInner {
@@ -3782,7 +3822,6 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
         plugin_params,
         port_handle,
         array_counter: 0,
-        std_array_data_param,
         array_callbacks,
         dropped_arrays: dropped_arrays_counter,
         prev_input_array: None,
@@ -4097,7 +4136,7 @@ async fn complete_frame(
         }
     };
     output
-        .complete(callbacks_gate, delivery, scatter_cursor, msg.scope)
+        .complete(shared, callbacks_gate, delivery, scatter_cursor, msg.scope)
         .await;
     // msg dropped here → completion signaled (if tracked)
 }
@@ -4353,6 +4392,7 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                 po
                             };
                             po.complete(
+                                &shared,
                                 &mut callbacks_gate,
                                 &delivery,
                                 &mut scatter_cursor,
@@ -4584,6 +4624,7 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                                     &array,
                                                 );
                                                 po.complete(
+                                                    &shared,
                                                     &mut callbacks_gate,
                                                     &delivery,
                                                     &mut scatter_cursor,
@@ -4654,6 +4695,7 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                 if let Some(output) = flush_work {
                                     output
                                         .complete(
+                                            &shared,
                                             &mut callbacks_gate,
                                             &delivery,
                                             &mut scatter_cursor,
@@ -4717,6 +4759,7 @@ fn plugin_data_loop<P: NDPluginProcess>(
                             };
                             if let Some(po) = process_output {
                                 po.complete(
+                                    &shared,
                                     &mut callbacks_gate,
                                     &delivery,
                                     &mut scatter_cursor,
@@ -4736,6 +4779,7 @@ fn plugin_data_loop<P: NDPluginProcess>(
                         .tick_sort_buffer(ParamBatch::new(&callbacks_gate));
                     output
                         .complete(
+                            &shared,
                             &mut callbacks_gate,
                             &delivery,
                             &mut scatter_cursor,

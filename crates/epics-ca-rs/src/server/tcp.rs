@@ -16931,6 +16931,7 @@ mod destroyed_channel_teardown_tests {
             None,
             "closed after EVENT_CANCEL"
         );
+        epics_base_rs::runtime::log::errlog_flush();
         epics_base_rs::runtime::log::errlog_remove_listener(listener);
         assert_eq!(
             *logged.lock().unwrap(),

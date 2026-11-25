@@ -623,10 +623,10 @@ pub fn spawn_ca_monitor(
     // has the IOC render a float at its PREC and an enum as its label.
     let as_text = dbr_type == PvAttrDbrType::String;
     runtime.spawn(async move {
-        use epics_ca_rs::protocol::{DBE_ALARM, DBE_LOG, DBE_VALUE};
+        use epics_ca_rs::protocol::DBE_VALUE;
         let channel = client.create_channel(&pv_name);
         let Ok(mut monitor) = channel
-            .subscribe_with_mask_readback(0.0, DBE_VALUE | DBE_LOG | DBE_ALARM, as_text, as_text)
+            .subscribe_with_mask_readback(0.0, DBE_VALUE, as_text, as_text)
             .await
         else {
             return;

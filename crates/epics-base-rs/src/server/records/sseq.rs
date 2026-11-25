@@ -8,7 +8,7 @@ use crate::server::database::{AsyncDbHandle, PostRule};
 use crate::server::record::{CycleCell, CycleRead, CycleValue};
 use crate::server::record::{
     CycleMarks, CyclePostMask, LinkReadAs, OutTarget, PostStage, ProcessAction, ProcessActions,
-    ProcessOutcome, Record, RecordProcessResult,
+    ProcessOutcome, Record, RecordProcessResult, parse_link_v2, parse_output_link_v2,
 };
 use crate::types::{DbfCode, EpicsValue, PvString};
 use std::sync::Arc;
@@ -329,6 +329,19 @@ struct SseqStep {
 }
 
 impl SseqStep {
+    /// C `dol.type != CONSTANT`: a number or empty `DOLn` was consumed at
+    /// init and is never read again.
+    fn reads_dol(&self) -> bool {
+        !parse_link_v2(&self.dol).is_constant_type()
+    }
+
+    /// C `lnk.type != CONSTANT || dol.type != CONSTANT`
+    /// (sseqRecord.c:355-356): a group with nothing to read and nowhere to
+    /// write is no step, so its `DLYn` is not waited.
+    fn is_step(&self) -> bool {
+        !parse_output_link_v2(&self.lnk).is_constant_type() || self.reads_dol()
+    }
+
     /// Write the step's value FROM its numeric view, re-deriving the string
     /// view — the single owner of `dov → s` (C `cvtDoubleToString(dov, s,
     /// pR->prec)`).
@@ -437,10 +450,15 @@ pub struct SseqRecord {
     /// disturb the next sequence. `None` while `Idle`.
     seq_wake: Option<Arc<Notify>>,
     /// Canonical record name + cycle-free database handle, stashed at
-    /// `add_record` via [`Record::set_async_context`]. Drives the `ABORT` finish
-    /// re-entry and the link-status refresh — the surfaces a `process()`
+    /// `add_record` via [`Record::set_async_context`]. Drives the put-callback
+    /// wake re-entry and the link-status refresh — the surfaces a `process()`
     /// cannot reach itself.
     async_ctx: Option<(crate::types::RecordName, AsyncDbHandle)>,
+    /// `special(ABORT)`'s `callbackRequest` (sseqRecord.c:1188, :1212), taken
+    /// by the put as a zero-delay `ReprocessAfter` whose token supersedes any
+    /// pending `DLYn` timer. C cancels the timer only with over 0.1 s left
+    /// (:1204) and otherwise lets it finish the abort; here any is superseded.
+    finish_now: bool,
     /// The callback band this record's `PRIO` selects, refreshed from
     /// [`crate::server::record::ProcessContext`] before every `process()` — C
     /// `sseqRecord.c:178` `callbackSetPriority(pR->prio, &pcb->callback)`,
@@ -495,6 +513,7 @@ impl Default for SseqRecord {
             in_flight: Vec::new(),
             seq_wake: None,
             async_ctx: None,
+            finish_now: false,
             callback_priority: crate::runtime::task::CallbackPriority::Low,
             pending_posts: 0,
             link_gen: LinkStatusGen::default(),
@@ -658,13 +677,8 @@ impl SseqRecord {
         // bridge that re-enters the machine when one completes.
         self.in_flight.clear();
         self.seq_wake = Some(Arc::new(Notify::new()));
-        // C `process` (sseqRecord.c:347-365): a step joins the active list
-        // when it is selected AND has a non-constant `LNKn` or `DOLn`.
         self.active = (0..NUM_STEPS)
-            .filter(|&i| {
-                self.should_execute_step(i)
-                    && (!self.steps[i].lnk.is_empty() || !self.steps[i].dol.is_empty())
-            })
+            .filter(|&i| self.should_execute_step(i) && self.steps[i].is_step())
             .collect();
         self.cursor = 0;
         if self.active.is_empty() {
@@ -942,7 +956,11 @@ impl SseqRecord {
         let prio = self.callback_priority;
         crate::runtime::task::spawn_background(prio, async move {
             wake.notified().await;
-            reenter_now(&name, &handle).await;
+            if let Some(token) = handle.mint_async_token(&name) {
+                let (waitset, completion) = AsyncDbHandle::new_put_notify();
+                waitset.leave();
+                handle.reprocess_on_notify(token, completion);
+            }
         });
     }
 
@@ -1035,25 +1053,6 @@ impl SseqRecord {
             field: "BUSY",
             value: crate::server::record::CycleValue::Short(0),
         }])
-    }
-
-    /// Drive an immediate abort completion from `special` (C
-    /// `epicsTimerCancel` + `callbackRequest`): supersede any pending
-    /// `DLYn` re-entry, then re-enter so the next `process()` runs the abort
-    /// drain at once. The superseded timer, when it wakes, re-enters nothing
-    /// (the `AsyncToken` generation gate). Used when the machine is in phase
-    /// `Fire` (a delay is pending); a phase-`Wait` abort instead wakes the
-    /// already-parked bridge task via [`Self::wake_machine`].
-    fn force_finish_reentry(&self) {
-        if let Some((name, handle)) = &self.async_ctx {
-            let name = name.clone();
-            let handle = handle.clone();
-            let prio = self.callback_priority;
-            crate::runtime::task::spawn_background(prio, async move {
-                handle.cancel_async_reentry(&name);
-                reenter_now(&name, &handle).await;
-            });
-        }
     }
 
     /// Recompute the per-step DOL/LNK link-status diagnostics
@@ -1227,21 +1226,6 @@ impl SseqRecord {
     }
 }
 
-/// Mint a fresh async re-entry token wired to an already-fired completion,
-/// so the record's `process()` runs again as soon as the framework
-/// schedules it (C `callbackRequest`). Shared by `arm_wake` (after a
-/// completion notify) and `force_finish_reentry` (after cancelling a
-/// pending delay). Minting supersedes any prior pending token; callers
-/// invoke it only where that is intended (phase `Wait`, where nothing is
-/// pending, or right after `cancel_async_reentry`).
-async fn reenter_now(name: &[u8], handle: &AsyncDbHandle) {
-    if let Some(token) = handle.mint_async_token(name) {
-        let (waitset, completion) = AsyncDbHandle::new_put_notify();
-        waitset.leave();
-        handle.reprocess_on_notify(token, completion);
-    }
-}
-
 impl Record for SseqRecord {
     crate::slot_map!(crate::server::record::dbd_generated::slots::sseq;
         fields:
@@ -1319,6 +1303,14 @@ impl Record for SseqRecord {
             }
         }
         Ok(())
+    }
+
+    fn take_special_actions(&mut self) -> Vec<ProcessAction> {
+        if std::mem::take(&mut self.finish_now) {
+            vec![ProcessAction::ReprocessAfter(std::time::Duration::ZERO)]
+        } else {
+            Vec::new()
+        }
     }
 
     /// Every post of a `DOn`/`STRn` is one the record's own writer made
@@ -1439,7 +1431,7 @@ impl Record for SseqRecord {
         // the earliest hook (it runs before the selection is resolved), and
         // only at a sequence start (`busy == 0`); a continuation must not
         // re-read `SELL` mid-sequence.
-        if self.busy == 0 && self.selm != 0 && !self.sell.is_empty() {
+        if self.busy == 0 && self.selm != 0 && !parse_link_v2(&self.sell).is_constant_type() {
             ProcessActions::from(vec![ProcessAction::ReadDbLink {
                 link_field: "SELL",
                 target_field: "SELN",
@@ -1457,7 +1449,7 @@ impl Record for SseqRecord {
         if self.phase == SeqPhase::Fire && self.cursor < self.active.len() {
             let i = self.active[self.cursor];
             let mut actions = Vec::with_capacity(2);
-            if !self.steps[i].dol.is_empty() {
+            if self.steps[i].reads_dol() {
                 actions.push(ProcessAction::ReadDbLink {
                     link_field: DOL_FIELDS[i],
                     target_field: DO_FIELDS[i],
@@ -1580,12 +1572,12 @@ impl Record for SseqRecord {
             self.in_flight.clear();
             self.cursor = self.active.len();
             // With `in_flight` empty the drain finishes immediately on
-            // re-entry: wake the parked phase-`Wait` task, or mint a fresh
+            // re-entry: wake the parked phase-`Wait` task, or request a fresh
             // re-entry if somehow not blocked.
             if self.phase == SeqPhase::Wait {
                 self.wake_machine();
             } else {
-                self.force_finish_reentry();
+                self.finish_now = true;
             }
             return Ok(());
         }
@@ -1605,7 +1597,7 @@ impl Record for SseqRecord {
         // (firing its current, un-superseded token — no competing re-entry
         // task).
         if self.phase == SeqPhase::Fire {
-            self.force_finish_reentry();
+            self.finish_now = true;
         } else if self.phase == SeqPhase::Wait {
             self.wake_machine();
         }

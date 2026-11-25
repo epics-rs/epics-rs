@@ -952,6 +952,7 @@ mod special_scan_store_keeps_the_scan_list;
 mod sseq_async_machine;
 mod sseq_busy_clears_after_the_step_write;
 mod sseq_ca_link_to_a_local_pv;
+mod sseq_constant_links_make_no_step;
 mod sseq_db_link_put_posts_like_softioc;
 mod sseq_dly_quantization;
 mod sseq_dol_source_typed;

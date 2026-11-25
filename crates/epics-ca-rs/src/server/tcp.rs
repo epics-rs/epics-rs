@@ -6167,6 +6167,8 @@ enum EventStep {
     Ended(usize),
     /// The database destroyed something since the last sweep.
     Destroyed,
+    /// Access security changed since the last re-evaluation.
+    AccessChanged,
     /// A control message (`None` = the dispatch thread dropped the sender).
     Control(Option<EventTaskControl>),
     /// Pending write-completion `idx` ended.
@@ -6236,7 +6238,7 @@ async fn next_event_step(
     events: &epics_base_rs::server::event_queue::EventUser,
     subs: &mut [MonitorDelivery],
     pending_writes: &mut [PendingWriteNotify],
-    destroyed: &mut impl DestroyedChannels,
+    table: &mut impl ChannelTable,
     control: &mut tokio::sync::mpsc::UnboundedReceiver<EventTaskControl>,
     slot: &mut Option<epics_base_rs::server::event_queue::CircuitEvent>,
 ) -> EventStep {
@@ -6269,16 +6271,19 @@ async fn next_event_step(
         }
     });
     let writes = next_settled_write_notify(pending_writes);
-    let gone = destroyed.destroyed();
+    let woke = table.wake();
     let ctrl = control.recv();
-    tokio::pin!(readers, writes, gone, ctrl);
+    tokio::pin!(readers, writes, woke, ctrl);
 
-    match select(select(select(readers, writes), gone), ctrl).await {
-        Either::Left((Either::Left((Either::Left((step, _writes)), _gone)), _ctrl)) => step,
-        Either::Left((Either::Left((Either::Right(((res, idx), _readers)), _gone)), _ctrl)) => {
+    match select(select(select(readers, writes), woke), ctrl).await {
+        Either::Left((Either::Left((Either::Left((step, _writes)), _woke)), _ctrl)) => step,
+        Either::Left((Either::Left((Either::Right(((res, idx), _readers)), _woke)), _ctrl)) => {
             EventStep::WriteDone(idx, res)
         }
-        Either::Left((Either::Right(((), _)), _ctrl)) => EventStep::Destroyed,
+        Either::Left((Either::Right((TableWake::Destroyed, _)), _ctrl)) => EventStep::Destroyed,
+        Either::Left((Either::Right((TableWake::AccessChanged, _)), _ctrl)) => {
+            EventStep::AccessChanged
+        }
         Either::Right((ctrl_msg, _)) => EventStep::Control(ctrl_msg),
     }
 }
@@ -6295,41 +6300,76 @@ async fn next_event_step(
 /// (`casStrmClient.cc:2171-2209`), monitored or not. libca fails every IO on
 /// it with `ECA_DISCONN` (`cac::disconnectAllIO`,
 /// `modules/ca/src/client/cac.cpp:676-694` at R7.0.10).
-pub(crate) trait DestroyedChannels {
-    /// Resolves once the database has destroyed something since it last did.
-    async fn destroyed(&mut self);
+///
+/// rsrv's event task is also where an access change lands: asLib's
+/// `casAccessRightsCB` queues the channel and posts extra labor, and the
+/// event task sends its `CA_PROTO_ACCESS_RIGHTS` (`rsrv_extra_labor`,
+/// `camessage.c:1070-1138`, `:1502-1508`).
+pub(crate) trait ChannelTable {
+    /// Resolves with the next reason to take the table.
+    async fn wake(&mut self) -> TableWake;
     /// With the table held, retire every channel whose target is destroyed
     /// ([`retire_destroyed_channels`]) and hand their client cids to `stage`
     /// before letting go. `false` reports the peer gone.
     async fn retire(&mut self, stage: impl FnOnce(Vec<u32>) -> bool) -> bool;
+    /// With the table held, re-evaluate every channel's rights
+    /// ([`reeval_access_rights`]) and send what moved. `false` reports the
+    /// peer gone.
+    async fn reevaluate_access(&mut self) -> bool;
 }
 
-/// A blocking driver's client under its lock, as [`ClientDestroys`] retires
+/// What [`ChannelTable::wake`] resolved to.
+pub(crate) enum TableWake {
+    /// The database has destroyed something since it last did.
+    Destroyed,
+    /// Access security changed since it last did.
+    AccessChanged,
+}
+
+/// A blocking driver's client under its lock, as [`ClientTable`] works
 /// against it. Synchronous, so the driver's own code awaits nothing.
 pub(crate) trait LockedClient {
     fn state(&mut self) -> &mut ClientState;
+    /// Send the replies queued in the outbox. `false` reports the peer gone.
+    fn send_queued(&mut self) -> bool;
     /// Channels were just retired: send the replies queued ahead of their
     /// `CA_PROTO_SERVER_DISCONN`s and drop their subscriptions. `false`
     /// reports the peer gone.
     fn channels_retired(&mut self) -> bool;
 }
 
-/// The blocking driver's [`DestroyedChannels`]: the database's destroy
-/// wake-up, and the client lock to retire under.
-pub(crate) struct ClientDestroys<C> {
+/// The blocking driver's [`ChannelTable`]: the client lock, and the wake-ups
+/// that send the event thread to it.
+pub(crate) struct ClientTable<C> {
     pub(crate) client: Arc<tokio::sync::Mutex<C>>,
-    pub(crate) wake: broadcast::Receiver<()>,
+    /// [`PvDatabase::pv_destroyed_events`](epics_base_rs::server::database::PvDatabase::pv_destroyed_events).
+    pub(crate) destroyed: broadcast::Receiver<()>,
+    /// [`subscribe_asg_changes`](epics_base_rs::server::access_security::subscribe_asg_changes).
+    pub(crate) access: broadcast::Receiver<()>,
+    /// The client's outbox, which `reevaluate_access` queues into.
+    pub(crate) outbox: Outbox,
     pub(crate) peer: SocketAddr,
 }
 
-impl<C: LockedClient> DestroyedChannels for ClientDestroys<C> {
-    async fn destroyed(&mut self) {
-        match self.wake.recv().await {
-            // A missed wake still means "re-check what you serve".
-            Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {}
-            // The client holds the database, the sender's owner, until the
-            // event thread is joined.
-            Err(broadcast::error::RecvError::Closed) => std::future::pending().await,
+/// A missed wake still means "re-check what you serve". Neither sender is
+/// dropped while the event thread runs: the client holds the database, and
+/// the access-change sender is a process static.
+async fn next_wake(rx: &mut broadcast::Receiver<()>) {
+    match rx.recv().await {
+        Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+        Err(broadcast::error::RecvError::Closed) => std::future::pending().await,
+    }
+}
+
+impl<C: LockedClient> ChannelTable for ClientTable<C> {
+    async fn wake(&mut self) -> TableWake {
+        use futures_util::future::{Either, select};
+        let destroyed = next_wake(&mut self.destroyed);
+        let access = next_wake(&mut self.access);
+        tokio::pin!(destroyed, access);
+        match select(destroyed, access).await {
+            Either::Left(_) => TableWake::Destroyed,
+            Either::Right(_) => TableWake::AccessChanged,
         }
     }
 
@@ -6340,6 +6380,14 @@ impl<C: LockedClient> DestroyedChannels for ClientDestroys<C> {
             return false;
         }
         stage(cids)
+    }
+
+    async fn reevaluate_access(&mut self) -> bool {
+        let mut client = self.client.lock().await;
+        reeval_access_rights(client.state(), &self.outbox)
+            .await
+            .is_ok()
+            && client.send_queued()
     }
 }
 
@@ -6364,13 +6412,17 @@ impl DestroyedCids {
 }
 
 #[cfg(test)]
-impl DestroyedChannels for DestroyedCids {
-    async fn destroyed(&mut self) {
+impl ChannelTable for DestroyedCids {
+    async fn wake(&mut self) -> TableWake {
         self.1.notified().await;
+        TableWake::Destroyed
     }
     async fn retire(&mut self, stage: impl FnOnce(Vec<u32>) -> bool) -> bool {
         let cids = std::mem::take(&mut *self.0.lock().unwrap());
         stage(cids)
+    }
+    async fn reevaluate_access(&mut self) -> bool {
+        true
     }
 }
 
@@ -6402,7 +6454,7 @@ fn take_control(
 /// ahead of that channel's `CA_PROTO_SERVER_DISCONN`. `false` reports the
 /// peer gone.
 async fn retire_destroyed(
-    destroyed: &mut impl DestroyedChannels,
+    table: &mut impl ChannelTable,
     control: &mut tokio::sync::mpsc::UnboundedReceiver<EventTaskControl>,
     subs: &mut Vec<MonitorDelivery>,
     pending_writes: &mut Vec<PendingWriteNotify>,
@@ -6410,7 +6462,7 @@ async fn retire_destroyed(
     events: &epics_base_rs::server::event_queue::EventUser,
     client_minor: u16,
 ) -> bool {
-    destroyed
+    table
         .retire(|cids| {
             let mut acks = Vec::new();
             while let Ok(msg) = control.try_recv() {
@@ -6568,7 +6620,8 @@ impl<S: EventSink> Drop for FlushOnExit<S> {
 /// fires, sends the deferred reply via [`PendingWriteNotify::settle`] under the
 /// send lock. So there is no third socket writer — monitors and write
 /// completions share this one owner. A destroyed channel's retirement is
-/// staged here too, through [`DestroyedChannels`], behind the writes it owes.
+/// staged here too, through [`ChannelTable`], behind the writes it owes, and
+/// so is an access change's `CA_PROTO_ACCESS_RIGHTS`.
 ///
 /// Frames are staged into the client's send buffer and sent at the end of a
 /// drained queue, or once nothing more is ready (see [`EventSink`]); on the
@@ -6577,7 +6630,7 @@ impl<S: EventSink> Drop for FlushOnExit<S> {
 pub(crate) async fn run_event_task(
     events: Arc<epics_base_rs::server::event_queue::EventUser>,
     mut control: tokio::sync::mpsc::UnboundedReceiver<EventTaskControl>,
-    mut destroyed: impl DestroyedChannels,
+    mut table: impl ChannelTable,
     sink: impl EventSink,
     minor: CircuitMinor,
 ) {
@@ -6601,7 +6654,7 @@ pub(crate) async fn run_event_task(
                 &events,
                 &mut subs,
                 &mut pending_writes,
-                &mut destroyed,
+                &mut table,
                 &mut control,
                 &mut slot,
             );
@@ -6624,7 +6677,7 @@ pub(crate) async fn run_event_task(
                     continue;
                 };
                 if !retire_destroyed(
-                    &mut destroyed,
+                    &mut table,
                     &mut control,
                     &mut subs,
                     &mut pending_writes,
@@ -6640,7 +6693,7 @@ pub(crate) async fn run_event_task(
             }
             EventStep::Destroyed => {
                 if !retire_destroyed(
-                    &mut destroyed,
+                    &mut table,
                     &mut control,
                     &mut subs,
                     &mut pending_writes,
@@ -6650,6 +6703,11 @@ pub(crate) async fn run_event_task(
                 )
                 .await
                 {
+                    break;
+                }
+            }
+            EventStep::AccessChanged => {
+                if !table.reevaluate_access().await {
                     break;
                 }
             }

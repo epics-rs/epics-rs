@@ -159,7 +159,7 @@ use crate::server::outbox::{self, OutboxDrain};
 use crate::server::recv::{Admit, Gate, RecvAccumulator};
 use crate::server::stats::ServerStats;
 use crate::server::tcp::{
-    AdmittedPut, Blocked, CancelInfo, ChannelTarget, ClientDestroys, ClientState, Dispatched,
+    AdmittedPut, Blocked, CancelInfo, ChannelTarget, ClientState, ClientTable, Dispatched,
     EventTaskControl, LockedClient, MonitorDelivery, RegisteredSubscription, SubscriptionDelivery,
     SubscriptionOutcome, WriteHeadOutcome, cancel_subscription_reply, dispatch_message,
     is_peer_disconnect, log_circuit, print_forcing_disconnect, refuse_bad_tcp_command,
@@ -1411,8 +1411,12 @@ impl LockedClient for BlockingClient {
         &mut self.state
     }
 
+    fn send_queued(&mut self) -> bool {
+        drain_outbox_locked(&self.send_lock, &mut self.drain).is_ok()
+    }
+
     fn channels_retired(&mut self) -> bool {
-        if drain_outbox_locked(&self.send_lock, &mut self.drain).is_err() {
+        if !self.send_queued() {
             return false;
         }
         // The destroy ended their readers on the event thread.
@@ -1578,10 +1582,13 @@ fn handle_client_blocking(
         drain,
         send_lock: send_lock.clone(),
     }));
-    // Subscribed before any channel exists, so no destroy goes unseen.
-    let destroys = ClientDestroys {
+    // Subscribed before any channel exists, so no destroy and no access
+    // change goes unseen.
+    let table = ClientTable {
         client: client.clone(),
-        wake: db.pv_destroyed_events(),
+        destroyed: db.pv_destroyed_events(),
+        access: epics_base_rs::server::access_security::subscribe_asg_changes(),
+        outbox: outbox.clone(),
         peer,
     };
     let event_job = event_worker.run(move || {
@@ -1594,15 +1601,7 @@ fn handle_client_blocking(
             None,
         );
         let sink = EventSendBuf(event_send_lock);
-        if block_on_sync(run_event_task(
-            event_user,
-            ev_rx,
-            destroys,
-            sink,
-            event_minor,
-        ))
-        .is_err()
-        {
+        if block_on_sync(run_event_task(event_user, ev_rx, table, sink, event_minor)).is_err() {
             tracing::error!(
                 target: "epics_ca_rs::server::blocking",
                 %peer,
@@ -5145,6 +5144,51 @@ mod tests {
             crate::protocol::ECA_NORDACCESS
         );
         assert_eq!(u32::from_be_bytes(initial[12..16].try_into().unwrap()), 9);
+
+        server.shutdown();
+        accept.join().unwrap();
+    }
+
+    /// An ACF reload under a live channel moves both what the server enforces
+    /// and the `CA_PROTO_ACCESS_RIGHTS` its client holds: rsrv's
+    /// `casAccessRightsCB` and the event task's `rsrv_extra_labor`
+    /// (`camessage.c:1070-1138`, `:1502-1508`).
+    #[test]
+    fn an_acf_reload_moves_a_live_channels_rights() {
+        use crate::protocol::{CA_PROTO_ACCESS_RIGHTS, ECA_NORMAL, ECA_NOWTACCESS};
+        use epics_base_rs::server::access_security::{new_acf_cell, parse_acf};
+        const READ_WRITE: &str = "ASG(DEFAULT) {\n RULE(1, READ)\n RULE(1, WRITE)\n}\n";
+        const READ_ONLY: &str = "ASG(DEFAULT) {\n RULE(1, READ)\n}\n";
+        let word = |f: &[u8], at: usize| u32::from_be_bytes(f[at..at + 4].try_into().unwrap());
+
+        let db = seed_db(&[("BLK:AR", EpicsValue::Double(0.0))]);
+        let acf = new_acf_cell(Some(parse_acf(READ_WRITE).unwrap()));
+        let server = Arc::new(BlockingCaServer::bind("127.0.0.1:0", db, acf.clone()).unwrap());
+        let addr = server.local_addr().unwrap();
+        let srv = server.clone();
+        let accept = thread::spawn(move || srv.serve());
+
+        let mut c = TcpStream::connect(addr).unwrap();
+        c.set_read_timeout(Some(fact_budget::FACT_BUDGET)).unwrap();
+        let _ = read_until_cmmd(&mut c, CA_PROTO_VERSION);
+        c.write_all(&version_frame()).unwrap();
+        c.write_all(&create_chan_frame(0x1234, "BLK:AR")).unwrap();
+        let granted = read_until_cmmd(&mut c, CA_PROTO_ACCESS_RIGHTS);
+        assert_eq!((word(&granted, 8), word(&granted, 12)), (0x1234, 3));
+        let sid = word(&read_until_cmmd(&mut c, CA_PROTO_CREATE_CHAN), 12);
+        let put = |c: &mut TcpStream, ioid: u32| {
+            c.write_all(&write_notify_frame(sid, ioid, DBR_DOUBLE_MON, 1.0))
+                .unwrap();
+            word(&read_until_cmmd(c, CA_PROTO_WRITE_NOTIFY), 8)
+        };
+        assert_eq!(put(&mut c, 1), ECA_NORMAL);
+
+        // iocsh `asInit`.
+        acf.install(parse_acf(READ_ONLY).unwrap());
+
+        let revoked = read_until_cmmd(&mut c, CA_PROTO_ACCESS_RIGHTS);
+        assert_eq!((word(&revoked, 8), word(&revoked, 12)), (0x1234, 1));
+        assert_eq!(put(&mut c, 2), ECA_NOWTACCESS);
 
         server.shutdown();
         accept.join().unwrap();

@@ -236,7 +236,10 @@ impl Connection {
         match &result {
             // A disconnect is the monitor's to report.
             Err(e) if !is_disconnect(e) => {
-                epics_base_rs::stderr_println!("{pv_name} PVA link put ERROR: {}", put_what(e));
+                epics_base_rs::runtime::log::errlog_vprintf(format_args!(
+                    "{pv_name} PVA link put ERROR: {}\n",
+                    put_what(e)
+                ));
             }
             _ => {}
         }

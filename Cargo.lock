@@ -26,6 +26,7 @@ name = "ad-plugins-rs"
 version = "0.34.2"
 dependencies = [
  "ad-core-rs",
+ "alloc-count",
  "asyn-rs",
  "epics-base-rs",
  "epics-bridge-rs",

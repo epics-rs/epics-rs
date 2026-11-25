@@ -2,39 +2,13 @@
 //! grew: it allocates its waveforms and its output, one `f64` per padded
 //! sample at most, and no complex row or plan scratch, which is twice that.
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
 use std::sync::Arc;
 
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::NDPluginProcess;
 use ad_plugins_rs::fft::{FFTConfig, FFTDirection, FFTProcessor};
-
-thread_local! {
-    static COUNTING: Cell<bool> = const { Cell::new(false) };
-    static LARGEST: Cell<usize> = const { Cell::new(0) };
-}
-
-struct Counting;
-
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if COUNTING.with(Cell::get) {
-            LARGEST.with(|n| n.set(n.get().max(layout.size())));
-        }
-        // SAFETY: forwarded unchanged.
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        // SAFETY: forwarded unchanged.
-        unsafe { System.dealloc(ptr, layout) }
-    }
-}
-
-#[global_allocator]
-static GLOBAL: Counting = Counting;
+use alloc_count::thread;
 
 const N: usize = 1 << 16;
 
@@ -51,12 +25,9 @@ fn a_second_1d_frame_allocates_no_complex_buffer() {
             ..FFTConfig::default()
         });
         drop(fft.process_array(&frame, &pool));
-        LARGEST.with(|n| n.set(0));
-        COUNTING.with(|c| c.set(true));
-        let second = fft.process_array(&frame, &pool);
-        COUNTING.with(|c| c.set(false));
+        let (second, counts) = thread::counted(|| fft.process_array(&frame, &pool));
         drop(second);
-        let largest = LARGEST.with(Cell::get);
+        let largest = counts.largest;
         assert!(
             largest <= N * size_of::<f64>(),
             "{direction:?}: a {largest}-byte allocation"

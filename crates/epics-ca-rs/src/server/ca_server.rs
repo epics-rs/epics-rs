@@ -1242,8 +1242,8 @@ impl CaServer {
         }
         let audit_for_tcp = self.audit.clone();
         // Drain coordination — shared between the TCP listener
-        // (checks before accept) and the introspection /drain admin
-        // route (sets when triggered).
+        // (refuses new connections while set) and the introspection /drain
+        // admin route (sets when triggered).
         let drain = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let drain_for_tcp = drain.clone();
         #[cfg(feature = "cap-tokens")]

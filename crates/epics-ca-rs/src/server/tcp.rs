@@ -1781,7 +1781,7 @@ pub async fn run_tcp_listener(
         #[cfg(feature = "cap-tokens")]
         let cap_token_verifier_t = cap_token_verifier.clone();
         accept_tasks.spawn(async move {
-            accept_loop(
+            match accept_loop(
                 listener,
                 intf,
                 actual_port,
@@ -1797,12 +1797,12 @@ pub async fn run_tcp_listener(
                 #[cfg(feature = "cap-tokens")]
                 cap_token_verifier_t,
             )
-            .await
+            .await {}
         });
     }
 
-    // Wait for the first error (or for all loops to exit cleanly via
-    // drain). On error, JoinSet::Drop aborts the surviving loops.
+    // An accept loop never returns, so this ends only on a task panic. On
+    // error, JoinSet::Drop aborts the surviving loops.
     while let Some(res) = accept_tasks.join_next().await {
         match res {
             Ok(Ok(())) => continue,
@@ -1820,10 +1820,11 @@ pub async fn run_tcp_listener(
 }
 
 /// Per-interface accept loop. Owned by `run_tcp_listener` via a
-/// `JoinSet` — one task per `EPICS_CAS_INTF_ADDR_LIST` entry. Drains
-/// when the shared `drain` flag is set; otherwise spawns a
+/// `JoinSet` — one task per `EPICS_CAS_INTF_ADDR_LIST` entry. Spawns a
 /// `handle_client` task into the local `conn_tasks` `JoinSet` per
-/// accepted connection.
+/// accepted connection, or closes the connection while the shared `drain`
+/// flag is set. It never returns: `conn_tasks` belongs to this future, so
+/// an exit would abort every connected client, which drain must keep.
 ///
 /// `intf` is the bound interface IP; recorded on accept-error logs so
 /// multi-NIC hosts can tell which listener saw the failure. The
@@ -1846,7 +1847,7 @@ async fn accept_loop(
         Arc<std::sync::RwLock<Arc<tokio_rustls::rustls::ServerConfig>>>,
     >,
     #[cfg(feature = "cap-tokens")] cap_token_verifier: Option<Arc<crate::cap_token::TokenVerifier>>,
-) -> CaResult<()> {
+) -> std::convert::Infallible {
     // track per-connection tasks in a JoinSet so they're
     // aborted as a unit when this accept-loop future is dropped (e.g.
     // CaServer shutdown via tcp_abort.abort()). Without this, every
@@ -1866,14 +1867,6 @@ async fn accept_loop(
     let mut backoff = AcceptBackoff::new();
 
     loop {
-        // Drain mode: stop accepting new connections. Existing
-        // connections continue to be served by their own tasks; the
-        // CaServer::run() loop coordinates the grace period and the
-        // ultimate exit.
-        if drain.load(std::sync::atomic::Ordering::Acquire) {
-            tracing::info!(intf = %intf, "TCP listener: drain mode set, exiting accept loop");
-            return Ok(());
-        }
         let (stream, peer) = tokio::select! {
             biased;
             // Was `res?`. A single transient failure — `ECONNABORTED` from a
@@ -10609,6 +10602,97 @@ mod multi_nic_listener_tests {
                 std::env::set_var("EPICS_CAS_INTF_ADDR_LIST", v);
             }
         }
+    }
+}
+
+#[cfg(tokio_backend)]
+#[cfg(test)]
+mod drain_tests {
+    //! Drain (SIGTERM under `EPICS_CAS_DRAIN_GRACE_SECS`, POST /drain) closes
+    //! admission and keeps serving the clients already connected.
+    use super::*;
+    use epics_base_rs::server::database::PvDatabase;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpStream;
+
+    /// Whether `client` gets its `CA_PROTO_ECHO` answered, skipping whatever
+    /// the server sent first; `false` on EOF, reset or silence.
+    async fn echo_answered(client: &mut TcpStream) -> bool {
+        if client
+            .write_all(&CaHeader::new(CA_PROTO_ECHO).to_bytes())
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        let exchange = async {
+            loop {
+                let mut frame = [0u8; CaHeader::SIZE];
+                client.read_exact(&mut frame).await?;
+                let (h, _) = CaHeader::from_bytes_extended(&frame).expect("header parses");
+                let mut body = vec![0u8; h.actual_postsize()];
+                client.read_exact(&mut body).await?;
+                if h.cmmd == CA_PROTO_ECHO {
+                    return std::io::Result::Ok(());
+                }
+            }
+        };
+        matches!(
+            tokio::time::timeout(fact_budget::FACT_BUDGET, exchange).await,
+            Ok(Ok(()))
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn a_connected_client_keeps_being_served_after_a_connect_during_drain() {
+        let acf = epics_base_rs::server::access_security::new_acf_cell(None);
+        let (acf_reload_tx, _) = broadcast::channel::<()>(4);
+        let drain = Arc::new(AtomicBool::new(false));
+        let bound = bind_tcp_listeners(0).await.expect("listener bound");
+        let port = bound.port();
+        let server = tokio::spawn(run_tcp_listener(
+            Arc::new(PvDatabase::new()),
+            bound,
+            acf,
+            acf_reload_tx,
+            None,
+            None,
+            drain.clone(),
+            None,
+            #[cfg(feature = "experimental-rust-tls")]
+            None,
+            #[cfg(feature = "cap-tokens")]
+            None,
+        ));
+
+        let mut served = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("first client connects");
+        let mut ver = CaHeader::new(CA_PROTO_VERSION);
+        ver.count = CA_MINOR_VERSION;
+        served.write_all(&ver.to_bytes()).await.expect("version");
+        assert!(echo_answered(&mut served).await, "served before drain");
+
+        drain.store(true, Ordering::Release);
+
+        let mut refused = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("the kernel completes the handshake");
+        let mut byte = [0u8; 1];
+        let read = tokio::time::timeout(fact_budget::FACT_BUDGET, refused.read(&mut byte))
+            .await
+            .expect("the server closes a connection made during drain");
+        assert!(
+            matches!(read, Ok(0) | Err(_)),
+            "a connection made during drain is closed unserved, got {read:?}"
+        );
+
+        assert!(
+            echo_answered(&mut served).await,
+            "the client connected before drain is still served"
+        );
+        server.abort();
     }
 }
 

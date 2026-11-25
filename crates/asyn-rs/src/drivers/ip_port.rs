@@ -401,22 +401,17 @@ impl<T: socket::Pollable> BoundNextRead for T {
 
 impl<T: socket::Pollable> WaitWritable for T {
     fn wait_writable(&self, deadline: Option<std::time::Instant>) -> std::io::Result<bool> {
-        loop {
-            let remaining = match deadline {
-                Some(deadline) => {
-                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                    if remaining.is_zero() {
-                        return Ok(false);
-                    }
-                    Some(remaining)
+        let remaining = match deadline {
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return Ok(false);
                 }
-                None => None,
-            };
-            match socket::poll_ready(self, socket::Readiness::Writable, remaining) {
-                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
-                outcome => return outcome,
+                Some(remaining)
             }
-        }
+            None => None,
+        };
+        socket::poll_ready(self, socket::Readiness::Writable, remaining)
     }
 }
 
@@ -1371,7 +1366,6 @@ pub(crate) fn fill_until_refused(sock: &TcpStream) {
             ) {
                 Ok(false) => return,
                 Ok(true) => continue,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(e) => panic!("polling the filled socket failed: {e}"),
             }
         }
@@ -2683,6 +2677,64 @@ mod tests {
             } => {}
             other => panic!("expected Timeout, got {other:?}"),
         }
+    }
+
+    /// A signal does not cut a read short: C's `readIt` polls again after
+    /// `EINTR` (drvAsynIPPort.c:812-824), so the read still waits its timeout.
+    #[cfg(unix)]
+    #[test]
+    fn a_signal_during_a_read_does_not_shorten_its_timeout() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+        let (listener, port) = start_echo_server();
+        // The peer holds the connection open and silent until the test ends.
+        let (_hold, held) = std::sync::mpsc::channel::<()>();
+        let _handle = thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            let _ = held.recv();
+        });
+        let mut drv = DrvAsynIPPort::new("iptest", &format!("127.0.0.1:{port}")).unwrap();
+        drv.connect(&AsynUser::default()).unwrap();
+
+        static TAKEN: AtomicU32 = AtomicU32::new(0);
+        extern "C" fn take(_: libc::c_int) {
+            TAKEN.fetch_add(1, Ordering::SeqCst);
+        }
+        // SAFETY: a zeroed `sigaction` with a counting handler, no SA_RESTART.
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = take as extern "C" fn(libc::c_int) as usize;
+            assert_eq!(libc::sigaction(libc::SIGUSR2, &sa, std::ptr::null_mut()), 0);
+        }
+        // SAFETY: `pthread_self` has no preconditions.
+        let me = unsafe { libc::pthread_self() };
+        let done = Arc::new(AtomicBool::new(false));
+        let kicker = {
+            let done = Arc::clone(&done);
+            thread::spawn(move || {
+                while !done.load(Ordering::SeqCst) {
+                    thread::sleep(Duration::from_millis(20));
+                    // SAFETY: `me` is the test thread, alive until the join below.
+                    unsafe { libc::pthread_kill(me, libc::SIGUSR2) };
+                }
+            })
+        };
+        let timeout = Duration::from_millis(300);
+        let user = AsynUser::new(0).with_timeout(timeout);
+        let mut buf = [0u8; 32];
+        let before = TAKEN.load(Ordering::SeqCst);
+        let start = std::time::Instant::now();
+        let res = drv.io_read_octet(&user, &mut buf);
+        let elapsed = start.elapsed();
+        let during = TAKEN.load(Ordering::SeqCst) - before;
+        done.store(true, Ordering::SeqCst);
+        kicker.join().unwrap();
+
+        let err = res.unwrap_err();
+        assert_eq!(err.status(), AsynStatus::Timeout, "got {err:?}");
+        assert!(elapsed >= timeout, "a 300 ms read ended after {elapsed:?}");
+        assert!(during >= 1, "no signal reached the read");
     }
 
     #[test]

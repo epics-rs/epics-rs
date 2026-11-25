@@ -265,8 +265,9 @@ fn poll_interval(remaining: Option<Duration>) -> i32 {
 /// `timeout` is one non-blocking probe. Only the clock ends the wait: C takes
 /// `poll`'s 0 as the timeout after truncating it to whole milliseconds
 /// (:662-664, :697), so its wait ends up to 1 ms early, and here the interval
-/// is also capped at `i32::MAX` ms. An `EINTR` is returned, not retried —
-/// whether a signal ends the wait is the caller's rule.
+/// is also capped at `i32::MAX` ms. Nor does a signal end it: an `EINTR` polls
+/// again for the time left, where C re-polls its whole interval
+/// (drvAsynIPPort.c:686-695, :812-824) and its connect fails (:555).
 pub fn poll_ready(
     socket: &impl Pollable,
     want: Readiness,
@@ -283,8 +284,11 @@ fn poll_within(
     let deadline = timeout.map(super::time::deadline_from_now);
     loop {
         let remaining = deadline.map(|d| d.saturating_duration_since(std::time::Instant::now()));
-        if poll(poll_interval(remaining))? {
-            return Ok(true);
+        match poll(poll_interval(remaining)) {
+            Ok(true) => return Ok(true),
+            Ok(false) => {}
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
         }
         if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
             return Ok(false);
@@ -737,10 +741,9 @@ mod sys {
 
     /// The poll half of [`connect_within`]: `Ok` once `SO_ERROR` is clear.
     fn await_connect(socket: &socket2::Socket, timeout: Duration) -> io::Result<()> {
-        // No EINTR retry: C fails the connect on any return but 1
-        // (drvAsynIPPort.c:555), a signal included. The wait lasts the whole
-        // timeout, where C's `(int)(1000 * connectTimeout)` (:547) truncates
-        // it and polls 0 for a sub-millisecond one.
+        // The wait lasts the whole timeout, a signal or not, where C's
+        // `(int)(1000 * connectTimeout)` (:547) truncates it and polls 0 for a
+        // sub-millisecond one.
         if !super::poll_ready(socket, super::Readiness::Writable, Some(timeout))? {
             return Err(io::ErrorKind::TimedOut.into());
         }
@@ -1192,6 +1195,64 @@ mod tests {
         }
     }
 
+    /// Run `wait` on this thread while another sends it `SIGUSR2` every 20 ms
+    /// through a handler without `SA_RESTART`, so each signal reaches the wait
+    /// as `EINTR`. Returns `wait`'s result and how many signals the handler
+    /// took while it ran.
+    #[cfg(unix)]
+    fn interrupted<R>(wait: impl FnOnce() -> R) -> (R, u32) {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+        static TAKEN: AtomicU32 = AtomicU32::new(0);
+        extern "C" fn take(_: libc::c_int) {
+            TAKEN.fetch_add(1, Ordering::SeqCst);
+        }
+        // SAFETY: a zeroed `sigaction` with a counting handler, no SA_RESTART.
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = take as extern "C" fn(libc::c_int) as usize;
+            assert_eq!(libc::sigaction(libc::SIGUSR2, &sa, std::ptr::null_mut()), 0);
+        }
+        // SAFETY: `pthread_self` has no preconditions.
+        let me = unsafe { libc::pthread_self() };
+        let done = Arc::new(AtomicBool::new(false));
+        let kicker = {
+            let done = Arc::clone(&done);
+            std::thread::spawn(move || {
+                while !done.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(20));
+                    // SAFETY: `me` is the test thread, alive until the join below.
+                    unsafe { libc::pthread_kill(me, libc::SIGUSR2) };
+                }
+            })
+        };
+        let before = TAKEN.load(Ordering::SeqCst);
+        let out = wait();
+        let during = TAKEN.load(Ordering::SeqCst) - before;
+        done.store(true, Ordering::SeqCst);
+        kicker.join().unwrap();
+        (out, during)
+    }
+
+    /// A signal does not end a wait: it lasts the whole timeout.
+    #[cfg(unix)]
+    #[test]
+    fn a_signal_during_poll_ready_does_not_end_the_wait() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let _accepted = listener.accept().unwrap();
+
+        let timeout = Duration::from_millis(300);
+        let start = std::time::Instant::now();
+        let (ready, signals) =
+            interrupted(|| poll_ready(&client, Readiness::Readable, Some(timeout)));
+        let elapsed = start.elapsed();
+        assert!(matches!(ready, Ok(false)), "got {ready:?}");
+        assert!(elapsed >= timeout, "a 300 ms wait ended after {elapsed:?}");
+        assert!(signals >= 1, "no signal reached the wait");
+    }
+
     /// Unix only: `WSAPoll` may end a 1 ms wait at the next clock tick (386 us
     /// on windows-x86_64, fork run 40470677640).
     #[cfg(unix)]
@@ -1419,23 +1480,12 @@ mod tests {
         assert_eq!(err.sockerr().raw_os_error(), Some(libc::EINPROGRESS));
     }
 
-    /// A signal that interrupts the connect poll fails the connect with
-    /// connect()'s own errno, as C's single `poll` does (drvAsynIPPort.c:555,
-    /// :568-571); it is not retried to the deadline.
+    /// A signal does not end the connect poll: the connect waits out its
+    /// timeout, where C's single `poll` fails it on `EINTR`
+    /// (drvAsynIPPort.c:555).
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_signal_during_the_connect_poll_fails_the_connect() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        extern "C" fn ignore(_: libc::c_int) {}
-        // SAFETY: a zeroed `sigaction` with a no-op handler, no SA_RESTART.
-        unsafe {
-            let mut sa: libc::sigaction = std::mem::zeroed();
-            sa.sa_sigaction = ignore as extern "C" fn(libc::c_int) as usize;
-            assert_eq!(libc::sigaction(libc::SIGUSR2, &sa, std::ptr::null_mut()), 0);
-        }
-
+    fn a_signal_during_the_connect_poll_does_not_end_it() {
         // A full accept queue drops further SYNs, so the next connect pends.
         let listener = tcp_listener(localhost(0), SocketOptions::default(), 0).unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1457,33 +1507,21 @@ mod tests {
             }
         }
 
-        // SAFETY: `pthread_self` has no preconditions.
-        let me = unsafe { libc::pthread_self() };
-        let done = Arc::new(AtomicBool::new(false));
-        let kicker = {
-            let done = Arc::clone(&done);
-            std::thread::spawn(move || {
-                while !done.load(Ordering::SeqCst) {
-                    std::thread::sleep(Duration::from_millis(100));
-                    // SAFETY: `me` is the test thread, alive until the join below.
-                    unsafe { libc::pthread_kill(me, libc::SIGUSR2) };
-                }
-            })
-        };
+        let timeout = Duration::from_secs(1);
         let start = std::time::Instant::now();
-        let err =
-            tcp_connect(addr, None, SocketOptions::default(), Duration::from_secs(5)).unwrap_err();
-        done.store(true, Ordering::SeqCst);
-        kicker.join().unwrap();
+        let (err, signals) =
+            interrupted(|| tcp_connect(addr, None, SocketOptions::default(), timeout).unwrap_err());
+        let elapsed = start.elapsed();
 
         match &err {
             TcpConnectError::Deferred { in_progress, cause } => {
                 assert_eq!(in_progress.raw_os_error(), Some(libc::EINPROGRESS));
-                assert_eq!(cause.raw_os_error(), Some(libc::EINTR));
+                assert_eq!(cause.kind(), io::ErrorKind::TimedOut, "got {cause:?}");
             }
             other => panic!("expected Deferred, got {other:?}"),
         }
-        assert!(start.elapsed() < Duration::from_secs(4));
+        assert!(elapsed >= timeout, "a 1 s connect ended after {elapsed:?}");
+        assert!(signals >= 1, "no signal reached the connect");
     }
 
     /// connect() failing outright is C's `sockerrmsg` with no poll behind it

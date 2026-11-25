@@ -661,9 +661,14 @@ impl BlockingCaServer {
             return;
         }
         let mut backoff = AcceptBackoff::new();
-        for stream in self.listener.incoming() {
-            match stream {
-                Ok(mut stream) => {
+        // Read before every `accept` as well as after: a stop that lands while
+        // the loop is away (serving, refusing, backing off) is seen here even if
+        // its wake dial never reaches the queue — it can time out behind a full
+        // backlog, and BSD stacks drop queued clients that reset. A stop between
+        // this read and the `accept` itself still relies on the dial.
+        while !self.run.state().is_stopped() {
+            match self.listener.accept() {
+                Ok((mut stream, _)) => {
                     backoff.accepted();
                     // A `shutdown()` wakes the blocking accept by dialing our
                     // own socket; the throwaway connection, or the queued
@@ -758,11 +763,6 @@ impl BlockingCaServer {
                     // C `rsrv` never leaves this loop, and an IOC that stops
                     // accepting for good is worse than one that keeps trying.
                     thread::sleep(backoff.failed());
-                    // `shutdown()` may have been asked for while we slept, and
-                    // its self-dial cannot wake an `accept()` that is failing.
-                    if self.run.state().is_stopped() {
-                        break;
-                    }
                 }
             }
         }
@@ -3162,6 +3162,42 @@ mod tests {
         );
     }
 
+    /// MUST: the accept loop reads the run state right before every `accept`,
+    /// not only after one returns. A stop landing while the loop is away
+    /// serving or refusing a client otherwise reaches it only through the
+    /// wake dial, which can be lost: it times out behind a full backlog, and
+    /// BSD stacks drop queued clients that reset, leaving nothing to take.
+    ///
+    /// Source inspection: the window is the few microseconds the loop spends
+    /// away, and no Linux client can make a queued dial vanish.
+    #[test]
+    fn the_accept_loop_reads_the_run_state_before_every_accept() {
+        let prod = production(include_str!("blocking.rs"), Comments::Strip);
+        let serve = {
+            let at = prod
+                .find("pub fn serve(&self) {")
+                .expect("serve moved; update this guard");
+            let tail = &prod[at..];
+            &tail[..tail.find("\n    }\n").expect("serve body")]
+        };
+        assert!(
+            !serve.contains(".incoming()"),
+            "`incoming()` accepts before the loop body can read the run state"
+        );
+        let accepts: Vec<usize> = serve.match_indices("accept(").map(|(at, _)| at).collect();
+        assert!(!accepts.is_empty(), "the accept moved; update this guard");
+        for at in accepts {
+            let check = serve[..at]
+                .rfind("is_stopped()")
+                .expect("an accept with no run-state read before it");
+            assert_eq!(
+                serve[check..at].split_whitespace().collect::<Vec<_>>(),
+                ["is_stopped()", "{", "match", "self.listener."],
+                "nothing may run between the run-state read and the accept"
+            );
+        }
+    }
+
     /// The placement that makes the count survivable: the slot is a guard, so
     /// a client thread that unwinds still returns it. No cleanup on the normal
     /// exit path covers this one.
@@ -3677,7 +3713,7 @@ mod tests {
             // One accept loop per file today. Counting rather than merely
             // checking presence is what makes this catch a *newly added*
             // loop that forgot the backoff.
-            let loops = src.matches(concat!("self.listener.inco", "ming()")).count()
+            let loops = src.matches(concat!("self.listener.acc", "ept()")).count()
                 + src
                     .matches(concat!("res = listener.acc", "ept() => match res {"))
                     .count();

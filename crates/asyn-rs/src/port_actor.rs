@@ -2552,13 +2552,50 @@ impl PortActor {
     }
 
     /// C's port thread at a holder's release ([`Lend::give_back`]): it took
-    /// the queue's head while the port was held and waits at the lock with it
-    /// (asynManager.c:894-910), so that one request gets the port ahead of
-    /// anything queued after, the holder's next lock included
-    /// (specsAnalyser.cpp:617-619). It holds one at a time.
+    /// the first request its scan runs while the port was held and waits at
+    /// the lock with it (asynManager.c:870-910), so that one request gets the
+    /// port ahead of anything queued after, the holder's next lock included
+    /// (specsAnalyser.cpp:617-619). It holds one at a time. The scan passes a
+    /// disabled device's request over (:877), and a request that already left
+    /// the queue is not on it.
     fn dequeue_at_release(&mut self) {
         self.drain_channel();
-        self.dequeued = self.dequeued.take().or_else(|| self.heap.pop());
+        let multi_device = self.driver.base().flags.multi_device;
+        while self.dequeued.is_none() {
+            let Some(msg) = self.heap.pop() else { return };
+            if msg.is_gone() {
+                continue;
+            }
+            let passed_over = queue_gate(&msg.op, &msg.user, multi_device)
+                .is_some_and(|connect| self.device_scanned(&msg.op, connect))
+                && self
+                    .driver
+                    .base()
+                    .check_device_enabled(msg.user.addr)
+                    .is_err();
+            if passed_over {
+                self.parked.push(msg);
+            } else {
+                self.dequeued = Some(msg);
+            }
+        }
+    }
+
+    /// Whether C `portThread`'s per-request DEVICE checks (asynManager.c:877-888)
+    /// apply: the half of the device state `check_queue` deliberately leaves to
+    /// the thread on a CANBLOCK port, because C answers them there in a way
+    /// `queueRequest` cannot — by *not answering*.
+    ///
+    /// The scope is the requests C leaves in the lower-priority loop: the
+    /// Connect-priority queue is drained above it with no device checks at all
+    /// (:813-857), and every waived request C queues rides that queue
+    /// (asynShellCommands.c:127,174,245,296; asynRecord.c:562-571). Hence
+    /// `Queued` dispatch and a `Required` connect check — the same requests,
+    /// asked the same way.
+    fn device_scanned(&self, op: &RequestOp, connect: ConnectCheck) -> bool {
+        connect == ConnectCheck::Required
+            && self.driver.base().flags.can_block
+            && Self::c_dispatch(op) == CDispatch::Queued
     }
 
     fn pop_next(&mut self) -> Option<ActorMessage> {
@@ -2651,21 +2688,7 @@ impl PortActor {
                     msg.refuse(e);
                     return None;
                 }
-                // C `portThread`'s per-request DEVICE checks (asynManager.c:877-888):
-                // the half of the device state `check_queue` deliberately leaves to
-                // the thread on a CANBLOCK port, because C answers them here in a way
-                // `queueRequest` cannot — by *not answering*.
-                //
-                // The scope is the requests C leaves in the lower-priority loop: the
-                // Connect-priority queue is drained above it with no device checks at
-                // all (:813-857), and every waived request C queues rides that queue
-                // (asynShellCommands.c:127,174,245,296; asynRecord.c:562-571). Hence
-                // `Queued` dispatch and a `Required` connect check — the same
-                // requests, asked the same way.
-                if connect == ConnectCheck::Required
-                    && self.driver.base().flags.can_block
-                    && Self::c_dispatch(&msg.op) == CDispatch::Queued
-                {
+                if self.device_scanned(&msg.op, connect) {
                     // :877 `if(!pdpCommon->enabled) continue;` — the request keeps
                     // its place in the queue. It runs when the device is re-enabled,
                     // and its queue timer still expires under it if it never is.

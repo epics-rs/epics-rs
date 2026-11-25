@@ -58,7 +58,7 @@ use super::params::PluginBaseParams;
 use super::wiring::WiringRegistry;
 
 mod delivery;
-use delivery::{Delivery, SortCounters};
+use delivery::{Delivery, Routed, SortCounters};
 
 /// Message sent through the param channel from control plane to data plane.
 ///
@@ -1850,12 +1850,12 @@ impl SharedProcessorInner {
                 )
             }
         };
-        let ready = self
+        let routed = self
             .delivery
             .end_written(arrays, evaluated.then_some(&self.attribute_set));
         let mut output = self.build_publish_batch(
             batch,
-            ready,
+            routed,
             &[],
             begin
                 .as_ref()
@@ -1994,7 +1994,7 @@ impl SharedProcessorInner {
     /// ExecutionTime C sets after `processCallbacks` (NDPluginDriver.cpp:
     /// 438, :537).
     fn unprocessed(&mut self, batch: ParamBatch, elapsed_ms: f64) -> ProcessOutput {
-        self.build_publish_batch(batch, Frame::new(), &[], None, Some(elapsed_ms), false)
+        self.build_publish_batch(batch, Routed::default(), &[], None, Some(elapsed_ms), false)
     }
 
     /// The completion half: route the produced arrays and build the param
@@ -2024,8 +2024,8 @@ impl SharedProcessorInner {
         // still serves its typed-array waveforms (STD_ARRAY_DATA). Those are
         // NOT the `doCallbacksGenericPointer` downstream path — they fire
         // regardless of NDArrayCallbacks and ARE subject to the MaxByteRate
-        // throttle (NDPluginStdArrays.cpp:58 per-interface `throttled()`). So
-        // route whenever we deliver downstream OR serve the StdArray waveforms.
+        // throttle (NDPluginStdArrays.cpp:58 per-interface `throttled()`), but
+        // never wait in the sort buffer.
         let produced = result.output_arrays.len();
         // `getAttributes` only past the NDArrayCallbacks return (:289).
         let evaluated = self.array_callbacks.get()
@@ -2036,16 +2036,15 @@ impl SharedProcessorInner {
                 begin,
                 &result.param_updates,
             );
-        let ready = self.delivery.end_process(
+        let routed = self.delivery.end_process(
             result.output_arrays,
             evaluated.then_some(&self.attribute_set),
             CopyArray::IfInput(array),
         );
         // A StdArrays frame that produced a waveform which the MaxByteRate
-        // throttle then dropped (`produced > 0` but `ready` empty) must not
-        // advance ArrayCounter — C nets it back out
-        // (NDPluginStdArrays.cpp:202-211).
-        if self.std_array_data_param.is_some() && produced > 0 && ready.is_empty() {
+        // throttle then dropped must not advance ArrayCounter — C nets it
+        // back out (NDPluginStdArrays.cpp:202-211).
+        if self.std_array_data_param.is_some() && produced > 0 && routed.served.is_none() {
             self.array_counter -= 1;
         }
         if !result.counted {
@@ -2053,7 +2052,7 @@ impl SharedProcessorInner {
         }
         let mut output = self.build_publish_batch(
             batch,
-            ready,
+            routed,
             &result.param_updates,
             Some((array, begin)),
             Some(elapsed_ms),
@@ -2100,9 +2099,16 @@ impl SharedProcessorInner {
             // Sort-buffer entries were admitted only while NDArrayCallbacks was
             // on (route_output_arrays runs past the delivery gate); the C++
             // sort thread delivers them regardless of the *current* flag, so
-            // they always deliver here.
-            let output =
-                self.build_publish_batch(batch, Frame::from_vec(arrays), &[], None, None, true);
+            // they always deliver here. Their waveforms posted in their own
+            // cycle.
+            let output = self.build_publish_batch(
+                batch,
+                Routed::ready(Frame::from_vec(arrays)),
+                &[],
+                None,
+                None,
+                true,
+            );
             all_arrays.extend(output.arrays);
             batch = output.batch;
         }
@@ -2196,10 +2202,9 @@ impl SharedProcessorInner {
     /// must publish them in async context.
     ///
     /// `deliver` is the NDArrayCallbacks gate (C++ `endProcessCallbacks`,
-    /// NDPluginDriver.cpp:257-265): when `false`, the downstream array
-    /// delivery — the STD_ARRAY_DATA generic-pointer interrupt and the returned
-    /// `ProcessOutput.arrays` — is suppressed, while the `begin` params are
-    /// still set.
+    /// NDPluginDriver.cpp:257-265): when `false`, the returned
+    /// `ProcessOutput.arrays` are suppressed, while the `begin` params and
+    /// `routed.served`'s STD_ARRAY_DATA waveform are still posted.
     ///
     /// `elapsed_ms` is `None` off the input-array path: C sets ExecutionTime
     /// only around `processCallbacks` (NDPluginDriver.cpp:422, :521).
@@ -2211,7 +2216,7 @@ impl SharedProcessorInner {
     fn build_publish_batch(
         &mut self,
         mut batch: ParamBatch,
-        output_arrays: Frame<PublishedArray>,
+        routed: Routed,
         param_updates: &[ParamUpdate],
         begin: Option<(&NDArray, &[PendingParam])>,
         elapsed_ms: Option<f64>,
@@ -2243,7 +2248,7 @@ impl SharedProcessorInner {
         // 170-197), between the dims post and the frame's params. Not gated by
         // `deliver`: C posts at NDArrayCallbacks 0, StdArrays' default. Only
         // the served output posts, so a throttled frame posts nothing (:58).
-        if let (Some(param), Some(served)) = (self.std_array_data_param, output_arrays.first()) {
+        if let (Some(param), Some(served)) = (self.std_array_data_param, &routed.served) {
             let interrupts = self.port_handle.interrupts();
             let data = served.data();
             sets.extend(
@@ -2278,7 +2283,7 @@ impl SharedProcessorInner {
             // NDArrayCallbacks==0 suppresses downstream delivery (C++
             // endProcessCallbacks early-return); the metadata params above are
             // still published.
-            arrays: if deliver { output_arrays } else { Frame::new() },
+            arrays: if deliver { routed.ready } else { Frame::new() },
             scatter: false,
             batch,
             addressed: Frame::new(),
@@ -4703,7 +4708,7 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                 {
                                     let deliver = guard.array_callbacks.get();
                                     let arrays = guard.delivery.publishable(Frame::from_vec(result.output_arrays), None, CopyArray::Never);
-                                    let mut output = guard.build_publish_batch(ParamBatch::new(&callbacks_gate), arrays, &result.param_updates, None, None, deliver);
+                                    let mut output = guard.build_publish_batch(ParamBatch::new(&callbacks_gate), Routed::ready(arrays), &result.param_updates, None, None, deliver);
                                     output.addressed = guard.delivery.publishable_addressed(result.addressed);
                                     Some(output)
                                 } else {
@@ -5485,6 +5490,114 @@ mod tests {
         wait_until("the waveform to be served", || served.lock().is_some());
         assert!(Arc::ptr_eq(served.lock().as_ref().unwrap(), frame.array()));
         assert_eq!(detector.num_alloc_buffers(), 1);
+    }
+
+    /// NDPluginStdArrays posts each frame's waveform in its own
+    /// processCallbacks, stamped with its own epicsTS (NDPluginStdArrays.cpp:
+    /// 58-72), before endProcessCallbacks' NDArrayCallbacks return and sort
+    /// buffer (NDPluginDriver.cpp:265-328): SortMode holds back only what
+    /// goes downstream, and at NDArrayCallbacks 0 nothing does.
+    #[test]
+    fn std_arrays_waveforms_bypass_the_sort_buffer() {
+        use crate::ndarray::NDDataBuffer;
+        use crate::timestamp::EpicsTimestamp;
+        use epics_libcom_rs::runtime::interrupt_accept::InterruptGate;
+        let stamp = |sec| EpicsTimestamp { sec, nsec: 0 };
+        let frame = |id: i32| {
+            let mut array = NDArray::with_data(
+                vec![NDDimension::new(1)],
+                NDDataBuffer::from_vec::<f64>(vec![id as f64]),
+            );
+            array.unique_id = id;
+            array.timestamp = stamp(id as u32 * 1000);
+            published(Arc::new(array))
+        };
+        for (callbacks, delivered) in [(0, vec![3]), (1, vec![1, 2, 3])] {
+            let claim = asyn_rs::asyn_record::claim_port(&format!("STDSORT{callbacks}")).unwrap();
+            let (ds, mut downstream_rx) = ndarray_channel("DS_STDSORT", 10);
+            let mut output = NDArrayOutput::new();
+            output.add(ds);
+            let (handle, _jh) = create_plugin_runtime_with_output(
+                &claim,
+                ServingProcessor {
+                    served: Arc::default(),
+                },
+                1_000_000,
+                10,
+                0,
+                output,
+                "",
+                test_wiring(),
+                DEFAULT_PLUGIN_THREADS,
+            );
+            let port = handle.port_runtime().port_handle().clone();
+            claim
+                .publish(port.clone(), &InterruptGate::opened())
+                .unwrap();
+            enable_callbacks(&handle);
+            let params = &handle.plugin_params;
+            port.write_int32_blocking(handle.ndarray_params.array_callbacks, 0, callbacks)
+                .unwrap();
+            port.write_float64_blocking(params.sort_time, 0, 30.0)
+                .unwrap();
+            port.write_int32_blocking(params.sort_mode, 0, 1).unwrap();
+            params_applied(&handle);
+            let std = port
+                .drv_user_create_blocking(&asyn_rs::port::DrvUserRequest::new("STD_ARRAY_DATA", 0))
+                .unwrap()
+                .reason;
+            let posts = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let log = posts.clone();
+            let _binding = port
+                .interrupts()
+                .register_sync_callback(
+                    asyn_rs::interrupt::InterruptFilter {
+                        reason: Some(std),
+                        addr: Some(0),
+                        iface: Some(asyn_rs::interfaces::InterfaceType::Float64Array),
+                        ..Default::default()
+                    },
+                    move |iv| {
+                        if let ParamValue::Float64Array(a) = &iv.value {
+                            log.lock().push((a[0], iv.timestamp));
+                        }
+                    },
+                )
+                .unwrap();
+
+            // Both out of order against the sentinel, so at NDArrayCallbacks
+            // 1 both wait for the sort deadline, which SortMode 0 forces.
+            send_array(handle.array_sender(), frame(2));
+            send_array(handle.array_sender(), frame(1));
+            params_applied(&handle);
+            port.write_int32_blocking(params.sort_mode, 0, 0).unwrap();
+            params_applied(&handle);
+            wait_until("both waveforms", || posts.lock().len() >= 2);
+            assert_eq!(
+                *posts.lock(),
+                [
+                    (2.0, stamp(2000).to_system_time()),
+                    (1.0, stamp(1000).to_system_time()),
+                ],
+                "NDArrayCallbacks {callbacks}"
+            );
+            assert_eq!(
+                port.read_int32_blocking(handle.ndarray_params.array_counter, 0)
+                    .unwrap(),
+                2,
+                "NDArrayCallbacks {callbacks}"
+            );
+
+            port.write_int32_blocking(handle.ndarray_params.array_callbacks, 0, 1)
+                .unwrap();
+            params_applied(&handle);
+            send_array(handle.array_sender(), frame(3));
+            let mut received = Vec::new();
+            while received.last() != Some(&3) {
+                received.push(downstream_rx.blocking_recv().unwrap().unique_id);
+            }
+            assert_eq!(received, delivered, "NDArrayCallbacks {callbacks}");
+        }
     }
 
     type StdArrayPosts = (

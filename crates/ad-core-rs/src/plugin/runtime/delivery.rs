@@ -64,6 +64,28 @@ struct State {
     last_output_array: Option<Arc<NDArray>>,
 }
 
+/// What [`Delivery::end_process`] made of a frame.
+#[derive(Default)]
+pub(super) struct Routed {
+    /// NDPluginStdArrays' waveform: the first array past the MaxByteRate
+    /// throttle. C posts it inside `processCallbacks`, ahead of
+    /// `endProcessCallbacks` and its sort buffer (NDPluginStdArrays.cpp:
+    /// 58-72, :202), so it never waits for a drain.
+    pub served: Option<PublishedArray>,
+    /// The deliveries ready now; the rest wait in the sort buffer.
+    pub ready: Frame<PublishedArray>,
+}
+
+impl Routed {
+    /// Deliveries that serve no waveform: a sort drain's, say.
+    pub(super) fn ready(ready: Frame<PublishedArray>) -> Self {
+        Self {
+            served: None,
+            ready,
+        }
+    }
+}
+
 /// The counters C's sort path sets.
 #[derive(Clone, Copy)]
 pub(super) struct SortCounters {
@@ -105,13 +127,13 @@ impl Delivery {
     /// writes (NDPluginFile.cpp:252, :301, :349). `pArrays[0]` is cached
     /// before the throttle and the sort buffer see the array: the array
     /// itself with NDArrayCallbacks 0 (:273-280), otherwise its copy once
-    /// the copy succeeded (:285-299). Returns what is ready to deliver.
+    /// the copy succeeded (:285-299).
     pub(super) fn end_process(
         &self,
         arrays: Frame<Arc<NDArray>>,
         attributes: Option<&NDAttributeList>,
         copy: CopyArray<'_>,
-    ) -> Frame<PublishedArray> {
+    ) -> Routed {
         self.end(arrays, attributes, copy, true)
     }
 
@@ -130,7 +152,7 @@ impl Delivery {
         &self,
         arrays: Frame<Arc<NDArray>>,
         attributes: Option<&NDAttributeList>,
-    ) -> Frame<PublishedArray> {
+    ) -> Routed {
         self.end(arrays, attributes, CopyArray::Never, false)
     }
 
@@ -140,7 +162,7 @@ impl Delivery {
         attributes: Option<&NDAttributeList>,
         copy: CopyArray<'_>,
         cache: bool,
-    ) -> Frame<PublishedArray> {
+    ) -> Routed {
         let callbacks = self.array_callbacks.get();
         let mut state = self.state.lock();
         if cache
@@ -150,7 +172,7 @@ impl Delivery {
             state.last_output_array = Some(Arc::clone(last));
         }
         if !callbacks && !self.std_arrays {
-            return Frame::new();
+            return Routed::default();
         }
         // C copies only past the NDArrayCallbacks return (:274-286); the
         // StdArrays waveform route takes the frame as it is.
@@ -162,7 +184,7 @@ impl Delivery {
         {
             state.last_output_array = Some(Arc::clone(last.array()));
         }
-        state.route_output_arrays(arrays)
+        state.route_output_arrays(arrays, callbacks, self.std_arrays)
     }
 
     /// NDArrayCallbacks.
@@ -179,6 +201,7 @@ impl Delivery {
         attributes: Option<&NDAttributeList>,
     ) -> Frame<PublishedArray> {
         self.end_process(smallvec![Arc::clone(array)], attributes, CopyArray::Always)
+            .ready
     }
 
     /// Deliver what [`Self::hand_on`] made ready before this returns. A
@@ -360,18 +383,29 @@ impl State {
         }
     }
 
-    /// Route output arrays through the throttle, the in-order fast path, and
-    /// the sort buffer. Returns arrays ready to emit *now*, in order.
+    /// Route output arrays through the throttle, then, when `deliver`, the
+    /// in-order fast path and the sort buffer.
     ///
     /// Port of C++ `endProcessCallbacks` (NDPluginDriver.cpp:295-328): an
     /// array whose uniqueId is contiguous with `prevUniqueId_` is emitted
     /// immediately (B2); only out-of-order arrays enter the sort buffer.
     /// Disordered arrays are counted at emission time in both modes (B4).
-    fn route_output_arrays(&mut self, arrays: Frame<PublishedArray>) -> Frame<PublishedArray> {
-        let mut ready = Frame::new();
+    fn route_output_arrays(
+        &mut self,
+        arrays: Frame<PublishedArray>,
+        deliver: bool,
+        serve: bool,
+    ) -> Routed {
+        let mut routed = Routed::default();
         for arr in arrays {
             if !self.throttle_ok(&arr) {
                 continue; // G7: dropped by MaxByteRate throttle
+            }
+            if serve && routed.served.is_none() {
+                routed.served = Some(arr.clone());
+            }
+            if !deliver {
+                continue;
             }
             let uid = arr.unique_id;
             if self.sort_mode != 0 && !self.sort_buffer.order_ok(uid) {
@@ -380,20 +414,20 @@ impl State {
             } else {
                 // In order (or sort mode off): emit immediately, count disorder.
                 self.sort_buffer.note_emitted(uid);
-                ready.push(arr);
+                routed.ready.push(arr);
             }
         }
         // After emitting in-order arrays, the sort buffer head may now be
         // contiguous — release any newly-ready run (C++ sortingTask).
-        if self.sort_mode != 0 {
+        if deliver && self.sort_mode != 0 {
             for (_id, bucket) in self
                 .sort_buffer
                 .drain_ready(self.sort_time, std::time::Instant::now())
             {
-                ready.extend(bucket);
+                routed.ready.extend(bucket);
             }
         }
-        ready
+        routed
     }
 }
 

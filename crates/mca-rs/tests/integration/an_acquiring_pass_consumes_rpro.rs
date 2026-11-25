@@ -140,7 +140,7 @@ fn a_stop_dbpf_during_the_status_read_goes_out_after_it() {
         let rpro = num(&db, "M.RPRO");
         // The status read's callback: its pass ends still acquiring.
         let (done, band) = owed.lock().unwrap().remove(0);
-        std::thread::spawn(move || done.reprocess(band).unwrap())
+        std::thread::spawn(move || done.reprocess(band))
             .join()
             .unwrap();
         for _ in 0..400 {

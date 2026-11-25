@@ -215,7 +215,7 @@ async fn a_read_completion_requested_before_the_scan_stopped_ends_its_cycle() {
     let db = ioc().await;
     let (done, band, reads) = queued_read(&db).await;
     let busy = Busy::band(band);
-    done.reprocess(band).unwrap();
+    done.reprocess(band);
     db.scan_control().stop();
     drop(busy);
     until("the read completed", || {
@@ -230,7 +230,7 @@ async fn a_read_completion_requested_after_the_scan_stopped_processes_nothing() 
     let db = ioc().await;
     let (done, band, reads) = queued_read(&db).await;
     db.scan_control().stop();
-    done.reprocess(band).unwrap();
+    done.reprocess(band);
     band_drained(band).await;
     assert_eq!(reads.load(Ordering::SeqCst), 0);
     assert!(pact(&db, "AI"));
@@ -241,7 +241,7 @@ async fn a_process_callback_requested_before_the_scan_stopped_processes() {
     let db = ioc().await;
     let cb = db.async_handle().process_callback("C");
     let busy = Busy::band(CallbackPriority::Low);
-    cb.request(CallbackPriority::Low).unwrap();
+    cb.request(CallbackPriority::Low);
     db.scan_control().stop();
     drop(busy);
     until("C processed", || read(&db, "C") == 1.0).await;
@@ -252,7 +252,7 @@ async fn a_process_callback_requested_after_the_scan_stopped_processes_nothing()
     let db = ioc().await;
     let cb = db.async_handle().process_callback("C");
     db.scan_control().stop();
-    cb.request(CallbackPriority::Low).unwrap();
+    cb.request(CallbackPriority::Low);
     band_drained(CallbackPriority::Low).await;
     assert_eq!(read(&db, "C"), 0.0);
 }

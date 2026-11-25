@@ -191,7 +191,7 @@ async fn put(db: &PvDatabase, field: &str, value: &str) {
 /// Runs the oldest owed callback and waits for the log to reach `len`.
 async fn complete_one(ioc: &Ioc, len: usize) {
     let (done, band) = ioc.owed.lock().unwrap().remove(0);
-    std::thread::spawn(move || done.reprocess(band).unwrap())
+    std::thread::spawn(move || done.reprocess(band))
         .join()
         .unwrap();
     for _ in 0..400 {

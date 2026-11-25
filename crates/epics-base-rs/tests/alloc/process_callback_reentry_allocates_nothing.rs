@@ -50,14 +50,13 @@ async fn a_process_callback_reentry_allocates_nothing() {
     let db = db().await;
     let cb = db.async_handle().process_callback("C");
     // Warm the band and the record: the first cycle arms nothing.
-    cb.request(BAND).unwrap();
+    cb.request(BAND);
     wait_val(&db, 1);
 
     let band = named::open(&BAND_WORKERS);
     let mut requests = 0;
     for i in 0..N {
-        let (r, counts) = thread::counted(|| cb.request(BAND));
-        r.unwrap();
+        let ((), counts) = thread::counted(|| cb.request(BAND));
         requests += counts.allocs;
         wait_val(&db, i + 2);
     }
@@ -82,7 +81,7 @@ async fn a_process_callback_supersedes_tokens_and_outlives_nothing() {
     let db = db().await;
     let cb = db.async_handle().process_callback("C");
     let token = db.mint_async_token("C").expect("C");
-    cb.request(BAND).unwrap();
+    cb.request(BAND);
     wait_val(&db, 1);
     assert!(
         !token.is_current(),
@@ -90,12 +89,12 @@ async fn a_process_callback_supersedes_tokens_and_outlives_nothing() {
     );
 
     let gone = db.async_handle().process_callback("NOT_A_RECORD");
-    gone.request(BAND).unwrap();
+    gone.request(BAND);
     let weak = std::sync::Arc::downgrade(&db);
     drop(db);
     assert!(
         weak.upgrade().is_none(),
         "the callback kept the database alive"
     );
-    cb.request(BAND).unwrap();
+    cb.request(BAND);
 }

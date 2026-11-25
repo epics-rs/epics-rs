@@ -27,7 +27,7 @@ struct Trigger {
 impl Trigger {
     fn release(&self) {
         let done = self.held.lock().unwrap().take().expect("a write in flight");
-        std::thread::spawn(move || done.complete(done.priority()).unwrap())
+        std::thread::spawn(move || done.complete(done.priority()))
             .join()
             .unwrap();
     }

@@ -222,7 +222,7 @@ async fn a_reentered_pass_then_pending_leaves_the_record_pact() {
     );
 
     let (done, band) = ioc.queued.lock().unwrap().take().unwrap();
-    std::thread::spawn(move || done.reprocess(band).unwrap())
+    std::thread::spawn(move || done.reprocess(band))
         .join()
         .unwrap();
     let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;

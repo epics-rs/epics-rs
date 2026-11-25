@@ -749,7 +749,8 @@ where
 /// Queue a requester-owned [`CallbackCell`] on the process-global pool's
 /// `priority` band — C `callbackRequest` (`callback.c:341`). Unlike
 /// [`spawn_background`] this allocates nothing per request; a cell already
-/// queued is taken by its pending run.
+/// queued is taken by its pending run. Never refused for a full band: `Err`
+/// is only `NotInit`.
 ///
 /// [`CallbackCell`]: crate::runtime::background::CallbackCell
 pub fn request_cell<B: crate::runtime::background::CallbackBody>(

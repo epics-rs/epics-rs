@@ -98,12 +98,12 @@ async fn passes_owed_mid_run_are_drained_by_that_run() {
     db.process_record("AI").await.unwrap();
     let (done, band) = queued.lock().unwrap().take().expect("a read was queued");
     epics_base_rs::runtime::task::spawn_blocking_background(band, move |_| {
-        done.reprocess(band).unwrap();
+        done.reprocess(band);
         started_rx
             .recv_timeout(fact_budget::FACT_BUDGET)
             .expect("the first pass ran");
         for _ in 1..PASSES {
-            done.reprocess(band).unwrap();
+            done.reprocess(band);
         }
     })
     .await

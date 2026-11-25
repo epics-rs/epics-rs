@@ -73,7 +73,7 @@ impl DeviceSupport for Dev {
             return Ok(WriteStart::Synchronous);
         }
         let _ = self.record_write(record);
-        done.device_done().complete(done.priority()).unwrap();
+        done.device_done().complete(done.priority());
         Ok(WriteStart::Pending)
     }
 

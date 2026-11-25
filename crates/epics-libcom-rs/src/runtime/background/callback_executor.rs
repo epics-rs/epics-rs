@@ -332,8 +332,9 @@ enum Queued {
     /// task count and take no ring slot: a wake that the ring could reject
     /// would strand a long-lived task forever.
     Task(TaskEntry),
-    /// A [`CallbackCell`] request — holds a ring slot, as [`Queued::Ring`]
-    /// does, but queues the requester's own cell instead of a closure.
+    /// A [`CallbackCell`] request. Like [`Queued::Task`] it takes no ring
+    /// slot: the cell's `queued` flag is the claim, so these are bounded by
+    /// the live cell count, and a record completion is never refused.
     Cell(CellEntry),
 }
 
@@ -667,9 +668,11 @@ impl PriorityQueue {
         Ok(())
     }
 
-    /// [`Self::request`] for a [`CallbackCell`]: the slot first, then the
-    /// cell's claim, so a full band refuses either way and a cell already
-    /// queued gives its slot back (`callback.c:855-868`, intrusive form).
+    /// [`Self::request`] for a [`CallbackCell`], queued on the run-queue
+    /// supply ([`Queued::Cell`]). Never refused for a full band: C loses a
+    /// full ring's request (`callback.c:367-373`), and with it a record's
+    /// completion; a cell already queued is taken by the run pending for it
+    /// (`callback.c:865-868`, intrusive form).
     fn request_cell<B: CallbackBody>(
         &self,
         name: &str,
@@ -680,20 +683,21 @@ impl PriorityQueue {
         }
         // A swap, not a compare-exchange: a coalesced request must still
         // write, so the run pending for it acquires what it published.
-        let claim = || {
-            (!cell.queued.swap(true, Ordering::AcqRel))
-                .then(|| Queued::Cell(CellEntry(Some(Arc::clone(cell) as Arc<dyn CellRun>))))
-        };
-        match self
-            .queue
-            .push_ring_claimed(claim, || self.parking.wake_one())
-        {
-            Ok(Some(depth)) => self.deepen_high_water(depth),
-            Ok(None) => self.unadmit(),
-            Err(()) => {
-                self.unadmit();
-                return Err(self.report_full(name));
-            }
+        if cell.queued.swap(true, Ordering::AcqRel) {
+            self.unadmit();
+            return Ok(());
+        }
+        let entry = Queued::Cell(CellEntry(Some(Arc::clone(cell) as Arc<dyn CellRun>)));
+        if let Err(entry) = self.queue.push_task(entry, || self.parking.wake_one()) {
+            // Only reachable with the whole 4 G index space queued; dropping
+            // the entry idles the cell.
+            drop(entry);
+            self.unadmit();
+            tracing::error!(
+                target: "epics_base_rs::runtime::callback",
+                band = name,
+                "callback band queue arena exhausted; cell request dropped"
+            );
         }
         Ok(())
     }
@@ -919,7 +923,8 @@ impl CallbackHandle {
     }
 
     /// Queue `cell` on `priority` — `callbackRequest` of a requester-owned
-    /// `epicsCallback`. Allocates nothing. See [`CallbackCell`].
+    /// `epicsCallback`. Allocates nothing, and is never refused for a full
+    /// band: `Err` is only [`CallbackError::NotInit`]. See [`CallbackCell`].
     pub fn request_cell<B: CallbackBody>(
         &self,
         priority: CallbackPriority,
@@ -2343,8 +2348,7 @@ mod tests {
         gate_tx
     }
 
-    /// Requests of a queued cell are taken by its pending run and give their
-    /// slot back: one run, one slot used.
+    /// Requests of a queued cell are taken by its pending run: one run.
     #[test]
     fn a_queued_cell_takes_a_second_request_into_its_pending_run() {
         let mut pool = CallbackPool::with_config(4, 1);
@@ -2354,7 +2358,6 @@ mod tests {
             assert_eq!(pool.request_cell(CallbackPriority::Low, &cell), Ok(()));
         }
         assert!(cell.is_queued());
-        assert_eq!(pool.stats(CallbackPriority::Low, false).num_used, 1);
         drop(gate);
         assert_eq!(rx.recv_timeout(T).unwrap(), 1);
         assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
@@ -2377,29 +2380,85 @@ mod tests {
         pool.shutdown();
     }
 
-    /// The slot is taken before the claim: a full band refuses an idle cell
-    /// and leaves it idle, and refuses a queued one too, counting both.
+    /// A band of one ring slot, its worker held and the slot taken by an
+    /// ad-hoc request whose run is reported on the returned receiver.
+    fn full_band(pool: &CallbackPool) -> (mpsc::Sender<()>, mpsc::Receiver<()>) {
+        let gate = hold_worker(pool);
+        let (ran_tx, ran_rx) = mpsc::channel();
+        pool.request(
+            CallbackPriority::Low,
+            Box::new(move || ran_tx.send(()).unwrap()),
+        )
+        .unwrap();
+        (gate, ran_rx)
+    }
+
+    /// A cell takes no ring slot: requested on a full band it is queued, runs
+    /// after the ring entry ahead of it, and no overflow is counted.
     #[test]
-    fn a_full_band_refuses_a_cell_queued_or_not() {
+    fn a_cell_request_on_a_full_band_still_runs() {
         let mut pool = CallbackPool::with_config(1, 1);
-        let gate = hold_worker(&pool);
-        let (queued, rx) = count_cell();
-        pool.request_cell(CallbackPriority::Low, &queued).unwrap();
-        let (idle, idle_rx) = count_cell();
+        let (gate, ring_ran) = full_band(&pool);
+        let (cell, rx) = count_cell();
+        assert_eq!(pool.request_cell(CallbackPriority::Low, &cell), Ok(()));
+        assert!(cell.is_queued());
+        drop(gate);
+        assert_eq!(rx.recv_timeout(T).unwrap(), 1);
+        assert!(
+            ring_ran.try_recv().is_ok(),
+            "the cell ran before the ring entry ahead of it"
+        );
+        assert_eq!(pool.overflow_count(CallbackPriority::Low), 0);
+        pool.shutdown();
+    }
+
+    /// Requests of a cell already queued on a full band are taken by its
+    /// pending run: one run, however many requests.
+    #[test]
+    fn a_cell_queued_on_a_full_band_is_not_queued_twice() {
+        let mut pool = CallbackPool::with_config(1, 1);
+        let (gate, _ring_ran) = full_band(&pool);
+        let (cell, rx) = count_cell();
+        for _ in 0..3 {
+            assert_eq!(pool.request_cell(CallbackPriority::Low, &cell), Ok(()));
+        }
+        drop(gate);
+        // `stop` returns once every request the band took has run.
+        pool.stop();
+        assert_eq!(rx.try_iter().collect::<Vec<_>>(), [1]);
+        assert!(!cell.is_queued());
+        pool.shutdown();
+    }
+
+    /// The ring stays bounded beside the cells: an ad-hoc request on a full
+    /// band is refused, counted, and never run, with a cell queued or not.
+    #[test]
+    fn an_ad_hoc_request_on_a_full_band_is_still_refused() {
+        let mut pool = CallbackPool::with_config(1, 1);
+        let (gate, _ring_ran) = full_band(&pool);
+        let (cell, cell_rx) = count_cell();
+        let (refused_tx, refused_rx) = mpsc::channel();
+        let refused = refused_tx.clone();
         assert_eq!(
-            pool.request_cell(CallbackPriority::Low, &idle),
+            pool.request(
+                CallbackPriority::Low,
+                Box::new(move || refused.send(()).unwrap())
+            ),
             Err(CallbackError::QueueFull)
         );
-        assert!(!idle.is_queued(), "a refused cell stayed claimed");
+        pool.request_cell(CallbackPriority::Low, &cell).unwrap();
         assert_eq!(
-            pool.request_cell(CallbackPriority::Low, &queued),
+            pool.request(
+                CallbackPriority::Low,
+                Box::new(move || refused_tx.send(()).unwrap())
+            ),
             Err(CallbackError::QueueFull)
         );
         assert_eq!(pool.overflow_count(CallbackPriority::Low), 2);
         drop(gate);
-        assert_eq!(rx.recv_timeout(T).unwrap(), 1);
-        pool.request_cell(CallbackPriority::Low, &idle).unwrap();
-        assert_eq!(idle_rx.recv_timeout(T).unwrap(), 1);
+        pool.stop();
+        assert_eq!(cell_rx.try_iter().collect::<Vec<_>>(), [1]);
+        assert!(refused_rx.try_recv().is_err());
         pool.shutdown();
     }
 
@@ -2477,9 +2536,7 @@ mod tests {
             });
             for i in 1..=N {
                 cell.body().latest.store(i, Ordering::Release);
-                while pool.request_cell(CallbackPriority::Low, &cell).is_err() {
-                    std::thread::yield_now();
-                }
+                pool.request_cell(CallbackPriority::Low, &cell).unwrap();
             }
             let deadline = Instant::now() + T;
             while cell.body().seen.load(Ordering::Acquire) != N && Instant::now() < deadline {

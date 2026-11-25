@@ -300,18 +300,15 @@ impl AsyncToken {
 pub struct ProcessCallback(Arc<crate::runtime::background::CallbackCell<ProcessReentry>>);
 
 impl ProcessCallback {
-    /// C `callbackRequestProcessCallback(&cb, priority, prec)`. A request
-    /// while one is queued is taken by that one; `Err` is a full band. One
-    /// made once the database's scan has stopped never runs, and is `Ok` as
-    /// C's after `callbackStop` is.
-    pub fn request(
-        &self,
-        priority: crate::runtime::task::CallbackPriority,
-    ) -> Result<(), crate::runtime::background::CallbackError> {
-        if !admits_cell_request(&self.0.body().db) {
-            return Ok(());
+    /// C `callbackRequestProcessCallback(&cb, priority, prec)`, never refused
+    /// for a full band. A request while one is queued is taken by that one.
+    /// One made once the database's scan has stopped never runs, as C's
+    /// after `callbackStop`.
+    pub fn request(&self, priority: crate::runtime::task::CallbackPriority) {
+        if admits_cell_request(&self.0.body().db) {
+            // `Err` is only `NotInit`, already logged as C's `S_db_notInit`.
+            let _ = crate::runtime::task::request_cell(priority, &self.0);
         }
-        crate::runtime::task::request_cell(priority, &self.0)
     }
 
     /// C `ProcessCallback`'s body on the calling thread (`callback.c:379-387`):
@@ -434,16 +431,12 @@ impl DeviceDone {
             .store(band_index(prio), std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Queue the pass that completes an asynchronous write on `priority`. The
-    /// write's alarm is the device's own, read through `last_alarm` on that
-    /// pass. `Err` is a full band, which C's caller ignores as well; a
-    /// request once the scan has stopped runs nothing, as
-    /// [`ProcessCallback::request`]'s.
-    pub fn complete(
-        &self,
-        priority: crate::runtime::task::CallbackPriority,
-    ) -> Result<(), crate::runtime::background::CallbackError> {
-        self.owe(priority, Completion::Write)
+    /// Queue the pass that completes an asynchronous write on `priority`,
+    /// never refused for a full band. The write's alarm is the device's own,
+    /// read through `last_alarm` on that pass. A request once the scan has
+    /// stopped runs nothing, as [`ProcessCallback::request`]'s.
+    pub fn complete(&self, priority: crate::runtime::task::CallbackPriority) {
+        self.owe(priority, Completion::Write);
     }
 
     /// [`Self::complete`] on the record's band `delay` from now: C
@@ -462,13 +455,10 @@ impl DeviceDone {
     /// Queue the pass that ends a [`ReadStart::Pending`](crate::server::device_support::ReadStart::Pending)
     /// read on `priority`: the record's `process()` again with PACT set, whose
     /// [`DeviceSupport::read`](crate::server::device_support::DeviceSupport::read)
-    /// applies what the device read. `Err` is a full band; a request once the
-    /// scan has stopped runs nothing, as [`ProcessCallback::request`]'s.
-    pub fn reprocess(
-        &self,
-        priority: crate::runtime::task::CallbackPriority,
-    ) -> Result<(), crate::runtime::background::CallbackError> {
-        self.owe(priority, Completion::Read)
+    /// applies what the device read. Never refused for a full band; a request
+    /// once the scan has stopped runs nothing, as [`ProcessCallback::request`]'s.
+    pub fn reprocess(&self, priority: crate::runtime::task::CallbackPriority) {
+        self.owe(priority, Completion::Read);
     }
 
     /// One pass per request, in order, as C's asyn callback processes the
@@ -476,27 +466,20 @@ impl DeviceDone {
     /// owed to an idle cell requests a run, and that run drains every pass
     /// owed until none is: one at a time on one worker, as C runs them on
     /// the port thread, however many workers the band has.
-    fn owe(
-        &self,
-        priority: crate::runtime::task::CallbackPriority,
-        completion: Completion,
-    ) -> Result<(), crate::runtime::background::CallbackError> {
+    fn owe(&self, priority: crate::runtime::task::CallbackPriority, completion: Completion) {
         let body = self.0.body();
         // Judged before it is owed: a run already draining the cell takes
         // what it finds owed, admitted or not.
-        if !admits_cell_request(&body.db) {
-            return Ok(());
+        if !admits_cell_request(&body.db) || !self.push(completion) {
+            return;
         }
-        if !self.push(completion) {
-            return Ok(());
-        }
-        crate::runtime::task::request_cell(priority, &self.0).inspect_err(|_| {
-            // No run will drain them: lost, as C loses a refused
-            // `callbackRequest`, so the next pass owed requests afresh.
+        if crate::runtime::task::request_cell(priority, &self.0).is_err() {
+            // Only before `callbackInit` (C `S_db_notInit`): no run will
+            // drain them, so the next pass owed requests afresh.
             let mut owed = body.owed.lock().unwrap();
             *owed = Owed::default();
             body.pending.store(0, Ordering::Release);
-        })
+        }
     }
 
     /// [`Self::complete`] on the calling thread, for a callback that runs
@@ -533,12 +516,9 @@ impl DeviceDone {
 
     /// [`Self::reprocess`] at the record's band for the re-entry `epoch`
     /// names, for a completion that minted its own [`AsyncToken`].
-    pub(crate) fn reprocess_at(
-        &self,
-        epoch: u64,
-    ) -> Result<(), crate::runtime::background::CallbackError> {
+    pub(crate) fn reprocess_at(&self, epoch: u64) {
         self.0.body().epoch.store(epoch, Ordering::Release);
-        self.reprocess(self.priority())
+        self.reprocess(self.priority());
     }
 }
 
@@ -1238,7 +1218,8 @@ impl AsyncDbHandle {
     /// C `callbackRequest` of a record or device support's own callback
     /// `cell`, judged against this database's scan as [`Self::spawn_callback`]
     /// is: whether a run of it will come. None does once the scan has
-    /// stopped or the database is gone, nor when the band is full.
+    /// stopped or the database is gone, nor before `callbackInit`; a full
+    /// band never refuses it.
     pub fn request_callback<B: crate::runtime::background::CallbackBody>(
         &self,
         priority: crate::runtime::task::CallbackPriority,
@@ -5242,7 +5223,7 @@ impl PvDatabase {
                     instance.dpvt.set_notified_read(read);
                     instance.device_done.clone()
                 };
-                let _ = done.reprocess_at(token.epoch);
+                done.reprocess_at(token.epoch);
             }
         });
     }

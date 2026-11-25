@@ -124,7 +124,7 @@ async fn completes_on(prio: i16) -> Vec<String> {
     let (done, band) = pending.lock().unwrap().take().expect("the read was queued");
     std::thread::Builder::new()
         .name("port".into())
-        .spawn(move || done.reprocess(band).unwrap())
+        .spawn(move || done.reprocess(band))
         .unwrap()
         .join()
         .unwrap();
@@ -194,7 +194,7 @@ async fn queueing_ai(db: &PvDatabase, pending: &Pending) -> Arc<AtomicUsize> {
 /// queued land.
 async fn complete(db: &PvDatabase, pending: &Pending) {
     let (done, band) = pending.lock().unwrap().take().expect("the read was queued");
-    std::thread::spawn(move || done.reprocess(band).unwrap())
+    std::thread::spawn(move || done.reprocess(band))
         .join()
         .unwrap();
     for _ in 0..100 {

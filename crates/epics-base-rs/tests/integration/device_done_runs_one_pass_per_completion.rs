@@ -111,8 +111,8 @@ async fn two_completions_queued_back_to_back_run_two_passes() {
     db.process_record("AI").await.unwrap();
     let (done, band) = queued.lock().unwrap().take().expect("a read was queued");
     epics_base_rs::runtime::task::spawn_blocking_background(band, move |_| {
-        done.reprocess(band).unwrap();
-        done.reprocess(band).unwrap();
+        done.reprocess(band);
+        done.reprocess(band);
     })
     .await
     .unwrap();

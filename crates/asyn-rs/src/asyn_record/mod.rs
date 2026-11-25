@@ -1019,8 +1019,7 @@ impl CellBody for ProcessJob {
             return;
         }
         if let Some(cb) = self.reentry.lock().as_ref() {
-            // asynRecord ignores the status (asynRecord.c:830-831).
-            let _ = cb.request(prio);
+            cb.request(prio);
         }
     }
 }

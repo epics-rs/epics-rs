@@ -2716,10 +2716,10 @@ impl CellBody for DeviceJob {
             return;
         };
         if wrote {
-            let _ = reentry.complete(*prio);
+            reentry.complete(*prio);
         } else if self.read.lock().is_some() {
             // The result stays for the re-entered pass's `read()`.
-            let _ = reentry.reprocess(*prio);
+            reentry.reprocess(*prio);
         }
     }
 }

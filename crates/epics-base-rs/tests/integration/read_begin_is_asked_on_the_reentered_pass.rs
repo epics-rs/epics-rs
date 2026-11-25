@@ -71,7 +71,7 @@ impl DeviceSupport for Sink {
 
 async fn complete(db: &PvDatabase, pending: &Pending) {
     let (done, band) = pending.lock().unwrap().take().expect("a read was queued");
-    std::thread::spawn(move || done.reprocess(band).unwrap())
+    std::thread::spawn(move || done.reprocess(band))
         .join()
         .unwrap();
     // The re-entered pass either queues again or ends the cycle.

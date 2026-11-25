@@ -1,14 +1,13 @@
 //! C devMcaAsyn's port-thread callback ends a queued read with
 //! `dbScanLock; process; dbScanUnlock` on that thread (devMcaAsyn.c:359-361,
 //! :381-383), never through `callbackRequest`. A completion that IS queued
-//! and finds the band full is lost (`S_db_bufFull`, callback.c:368-373), and
-//! the record stays PACT.
+//! and finds the band full is lost in C (`S_db_bufFull`, callback.c:368-373),
+//! and the record stays PACT; here it waits for the band and ends the cycle.
 
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use epics_base_rs::error::CaResult;
-use epics_base_rs::runtime::background::CallbackError;
 use epics_base_rs::runtime::background::callback_executor::{set_parallel_threads, set_queue_size};
 use epics_base_rs::runtime::task::{
     CallbackPriority, background_callback_stats, spawn_blocking_background,
@@ -146,18 +145,22 @@ fn val(db: &PvDatabase) -> Option<EpicsValue> {
 }
 
 #[epics_macros_rs::epics_test]
-async fn a_read_completion_the_full_band_refuses_leaves_the_record_active() {
+async fn a_read_completion_on_a_full_band_ends_the_cycle() {
     let (db, done, reads, full) = queued_read().await;
-    assert_eq!(
-        done.reprocess(CallbackPriority::Low),
-        Err(CallbackError::QueueFull)
-    );
+    done.reprocess(CallbackPriority::Low);
     drop(full);
-    // A pass still owed would run on the freed band within this window.
-    epics_base_rs::runtime::task::sleep(Duration::from_millis(200)).await;
-    assert!(db.get_record("AI").unwrap().read().is_processing());
-    assert_eq!(val(&db), Some(EpicsValue::Double(0.0)));
-    assert!(reads.lock().unwrap().is_empty());
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while db.get_record("AI").unwrap().read().is_processing() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the completion was lost: the record stayed PACT"
+        );
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(val(&db), Some(EpicsValue::Double(7.0)));
+    let reads = reads.lock().unwrap();
+    assert_eq!(reads.len(), 1, "{reads:?}");
+    assert!(reads[0].starts_with("cbLow"), "{reads:?}");
 }
 
 #[epics_macros_rs::epics_test]

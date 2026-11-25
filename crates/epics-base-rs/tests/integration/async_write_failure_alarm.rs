@@ -51,7 +51,7 @@ impl DeviceSupport for AsyncDevice {
             return Ok(WriteStart::Synchronous);
         }
         self.failed = self.fails.load(Ordering::SeqCst);
-        done.device_done().complete(done.priority()).unwrap();
+        done.device_done().complete(done.priority());
         Ok(WriteStart::Pending)
     }
     fn dtyp(&self) -> &str {

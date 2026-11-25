@@ -77,7 +77,7 @@ impl CellBody for Trip {
         let got = port.call(&RequestOp::Int32Read, AsynUser::new(0)).unwrap();
         self.last.store(got.int_val.unwrap(), Ordering::SeqCst);
         if let Some((done, band)) = self.reentry.lock().unwrap().take() {
-            done.reprocess(band).unwrap();
+            done.reprocess(band);
         }
     }
     fn unrun(&self, why: Unrun) {

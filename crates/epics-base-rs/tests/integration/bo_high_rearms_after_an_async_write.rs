@@ -40,7 +40,7 @@ impl DeviceSupport for Port {
         let (done, band, delay) = (done.device_done(), done.priority(), self.delay);
         std::thread::spawn(move || {
             std::thread::sleep(delay);
-            done.complete(band).unwrap();
+            done.complete(band);
         });
         Ok(WriteStart::Pending)
     }

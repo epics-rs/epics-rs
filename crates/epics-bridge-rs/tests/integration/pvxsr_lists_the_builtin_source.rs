@@ -52,7 +52,11 @@ fn report_lines(db_text: &str, after_init: &str, input: &[u8]) -> Vec<String> {
     )
     .unwrap();
     let mut child = Command::new(std::env::current_exe().unwrap())
-        .args(["ioc_child", "--exact", "--nocapture"])
+        .args([
+            "pvxsr_lists_the_builtin_source::ioc_child",
+            "--exact",
+            "--nocapture",
+        ])
         .env(CHILD, &stcmd)
         .env("EPICS_PVAS_SERVER_PORT", "0")
         .env("EPICS_PVAS_BROADCAST_PORT", "0")

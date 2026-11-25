@@ -6,7 +6,7 @@
 //! stopped and then killed under it prints nothing, retry or not.
 #![cfg(all(feature = "pvalink", feature = "qsrv", tokio_backend, unix))]
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -16,6 +16,8 @@ use common::{CHILD, Shell, spawn_ioc, stop};
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
 use epics_pva_rs::server_native::{PvaServer, SharedPV, SharedSource};
 use named_port::HeldPort;
+
+const IOC_CHILD: &str = "pva_link_put_error_prints_the_pvxs_line::ioc_child";
 
 /// The child half; a no-op unless the parent set [`CHILD`].
 #[test]
@@ -67,8 +69,9 @@ fn a_refused_pva_link_put_prints_the_pvxs_line() {
 
     let dir = tempfile::tempdir().unwrap();
     let (remote_port, local_port) = (HeldPort::tcp(), HeldPort::tcp());
-    let mut remote = spawn_ioc(dir.path(), "remote", REMOTE, &remote_port, "");
+    let mut remote = spawn_ioc(IOC_CHILD, dir.path(), "remote", REMOTE, &remote_port, "");
     let mut ioc = spawn_ioc(
+        IOC_CHILD,
         dir.path(),
         "local",
         DB,

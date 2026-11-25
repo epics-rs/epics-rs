@@ -160,15 +160,15 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ("epics-base-rs", "tests/integration/client_server.rs"),
     (
         "epics-bridge-rs",
-        "tests/a_bare_ca_link_opens_no_pva_channel.rs",
+        "tests/integration/a_bare_ca_link_opens_no_pva_channel.rs",
     ),
     (
         "epics-bridge-rs",
-        "tests/a_compress_pva_inp_of_an_empty_array_keeps_its_ring.rs",
+        "tests/integration/a_compress_pva_inp_of_an_empty_array_keeps_its_ring.rs",
     ),
     (
         "epics-bridge-rs",
-        "tests/a_qsrv_put_reply_follows_its_update.rs",
+        "tests/integration/a_qsrv_put_reply_follows_its_update.rs",
     ),
     (
         "epics-bridge-rs",
@@ -176,46 +176,70 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ),
     (
         "epics-bridge-rs",
-        "tests/gw_upstream_unresponsive_window.rs",
+        "tests/integration/gw_upstream_unresponsive_window.rs",
     ),
     (
         "epics-bridge-rs",
         "tests/pva_forward_link_dispatch_alloc.rs",
     ),
-    ("epics-bridge-rs", "tests/pva_gateway.rs"),
+    ("epics-bridge-rs", "tests/integration/pva_gateway.rs"),
     (
         "epics-bridge-rs",
-        "tests/pva_link_empty_name_processes_invalid.rs",
-    ),
-    ("epics-bridge-rs", "tests/pva_link_parse_warnings.rs"),
-    (
-        "epics-bridge-rs",
-        "tests/pva_link_put_error_prints_the_pvxs_line.rs",
-    ),
-    ("epics-bridge-rs", "tests/pva_link_put_relinks_cp_holder.rs"),
-    ("epics-bridge-rs", "tests/pva_link_scan_needs_an_inlink.rs"),
-    ("epics-bridge-rs", "tests/pva_local_link_unfulfilled.rs"),
-    (
-        "epics-bridge-rs",
-        "tests/pvalink_channel_closes_with_its_last_link.rs",
+        "tests/integration/pva_link_empty_name_processes_invalid.rs",
     ),
     (
         "epics-bridge-rs",
-        "tests/pvalink_cp_scan_of_an_active_record_traces.rs",
-    ),
-    ("epics-bridge-rs", "tests/pvalink_read_stamps_the_reader.rs"),
-    (
-        "epics-bridge-rs",
-        "tests/pvalink_reopened_cp_channel_scans.rs",
+        "tests/integration/pva_link_parse_warnings.rs",
     ),
     (
         "epics-bridge-rs",
-        "tests/qsrv_put_fails_on_the_process_status.rs",
+        "tests/integration/pva_link_put_error_prints_the_pvxs_line.rs",
     ),
-    ("epics-bridge-rs", "tests/qsrv_remote_log.rs"),
-    ("epics-bridge-rs", "tests/qsrv_rs_resolves_a_ca_link.rs"),
-    ("epics-bridge-rs", "tests/qsrv_ts_filter_probe.rs"),
-    ("epics-bridge-rs", "tests/tpro_names_the_pva_client.rs"),
+    (
+        "epics-bridge-rs",
+        "tests/integration/pva_link_put_relinks_cp_holder.rs",
+    ),
+    (
+        "epics-bridge-rs",
+        "tests/integration/pva_link_scan_needs_an_inlink.rs",
+    ),
+    (
+        "epics-bridge-rs",
+        "tests/integration/pva_local_link_unfulfilled.rs",
+    ),
+    (
+        "epics-bridge-rs",
+        "tests/integration/pvalink_channel_closes_with_its_last_link.rs",
+    ),
+    (
+        "epics-bridge-rs",
+        "tests/integration/pvalink_cp_scan_of_an_active_record_traces.rs",
+    ),
+    (
+        "epics-bridge-rs",
+        "tests/integration/pvalink_read_stamps_the_reader.rs",
+    ),
+    (
+        "epics-bridge-rs",
+        "tests/integration/pvalink_reopened_cp_channel_scans.rs",
+    ),
+    (
+        "epics-bridge-rs",
+        "tests/integration/qsrv_put_fails_on_the_process_status.rs",
+    ),
+    ("epics-bridge-rs", "tests/integration/qsrv_remote_log.rs"),
+    (
+        "epics-bridge-rs",
+        "tests/integration/qsrv_rs_resolves_a_ca_link.rs",
+    ),
+    (
+        "epics-bridge-rs",
+        "tests/integration/qsrv_ts_filter_probe.rs",
+    ),
+    (
+        "epics-bridge-rs",
+        "tests/integration/tpro_names_the_pva_client.rs",
+    ),
     ("epics-ca-rs", "src/client/mod.rs"),
     ("epics-ca-rs", "src/client/sync_group.rs"),
     ("epics-ca-rs", "src/client/transport.rs"),

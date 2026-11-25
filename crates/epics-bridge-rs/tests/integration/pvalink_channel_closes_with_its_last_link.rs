@@ -20,9 +20,10 @@ record(ai, "H") { field(INP, {pva:{pv:"T:OLD"}}) }
 #[tokio::test(flavor = "multi_thread")]
 async fn a_put_moving_the_last_link_off_a_channel_closes_it() {
     let closed = named_port::HeldPort::closed_tcp();
-    // SAFETY: before the IOC builds its PVA client; nothing else in this
-    // test binary touches the environment. Nothing listens on `closed.port`,
-    // and the hold keeps a stranger from binding it until the test ends.
+    // SAFETY: before the IOC builds its PVA client; under nextest, the repo's
+    // runner, each test runs in its own process. Nothing listens on
+    // `closed.port`, and the hold keeps a stranger from binding it until the
+    // test ends.
     unsafe {
         std::env::set_var(
             "EPICS_PVA_NAME_SERVERS",

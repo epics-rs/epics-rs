@@ -20,7 +20,7 @@ use epics_ca_rs::server::CaServer;
 use epics_pva_rs::client::PvaClient;
 use epics_pva_rs::pvdata::{PvField, ScalarValue};
 
-mod qsrv_named_ports;
+use crate::qsrv_named_ports;
 
 /// `(value, alarm.severity)` of `pv`'s NTScalar.
 async fn value_and_severity(client: &PvaClient, pv: &str) -> Option<(f64, i32)> {

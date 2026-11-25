@@ -6,10 +6,12 @@
 //! `%s\t` (`ioc/pvalink.cpp:244-248`).
 #![cfg(all(feature = "pvalink", feature = "qsrv", tokio_backend, unix))]
 
-mod common;
+use crate::common;
 
 use common::{CHILD, Shell, spawn_ioc, stop};
 use named_port::HeldPort;
+
+const IOC_CHILD: &str = "dbpvar_prints_the_pvxs_channel_report::ioc_child";
 
 /// The child half; a no-op unless the parent set [`CHILD`].
 #[test]
@@ -190,8 +192,9 @@ fn dbpvar_prints_the_pvxs_channel_report() {
     }
     let dir = tempfile::tempdir().unwrap();
     let (remote_port, local_port, late_port) = (HeldPort::tcp(), HeldPort::tcp(), HeldPort::tcp());
-    let mut remote = spawn_ioc(dir.path(), "remote", REMOTE, &remote_port, "");
+    let mut remote = spawn_ioc(IOC_CHILD, dir.path(), "remote", REMOTE, &remote_port, "");
     let mut local = spawn_ioc(
+        IOC_CHILD,
         dir.path(),
         "local",
         LOCAL,
@@ -223,7 +226,7 @@ fn dbpvar_prints_the_pvxs_channel_report() {
         t.contains("REM conn=F 1 disconnects, 1 type changes\n")
     });
 
-    let mut late = spawn_ioc(dir.path(), "late", LATE, &late_port, "");
+    let mut late = spawn_ioc(IOC_CHILD, dir.path(), "late", LATE, &late_port, "");
     let p5_end = sh.capture_when(&all(5), |t| {
         t.contains("NOPE:Y conn=T 0 disconnects, 1 type changes\n")
     });

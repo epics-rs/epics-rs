@@ -46,7 +46,11 @@ fn a_declared_pva_link_loads_clean_as_in_soft_ioc_pva() {
     .unwrap();
 
     let mut child = Command::new(std::env::current_exe().unwrap())
-        .args(["ioc_child", "--exact", "--nocapture"])
+        .args([
+            "qsrv_app_declares_pva_link_type::ioc_child",
+            "--exact",
+            "--nocapture",
+        ])
         .env(CHILD, &stcmd)
         .env("EPICS_PVAS_SERVER_PORT", "0")
         .env("EPICS_PVAS_BROADCAST_PORT", "0")

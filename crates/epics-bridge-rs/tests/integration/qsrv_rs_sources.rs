@@ -8,7 +8,7 @@
 //! ```
 #![cfg(all(feature = "qsrv-bin", unix))]
 
-mod qsrv_named_ports;
+use crate::qsrv_named_ports;
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;

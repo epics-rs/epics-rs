@@ -13,7 +13,7 @@ use epics_bridge_rs::qsrv::{BridgeProvider, ProcessMode, PutOptions, group::Grou
 use epics_pva_rs::pvdata::{PvField, PvStructure, ScalarValue};
 
 const CHILD: &str = "GROUP_PUTF_CHILD";
-const TEST: &str = "a_group_put_to_an_active_record_prints_the_pvxs_line";
+const TEST: &str = "a_group_put_to_an_active_record_prints_the_pvxs_line::a_group_put_to_an_active_record_prints_the_pvxs_line";
 
 // RTEMS-EXEC-MODEL-ALLOW(1): checked - runs and passes in the exec-backend
 // suite.

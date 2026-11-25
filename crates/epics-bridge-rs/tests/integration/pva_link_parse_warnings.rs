@@ -35,7 +35,8 @@ async fn ignored_pva_link_member_prints_pvxs_warning() {
         .0;
 
     let err_sink = tempfile::NamedTempFile::new().expect("stderr capture");
-    // SAFETY: fd 2 is process-global; this binary holds one test.
+    // SAFETY: fd 2 is process-global; under nextest, the repo's runner, each
+    // test runs in its own process.
     let saved_err = unsafe {
         let saved = libc::dup(2);
         libc::dup2(err_sink.as_file().as_raw_fd(), 2);

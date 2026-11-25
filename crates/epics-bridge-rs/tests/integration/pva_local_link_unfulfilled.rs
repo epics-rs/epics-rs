@@ -26,7 +26,8 @@ record(calc, "L:FLNK") { field(FLNK, {pva:{pv:"L:NOSUCH", local:true}}) }
 /// the reactor prints after `f` returns) and a duplicate would have followed.
 async fn stderr_of<T>(lines: usize, f: impl Future<Output = T>) -> (T, String) {
     let sink = tempfile::NamedTempFile::new().expect("stderr capture");
-    // SAFETY: fd 2 is process-global; this binary holds one test.
+    // SAFETY: fd 2 is process-global; under nextest, the repo's runner, each
+    // test runs in its own process.
     let saved = unsafe {
         let saved = libc::dup(2);
         libc::dup2(sink.as_file().as_raw_fd(), 2);

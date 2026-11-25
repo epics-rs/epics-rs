@@ -28,7 +28,7 @@ use epics_pva_rs::pv_request::PvRequestExpr;
 use epics_pva_rs::server_native::{PvaServer, PvaServerConfig};
 
 const CHILD: &str = "TPRO_PVA_CLIENT_CHILD";
-const TEST: &str = "a_pva_put_traces_with_the_peer_s_name";
+const TEST: &str = "tpro_names_the_pva_client::a_pva_put_traces_with_the_peer_s_name";
 
 const DB: &str = r#"
 record(calc, "X") { field(TPRO, "1") field(CALC, "VAL+1") field(FLNK, "Y") }

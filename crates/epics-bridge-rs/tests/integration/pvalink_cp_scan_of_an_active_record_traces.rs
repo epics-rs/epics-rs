@@ -38,8 +38,8 @@ async fn a_cp_update_of_an_active_record_prints_the_tpro_line() {
         PvaServerConfig::isolated(),
     )
     .expect("source PVA server starts");
-    // SAFETY: before the reader IOC builds its PVA client; nothing else in
-    // this test binary touches the environment.
+    // SAFETY: before the reader IOC builds its PVA client; under nextest, the
+    // repo's runner, each test runs in its own process.
     unsafe {
         std::env::set_var("EPICS_PVA_NAME_SERVERS", server.tcp_addr().to_string());
         std::env::set_var("EPICS_PVA_ADDR_LIST", "");
@@ -71,7 +71,8 @@ async fn a_cp_update_of_an_active_record_prints_the_tpro_line() {
     }
 
     let out_sink = tempfile::NamedTempFile::new().expect("stdout capture");
-    // SAFETY: fd 1 is process-global; this binary holds one test.
+    // SAFETY: fd 1 is process-global; under nextest, the repo's runner, each
+    // test runs in its own process.
     let saved_out = unsafe {
         let saved = libc::dup(1);
         libc::dup2(out_sink.as_file().as_raw_fd(), 1);

@@ -13,8 +13,9 @@ use epics_ca_rs::calink::CaLinkResolver;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_down_ca_link_opens_no_pva_channel() {
-    // SAFETY: the only test in this binary, before any runtime thread reads
-    // the environment. Nothing is searched for: the CA link stays down.
+    // SAFETY: under nextest, the repo's runner, each test runs in its own
+    // process; this is before any runtime thread reads the environment.
+    // Nothing is searched for: the CA link stays down.
     unsafe {
         std::env::set_var("EPICS_CA_AUTO_ADDR_LIST", "NO");
         std::env::set_var("EPICS_CA_ADDR_LIST", "");

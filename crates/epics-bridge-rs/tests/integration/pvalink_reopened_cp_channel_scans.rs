@@ -53,8 +53,8 @@ async fn a_cp_channel_reopened_after_closing_scans_its_holder() {
         PvaServerConfig::isolated(),
     )
     .expect("source PVA server starts");
-    // SAFETY: before the reader IOC builds its PVA client; nothing else in
-    // this test binary touches the environment.
+    // SAFETY: before the reader IOC builds its PVA client; under nextest, the
+    // repo's runner, each test runs in its own process.
     unsafe {
         std::env::set_var("EPICS_PVA_NAME_SERVERS", server.tcp_addr().to_string());
         std::env::set_var("EPICS_PVA_ADDR_LIST", "");

@@ -57,7 +57,11 @@ record(ai, "LNK") { field(INP, {pva:"XA"}) field(SCAN, "1 second") }
     let held = named_port::HeldPort::tcp();
     let port = held.port.to_string();
     let mut child = Command::new(std::env::current_exe().unwrap())
-        .args(["ioc_child", "--exact", "--nocapture"])
+        .args([
+            "qsrv2_disabled_still_serves::ioc_child",
+            "--exact",
+            "--nocapture",
+        ])
         .env(CHILD, &stcmd)
         .env("PVXS_QSRV_ENABLE", "NO")
         .env("EPICS_PVAS_SERVER_PORT", &port)

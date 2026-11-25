@@ -1,6 +1,7 @@
 //! IOC children typed at through their iocsh, for tests that compare an
-//! rs IOC's shell output with a softIocPVX capture. Each test binary
-//! re-runs itself on its own `ioc_child` test, which calls [`ioc_child`].
+//! rs IOC's shell output with a softIocPVX capture. Each user module has its
+//! own `ioc_child` test, which calls [`ioc_child`], and names it to
+//! [`spawn_ioc`]: the binary is re-run on that test.
 
 use std::fs::File;
 use std::io::Write;
@@ -29,14 +30,22 @@ pub fn ioc_child() {
     .expect("the IOC runs");
 }
 
-/// An IOC child on `db` serving PVA on `port`, finding PVs at `servers`.
+/// An IOC child on `db` serving PVA on `port`, finding PVs at `servers`,
+/// run as the test `child` names.
 /// The caller keeps `port` held as long as any IOC may dial it: a number
 /// probed and released is any socket's, under load a connect's source port.
 ///
 /// Its stdout and stderr go to `{name}.out` and `{name}.err` in `dir`: a
 /// pipe nobody reads blocks the shell once its prompts and report headers
 /// fill it, at 8 KiB when the user is past `fs.pipe-user-pages-soft`.
-pub fn spawn_ioc(dir: &Path, name: &str, db: &str, port: &HeldPort, servers: &str) -> Child {
+pub fn spawn_ioc(
+    child: &str,
+    dir: &Path,
+    name: &str,
+    db: &str,
+    port: &HeldPort,
+    servers: &str,
+) -> Child {
     let db_path = dir.join(format!("{name}.db"));
     std::fs::write(&db_path, db).unwrap();
     let stcmd = dir.join(format!("{name}.cmd"));
@@ -47,7 +56,7 @@ pub fn spawn_ioc(dir: &Path, name: &str, db: &str, port: &HeldPort, servers: &st
     .unwrap();
     let log = |ext: &str| File::create(dir.join(format!("{name}.{ext}"))).unwrap();
     Command::new(std::env::current_exe().unwrap())
-        .args(["ioc_child", "--exact", "--nocapture"])
+        .args([child, "--exact", "--nocapture"])
         .env(CHILD, &stcmd)
         .env("EPICS_PVAS_SERVER_PORT", port.port.to_string())
         .env("EPICS_PVAS_BROADCAST_PORT", "0")

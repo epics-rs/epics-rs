@@ -28,10 +28,12 @@
 //! re-run on [`ioc_child`]) whose piped stdin types the commands.
 #![cfg(all(feature = "pvalink", feature = "qsrv", tokio_backend, unix))]
 
-mod common;
+use crate::common;
 
 use common::{CHILD, Shell, signal, spawn_ioc, stop};
 use named_port::HeldPort;
+
+const IOC_CHILD: &str = "dbjlr_prints_the_pvxs_pva_report::ioc_child";
 
 /// The child half; a no-op unless the parent set [`CHILD`].
 #[test]
@@ -79,8 +81,9 @@ fn dbjlr_prints_the_pvxs_pva_report() {
     }
     let dir = tempfile::tempdir().unwrap();
     let (remote_port, local_port, late_port) = (HeldPort::tcp(), HeldPort::tcp(), HeldPort::tcp());
-    let mut remote = spawn_ioc(dir.path(), "remote", REMOTE, &remote_port, "");
+    let mut remote = spawn_ioc(IOC_CHILD, dir.path(), "remote", REMOTE, &remote_port, "");
     let mut local = spawn_ioc(
+        IOC_CHILD,
         dir.path(),
         "local",
         LOCAL,
@@ -123,7 +126,7 @@ fn dbjlr_prints_the_pvxs_pva_report() {
     let r0_gone = sh.report("R", 0);
     let wrt_gone = sh.report_until("WRT", 1, "conn=F #disconn=1");
 
-    let mut late = spawn_ioc(dir.path(), "late", LATE, &late_port, "");
+    let mut late = spawn_ioc(IOC_CHILD, dir.path(), "late", LATE, &late_port, "");
     let mut late_sh = Shell::new(&mut late, dir.path(), "late");
     let wt_back = sh.report_until("WT", 1, "conn=T #disconn=0");
     let nope_y = late_sh.capture_until("dbgf NOPE:Y", "DBF_DOUBLE:         6         ");

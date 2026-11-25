@@ -1,5 +1,5 @@
 //! The CA gateway's access hook after an unresponsive upstream circuit,
-//! against softIoc. Its own binary, not `upstream.rs`'s tests: it spawns an
+//! against softIoc. In `tests/`, not `upstream.rs`'s tests: it spawns an
 //! IOC, and tools/ioc-spawn-gate charges a spawn under `src/` to every binary
 //! that links the library. Tokio backend only: `UpstreamManager`,
 //! `CacheMode` and `resolve_event_mask` do not exist on the exec backend,

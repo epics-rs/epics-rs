@@ -55,7 +55,7 @@ fn a_malformed_group_file_aborts_inside_iocbuild_with_pvxs_text() {
     let out = std::fs::File::create(&log).unwrap();
     let stdout_log = dir.path().join("stdout");
     let mut child = Command::new(std::env::current_exe().unwrap())
-        .args(["ioc_child", "--exact", "--nocapture"])
+        .args(["qsrv_app_group_file::ioc_child", "--exact", "--nocapture"])
         .env(CHILD, &stcmd)
         .env("EPICS_PVAS_SERVER_PORT", "0")
         .env("EPICS_PVAS_BROADCAST_PORT", "0")

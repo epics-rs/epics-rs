@@ -6,7 +6,6 @@
 mod hsc1_mock;
 #[path = "hsc1_mock/rig.rs"]
 mod hsc1_mock_rig;
-mod qxbpm_mock;
 
 mod a_removed_drive_link_writes_nothing;
 mod dbaddr_fields_serve_their_arrays;

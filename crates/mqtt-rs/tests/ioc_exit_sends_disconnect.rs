@@ -4,7 +4,7 @@
 //! `epics_libcom_rs::runtime::exit::call_at_exits`, asyn registers every port
 //! there, and stopping a port actor drops the driver, so `MqttDriver::drop`
 //! runs (`crates/epics-base-rs/tests/integration/ioc_run_is_the_shutdown_owner.rs`,
-//! `crates/asyn-rs/tests/ioc_exit_stops_every_port_actor.rs`). None of that
+//! `crates/asyn-rs/tests/integration/ioc_exit_stops_every_port_actor.rs`). None of that
 //! says a byte left the process. `MqttDriver::drop` only calls
 //! `Notify::notify_one`; the DISCONNECT is written much later, by a *different*
 //! task on the tokio runtime, out of rumqttc's command channel. Between the two

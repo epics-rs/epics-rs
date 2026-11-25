@@ -68,7 +68,8 @@ fn configure(port: &str) -> Result<(), AsynError> {
 #[test]
 fn a_second_configure_of_a_half_built_port_is_refused() {
     const CHILD: &str = "ASYN_RS_HALF_BUILT_CHILD";
-    const TEST: &str = "a_second_configure_of_a_half_built_port_is_refused";
+    const TEST: &str =
+        "half_built_port_stays_registered::a_second_configure_of_a_half_built_port_is_refused";
     if std::env::var_os(CHILD).is_some() {
         assert!(configure("HALFDUP").is_err());
         assert!(

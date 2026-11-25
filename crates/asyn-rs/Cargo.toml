@@ -125,70 +125,14 @@ harness = false
 
 # Integration tests of the EPICS-IOC surface — the record device support, the
 # iocsh commands, and `epics_base_rs`'s database — so they exist only when that
-# surface does. Declared as `required-features` rather than `#![cfg(feature =
-# "epics")]` inside each file: cargo then SKIPS the target, instead of
-# compiling a file whose contents have been cfg'd away to nothing, which reads
-# as a passing test that never ran. The other eight files in `tests/` name only
-# the framework and are auto-discovered unchanged; `tools/target-cfg-gate`
-# holds the two lists to each other, for every crate rather than this one.
-[[test]]
-name = "device_support_brings_the_shell_commands"
-required-features = ["epics"]
-
-[[test]]
-name = "octet_short_write_raises_write_minor"
-required-features = ["epics"]
-
-[[test]]
-name = "octet_write_read_reads_its_command_record"
-required-features = ["epics"]
-
-[[test]]
-name = "octet_write_read_takes_no_lock_on_its_command_record"
-required-features = ["epics"]
-
-[[test]]
-name = "octet_write_defines_the_record"
-required-features = ["epics"]
-
-[[test]]
-name = "asyn_monitor_posts_its_read_fields"
-required-features = ["epics"]
-
-[[test]]
-name = "asyn_specials_under_the_hold"
-required-features = ["epics"]
-
-[[test]]
-name = "errs_put_is_refused_by_the_gate"
-required-features = ["epics"]
-
+# surface does. In `tests/integration/` that is `#[cfg(feature = "epics")]` on
+# the `mod`; these three keep a process of their own for their counting
+# allocator, so the gate is `required-features` and cargo SKIPS the target,
+# instead of compiling a file whose contents have been cfg'd away to nothing,
+# which reads as a passing test that never ran. `tools/target-cfg-gate` holds
+# both declarations to the files' imports, for every crate rather than this one.
 [[test]]
 name = "asyn_reentry_allocates_nothing"
-required-features = ["epics"]
-
-[[test]]
-name = "asyn_errs_posts_ahead_of_the_alarm"
-required-features = ["epics"]
-
-[[test]]
-name = "asyn_portless_errs_posts_once"
-required-features = ["epics"]
-
-[[test]]
-name = "interrupt_gate_follows_the_database"
-required-features = ["epics"]
-
-[[test]]
-name = "asyn_special_posts_in_c_order"
-required-features = ["epics"]
-
-[[test]]
-name = "special_puts_queue_behind_a_blocked_read"
-required-features = ["epics"]
-
-[[test]]
-name = "enum_property_post_mask"
 required-features = ["epics"]
 
 [[test]]
@@ -196,53 +140,5 @@ name = "enum_notify_allocates_nothing"
 required-features = ["epics"]
 
 [[test]]
-name = "enum_table_lands_under_the_record_lock"
-required-features = ["epics"]
-
-[[test]]
-name = "ring_size_0_copies_under_the_record_lock"
-required-features = ["epics"]
-
-[[test]]
 name = "notify_allocates_nothing"
-required-features = ["epics"]
-
-[[test]]
-name = "iocsh_port_is_traceable"
-required-features = ["epics"]
-
-[[test]]
-name = "ip_server_port_accepts"
-required-features = ["epics"]
-
-[[test]]
-name = "non_blocking_write_reaches_the_driver_once"
-required-features = ["epics"]
-
-[[test]]
-name = "blocking_write_completes_on_the_callback_band"
-required-features = ["epics"]
-
-[[test]]
-name = "half_built_port_stays_registered"
-required-features = ["epics"]
-
-[[test]]
-name = "port_runtime_lifetime"
-required-features = ["epics"]
-
-[[test]]
-name = "process_gate_tests"
-required-features = ["epics"]
-
-[[test]]
-name = "spc_nomod_fields_refuse_every_runtime_write"
-required-features = ["epics"]
-
-[[test]]
-name = "time_series_busy_post_mask"
-required-features = ["epics"]
-
-[[test]]
-name = "trace_prints_reach_the_trace_file"
 required-features = ["epics"]

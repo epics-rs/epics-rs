@@ -140,7 +140,7 @@ fn a_disconnected_port_is_still_swept() {
 
 // RTEMS-EXEC-MODEL-ALLOW(1): checked, not waived — it ran and passed on the
 // exec backend (`EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p
-// asyn-rs --test boot_sweep_runs_behind_the_queue`, 3/3).
+// asyn-rs --test integration boot_sweep_runs_behind_the_queue::`, 3/3).
 
 /// Boundary — a request queued before the edge that does not return, as a
 /// driver call with no timeout on a silent device: the edge's job, which

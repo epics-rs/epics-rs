@@ -8,7 +8,7 @@
 
 // RTEMS-EXEC-MODEL-ALLOW(4): checked, not waived — all 4 ran and passed
 // on the exec backend (`EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest
-// run -p asyn-rs --test boot_flush_is_its_owner_gates_job`, 4/4).
+// run -p asyn-rs --test integration boot_flush_is_its_owner_gates_job::`, 4/4).
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

@@ -128,7 +128,7 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ("ad-plugins-rs", "tests/plugin_interrupt_sources.rs"),
     ("ad-plugins-rs", "tests/reference_plugin_asyn_flags.rs"),
     ("ad-plugins-rs", "tests/std_arrays_configure_queue_size.rs"),
-    ("asyn-rs", "tests/process_gate_tests.rs"),
+    ("asyn-rs", "tests/integration/process_gate_tests.rs"),
     (
         "epics-base-rs",
         "tests/integration/a_band_blocks_on_the_programs_runtime.rs",

@@ -34,7 +34,12 @@ fn redirected(files: &[(&str, &str)], script: &str, names: &[&str]) -> Vec<Strin
     let d = d.display().to_string().replace('\\', "/");
     std::fs::write(format!("{d}/st.cmd"), script.replace("{d}", &d)).unwrap();
     let out = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "child_script", "--nocapture", "--test-threads=1"])
+        .args([
+            "--exact",
+            "prints_follow_the_redirect::child_script",
+            "--nocapture",
+            "--test-threads=1",
+        ])
         .env(CHILD, format!("{d}/st.cmd"))
         .current_dir(&d)
         .output()

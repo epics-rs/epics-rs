@@ -4,6 +4,7 @@
 //! device. Counted with this binary's own allocator on the calling thread,
 //! every string metadata field set.
 
+#[path = "integration/module_records/mod.rs"]
 mod module_records;
 
 use std::alloc::{GlobalAlloc, Layout, System};

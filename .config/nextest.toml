@@ -152,9 +152,11 @@ default-filter = """
 # rtems-exec-model were caught.
 #
 # One rule, not a list: a test binary that reads a reference tree is named
-# `reference_*`, and `binary(/^reference_/)` excludes them all. The
-# `epics-base-rs` test `reference_consumers_are_named_reference` fails a
-# top-level test file that calls the resolver under any other name.
+# `reference_*`, and `binary(/^reference_/)` excludes them all; in a crate
+# whose tests are merged into `tests/integration/`, the module is named
+# `reference_*` and `binary(integration) & test(/^reference_/)` excludes it.
+# The `epics-base-rs` test `reference_consumers_are_excluded_from_profile_ci`
+# fails a test file that calls the resolver and neither rule excludes.
 [profile.ci]
 fail-fast = false
 retries = 2
@@ -171,6 +173,7 @@ default-filter = """
     binary(wire_golden_ext) |
     binary(interop_pvxs) |
     binary(/^reference_/) |
+    (binary(integration) & test(/^reference_/)) |
     package(epics-oracle-rs) |
     (binary(rt_priority_default) & test(=the_default_gets_fifo_where_the_process_may_have_it)) |
     (package(epics-libcom-rs) & test(=runtime::task::tests::an_above_99_priority_is_refused_by_the_fifo_scheduler)) |

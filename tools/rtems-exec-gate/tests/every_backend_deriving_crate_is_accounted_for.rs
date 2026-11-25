@@ -131,9 +131,9 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ("asyn-rs", "tests/process_gate_tests.rs"),
     (
         "epics-base-rs",
-        "tests/a_band_blocks_on_the_programs_runtime.rs",
+        "tests/integration/a_band_blocks_on_the_programs_runtime.rs",
     ),
-    ("epics-base-rs", "tests/client_server.rs"),
+    ("epics-base-rs", "tests/integration/client_server.rs"),
     (
         "epics-bridge-rs",
         "tests/a_bare_ca_link_opens_no_pva_channel.rs",

@@ -5305,7 +5305,7 @@ mod tests {
     /// it processes the record; the put writes VAL, the process returns
     /// `AsyncPending`, and the completion fires later on `complete_async_record`
     /// (C `dbNotifyCompletion`). Mirrors `AsyncOnceRecord` in
-    /// `epics-base-rs/tests/put_notify_defers_on_pact.rs`.
+    /// `epics-base-rs/tests/integration/put_notify_defers_on_pact.rs`.
     struct AsyncOnceRecord {
         val: f64,
         pending: bool,

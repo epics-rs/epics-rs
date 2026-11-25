@@ -713,7 +713,7 @@ mod tests {
         // assertion is against `menu_scan()`, not against the generated
         // constant it happens to equal in a process that loaded no site menu.
         // Asserting the constant would let a compiled-in list back in without
-        // failing; `tests/menuscan_site_menu_is_runtime_data.rs` is the other
+        // failing; `tests/integration/menuscan_site_menu_is_runtime_data.rs` is the other
         // half, in the process that does load one.
         assert_eq!(
             shared_menu_choices("SSCN"),

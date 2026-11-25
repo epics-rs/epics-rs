@@ -295,7 +295,7 @@ To add support for a new DBR type code:
    `CA_PROTO_WRITE_NOTIFY`, `CA_PROTO_EVENT_ADD`) to special-case the
    new type if it doesn't follow the family pattern.
 6. Add a wire-layout test in
-   `crates/epics-base-rs/tests/types_tests.rs`
+   `crates/epics-base-rs/tests/integration/types_tests.rs`
    asserting the byte layout matches the C reference.
 
 ## Common pitfalls

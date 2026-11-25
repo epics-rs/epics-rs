@@ -2136,7 +2136,7 @@ pub fn alarm_val_arm(rtype: &str) -> AlarmValArm {
 /// `MotorRecord::field_metadata_override` (`motor-rs/src/record/mod.rs:201-205`)
 /// answers `Some(..)` for EVERY field, and the override layer runs after
 /// `route_field_metadata` (pinned by
-/// `epics-base-rs/tests/the_override_layer_runs_last.rs`), so every served
+/// `epics-base-rs/tests/integration/the_override_layer_runs_last.rs`), so every served
 /// motor field takes its window from `motor-rs` and never from this table.
 /// The arm states what C's rset does for the day a motor field reaches the
 /// routing layer without an override.
@@ -4240,7 +4240,7 @@ pub trait Record: RecordAny + Send + Sync + 'static {
     /// A field with choices but a `Short` declaration is a self-contradictory
     /// declaration: it would be served as a bare `DBR_SHORT` index while
     /// claiming to have labels for it. `menu_choices_are_served_as_dbr_enum`
-    /// (`tests/menu_fields_serve_enum_choices.rs`) fails on any record type
+    /// (`tests/integration/menu_fields_serve_enum_choices.rs`) fails on any record type
     /// that breaks it — the storage may be a short, the declaration may not.
     fn menu_field_choices(&self, _field: &str) -> Option<&'static [&'static str]> {
         None

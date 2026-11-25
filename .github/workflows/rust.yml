@@ -96,7 +96,7 @@ jobs:
   # through. A hand-kept list had omitted `epics-modbus-rs` (167 tests) and
   # `mqtt-rs` (111), and a hand-kept *feature* half enrolled a crate only if
   # the feature happened to be spelled `ioc` or `epics` — which missed
-  # `epics-base-rs/tests/client_server.rs` (`#![cfg(feature =
+  # `epics-base-rs/tests/integration/client_server.rs` (`#![cfg(feature =
   # "ca-server-tls-test")]`) entirely, letting an `E0308` in it survive from
   # before 70b4a74b until 0909e7cb.
   all-features:
@@ -206,7 +206,7 @@ jobs:
         python3 -c 'import socket; s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM); s.bind(("::1", 0)); s.sendto(b"x", s.getsockname())'
         ip -4 -o addr show scope global up | grep -q .
     - name: The exec backend is what this job actually built
-      run: cargo nextest run --profile ci --workspace -E 'binary(rtems_exec_model_gate)'
+      run: cargo nextest run --profile ci --workspace -E 'binary(rtems_exec_model_gate) | (binary(integration) & test(/^rtems_exec_model_gate::/))'
     - name: Workspace on the exec backend
       run: cargo nextest run --profile ci --workspace
     - name: Clippy on the exec backend

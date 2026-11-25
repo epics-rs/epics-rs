@@ -514,7 +514,7 @@ mod parity_tests {
         // And acalc end-to-end still produces an array result. CAT cannot grow the
         // `arraySize` buffer: with AA carrying no window its `lastEl` is already
         // arraySize-1, so C copies nothing (`aCalcPerform.c:1359-1364`) and the
-        // result is AA. See `tests/calc_array_window.rs` for the windowed cases.
+        // result is AA. See `tests/integration/calc_array_window.rs` for the windowed cases.
         let mut inputs = ArrayInputs::new(3);
         inputs.arrays[0] = vec![1.0, 2.0, 3.0];
         inputs.arrays[1] = vec![4.0, 5.0, 6.0];

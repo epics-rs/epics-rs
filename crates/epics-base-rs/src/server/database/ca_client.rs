@@ -17,8 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::task::{Context, Poll, Wake, Waker};
 
-use super::ca_link::{LocalChannel, StateNotify};
-use super::channel_io::ChannelTarget;
+use super::ca_link::StateNotify;
 use super::{PvDatabase, PvDatabaseInner};
 use crate::error::CaError;
 use crate::runtime::task::{
@@ -29,6 +28,7 @@ use crate::server::event_queue::{CircuitEvent, DeliveryContext, EventReader, Eve
 use crate::server::pv::MonitorEvent;
 use crate::server::snapshot::Snapshot;
 use crate::types::{DbFieldType, EpicsValue};
+use context_channel::ContextChannel;
 
 /// A boxed future the client hands back, run wherever the caller spawns it.
 pub type ClientFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
@@ -155,10 +155,9 @@ impl CaClientContext {
     /// whose search nobody answers.
     pub async fn create_channel(&self, name: &str) -> Option<Arc<dyn ClientChannel>> {
         let db = self.db()?;
-        if let Some(channel) = LocalChannel::create(&db, name.as_bytes()).await {
+        if let Some(chan) = ContextChannel::create(&db, name, &self.events).await {
             return Some(Arc::new(LocalClientChannel {
-                channel,
-                events: self.events.clone(),
+                chan,
                 announced: std::sync::atomic::AtomicBool::new(false),
             }));
         }
@@ -172,12 +171,8 @@ impl CaClientContext {
     pub fn create_in_process(&self, name: &str) -> Option<InProcessChannel> {
         let db = self.db()?;
         let bridge = db.inner.link_puts.network()?.clone();
-        let channel = in_caller(&bridge, LocalChannel::create(&db, name.as_bytes())).ok()??;
-        Some(InProcessChannel {
-            channel,
-            bridge,
-            events: self.events.clone(),
-        })
+        let chan = in_caller(&bridge, ContextChannel::create(&db, name, &self.events)).ok()??;
+        Some(InProcessChannel { chan, bridge })
     }
 
     /// `dbContext::createChannel`'s network context alone, for a name
@@ -222,26 +217,24 @@ fn in_caller<F: Future>(bridge: &BlockingBridge, fut: F) -> Result<F::Output, No
 /// disconnected, full access, and each request made on the calling thread,
 /// which waits there as C's caller does.
 pub struct InProcessChannel {
-    channel: LocalChannel,
+    chan: ContextChannel,
     bridge: BlockingBridge,
-    /// Its context's.
-    events: InProcessEvents,
 }
 
 impl InProcessChannel {
     /// `dbChannelIO::nativeType`.
     pub fn native_type(&self) -> DbFieldType {
-        self.channel.native_type()
+        self.chan.native_type()
     }
 
     /// `dbChannelIO::nativeElementCount`.
     pub fn element_count(&self) -> u32 {
-        self.channel.element_count()
+        self.chan.element_count()
     }
 
     /// `dbChannelIO::read`: `count` elements of `dbr_type`.
     pub fn get(&self, dbr_type: u16, count: u32) -> Result<Snapshot, String> {
-        read(&self.channel, dbr_type, count)
+        self.chan.get(dbr_type, count)
     }
 
     /// `dbChannelIO::subscribe` on its context's event context: the first
@@ -254,25 +247,14 @@ impl InProcessChannel {
         mask: u16,
         callback: impl Fn(Snapshot) + Send + Sync + 'static,
     ) -> Result<InProcessSubscription, String> {
-        subscribe(
-            &self.channel,
-            &self.events,
-            dbr_type,
-            count,
-            mask,
-            Box::new(callback),
-        )
+        self.chan
+            .subscribe(dbr_type, count, mask, Box::new(callback))
     }
 
     /// `dbChannelIO::write`: `dbChannel_put`, done when this returns, run
     /// as a put of its context.
     pub fn put(&self, value: EpicsValue) -> Result<(), String> {
-        let value = put_value(&self.channel, value);
-        let put = self.events.0.0.running.run(
-            RecordKey::of(&self.channel),
-            self.channel.issue_put(value, false),
-        );
-        in_caller(&self.bridge, put)
+        in_caller(&self.bridge, self.chan.put(value, false))
             .map_err(|e| e.to_string())?
             .map(drop)
     }
@@ -287,15 +269,8 @@ impl InProcessChannel {
         value: EpicsValue,
         issued: impl FnOnce(PutCompletion) -> R,
     ) -> Result<R, CaError> {
-        let value = put_value(&self.channel, value);
-        let put = async { self.channel.put_callback(value).await.map(issued) };
-        let put = self
-            .events
-            .0
-            .0
-            .running
-            .run(RecordKey::of(&self.channel), put);
-        in_caller(&self.bridge, put).map_err(|e| CaError::Protocol(e.to_string()))?
+        in_caller(&self.bridge, self.chan.put_callback(value, issued))
+            .map_err(|e| CaError::Protocol(e.to_string()))?
     }
 }
 
@@ -602,16 +577,6 @@ impl Running {
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct RecordKey(usize);
 
-impl RecordKey {
-    fn of(channel: &LocalChannel) -> Self {
-        let record = match channel.target() {
-            ChannelTarget::SimplePv(pv) => Arc::as_ptr(pv).cast::<()>(),
-            ChannelTarget::RecordField { record, .. } => Arc::as_ptr(record).cast::<()>(),
-        };
-        Self(record as usize)
-    }
-}
-
 /// One poll of a put, ended on every exit.
 struct Run<'a> {
     running: &'a Running,
@@ -749,68 +714,148 @@ impl Drop for InProcessSubscription {
     }
 }
 
-/// `dbChannelIO::read`.
-fn read(channel: &LocalChannel, dbr_type: u16, count: u32) -> Result<Snapshot, String> {
-    channel
-        .read(dbr_type, count)
-        .ok_or_else(|| "dbChannel_get failed".to_string())
-}
+/// The context's way to its database's channels: no channel type reaches
+/// their put but through [`ContextChannel::run`].
+mod context_channel {
+    use super::*;
+    use crate::server::database::ca_link::LocalChannel;
+    use crate::server::database::channel_io::ChannelTarget;
 
-/// `dbChannelIO::subscribe` on `events`: the first event is queued, not
-/// delivered, and each reaches `callback` as `count` elements of
-/// `dbr_type`.
-fn subscribe(
-    channel: &LocalChannel,
-    events: &InProcessEvents,
-    dbr_type: u16,
-    count: u32,
-    mask: u16,
-    callback: Box<dyn Fn(Snapshot) + Send + Sync>,
-) -> Result<InProcessSubscription, String> {
-    let events = &events.0.0;
-    events.start()?;
-    let db = channel.db().ok_or("database gone")?;
-    let (pre_chain, notify) = channel.state_notify(dbr_type);
-    let route = Arc::new(Route {
-        record: RecordKey::of(channel),
-        notify,
-        count,
-        callback: Callback::new(callback),
-    });
-    let context: DeliveryContext = route.clone();
-    let reader = channel
-        .add_event(&db, &events.user, mask, &context, pre_chain)
-        .map_err(|e| format!("{e:?}"))?;
-    Ok(InProcessSubscription {
-        _reader: reader,
-        route,
-    })
-}
+    /// `dbChannelIO` on its context's event context.
+    pub(super) struct ContextChannel {
+        channel: LocalChannel,
+        /// Its context's.
+        events: InProcessEvents,
+    }
 
-/// `value` as the channel's native type and element count.
-fn put_value(channel: &LocalChannel, value: EpicsValue) -> EpicsValue {
-    let mut value = value.into_type(channel.native_type());
-    value.truncate(channel.element_count() as usize);
-    value
+    impl ContextChannel {
+        /// `dbContext::createChannel`'s `dbChannel_create`: `None` when the
+        /// database does not serve `name`.
+        pub(super) async fn create(
+            db: &PvDatabase,
+            name: &str,
+            events: &InProcessEvents,
+        ) -> Option<Self> {
+            let channel = LocalChannel::create(db, name.as_bytes()).await?;
+            Some(Self {
+                channel,
+                events: events.clone(),
+            })
+        }
+
+        /// `dbChannelIO::nativeType`.
+        pub(super) fn native_type(&self) -> DbFieldType {
+            self.channel.native_type()
+        }
+
+        /// `dbChannelIO::nativeElementCount`.
+        pub(super) fn element_count(&self) -> u32 {
+            self.channel.element_count()
+        }
+
+        /// `dbChannelIO::read`.
+        pub(super) fn get(&self, dbr_type: u16, count: u32) -> Result<Snapshot, String> {
+            self.channel
+                .read(dbr_type, count)
+                .ok_or_else(|| "dbChannel_get failed".to_string())
+        }
+
+        /// `dbChannelIO::subscribe` on its context's event context: the
+        /// first event is queued, not delivered, and each reaches `callback`
+        /// as `count` elements of `dbr_type`.
+        pub(super) fn subscribe(
+            &self,
+            dbr_type: u16,
+            count: u32,
+            mask: u16,
+            callback: Box<dyn Fn(Snapshot) + Send + Sync>,
+        ) -> Result<InProcessSubscription, String> {
+            let events = &self.events.0.0;
+            events.start()?;
+            let db = self.channel.db().ok_or("database gone")?;
+            let (pre_chain, notify) = self.channel.state_notify(dbr_type);
+            let route = Arc::new(Route {
+                record: RecordKey::of(&self.channel),
+                notify,
+                count,
+                callback: Callback::new(callback),
+            });
+            let context: DeliveryContext = route.clone();
+            let reader = self
+                .channel
+                .add_event(&db, &events.user, mask, &context, pre_chain)
+                .map_err(|e| format!("{e:?}"))?;
+            Ok(InProcessSubscription {
+                _reader: reader,
+                route,
+            })
+        }
+
+        /// `dbChannelIO::write`, run as a put of its context: a plain put is
+        /// done when this returns (`None`); a put callback returns its
+        /// completion.
+        pub(super) async fn put(
+            &self,
+            value: EpicsValue,
+            callback: bool,
+        ) -> Result<Option<PutCompletion>, String> {
+            let value = self.put_value(value);
+            self.run(self.channel.issue_put(value, callback)).await
+        }
+
+        /// `dbChannelIO::write` with a notify, run as a put of its context,
+        /// `issued` taking its completion while the put still runs. `Err` is
+        /// `dbPutNotifyBlocker`'s wait for the put in flight running out.
+        pub(super) async fn put_callback<R>(
+            &self,
+            value: EpicsValue,
+            issued: impl FnOnce(PutCompletion) -> R,
+        ) -> Result<R, CaError> {
+            let value = self.put_value(value);
+            self.run(async { self.channel.put_callback(value).await.map(issued) })
+                .await
+        }
+
+        /// `put` as a put of the context, each poll of it a run.
+        async fn run<F: Future>(&self, put: F) -> F::Output {
+            let record = RecordKey::of(&self.channel);
+            self.events.0.0.running.run(record, put).await
+        }
+
+        /// `value` as the channel's native type and element count.
+        fn put_value(&self, value: EpicsValue) -> EpicsValue {
+            let mut value = value.into_type(self.channel.native_type());
+            value.truncate(self.channel.element_count() as usize);
+            value
+        }
+    }
+
+    impl RecordKey {
+        fn of(channel: &LocalChannel) -> Self {
+            let record = match channel.target() {
+                ChannelTarget::SimplePv(pv) => Arc::as_ptr(pv).cast::<()>(),
+                ChannelTarget::RecordField { record, .. } => Arc::as_ptr(record).cast::<()>(),
+            };
+            Self(record as usize)
+        }
+    }
 }
 
 /// An in-process channel: connected from creation, never disconnected,
 /// full access (`dbChannelIO`).
 struct LocalClientChannel {
-    channel: LocalChannel,
-    /// Its context's.
-    events: InProcessEvents,
+    chan: ContextChannel,
     announced: std::sync::atomic::AtomicBool,
 }
 
 #[async_trait::async_trait]
 impl ClientChannel for LocalClientChannel {
     fn native_type(&self) -> Option<DbFieldType> {
-        Some(self.channel.native_type())
+        Some(self.chan.native_type())
     }
 
     fn element_count(&self) -> Option<u32> {
-        Some(self.channel.element_count())
+        Some(self.chan.element_count())
     }
 
     fn access(&self) -> (bool, bool) {
@@ -828,7 +873,7 @@ impl ClientChannel for LocalClientChannel {
     }
 
     async fn get(&self, dbr_type: u16, count: u32) -> Result<Snapshot, String> {
-        read(&self.channel, dbr_type, count)
+        self.chan.get(dbr_type, count)
     }
 
     async fn subscribe(
@@ -838,7 +883,8 @@ impl ClientChannel for LocalClientChannel {
         mask: u16,
         callback: Box<dyn Fn(Snapshot) + Send + Sync>,
     ) -> Result<ClientSubscription, String> {
-        subscribe(&self.channel, &self.events, dbr_type, count, mask, callback)
+        self.chan
+            .subscribe(dbr_type, count, mask, callback)
             .map(ClientSubscription::new)
     }
 
@@ -847,8 +893,7 @@ impl ClientChannel for LocalClientChannel {
         value: EpicsValue,
         callback: bool,
     ) -> Result<Option<PutCompletion>, String> {
-        let value = put_value(&self.channel, value);
-        self.channel.issue_put(value, callback).await
+        self.chan.put(value, callback).await
     }
 }
 

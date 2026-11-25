@@ -162,3 +162,30 @@ async fn a_puts_own_record_monitor_waits_for_the_put() {
         assert_eq!(a_values.recv_timeout(fact_budget::FACT_BUDGET), Ok(1.0));
     });
 }
+
+/// The same for a put through a channel `create_channel` opened, as
+/// sscan's `saveData` and motor's `motorUtil` put.
+#[epics_macros_rs::epics_test]
+async fn a_create_channel_puts_own_record_monitor_waits_for_the_put() {
+    let gate = Arc::new(Gate::default());
+    let db = ioc(&gate).await;
+    let ctx = db.ca_client();
+    let put = ctx.create_channel("A").await.expect("A");
+    std::thread::scope(|s| {
+        let release = Release(&gate);
+        let (values, a_values) = mpsc::channel();
+        let _a = monitor(&open(&ctx, "A"), move |v| values.send(v).unwrap());
+        let putter = s.spawn(move || block_on_sync(put.put(EpicsValue::Double(1.0), false)));
+        gate.until_held();
+        // absence-window: `CAC-event` waits on the held put with the entry
+        // taken, so no later event of the context can mark the wait.
+        assert!(
+            a_values.recv_timeout(SETTLE).is_err(),
+            "A's monitor while its put is held"
+        );
+        drop(release);
+        let put = putter.join().unwrap().expect("a plain thread blocks");
+        assert!(put.unwrap().is_none(), "a plain put has no completion");
+        assert_eq!(a_values.recv_timeout(fact_budget::FACT_BUDGET), Ok(1.0));
+    });
+}

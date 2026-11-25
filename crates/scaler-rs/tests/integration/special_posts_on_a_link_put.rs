@@ -18,7 +18,8 @@
 
 // RTEMS-EXEC-MODEL-ALLOW(1): checked, not waived — passes on the exec backend
 // (`EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p scaler-rs
-// --all-features --test special_posts_on_a_link_put`); no CA server is built.
+// --all-features --test integration special_posts_on_a_link_put::`); no CA
+// server is built.
 
 use std::collections::HashMap;
 

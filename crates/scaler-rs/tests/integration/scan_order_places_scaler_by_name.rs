@@ -47,7 +47,7 @@ async fn a_runtime_registered_type_scans_between_two_declared_ones() {
     if std::env::var_os(CHILD).is_none() {
         let out = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
-                "a_runtime_registered_type_scans_between_two_declared_ones",
+                "scan_order_places_scaler_by_name::a_runtime_registered_type_scans_between_two_declared_ones",
                 "--exact",
                 "--nocapture",
             ])

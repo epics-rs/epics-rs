@@ -66,10 +66,10 @@ fn out(db: &PvDatabase) -> EpicsValue {
     db.get_pv("S.OUT").unwrap()
 }
 
-// RTEMS-EXEC-MODEL-ALLOW(2): checked, not waived — both ran and passed on
-// the exec backend (`EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p
-// scaler-rs --all-features --test nomod_out_put_keeps_the_link`). No CA
-// server is built; the reactor comes from `#[tokio::test]`, which the
+// RTEMS-EXEC-MODEL-ALLOW(2): checked, not waived — both ran and passed on the
+// exec backend (`EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p
+// scaler-rs --all-features --test integration nomod_out_put_keeps_the_link::`).
+// No CA server is built; the reactor comes from `#[tokio::test]`, which the
 // backend does not remove.
 #[tokio::test]
 async fn a_hardware_out_with_no_device_row_is_bad_hw_addr_and_kept() {

@@ -22,8 +22,9 @@ use scaler_rs::device_support::scaler_asyn::{
 
 // RTEMS-EXEC-MODEL-ALLOW(5): checked, not waived — all 5 ran and passed on the
 // exec backend (`EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p
-// scaler-rs --test done_param_boot_replay`). No CA server is built; the reactor
-// comes from `#[tokio::test]`, which the backend does not remove.
+// scaler-rs --test integration done_param_boot_replay::`). No CA server is
+// built; the reactor comes from `#[tokio::test]`, which the backend does not
+// remove.
 
 /// `scalerSupport.dbd`'s `device(scaler,INST_IO,devScalerAsyn,"Asyn Scaler")`.
 static ASYN_SCALER: DevSup = DevSup {

@@ -51,11 +51,12 @@ static ASYN_SCALER: DevSup = DevSup {
     dset: Dset::new(7, &[2, 4, 5, 6], false),
 };
 
-// RTEMS-EXEC-MODEL-ALLOW(2): checked, not waived — both ran on the exec
-// backend (`EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p scaler-rs
-// --test cnt_done_alarm --run-ignored all`): the first passed, the ignored pin
-// failed on the same :470 CNT post it fails on tokio. No CA server is built;
-// the reactor comes from `#[tokio::test]`, which the backend does not remove.
+// RTEMS-EXEC-MODEL-ALLOW(2): checked, not waived — both ran on the exec backend
+// (`EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p scaler-rs --test
+// integration cnt_done_alarm:: --run-ignored all`): the first passed, the
+// ignored pin failed on the same :470 CNT post it fails on tokio. No CA server
+// is built; the reactor comes from `#[tokio::test]`, which the backend does not
+// remove.
 
 const UDF_ALARM: u16 = 17;
 const INVALID_ALARM: u16 = 3;

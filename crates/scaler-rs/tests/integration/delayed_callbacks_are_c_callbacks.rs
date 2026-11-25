@@ -59,7 +59,7 @@ async fn the_delayed_start_and_the_autocount_restart_are_scan_once_passes() {
     if std::env::var_os(CHILD).is_none() {
         let out = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
-                "the_delayed_start_and_the_autocount_restart_are_scan_once_passes",
+                "delayed_callbacks_are_c_callbacks::the_delayed_start_and_the_autocount_restart_are_scan_once_passes",
                 "--exact",
                 "--nocapture",
             ])
@@ -229,7 +229,7 @@ async fn a_user_count_leaves_the_autocount_restart_armed() {
     if std::env::var_os(CHILD).is_none() {
         let out = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
-                "a_user_count_leaves_the_autocount_restart_armed",
+                "delayed_callbacks_are_c_callbacks::a_user_count_leaves_the_autocount_restart_armed",
                 "--exact",
                 "--nocapture",
             ])

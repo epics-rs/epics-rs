@@ -412,8 +412,11 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ("regression-ioc", "tests/families.rs"),
     ("regression-ioc", "tests/motor.rs"),
     ("regression-ioc", "tests/smoke.rs"),
-    ("scaler-rs", "tests/cnt_abort_cancels_delayed_start.rs"),
-    ("scaler-rs", "tests/integration_tests.rs"),
+    (
+        "scaler-rs",
+        "tests/integration/cnt_abort_cancels_delayed_start.rs",
+    ),
+    ("scaler-rs", "tests/integration/integration_tests.rs"),
     ("seq-validate", "tests/integration/validate.rs"),
     ("std-rs", "tests/e2e_tests.rs"),
     ("std-rs", "tests/epid_dtyp_put_keeps_the_init_dset.rs"),

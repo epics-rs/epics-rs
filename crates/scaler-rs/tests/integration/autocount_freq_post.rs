@@ -22,8 +22,8 @@ use scaler_rs::records::scaler::ScalerRecord;
 
 // RTEMS-EXEC-MODEL-ALLOW(3): checked, not waived — all 3 ran and passed on the
 // exec backend (`EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p
-// scaler-rs --test autocount_freq_post`). No CA server is built; the reactor
-// comes from `#[tokio::test]`, which the backend does not remove.
+// scaler-rs --test integration autocount_freq_post::`). No CA server is built;
+// the reactor comes from `#[tokio::test]`, which the backend does not remove.
 
 /// `scalerSupport.dbd`'s `device(scaler,INST_IO,devScalerAsyn,"Asyn Scaler")`.
 static ASYN_SCALER: DevSup = DevSup {

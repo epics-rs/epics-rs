@@ -61,8 +61,8 @@ async fn put(db: &PvDatabase, record: &str, value: EpicsValue) {
 
 // RTEMS-EXEC-MODEL-ALLOW(4): checked, not waived — ran and passed on the exec
 // backend (`EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p scaler-rs
-// --test soft_port_inputs`). No CA server is built; the reactor comes from
-// `#[tokio::test]`, which the backend does not remove.
+// --test integration soft_port_inputs::`). No CA server is built; the reactor
+// comes from `#[tokio::test]`, which the backend does not remove.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_one_element_waveform_input_updates_its_count() {
     let (ports, db) = port().await;

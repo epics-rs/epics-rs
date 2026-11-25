@@ -33,9 +33,9 @@ record(scaler, "SC") {
 }
 "#;
 
-// RTEMS-EXEC-MODEL-ALLOW(1): checked, not waived — ran and passed on the
-// exec backend (`EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p
-// scaler-rs --test soft_port_connect`). No CA server is built; the reactor
+// RTEMS-EXEC-MODEL-ALLOW(1): checked, not waived — ran and passed on the exec
+// backend (`EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p scaler-rs
+// --test integration soft_port_connect::`). No CA server is built; the reactor
 // comes from `#[tokio::test]`, which the backend does not remove.
 #[tokio::test(flavor = "multi_thread")]
 async fn connect_waits_for_an_input_record_without_holding_the_input_state() {

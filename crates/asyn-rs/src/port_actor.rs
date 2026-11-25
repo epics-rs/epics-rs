@@ -4302,13 +4302,21 @@ mod tests {
     }
 
     /// C `cancelRequest` finds a request the port thread took not queued
-    /// (asynManager.c:1647-1661): `wasQueued` stays 0 and it still runs.
+    /// (asynManager.c:1647-1661): `wasQueued` stays 0, it still runs, and the
+    /// cancel returns once it has.
     #[test]
     fn a_cancel_after_the_release_took_a_request_lets_it_run() {
         let (lend, cell, seen) = released_with_a_queued_request(&AsynUser::new(0));
-        assert!(!cell.cancel(), "taken off the queue at the release");
+        let canceler = std::thread::spawn({
+            let seen = Arc::clone(&seen);
+            move || (cell.cancel(), seen.lock().clone())
+        });
+        // absence-window: a cancel that does not wait returns before the pass runs.
+        std::thread::sleep(Duration::from_millis(100));
         next_pass(&lend);
-        assert_eq!(*seen.lock(), ["ran", "done"]);
+        let (was_queued, seen_by_cancel) = canceler.join().unwrap();
+        assert!(!was_queued, "taken off the queue at the release");
+        assert_eq!(seen_by_cancel, ["ran", "done"]);
     }
 
     /// C's queue timer does nothing to a request the port thread took

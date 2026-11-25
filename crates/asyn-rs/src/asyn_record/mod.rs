@@ -5294,7 +5294,7 @@ impl Record for AsynRecord {
             // `wasQueued==true` analogue — and `done` requests the record's
             // `ProcessCallback`, as C's `special()` does (asynRecord.c:396-404).
             // A cancel that arrives after the port thread claimed it loses the
-            // CAS and is a no-op: the I/O completes and applies normally,
+            // CAS and waits for the I/O, which completes and applies normally,
             // matching C `cancelRequest` returning `wasQueued==0` once the
             // callback is active (asynManager.c:1647-1661). Either way that
             // callback's re-entry is the single owner that applies the outcome
@@ -11623,10 +11623,9 @@ mod tests {
     /// for `AQR` (asynRecord.c:393-408) calls `cancelRequest`; once the request
     /// has been dequeued and its callback is running, `cancelRequest` reports
     /// `wasQueued==0` and waits for the callback (asynManager.c:1647-1661), so
-    /// the I/O runs to completion and is reported normally — `AQR` does NOT
-    /// raise "I/O request canceled". Here the read is already parked in the
-    /// driver (the executor has claimed the token, `Running`) when `AQR` fires,
-    /// so the completion re-entry applies the device value, not CANCELED.
+    /// `AQR` returns with the I/O done, which is reported normally — `AQR`
+    /// does NOT raise "I/O request canceled". Here the read is already parked
+    /// in the driver when `AQR` fires, and is let go only while `AQR` waits.
     #[tokio::test]
     async fn aqr_after_driver_dequeue_runs_to_completion() {
         use crate::interrupt::InterruptManager;
@@ -11723,22 +11722,20 @@ mod tests {
             "the off-thread read must reach the driver before AQR"
         );
 
-        // AQR fires while the read is already running in the driver: the token
-        // is `Running`, so the cancel loses (C `wasQueued==0`). Release the
-        // parked read so the request completes.
+        // AQR fires while the read is already running in the driver: the
+        // cancel loses (C `wasQueued==0`) and waits for the read, which another
+        // thread lets go a little later.
+        let releaser = std::thread::spawn(move || {
+            // absence-window: an AQR that does not wait returns before the let-go.
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            release.wait();
+        });
         rec.special("AQR", true, &Default::default()).unwrap();
-        release.wait();
-
-        let job = Arc::clone(&rec.process_job);
-        let mut filled = false;
-        for _ in 0..2000 {
-            if job.outcome.lock().is_some() {
-                filled = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-        }
-        assert!(filled, "the running request still produces an outcome");
+        assert!(
+            rec.process_job.outcome.lock().is_some(),
+            "AQR returns only once the running read has finished"
+        );
+        releaser.join().unwrap();
 
         // Completion re-entry applies the device value: the cancel lost the
         // race (C `wasQueued==0`), so the I/O ran to completion and is reported

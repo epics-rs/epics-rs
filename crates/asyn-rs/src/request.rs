@@ -124,6 +124,8 @@ pub struct RequestCell {
     /// body makes — one per cell, as C's is one per `asynUser`.
     block_token: u64,
     slot: Mutex<Slot>,
+    /// Signalled as [`Slot::quiet`] counts up.
+    went_quiet: parking_lot::Condvar,
     body: Arc<dyn CellBody>,
 }
 
@@ -131,11 +133,14 @@ pub struct RequestCell {
 struct Slot {
     request: CellRequest,
     state: CellState,
+    /// How many times the cell's last running callback has returned.
+    quiet: u64,
 }
 
 /// C's `isQueued` and `state == callbackActive`, as one state. `callbacks`
-/// counts the `process`/`unrun` calls running: one that queued the cell again
-/// can still be running when that request leaves the queue too.
+/// counts the callbacks running, each a `process` or `unrun` and its `done`:
+/// one that queued the cell again can still be running when that request
+/// leaves the queue too.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CellState {
     Idle,
@@ -147,6 +152,10 @@ enum CellState {
 impl CellState {
     fn is_queued(self) -> bool {
         matches!(self, Self::Queued | Self::ActiveQueued { .. })
+    }
+
+    fn runs_a_callback(self) -> bool {
+        matches!(self, Self::Active { .. } | Self::ActiveQueued { .. })
     }
 
     /// The request leaves the queue and its callback is about to run.
@@ -259,25 +268,40 @@ impl RequestCell {
         }
     }
 
-    /// C `cancelRequest` (asynManager.c:1663-1668): `true` (C `wasQueued`)
+    /// C `cancelRequest` (asynManager.c:1632-1692): `true` (C `wasQueued`)
     /// when the cell was still queued, which unlinks it at once, runs its body's
     /// [`Unrun::Canceled`] and `done` here — asynRecord's `special()` reports and
     /// requests its callback inline (asynRecord.c:396-404) — and tells the port
     /// thread, whose entry for it is now gone (`is_gone`).
+    ///
+    /// It returns once no callback of the cell runs on another thread, as C
+    /// waits for `callbackDone` (:1647-1655). Unlike C it waits after removing
+    /// a request too, and not for a callback of the cell this thread is in,
+    /// which C waits on forever.
     pub fn cancel(&self) -> bool {
-        {
+        let was_queued = {
             let mut slot = self.lock();
-            if !slot.state.is_queued() || !self.token.cancel() {
-                return false;
+            let was_queued = slot.state.is_queued() && self.token.cancel();
+            if was_queued {
+                queue_timer().disarm(self);
+                self.queue.unlink(self);
+                slot.state.dequeue();
             }
-            queue_timer().disarm(self);
-            self.queue.unlink(self);
-            slot.state.dequeue();
+            was_queued
+        };
+        if was_queued {
+            self.callback(|| self.body.unrun(Unrun::Canceled));
+            self.queue.poke();
         }
-        self.body.unrun(Unrun::Canceled);
-        self.end_callback();
-        self.queue.poke();
-        true
+        if !InCallback::of(self) {
+            let mut slot = self.lock();
+            if slot.state.runs_a_callback() {
+                let quiet = slot.quiet;
+                self.went_quiet
+                    .wait_while(&mut slot, |slot| slot.quiet == quiet);
+            }
+        }
+        was_queued
     }
 
     /// C `blockProcessCallback(pasynUser, allDevices)` (asynManager.c:1694-1725)
@@ -380,24 +404,25 @@ impl RequestCell {
 
     /// On the port's thread, once [`Self::claim`] said [`Claim::Run`].
     pub(crate) fn run(&self, port: &mut dyn PortCalls) {
-        self.body.process(port);
-        self.token.finish();
-        self.end_callback();
+        self.callback(|| {
+            self.body.process(port);
+            self.token.finish();
+        });
     }
 
     /// A request [`Self::claim`] took whose port stopped before running it.
     pub(crate) fn abandon(&self, e: AsynError) {
-        self.body.unrun(Unrun::Refused(e));
-        self.token.finish();
-        self.end_callback();
+        self.callback(|| {
+            self.body.unrun(Unrun::Refused(e));
+            self.token.finish();
+        });
     }
 
     /// C `processUser` run by `queueRequest` itself, on a port without
     /// `ASYN_CANBLOCK` ([`crate::port_handle::PortHandle::queue_request`]).
     pub(crate) fn run_inline(&self, port: &mut dyn PortCalls) {
         self.lock().state.enter_inline();
-        self.body.process(port);
-        self.end_callback();
+        self.callback(|| self.body.process(port));
     }
 
     /// The actor takes the entry queued as `seq` off its queue without running
@@ -414,13 +439,12 @@ impl RequestCell {
             queue_timer().disarm(self);
             slot.state.dequeue();
         }
-        self.body
-            .unrun(if matches!(e, AsynError::QueueTimeout { .. }) {
-                Unrun::TimedOut
-            } else {
-                Unrun::Refused(e)
-            });
-        self.end_callback();
+        let why = if matches!(e, AsynError::QueueTimeout { .. }) {
+            Unrun::TimedOut
+        } else {
+            Unrun::Refused(e)
+        };
+        self.callback(|| self.body.unrun(why));
     }
 
     /// C `queueTimeoutCallback` (asynManager.c:649-703), on the timer thread:
@@ -439,8 +463,7 @@ impl RequestCell {
             self.queue.unlink(self);
             slot.state.dequeue();
         }
-        self.body.unrun(Unrun::TimedOut);
-        self.end_callback();
+        self.callback(|| self.body.unrun(Unrun::TimedOut));
         self.queue.poke();
     }
 
@@ -455,9 +478,52 @@ impl RequestCell {
         slot.request.seq != seq || !slot.state.is_queued()
     }
 
-    fn end_callback(&self) {
-        self.lock().state.end_callback();
-        Arc::clone(&self.body).done();
+    /// One callback its caller counted in the state: `f`'s `process` or
+    /// `unrun`, then `done`, which ends it as C's `processUser` ends before
+    /// `callbackIdle` (asynManager.c:935-937).
+    fn callback(&self, f: impl FnOnce()) {
+        {
+            let _here = InCallback::enter(self);
+            f();
+            Arc::clone(&self.body).done();
+        }
+        let mut slot = self.lock();
+        slot.state.end_callback();
+        if !slot.state.runs_a_callback() {
+            slot.quiet += 1;
+            self.went_quiet.notify_all();
+        }
+    }
+}
+
+thread_local! {
+    /// The cells whose callback this thread is inside, innermost last.
+    static IN_CALLBACK: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// This thread is inside a callback of one cell until it drops.
+struct InCallback;
+
+impl InCallback {
+    fn enter(cell: &RequestCell) -> Self {
+        IN_CALLBACK.with(|cells| cells.borrow_mut().push(Self::key(cell)));
+        Self
+    }
+
+    fn of(cell: &RequestCell) -> bool {
+        IN_CALLBACK.with(|cells| cells.borrow().contains(&Self::key(cell)))
+    }
+
+    fn key(cell: &RequestCell) -> usize {
+        std::ptr::from_ref(cell) as usize
+    }
+}
+
+impl Drop for InCallback {
+    fn drop(&mut self) {
+        IN_CALLBACK.with(|cells| {
+            cells.borrow_mut().pop();
+        });
     }
 }
 
@@ -553,7 +619,9 @@ impl CellQueue {
                     seq: 0,
                 },
                 state: CellState::Idle,
+                quiet: 0,
             }),
+            went_quiet: parking_lot::Condvar::new(),
             body,
         })
     }
@@ -2245,6 +2313,119 @@ mod tests {
         assert!(matches!(cell.claim(next), Claim::Run));
     }
 
+    /// A body whose `process` waits in the middle until the test lets it go,
+    /// after queueing its cell again if asked to, and logs every callback.
+    #[derive(Default)]
+    struct Parked {
+        cell: std::sync::OnceLock<std::sync::Weak<RequestCell>>,
+        requeue: bool,
+        cancel_itself: bool,
+        log: Mutex<Vec<&'static str>>,
+        let_go: (Mutex<bool>, parking_lot::Condvar),
+    }
+
+    impl Parked {
+        fn let_go(&self) {
+            *self.let_go.0.lock() = true;
+            self.let_go.1.notify_all();
+        }
+    }
+
+    impl CellBody for Parked {
+        fn process(&self, _: &mut dyn PortCalls) {
+            self.log.lock().push("process");
+            let cell = self.cell.get().unwrap().upgrade().unwrap();
+            if self.requeue {
+                cell.queue(&crate::user::AsynUser::new(0)).unwrap();
+            }
+            if self.cancel_itself {
+                assert!(!cell.cancel());
+            } else {
+                let mut let_go = self.let_go.0.lock();
+                self.let_go.1.wait_while(&mut let_go, |go| !*go);
+            }
+        }
+        fn unrun(&self, _: Unrun) {
+            self.log.lock().push("canceled");
+        }
+        fn done(self: Arc<Self>) {
+            self.log.lock().push("done");
+        }
+    }
+
+    /// The cell's request, claimed and running on a thread of its own, parked
+    /// in `process` unless it cancels itself there.
+    fn running(body: Parked) -> (Arc<Parked>, Arc<RequestCell>, std::thread::JoinHandle<()>) {
+        let body = Arc::new(body);
+        let queue = Arc::new(CellQueue::default());
+        let cell = queue.new_cell(Arc::clone(&body) as Arc<dyn CellBody>);
+        body.cell.set(Arc::downgrade(&cell)).unwrap();
+        cell.queue(&crate::user::AsynUser::new(0)).unwrap();
+        let (_, seq) = queue.pop().unwrap();
+        assert!(matches!(cell.claim(seq), Claim::Run));
+        let runner = std::thread::spawn({
+            let cell = Arc::clone(&cell);
+            move || cell.run(&mut NoPort)
+        });
+        while body.log.lock().is_empty() {
+            std::thread::yield_now();
+        }
+        (body, cell, runner)
+    }
+
+    /// What a cancel from another thread returned, and the log as it returned,
+    /// with the parked `process` let go only while the cancel is under way.
+    fn cancel_while_parked(
+        body: &Arc<Parked>,
+        cell: &Arc<RequestCell>,
+        runner: std::thread::JoinHandle<()>,
+    ) -> (bool, Vec<&'static str>) {
+        let canceler = std::thread::spawn({
+            let (body, cell) = (Arc::clone(body), Arc::clone(cell));
+            move || (cell.cancel(), body.log.lock().clone())
+        });
+        // absence-window: a cancel that does not wait returns before the let-go.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        body.let_go();
+        runner.join().unwrap();
+        canceler.join().unwrap()
+    }
+
+    /// C `cancelRequest` on a request whose callback is active waits for
+    /// `callbackDone` (asynManager.c:1647-1655): the caller may then reuse
+    /// what the callback was using.
+    #[test]
+    fn a_cancel_returns_after_the_running_callback_and_its_done() {
+        let (body, cell, runner) = running(Parked::default());
+        let (was_queued, log) = cancel_while_parked(&body, &cell, runner);
+        assert!(!was_queued);
+        assert_eq!(log, ["process", "done"]);
+    }
+
+    /// A cancel that removes a request queued from inside a callback still
+    /// running waits for that callback too.
+    #[test]
+    fn a_cancel_that_removes_a_request_waits_for_the_callback_still_running() {
+        let (body, cell, runner) = running(Parked {
+            requeue: true,
+            ..Parked::default()
+        });
+        let (was_queued, log) = cancel_while_parked(&body, &cell, runner);
+        assert!(was_queued);
+        assert_eq!(log, ["process", "canceled", "done", "done"]);
+    }
+
+    /// A callback cancelling its own cell does not wait for itself.
+    #[test]
+    fn a_cancel_from_inside_its_own_callback_returns() {
+        let (body, _cell, runner) = running(Parked {
+            cancel_itself: true,
+            ..Parked::default()
+        });
+        runner.join().unwrap();
+        assert_eq!(*body.log.lock(), ["process", "done"]);
+    }
+
     /// What a [`Probe`] saw: the callback, the cell's state inside it, and the
     /// refusal of the requeue it made there, if it made one.
     type Seen = (
@@ -2352,9 +2533,10 @@ mod tests {
                 body.seen(),
                 [
                     (what, ACTIVE_QUEUED, Some(Ok(()))),
-                    ("done", CellState::Queued, None)
+                    ("done", ACTIVE_QUEUED, None)
                 ],
             );
+            assert_eq!(cell.lock().state, CellState::Queued);
             // The left entry is unlinked, or was the actor's (`leave`); only
             // the requeued one is on the queue, and it is the one that runs.
             let (_, next) = queue.pop().unwrap();
@@ -2412,28 +2594,25 @@ mod tests {
         cell.queue(&crate::user::AsynUser::new(0)).unwrap();
     }
 
-    /// C `state == callbackActive` with `isQueued` clear: a cancel finds
-    /// nothing queued (asynManager.c:1647-1661), the callback may queue the
-    /// cell again, and `done` follows the callback's end.
+    /// C `state == callbackActive` with `isQueued` clear: the callback may
+    /// queue the cell again, and `done` is the last of the callback, as C's
+    /// `processUser` returns before `callbackIdle` (asynManager.c:935-937).
     #[test]
-    fn done_follows_a_callback_that_was_active() {
+    fn done_ends_a_callback_that_was_active() {
         let (queue, body, cell) = probe(true);
         cell.queue(&crate::user::AsynUser::new(0)).unwrap();
         let (_, seq) = queue.pop().unwrap();
         assert!(matches!(cell.claim(seq), Claim::Run));
         assert_eq!(cell.lock().state, CellState::Active { callbacks: 1 });
-        assert!(
-            !cell.cancel(),
-            "nothing queued while the callback is active"
-        );
         cell.run(&mut NoPort);
         assert_eq!(
             body.seen(),
             [
                 ("process", ACTIVE_QUEUED, Some(Ok(()))),
-                ("done", CellState::Queued, None)
+                ("done", ACTIVE_QUEUED, None)
             ],
         );
+        assert_eq!(cell.lock().state, CellState::Queued);
         // Without a requeue the callback's end leaves the cell idle.
         let (queue, body, cell) = probe(false);
         cell.queue(&crate::user::AsynUser::new(0)).unwrap();
@@ -2444,9 +2623,10 @@ mod tests {
             body.seen(),
             [
                 ("process", CellState::Active { callbacks: 1 }, None),
-                ("done", CellState::Idle, None)
+                ("done", CellState::Active { callbacks: 1 }, None)
             ],
         );
+        assert_eq!(cell.lock().state, CellState::Idle);
     }
 
     /// The request an `unrun` queued is claimed by the port thread before
@@ -2465,18 +2645,20 @@ mod tests {
                     CellState::Active { callbacks: 2 },
                     Some(Ok(()))
                 ),
-                ("done", CellState::Active { callbacks: 1 }, None)
+                ("done", CellState::Active { callbacks: 2 }, None)
             ],
         );
+        assert_eq!(cell.lock().state, CellState::Active { callbacks: 1 });
         // The claimed request's `process` queues once more as it ends.
         cell.run(&mut NoPort);
         assert_eq!(
             body.seen(),
             [
                 ("process", ACTIVE_QUEUED, Some(Ok(()))),
-                ("done", CellState::Queued, None)
+                ("done", ACTIVE_QUEUED, None)
             ],
         );
+        assert_eq!(cell.lock().state, CellState::Queued);
     }
 
     /// A request the closed queue refused was never queued: nothing can
@@ -2496,7 +2678,7 @@ mod tests {
                     CellState::Active { callbacks: 1 },
                     Some(Err(QueueRefusal::ShutDown))
                 ),
-                ("done", CellState::Idle, None)
+                ("done", CellState::Active { callbacks: 1 }, None)
             ],
         );
         assert_eq!(cell.queue(&user), Err(QueueRefusal::ShutDown));

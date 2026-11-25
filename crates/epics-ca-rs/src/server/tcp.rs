@@ -1712,9 +1712,10 @@ pub async fn run_tcp_listener(
     // One accept-loop task per bound interface. When the parent
     // `run_tcp_listener` future is dropped (CaServer shutdown via
     // `tcp_abort.abort()`), this JoinSet is dropped which aborts all
-    // accept loops as a unit. First task to error wins; the rest
-    // are aborted via JoinSet::Drop.
-    let mut accept_tasks: tokio::task::JoinSet<CaResult<()>> = tokio::task::JoinSet::new();
+    // accept loops as a unit. No task returns, so the first to end has
+    // panicked; the rest are aborted via JoinSet::Drop.
+    let mut accept_tasks: tokio::task::JoinSet<std::convert::Infallible> =
+        tokio::task::JoinSet::new();
 
     // ASG-field-change forwarder. C
     // `database/src/ioc/as/asDbLib.c:107-110,144` `asSpcAsCallback`
@@ -1755,10 +1756,11 @@ pub async fn run_tcp_listener(
                         );
                         let _ = acf_reload_tx_t.send(());
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        std::future::pending().await
+                    }
                 }
             }
-            Ok(())
         });
     }
 
@@ -1774,43 +1776,31 @@ pub async fn run_tcp_listener(
         let tls_t = tls.clone();
         #[cfg(feature = "cap-tokens")]
         let cap_token_verifier_t = cap_token_verifier.clone();
-        accept_tasks.spawn(async move {
-            match accept_loop(
-                listener,
-                intf,
-                actual_port,
-                db_t,
-                acf_t,
-                acf_reload_tx_t,
-                conn_events_t,
-                audit_t,
-                drain_t,
-                stats_t,
-                #[cfg(feature = "experimental-rust-tls")]
-                tls_t,
-                #[cfg(feature = "cap-tokens")]
-                cap_token_verifier_t,
-            )
-            .await {}
-        });
+        accept_tasks.spawn(accept_loop(
+            listener,
+            intf,
+            actual_port,
+            db_t,
+            acf_t,
+            acf_reload_tx_t,
+            conn_events_t,
+            audit_t,
+            drain_t,
+            stats_t,
+            #[cfg(feature = "experimental-rust-tls")]
+            tls_t,
+            #[cfg(feature = "cap-tokens")]
+            cap_token_verifier_t,
+        ));
     }
 
-    // An accept loop never returns, so this ends only on a task panic. On
-    // error, JoinSet::Drop aborts the surviving loops.
-    while let Some(res) = accept_tasks.join_next().await {
-        match res {
-            Ok(Ok(())) => continue,
-            Ok(Err(e)) => return Err(e),
-            Err(join_err) if join_err.is_cancelled() => continue,
-            Err(join_err) => {
-                return Err(epics_base_rs::error::CaError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    join_err.to_string(),
-                )));
-            }
-        }
+    match accept_tasks.join_next().await {
+        Some(Err(join_err)) => Err(epics_base_rs::error::CaError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            join_err.to_string(),
+        ))),
+        None => unreachable!("the ASG forwarder never ends"),
     }
-    Ok(())
 }
 
 /// Per-interface accept loop. Owned by `run_tcp_listener` via a

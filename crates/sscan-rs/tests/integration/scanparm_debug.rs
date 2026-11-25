@@ -114,7 +114,7 @@ fn iocsh(db: &Arc<PvDatabase>, line: &str) {
 async fn the_debug_variable_prints_the_process_traces() {
     if std::env::var_os(CHILD).is_none() {
         assert_eq!(
-            trace_of("the_debug_variable_prints_the_process_traces"),
+            trace_of("scanparm_debug::the_debug_variable_prints_the_process_traces"),
             [
                 "scanparm(P):process:act=0",
                 "scanparm(P):process:mp=100",
@@ -146,7 +146,7 @@ async fn the_debug_variable_prints_the_process_traces() {
 async fn a_load_group_that_returns_does_not_print_starting_scan() {
     if std::env::var_os(CHILD).is_none() {
         assert_eq!(
-            trace_of("a_load_group_that_returns_does_not_print_starting_scan"),
+            trace_of("scanparm_debug::a_load_group_that_returns_does_not_print_starting_scan"),
             ["scanparm(P):process:act=0", "scanparm(P):process:mp=100"]
         );
         return;

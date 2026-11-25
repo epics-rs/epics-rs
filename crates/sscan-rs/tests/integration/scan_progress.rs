@@ -284,7 +284,8 @@ async fn debug_stdout(test: &str) -> Option<String> {
 /// (:126-129).
 #[epics_base_rs::epics_test]
 async fn the_debug_header_names_the_program() {
-    let Some(stdout) = debug_stdout("the_debug_header_names_the_program").await else {
+    let Some(stdout) = debug_stdout("scan_progress::the_debug_header_names_the_program").await
+    else {
         return;
     };
     let init = stdout
@@ -298,7 +299,9 @@ async fn the_debug_header_names_the_program() {
 /// pointers (:400).
 #[epics_base_rs::epics_test]
 async fn idle_pause_prints_its_event_flags_as_numbers() {
-    let Some(stdout) = debug_stdout("idle_pause_prints_its_event_flags_as_numbers").await else {
+    let Some(stdout) =
+        debug_stdout("scan_progress::idle_pause_prints_its_event_flags_as_numbers").await
+    else {
         return;
     };
     let pause = stdout

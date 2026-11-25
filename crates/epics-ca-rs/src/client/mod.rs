@@ -1677,14 +1677,24 @@ async fn within<T>(
         .unwrap_or(Err(CaError::Timeout))
 }
 
-/// C `nciu::write` (`libca/nciu.cpp`) and its write-callback
-/// overload reject `countIn > this->count` before queueing the
-/// request, surfacing as `ECA_BADCOUNT`. Pre-fix Rust forwarded any
-/// caller-supplied count to the server, which the server would then
-/// reject asynchronously (callback path) or accept past its array
-/// bound (nowait path). Validate client-side so the call fails
-/// synchronously the way libca does.
-fn validate_put_count(snap: &types::ChannelSnapshotPublic, count: u32) -> CaResult<()> {
+/// libca `nciu::read`'s gate ahead of queueing, in its order: the read
+/// right, then `countIn > this->count` as `ECA_BADCOUNT`
+/// (`nciu.cpp:282-287`). Every read passes it before its waiter exists.
+fn admit_read(snap: &ChannelSnapshotPublic, count: u32) -> CaResult<()> {
+    snap.permit_read()?;
+    validate_count(snap, count)
+}
+
+/// libca `nciu::write`'s gate, both overloads, in their order: the write
+/// right, the count, then each string (`nciu.cpp:329-337,350-358`).
+fn admit_write(snap: &ChannelSnapshotPublic, value: &EpicsValue) -> CaResult<()> {
+    snap.permit_write()?;
+    validate_count(snap, value.count())?;
+    validate_put_strings(value)
+}
+
+/// `countIn > this->count` is `outOfBounds`, `ECA_BADCOUNT`.
+fn validate_count(snap: &ChannelSnapshotPublic, count: u32) -> CaResult<()> {
     if count > snap.element_count {
         return Err(CaError::BadCount);
     }
@@ -2092,7 +2102,6 @@ impl CaChannel {
         count: u32,
         ioid: u32,
     ) -> CaResult<()> {
-        snap.permit_read()?;
         // C `tcpiiu::readNotifyRequest` (`tcpiiu.cpp:1463-1478`) bounds the
         // requested element count against what the circuit can carry
         // (ECA_TOLARGE past it), then substitutes the channel's native count
@@ -2139,7 +2148,6 @@ impl CaChannel {
         ioid: u32,
         payload: Vec<u8>,
     ) -> CaResult<()> {
-        snap.permit_write()?;
         // C `comQueSend::insertRequestWithPayLoad` refuses a DBR type past
         // `INVALID_DB_REQ` (`comQueSend.cpp:323`, → ECA_BADTYPE) and an array
         // past the peer's message-body limit (`:352-364`, → ECA_BADCOUNT),
@@ -2174,16 +2182,17 @@ impl CaChannel {
             .map_err(|_| CaError::Shutdown)
     }
 
-    /// Send a fire-and-forget `CA_PROTO_WRITE`. See
+    /// Send `value` as a fire-and-forget `CA_PROTO_WRITE`. See
     /// [`Self::send_write_notify_fast`] for the `data_type` contract.
     fn send_write_nowait_fast(
         &self,
         snap: &ChannelSnapshotPublic,
         data_type: u16,
-        count: u32,
-        payload: Vec<u8>,
+        value: &EpicsValue,
     ) -> CaResult<()> {
-        snap.permit_write()?;
+        admit_write(snap, value)?;
+        let count = value.count();
+        let payload = value.to_bytes();
         // Same pre-queue type and element bounds as `send_write_notify_fast`
         // — a fire-and-forget put goes through the identical
         // `comQueSend::insertRequestWithPayLoad`, so `ca_array_put` returns
@@ -2281,7 +2290,10 @@ impl CaChannel {
         let mut pending: Vec<Pending> = Vec::new();
 
         for (index, ch) in channels.iter().enumerate() {
-            let snap = match ch.snapshot().and_then(|s| s.permit_read().map(|()| s)) {
+            let snap = match ch
+                .snapshot()
+                .and_then(|s| admit_read(&s, s.element_count).map(|()| s))
+            {
                 Ok(s) => s,
                 Err(e) => {
                     results[index] = Some(Err(e));
@@ -2805,16 +2817,7 @@ impl CaChannel {
         // Resolve the request mode (`Fixed(0)` → native count; `Autosize`
         // passes its count through, including the `0` autosize request).
         let request_count = count.resolve(snap.element_count);
-        // C `libca/nciu.cpp::read()` rejects `countIn > this->count` with
-        // ECA_BADCOUNT before queueing the read. Pre-fix Rust silently
-        // clamped with `.min(snap.element_count)`, so a caller bug
-        // requesting 100 elements from a 10-element PV got a 10-element
-        // response from Rust where libca would have returned ECA_BADCOUNT
-        // without sending anything. Validate the resolved count up front;
-        // `0` (native or autosize) is always in range.
-        if request_count > snap.element_count {
-            return Err(CaError::BadCount);
-        }
+        admit_read(&snap, request_count)?;
 
         let ioid = self.in_flight.alloc_ioid();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -2867,15 +2870,17 @@ impl CaChannel {
         Ok(self.issue_write_notify_as(dbr_type, value)?.reply())
     }
 
-    /// Register a write waiter and send `count` elements of `payload` as a
-    /// `dbr_type` `CA_PROTO_WRITE_NOTIFY`.
+    /// Register a write waiter and send `value` as a `dbr_type`
+    /// `CA_PROTO_WRITE_NOTIFY`.
     fn send_write_notify(
         &self,
         snap: &ChannelSnapshotPublic,
         dbr_type: u16,
-        count: u32,
-        payload: Vec<u8>,
+        value: &EpicsValue,
     ) -> CaResult<PendingWrite> {
+        admit_write(snap, value)?;
+        let count = value.count();
+        let payload = value.to_bytes();
         let ioid = self.in_flight.alloc_ioid();
         let (reply_tx, reply_rx) = oneshot::channel();
         // Direct registry insert (Option C Phase A).
@@ -2901,17 +2906,11 @@ impl CaChannel {
         // `Long(1)` landed as 0, silently. `convert_to` is the single
         // value-coercion owner (C cast semantics), so the header/payload
         // pairing holds for every variant. Menu labels still go through
-        // `put_string`, which the server resolves against its menu.
-        let value = value.convert_to(snap.native_type);
-        // C `nciu::write` rejects countIn > channel count with
-        // ECA_BADCOUNT before queueing the request. Validated on the
-        // converted value — the count of the actual wire request, which
+        // `put_string`, which the server resolves against its menu. The gate
+        // counts the converted value — the actual wire request, whose count
         // conversion can change (String → CHAR-array on a CHAR field).
-        validate_put_count(&snap, value.count())?;
-        validate_put_strings(&value)?;
-
-        let count = value.count() as u32;
-        self.send_write_notify(&snap, snap.native_type as u16, count, value.to_bytes())
+        let value = value.convert_to(snap.native_type);
+        self.send_write_notify(&snap, snap.native_type as u16, &value)
     }
 
     /// Fire-and-forget put (CA_PROTO_WRITE). Returns immediately without
@@ -2928,12 +2927,7 @@ impl CaChannel {
         // Native encoding to match the native-typed header; see
         // `issue_write_notify`.
         let value = value.convert_to(snap.native_type);
-        validate_put_count(&snap, value.count())?;
-        validate_put_strings(&value)?;
-
-        let payload = value.to_bytes();
-        let count = value.count() as u32;
-        self.send_write_nowait_fast(&snap, snap.native_type as u16, count, payload)
+        self.send_write_nowait_fast(&snap, snap.native_type as u16, &value)
     }
 
     /// Write `value`'s payload under an explicit DBR wire type
@@ -2972,11 +2966,7 @@ impl CaChannel {
 
     /// Send `value` under `dbr_type` as a `CA_PROTO_WRITE_NOTIFY`.
     fn issue_write_notify_as(&self, dbr_type: u16, value: &EpicsValue) -> CaResult<PendingWrite> {
-        let snap = self.snapshot()?;
-        let count = value.count() as u32;
-        validate_put_count(&snap, count)?;
-        validate_put_strings(value)?;
-        self.send_write_notify(&snap, dbr_type, count, value.to_bytes())
+        self.send_write_notify(&self.snapshot()?, dbr_type, value)
     }
 
     /// Fire-and-forget variant of [`Self::put_as_dbr_with_timeout`] —
@@ -2989,12 +2979,7 @@ impl CaChannel {
     /// [`Self::put_as_dbr_nowait`] for a caller that cannot await:
     /// `ca_array_put`'s status is known once the request is queued.
     pub fn put_as_dbr_no_callback(&self, dbr_type: u16, value: &EpicsValue) -> CaResult<()> {
-        let snap = self.snapshot()?;
-        let count = value.count() as u32;
-        validate_put_count(&snap, count)?;
-        validate_put_strings(value)?;
-        let payload = value.to_bytes();
-        self.send_write_nowait_fast(&snap, dbr_type, count, payload)
+        self.send_write_nowait_fast(&self.snapshot()?, dbr_type, value)
     }
 
     /// Write a string value to the channel as `DBR_STRING` (DBR type 0)
@@ -3014,14 +2999,10 @@ impl CaChannel {
     /// `nciu::stringVerify` refuses it before the request is queued (R6-29).
     /// ENUM menu names are well within the 39-byte cap.
     pub async fn put_string(&self, value: &str, timeout: Duration) -> CaResult<()> {
-        let snap = self.snapshot()?;
-        validate_put_count(&snap, 1)?;
-        validate_string_length(value)?;
-
-        let payload = EpicsValue::String(value.into()).to_bytes();
         // DBR_STRING = 0; count 1. The server interprets the bytes
         // against its own field type (e.g. ENUM menu resolution).
-        let write = self.send_write_notify(&snap, 0, 1, payload)?;
+        let write =
+            self.send_write_notify(&self.snapshot()?, 0, &EpicsValue::String(value.into()))?;
         within(timeout, write.reply()).await
     }
 
@@ -3029,11 +3010,7 @@ impl CaChannel {
     /// value as `DBR_STRING` via `CA_PROTO_WRITE` without waiting for
     /// server acknowledgement.
     pub async fn put_string_nowait(&self, value: &str) -> CaResult<()> {
-        let snap = self.snapshot()?;
-        validate_put_count(&snap, 1)?;
-        validate_string_length(value)?;
-        let payload = EpicsValue::String(value.into()).to_bytes();
-        self.send_write_nowait_fast(&snap, 0, 1, payload)
+        self.send_write_nowait_fast(&self.snapshot()?, 0, &EpicsValue::String(value.into()))
     }
 
     /// Array variant of [`Self::put_string`] — writes `values` as a
@@ -3047,32 +3024,17 @@ impl CaChannel {
     /// same 39-byte cap as [`Self::put_string`]: an over-long element is
     /// rejected with `ECA_BADSTR`, not truncated.
     pub async fn put_string_array(&self, values: &[String], timeout: Duration) -> CaResult<()> {
-        let snap = self.snapshot()?;
-        validate_put_count(&snap, values.len() as u32)?;
-        for s in values {
-            validate_string_length(s)?;
-        }
-
-        let payload =
-            EpicsValue::StringArray(values.iter().map(PvString::from).collect()).to_bytes();
-        let count = values.len() as u32;
+        let value = EpicsValue::StringArray(values.iter().map(PvString::from).collect());
         // DBR_STRING = 0. The server interprets each 40-byte element
         // against its own field type (e.g. ENUM menu resolution).
-        let write = self.send_write_notify(&snap, 0, count, payload)?;
+        let write = self.send_write_notify(&self.snapshot()?, 0, &value)?;
         within(timeout, write.reply()).await
     }
 
     /// Fire-and-forget variant of [`Self::put_string_array`].
     pub async fn put_string_array_nowait(&self, values: &[String]) -> CaResult<()> {
-        let snap = self.snapshot()?;
-        validate_put_count(&snap, values.len() as u32)?;
-        for s in values {
-            validate_string_length(s)?;
-        }
-        let payload =
-            EpicsValue::StringArray(values.iter().map(PvString::from).collect()).to_bytes();
-        let count = values.len() as u32;
-        self.send_write_nowait_fast(&snap, 0, count, payload)
+        let value = EpicsValue::StringArray(values.iter().map(PvString::from).collect());
+        self.send_write_nowait_fast(&self.snapshot()?, 0, &value)
     }
 
     pub async fn subscribe(&self) -> CaResult<MonitorHandle> {
@@ -7252,6 +7214,61 @@ mod refused_before_queueing_tests {
             );
             wire.assert_silent(route);
         }
+    }
+
+    /// `nciu::read` and `nciu::write` test the right before the count and the
+    /// strings (`nciu.cpp:282-287,329-337`), so a denied request answers the
+    /// denial whatever else is wrong with it.
+    #[tokio::test(start_paused = true)]
+    async fn a_denial_outranks_a_bad_count_or_string() {
+        let (ch, mut wire) = connected(WRITE_ONLY, false);
+        assert_eq!(
+            status(CaOp::Read, ch.get_callback(DBR_TIME_DOUBLE, 2).map(drop)),
+            Some(ECA_NORDACCESS),
+            "get_callback of 2"
+        );
+        wire.assert_silent("read");
+
+        let (ch, mut wire) = connected(READ_ONLY, false);
+        let denied = Some(ECA_NOWTACCESS);
+        let two = EpicsValue::DoubleArray(vec![1.0, 2.0].into());
+        let long = "x".repeat(40);
+        assert_eq!(
+            status(CaOp::Write, ch.put_with_timeout(&two, BOUND).await),
+            denied,
+            "put of 2"
+        );
+        assert_eq!(
+            status(CaOp::Write, ch.put_nowait(&two).await),
+            denied,
+            "put_nowait of 2"
+        );
+        let strings = ["1".to_string(), "2".to_string()];
+        assert_eq!(
+            status(CaOp::Write, ch.put_string_array(&strings, BOUND).await),
+            denied,
+            "put_string_array of 2"
+        );
+        assert_eq!(
+            status(CaOp::Write, ch.put_string(&long, BOUND).await),
+            denied,
+            "put_string of 40 bytes"
+        );
+        assert_eq!(
+            status(CaOp::Write, ch.put_string_nowait(&long).await),
+            denied,
+            "put_string_nowait of 40 bytes"
+        );
+        assert_eq!(
+            status(
+                CaOp::Write,
+                ch.put_as_dbr_nowait(0, &EpicsValue::String(long.as_str().into()))
+                    .await
+            ),
+            denied,
+            "put_as_dbr_nowait of 40 bytes"
+        );
+        wire.assert_silent("write");
     }
 
     #[tokio::test(start_paused = true)]

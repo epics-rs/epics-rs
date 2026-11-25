@@ -1456,7 +1456,7 @@ impl LinkSet for CaLinkResolver {
         // ECA_BADCOUNT (`oldChannelNotify.cpp:512`). C reaches that only
         // from a direct client write, never from a link put — dbCa has
         // already clamped. Clamping the converted value keeps
-        // `validate_put_count` unreachable from this path by
+        // `admit_write`'s count refusal unreachable from this path by
         // construction rather than by a second bound inside the client.
         //
         // No native description: the channel is down, which `dbCaTask`

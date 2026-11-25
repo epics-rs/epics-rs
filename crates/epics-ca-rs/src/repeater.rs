@@ -368,22 +368,34 @@ fn spawn_repeater() {
 
     // Fallback: run repeater in-process on a background thread.
     // This ensures beacon reception works even without the external binary.
-    std::thread::spawn(|| {
-        // C's in-process fallback is `caRepeaterThread` (`repeater.cpp:632`),
-        // which registers with the watchdog before entering `ca_repeater()`.
-        // Unbounded: the loop parks on `recv_from`, and a host with no CA
-        // traffic is quiet rather than wedged.
-        let _watched = epics_base_rs::runtime::taskwd::taskwd_insert(
-            "CAC-repeater",
-            epics_base_rs::runtime::taskwd::CheckIn::Unbounded,
-            None,
+    // C `udpiiu.cpp:639`: its own name and band, not the calling thread's.
+    use epics_base_rs::runtime::task::{StackSizeClass, ThreadPriority, spawn_dedicated_thread};
+    let started = spawn_dedicated_thread(
+        "CAC-repeater".to_string(),
+        ThreadPriority::Low,
+        StackSizeClass::Medium,
+        || {
+            // C's in-process fallback is `caRepeaterThread` (`repeater.cpp:632`),
+            // which registers with the watchdog before entering `ca_repeater()`.
+            // Unbounded: the loop parks on `recv_from`, and a host with no CA
+            // traffic is quiet rather than wedged.
+            let _watched = epics_base_rs::runtime::taskwd::taskwd_insert(
+                "CAC-repeater",
+                epics_base_rs::runtime::taskwd::CheckIn::Unbounded,
+                None,
+            );
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("repeater runtime");
+            let _ = rt.block_on(run_repeater());
+        },
+    );
+    if started.is_err() {
+        epics_base_rs::stderr_println!(
+            "caStartRepeaterIfNotInstalled : unable to create CA repeater daemon thread"
         );
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("repeater runtime");
-        let _ = rt.block_on(run_repeater());
-    });
+    }
 }
 
 /// The daemon `osiSpawnDetachedProcess` starts, with null stdio. It outlives
@@ -864,6 +876,50 @@ mod tests {
             ready
         };
         assert_eq!(ready, 1, "the daemon holds the write end");
+    }
+
+    /// With no daemon binary to spawn, C starts the repeater on a thread
+    /// `epicsThreadShowAll` lists as `CAC-repeater` at `epicsThreadPriorityLow`,
+    /// 10 (`udpiiu.cpp:639`), whatever thread the client called from.
+    #[test]
+    fn the_in_process_repeater_is_listed_as_cac_repeater_at_low() {
+        use std::time::{Duration, Instant};
+        let exe = std::env::current_exe().unwrap();
+        let daemon = exe.with_file_name(format!("ca-repeater-rs{}", std::env::consts::EXE_SUFFIX));
+        assert!(
+            !daemon.exists(),
+            "a sibling {daemon:?} would take the daemon arm"
+        );
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("client runtime");
+
+        // Another process can take, or answer on, a probed port before this
+        // one's repeater binds it; a fresh port is a fresh attempt.
+        for _ in 0..5 {
+            let port = StdUdpSocket::bind("127.0.0.1:0")
+                .and_then(|s| s.local_addr())
+                .expect("probe port")
+                .port();
+            // SAFETY: nextest runs each test in its own process.
+            unsafe { std::env::set_var("EPICS_CA_REPEATER_PORT", port.to_string()) };
+
+            rt.block_on(ensure_repeater(port));
+
+            let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+            while Instant::now() < deadline {
+                if let Some(row) = epics_base_rs::runtime::task::thread_by_name("CAC-repeater")
+                    && rt.block_on(try_register(port)).is_ok()
+                {
+                    assert_eq!(row.epics_priority(), 10, "epicsThreadPriorityLow");
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        panic!("no CAC-repeater thread is listed and serving registrations");
     }
 
     /// A client thread on SCHED_FIFO starts the daemon on SCHED_OTHER.

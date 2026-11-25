@@ -369,16 +369,16 @@ impl NexusWriter {
     }
 
     /// Load (parse and validate) a NeXus XML template. On success the template
-    /// drives the file structure; on parse failure the template is cleared and
-    /// the writer falls back to its built-in NXentry/NXdata hierarchy. Returns
-    /// whether the template parsed successfully (C++ `NDFileNexusTemplateValid`).
+    /// drives the file structure; on parse failure the last good template
+    /// stays. Returns whether the template parsed successfully (C++
+    /// `NDFileNexusTemplateValid`).
     pub fn load_template(&mut self, xml: &str) -> bool {
-        store_template(&self.template.store(), Some(xml))
+        store_template(&self.template.store(), xml)
     }
 
     /// Clear any loaded template (revert to the built-in hierarchy).
     pub fn clear_template(&mut self) {
-        store_template(&self.template.store(), None);
+        self.template.store().update(|t| *t = None);
     }
 
     /// Write the NeXus `NX_class` group marker as a true HDF5 group attribute.
@@ -921,12 +921,17 @@ impl NDFileWriter for NexusWriter {
 // Processor
 // ============================================================
 
-/// Parse `xml` into `store`, or clear it; whether a template is now loaded.
-fn store_template(store: &SettingsStore<Option<XmlElement>>, xml: Option<&str>) -> bool {
-    let root = xml.and_then(|x| parse_nexus_template(x).ok());
-    let valid = root.is_some();
-    store.update(|t| *t = root);
-    valid
+/// Parse `xml` into `store`; whether it parsed. One that does not leaves the
+/// last good template, as C sets `rootNode` only on a load that succeeds
+/// (NDFileNexus.cpp:829-847).
+fn store_template(store: &SettingsStore<Option<XmlElement>>, xml: &str) -> bool {
+    match parse_nexus_template(xml) {
+        Ok(root) => {
+            store.update(|t| *t = Some(root));
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 pub struct NexusFileProcessor {
@@ -953,10 +958,9 @@ impl NexusFileProcessor {
 
     /// Load the NeXus XML template at `full` (C++
     /// NDFileNexus::loadTemplateFile); a file that cannot be read or parsed
-    /// leaves no template, as C's NULL `configDoc` does.
+    /// leaves the last good template in use.
     fn load_template(&self, full: &str) -> bool {
-        let xml = std::fs::read_to_string(full).ok();
-        store_template(&self.template, xml.as_deref())
+        std::fs::read_to_string(full).is_ok_and(|xml| store_template(&self.template, &xml))
     }
 }
 
@@ -1584,7 +1588,8 @@ mod tests {
 
         std::fs::remove_file(&tmpl_path).ok();
 
-        // :825 returns on an empty file; a bad one prints and clears (:830-836).
+        // :825 returns on an empty file; a bad one prints and keeps the last
+        // good one (:830-836, :847).
         let write = |v: &str| {
             proc.validate_octet(
                 file_idx,
@@ -1606,7 +1611,58 @@ mod tests {
             out.trace[0].1,
             format!("NDFileNexus:loadTemplateFile: Parameter file {path} is invalid\n")
         );
-        assert!(!proc.template.get(Option::is_some));
+        assert!(proc.template.get(Option::is_some));
+    }
+
+    /// A template file that does not load leaves the last good one laying out
+    /// the next file (NDFileNexus.cpp:71, :829-847).
+    #[test]
+    fn a_bad_template_file_keeps_the_last_good_layout() {
+        use crate::test_util::{auto_save_to, publish, running, wait_saved};
+        let good = temp_path("template_good").with_extension("xml");
+        std::fs::write(
+            &good,
+            r#"<NXroot><NXentry name="e"><NXdata name="d"><x type="pArray"/></NXdata></NXentry></NXroot>"#,
+        )
+        .unwrap();
+        let bad = temp_path("template_bad").with_extension("xml");
+        std::fs::write(&bad, "<NXroot><unclosed>").unwrap();
+
+        let (handle, _rx, _jh) = running("NEXUS_KEEP_TEMPLATE", NexusFileProcessor::new());
+        let port = handle.port_runtime().port_handle();
+        let reason = |name: &str| {
+            port.drv_user_create_blocking(&asyn_rs::port::DrvUserRequest::new(name, 0))
+                .unwrap()
+                .reason
+        };
+        let load = |file: &Path| {
+            port.submit_blocking(
+                asyn_rs::request::RequestOp::OctetWrite {
+                    data: file.to_str().unwrap().as_bytes().to_vec(),
+                },
+                asyn_rs::user::AsynUser::new(reason("TEMPLATE_FILE_NAME")),
+            )
+            .unwrap();
+            assert!(handle.wait_params_applied(fact_budget::FACT_BUDGET));
+            port.read_int32_blocking(reason("TEMPLATE_FILE_VALID"), 0)
+                .unwrap()
+        };
+        assert_eq!(load(&good), 1);
+        assert_eq!(load(&bad), 0);
+
+        let path = temp_path("kept_template");
+        auto_save_to(&handle, &path);
+        publish(
+            &handle,
+            &NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8),
+        );
+        wait_saved(&handle, 1);
+        let h5 = H5File::open(&path).unwrap();
+        assert_eq!(h5.dataset("e/d/x").unwrap().shape(), vec![1, 4]);
+        assert!(h5.dataset("entry/instrument/detector/data").is_err());
+        for f in [&path, &good, &bad] {
+            std::fs::remove_file(f).ok();
+        }
     }
 
     #[test]

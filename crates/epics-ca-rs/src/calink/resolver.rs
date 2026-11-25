@@ -95,16 +95,20 @@ impl LinkEvents {
         self.string.lock().is_some()
     }
 
-    /// The string monitor open for `native`, else a new one from `spawn`,
-    /// replacing one opened for another description.
-    fn open_string(
+    /// The last value of the string monitor open for `native`. With none
+    /// open, `spawn` opens one, replacing one opened for another
+    /// description, and the read answers `None` whatever that monitor
+    /// delivers meanwhile: C decides `!gotInString` under `pca->lock` before
+    /// it queues `CA_MONITOR_STRING` (`dbCa.c:468-477`, `:526-528`), so the
+    /// read that adds the monitor fails.
+    fn read_string(
         &self,
         native: (DbFieldType, u32),
         spawn: impl FnOnce(std::sync::Weak<StringMonitor>) -> AbortOnDrop,
-    ) -> Arc<StringMonitor> {
+    ) -> Option<Arc<PvString>> {
         let mut slot = self.string.lock();
         if let Some(open) = slot.as_ref().filter(|m| m.native == native) {
-            return open.clone();
+            return open.value.load_full();
         }
         let monitor = Arc::new(StringMonitor {
             native,
@@ -112,10 +116,10 @@ impl LinkEvents {
             task: std::sync::OnceLock::new(),
         });
         let _ = monitor.task.set(spawn(Arc::downgrade(&monitor)));
-        let stale = slot.replace(monitor.clone());
+        let stale = slot.replace(monitor);
         drop(slot);
         drop(stale);
-        monitor
+        None
     }
 
     /// C `connectionCallback`'s size-or-type-change clear, string half
@@ -712,18 +716,16 @@ impl CaLink {
         }
         // C `pvlOptInpString` with its `CA_MONITOR_STRING`
         // (`dbCa.c:1236-1248`).
-        let monitor = self.events.open_string(native, |monitor| {
-            AbortOnDrop(self.reactor.spawn(run_string_monitor(
-                self.channel.clone(),
-                self.events.clone(),
-                monitor,
-                self.connected.clone(),
-                self.pv_name.clone(),
-            )))
-        });
-        monitor
-            .value
-            .load_full()
+        self.events
+            .read_string(native, |monitor| {
+                AbortOnDrop(self.reactor.spawn(run_string_monitor(
+                    self.channel.clone(),
+                    self.events.clone(),
+                    monitor,
+                    self.connected.clone(),
+                    self.pv_name.clone(),
+                )))
+            })
             .map_or(EnumString::Pending, |s| EnumString::Got((*s).clone()))
     }
 
@@ -2049,6 +2051,29 @@ mod tests {
         assert_eq!(reads() - base, one);
         step(&state);
         assert_eq!(reads() - base, one, "both were taken");
+    }
+
+    /// C fails the string read that adds the monitor (`dbCa.c:468-477`), and
+    /// still does when the monitor's first event lands before that read
+    /// returns; the next read serves the event.
+    #[cfg(tokio_backend)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_read_that_adds_the_string_monitor_fails_whatever_it_delivers() {
+        let reactor = task::Reactor::current().expect("test runtime");
+        let events = LinkEvents::new();
+        let native = (DbFieldType::Enum, 1);
+        let delivers_at_once = |monitor: std::sync::Weak<StringMonitor>| {
+            let monitor = monitor.upgrade().expect("the monitor being opened");
+            monitor.value.store(Some(Arc::new(PvString::from("one"))));
+            AbortOnDrop(reactor.spawn(std::future::pending::<()>()))
+        };
+
+        assert_eq!(events.read_string(native, delivers_at_once), None);
+        let next = events.read_string(native, |_| unreachable!("the monitor is open"));
+        assert_eq!(
+            next.as_deref().map(|s| s.as_str_lossy()),
+            Some("one".into())
+        );
     }
 
     /// C `addAction` (`dbCa.c:132-161`) per boundary, with the processor

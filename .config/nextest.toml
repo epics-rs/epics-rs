@@ -102,7 +102,7 @@ default-filter = """
   (binary(integration) & test(/^wire_golden_ext::/)) |
   (binary(integration) & test(/^interop_pvxs::/)) |
   (binary(integration) & test(/^discovery_mdns::/)) |
-  binary(attributes_file_over_ca) |
+  (binary(integration) & test(/^attributes_file_over_ca::/)) |
   (binary(integration) & test(/^stress_load::/)) |
   (binary(integration) & test(/^calink_rights_match_softioc::/)) |
   (binary(integration) & test(/^local_cp_link_matches_softioc::/)) |
@@ -278,7 +278,7 @@ test-group = 'ioc_unthrottled'
 
 # Capped because nobody has measured them unthrottled.
 [[profile.default.overrides]]
-filter = '(binary(integration) & test(/^boot_stderr_matches_softioc::/)) | (binary(integration) & test(/^softioc_a_ca_put_never_waits_on_the_console::/)) | (binary(integration) & test(/^softioc_errlog_reports_lost_messages::/)) | (binary(integration) & test(/^softioc_undeclared_json_link_type::/)) | (binary(integration) & test(/^a_ca_forward_link_processes_the_remote_record::/)) | (binary(integration) & test(/^gw_upstream_unresponsive_window::/)) | (binary(integration) & test(/^softioc_db_path_bytes::/)) | (binary(integration) & test(/^qsrv_rs_db_path_bytes::/)) | (binary(integration) & test(/^st_cmd_boots_through_iocinit::/)) | binary(attributes_file_over_ca) | (binary(integration) & test(/^softioc_asub_init_stderr::/)) | (binary(integration) & test(/^softioc_ioc_init_failure_lines::/)) | (binary(integration) & test(/^softioc_ioc_init_redirect::/)) | (binary(integration) & test(/^softioc_general_time_dtyp::/)) | (binary(integration) & test(/^softioc_dbd_device_line::/)) | (binary(integration) & test(/^cp_process_runs_on_dbcalink::/))'
+filter = '(binary(integration) & test(/^boot_stderr_matches_softioc::/)) | (binary(integration) & test(/^softioc_a_ca_put_never_waits_on_the_console::/)) | (binary(integration) & test(/^softioc_errlog_reports_lost_messages::/)) | (binary(integration) & test(/^softioc_undeclared_json_link_type::/)) | (binary(integration) & test(/^a_ca_forward_link_processes_the_remote_record::/)) | (binary(integration) & test(/^gw_upstream_unresponsive_window::/)) | (binary(integration) & test(/^softioc_db_path_bytes::/)) | (binary(integration) & test(/^qsrv_rs_db_path_bytes::/)) | (binary(integration) & test(/^st_cmd_boots_through_iocinit::/)) | (binary(integration) & test(/^attributes_file_over_ca::/)) | (binary(integration) & test(/^softioc_asub_init_stderr::/)) | (binary(integration) & test(/^softioc_ioc_init_failure_lines::/)) | (binary(integration) & test(/^softioc_ioc_init_redirect::/)) | (binary(integration) & test(/^softioc_general_time_dtyp::/)) | (binary(integration) & test(/^softioc_dbd_device_line::/)) | (binary(integration) & test(/^cp_process_runs_on_dbcalink::/))'
 test-group = 'ca_softioc'
 
 # epics-pva-rs lib tests: the pvalink tests that spawn softIocPVX (interop

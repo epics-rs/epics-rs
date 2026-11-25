@@ -18,6 +18,7 @@ use std::sync::{Arc, OnceLock, Weak};
 use std::task::{Context, Poll, Wake, Waker};
 
 use super::ca_link::{LocalChannel, StateNotify};
+use super::channel_io::ChannelTarget;
 use super::{PvDatabase, PvDatabaseInner};
 use crate::error::CaError;
 use crate::runtime::task::{
@@ -260,12 +261,10 @@ impl InProcessChannel {
     /// as a put of its context.
     pub fn put(&self, value: EpicsValue) -> Result<(), String> {
         let value = put_value(&self.channel, value);
-        let put = self
-            .events
-            .0
-            .0
-            .running
-            .run(self.channel.issue_put(value, false));
+        let put = self.events.0.0.running.run(
+            RecordKey::of(&self.channel),
+            self.channel.issue_put(value, false),
+        );
         in_caller(&self.bridge, put)
             .map_err(|e| e.to_string())?
             .map(drop)
@@ -283,8 +282,13 @@ impl InProcessChannel {
     ) -> Result<R, CaError> {
         let value = put_value(&self.channel, value);
         let put = async { self.channel.put_callback(value).await.map(issued) };
-        in_caller(&self.bridge, self.events.0.0.running.run(put))
-            .map_err(|e| CaError::Protocol(e.to_string()))?
+        let put = self
+            .events
+            .0
+            .0
+            .running
+            .run(RecordKey::of(&self.channel), put);
+        in_caller(&self.bridge, put).map_err(|e| CaError::Protocol(e.to_string()))?
     }
 }
 
@@ -293,8 +297,8 @@ impl InProcessChannel {
 /// `CAC-event`, its consumer, which the first subscription starts at the
 /// lowest priority above its own thread's. Entries reach their callbacks
 /// one at a time in post order, on that thread or in [`Self::deliver`],
-/// each after the runs of the context's puts going when it is taken
-/// (`Running`). The thread returns when the last clone
+/// each after the runs of the context's puts on its record going when it
+/// is taken (`Running`). The thread returns when the last clone
 /// drops (`db_close_events`).
 #[derive(Clone, Default)]
 pub struct InProcessEvents(Arc<EventsOwner>);
@@ -419,7 +423,7 @@ impl Events {
             if let CircuitEvent::Event { context, event, .. } = entry
                 && let Some(route) = context.downcast_ref::<Route>()
             {
-                self.running.wait();
+                self.running.wait(route.record);
                 route.deliver(event);
             }
         }
@@ -427,40 +431,59 @@ impl Events {
 }
 
 /// The puts of a client context while they run on their callers, each poll
-/// of one a run; what a run posts reaches its callback after the run. C's
-/// `CAC-event` must be woken and scheduled before it delivers, so
-/// `dbChannelIO::write` is ordinarily back in the poster first
+/// of one a run; what a run posts on its own record reaches its callback
+/// after the run. C's `CAC-event` must be woken and scheduled before it
+/// delivers, so `dbChannelIO::write` is ordinarily back in the poster first
 /// (MM4005_trajectoryScan's `pvPut(motorMDVS[j])` then
 /// `efClear(motorMDVSMon)` sees the event after the clear on 287 of 300 C
-/// boots). A put parked between polls (`dbPutNotifyBlocker`, a postponed
-/// write) runs nothing and holds up no one, as C's blocked caller does
-/// not, and no put waits for another.
+/// boots). An entry waits only for runs on its own record, whose value is
+/// the one still changing; C's `CAC-event` waits on the record's whole
+/// lockset only because it reads under `dbScanLock` (`db_access.c:158`). A
+/// put parked between polls (`dbPutNotifyBlocker`, a postponed write) runs
+/// nothing and holds up no one, as C's blocked caller does not, and no put
+/// waits for another.
 #[derive(Default)]
 struct Running {
-    /// The next run's number, and the numbers of the runs not ended.
-    runs: parking_lot::Mutex<(u64, Vec<u64>)>,
+    /// The next run's number, and the number and record of each run not
+    /// ended.
+    runs: parking_lot::Mutex<(u64, Vec<(u64, RecordKey)>)>,
     ended: parking_lot::Condvar,
 }
 
 impl Running {
-    /// `put`, each poll of it a run.
-    async fn run<F: Future>(&self, put: F) -> F::Output {
+    /// `put` to `record`, each poll of it a run.
+    async fn run<F: Future>(&self, record: RecordKey, put: F) -> F::Output {
         let mut put = std::pin::pin!(put);
         std::future::poll_fn(|cx| {
-            let _run = Run::start(self);
+            let _run = Run::start(self, record);
             put.as_mut().poll(cx)
         })
         .await
     }
 
-    /// Until each run going now has ended; one started later is not waited
-    /// for.
-    fn wait(&self) {
+    /// Until each run on `record` going now has ended; one started later is
+    /// not waited for.
+    fn wait(&self, record: RecordKey) {
         let mut runs = self.runs.lock();
         let now = runs.0;
-        while runs.1.iter().any(|&run| run < now) {
+        while runs.1.iter().any(|&(run, on)| run < now && on == record) {
             self.ended.wait(&mut runs);
         }
+    }
+}
+
+/// The record a channel addresses. The run's channel and the entry's
+/// subscription each hold it, so while both live, equal keys are one record.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RecordKey(usize);
+
+impl RecordKey {
+    fn of(channel: &LocalChannel) -> Self {
+        let record = match channel.target() {
+            ChannelTarget::SimplePv(pv) => Arc::as_ptr(pv).cast::<()>(),
+            ChannelTarget::RecordField { record, .. } => Arc::as_ptr(record).cast::<()>(),
+        };
+        Self(record as usize)
     }
 }
 
@@ -471,11 +494,11 @@ struct Run<'a> {
 }
 
 impl<'a> Run<'a> {
-    fn start(running: &'a Running) -> Self {
+    fn start(running: &'a Running, record: RecordKey) -> Self {
         let mut runs = running.runs.lock();
         let number = runs.0;
         runs.0 += 1;
-        runs.1.push(number);
+        runs.1.push((number, record));
         Run { running, number }
     }
 }
@@ -483,7 +506,7 @@ impl<'a> Run<'a> {
 impl Drop for Run<'_> {
     fn drop(&mut self) {
         let mut runs = self.running.runs.lock();
-        if let Some(at) = runs.1.iter().position(|&run| run == self.number) {
+        if let Some(at) = runs.1.iter().position(|&(run, _)| run == self.number) {
             runs.1.swap_remove(at);
         }
         self.running.ended.notify_all();
@@ -492,6 +515,7 @@ impl Drop for Run<'_> {
 
 /// One subscription's way from an entry to its callback.
 struct Route {
+    record: RecordKey,
     notify: StateNotify,
     count: u32,
     callback: Box<dyn Fn(Snapshot) + Send + Sync>,
@@ -549,6 +573,7 @@ fn subscribe(
     let db = channel.db().ok_or("database gone")?;
     let (pre_chain, notify) = channel.state_notify(dbr_type);
     let route = Arc::new(Route {
+        record: RecordKey::of(channel),
         notify,
         count,
         callback,
@@ -635,12 +660,15 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    /// [`Running::wait`] on another thread; the receiver hears when it ends.
+    const RECORD: RecordKey = RecordKey(1);
+
+    /// [`Running::wait`] for [`RECORD`] on another thread; the receiver
+    /// hears when it ends.
     fn waiting(running: &Arc<Running>) -> mpsc::Receiver<()> {
         let (ended, waited) = mpsc::channel();
         let running = Arc::clone(running);
         std::thread::spawn(move || {
-            running.wait();
+            running.wait(RECORD);
             ended.send(()).unwrap();
         });
         waited
@@ -653,10 +681,10 @@ mod tests {
     #[test]
     fn a_wait_is_for_the_runs_going_when_it_starts() {
         let running = Arc::new(Running::default());
-        let going = Run::start(&running);
+        let going = Run::start(&running, RECORD);
         let waited = waiting(&running);
         std::thread::sleep(SETTLE);
-        let later = Run::start(&running);
+        let later = Run::start(&running, RECORD);
         assert!(waited.recv_timeout(SETTLE).is_err(), "before the run ends");
         drop(going);
         waited.recv_timeout(fact_budget::FACT_BUDGET).unwrap();
@@ -668,7 +696,7 @@ mod tests {
     #[test]
     fn a_put_parked_between_polls_is_no_run() {
         let running = Arc::new(Running::default());
-        let mut put = std::pin::pin!(running.run(std::future::pending::<()>()));
+        let mut put = std::pin::pin!(running.run(RECORD, std::future::pending::<()>()));
         let polled = put.as_mut().poll(&mut Context::from_waker(Waker::noop()));
         assert!(polled.is_pending());
         waiting(&running)

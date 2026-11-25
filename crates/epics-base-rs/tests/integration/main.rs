@@ -695,6 +695,7 @@ mod lnkcalc_val_is_the_link_value;
 mod load_diagnostics_print_in_file_order;
 mod local_async_put_completes_on_the_low_band;
 mod local_ca_client_monitors_run_in_post_order;
+mod local_ca_client_put_holds_back_only_its_record;
 mod local_ca_client_reads_count_elements;
 mod local_cp_link_on_build_ioc;
 mod lock_sets_match_c;

@@ -1387,6 +1387,11 @@ impl LocalChannel {
         self.chan.final_element_count
     }
 
+    /// The record, or the PV, the channel addresses.
+    pub(super) fn target(&self) -> &ChannelTarget {
+        &self.chan.target
+    }
+
     /// `dbContextReadNotifyCache::callReadNotify`
     /// (`dbContextReadNotifyCache.cpp:60-110`): `dbChannel_get` of
     /// `dbr_type`, `count` elements, completed synchronously.

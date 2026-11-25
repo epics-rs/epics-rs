@@ -603,6 +603,7 @@ mod histogram_monitor_posts_from_its_own_copies;
 mod histogram_sdel_full_double_range;
 mod histogram_soft_read_keeps_udf;
 mod histogram_svl_input_link;
+mod histogram_watchdog_runs_on_the_low_band;
 mod hop_chain_unwinds_on_panic;
 mod hop_frame_hands_on_its_put;
 mod init_hook_at_beginning_sees_the_prebuild_state;

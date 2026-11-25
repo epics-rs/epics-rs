@@ -4788,7 +4788,7 @@ impl PvDatabase {
 
     /// [`Self::arm_watchdog`] for a caller inside the record's frame.
     pub(crate) fn arm_watchdog_in(&self, frame: InFrame<'_>) {
-        let (generation, epoch, prio, interval) = {
+        let (generation, epoch, interval) = {
             let instance = frame.read();
             let Some(interval) = instance.record.watchdog_interval() else {
                 // Bumping the generation still cancels a watchdog left running
@@ -4800,12 +4800,7 @@ impl PvDatabase {
             };
             let generation = instance.watchdog_generation.clone();
             let epoch = generation.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
-            (
-                generation,
-                epoch,
-                instance.common.callback_priority(),
-                interval,
-            )
+            (generation, epoch, interval)
         };
         let rec = frame.unframed().clone();
         // C `histogramRecord.c::wdogCallback` stamps with `recGblGetTimeStamp`
@@ -4813,6 +4808,9 @@ impl PvDatabase {
         // a live watchdog never keeps the database alive — the tick simply
         // stamps without TSEL if the database is already gone.
         let db = self.async_handle();
+        // C `wdogInit` pins the tick to `priorityLow` (`histogramRecord.c:141`),
+        // whatever the record's PRIO.
+        let prio = crate::runtime::task::CallbackPriority::Low;
         self.spawn_callback_after(prio, interval, async move {
             loop {
                 // A newer arm superseded this task while it waited.

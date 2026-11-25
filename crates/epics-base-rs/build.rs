@@ -30,8 +30,8 @@
 
 fn main() {
     stamp_vcs_version();
-    // autosave's `compiled <ctime>` (autosave_release.pl:6); a build of this
-    // crate is C's compile of save_restore.c.
+    // autosave's `compiled <ctime>` (autosave_release.pl:6), taken when this
+    // script runs: see `stamp_vcs_version` for when that is.
     println!("cargo::rustc-env=EPICS_RS_BUILD_EPOCH={}", build_epoch());
 
     println!("cargo::rustc-check-cfg=cfg(exec_backend)");
@@ -87,9 +87,11 @@ fn main() {
 /// invariant, and `misc_commands.rs` asserts it again at compile time.
 ///
 /// C's `FORCE` rule regenerates `epicsVCS.h` on every make. Here the script
-/// re-runs when this package's files change or this checkout's `HEAD` moves
-/// ([`head_paths`]), so the stamp names the commit built; an edit outside
-/// this package leaves `-dirty` off until one of those moves.
+/// re-runs when this checkout's `HEAD` moves ([`head_paths`]) or the
+/// library's own inputs change, so the stamp names the commit built; an edit
+/// anywhere else leaves it as it was until one of those moves. That includes
+/// `tests/`: tests are not in the shipped binary, and a re-stamp would
+/// recompile every crate that depends on this one.
 ///
 /// The one place this reads differently from C: C leaves the date's tail
 /// unset on the no-VCS arm (`$cv` is never assigned there), so its own
@@ -100,12 +102,12 @@ fn stamp_vcs_version() {
     let (version, date) = from_git().unwrap_or_else(build_timestamp);
     println!("cargo::rustc-env=EPICS_VCS_VERSION={version}");
     println!("cargo::rustc-env=EPICS_VCS_VERSION_DATE={date}");
-    // A `rerun-if-changed` ends Cargo's own watch on the package, so the
-    // package is named too.
     let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("set by Cargo");
-    println!("cargo::rerun-if-changed={manifest}");
     for path in head_paths(std::path::Path::new(&manifest)) {
         println!("cargo::rerun-if-changed={}", path.display());
+    }
+    for input in ["src", "build.rs", "Cargo.toml"] {
+        println!("cargo::rerun-if-changed={input}");
     }
 }
 

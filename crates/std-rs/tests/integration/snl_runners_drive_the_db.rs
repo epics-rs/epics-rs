@@ -386,7 +386,7 @@ async fn rv7_delaydo_debug_names_the_program() {
     if std::env::var_os(DEBUG_CHILD).is_none() {
         let out = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
-                "rv7_delaydo_debug_names_the_program",
+                "snl_runners_drive_the_db::rv7_delaydo_debug_names_the_program",
                 "--exact",
                 "--nocapture",
                 "--test-threads=1",

@@ -418,12 +418,15 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ),
     ("scaler-rs", "tests/integration/integration_tests.rs"),
     ("seq-validate", "tests/integration/validate.rs"),
-    ("std-rs", "tests/e2e_tests.rs"),
-    ("std-rs", "tests/epid_dtyp_put_keeps_the_init_dset.rs"),
-    ("std-rs", "tests/epid_empty_inp_is_constant.rs"),
-    ("std-rs", "tests/integration_tests.rs"),
-    ("std-rs", "tests/snl_runners_drive_the_db.rs"),
-    ("std-rs", "tests/timestamp_monitor_gate.rs"),
+    ("std-rs", "tests/integration/e2e_tests.rs"),
+    (
+        "std-rs",
+        "tests/integration/epid_dtyp_put_keeps_the_init_dset.rs",
+    ),
+    ("std-rs", "tests/integration/epid_empty_inp_is_constant.rs"),
+    ("std-rs", "tests/integration/integration_tests.rs"),
+    ("std-rs", "tests/integration/snl_runners_drive_the_db.rs"),
+    ("std-rs", "tests/integration/timestamp_monitor_gate.rs"),
 ];
 
 fn workspace_root() -> PathBuf {

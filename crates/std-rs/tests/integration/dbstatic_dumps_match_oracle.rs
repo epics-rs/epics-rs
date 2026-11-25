@@ -7,13 +7,14 @@ use std::sync::Arc;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::iocsh::IocShell;
 
-mod common;
+use crate::common;
 use common::masked;
 
-// RTEMS-EXEC-MODEL-ALLOW(1): checked, not waived — all 8 ran and passed on
-// the exec backend (`EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p
-// std-rs --all-features --test dbstatic_dumps_match_oracle`). The runtime only
-// feeds `BlockingBridge::capture` for the shell; no CA server is built.
+// RTEMS-EXEC-MODEL-ALLOW(1): checked, not waived — all 8 ran and passed on the
+// exec backend (`EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p std-rs
+// --all-features --test integration dbstatic_dumps_match_oracle::`). The
+// runtime only feeds `BlockingBridge::capture` for the shell; no CA server is
+// built.
 fn shell() -> IocShell {
     std_rs::register_std_dbd();
     // devTimeOfDay.dbd's ai/stringin lines arrive when its supports are
@@ -43,7 +44,7 @@ fn run(shell: &IocShell, line: &str) -> String {
 /// oracleStdIoc's `dbDumpDevice` block for `record_type`.
 fn c_device_block(record_type: &str) -> String {
     let head = format!("recordtype({record_type})\n");
-    blocks(include_str!("oracle/dbDumpDevice.txt"), "recordtype(")
+    blocks(include_str!("../oracle/dbDumpDevice.txt"), "recordtype(")
         .into_iter()
         .find(|b| b.starts_with(&head))
         .unwrap()
@@ -111,7 +112,7 @@ fn a_std_record_type_dumps_its_field_table_dbstaticlib_c_3304() {
     let shell = shell();
     assert_eq!(
         run(&shell, "dbDumpRecordType pdbbase epid"),
-        without_struct_layout(include_str!("oracle/dbDumpRecordType_epid.txt"))
+        without_struct_layout(include_str!("../oracle/dbDumpRecordType_epid.txt"))
     );
 }
 
@@ -139,8 +140,8 @@ fn without_undeclared_lines(c: &str) -> String {
 fn a_std_record_type_dumps_its_fields_dbstaticlib_c_3346() {
     let shell = shell();
     for (field, c) in [
-        ("KP", include_str!("oracle/dbDumpField_epid_KP.txt")),
-        ("INP", include_str!("oracle/dbDumpField_epid_INP.txt")),
+        ("KP", include_str!("../oracle/dbDumpField_epid_KP.txt")),
+        ("INP", include_str!("../oracle/dbDumpField_epid_INP.txt")),
     ] {
         assert_eq!(
             run(&shell, &format!("dbDumpField pdbbase epid {field}")),
@@ -163,7 +164,7 @@ fn std_menus_join_the_menu_dump_in_c_order_dbstaticlib_c_3295() {
     );
     // rs's base tables also carry asyn's and swait's menus, which
     // oracleStdIoc does not load; the rest is C's whole dump, order included.
-    let c = include_str!("oracle/dbDumpMenu.txt");
+    let c = include_str!("../oracle/dbDumpMenu.txt");
     let rs: String = run(&shell, "dbDumpMenu pdbbase")
         .split_inclusive("}\n")
         .filter(|block| {
@@ -211,7 +212,7 @@ fn of_c_types(rs: &str, c: &str, head: &str) -> String {
 #[test]
 fn the_whole_device_dump_walks_types_in_c_order_dbstaticlib_c_3444() {
     let shell = shell();
-    let c = include_str!("oracle/dbDumpDevice.txt");
+    let c = include_str!("../oracle/dbDumpDevice.txt");
     let rs = run(&shell, "dbDumpDevice pdbbase");
     assert_eq!(masked(&of_c_types(&rs, c, "recordtype(")), masked(c));
 }
@@ -219,7 +220,7 @@ fn the_whole_device_dump_walks_types_in_c_order_dbstaticlib_c_3444() {
 #[test]
 fn the_whole_record_type_dump_walks_types_in_c_order_dbstaticlib_c_3304() {
     let shell = shell();
-    let c = without_struct_layout(include_str!("oracle/dbDumpRecordType.txt"));
+    let c = without_struct_layout(include_str!("../oracle/dbDumpRecordType.txt"));
     let rs = run(&shell, "dbDumpRecordType pdbbase");
     assert_eq!(of_c_types(&rs, &c, "name("), c);
 }

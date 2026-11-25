@@ -10,8 +10,8 @@ use epics_base_rs::types::EpicsValue;
 
 // RTEMS-EXEC-MODEL-ALLOW(1): checked, not waived — ran and passed on the exec
 // backend (`EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p std-rs
-// --all-features --test time_of_day_dtyp_menu`). No CA server is built; the
-// reactor comes from `#[tokio::test]` itself.
+// --all-features --test integration time_of_day_dtyp_menu::`). No CA server is
+// built; the reactor comes from `#[tokio::test]` itself.
 #[tokio::test]
 async fn std_time_of_day_dtyps_extend_the_base_menus_stdsupport_dbd_18() {
     let db_content = r#"

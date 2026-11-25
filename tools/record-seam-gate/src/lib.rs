@@ -27,7 +27,7 @@
 //! its caller moved onto the callback pool.
 //!
 //! The answer to "the same rule in three crates" is not three copies of it.
-//! Each crate keeps a short `tests/record_seam_gate.rs` (or, for
+//! Each crate keeps a short `tests/integration/record_seam_gate.rs` (or, for
 //! `epics-base-rs`, a module in `server/mod.rs`) naming *its own* roots and
 //! exemptions; the rule and its message live here, once. The production slice
 //! it runs on is one level further down again, in `source-guard`, shared with

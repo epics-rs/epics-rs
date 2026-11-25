@@ -12,11 +12,11 @@ use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::iocsh::IocShell;
 use epics_base_rs::types::EpicsValue;
 
-mod common;
+use crate::common;
 use common::masked;
 
-const AI: &str = include_str!("oracle/oracleIoc_dbDumpDevice_ai.txt");
-const STRINGIN: &str = include_str!("oracle/oracleIoc_dbDumpDevice_stringin.txt");
+const AI: &str = include_str!("../oracle/oracleIoc_dbDumpDevice_ai.txt");
+const STRINGIN: &str = include_str!("../oracle/oracleIoc_dbDumpDevice_stringin.txt");
 
 /// The pin IOC's order: std's record types, then asyn's devices, then std's.
 fn pin_ioc_builder() -> IocBuilder {
@@ -32,9 +32,10 @@ fn pin_ioc_builder() -> IocBuilder {
 }
 
 // RTEMS-EXEC-MODEL-ALLOW(2): checked, not waived — both ran and passed on the
-// exec backend (`EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p
-// std-rs --all-features --test dtyp_menu_follows_device_registration_order`).
-// The shell's runtime only feeds `BlockingBridge::capture`; no CA server.
+// exec backend (`EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p std-rs
+// --all-features --test integration
+// dtyp_menu_follows_device_registration_order::`). The shell's runtime only
+// feeds `BlockingBridge::capture`; no CA server.
 fn dump(record_type: &str) -> String {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let bridge = {

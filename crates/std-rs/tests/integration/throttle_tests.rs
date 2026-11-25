@@ -456,7 +456,7 @@ fn test_limit_clipping_low_bound_order() {
 
 // SYNC (`valueSync`) and OV/SIV link classification are async, DB-backed
 // operations (C `dbGetLink`/`dbNameToAddr`); they are exercised end-to-end
-// through the framework in `tests/integration_tests.rs`, not as a
+// through the framework in `tests/integration/integration_tests.rs`, not as a
 // `process()`-only unit test. The old `pre_process_actions` SINP-read
 // mechanism was removed: SYNC must NOT process the record (only VAL is
 // pp(TRUE)), so the read moved into `special()`.

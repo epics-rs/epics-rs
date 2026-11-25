@@ -175,7 +175,7 @@ default-filter = """
     binary(/^reference_/) |
     (binary(integration) & test(/^reference_/)) |
     package(epics-oracle-rs) |
-    (binary(rt_priority_default) & test(=the_default_gets_fifo_where_the_process_may_have_it)) |
+    (binary(integration) & test(=rt_priority_default::the_default_gets_fifo_where_the_process_may_have_it)) |
     (package(epics-libcom-rs) & test(=runtime::task::tests::an_above_99_priority_is_refused_by_the_fifo_scheduler)) |
     (package(asyn-rs) & test(=runtime::port::tests::a_refused_port_thread_fails_registration))
   )

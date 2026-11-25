@@ -86,7 +86,9 @@ fn console_lines_survive_a_concurrent_stdout_writer() {
             )
         });
     }
-    run_child("console_lines_survive_a_concurrent_stdout_writer");
+    run_child(
+        "console_lines_survive_a_concurrent_stdout::console_lines_survive_a_concurrent_stdout_writer",
+    );
 }
 
 #[test]
@@ -105,5 +107,7 @@ fn stderr_println_lines_survive_a_concurrent_stdout_writer() {
             )
         });
     }
-    run_child("stderr_println_lines_survive_a_concurrent_stdout_writer");
+    run_child(
+        "console_lines_survive_a_concurrent_stdout::stderr_println_lines_survive_a_concurrent_stdout_writer",
+    );
 }

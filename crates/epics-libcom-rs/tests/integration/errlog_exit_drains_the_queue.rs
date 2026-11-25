@@ -32,7 +32,7 @@ fn a_queued_line_reaches_the_console_at_exit() {
     let out = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            "a_queued_line_reaches_the_console_at_exit",
+            "errlog_exit_drains_the_queue::a_queued_line_reaches_the_console_at_exit",
             "--nocapture",
         ])
         .env(CHILD, "1")

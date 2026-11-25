@@ -116,7 +116,7 @@ fn asked(out: &str) -> bool {
 
 #[test]
 fn the_switch_defaults_on_and_falls_back_silently() {
-    const TEST: &str = "the_switch_defaults_on_and_falls_back_silently";
+    const TEST: &str = "rt_priority_default::the_switch_defaults_on_and_falls_back_silently";
     if let Ok(mode) = std::env::var(CHILD) {
         return child(&mode);
     }
@@ -142,7 +142,7 @@ fn the_switch_defaults_on_and_falls_back_silently() {
 /// may not have SCHED_FIFO.
 #[test]
 fn the_default_gets_fifo_where_the_process_may_have_it() {
-    const TEST: &str = "the_default_gets_fifo_where_the_process_may_have_it";
+    const TEST: &str = "rt_priority_default::the_default_gets_fifo_where_the_process_may_have_it";
     if let Ok(mode) = std::env::var(CHILD) {
         return child(&mode);
     }

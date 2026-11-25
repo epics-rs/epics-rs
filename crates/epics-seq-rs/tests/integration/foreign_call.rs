@@ -15,7 +15,7 @@ use epics_base_rs::server::database::db_access::DbChannel;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 
 /// The companion: the escaped C, and `trajectoryExecute`'s Rust.
-mod foreign_call {
+mod companion {
     use std::sync::{Condvar, Mutex};
 
     macro_rules! seqg_escaped {
@@ -25,7 +25,7 @@ mod foreign_call {
         };
     }
 
-    include!("programs/foreignCall.rs");
+    include!("../programs/foreignCall.rs");
 
     #[derive(Clone, Copy, Debug, PartialEq)]
     pub enum Trajectory {
@@ -49,10 +49,10 @@ mod foreign_call {
     }
 }
 
-use foreign_call::{CHANGED, TRAJECTORY, Trajectory};
+use companion::{CHANGED, TRAJECTORY, Trajectory};
 
 /// What an IOC calls to register the program, as C's dbd `registrar`.
-const _: fn() = foreign_call::foreignCallRegistrar;
+const _: fn() = companion::foreignCallRegistrar;
 
 fn trajectory() -> Trajectory {
     *TRAJECTORY.lock().unwrap()
@@ -84,7 +84,7 @@ async fn an_abort_lands_while_another_state_set_is_in_a_foreign_call() {
         .expect("iocBuild");
     let db = Arc::clone(ioc.database());
     assert!(ioc.run().await, "iocRun");
-    epics_seq_rs::seq(&foreign_call::foreignCall, "", 0, &db).expect("foreignCall starts");
+    epics_seq_rs::seq(&companion::foreignCall, "", 0, &db).expect("foreignCall starts");
     let read = |pv: &str| db.get_pv(pv).unwrap().to_f64().unwrap();
 
     until("xpsTrajectoryRun enters trajectoryExecute", || {

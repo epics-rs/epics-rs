@@ -2,8 +2,6 @@
 //! analysis the way C snc runs them, and the golden format of the analysis
 //! fixtures.
 
-#![allow(dead_code)] // each test binary uses its own part
-
 use std::path::{Path, PathBuf};
 
 use epics_seq_rs::snc::analysis::analyse_program;

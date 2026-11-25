@@ -5,7 +5,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::Write;
@@ -331,39 +331,39 @@ const UNDEFINED: &[&str] = &["pvPutCompleteArray"];
 const COMPANIONS: &[(&str, &str)] = &[
     (
         "sequencer/examples/small/decl.st",
-        include_str!("companions/decl.rs"),
+        include_str!("../companions/decl.rs"),
     ),
     (
         "sequencer/test/compiler/foreignTypes.st",
-        include_str!("companions/foreignTypes_h.rs"),
+        include_str!("../companions/foreignTypes_h.rs"),
     ),
     (
         "sequencer/test/compiler/member.st",
-        include_str!("companions/struct_t.rs"),
+        include_str!("../companions/struct_t.rs"),
     ),
     (
         "sequencer/test/validate/foreignTypes.st",
-        include_str!("companions/struct_t.rs"),
+        include_str!("../companions/struct_t.rs"),
     ),
     (
         "sequencer/test/validate/indirectCall.st",
-        include_str!("companions/indirectCall.rs"),
+        include_str!("../companions/indirectCall.rs"),
     ),
     (
         "tests/fixtures/gen_code/foreign_mixed_arith.st",
-        include_str!("companions/struct_t.rs"),
+        include_str!("../companions/struct_t.rs"),
     ),
     (
         "tests/fixtures/gen_code/foreign_pointer_compare.st",
-        include_str!("companions/struct_t.rs"),
+        include_str!("../companions/struct_t.rs"),
     ),
     (
         "tests/fixtures/gen_code/foreign_promotion.st",
-        include_str!("companions/uc_t.rs"),
+        include_str!("../companions/uc_t.rs"),
     ),
     (
         "tests/fixtures/gen_code/foreign_struct_select.st",
-        include_str!("companions/struct_t.rs"),
+        include_str!("../companions/struct_t.rs"),
     ),
 ];
 

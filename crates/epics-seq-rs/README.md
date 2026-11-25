@@ -85,7 +85,7 @@ types, the `+r`/`+s` variable models, escaped-C binding, lock order).
 ## Programs built and run with it
 
 The 16 programs v0.32.0 moved onto the sequencer (`IN_SCOPE` in
-`tests/reference_gen_code.rs`):
+`tests/integration/reference_gen_code.rs`):
 
 - std-rs: `delayDo.st`, `femto.st`
 - optics-rs: `filterDrive.st`, `flexCombinedMotion.st`, `hrCtl.st`, `Io.st`,
@@ -105,7 +105,7 @@ run-time type this crate does not have yet. An array or `string` parameter
 of a function definition, which C passes as a pointer, is refused the same
 way.
 
-`EXPECTED_FAILURES` in `tests/reference_gen_code.rs` pins every upstream
+`EXPECTED_FAILURES` in `tests/integration/reference_gen_code.rs` pins every upstream
 program that does not build, with its first error; every other program
 type-checks or is rejected by analysis as C snc rejects it. Besides the
 refusals, sequencer `examples/parallel/control.st` calls

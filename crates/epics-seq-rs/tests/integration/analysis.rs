@@ -4,7 +4,7 @@
 //! prints them up to the end of analysis; `reference_analysis` checks them
 //! against the live C snc.
 
-mod common;
+use crate::common;
 
 use epics_seq_rs::snc::analysis::traverse_syntax_tree;
 use epics_seq_rs::snc::type_check::type_is_function;

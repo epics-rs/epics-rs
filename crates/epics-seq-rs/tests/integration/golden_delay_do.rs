@@ -7,7 +7,7 @@
 mod delay_do {
     use epics_seq_rs::c::*;
 
-    include!("golden/delayDo.rs");
+    include!("../golden/delayDo.rs");
 
     pub use self::seqg::seqg_vars;
 }

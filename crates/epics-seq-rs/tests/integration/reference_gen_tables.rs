@@ -7,7 +7,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

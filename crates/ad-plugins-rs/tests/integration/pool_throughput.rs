@@ -12,7 +12,8 @@
 //! Ignored by default because it asserts on wall clock. Run explicitly:
 //!
 //! ```text
-//! cargo test -p ad-plugins-rs --test pool_throughput --release -- --ignored --nocapture
+//! cargo test -p ad-plugins-rs --test integration pool_throughput:: \
+//!     --release -- --ignored --nocapture
 //! ```
 
 // RTEMS-EXEC-MODEL-ALLOW(1): checked, not waived — all 1 ran and passed

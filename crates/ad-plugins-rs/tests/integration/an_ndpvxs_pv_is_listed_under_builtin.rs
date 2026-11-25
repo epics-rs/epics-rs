@@ -52,7 +52,11 @@ fn run_ioc(script: &str, input: &[u8], ca_only: bool) -> (String, String) {
         cmd.env(CA_ONLY, "1");
     }
     let mut child = cmd
-        .args(["ioc_child", "--exact", "--nocapture"])
+        .args([
+            "an_ndpvxs_pv_is_listed_under_builtin::ioc_child",
+            "--exact",
+            "--nocapture",
+        ])
         .env(CHILD, &stcmd)
         .env("EPICS_CAS_SERVER_PORT", "0")
         .env("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1")

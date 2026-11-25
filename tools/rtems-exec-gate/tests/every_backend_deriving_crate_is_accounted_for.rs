@@ -109,25 +109,49 @@ use std::path::{Path, PathBuf};
 const SCOPE_GATED: &[(&str, &str)] = &[
     (
         "ad-plugins-rs",
-        "tests/circular_buff_configure_max_buffers.rs",
+        "tests/integration/circular_buff_configure_max_buffers.rs",
     ),
-    ("ad-plugins-rs", "tests/configure_duplicate_port.rs"),
-    ("ad-plugins-rs", "tests/ioc_asyn_commands.rs"),
     (
         "ad-plugins-rs",
-        "tests/plugin_configure_blocking_callbacks.rs",
+        "tests/integration/configure_duplicate_port.rs",
     ),
-    ("ad-plugins-rs", "tests/plugin_configure_max_threads.rs"),
-    ("ad-plugins-rs", "tests/plugin_configure_queue_size.rs"),
-    ("ad-plugins-rs", "tests/plugin_configure_source.rs"),
-    ("ad-plugins-rs", "tests/plugin_configure_stack_size.rs"),
+    ("ad-plugins-rs", "tests/integration/ioc_asyn_commands.rs"),
     (
         "ad-plugins-rs",
-        "tests/plugin_configure_unknown_array_port.rs",
+        "tests/integration/plugin_configure_blocking_callbacks.rs",
     ),
-    ("ad-plugins-rs", "tests/plugin_interrupt_sources.rs"),
-    ("ad-plugins-rs", "tests/reference_plugin_asyn_flags.rs"),
-    ("ad-plugins-rs", "tests/std_arrays_configure_queue_size.rs"),
+    (
+        "ad-plugins-rs",
+        "tests/integration/plugin_configure_max_threads.rs",
+    ),
+    (
+        "ad-plugins-rs",
+        "tests/integration/plugin_configure_queue_size.rs",
+    ),
+    (
+        "ad-plugins-rs",
+        "tests/integration/plugin_configure_source.rs",
+    ),
+    (
+        "ad-plugins-rs",
+        "tests/integration/plugin_configure_stack_size.rs",
+    ),
+    (
+        "ad-plugins-rs",
+        "tests/integration/plugin_configure_unknown_array_port.rs",
+    ),
+    (
+        "ad-plugins-rs",
+        "tests/integration/plugin_interrupt_sources.rs",
+    ),
+    (
+        "ad-plugins-rs",
+        "tests/integration/reference_plugin_asyn_flags.rs",
+    ),
+    (
+        "ad-plugins-rs",
+        "tests/integration/std_arrays_configure_queue_size.rs",
+    ),
     ("asyn-rs", "tests/integration/process_gate_tests.rs"),
     (
         "epics-base-rs",

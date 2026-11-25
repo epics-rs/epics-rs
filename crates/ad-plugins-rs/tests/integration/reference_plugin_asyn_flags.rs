@@ -218,7 +218,7 @@ fn each_configure_command_s_port_has_c_s_asyn_flags() {
 #[test]
 fn a_negative_priority_on_a_synchronous_plugin_does_not_stop_the_ioc() {
     const CHILD: &str = "AD_NEG_PRIORITY_CHILD";
-    const TEST: &str = "a_negative_priority_on_a_synchronous_plugin_does_not_stop_the_ioc";
+    const TEST: &str = "reference_plugin_asyn_flags::a_negative_priority_on_a_synchronous_plugin_does_not_stop_the_ioc";
     if std::env::var_os(CHILD).is_none() {
         let out = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", TEST, "--nocapture"])

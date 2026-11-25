@@ -1827,6 +1827,9 @@ impl PortActor {
     /// failure honestly, and it cannot wedge a port whose `connect()` returns
     /// success without actually bringing the link up.
     fn service_connect_timer(&mut self) {
+        if self.holds_a_taken_request() {
+            return;
+        }
         match self.driver.base().connect_retry_at {
             Some(at) if at <= Instant::now() => {}
             _ => return,
@@ -1907,10 +1910,18 @@ impl PortActor {
     /// [`Self::connect_gate`] refuses on a disabled or defunct port, and the 2 s
     /// throttle bounds an exception storm to one attempt per window.
     fn port_thread_auto_connect(&mut self) {
-        if !self.take_port_thread_wake() {
+        if self.holds_a_taken_request() || !self.take_port_thread_wake() {
             return;
         }
         self.auto_connect_port();
+    }
+
+    /// A request taken at a release ([`Self::dequeue_at_release`]) is already
+    /// running, so the port's own connects wait until it has run: C's port
+    /// thread, holding it at `synchronousLock`, runs it the moment the holder
+    /// lets go (asynManager.c:904-917), and its cancel waits on it meanwhile.
+    fn holds_a_taken_request(&self) -> bool {
+        self.dequeued.is_some()
     }
 
     /// C `epicsEventMustWait(pport->notifyPortThread)` (asynManager.c:806) —
@@ -4351,6 +4362,81 @@ mod tests {
         let (lend, _cell, seen) = released_with_a_queued_request(&AsynUser::new(0));
         drop(std::mem::replace(&mut *lend.slot(), LendSlot::Home));
         assert_eq!(*seen.lock(), ["refused", "done"]);
+    }
+
+    /// The request a release took is already running: the port's next act is
+    /// to run it, even with a connect retry and the port's 2 s-throttled
+    /// auto-connect both due by then.
+    #[test]
+    fn a_request_the_release_took_runs_before_a_due_connect_retry() {
+        use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
+
+        struct DeadLink {
+            base: PortDriverBase,
+            seen: Log<&'static str>,
+        }
+        impl PortDriver for DeadLink {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
+                self.seen.lock().push("connect");
+                Err(AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: "link down".into(),
+                })
+            }
+            fn disconnect(&mut self, _user: &AsynUser) -> AsynResult<()> {
+                self.base.set_connected(false);
+                Ok(())
+            }
+        }
+
+        let seen = Log::default();
+        let mut base = PortDriverBase::new(
+            "release_retry",
+            1,
+            PortFlags {
+                can_block: true,
+                ..PortFlags::default()
+            },
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
+        );
+        base.init_auto_connect(true);
+        base.set_connected(true);
+        let drv = DeadLink {
+            base,
+            seen: Arc::clone(&seen),
+        };
+        let (handle, _jh) = create_port_runtime_unclaimed(drv, RuntimeConfig::default()).unwrap();
+        let port = handle.port_handle();
+        let cell = port.new_cell(Arc::new(Outcomes(Arc::clone(&seen))));
+        let held = Arc::clone(&seen);
+        let at_release = port
+            .lock_port_blocking(AsynUser::default(), move |calls| {
+                // The link drops under the hold, arming the retry timer.
+                calls
+                    .call(&RequestOp::Disconnect, AsynUser::default())
+                    .unwrap();
+                cell.queue(&AsynUser::new(0).queue_even_if_not_connected())
+                    .unwrap();
+                // not-a-wait: past the retry's deadline and the throttle, both clock checks.
+                std::thread::sleep(Duration::from_millis(2100));
+                held.lock().len()
+            })
+            .unwrap();
+
+        let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+        while !seen.lock().contains(&"ran") {
+            assert!(Instant::now() < deadline, "never ran: {:?}", seen.lock());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let after = seen.lock()[at_release..].to_vec();
+        assert_eq!(after.first(), Some(&"ran"), "after the release: {after:?}");
     }
 
     /// A driver that writes the parameter at the address it is handed and

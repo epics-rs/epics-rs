@@ -2494,6 +2494,8 @@ pub struct RecordCell {
     /// Set with no borrow of the record, on the line of `name`, which the
     /// cycle reads.
     chain_pact: AtomicBool,
+    /// A `scanOnce` of this record waits on the ring ([`Self::queue_once`]).
+    once_queued: AtomicBool,
     /// How many dset calls hold this record lent, its device out
     /// ([`Self::lend_to_dset`]). Touched only by the set's holder, as
     /// `borrow` is.
@@ -3614,6 +3616,19 @@ impl Drop for ChainPactHold<'_> {
     }
 }
 
+/// A record's place on the `scanOnce` ring, from [`RecordCell::queue_once`]:
+/// given up when the process it was queued for starts, or when the ring
+/// refuses or discards it.
+pub(crate) struct OnceTicket(Arc<RecordCell>);
+
+impl Drop for OnceTicket {
+    fn drop(&mut self) {
+        // A read-modify-write, so the process that starts after this sees
+        // what each request merged into it wrote before asking.
+        self.0.once_queued.swap(false, Ordering::AcqRel);
+    }
+}
+
 impl RecordCell {
     /// Hold this record's PACT as a target's source while the guard lives.
     /// Under the chain's lock set, so a reader that takes it sees C's value.
@@ -3633,6 +3648,13 @@ impl RecordCell {
 
     pub(crate) fn restore_chain_pact(&self, was: bool) {
         self.chain_pact.store(was, Ordering::Relaxed);
+    }
+
+    /// Claim this record's place on the `scanOnce` ring, or `None` while a
+    /// process queued for it has yet to start: that one starts after this
+    /// request and serves it.
+    pub(crate) fn queue_once(self: &Arc<Self>) -> Option<OnceTicket> {
+        (!self.once_queued.swap(true, Ordering::AcqRel)).then(|| OnceTicket(self.clone()))
     }
 
     /// Whether this thread is inside the record: it holds the record's set
@@ -3744,6 +3766,7 @@ impl RecordCell {
             init_owed: std::sync::atomic::AtomicBool::new(init_owed),
             link_opens_owed: std::sync::atomic::AtomicBool::new(true),
             chain_pact: AtomicBool::new(false),
+            once_queued: AtomicBool::new(false),
             lent: std::sync::atomic::AtomicU32::new(0),
             string_typed: std::sync::atomic::AtomicU64::new(string_typed_mask(&instance)),
             cvt_pending_more: (0..dbaddr_counts.len().saturating_sub(1) / 64)
@@ -14561,6 +14584,7 @@ mod record_cell_layout_tests {
             init_owed,
             link_opens_owed,
             chain_pact,
+            once_queued,
             lent,
             index,
             rdes,

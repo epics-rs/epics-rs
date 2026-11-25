@@ -886,6 +886,7 @@ mod scan_add_io_intr_refusal_reaches_the_errlog;
 mod scan_illegal_index_is_carried;
 mod scan_init_runs_after_finish_dev_sup;
 mod scan_once_keeps_c_order;
+mod scan_once_queues_a_record_once;
 mod scan_order_follows_record_type_list;
 mod scan_order_is_record_type_major;
 mod scan_sweep_observes_the_live_list;

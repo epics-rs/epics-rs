@@ -133,6 +133,32 @@ struct ExtraDim {
     chunk: i32,
 }
 
+/// The extra dimensions a file opened with, fixed until it closes (C
+/// `configureDims`, NDFileHDF5.cpp:3166-3215). Unlike C, which reads
+/// nExtraDims and posRunning again for each frame (:1398-1399), a write
+/// while the file is open does not move frames off the dataset's axes.
+struct OpenExtraDims {
+    /// C `virtualdims_`: each extra axis's size, outermost first, the
+    /// frames-per-point axis last; a frame carries one position per axis.
+    sizes: Vec<usize>,
+    /// C `virtualchunkdims_`: each axis's extraDimChunk as written, in the
+    /// same order.
+    chunks: Vec<i32>,
+    /// HDF5_posRunning: frames go where their positions say.
+    positioned: bool,
+}
+
+impl OpenExtraDims {
+    fn of(s: &Hdf5Settings) -> Self {
+        let axes = s.extra_dims[..=s.n_extra_dims].iter().rev();
+        Self {
+            sizes: axes.clone().map(|d| d.size.max(1)).collect(),
+            chunks: axes.map(|d| d.chunk).collect(),
+            positioned: s.pos_running,
+        }
+    }
+}
+
 /// State for a single open attribute time-series dataset (one per NDAttribute).
 /// Mirrors C++ `NDFileHDF5AttributeDataset`: a 1-D extensible dataset holding
 /// one numeric (or string) value per frame.
@@ -1143,6 +1169,7 @@ pub struct Hdf5Writer {
     /// Rows per chunk of the open file's attribute and `timestamp`
     /// datasets: C's `calculateAttributeChunking` at open.
     open_attr_chunk: usize,
+    open_extra_dims: OpenExtraDims,
     /// What `configure_compression` left for the port to post and print;
     /// shared so the port drains it without the writer's lock.
     open_posts: Arc<Mutex<OpenPosts>>,
@@ -1222,6 +1249,7 @@ impl Hdf5Writer {
             dataset_codec: None,
             open_chunk: Vec::new(),
             open_attr_chunk: 1,
+            open_extra_dims: OpenExtraDims::of(&Hdf5Settings::default()),
             open_posts: Arc::default(),
             cfg: WriterSettings::new(Hdf5Settings::default()),
             multi_frame: false,
@@ -1605,27 +1633,23 @@ impl Hdf5Writer {
     /// uses `extraDimSize[N - i]`, so outermost is `extraDimSize[N]` and the
     /// innermost leading axis is `extraDimSize[0]` ("N", frames per point).
     fn extra_dim_axes(&self) -> Option<Vec<usize>> {
-        (self.cfg.n_extra_dims > 0).then(|| self.virtual_dims())
-    }
-
-    /// C `virtualdims` (NDFileHDF5Dataset.cpp:85-92): every extra dimension's
-    /// size, outermost first, the frames-per-point axis included.
-    fn virtual_dims(&self) -> Vec<usize> {
-        (0..=self.cfg.n_extra_dims)
-            .rev()
-            .map(|i| self.cfg.extra_dims[i].size.max(1))
-            .collect()
+        let sizes = &self.open_extra_dims.sizes;
+        (sizes.len() > 1).then(|| sizes.clone())
     }
 
     /// C's chunk on each extra axis, outermost first: `extraDimChunk`
     /// clamped to `1..=size` (NDFileHDF5.cpp:3184-3200), the innermost then
     /// replaced by nFramesChunks (:3266-3274).
     fn extra_dim_chunks(&self) -> Vec<usize> {
-        (0..=self.cfg.n_extra_dims)
-            .rev()
-            .map(|i| match &self.cfg.extra_dims[i] {
-                _ if i == 0 => self.cfg.chunk.n_frames_chunks,
-                d => (d.chunk.max(1) as usize).min(d.size.max(1)),
+        let OpenExtraDims { sizes, chunks, .. } = &self.open_extra_dims;
+        let innermost = sizes.len() - 1;
+        sizes
+            .iter()
+            .zip(chunks)
+            .enumerate()
+            .map(|(i, (&size, &chunk))| match i {
+                _ if i == innermost => self.cfg.chunk.n_frames_chunks,
+                _ => (chunk.max(1) as usize).min(size),
             })
             .collect()
     }
@@ -1636,10 +1660,10 @@ impl Hdf5Writer {
     /// `HDF5_posNameDim*` names. A missing attribute or a negative value fails
     /// the frame.
     fn frame_positions(&self, array: &NDArray) -> ADResult<Option<Vec<usize>>> {
-        if !self.cfg.pos_running {
+        if !self.open_extra_dims.positioned {
             return Ok(None);
         }
-        let n = self.cfg.n_extra_dims;
+        let n = self.open_extra_dims.sizes.len() - 1;
         let mut offsets = vec![0; n + 1];
         for index in 0..=n {
             let name = &self.cfg.pos_names[index];
@@ -1668,8 +1692,8 @@ impl Hdf5Writer {
     fn check_positions(&self, offsets: &[usize], dataset: &str) -> ADResult<()> {
         let lines: Vec<String> = offsets
             .iter()
-            .zip(self.virtual_dims())
-            .filter(|&(&o, v)| o >= v)
+            .zip(&self.open_extra_dims.sizes)
+            .filter(|&(o, v)| o >= v)
             .map(|_| {
                 format!("NDFileHDF5Dataset::extendDataSet ERROR extending the dataset [{dataset}] failed\n")
             })
@@ -2029,8 +2053,8 @@ impl Hdf5Writer {
             .collect();
         // rust-hdf5 appends to a SWMR frame axis in order only; positioned
         // frames are placed in a grid over their positions.
-        if grid_leading.is_none() && self.cfg.pos_running {
-            grid_leading = Some(self.virtual_dims());
+        if grid_leading.is_none() && self.open_extra_dims.positioned {
+            grid_leading = Some(self.open_extra_dims.sizes.clone());
         }
         let use_grid = grid_leading.is_some();
         let grid_chunk: Vec<u64> = grid_chunk_usize.iter().map(|&v| v as u64).collect();
@@ -2908,7 +2932,7 @@ impl Hdf5Writer {
                 // `HDF5_posIndexDim*` names is a plain series of that axis's
                 // values (NDFileHDF5.cpp:2803-2809).
                 let (shape, axes) = match self.attribute_index(&attr.name) {
-                    Some(i) if self.cfg.dim_att_datasets && self.cfg.pos_running => (
+                    Some(i) if self.cfg.dim_att_datasets && self.open_extra_dims.positioned => (
                         AttrShape::Series {
                             chunk: self.open_attr_chunk,
                         },
@@ -2937,7 +2961,7 @@ impl Hdf5Writer {
     /// `offsets[-k]`.
     fn attribute_index(&self, name: &str) -> Option<usize> {
         let i = self.cfg.pos_index_names.iter().rposition(|n| n == name)?;
-        self.cfg.n_extra_dims.checked_sub(i)
+        (self.open_extra_dims.sizes.len() - 1).checked_sub(i)
     }
 
     /// Effective chunk depth for the NDAttribute datasets and the performance
@@ -2973,21 +2997,20 @@ impl Hdf5Writer {
             return AttrShape::Scalar;
         }
         // C `mdim_chunking[k]`; an extra-dimension size here is at least 1.
-        let chunk = |k: usize| match (self.cfg.chunk.ndattr_chunk, self.num_capture) {
+        let chunk = |size: usize| match (self.cfg.chunk.ndattr_chunk, self.num_capture) {
             (0, 0) => 32,
-            (0, _) => self.cfg.extra_dims[k].size.max(1),
+            (0, _) => size,
             (c, _) => c,
         };
         match self.extra_dim_axes() {
             // C's rank-1 dataset grows as a series (NDFileHDF5AttributeDataset.cpp:385-389).
-            None => AttrShape::Series { chunk: chunk(0) },
-            Some(dims) => {
-                let n = dims.len() - 1;
-                AttrShape::Grid {
-                    chunk: (0..=n).map(|i| chunk(n - i)).collect(),
-                    dims,
-                }
-            }
+            None => AttrShape::Series {
+                chunk: chunk(self.open_extra_dims.sizes[0]),
+            },
+            Some(dims) => AttrShape::Grid {
+                chunk: dims.iter().map(|&d| chunk(d)).collect(),
+                dims,
+            },
         }
     }
 
@@ -3210,15 +3233,18 @@ impl Hdf5Writer {
         let err = |e: rust_hdf5::Hdf5Error| {
             ADError::UnsupportedConversion(format!("SWMR attribute dataset error: {e}"))
         };
-        let bounds = self.virtual_dims();
-        let positioned = self.cfg.pos_running;
+        let OpenExtraDims {
+            sizes: bounds,
+            positioned,
+            ..
+        } = &self.open_extra_dims;
         for ad in &mut self.attr_datasets {
             let path = ad.path();
             let fill = ad.fill();
             ad.shape = match std::mem::replace(&mut ad.shape, AttrShape::Scalar) {
                 // A stream only appends, so a positioned series is a grid
                 // over the positions of its axis.
-                AttrShape::Series { chunk } if positioned && !ad.offset_axes.is_empty() => {
+                AttrShape::Series { chunk } if *positioned && !ad.offset_axes.is_empty() => {
                     AttrShape::Grid {
                         dims: vec![bounds[ad.offset_axes[0]]],
                         chunk: vec![chunk],
@@ -3458,10 +3484,7 @@ impl Hdf5Writer {
                 .iter()
                 .zip(frame_dims)
                 .all(|(&c, &d)| c == d.max(1))
-            && !(self.multi_frame
-                && self.cfg.extra_dims[..=self.cfg.n_extra_dims]
-                    .iter()
-                    .any(|d| d.chunk > 1));
+            && !(self.multi_frame && self.open_extra_dims.chunks.iter().any(|&c| c > 1));
         if !(one_frame && codecs_match(self.dataset_codec.as_ref(), Some(codec))) {
             return Err(FrameError::Dataset(ADError::Reported {
                 lines: vec![
@@ -4554,6 +4577,7 @@ impl NDFileWriter for Hdf5Writer {
         refused?;
         self.current_path = Some(path.to_path_buf());
         self.multi_frame = mode.contains(NDFileOpenMode::MULTIPLE);
+        self.open_extra_dims = OpenExtraDims::of(&self.cfg);
         self.frame_count = 0;
         self.total_runtime = 0.0;
         self.total_bytes = 0;
@@ -8732,6 +8756,18 @@ mod tests {
         configure: impl FnOnce(&mut Hdf5Writer),
         positions: &[(i32, i32)],
     ) -> (std::path::PathBuf, Vec<ADResult<()>>) {
+        write_positioned_changing(name, swmr, configure, |_| {}, positions)
+    }
+
+    /// `write_positioned`, with `after_first` changing the settings once
+    /// the first frame is written.
+    fn write_positioned_changing(
+        name: &str,
+        swmr: bool,
+        configure: impl FnOnce(&mut Hdf5Writer),
+        after_first: impl FnOnce(&mut Hdf5Writer),
+        positions: &[(i32, i32)],
+    ) -> (std::path::PathBuf, Vec<ADResult<()>>) {
         let xml =
             std::env::temp_dir().join(format!("adcore_layout_{name}_{}.xml", std::process::id()));
         std::fs::write(
@@ -8773,12 +8809,16 @@ mod tests {
             )
             .unwrap();
         let mut results = Vec::new();
+        let mut after_first = Some(after_first);
         for (i, &pos) in positions.iter().enumerate() {
             let r = writer.write_file(&Arc::new(mk(i as u8 + 1, pos)));
             let aborted = r.as_ref().is_err_and(|e| e.is_aborted());
             results.push(r);
             if aborted {
                 break;
+            }
+            if let Some(change) = after_first.take() {
+                change(&mut writer);
             }
         }
         if !results.last().is_some_and(|r| r.is_err()) {
@@ -8834,6 +8874,76 @@ mod tests {
     #[test]
     fn swmr_positions_place_frames_on_the_extra_dimensions() {
         assert_positions_place_frames_on_the_extra_dimensions(true);
+    }
+
+    /// A positioned file keeps the extra axes it opened with. posRunning off
+    /// with NumCapture 0 resets nExtraDims while the file is open; C reads
+    /// both again for each frame, so its frames then carry one position for
+    /// two axes.
+    #[test]
+    fn a_positioned_file_places_frames_on_the_axes_it_opened_with() {
+        let n_reset = |w: &mut Hdf5Writer| {
+            w.set_pos_running(false);
+            w.set_n_extra_dims(0);
+            w.set_pos_running(true);
+        };
+        let pos_off = |w: &mut Hdf5Writer| w.set_pos_running(false);
+        let changes: [(&str, &dyn Fn(&mut Hdf5Writer)); 2] =
+            [("n_reset", &n_reset), ("pos_off", &pos_off)];
+        for swmr in [false, true] {
+            for (change, after_first) in changes {
+                let (path, results) = write_positioned_changing(
+                    &format!("hdf5_pos_open_axes_{change}_{swmr}"),
+                    swmr,
+                    |w| {
+                        w.set_n_extra_dims(1);
+                        w.set_extra_dim_size(0, 2);
+                        w.set_extra_dim_size(1, 3);
+                        w.set_num_capture(6);
+                    },
+                    after_first,
+                    &[(2, 1), (0, 0), (1, 1), (0, 1)],
+                );
+                assert!(
+                    results.iter().all(Result::is_ok),
+                    "{change} swmr={swmr}: {results:?}"
+                );
+                assert_eq!(
+                    positioned_cells(&path),
+                    (vec![3, 2, 4, 4], vec![2, 4, 0, 3, 0, 1]),
+                    "{change} swmr={swmr}"
+                );
+                std::fs::remove_file(&path).ok();
+            }
+        }
+    }
+
+    /// A file opened without PositionMode keeps appending frames in order
+    /// when posRunning turns on while it is open.
+    #[test]
+    fn a_file_opened_unpositioned_appends_after_posrunning_turns_on() {
+        for swmr in [false, true] {
+            let (path, results) = write_positioned_changing(
+                &format!("hdf5_pos_turned_on_{swmr}"),
+                swmr,
+                |w| {
+                    w.set_pos_running(false);
+                    w.set_num_capture(4);
+                },
+                |w| w.set_pos_running(true),
+                &[(0, 0), (0, 3), (0, 1), (0, 2)],
+            );
+            assert!(
+                results.iter().all(Result::is_ok),
+                "swmr={swmr}: {results:?}"
+            );
+            assert_eq!(
+                positioned_cells(&path),
+                (vec![4, 4, 4], vec![1, 2, 3, 4]),
+                "swmr={swmr}"
+            );
+            std::fs::remove_file(&path).ok();
+        }
     }
 
     /// Each extra axis chunks at its `extraDimChunk` clamped to its size, the
@@ -13616,6 +13726,35 @@ mod tests {
                 writer.close_file().ok();
                 std::fs::remove_file(&path).ok();
             }
+        }
+    }
+
+    /// `verifyChunking` reads the extraDimChunk params the dataset was
+    /// configured with, so an nExtraDims reset while the file is open does
+    /// not let a compressed frame through.
+    #[test]
+    fn a_compressed_frame_is_refused_on_the_extra_dim_chunks_the_file_opened_with() {
+        for swmr in [false, true] {
+            let path = temp_path(&format!("hdf5_comp_ed_chunk_open_{swmr}"));
+            let mut writer = Hdf5Writer::new();
+            writer.set_swmr_mode(swmr);
+            writer.set_n_extra_dims(1);
+            writer.set_extra_dim_size(0, 2);
+            writer.set_extra_dim_chunk(1, 2);
+            writer.set_num_capture(2);
+            let comp = crate::codec::compress_lz4(&ramp_u16(4, 5)).unwrap();
+            writer
+                .open_file(
+                    &path,
+                    NDFileOpenMode::WRITE | NDFileOpenMode::MULTIPLE,
+                    &comp,
+                )
+                .unwrap();
+            writer.set_n_extra_dims(0);
+            let err = writer.write_file(&Arc::new(comp)).unwrap_err();
+            assert_eq!(err.lines(), [MISMATCHED, ABORTING], "swmr={swmr}");
+            writer.close_file().ok();
+            std::fs::remove_file(&path).ok();
         }
     }
 

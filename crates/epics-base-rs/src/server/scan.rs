@@ -372,13 +372,13 @@ struct Wakes {
 impl IoIntrWakes {
     /// The next wake and whether it was admitted; `None` once the device has
     /// dropped its sender.
-    pub(crate) async fn next(&self) -> Option<bool> {
-        std::future::poll_fn(|cx| {
-            let mut wakes = self.0.lock();
-            let woke = std::task::ready!(wakes.rx.poll_recv(cx));
-            std::task::Poll::Ready(woke.map(|()| wakes.take_judged()))
-        })
-        .await
+    pub(crate) fn poll_next(
+        &self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<bool>> {
+        let mut wakes = self.0.lock();
+        let woke = std::task::ready!(wakes.rx.poll_recv(cx));
+        std::task::Poll::Ready(woke.map(|()| wakes.take_judged()))
     }
 
     /// How many wakes are queued.

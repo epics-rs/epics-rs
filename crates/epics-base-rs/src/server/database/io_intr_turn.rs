@@ -27,8 +27,8 @@ pub(crate) fn owed_sweeps(record: &Arc<RecordCell>) -> Option<Arc<Outstanding>> 
 /// queued to it when it took the request.
 pub(crate) type Turn = oneshot::Sender<()>;
 
-/// Each pumped record's turn queue, by the record's cell. The pump holds its
-/// record, so a key's record lives while its pump does.
+/// Each pumped record's turn queue, by the record's cell. The pump holds a
+/// `Weak` of its record, so a key is not reused while its pump lives.
 #[derive(Default)]
 pub(crate) struct IoIntrTurns {
     pumps: parking_lot::Mutex<HashMap<usize, mpsc::UnboundedSender<Turn>>>,

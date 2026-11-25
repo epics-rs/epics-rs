@@ -20,6 +20,7 @@ mod access_rights_spc_nomod;
 mod acf_host_identity;
 mod acf_hot_reload;
 mod an_initial_monitor_value_waits_for_events_on;
+mod an_io_intr_record_served_without_a_build_processes;
 mod an_out_ca_link_sends_no_event_add;
 mod asg_inp_change_reevaluates_access;
 mod async_write_notify_rtems_exec;

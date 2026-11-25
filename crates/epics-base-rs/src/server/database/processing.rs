@@ -3921,10 +3921,10 @@ impl PvDatabase {
     ///
     /// The single owner of this entry is the I/O Intr wiring
     /// (`crate::server::ioc_app::setup_io_intr` and its `ioc_builder`
-    /// twin): the spawned task processes a record because the driver
+    /// twin): its pump processes a record because the driver
     /// fired an interrupt callback, not because of a client put / FLNK /
     /// scan. `device_callback = true` tells
-    /// `Self::process_record_with_links_inner` that, for an *output*
+    /// `Self::run_process_frame` that, for an *output*
     /// record, this cycle must READ the callback value back into VAL and
     /// MUST NOT write it to the driver — C `devAsynInt32.c::processBo`
     /// (and `processAo`/`processLongout`/…) take the readback branch when
@@ -3943,10 +3943,17 @@ impl PvDatabase {
         visited: &'a mut ProcStack,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CaResult<()>> + Send + 'a>> {
         let name = name.as_ref();
-        Box::pin(async move {
-            self.process_record_with_links_inner(name, visited, false, true, true)
-                .await
-        })
+        Box::pin(async move { self.process_record_readback_sync(name, visited) })
+    }
+
+    /// [`Self::process_record_readback`] called directly, from the I/O Intr
+    /// pump's callback run.
+    pub(crate) fn process_record_readback_sync(
+        &self,
+        name: &[u8],
+        visited: &mut ProcStack,
+    ) -> CaResult<()> {
+        self.run_process_frame(ProcessTarget::Name(name), visited, true, false, true)
     }
 
     /// An output's callback-readback read, in its OUT stage: the device sets

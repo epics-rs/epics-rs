@@ -535,9 +535,9 @@ pub fn background_init() {
     background().callbacks().init();
 }
 
-/// Arm the callback bands if they are in `cbInit`, silently otherwise —
-/// [`background_init`] without C's second-call warning, for a build that has
-/// no `iocBuild` to call `callbackInit`.
+/// Arm the callback bands if they are in `cbInit`, silently otherwise, for
+/// what needs them where no `iocBuild` has called `callbackInit`. It is not
+/// that call: a later [`background_init`] is still the first.
 pub fn background_arm() {
     background().callbacks().arm();
 }

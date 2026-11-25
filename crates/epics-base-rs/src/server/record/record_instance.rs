@@ -5616,9 +5616,9 @@ pub(crate) struct RecordCold {
     /// The database a [`Subroutine::Context`] routine reaches; set at
     /// creation beside `device_done`.
     db: crate::server::database::RecordDb,
-    /// The task delivering the bound device's I/O Intr wakes, wired only by
+    /// The pump delivering the bound device's I/O Intr wakes, wired only by
     /// [`RecordInstance::wire_io_intr_pump`].
-    io_intr_pump: Option<crate::runtime::background::AbortHandle>,
+    io_intr_pump: Option<crate::server::ioc_app::IoIntrPump>,
     /// What a [`Subroutine::Context`] routine stored as C `prec->dpvt`. Not
     /// a [`Dpvt`](crate::server::device_support::Dpvt) variant: a boxed `dyn`
     /// there makes every soft-input read's `Dpvt` overwrite an outlined drop.
@@ -10867,14 +10867,14 @@ impl RecordInstance {
         Ok(())
     }
 
-    /// Start the task that turns the bound device's wakes into processing,
+    /// Start the pump that turns the bound device's wakes into processing,
     /// the one place that starts it. A device hands its receiver out once
     /// per object, so a fresh one is a newly bound dset and replaces the old
     /// pump; leaving the list stops nothing, because the pump only processes
     /// a record that is on it (C `scanIoRequest` walks the list's members).
     /// Whether the record now has a live pump.
     pub(crate) fn wire_io_intr_pump(&mut self) -> bool {
-        let pumped = |p: &Option<crate::runtime::background::AbortHandle>| {
+        let pumped = |p: &Option<crate::server::ioc_app::IoIntrPump>| {
             p.as_ref().is_some_and(|p| !p.is_finished())
         };
         let Some(dev) = self.device.as_mut() else {
@@ -10886,18 +10886,16 @@ impl RecordInstance {
         let (Some(db), Some(cell)) = (self.cold.db.upgrade(), self.cold.cell.upgrade()) else {
             return false;
         };
-        let pump = crate::server::ioc_app::spawn_io_intr_pump(
-            db,
+        let pump = crate::server::ioc_app::IoIntrPump::start(
+            &db,
             self.name.clone(),
-            cell,
+            &cell,
+            self.band.clone(),
             rx,
-            self.common.callback_priority(),
             dev.io_intr_processes_directly(),
             dev.io_intr_scan_independent(),
         );
-        if let Some(old) = self.cold.io_intr_pump.replace(pump.abort_handle()) {
-            old.abort();
-        }
+        self.cold.io_intr_pump = Some(pump);
         true
     }
 

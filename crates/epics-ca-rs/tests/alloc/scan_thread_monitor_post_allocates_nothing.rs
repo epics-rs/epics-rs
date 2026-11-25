@@ -84,7 +84,7 @@ async fn between_sweeps(db: &PvDatabase, scan: &named::Window<1>) -> (u64, u64, 
     }
     tokio::time::sleep(Duration::from_millis(40)).await;
     let [counts] = scan.counts();
-    (counts.allocs, counts.frees, tick(db))
+    (counts.allocs, counts.deallocs, tick(db))
 }
 
 async fn window(db: &PvDatabase, scan: &named::Window<1>) -> Window {

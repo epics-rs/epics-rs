@@ -6,7 +6,8 @@
 //! of them: `alloc`, `alloc_zeroed` and `realloc` take a block, `dealloc` and
 //! `realloc` give one back. A realloc is both, as the default
 //! `GlobalAlloc::realloc` is an alloc and a dealloc, so `allocs - frees` is
-//! always the change in live blocks.
+//! always the change in live blocks; `deallocs` is the frees that were
+//! `dealloc` calls.
 //!
 //! Two windows:
 //!
@@ -38,22 +39,22 @@ pub struct Counting;
 // allocate.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        note(1, 0, layout.size());
+        note(TAKE.largest(layout.size()));
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        note(1, 0, layout.size());
+        note(TAKE.largest(layout.size()));
         unsafe { System.alloc_zeroed(layout) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        note(1, 1, new_size);
+        note(REALLOC.largest(new_size));
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        note(0, 1, 0);
+        note(GIVE);
         unsafe { System.dealloc(ptr, layout) }
     }
 }
@@ -65,8 +66,35 @@ pub struct Counts {
     pub allocs: u64,
     /// Blocks given back: `dealloc` and `realloc` calls.
     pub frees: u64,
+    /// Of `frees`, the `dealloc` calls: a block given back and none taken.
+    pub deallocs: u64,
     /// The largest block taken, in bytes (a realloc's new size).
     pub largest: usize,
+}
+
+const TAKE: Counts = Counts {
+    allocs: 1,
+    frees: 0,
+    deallocs: 0,
+    largest: 0,
+};
+const GIVE: Counts = Counts {
+    allocs: 0,
+    frees: 1,
+    deallocs: 1,
+    largest: 0,
+};
+const REALLOC: Counts = Counts {
+    allocs: 1,
+    frees: 1,
+    deallocs: 0,
+    largest: 0,
+};
+
+impl Counts {
+    const fn largest(self, largest: usize) -> Counts {
+        Counts { largest, ..self }
+    }
 }
 
 /// Runs `f` with the calling thread counted by no window.
@@ -298,58 +326,56 @@ impl Armed {
 struct Shared {
     allocs: AtomicU64,
     frees: AtomicU64,
+    deallocs: AtomicU64,
     largest: AtomicUsize,
 }
 
 impl Shared {
-    fn add(&self, allocs: u64, frees: u64, size: usize) {
-        self.allocs.fetch_add(allocs, Ordering::Relaxed);
-        self.frees.fetch_add(frees, Ordering::Relaxed);
-        self.largest.fetch_max(size, Ordering::Relaxed);
+    fn add(&self, call: Counts) {
+        self.allocs.fetch_add(call.allocs, Ordering::Relaxed);
+        self.frees.fetch_add(call.frees, Ordering::Relaxed);
+        self.deallocs.fetch_add(call.deallocs, Ordering::Relaxed);
+        self.largest.fetch_max(call.largest, Ordering::Relaxed);
     }
 
     fn get(&self) -> Counts {
         Counts {
             allocs: self.allocs.load(Ordering::Relaxed),
             frees: self.frees.load(Ordering::Relaxed),
+            deallocs: self.deallocs.load(Ordering::Relaxed),
             largest: self.largest.load(Ordering::Relaxed),
         }
     }
 }
 
-struct Tally {
-    allocs: Cell<u64>,
-    frees: Cell<u64>,
-    largest: Cell<usize>,
-}
+struct Tally(Cell<Counts>);
 
 impl Tally {
     const fn new() -> Self {
-        Tally {
-            allocs: Cell::new(0),
-            frees: Cell::new(0),
-            largest: Cell::new(0),
-        }
+        Tally(Cell::new(Counts {
+            allocs: 0,
+            frees: 0,
+            deallocs: 0,
+            largest: 0,
+        }))
     }
 
-    fn add(&self, allocs: u64, frees: u64, size: usize) {
-        self.allocs.set(self.allocs.get() + allocs);
-        self.frees.set(self.frees.get() + frees);
-        self.largest.set(self.largest.get().max(size));
+    fn add(&self, call: Counts) {
+        let t = self.0.get();
+        self.0.set(Counts {
+            allocs: t.allocs + call.allocs,
+            frees: t.frees + call.frees,
+            deallocs: t.deallocs + call.deallocs,
+            largest: t.largest.max(call.largest),
+        });
     }
 
     fn get(&self) -> Counts {
-        Counts {
-            allocs: self.allocs.get(),
-            frees: self.frees.get(),
-            largest: self.largest.get(),
-        }
+        self.0.get()
     }
 
     fn reset(&self) {
-        self.allocs.set(0);
-        self.frees.set(0);
-        self.largest.set(0);
+        self.0.set(Counts::default());
     }
 }
 
@@ -421,17 +447,17 @@ thread_local! {
     static LOCAL: Local = const { Local::new() };
 }
 
-fn note(allocs: u64, frees: u64, size: usize) {
+fn note(call: Counts) {
     let _ = LOCAL.try_with(|l| {
         if l.quiet.get() != 0 {
             return;
         }
         if l.open.get() {
-            l.all.add(allocs, frees, size);
+            l.all.add(call);
             if let Some(when) = l.when.get()
                 && l.quietly(when)
             {
-                l.under.add(allocs, frees, size);
+                l.under.add(call);
             }
         }
         let armed = ARMED.load(Ordering::Acquire);
@@ -446,7 +472,7 @@ fn note(allocs: u64, frees: u64, size: usize) {
             Known::Named { len, cut } => armed.slot(Some(&l.name.get()[..len]), cut),
         };
         if let Some(slot) = slot {
-            armed.slots[slot].add(allocs, frees, size);
+            armed.slots[slot].add(call);
         }
     });
 }

@@ -98,6 +98,7 @@ fn a_realloc_is_a_block_taken_and_a_block_given_back() {
         Counts {
             allocs: 3,
             frees: 3,
+            deallocs: 2,
             largest: 64
         },
         "alloc 8, realloc to 64, dealloc, alloc_zeroed 16, dealloc"

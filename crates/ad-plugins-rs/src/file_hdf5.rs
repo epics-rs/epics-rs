@@ -1297,9 +1297,10 @@ impl Hdf5Writer {
         Arc::clone(&self.open_posts)
     }
 
-    /// C `configureDims` (NDFileHDF5.cpp:3248-3263) sets the chunk size each
+    /// C `configureDims` (NDFileHDF5.cpp:3248-3283) sets the chunk size each
     /// frame dimension resolves to back into its param, which the next open
-    /// then reads.
+    /// then reads; a multi-frame file takes at least one frame per chunk,
+    /// and flushNthFrame is raised to nFramesChunks.
     fn configure_chunking(&mut self, array: &NDArray) {
         let frame_dims: Vec<usize> = array.dims.iter().rev().map(|d| d.size).collect();
         let sizes: Vec<usize> = self
@@ -1308,18 +1309,31 @@ impl Hdf5Writer {
             .rev()
             .take(MAX_CHUNK_DIMS)
             .collect();
+        let mut posts: Vec<OpenPost> = sizes
+            .iter()
+            .enumerate()
+            .map(|(dim, &v)| OpenPost::ChunkSize(dim, v as i32))
+            .collect();
+        let mut frames_chunks = self.cfg.chunk.n_frames_chunks;
+        if self.multi_frame {
+            frames_chunks = frames_chunks.max(1);
+            posts.push(OpenPost::NFramesChunks(frames_chunks as i32));
+        }
+        let raise_flush = self.cfg.flush_nth_frame < frames_chunks;
+        if raise_flush {
+            posts.push(OpenPost::FlushNthFrame(frames_chunks as i32));
+        }
         self.cfg.store().update(|s| {
             for (dim, &v) in sizes.iter().enumerate() {
                 s.set_chunk_size(dim, v);
             }
+            s.set_n_frames_chunks(frames_chunks);
+            if raise_flush {
+                s.set_flush_nth_frame(frames_chunks);
+            }
         });
         self.read_settings();
-        self.open_posts.lock().posts.extend(
-            sizes
-                .iter()
-                .enumerate()
-                .map(|(dim, &v)| OpenPost::ChunkSize(dim, v as i32)),
-        );
+        self.open_posts.lock().posts.extend(posts);
     }
 
     /// Read the settings where C reads its params: open, each frame, close.
@@ -1600,7 +1614,7 @@ impl Hdf5Writer {
         (0..=self.cfg.n_extra_dims)
             .rev()
             .map(|i| match &self.cfg.extra_dims[i] {
-                _ if i == 0 => self.cfg.chunk.n_frames_chunks.max(1),
+                _ if i == 0 => self.cfg.chunk.n_frames_chunks,
                 d => (d.chunk.max(1) as usize).min(d.size.max(1)),
             })
             .collect()
@@ -1695,7 +1709,7 @@ impl Hdf5Writer {
             None => {
                 let mut shape = vec![1usize];
                 shape.extend_from_slice(frame_dims);
-                let mut chunk = vec![self.cfg.chunk.n_frames_chunks.max(1)];
+                let mut chunk = vec![self.cfg.chunk.n_frames_chunks];
                 chunk.extend_from_slice(&frame_chunk);
                 (shape, chunk, None)
             }
@@ -4898,6 +4912,10 @@ enum OpenPost {
     Compression(CompressionParam, i32),
     /// `configureDims`'s chunk size of one NDArray dimension (:3262).
     ChunkSize(usize, i32),
+    /// A multi-frame file's frames per chunk, at least 1 (:3266-3274).
+    NFramesChunks(i32),
+    /// flushNthFrame raised to nFramesChunks (:3277-3283).
+    FlushNthFrame(i32),
 }
 
 /// HDF5 file processor wrapping `FilePluginController<Hdf5Writer>`.
@@ -4941,6 +4959,8 @@ impl Hdf5FileProcessor {
                         [int(idx, v), None]
                     }
                     OpenPost::ChunkSize(dim, v) => [int(p.chunk_size[dim], v), None],
+                    OpenPost::NFramesChunks(v) => [int(p.n_frames_chunks, v), None],
+                    OpenPost::FlushNthFrame(v) => [int(p.flush_nth_frame, v), None],
                 }
             })
             .flatten()
@@ -6742,6 +6762,8 @@ mod tests {
                 OpenPost::Layout(true, "Default layout selected"),
                 OpenPost::ChunkSize(0, 4),
                 OpenPost::ChunkSize(1, 5),
+                OpenPost::NFramesChunks(1),
+                OpenPost::FlushNthFrame(1),
                 OpenPost::Compression(CompressionParam::Type, 3),
                 OpenPost::Compression(CompressionParam::ZLevel, 4)
             ]
@@ -6785,6 +6807,7 @@ mod tests {
                     OpenPost::Layout(true, "Default layout selected"),
                     OpenPost::ChunkSize(0, 4),
                     OpenPost::ChunkSize(1, 4),
+                    OpenPost::FlushNthFrame(1),
                     OpenPost::Compression(CompressionParam::NbitOffset, want.0),
                     OpenPost::Compression(CompressionParam::NbitPrecision, want.1)
                 ],
@@ -7662,6 +7685,63 @@ mod tests {
     #[test]
     fn swmr_every_frame_dimension_takes_its_chunk_size() {
         assert_every_frame_dimension_takes_its_chunk_size(true);
+    }
+
+    /// C `configureDims` gives a multi-frame file at least one frame per
+    /// chunk and raises flushNthFrame to nFramesChunks, posting both, SWMR
+    /// or not (NDFileHDF5.cpp:3264-3283); a Single file keeps nFramesChunks.
+    #[test]
+    fn an_open_posts_frames_per_chunk_and_raises_the_flush_to_it() {
+        use crate::test_util::{auto_save_to, publish, running, wait_saved};
+        // (WRITE_MODE, SWMR, nFramesChunks, flushNthFrame) -> readbacks.
+        let cases = [
+            ((2, false, 0, 0), (1, 1)),
+            ((2, true, 0, 0), (1, 1)),
+            ((2, false, 3, 0), (3, 3)),
+            ((2, true, 3, 5), (3, 5)),
+            ((0, false, 0, 0), (0, 0)),
+            ((0, false, 2, 0), (2, 2)),
+        ];
+        for (n, ((mode, swmr, frames_chunks, flush), want)) in cases.into_iter().enumerate() {
+            let (handle, _rx, _jh) =
+                running(&format!("HDF5_FRAMES_CHUNKS_{n}"), Hdf5FileProcessor::new());
+            let port = handle.port_runtime().port_handle();
+            let reason = |name: &str| {
+                port.drv_user_create_blocking(&asyn_rs::port::DrvUserRequest::new(name, 0))
+                    .unwrap()
+                    .reason
+            };
+            let path = temp_path(&format!("hdf5_frames_chunks_{n}"));
+            auto_save_to(&handle, &path);
+            // A Single save leaves the frame a Stream capture opens on (C
+            // `doCapture` refuses with none).
+            publish(&handle, &ramp_u16(4, 5));
+            wait_saved(&handle, 1);
+            for (name, value) in [
+                ("HDF5_SWMRMode", swmr as i32),
+                // Before nFramesChunks, which a lower flush write must not pass.
+                ("HDF5_flushNthFrame", flush),
+                ("HDF5_nFramesChunks", frames_chunks),
+                ("WRITE_MODE", mode),
+                // Unbounded: a frame axis of NumCapture would refuse a deeper chunk.
+                ("NUM_CAPTURE", 0),
+            ] {
+                port.write_int32_blocking(reason(name), 0, value).unwrap();
+            }
+            if mode != 0 {
+                port.write_int32_blocking(reason("CAPTURE"), 0, 1).unwrap();
+            }
+            publish(&handle, &ramp_u16(4, 5));
+            wait_saved(&handle, 2);
+            if mode != 0 {
+                port.write_int32_blocking(reason("CAPTURE"), 0, 0).unwrap();
+            }
+            assert!(path.exists(), "case {n}");
+            let posted = ["HDF5_nFramesChunks", "HDF5_flushNthFrame"]
+                .map(|name| port.read_int32_blocking(reason(name), 0).unwrap());
+            assert_eq!(posted, [want.0, want.1], "case {n}");
+            std::fs::remove_file(&path).ok();
+        }
     }
 
     /// C `openFile`/`writeFile` fill `pFileAttributes` from `getAttributes`

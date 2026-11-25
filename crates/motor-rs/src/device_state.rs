@@ -99,9 +99,10 @@ pub struct MotorDeviceState {
 /// owner that turns a driver post, a finished move or the settle delay into
 /// a record process.
 ///
-/// devMotorAsyn's `statusCallback` and `asynCallback`, and motordevCom's
-/// `motor_callback`, `dbProcess` under `dbScanLock` on the driver's thread
-/// (`call_back`). The settle delay and a devMotorSim callback leave
+/// devMotorAsyn's `statusCallback` and `asynCallback` `dbProcess` under
+/// `dbScanLock` on the driver's thread (`call_back`), motordevCom's
+/// `motor_callback` on the medium callback band motordrvCom queues it on
+/// (motordrvCom.cc:347, :471). The settle delay and a devMotorSim callback leave
 /// their state for the next pass and ask for one on the record's io_intr
 /// task (`scanOnce`).
 #[derive(Debug, Default)]
@@ -501,14 +502,32 @@ impl Bound {
                 );
             }
             MotorDset::MotordevCom => {
+                // Copied here, not on the band as C copies it (motordevCom.cc:
+                // 541-548): a put before the band runs reads the post, and the
+                // queued pass then skips instead of landing stale after it.
                 ds.copy_post(status);
+                if ds.callbacks.init_sem.is_some() || !ds.callbacks.accepting {
+                    ds.init_callback();
+                    return;
+                }
+                let Some(db) = ds.callbacks.db.clone() else {
+                    return;
+                };
                 drop(ds);
-                let process = |_: &mut MotorDeviceState| IoIntrAction::Process;
-                call_back(
-                    &self.device_state,
-                    record,
-                    process,
-                    MotorDeviceState::init_callback,
+                let state = self.device_state.clone();
+                let record = record.to_owned();
+                db.0.spawn_callback(
+                    epics_base_rs::runtime::task::CallbackPriority::Medium,
+                    async move {
+                        let unread = |ds: &mut MotorDeviceState| {
+                            if ds.need_update() {
+                                IoIntrAction::Process
+                            } else {
+                                IoIntrAction::Skip
+                            }
+                        };
+                        call_back(&state, &record, unread, |_| {});
+                    },
                 );
             }
             MotorDset::DevMotorSim => {
@@ -721,6 +740,16 @@ pub(crate) mod passes {
     impl Reads {
         pub(crate) fn take(&self) -> Vec<Option<MotorStatus>> {
             std::mem::take(&mut self.0.lock().unwrap())
+        }
+
+        /// [`Self::take`] once `n` processes have run on a callback band,
+        /// or after [`fact_budget::FACT_BUDGET`].
+        pub(crate) fn take_after(&self, n: usize) -> Vec<Option<MotorStatus>> {
+            let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+            while self.0.lock().unwrap().len() < n && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            self.take()
         }
     }
 
@@ -996,7 +1025,8 @@ mod tests {
     }
 
     // motordevCom: a move processes nothing itself, and every driver
-    // callback processes the record (motordevCom.cc:534-556).
+    // callback processes the record on a callback band (motordevCom.cc:
+    // 534-556, motordrvCom.cc:347).
     #[test]
     fn a_motordevcom_move_waits_for_the_driver_callback() {
         let axis = AxisSubscribers::new();
@@ -1013,12 +1043,55 @@ mod tests {
         assert!(reads.take().is_empty(), "a motordevCom move processed");
         assert!(axis.post(at(1.0)).is_empty());
         let read: Vec<_> = reads
-            .take()
+            .take_after(1)
             .into_iter()
             .map(|s| s.map(|s| s.position()))
             .collect();
         assert_eq!(read, [Some(1.0)]);
         assert!(rx.try_recv().is_err(), "a motordevCom callback queued");
+    }
+
+    /// The medium band once every job queued on it so far has run.
+    fn medium_band_drained() {
+        use epics_base_rs::runtime::task::{CallbackPriority, spawn_background};
+        let (done, drained) = std::sync::mpsc::channel();
+        drop(spawn_background(CallbackPriority::Medium, async move {
+            let _ = done.send(());
+        }));
+        drained.recv_timeout(fact_budget::FACT_BUDGET).unwrap();
+    }
+
+    // A put that reads a motordevCom post before the band processes it
+    // leaves that process nothing new; it runs no NOTHING_DONE pass, which
+    // would ask the driver for GET_INFO (motorRecord.cc:2546-2557).
+    #[test]
+    fn a_motordevcom_post_a_put_read_first_is_not_processed_again() {
+        use epics_base_rs::runtime::task::{CallbackPriority, spawn_background};
+        let axis = AxisSubscribers::new();
+        let state = new_shared_state();
+        let trace = Arc::<MotorTrace>::default();
+        let reads = passes::bind(&state, &trace);
+        state.lock().unwrap().set_dset(MotorDset::MotordevCom);
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        axis.attach(state.clone(), tx, trace);
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        drop(spawn_background(CallbackPriority::Medium, async move {
+            let _ = held.recv();
+        }));
+        assert!(axis.post(at(1.0)).is_empty());
+        let put_read = state.lock().unwrap().update_values();
+        release.send(()).unwrap();
+        assert!(axis.post(at(2.0)).is_empty());
+        medium_band_drained();
+        let read: Vec<_> = reads
+            .take()
+            .into_iter()
+            .map(|s| s.map(|s| s.position()))
+            .collect();
+        assert_eq!(
+            (put_read.map(|s| s.position()), read),
+            (Some(1.0), vec![Some(2.0)])
+        );
     }
 
     #[test]

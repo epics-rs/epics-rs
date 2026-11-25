@@ -1,8 +1,9 @@
 //! devMotorAsyn's `statusCallback` and `asynCallback` (devMotorAsyn.c:
-//! 717-728, :756-764) and motordevCom's `motor_callback` (motordevCom.cc:
-//! 555-557) process the record under `dbScanLock` on the driver's thread,
-//! so a callback that has returned has processed, and a put that follows
-//! it finds the record past that pass. A pass the callback asked
+//! 717-728, :756-764) process the record under `dbScanLock` on the
+//! driver's thread, so a callback that has returned has processed, and a
+//! put that follows it finds the record past that pass. motordevCom's
+//! `motor_callback` (motordevCom.cc:555-557) processes it on the callback
+//! band motordrvCom queues it on (motordrvCom.cc:347). A pass the callback asked
 //! for must not land after a later put: with retries left it retries the
 //! move in flight, with none it ends the move early.
 
@@ -267,6 +268,37 @@ async fn a_model1_callback_pass_does_not_land_after_a_later_put() {
         let (moves, fields) = rig.after_put(10.0).await;
         assert_in_flight(rtry, &moves, 10000.0, &fields);
     }
+}
+
+/// RRBV after a model-1 post at raw 5: motordrvCom hands the post to
+/// `motor_callback` with `callbackRequest` (motordrvCom.cc:312, :347), and
+/// none requested after `iocShutdown`'s `callbackStop` runs (iocInit.c:
+/// 733-735).
+async fn rrbv_after_a_model1_post(stop: bool) -> EpicsValue {
+    let rig = Rig::new(model1(), 10).await;
+    if stop {
+        rig.db.scan_control().stop();
+        rig.post(at(5.0));
+        // absence-window: a post refused after the stop processes nothing.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+    } else {
+        rig.post(at(5.0));
+        let deadline = tokio::time::Instant::now() + fact_budget::FACT_BUDGET;
+        while rig.field("RRBV") == EpicsValue::Long(0) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+    rig.field("RRBV")
+}
+
+#[tokio::test]
+async fn a_model1_post_processes_the_record_while_the_ioc_runs() {
+    assert_eq!(rrbv_after_a_model1_post(false).await, EpicsValue::Long(5));
+}
+
+#[tokio::test]
+async fn a_model1_post_after_shutdown_processes_nothing() {
+    assert_eq!(rrbv_after_a_model1_post(true).await, EpicsValue::Long(0));
 }
 
 /// devMotorSim's `motor_callback` for a post before the put: its

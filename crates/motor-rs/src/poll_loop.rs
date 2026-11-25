@@ -6681,7 +6681,7 @@ mod tests {
         now(poll_loop.query_task(Instant::now()));
         assert!(poll_loop.axes[0].pulses.is_empty());
         let read: Vec<_> = reads
-            .take()
+            .take_after(1)
             .into_iter()
             .map(|s| s.map(|s| s.position()))
             .collect();

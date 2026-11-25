@@ -458,7 +458,8 @@ impl NDAttributeSource for FunctionAttributeSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PvAttrDbrType {
     /// C `DBR_NATIVE` — the default when `dbrtype` is omitted. The requested
-    /// type follows the PV's own field type (PVAttribute.cpp:224-249).
+    /// type follows the PV's own field type (PVAttribute.cpp:224-249), except
+    /// that a CHAR field is read as `DBR_SHORT`.
     #[default]
     Native,
     /// `DBR_STRING` → `NDAttrString`.
@@ -519,7 +520,9 @@ impl PvAttrDbrType {
             F::String => (DBR_STRING, D::String),
             F::Short | F::Enum => (DBR_SHORT, D::Int16),
             F::Float => (DBR_FLOAT, D::Float32),
-            F::Char => (DBR_CHAR, D::Int8),
+            // C asks for `DBR_CHAR` into an `NDAttrInt8`, which reads a UCHAR
+            // field's 200 as -56; as a short the IOC keeps the field's sign.
+            F::Char => (DBR_SHORT, D::Int16),
             F::Long => (DBR_LONG, D::Int32),
             F::Double => (DBR_DOUBLE, D::Float64),
             _ => return None,

@@ -1,9 +1,10 @@
-//! A `DBR_NATIVE` `EPICS_PV` attribute carries the type C's `PVAttribute`
-//! gives it, which is the datatype HDF5 and NeXus write for the attribute.
+//! A `DBR_NATIVE` `EPICS_PV` attribute carries the type its field is read
+//! as, which is the datatype HDF5 and NeXus write for the attribute.
 //!
-//! C reads a native ENUM as `DBR_SHORT` and a native CHAR as `DBR_CHAR`
-//! (PVAttribute.cpp:233-237) and stores them as `NDAttrInt16` and
-//! `NDAttrInt8` (:261-271), so a CHAR byte above 127 reads back negative.
+//! A native ENUM is read as `DBR_SHORT` into an `NDAttrInt16`, as C does
+//! (PVAttribute.cpp:233-237, :261-271). A native CHAR is read as `DBR_SHORT`
+//! too, so the IOC converts the byte with the field's sign: C reads it as
+//! `DBR_CHAR` into an `NDAttrInt8`, which turns a UCHAR 200 into -56.
 //!
 //! Needs the `ioc` feature.
 #![cfg(feature = "ioc")]
@@ -28,6 +29,7 @@ use fact_budget::FACT_BUDGET;
 
 const ENUM_PV: &str = "ADNATIVE:Enum";
 const CHAR_PV: &str = "ADNATIVE:Char";
+const UCHAR_PV: &str = "ADNATIVE:UChar";
 
 fn attribute_value(drv: &NDArrayDriverBase, name: &str) -> NDAttrValue {
     drv.attributes()
@@ -59,14 +61,20 @@ async fn first_value(drv: &NDArrayDriverBase, name: &str) -> NDAttrValue {
 // ad-core-rs --features ioc`); its CA server is the reactor-free RSRV, and
 // its reactor is `#[tokio::test]`'s own, which the backend does not remove.
 #[tokio::test]
-async fn native_enum_and_char_pvs_publish_c_signed_attribute_types() {
+async fn native_enum_and_char_pvs_publish_int16_attributes() {
+    // The byte 200 is -56 in a CHAR field and 200 in a UCHAR one.
     let mut chars = WaveformRecord::new(1, DbFieldType::Char);
     chars
         .put_field("VAL", EpicsValue::CharArray(vec![200].into()))
         .expect("seed the CHAR waveform");
+    let mut uchars = WaveformRecord::new(1, DbFieldType::UChar);
+    uchars
+        .put_field("VAL", EpicsValue::UCharArray(vec![200].into()))
+        .expect("seed the UCHAR waveform");
     let (db, _) = IocBuilder::new()
         .record(ENUM_PV, BoRecord::new(1))
         .record(CHAR_PV, chars)
+        .record(UCHAR_PV, uchars)
         .build_served()
         .await
         .expect("build the database");
@@ -104,7 +112,8 @@ async fn native_enum_and_char_pvs_publish_c_signed_attribute_types() {
     // No `dbrtype`: C's default is DBR_NATIVE.
     let xml = format!(
         "<Attributes><Attribute name=\"Enum\" type=\"EPICS_PV\" source=\"{ENUM_PV}\"/>\
-         <Attribute name=\"Char\" type=\"EPICS_PV\" source=\"{CHAR_PV}\"/></Attributes>"
+         <Attribute name=\"Char\" type=\"EPICS_PV\" source=\"{CHAR_PV}\"/>\
+         <Attribute name=\"UChar\" type=\"EPICS_PV\" source=\"{UCHAR_PV}\"/></Attributes>"
     );
     drv.port_base
         .set_string_param(drv.params.attributes_file, 0, &xml)
@@ -113,5 +122,6 @@ async fn native_enum_and_char_pvs_publish_c_signed_attribute_types() {
         .expect("a fed EPICS_PV attribute loads clean");
 
     assert_eq!(first_value(&drv, "Enum").await, NDAttrValue::Int16(1));
-    assert_eq!(first_value(&drv, "Char").await, NDAttrValue::Int8(-56));
+    assert_eq!(first_value(&drv, "Char").await, NDAttrValue::Int16(-56));
+    assert_eq!(first_value(&drv, "UChar").await, NDAttrValue::Int16(200));
 }

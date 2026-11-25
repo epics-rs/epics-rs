@@ -2,9 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use epics_base_rs::error::CaResult;
-use epics_base_rs::runtime::task::{
-    CallbackPriority, spawn_background_after, spawn_blocking_background,
-};
+use epics_base_rs::runtime::task::{CallbackPriority, spawn_blocking_background};
 use epics_base_rs::server::device_support::{
     DeviceInitOutcome, DevicePost, DeviceReadOutcome, DeviceSupport,
 };
@@ -813,15 +811,20 @@ impl CommandPort {
             Err(Unreached::NoSignal(records)) => {
                 // The motor task's callbackRequest runs on the callback
                 // pool, which waits for the record this pass holds.
-                spawn_blocking_background(CallbackPriority::Medium, move |_| {
-                    let problem = MotorStatus {
-                        problem: true,
-                        ..MotorStatus::default()
-                    };
-                    for pulse in records.post(problem) {
-                        let _ = pulse.try_send(());
-                    }
-                });
+                request_callback_after(
+                    &self.device_state,
+                    CallbackPriority::Medium,
+                    Duration::ZERO,
+                    async move {
+                        let problem = MotorStatus {
+                            problem: true,
+                            ..MotorStatus::default()
+                        };
+                        for pulse in records.post(problem) {
+                            let _ = pulse.try_send(());
+                        }
+                    },
+                );
                 return EndTrans::Passed;
             }
         };
@@ -898,7 +901,7 @@ impl CommandPort {
         let (id, duration) = (delay.id, delay.duration);
         let device_state = self.device_state.clone();
         let io_intr_tx = self.io_intr_tx.clone();
-        spawn_background_after(self.prio, duration, async move {
+        request_callback_after(&self.device_state, self.prio, duration, async move {
             let pulse = device_state.lock().is_ok_and(|mut ds| ds.delay_expired(id));
             if pulse {
                 let _ = io_intr_tx.send(()).await;

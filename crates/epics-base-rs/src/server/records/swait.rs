@@ -45,9 +45,10 @@ enum Cb {
 }
 
 /// Link events in arrival order: queued by a `recDynLink` thread without the
-/// record's lock, applied under it from a callback worker.
+/// record's lock, applied under it from a callback worker. Each carries
+/// whether the `callbackRequest` its `inputChanged` makes would run then.
 #[derive(Default)]
-struct Inbox(Mutex<VecDeque<(usize, u64, LinkEvent)>>);
+struct Inbox(Mutex<VecDeque<(usize, u64, LinkEvent, bool)>>);
 
 /// What a drained link event leaves the callback worker to do outside the
 /// record's borrow.
@@ -471,7 +472,12 @@ impl SwaitRecord {
         let inbox = self.inbox.clone();
         let prio = self.prio;
         Some(Arc::new(move |generation, event| {
-            inbox.0.lock().unwrap().push_back((li, generation, event));
+            let admitted = h.admits_callback_request();
+            inbox
+                .0
+                .lock()
+                .unwrap()
+                .push_back((li, generation, event, admitted));
             let (h, name) = (h.clone(), name.clone());
             drop(spawn_blocking_background(prio, move |_| {
                 h.with_held(&name, |held| {
@@ -557,16 +563,19 @@ impl SwaitRecord {
     /// Every queued link event, oldest first: `recDynLink` applies it, then
     /// the callback C would call runs, up to the first that leaves the
     /// record to be processed or forward-linked, the later events left
-    /// queued.
+    /// queued. An `ioIntProcess` requested after `callbackStop` never runs,
+    /// so its input is neither stored nor processed.
     fn drain_inbox(&mut self, scan: ScanType) -> Drain {
         loop {
             let next = self.inbox.0.lock().unwrap().pop_front();
-            let Some((li, generation, event)) = next else {
+            let Some((li, generation, event, admitted)) = next else {
                 return Drain::Done;
             };
             match self.links[li].apply(generation, event) {
                 Some(Cb::Search) => self.pv_search_callback(li),
-                Some(Cb::Input) if self.input_changed(li, scan) => return Drain::Process,
+                Some(Cb::Input) if admitted && self.input_changed(li, scan) => {
+                    return Drain::Process;
+                }
                 Some(Cb::Notify) => {
                     self.fwd_link = true;
                     return Drain::FwdLink;

@@ -234,3 +234,25 @@ record(motor, "R4:m") { field(DTYP, "TestRouting") field(OUT, "#C4 S4 @") field(
     assert_eq!(field(&db, "R4:m.RMP"), EpicsValue::Long(0));
     assert!(moves.lock().unwrap().is_empty());
 }
+
+/// The motor task's answer to a missing signal is a `callbackRequest`
+/// (motordrvCom.cc:499), and one made after `iocShutdown`'s `callbackStop`
+/// (iocInit.c:733-735) never runs: the move never ends.
+#[tokio::test]
+async fn a_missing_signal_answer_after_shutdown_never_lands() {
+    let db = boot(
+        5,
+        Card::default(),
+        r##"
+record(motor, "R5:m") { field(DTYP, "TestRouting") field(OUT, "#C5 S4 @") field(MRES, "1") field(RTRY, "0") }
+"##,
+    )
+    .await;
+    db.scan_control().stop();
+    db.put_record_field_from_ca("R5:m", "VAL", EpicsValue::Double(2.0))
+        .await
+        .unwrap();
+    // absence-window: a refused answer leaves nothing to wait on.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(field(&db, "R5:m.DMOV"), EpicsValue::Short(0));
+}

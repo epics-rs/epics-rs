@@ -338,3 +338,46 @@ async fn a_put_after_the_settle_delay_expires_moves_on_the_expiry_pass() {
     let (moves, fields) = rig.outcome();
     assert_in_flight(10, &moves, 20000.0, &fields);
 }
+
+/// Whether the settle delay's expiry asked for a pass, and MIP after one: C's
+/// DLY is `callbackRequestDelayed` (motorRecord.cc:1437), requested when
+/// its timer fires, and its `callbackFunc` turns DELAY_REQ into DELAY_ACK
+/// (:460-480). One requested after `iocShutdown`'s `callbackStop`
+/// (iocInit.c:733-735) never runs.
+async fn the_settle_delay_expiry(stop: bool) -> (bool, EpicsValue) {
+    let mut rig = Rig::build(controller(), 10, 0.3, false).await;
+    rig.put_val(10.0).await;
+    let mv = rig.commands().into_iter().find(|c| c.is_move()).unwrap();
+    rig.post(at(10000.0));
+    rig.axis.move_done(rig.record, &mv);
+    assert_eq!(rig.field("MIP"), EpicsValue::UShort(0x420));
+    let pulsed = if stop {
+        rig.db.scan_control().stop();
+        // absence-window: an expiry refused after the stop sends no pulse.
+        tokio::time::timeout(Duration::from_millis(600), rig.delay_pulse.recv())
+            .await
+            .is_ok()
+    } else {
+        tokio::time::timeout(fact_budget::FACT_BUDGET, rig.delay_pulse.recv())
+            .await
+            .is_ok()
+    };
+    rig.pass().await;
+    (pulsed, rig.field("MIP"))
+}
+
+#[tokio::test]
+async fn the_settle_delay_expires_while_the_ioc_runs() {
+    assert_eq!(
+        the_settle_delay_expiry(false).await,
+        (true, EpicsValue::UShort(0x820))
+    );
+}
+
+#[tokio::test]
+async fn a_settle_delay_expiring_after_shutdown_never_runs() {
+    assert_eq!(
+        the_settle_delay_expiry(true).await,
+        (false, EpicsValue::UShort(0x420))
+    );
+}

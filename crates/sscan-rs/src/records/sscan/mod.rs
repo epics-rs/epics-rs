@@ -1246,7 +1246,7 @@ impl SscanRecord {
             return;
         };
         let name = self.name.clone();
-        epics_base_rs::runtime::task::spawn_background(self.prio, async move {
+        h.clone().spawn_callback(self.prio, async move {
             with_sscan(&h, &name, |s, _| f(s));
         });
     }
@@ -1266,7 +1266,7 @@ impl SscanRecord {
         };
         let name = self.name.clone();
         let wait = epics_base_rs::runtime::time::duration_from_secs(f64::from(secs));
-        epics_base_rs::runtime::task::spawn_background_after(self.prio, wait, async move {
+        h.clone().spawn_callback_after(self.prio, wait, async move {
             with_sscan(&h, &name, |s, _| {
                 if s.dly_gen == generation {
                     s.delay_callback();

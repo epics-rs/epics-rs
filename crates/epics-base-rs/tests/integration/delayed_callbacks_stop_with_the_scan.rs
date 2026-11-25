@@ -6,7 +6,10 @@
 //! timer fires (callback.c:404-408). So a seq group behind its `DLYn`
 //! (seqRecord.c:214, `processCallback`) and a throttle's cooldown `valuePut`
 //! (throttleRecord.c:595, `delayFuncCallback`) land by when they were
-//! requested, not by when a busy band reaches them.
+//! requested, not by when a busy band reaches them. An I/O Intr swait's
+//! input change is a `callbackRequest` of `ioIntProcess` made on the
+//! recDynLink thread (swaitRecord.c:846), which stores the input and
+//! processes the record.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,10 +18,13 @@ use std::time::{Duration, Instant};
 
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::runtime::background::{CallbackBody, CallbackCell};
-use epics_base_rs::runtime::task::{CallbackPriority, request_cell, spawn_background_after};
+use epics_base_rs::runtime::task::{
+    CallbackPriority, background_callback_stats, request_cell, spawn_background_after,
+};
 use epics_base_rs::server::database::{ProcStack, PvDatabase};
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::record::{ProcessAction, ProcessActions, ProcessOutcome, Record};
+use epics_base_rs::server::records::swait::SwaitRecord;
 use epics_base_rs::types::EpicsValue;
 
 const DELAY: f64 = 0.3;
@@ -279,4 +285,65 @@ async fn a_seq_group_requested_after_shutdown_never_runs() {
     assert!(pact(&db, "S"), "the seq went asynchronous");
     past_the_delay().await;
     assert_eq!(read(&db, "A"), 0.0, "group 0 ran after scanStop");
+}
+
+const SWAIT_DB: &str = r#"
+record(ao, "SRC") {}
+record(swait, "W") { field(SCAN, "I/O Intr") field(INAN, "SRC") field(CALC, "A") }
+"#;
+
+/// A running IOC whose `W` watches `SRC`, its input connected.
+async fn swait_ioc() -> Arc<PvDatabase> {
+    let ioc = IocBuilder::new()
+        .register_record_type("swait", || Box::new(SwaitRecord::default()))
+        .db_string(SWAIT_DB, &HashMap::new())
+        .unwrap()
+        .build_ioc()
+        .await
+        .unwrap();
+    let db = Arc::clone(ioc.database());
+    assert!(ioc.run().await);
+    until("W.INAN connected", || read(&db, "W.INAV") == 0.0).await;
+    db
+}
+
+/// Requests queued on the low band's ring: C `callbackQueueStatus`'s
+/// `numUsed` for a one-worker band.
+fn low_band_queued() -> usize {
+    background_callback_stats(false).unwrap()[CallbackPriority::Low.index()].num_used
+}
+
+async fn put(db: &PvDatabase, rec: &str, v: f64) {
+    db.put_record_field_from_ca(rec, "VAL", EpicsValue::Double(v))
+        .await
+        .unwrap();
+}
+
+#[epics_macros_rs::epics_test]
+async fn a_swait_input_change_after_shutdown_never_processes_it() {
+    let db = swait_ioc().await;
+    put(&db, "SRC", 3.0).await;
+    until("W.A=3", || read(&db, "W.A") == 3.0).await;
+    db.scan_control().stop();
+    put(&db, "SRC", 5.0).await;
+    past_the_delay().await;
+    assert_eq!(
+        (read(&db, "W.A"), read(&db, "W")),
+        (3.0, 3.0),
+        "ioIntProcess ran after scanStop"
+    );
+}
+
+#[epics_macros_rs::epics_test]
+async fn a_swait_input_change_before_shutdown_processes_it_once_the_band_frees() {
+    let db = swait_ioc().await;
+    let band = BusyBand::take();
+    let queued = low_band_queued();
+    put(&db, "SRC", 5.0).await;
+    // The recDynLink thread's delivery makes the request.
+    until("the input change's request", || low_band_queued() > queued).await;
+    assert_eq!(read(&db, "W.A"), 0.0);
+    db.scan_control().stop();
+    drop(band);
+    until("W=5", || read(&db, "W.A") == 5.0 && read(&db, "W") == 5.0).await;
 }

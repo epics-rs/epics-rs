@@ -177,6 +177,23 @@ pub(crate) fn call_back(
     }
 }
 
+/// C `callbackRequestDelayed` on one of the record's callbacks: through its
+/// database's gate once bound, so a request made after that database's
+/// `scanStop` never runs. A record bound to no database has no scan to stop.
+pub(crate) fn request_callback_after(
+    state: &SharedDeviceState,
+    priority: epics_base_rs::runtime::task::CallbackPriority,
+    delay: Duration,
+    task: impl std::future::Future<Output = ()> + Send + 'static,
+) {
+    match state.lock().ok().and_then(|ds| ds.callbacks.db.clone()) {
+        Some(db) => db.0.spawn_callback_after(priority, delay, task),
+        None => drop(epics_base_rs::runtime::task::spawn_background_after(
+            priority, delay, task,
+        )),
+    }
+}
+
 /// C `asynCallback`'s tail for a finished move-class command
 /// (devMotorAsyn.c:717-729). motordevCom has none: only the driver's
 /// `motor_callback` processes its record (motordevCom.cc:534-556).

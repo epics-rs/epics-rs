@@ -446,9 +446,10 @@ impl DeviceDone {
     pub(crate) fn complete_after(&self, delay: std::time::Duration) {
         let done = self.clone();
         // The task is C's ProcessCallback, so it drains the pass itself.
-        crate::runtime::task::spawn_background_after(self.priority(), delay, async move {
-            done.complete_now();
-        });
+        self.database()
+            .spawn_callback_after(self.priority(), delay, async move {
+                done.complete_now();
+            });
     }
 
     /// Queue the pass that ends a [`ReadStart::Pending`](crate::server::device_support::ReadStart::Pending)
@@ -800,7 +801,7 @@ impl std::task::Wake for CallbackRequests {
     }
 
     fn wake_by_ref(self: &Arc<Self>) {
-        if self.scan.is_exiting() {
+        if !admits_callback_request(&self.scan) {
             let _ = self.verdict.compare_exchange(
                 UNJUDGED,
                 REFUSED,
@@ -815,6 +816,13 @@ impl std::task::Wake for CallbackRequests {
             outer.wake();
         }
     }
+}
+
+/// Whether a `callbackRequest` made now runs: not once the scan facility has
+/// stopped, as C `iocShutdown` runs `callbackStop` right after `scanStop`
+/// (iocInit.c:733-735).
+fn admits_callback_request(scan: &crate::server::scan::ScanControl) -> bool {
+    !scan.is_exiting()
 }
 
 /// What a SoftCallback input dset's `getCallback` reads off the notified
@@ -1177,6 +1185,38 @@ impl AsyncDbHandle {
     /// C's `interruptAccept`, this database's: its scan facility runs.
     pub fn interrupt_accept(&self) -> bool {
         self.db().is_some_and(|db| db.scan_control().is_running())
+    }
+
+    /// C `callbackRequest`: [`Self::spawn_callback_after`] with no delay.
+    pub fn spawn_callback<F>(&self, priority: crate::runtime::task::CallbackPriority, task: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.spawn_callback_after(priority, std::time::Duration::ZERO, task);
+    }
+
+    /// C `callbackRequestDelayed`: `task` on `priority`'s band `delay` from
+    /// now. The delay's expiry, and each later wake of `task`, is a new
+    /// request, as C record support makes one again; a request made after
+    /// this database's `scanStop` does not run, and `task` ends there.
+    /// Nothing runs once the database is gone.
+    pub fn spawn_callback_after<F>(
+        &self,
+        priority: crate::runtime::task::CallbackPriority,
+        delay: std::time::Duration,
+        task: F,
+    ) where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        if let Some(db) = self.db() {
+            db.spawn_callback_after(priority, delay, task);
+        }
+    }
+
+    /// Whether a `callbackRequest` made now would run.
+    pub(crate) fn admits_callback_request(&self) -> bool {
+        self.db()
+            .is_some_and(|db| admits_callback_request(db.scan_control()))
     }
 
     /// C `dbNameToAddr(name)` succeeding: `name` is a field this database
@@ -4503,7 +4543,7 @@ impl PvDatabase {
         });
         let admit = {
             let scan = Arc::clone(&requests.scan);
-            move || !scan.is_exiting()
+            move || admits_callback_request(&scan)
         };
         let inner = std::task::Waker::from(Arc::clone(&requests));
         crate::runtime::task::spawn_background_after_admitted(priority, delay, admit, async move {

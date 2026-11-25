@@ -1176,3 +1176,51 @@ record(sscan, "S") {
     assert_eq!(f64_of(&db, "S.CPT"), 3.0);
     assert_eq!(f64_of(&db, "TR.PACT"), 1.0, "TR never took this scan's put");
 }
+
+/// doPuts is a `callbackRequest` (sscanRecord.c:3298), and one made after
+/// `iocShutdown`'s `callbackStop` (iocInit.c:733-735) never runs: a scan
+/// started then moves nothing.
+#[epics_base_rs::epics_test]
+async fn a_scan_started_after_shutdown_moves_nothing() {
+    let db = ioc(ONE_D).await;
+    connected(&db, "S", &["P1NV", "D01NV", "T1NV"]).await;
+    db.scan_control().stop();
+    start(&db, "S").await;
+    // absence-window: a refused doPuts leaves nothing to wait on.
+    sleep(Duration::from_millis(500)).await;
+    assert_eq!((f64_of(&db, "M"), f64_of(&db, "S.CPT")), (0.0, 0.0));
+}
+
+/// WTNG after a client's WAIT=1 lands in the first point's PDLY wait, the
+/// IOC stopped in that wait or not: `delayCallback` holds the point for the
+/// client (sscanRecord.c:2502), and its request is made when the delay
+/// expires (callback.c:404-408).
+async fn wtng_after_a_wait_put_in_pdly(stop: bool) -> f64 {
+    let db = ioc(ONE_D).await;
+    connected(&db, "S", &["P1NV", "D01NV", "T1NV"]).await;
+    put(&db, "S.PDLY", EpicsValue::Float(0.3)).await;
+    start(&db, "S").await;
+    wait_until("M=1", || f64_of(&db, "M") == 1.0).await;
+    put_field(&db, "S", "WAIT", EpicsValue::Short(1)).await;
+    if stop {
+        db.scan_control().stop();
+        // absence-window: an expiry refused after the stop holds no point.
+        sleep(Duration::from_millis(600)).await;
+    } else {
+        let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+        while f64_of(&db, "S.WTNG") != 1.0 && std::time::Instant::now() < deadline {
+            sleep(Duration::from_millis(5)).await;
+        }
+    }
+    f64_of(&db, "S.WTNG")
+}
+
+#[epics_base_rs::epics_test]
+async fn a_pdly_expiry_waits_for_the_client_while_the_ioc_runs() {
+    assert_eq!(wtng_after_a_wait_put_in_pdly(false).await, 1.0);
+}
+
+#[epics_base_rs::epics_test]
+async fn a_pdly_expiry_after_shutdown_never_runs() {
+    assert_eq!(wtng_after_a_wait_put_in_pdly(true).await, 0.0);
+}

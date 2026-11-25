@@ -3938,7 +3938,7 @@ fn write_ndattr_descriptors(target: &mut impl AttrTarget, ad: &AttributeDataset)
 /// storeOnOpenCloseAttribute (NDFileHDF5.cpp:587-618): a live NDAttribute
 /// value as an attribute of its own type (C `typeNd2Hdf`); an undefined one
 /// is skipped.
-fn write_ndattr_value(
+pub(crate) fn write_ndattr_value(
     target: &mut impl AttrTarget,
     name: &str,
     value: &NDAttrValue,
@@ -3961,7 +3961,7 @@ fn write_ndattr_value(
 
 /// An object NDFileHDF5 hangs attributes on: a group or a dataset, in a
 /// standard or a SWMR file.
-trait AttrTarget {
+pub(crate) trait AttrTarget {
     fn scalar<T: H5Type>(&mut self, name: &str, value: &T) -> rust_hdf5::Result<()>;
     fn array<T: H5Type>(&mut self, name: &str, values: &[T]) -> rust_hdf5::Result<()>;
     fn string(&mut self, name: &str, value: &str) -> rust_hdf5::Result<()>;

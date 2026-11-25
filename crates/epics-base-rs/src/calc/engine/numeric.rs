@@ -435,7 +435,8 @@ mod parity_tests {
     /// postfix.c:235-241), and the empty program a FAILED compile leaves behind
     /// makes `calcPerform` return -1 (its closing `ptop != stack + 1`,
     /// calcPerform.c:419-420) — which is how a broken CALC alarms on every
-    /// process. Compiled C confirms both. See tests/calc_empty_program.rs.
+    /// process. Compiled C confirms both. See
+    /// tests/integration/calc_empty_program.rs.
     #[test]
     fn c1_the_empty_program_is_an_evaluation_error() {
         use crate::calc::{CompiledExpr, ExprKind};

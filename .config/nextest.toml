@@ -203,7 +203,7 @@ test-group = 'pva_listener'
 # Serialised IOC spawners. These four are the group's original membership
 # and stay capped: removing a cap is a measurement nobody has made, and
 # `interop_rust_client_c_ioc` additionally calls `std::env::set_var` on
-# `EPICS_CA_SERVER_PORT` (tests/interop_rust_client_c_ioc.rs:46-48).
+# `EPICS_CA_SERVER_PORT` (tests/integration/interop_rust_client_c_ioc.rs:50).
 # Note the group's old stated reason — "softIoc spawns share
 # EPICS_CA_SERVER_PORT globally" — does not hold: every spawn site passes
 # the port per child with `cmd.env(...)` on an ephemeral number, and

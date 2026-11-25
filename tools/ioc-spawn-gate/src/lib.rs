@@ -730,7 +730,8 @@ fn mod_decls(file: &Path, children: &Path) -> Vec<ModDecl> {
 /// plain `mod`s resolve under `children`.
 ///
 /// A test binary's spawn sites are usually in a shared helper module —
-/// `tests/common/mod.rs`, `tests/parity/interop.rs` — so scanning only the
+/// `tests/integration/common/mod.rs`,
+/// `tests/integration/interop_helpers/mod.rs` — so scanning only the
 /// root file would attribute nothing to the binary that actually spawns.
 fn module_closure(root: &Path, children: &Path) -> Vec<PathBuf> {
     let mut seen = BTreeSet::new();
@@ -1064,7 +1065,7 @@ fn named_dev_dep_evidence(files: &[PathBuf], deps: &[DevDepSpawner]) -> Option<S
 ///
 /// A spawn site in the *library* additionally makes every binary in the
 /// package a spawner, because the library is what they all call:
-/// `tests/oracle.rs` spawns three IOCs per case through
+/// `tests/integration/oracle.rs` spawns three IOCs per case through
 /// `epics-oracle-rs/src/ioc.rs` without containing the word `Command`. That
 /// promotion ADDS rows. It must never replace them — a library match used to
 /// return one package row and drop the crate's real per-binary census on the
@@ -1085,8 +1086,8 @@ pub fn spawners_in_crate(crate_dir: &Path, tokens: &BTreeSet<String>) -> Vec<Spa
     let through_lib = |ev: &str| format!("{ev} (through the {package} library this binary links)");
 
     // Keyed by the nextest binary and module, because a `binary()` term
-    // selects by name and `epics-oracle-rs` has both a bin target and a
-    // `tests/oracle.rs` called `oracle` — one name, one row, one declaration.
+    // selects by name: a bin target and a `tests/<name>.rs` of one name are
+    // one name, one row, one declaration.
     // First-hand evidence wins over the library fallback; otherwise the first
     // found.
     type Key = (Option<String>, Option<String>);

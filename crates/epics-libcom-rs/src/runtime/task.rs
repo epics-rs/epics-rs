@@ -4480,7 +4480,7 @@ mod tests {
     /// Rooted at `src`, not at `src/runtime`, because the claim these guards
     /// make is about this crate. `epics-base-rs`'s two thread-creating files
     /// (`server/ioc_app.rs`, `server/scan.rs`) are swept by the same
-    /// assertions in that crate's own `tests/thread_census.rs`:
+    /// assertions in that crate's own `tests/integration/thread_census.rs`:
     /// `include_str!` must not cross a crate boundary — a path outside the
     /// package directory does not survive `cargo publish` — so the guard is
     /// split by subject, not weakened.

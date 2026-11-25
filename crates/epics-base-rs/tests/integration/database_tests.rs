@@ -10626,7 +10626,7 @@ async fn init_applies_constant_dol_across_record_types() {
     // `recGblInitConstantLink`, and only a JSON `{const:"…"}` link carries text
     // — softIoc: `field(DOL,"\"hello\"")` is a CA_LINK (LEN 0, UDF 1), while
     // `field(DOL,{const:"hello"})` loads VAL "hello" / LEN 6 / UDF 0. See
-    // tests/long_string_constant_link_load.rs.
+    // tests/integration/long_string_constant_link_load.rs.
     let mut lso = LsoRecord::default();
     lso.omsl = 1;
     lso.dol = r#"{const:"hello"}"#.into();

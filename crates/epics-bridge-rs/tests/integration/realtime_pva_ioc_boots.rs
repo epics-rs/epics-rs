@@ -1,15 +1,16 @@
 //! `realtime-pva-ioc` must complete its whole init path on the host under
 //! `EPICS_RS_BUILD_EXEC_BACKEND=thread` without a panic.
 //!
-//! The reasoning is `epics-ca-rs`'s `tests/realtime_ca_ioc_boots.rs`, applied
-//! to the other IOC binary: under `exec_backend` the `runtime::task` seam
-//! routes `spawn` to the std-thread background executor, a future that lands
-//! on a callback-pool worker runs with **no tokio reactor entered**, and a
-//! `#[tokio::test]` cannot reproduce that because it has a reactor on its own
-//! thread. Only the real binary — which starts no tokio runtime at all — is
-//! the configuration the target has, so only a process test sees the whole
-//! init path: database load, QSRV2 install, pvalink resolver install, PVA
-//! client start, first search and first dial.
+//! The reasoning is `epics-ca-rs`'s
+//! `tests/integration/realtime_ca_ioc_boots.rs`, applied to the other IOC
+//! binary: under `exec_backend` the `runtime::task` seam routes `spawn` to the
+//! std-thread background executor, a future that lands on a callback-pool
+//! worker runs with **no tokio reactor entered**, and a `#[tokio::test]` cannot
+//! reproduce that because it has a reactor on its own thread. Only the real
+//! binary — which starts no tokio runtime at all — is the configuration the
+//! target has, so only a process test sees the whole init path: database load,
+//! QSRV2 install, pvalink resolver install, PVA client start, first search and
+//! first dial.
 //!
 //! And as there, the assertion is liveness *and* a clean console: a panic on
 //! a callback-pool worker kills that worker and leaves the IOC serving, so

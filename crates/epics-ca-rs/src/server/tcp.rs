@@ -19382,8 +19382,10 @@ mod bind_tcp_set_tests {
     /// OS-picked number (`caservertask.c:266`), not just the first interface.
     #[tokio::test]
     async fn a_requested_port_held_on_a_later_interface_moves_every_interface() {
-        let held = std::net::TcpListener::bind((LO2, 0)).unwrap();
-        let port = held.local_addr().unwrap().port();
+        // Held, so no other socket on the box was handed the number on LO.
+        let held = named_port::HeldPort::tcp();
+        let port = held.port;
+        let _taken_on_lo2 = std::net::TcpListener::bind((LO2, port)).unwrap();
         let (listeners, bound) = bind_tcp_set(vec![LO, LO2], port).await.expect("bind");
         assert_ne!(bound, port);
         assert_eq!(ports(&listeners), [(LO, bound), (LO2, bound)]);

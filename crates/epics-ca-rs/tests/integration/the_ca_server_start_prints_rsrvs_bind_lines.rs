@@ -33,10 +33,9 @@ async fn child_builds_the_server() {
 
 #[test]
 fn skip_restart_and_missing_broadcast_lines_are_rsrvs() {
-    let requested = {
-        let l = std::net::TcpListener::bind(("127.0.0.2", 0)).unwrap();
-        l.local_addr().unwrap().port()
-    };
+    // Held until the child is done, so its OS-picked restart never repeats it.
+    let held = named_port::HeldPort::tcp();
+    let requested = held.port;
     let out = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",

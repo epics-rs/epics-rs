@@ -179,6 +179,17 @@ pub struct ScanControl {
     dev_sup: Arc<crate::runtime::interrupt_accept::InterruptGate>,
     /// Set by C `scanInit`'s `buildScanLists`; never cleared.
     lists_built: std::sync::atomic::AtomicBool,
+    /// The I/O Intr pumps' wakes, judged at each transition.
+    io_intr: parking_lot::Mutex<IoIntrJudge>,
+}
+
+#[derive(Default)]
+struct IoIntrJudge {
+    /// Whether a wake sent now is admitted: set before `run` opens the gate
+    /// and after `pause`/`stop` close it, so a device that can see the gate
+    /// open is admitted.
+    admits: bool,
+    wakes: Vec<std::sync::Weak<IoIntrWakes>>,
 }
 
 const SCAN_CTL_PAUSE: u8 = 2;
@@ -192,7 +203,50 @@ impl ScanControl {
             gate: crate::runtime::interrupt_accept::InterruptGate::new(),
             dev_sup: crate::runtime::interrupt_accept::InterruptGate::new(),
             lists_built: std::sync::atomic::AtomicBool::new(false),
+            io_intr: parking_lot::Mutex::default(),
         }
+    }
+
+    /// A record's I/O Intr wakes from `rx`, each judged when it is sent by
+    /// this facility's state then, as C `scanIoRequest` queues nothing unless
+    /// `ctlRun` (`dbScan.c:616-618`). A device that processes directly
+    /// ([`io_intr_processes_directly`]) is not judged: every wake is admitted.
+    ///
+    /// [`io_intr_processes_directly`]: crate::server::device_support::DeviceSupport::io_intr_processes_directly
+    pub(crate) fn io_intr_wakes(
+        &self,
+        rx: crate::runtime::sync::mpsc::Receiver<()>,
+        direct: bool,
+    ) -> Arc<IoIntrWakes> {
+        let wakes = |admits| {
+            Arc::new(IoIntrWakes(parking_lot::Mutex::new(Wakes {
+                rx,
+                judged: std::collections::VecDeque::new(),
+                admits,
+            })))
+        };
+        if direct {
+            return wakes(true);
+        }
+        let mut judge = self.io_intr.lock();
+        let wakes = wakes(judge.admits);
+        judge.wakes.retain(|w| w.strong_count() > 0);
+        judge.wakes.push(Arc::downgrade(&wakes));
+        wakes
+    }
+
+    /// Judge every wake queued so far by the state it was sent in, and the
+    /// ones sent from now on by `admits`.
+    fn judge_io_intr(&self, admits: bool) {
+        let mut judge = self.io_intr.lock();
+        judge.admits = admits;
+        judge.wakes.retain(|w| match w.upgrade() {
+            Some(wakes) => {
+                wakes.judge(admits);
+                true
+            }
+            None => false,
+        });
     }
 
     /// The gate C's `finishDevSup` opens, for a device whose dset `init`
@@ -272,6 +326,7 @@ impl ScanControl {
             .store(SCAN_CTL_PAUSE, std::sync::atomic::Ordering::Release);
         // `iocBuild` runs `finishDevSup` before any `scanRun`.
         self.finish_dev_sup();
+        self.judge_io_intr(true);
         self.gate.set(true);
     }
 
@@ -283,6 +338,7 @@ impl ScanControl {
             .store(SCAN_CTL_PAUSE, std::sync::atomic::Ordering::Release);
         // C `scanPause` clears `interruptAccept` (`dbScan.c:241`).
         self.gate.set(false);
+        self.judge_io_intr(false);
     }
 
     /// C `scanStop` (`dbScan.c:154-178`), less the joins: the threads are
@@ -295,6 +351,64 @@ impl ScanControl {
             .store(SCAN_CTL_EXIT, std::sync::atomic::Ordering::Release);
         // C `scanStop` clears `interruptAccept` (`dbScan.c:165`).
         self.gate.set(false);
+        self.judge_io_intr(false);
+    }
+}
+
+/// One record's I/O Intr wakes, each carrying whether it was admitted when
+/// it was sent: C `ioscanCallback` processes what `scanIoRequest` queued
+/// whatever the state by then (`dbScan.c:961-970`).
+pub(crate) struct IoIntrWakes(parking_lot::Mutex<Wakes>);
+
+struct Wakes {
+    rx: crate::runtime::sync::mpsc::Receiver<()>,
+    /// The wakes queued before each transition and not yet taken, oldest
+    /// first: how many, and whether they were admitted. Those queued since
+    /// the last transition are judged by `admits`.
+    judged: std::collections::VecDeque<(usize, bool)>,
+    admits: bool,
+}
+
+impl IoIntrWakes {
+    /// The next wake and whether it was admitted; `None` once the device has
+    /// dropped its sender.
+    pub(crate) async fn next(&self) -> Option<bool> {
+        std::future::poll_fn(|cx| {
+            let mut wakes = self.0.lock();
+            let woke = std::task::ready!(wakes.rx.poll_recv(cx));
+            std::task::Poll::Ready(woke.map(|()| wakes.take_judged()))
+        })
+        .await
+    }
+
+    /// How many wakes are queued.
+    pub(crate) fn len(&self) -> usize {
+        self.0.lock().rx.len()
+    }
+
+    fn judge(&self, admits: bool) {
+        let mut wakes = self.0.lock();
+        let judged: usize = wakes.judged.iter().map(|&(n, _)| n).sum();
+        let fresh = wakes.rx.len().saturating_sub(judged);
+        if fresh > 0 {
+            let was = wakes.admits;
+            wakes.judged.push_back((fresh, was));
+        }
+        wakes.admits = admits;
+    }
+}
+
+impl Wakes {
+    fn take_judged(&mut self) -> bool {
+        let Some((n, admitted)) = self.judged.front_mut() else {
+            return self.admits;
+        };
+        let admitted = *admitted;
+        *n -= 1;
+        if *n == 0 {
+            self.judged.pop_front();
+        }
+        admitted
     }
 }
 

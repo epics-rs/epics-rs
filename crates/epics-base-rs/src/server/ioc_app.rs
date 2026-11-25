@@ -3544,7 +3544,7 @@ pub(crate) fn spawn_io_intr_pump(
     db: PvDatabase,
     rec_name: crate::types::RecordName,
     rec: Arc<record::RecordCell>,
-    mut intr_rx: crate::runtime::sync::mpsc::Receiver<()>,
+    intr_rx: crate::runtime::sync::mpsc::Receiver<()>,
     // C keeps one I/O Intr scan list per band and fires `callbackRequest` on
     // the band the record joined — `callbackSetPriority(prio,
     // &piosl->callback)` (`dbScan.c:597`), with `scanAdd` filing the record
@@ -3555,14 +3555,12 @@ pub(crate) fn spawn_io_intr_pump(
     independent: bool,
 ) -> crate::runtime::task::BackgroundTaskHandle<()> {
     let mut turns = db.register_io_intr_pump(&rec);
+    let wakes = db.scan_control().io_intr_wakes(intr_rx, direct);
     crate::runtime::task::spawn_background(prio, async move {
-        // One interrupt's pass.
-        let pump = async || {
-            // C `scanIoRequest` (`dbScan.c:616-618`): an I/O Intr callback
-            // queues nothing while the scan facility is not running, which is
-            // what `interruptAccept` buys a building or paused IOC. A
-            // device's own `dbProcess` passes no such gate.
-            if !direct && !db.scan_control().is_running() {
+        // One interrupt's pass, for a wake the facility admitted when it was
+        // sent.
+        let pump = async |admitted: bool| {
+            if !admitted {
                 return;
             }
             // Process if the device drives SCAN-independently, or the record
@@ -3582,16 +3580,16 @@ pub(crate) fn spawn_io_intr_pump(
             tokio::select! {
                 biased;
                 Some(turn) = turns.recv() => {
-                    for _ in 0..intr_rx.len() {
-                        if intr_rx.recv().await.is_none() {
+                    for _ in 0..wakes.len() {
+                        let Some(admitted) = wakes.next().await else {
                             break;
-                        }
-                        pump().await;
+                        };
+                        pump(admitted).await;
                     }
                     let _ = turn.send(());
                 }
-                woke = intr_rx.recv() => match woke {
-                    Some(()) => pump().await,
+                woke = wakes.next() => match woke {
+                    Some(admitted) => pump(admitted).await,
                     None => break,
                 },
             }
@@ -4157,6 +4155,178 @@ mod io_intr_scan_add_tests {
         assert_eq!(wired, 0);
         let rec = db.get_record("PASV").unwrap();
         assert_eq!(rec.read().common.scan, ScanType::Passive);
+    }
+}
+
+/// C `scanIoRequest` judges a wake when it is sent (`dbScan.c:616-618`), and
+/// `ioscanCallback` processes what it queued whatever the state by then
+/// (`:961-970`).
+#[cfg(test)]
+mod io_intr_pump_tests {
+    use std::collections::HashMap;
+    use std::sync::mpsc::{Receiver, Sender, channel};
+    use std::sync::{Arc, Mutex};
+
+    use crate::error::CaResult;
+    use crate::runtime::sync::mpsc;
+    use crate::server::database::PvDatabase;
+    use crate::server::device_support::{DeviceReadOutcome, DeviceSupport, DeviceUdf};
+    use crate::server::ioc_builder::IocBuilder;
+    use crate::server::record::{DbLinkType, DevSup, Dset, Record, RecordCell};
+
+    static HELD: DevSup = DevSup {
+        name: "devAiPumpHeld",
+        choice: "PumpHeld",
+        link_type: DbLinkType::InstIo,
+        dset: Dset::new(6, &[2, 3, 4], false),
+    };
+
+    /// Every read reports its start and waits for a release.
+    struct Held {
+        intr: Option<mpsc::Receiver<()>>,
+        started: Sender<()>,
+        release: Mutex<Receiver<()>>,
+    }
+
+    impl DeviceSupport for Held {
+        fn dtyp(&self) -> &str {
+            "PumpHeld"
+        }
+        fn io_intr_receiver(&mut self) -> Option<mpsc::Receiver<()>> {
+            self.intr.take()
+        }
+        fn read(&mut self, _record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
+            let _ = self.started.send(());
+            let _ = self
+                .release
+                .lock()
+                .unwrap()
+                .recv_timeout(fact_budget::FACT_BUDGET);
+            Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
+        }
+        fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {
+            Ok(())
+        }
+    }
+
+    /// A running IOC whose I/O Intr record `SRC` reads from [`Held`].
+    struct Pumped {
+        db: Arc<PvDatabase>,
+        src: Arc<RecordCell>,
+        wake: mpsc::Sender<()>,
+        started: Receiver<()>,
+        release: Sender<()>,
+    }
+
+    impl Pumped {
+        async fn running() -> Self {
+            let (wake, intr) = mpsc::channel(4);
+            let (started_tx, started) = channel();
+            let (release, release_rx) = channel();
+            let device = Mutex::new(Some(Held {
+                intr: Some(intr),
+                started: started_tx,
+                release: Mutex::new(release_rx),
+            }));
+            let (db, _) = IocBuilder::new()
+                .register_device_support("ai", &HELD, move || {
+                    Box::new(device.lock().unwrap().take().expect("one Held record"))
+                })
+                .db_string(
+                    r#"record(ai, "SRC") { field(DTYP, "PumpHeld") field(INP, "@x") field(SCAN, "I/O Intr") }"#,
+                    &HashMap::new(),
+                )
+                .unwrap()
+                .build()
+                .await
+                .unwrap();
+            let src = db.get_record("SRC").unwrap();
+            db.scan_control().run();
+            Pumped {
+                db,
+                src,
+                wake,
+                started,
+                release,
+            }
+        }
+
+        fn wake(&self) {
+            self.wake.try_send(()).unwrap();
+        }
+
+        /// A read has started.
+        fn read_started(&self) {
+            self.started
+                .recv_timeout(fact_budget::FACT_BUDGET)
+                .expect("a read starts");
+        }
+
+        /// Release the read in flight, and one more if it starts.
+        fn release_two(&self) {
+            self.release.send(()).unwrap();
+            self.release.send(()).unwrap();
+        }
+
+        /// Return once the pump has taken every wake queued now.
+        async fn drained(&self) {
+            let turn = self.db.ask_io_intr_turn(&self.src).expect("SRC has a pump");
+            crate::runtime::task::timeout(fact_budget::FACT_BUDGET, turn)
+                .await
+                .expect("the pump takes its queued wakes")
+                .expect("the pump answers the turn");
+        }
+
+        fn reads_since(&self) -> usize {
+            self.started.try_iter().count()
+        }
+    }
+
+    #[epics_macros_rs::epics_test]
+    async fn a_wake_sent_before_stop_is_processed_after_it() {
+        let p = Pumped::running().await;
+        p.wake();
+        p.read_started();
+        p.wake();
+        p.db.scan_control().stop();
+        p.release_two();
+        p.read_started();
+    }
+
+    #[epics_macros_rs::epics_test]
+    async fn a_wake_sent_after_stop_is_never_processed() {
+        let p = Pumped::running().await;
+        p.wake();
+        p.read_started();
+        p.db.scan_control().stop();
+        p.wake();
+        p.release_two();
+        p.drained().await;
+        assert_eq!(p.reads_since(), 0);
+    }
+
+    #[epics_macros_rs::epics_test]
+    async fn a_wake_sent_before_pause_is_processed_after_it() {
+        let p = Pumped::running().await;
+        p.wake();
+        p.read_started();
+        p.wake();
+        p.db.scan_control().pause();
+        p.release_two();
+        p.read_started();
+    }
+
+    #[epics_macros_rs::epics_test]
+    async fn a_wake_sent_while_paused_is_not_processed_after_run() {
+        let p = Pumped::running().await;
+        p.wake();
+        p.read_started();
+        p.db.scan_control().pause();
+        p.wake();
+        p.db.scan_control().run();
+        p.release_two();
+        p.drained().await;
+        assert_eq!(p.reads_since(), 0);
     }
 }
 

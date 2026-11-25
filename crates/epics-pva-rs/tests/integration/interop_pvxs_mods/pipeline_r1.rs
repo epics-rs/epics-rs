@@ -14,7 +14,7 @@
 //! If `softIocPVX` is not present under the resolved pvxs tree's
 //! `bin/<arch>/`, the test fails.
 
-// RTEMS-EXEC-MODEL-ALLOW(1): not run by the default nextest profile - this file is a module of the `interop_pvxs` binary, which `.config/nextest.toml`'s default-filter excludes.
+// RTEMS-EXEC-MODEL-ALLOW(1): not run by the default nextest profile - this file is a module of `interop_pvxs` in the `integration` binary, whose tests `.config/nextest.toml`'s default-filter excludes.
 
 use super::interop_helpers::{
     SOFT_IOC_PVX, pick_localhost_port, pvxs_command, pvxs_dbd_dir, require_pvxs,

@@ -8,7 +8,7 @@
 //! run it explicitly:
 //!
 //! ```text
-//! cargo test --release -p epics-pva-rs --test put_bench \
+//! cargo test --release -p epics-pva-rs --test integration put_bench:: \
 //!     -- --ignored --nocapture --test-threads=1
 //! ```
 //!

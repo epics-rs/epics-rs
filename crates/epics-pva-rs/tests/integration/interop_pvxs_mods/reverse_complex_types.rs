@@ -18,7 +18,7 @@
 //! FAILS if the C++ helper cannot be built: this suite is opt-in
 //! (`--profile interop`), so getting here means the trees resolved.
 
-// RTEMS-EXEC-MODEL-ALLOW(1): not run by the default nextest profile - this file is a module of the `interop_pvxs` binary, which `.config/nextest.toml`'s default-filter excludes.
+// RTEMS-EXEC-MODEL-ALLOW(1): not run by the default nextest profile - this file is a module of `interop_pvxs` in the `integration` binary, whose tests `.config/nextest.toml`'s default-filter excludes.
 
 use epics_pva_rs::pvdata::{PvField, ScalarValue};
 

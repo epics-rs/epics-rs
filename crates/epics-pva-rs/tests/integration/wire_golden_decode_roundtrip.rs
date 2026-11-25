@@ -18,8 +18,7 @@
 //!
 //! No external dep — runs on any host.
 
-#[path = "interop_helpers/pv_builders.rs"]
-mod pv_builders;
+use crate::interop_helpers_pv_builders as pv_builders;
 
 use epics_pva_rs::proto::ByteOrder;
 use epics_pva_rs::pvdata::{PvField, ScalarValue, encode::*};

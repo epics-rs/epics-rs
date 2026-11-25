@@ -16,7 +16,7 @@
 //! - Run pvxs `pvxget` with `EPICS_PVA_TLS_KEYCHAIN=<p12>`.
 //! - Assert pvxget succeeds and round-trips the value.
 //!
-//! The Rust↔Rust handshake is already covered by `tests/tls.rs`.
+//! The Rust↔Rust handshake is already covered by `tests/integration/tls.rs`.
 
 #![cfg(tokio_backend)]
 
@@ -76,7 +76,7 @@ async fn interop_tls_a_pvxget_over_tls_to_rust_server() {
         pvxs_has_tls(),
         "the located pvxs has no TLS support (`pvxinfo -D` lacks EPICS_PVA_TLS_KEYCHAIN); \
          rebuild pvxs on the `origin/tls` branch with libevent+OpenSSL, or set PVXS_TLS_HOME. \
-         Rust-side TLS is covered by tests/tls.rs"
+         Rust-side TLS is covered by tests/integration/tls.rs"
     );
     let pvxget = locate_tls_binary("pvxget");
 

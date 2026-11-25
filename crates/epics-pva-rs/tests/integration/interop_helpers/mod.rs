@@ -9,7 +9,9 @@
 
 #![allow(dead_code)]
 
-pub mod pv_builders;
+// main.rs declares it once: the wire_golden modules use it too.
+#[cfg(unix)]
+pub(crate) use crate::interop_helpers_pv_builders as pv_builders;
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -734,7 +736,7 @@ fn publish_helper(staged: &Path, out: &Path) {
 
 fn build_cpp_helper(name: &str, defines: &[&str]) -> PathBuf {
     let src = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/interop_pvxs_mods/cpp_helpers")
+        .join("tests/integration/interop_pvxs_mods/cpp_helpers")
         .join(format!("{name}.cpp"));
     assert!(src.is_file(), "C++ interop helper source missing: {src:?}");
     let out_dir = helper_out_dir();

@@ -73,7 +73,7 @@ jobs:
             - 'crates/epics-pva-rs/src/server_native/**'
             - 'crates/epics-pva-rs/tests/wire_golden*.rs'
             - 'crates/epics-pva-rs/tests/interop_*.rs'
-            - 'crates/epics-pva-rs/tests/pva_cases/**'
+            - 'crates/epics-pva-rs/tests/integration/pva_cases/**'
             - '.config/nextest.toml'
             - '.github/workflows/interop.yml'
 

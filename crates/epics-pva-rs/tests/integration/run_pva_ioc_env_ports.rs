@@ -47,7 +47,7 @@ fn serves_on_the_env_ports(db: &std::path::Path, tcp: u16) -> Option<()> {
         named_port::free_for_tcp_and_udp(),
     );
     let mut child = Command::new(std::env::current_exe().unwrap())
-        .args(["ioc_child", "--exact", "--nocapture"])
+        .args(["run_pva_ioc_env_ports::ioc_child", "--exact", "--nocapture"])
         .env(CHILD, db)
         .env("EPICS_PVAS_SERVER_PORT", tcp.to_string())
         .env("EPICS_PVAS_BROADCAST_PORT", udp.to_string())
@@ -158,7 +158,7 @@ fn a_held_search_port_is_printed_and_the_shell_survives() {
     let held = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
     let udp = held.local_addr().unwrap().port();
     let mut child = Command::new(std::env::current_exe().unwrap())
-        .args(["ioc_child", "--exact", "--nocapture"])
+        .args(["run_pva_ioc_env_ports::ioc_child", "--exact", "--nocapture"])
         .env(CHILD, &db)
         .env("EPICS_PVAS_SERVER_PORT", "0")
         .env("EPICS_PVAS_BROADCAST_PORT", udp.to_string())
@@ -212,7 +212,7 @@ fn pvxsr_at_the_first_prompt_reports_the_bound_server() {
     let db = dir.path().join("first.db");
     std::fs::write(&db, "record(ai, \"FIRST:X\") { field(VAL, \"1\") }\n").unwrap();
     let mut child = Command::new(std::env::current_exe().unwrap())
-        .args(["ioc_child", "--exact", "--nocapture"])
+        .args(["run_pva_ioc_env_ports::ioc_child", "--exact", "--nocapture"])
         .env(CHILD, &db)
         .env("EPICS_PVAS_SERVER_PORT", "0")
         .env("EPICS_PVAS_BROADCAST_PORT", "0")

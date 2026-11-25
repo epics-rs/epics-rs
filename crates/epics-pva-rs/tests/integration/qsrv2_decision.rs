@@ -56,7 +56,7 @@ fn run(entry: &str, enable: Option<&str>, input: &[u8]) -> String {
     )
     .unwrap();
     let mut cmd = Command::new(std::env::current_exe().unwrap());
-    cmd.args(["ioc_child", "--exact", "--nocapture"])
+    cmd.args(["qsrv2_decision::ioc_child", "--exact", "--nocapture"])
         .env(CHILD, &db)
         .env(ENTRY, entry)
         .env_remove("EPICS_IOC_IGNORE_SERVERS")

@@ -15,4 +15,5 @@
 
 #![allow(clippy::needless_range_loop)]
 
+#[path = "pva_cases/mod.rs"]
 mod pva_cases;

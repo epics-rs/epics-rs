@@ -1239,7 +1239,7 @@ with reason.
 
 - **PVA-R1** (LOW, interop) — Wire-level proof that the Rust
   client puts `record._options.pipeline` into the pvRequest sent
-  to a real pvxs server. `tests/interop_pvxs_mods/pipeline_r1.rs`
+  to a real pvxs server. `tests/integration/interop_pvxs_mods/pipeline_r1.rs`
   spawns `softIocPVX` with `PVXS_LOG=pvxs.tcp.setup=DEBUG`,
   drives a Rust `PvaClient` with `pipeline_size(4)`, then
   asserts the pvxs server's captured stderr contains the
@@ -1251,10 +1251,10 @@ with reason.
   helpers (now `pub(crate)`). Plumbed `guid` through
   `PvaServerConfig` and added a `pub fn tcp_addr()` accessor on
   `PvaServer`. Two reproducers:
-  - `tests/interop_pvxs_mods/tcp_search_r11.rs::interop_r11_tcp_circuit_search_returns_matching_cid`
+  - `tests/integration/interop_pvxs_mods/tcp_search_r11.rs::interop_r11_tcp_circuit_search_returns_matching_cid`
     builds a raw SEARCH frame on TCP and asserts cid round-trip
     (no pvxs dep — pure-Rust validation of the handler).
-  - `tests/interop_pvxs_mods/tcp_search_r11.rs::interop_r11_pvxget_via_name_server_resolves_pv_on_rust_server`
+  - `tests/integration/interop_pvxs_mods/tcp_search_r11.rs::interop_r11_pvxget_via_name_server_resolves_pv_on_rust_server`
     runs the real `pvxget` configured with
     `EPICS_PVA_NAME_SERVERS=<rust>:port` against a Rust-hosted
     PV and asserts the value is read end-to-end.
@@ -1262,7 +1262,7 @@ with reason.
   `server_native::tcp::tests::pva_r20_*` (typed Bool, typed Int,
   string `"true"`, typed Bool false, queueSize<2). Wire-level
   interop added via a C++ harness
-  `tests/interop_pvxs_mods/cpp_helpers/r20_typed_monitor.cpp`
+  `tests/integration/interop_pvxs_mods/cpp_helpers/r20_typed_monitor.cpp`
   built on demand against `$PVXS_HOME/include` + libpvxs; it
   subscribes with the typed-builder
   `Context::request().record("pipeline", true)` shape against the

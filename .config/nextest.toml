@@ -78,9 +78,9 @@ default-filter = """
     binary(interop_rust_client_c_ioc) |
     binary(differential_libca) |
     binary(stress_load) |
-    binary(wire_golden_pvxs) |
+    (binary(integration) & test(/^wire_golden_pvxs::/)) |
     binary(wire_golden_ext) |
-    binary(interop_pvxs)
+    (binary(integration) & test(/^interop_pvxs::/))
   )
 """
 
@@ -98,9 +98,9 @@ default-filter = """
   binary(interop_c_client_rust_ioc) |
   binary(interop_rust_client_c_ioc) |
   binary(differential_libca) |
-  binary(wire_golden_pvxs) |
+  (binary(integration) & test(/^wire_golden_pvxs::/)) |
   binary(wire_golden_ext) |
-  binary(interop_pvxs) |
+  (binary(integration) & test(/^interop_pvxs::/)) |
   binary(discovery_mdns) |
   binary(attributes_file_over_ca) |
   binary(stress_load) |
@@ -169,9 +169,9 @@ default-filter = """
     binary(interop_rust_client_c_ioc) |
     binary(differential_libca) |
     binary(stress_load) |
-    binary(wire_golden_pvxs) |
+    (binary(integration) & test(/^wire_golden_pvxs::/)) |
     binary(wire_golden_ext) |
-    binary(interop_pvxs) |
+    (binary(integration) & test(/^interop_pvxs::/)) |
     binary(/^reference_/) |
     (binary(integration) & test(/^reference_/)) |
     package(epics-oracle-rs) |
@@ -199,7 +199,7 @@ filter = 'package(ad-plugins-rs) and test(file_magick::)'
 test-group = 'ndarray_io'
 
 [[profile.default.overrides]]
-filter = 'binary(stability) | binary(tls) | binary(typed_nt) | binary(service_framework) | binary(pva_gateway) | binary(set_byte_order_renegotiate) | binary(heartbeat_echo) | binary(run_pva_ioc_env_ports) | binary(qsrv2_decision)'
+filter = '(binary(integration) & test(/^stability::/)) | (binary(integration) & test(/^tls::/)) | (binary(integration) & test(/^typed_nt::/)) | (binary(integration) & test(/^service_framework::/)) | binary(pva_gateway) | (binary(integration) & test(/^set_byte_order_renegotiate::/)) | (binary(integration) & test(/^heartbeat_echo::/)) | (binary(integration) & test(/^run_pva_ioc_env_ports::/)) | (binary(integration) & test(/^qsrv2_decision::/))'
 test-group = 'pva_listener'
 
 # Serialised IOC spawners. These four are the group's original membership
@@ -301,14 +301,15 @@ test-group = 'ca_softioc'
 #                                        first takes port 0, the second a
 #                                        named port it retries when taken.
 #                                        Every child ends at stdin EOF.
-#   binary(interop_pvxs)               — fix-db measured 3 failures in 20
+#   (binary(integration) & test(/^interop_pvxs::/))
+#                                      — fix-db measured 3 failures in 20
 #                                        runs with ONE test alone in the
 #                                        run on an idle host: not a
 #                                        concurrency effect, so a cap
 #                                        would cost wall time and buy
 #                                        nothing.
 [[profile.default.overrides]]
-filter = 'package(epics-oracle-rs) | package(qsrv-ioc) | package(c-ca-tools) | binary(realtime_ca_ioc_boots) | binary(realtime_pva_ioc_boots) | binary(cli_tcp_port_fallback) | binary(cli_monitor_disconnect_stderr) | binary(cli_monitor_separator) | binary(cli_env_double_diagnostics) | binary(softioc_default_is_interactive) | binary(softioc_verbose_brackets_the_script_and_iocinit) | binary(softioc_resolves_a_ca_link) | binary(softioc_db_channel_create_line) | binary(qsrv_rs_group_file) | binary(qsrv_rs_sources) | binary(qsrv_rs_resolves_a_ca_link) | binary(qsrv_rs_resolves_a_pva_link) | binary(dual_ioc_rs_resolves_a_pva_link) | binary(interop_pvxs) | binary(softioc_boot_stream_split) | binary(softioc_iocinit_line_precedes_init_record) | binary(softioc_pini_order) | binary(events_per_chan_clamp_is_reported_at_server_start) | binary(softioc_ioc_init_starts_scanning) | binary(softioc_prompt_ioc_init_starts_the_ca_server)'
+filter = 'package(epics-oracle-rs) | package(qsrv-ioc) | package(c-ca-tools) | binary(realtime_ca_ioc_boots) | binary(realtime_pva_ioc_boots) | binary(cli_tcp_port_fallback) | binary(cli_monitor_disconnect_stderr) | binary(cli_monitor_separator) | binary(cli_env_double_diagnostics) | binary(softioc_default_is_interactive) | binary(softioc_verbose_brackets_the_script_and_iocinit) | binary(softioc_resolves_a_ca_link) | binary(softioc_db_channel_create_line) | binary(qsrv_rs_group_file) | binary(qsrv_rs_sources) | binary(qsrv_rs_resolves_a_ca_link) | binary(qsrv_rs_resolves_a_pva_link) | binary(dual_ioc_rs_resolves_a_pva_link) | (binary(integration) & test(/^interop_pvxs::/)) | binary(softioc_boot_stream_split) | binary(softioc_iocinit_line_precedes_init_record) | binary(softioc_pini_order) | binary(events_per_chan_clamp_is_reported_at_server_start) | binary(softioc_ioc_init_starts_scanning) | binary(softioc_prompt_ioc_init_starts_the_ca_server)'
 test-group = 'ioc_unthrottled'
 
 # Capped because nobody has measured them unthrottled.

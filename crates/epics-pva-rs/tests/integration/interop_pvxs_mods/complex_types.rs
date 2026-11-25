@@ -12,7 +12,7 @@
 //! additionally re-encodes each PV via the Rust encoder and writes
 //! the bytes to `tests/fixtures/pvxs/<pv>.bin` after a successful
 //! pvxget round-trip. The default-suite golden replay
-//! (`tests/wire_golden_complex_types.rs`) then compares the same
+//! (`tests/integration/wire_golden_complex_types.rs`) then compares the same
 //! encoder output against those fixtures on every push without
 //! needing pvxs locally. The trust chain: interop verifies pvxs
 //! accepts the bytes → capture freezes them → default suite holds

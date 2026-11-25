@@ -77,8 +77,9 @@ const VALUE: f64 = 25.0;
 ///
 /// # Safety (edition 2024)
 ///
-/// Process-env writes; the two tests in this file are `#[serial]`, so no
-/// other thread reads or writes the environment concurrently.
+/// Process-env writes; under nextest, the repo's runner, each test runs in
+/// its own process, so no other thread reads or writes the environment
+/// concurrently.
 fn apply_pvxs200_env() -> String {
     // `broadcast_addrs()` is deliberately NOT used: it is C's SEARCH
     // destination set, which for a point-to-point interface is the PEER
@@ -166,8 +167,8 @@ fn clear_pvxs200_env() {
 fn name_the_bound_ports(server: &PvaServer) -> (u16, u16) {
     let port = server.tcp_addr().port();
     let udp = server.report().udp_port;
-    // SAFETY: same as `apply_pvxs200_env` — both tests here are `#[serial]`
-    // and no thread of theirs reads the environment concurrently.
+    // SAFETY: same as `apply_pvxs200_env`, and no thread of this test reads
+    // the environment concurrently.
     unsafe {
         std::env::set_var("EPICS_PVA_SERVER_PORT", port.to_string());
         std::env::set_var("EPICS_PVA_BROADCAST_PORT", udp.to_string());

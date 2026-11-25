@@ -23,7 +23,7 @@
 //! derived + distinct-coverage) in
 //! `tools/pvxs-golden-capture/README.md`.
 
-const FIXTURES: &str = include_str!("../../tools/pvxs-golden-capture/fixtures.txt");
+const FIXTURES: &str = include_str!("../../../tools/pvxs-golden-capture/fixtures.txt");
 
 /// Return the pvxs-captured hex string for `key`. Panics if absent
 /// so a typo surfaces as a clear test failure, not a silent

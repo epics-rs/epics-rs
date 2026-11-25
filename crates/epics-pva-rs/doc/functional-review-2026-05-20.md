@@ -51,9 +51,9 @@ Rust evidence:
 - `encode.rs:1715-1747`, `:1775-1822`, and `:1849-1894` accept incoming
   `0x00` null elements, but decode them into empty structures or null-like
   union / variant values, losing whether the element was absent or present.
-- `crates/epics-pva-rs/tests/pva_cases/compound_edge.rs:9-27` documents the
-  gap and keeps pvxs golden fixtures ignored until the model can express null
-  elements.
+- `crates/epics-pva-rs/tests/integration/pva_cases/compound_edge.rs:9-27`
+  documents the gap and keeps pvxs golden fixtures ignored until the model can
+  express null elements.
 
 pvxs reference:
 

@@ -24,6 +24,7 @@
 #![allow(clippy::disallowed_macros, reason = "tests may keep eprintln!")]
 #![cfg(feature = "client")]
 
+#[path = "interop_helpers/mod.rs"]
 mod interop_helpers;
 
 #[cfg(unix)]

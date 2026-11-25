@@ -18,8 +18,7 @@
 //!   (b) pvxs's wire format changed (rare — re-run interop with
 //!       UPDATE_GOLDENS=1, review the diff, commit if intentional).
 
-#[path = "interop_helpers/pv_builders.rs"]
-mod pv_builders;
+use crate::interop_helpers_pv_builders as pv_builders;
 
 use pv_builders::{complex_pv_matrix, encode_pv_fixture, split_fixture};
 

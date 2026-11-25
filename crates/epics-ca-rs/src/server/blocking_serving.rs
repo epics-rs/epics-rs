@@ -665,15 +665,17 @@ mod tests {
             match started {
                 Err(ServeError::Thread(name, _)) if refuse => {
                     assert_eq!(name, at);
+                    // Closing the listener resets the client still waiting
+                    // in it; a read that times out found it held open.
+                    let read = c.read(&mut [0u8; 1]);
                     assert!(
-                        !echoes(&mut c),
-                        "still served after the start failed at {at}"
+                        matches!(&read, Ok(0))
+                            || matches!(&read, Err(e) if e.kind() == io::ErrorKind::ConnectionReset),
+                        "not closed after the start failed at {at}: {read:?}"
                     );
-                    // absence-window: as for the search during the start.
-                    assert!(
-                        !answers(udp, Duration::from_millis(500)),
-                        "still searched after the start failed at {at}"
-                    );
+                    if let Err(e) = UdpSocket::bind(udp) {
+                        panic!("{udp} still held after the start failed at {at}: {e}");
+                    }
                 }
                 Ok(serving) if !refuse => {
                     assert!(echoes(&mut c), "not served once every thread runs");

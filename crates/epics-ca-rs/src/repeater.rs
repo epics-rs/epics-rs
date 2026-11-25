@@ -980,4 +980,94 @@ mod tests {
             "the daemon must run SCHED_OTHER (0), not the client's SCHED_FIFO (1)"
         );
     }
+
+    /// A client created on a current-thread runtime starts the repeater
+    /// daemon while that runtime's other tasks keep running, though the
+    /// spawn itself waits out the child's O(OPEN_MAX) descriptor loop.
+    ///
+    /// The daemon arm needs a sibling `ca-repeater-rs`, so the test re-runs
+    /// itself from a hard link that has one. Linux only: there the fd limit
+    /// can be raised until the spawn outlasts scheduling noise.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_client_runtime_keeps_running_while_the_daemon_starts() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+        const TEST: &str =
+            "repeater::tests::a_client_runtime_keeps_running_while_the_daemon_starts";
+        const ROLE: &str = "EPICS_RS_REPEATER_SIBLING_DIR";
+
+        let Some(dir) = std::env::var_os(ROLE).map(std::path::PathBuf::from) else {
+            let exe = std::env::current_exe().unwrap();
+            let dir = tempfile::tempdir_in(exe.parent().unwrap()).unwrap();
+            let link = dir.path().join(exe.file_name().unwrap());
+            std::fs::hard_link(&exe, &link).unwrap();
+            let daemon = dir.path().join("ca-repeater-rs");
+            let started = dir.path().join("started");
+            std::fs::write(&daemon, format!("#!/bin/sh\n: > '{}'\n", started.display())).unwrap();
+            std::fs::set_permissions(&daemon, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let out = std::process::Command::new(&link)
+                .args(["--exact", TEST, "--nocapture"])
+                .env(ROLE, dir.path())
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        };
+
+        // SAFETY: a plain C struct, valid all-zero; the calls take its address.
+        unsafe {
+            let mut nofile: libc::rlimit = std::mem::zeroed();
+            libc::getrlimit(libc::RLIMIT_NOFILE, &mut nofile);
+            nofile.rlim_cur = nofile.rlim_max;
+            libc::setrlimit(libc::RLIMIT_NOFILE, &nofile);
+        }
+        let begun = Instant::now();
+        assert!(spawn_detached(std::path::Path::new("/bin/sh")));
+        let spawn = begun.elapsed();
+
+        let port = StdUdpSocket::bind("127.0.0.1:0")
+            .and_then(|s| s.local_addr())
+            .expect("probe port")
+            .port();
+        // SAFETY: this process runs this one test and has no other thread yet.
+        unsafe {
+            std::env::set_var("EPICS_CA_REPEATER_PORT", port.to_string());
+            std::env::set_var("EPICS_CA_ADDR_LIST", "");
+            std::env::set_var("EPICS_CA_AUTO_ADDR_LIST", "NO");
+        }
+        // RTEMS-EXEC-MODEL-ALLOW(1): the module is tokio_backend-only
+        // (lib.rs), so it never builds on the exec backend.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("client runtime");
+        let started = dir.join("started");
+        let longest = rt.block_on(async {
+            let _client = crate::client::CaClient::new().await.expect("CA client");
+            let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+            let mut longest = Duration::ZERO;
+            let mut last = Instant::now();
+            loop {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                let now = Instant::now();
+                longest = longest.max(now - last);
+                last = now;
+                if started.exists() {
+                    return longest;
+                }
+                assert!(now < deadline, "the client never started the daemon");
+            }
+        });
+        assert!(
+            longest < spawn / 2,
+            "the client's runtime stood still for {longest:?} while the daemon \
+             started; the spawn alone takes {spawn:?}"
+        );
+    }
 }

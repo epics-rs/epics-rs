@@ -13,6 +13,7 @@
 //! ```
 
 use asyn_rs::port::InterfaceMask;
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -25,11 +26,13 @@ use ad_core_rs::plugin::file_controller::{
     FileControl, FilePluginController, SettingsStore, WriterSettings,
 };
 use ad_core_rs::plugin::runtime::{NDPluginProcess, PluginAttributes, PluginPool, ProcessResult};
+use epics_libcom_rs::runtime::scanf::{ScanNum, sscanf};
 use parking_lot::Mutex;
 
-use rust_hdf5::{H5Dataset, H5File};
+use rust_hdf5::format::messages::datatype::DatatypeMessage;
+use rust_hdf5::{H5Dataset, H5File, H5Type};
 
-use crate::file_hdf5::{AttrTarget, write_ndattr_value};
+use crate::file_hdf5::{AttrTarget, c_s1_nullterm, write_ndattr_value};
 
 /// Serialize an NDArray data buffer to **little-endian** bytes. `rust-hdf5`
 /// 0.2.15 records every numeric datatype message as little-endian and copies
@@ -490,18 +493,21 @@ impl NexusWriter {
                 data.attrs = AttrNode::children(node, attributes);
             }
             Some("CONST") => {
-                // Constant dataset: string text written once.
-                if let Some(parent) = parent {
-                    let ds = Self::write_const_dataset(parent, &node.name, &node.text)?;
+                if let (Some(parent), Some(value)) =
+                    (parent, NxValue::constant(node.attr("outtype"), &node.text))
+                {
+                    let ds = value.write_dataset(parent, &node.name)?;
                     AttrNode::write_all(&AttrNode::children(node, attributes), &ds)?;
                 }
             }
             Some("ND_ATTR") => {
-                // Dataset sourced from an NDAttribute, written once.
                 if let Some(parent) = parent {
                     let source = node.attr("source").unwrap_or(&node.name);
-                    if let Some(attr) = attributes.get(source) {
-                        let ds = Self::write_attr_dataset(parent, &node.name, &attr.value)?;
+                    if let Some(value) = attributes
+                        .get(source)
+                        .and_then(|a| NxValue::attribute(&a.value))
+                    {
+                        let ds = value.write_dataset(parent, &node.name)?;
                         AttrNode::write_all(&AttrNode::children(node, attributes), &ds)?;
                     }
                 }
@@ -516,78 +522,12 @@ impl NexusWriter {
                     } else {
                         &node.text
                     };
-                    let ds = Self::write_const_dataset(parent, &node.name, text)?;
+                    let ds = NxValue::Char(text.into()).write_dataset(parent, &node.name)?;
                     AttrNode::write_all(&AttrNode::children(node, attributes), &ds)?;
                 }
             }
         }
         Ok(())
-    }
-
-    /// Write a constant string dataset (NeXus CONST node, NX_CHAR).
-    fn write_const_dataset(
-        group: &rust_hdf5::H5Group,
-        name: &str,
-        text: &str,
-    ) -> ADResult<H5Dataset> {
-        let bytes = text.as_bytes();
-        let len = bytes.len().max(1);
-        let ds = group
-            .new_dataset::<u8>()
-            .shape([len])
-            .create(name)
-            .map_err(|e| {
-                ADError::UnsupportedConversion(format!("NeXus const dataset '{}': {}", name, e))
-            })?;
-        let mut buf = bytes.to_vec();
-        if buf.is_empty() {
-            buf.push(0);
-        }
-        ds.write_raw(&buf).map_err(|e| {
-            ADError::UnsupportedConversion(format!("NeXus const write '{}': {}", name, e))
-        })?;
-        Ok(ds)
-    }
-
-    /// Write an NDAttribute as a typed scalar dataset (NeXus ND_ATTR node).
-    /// The numeric NDAttrValue type is preserved, not stringified.
-    fn write_attr_dataset(
-        group: &rust_hdf5::H5Group,
-        name: &str,
-        value: &NDAttrValue,
-    ) -> ADResult<H5Dataset> {
-        macro_rules! scalar {
-            ($t:ty, $v:expr) => {{
-                let ds = group
-                    .new_dataset::<$t>()
-                    .shape([1usize])
-                    .create(name)
-                    .map_err(|e| {
-                        ADError::UnsupportedConversion(format!(
-                            "NeXus attr dataset '{}': {}",
-                            name, e
-                        ))
-                    })?;
-                ds.write_raw(&[$v]).map_err(|e| {
-                    ADError::UnsupportedConversion(format!("NeXus attr write '{}': {}", name, e))
-                })?;
-                ds
-            }};
-        }
-        Ok(match value {
-            NDAttrValue::Int8(v) => scalar!(i8, *v),
-            NDAttrValue::UInt8(v) => scalar!(u8, *v),
-            NDAttrValue::Int16(v) => scalar!(i16, *v),
-            NDAttrValue::UInt16(v) => scalar!(u16, *v),
-            NDAttrValue::Int32(v) => scalar!(i32, *v),
-            NDAttrValue::UInt32(v) => scalar!(u32, *v),
-            NDAttrValue::Int64(v) => scalar!(i64, *v),
-            NDAttrValue::UInt64(v) => scalar!(u64, *v),
-            NDAttrValue::Float32(v) => scalar!(f32, *v),
-            NDAttrValue::Float64(v) => scalar!(f64, *v),
-            NDAttrValue::String(s) => Self::write_const_dataset(group, name, s)?,
-            NDAttrValue::Undefined => Self::write_const_dataset(group, name, "")?,
-        })
     }
 }
 
@@ -605,8 +545,8 @@ struct DataNode {
 enum AttrNode {
     /// `ND_ATTR`: the NDAttribute in its own type (getAttrTypeNSize, :552).
     NdAttr { name: String, value: NDAttrValue },
-    /// `CONST`: the node text.
-    Const { name: String, text: String },
+    /// `CONST`: the node text in its `outtype`.
+    Const { name: String, value: NxValue },
 }
 
 impl AttrNode {
@@ -621,7 +561,7 @@ impl AttrNode {
             }
             "CONST" => Some(Self::Const {
                 name,
-                text: node.text.clone(),
+                value: NxValue::constant(node.attr("outtype"), &node.text)?,
             }),
             _ => None,
         }
@@ -640,13 +580,153 @@ impl AttrNode {
     fn write(&self, mut target: impl AttrTarget) -> ADResult<()> {
         match self {
             Self::NdAttr { name, value } => write_ndattr_value(&mut target, name, value),
-            Self::Const { name, text } => target.string(name, text),
+            Self::Const { name, value } => value.write_attr(&mut target, name),
         }
         .map_err(|e| ADError::UnsupportedConversion(format!("NeXus attribute error: {e}")))
     }
 
     fn write_all(attrs: &[Self], dataset: &H5Dataset) -> ADResult<()> {
         attrs.iter().try_for_each(|a| a.write(dataset))
+    }
+}
+
+/// A value as NDFileNexus passes it to `NXputattr` or `NXputdata`, in the NX
+/// type it is written as.
+#[derive(Debug, Clone, PartialEq)]
+enum NxValue {
+    Int8(i8),
+    UInt8(u8),
+    Int16(i16),
+    UInt16(u16),
+    Int32(i32),
+    UInt32(u32),
+    Int64(i64),
+    UInt64(u64),
+    Float32(f32),
+    Float64(f64),
+    /// `NX_CHAR`: as many bytes as the length C passes with them.
+    Char(Vec<u8>),
+}
+
+impl NxValue {
+    /// A `CONST` node's text in its `outtype`, NX_CHAR when absent, read as
+    /// constTextToDataType does (NDFileNexus.cpp:293-308, :427-443, :670-768).
+    /// `None` for an outtype typeStringToVal does not name: nxToHDF5Type
+    /// refuses it, so C creates nothing.
+    fn constant(outtype: Option<&str>, text: &str) -> Option<Self> {
+        // C leaves its `sscanf` target indeterminate when the text holds no
+        // number; this reads that as 0.
+        fn scan<T: ScanNum + Default>(text: &str, format: &str) -> T {
+            let value = Cell::new(T::default());
+            sscanf(text, format, &[&value]);
+            value.get()
+        }
+        let int = || scan::<i32>(text, "%d");
+        Some(match outtype.unwrap_or("NX_CHAR") {
+            "NX_CHAR" => Self::Char(text.into()),
+            "NX_INT8" => Self::Int8(int() as i8),
+            "NX_UINT8" => Self::UInt8(int() as u8),
+            "NX_INT16" => Self::Int16(int() as i16),
+            "NX_UINT16" => Self::UInt16(int() as u16),
+            "NX_INT32" => Self::Int32(int()),
+            "NX_UINT32" => Self::UInt32(int() as u32),
+            "NX_INT64" => Self::Int64(scan(text, "%lld")),
+            "NX_UINT64" => Self::UInt64(scan(text, "%llu")),
+            "NX_FLOAT32" => Self::Float32(scan::<f64>(text, "%lf") as f32),
+            "NX_FLOAT64" => Self::Float64(scan(text, "%lf")),
+            _ => return None,
+        })
+    }
+
+    /// An `ND_ATTR` dataset's value as getAttrTypeNSize types it
+    /// (NDFileNexus.cpp:319-333, :552-613): a string with its terminator, as
+    /// getValueInfo sizes it; `None` for an undefined one, which C skips.
+    fn attribute(value: &NDAttrValue) -> Option<Self> {
+        Some(match value {
+            NDAttrValue::Int8(v) => Self::Int8(*v),
+            NDAttrValue::UInt8(v) => Self::UInt8(*v),
+            NDAttrValue::Int16(v) => Self::Int16(*v),
+            NDAttrValue::UInt16(v) => Self::UInt16(*v),
+            NDAttrValue::Int32(v) => Self::Int32(*v),
+            NDAttrValue::UInt32(v) => Self::UInt32(*v),
+            NDAttrValue::Int64(v) => Self::Int64(*v),
+            NDAttrValue::UInt64(v) => Self::UInt64(*v),
+            NDAttrValue::Float32(v) => Self::Float32(*v),
+            NDAttrValue::Float64(v) => Self::Float64(*v),
+            NDAttrValue::String(s) => Self::Char([s.as_bytes(), b"\0"].concat()),
+            NDAttrValue::Undefined => return None,
+        })
+    }
+
+    /// The string type `H5Tset_size(len)` leaves (napi5.c NX5putattr,
+    /// NX5compmakedata64): HDF5 refuses a size of 0, so H5T_C_S1 keeps its
+    /// one byte, written from C's zeroed buffer.
+    fn char_type(bytes: &[u8]) -> (DatatypeMessage, Vec<u8>) {
+        let bytes = if bytes.is_empty() {
+            vec![0]
+        } else {
+            bytes.to_vec()
+        };
+        (c_s1_nullterm(bytes.len()), bytes)
+    }
+
+    /// NX5putattr: a scalar attribute.
+    fn write_attr(&self, target: &mut impl AttrTarget, name: &str) -> rust_hdf5::Result<()> {
+        match self {
+            Self::Int8(v) => target.scalar(name, v),
+            Self::UInt8(v) => target.scalar(name, v),
+            Self::Int16(v) => target.scalar(name, v),
+            Self::UInt16(v) => target.scalar(name, v),
+            Self::Int32(v) => target.scalar(name, v),
+            Self::UInt32(v) => target.scalar(name, v),
+            Self::Int64(v) => target.scalar(name, v),
+            Self::UInt64(v) => target.scalar(name, v),
+            Self::Float32(v) => target.scalar(name, v),
+            Self::Float64(v) => target.scalar(name, v),
+            Self::Char(bytes) => {
+                let (datatype, bytes) = Self::char_type(bytes);
+                target.typed(name, datatype, bytes)
+            }
+        }
+    }
+
+    /// NXmakedata with rank 1 and NXputdata: one element, a string being one
+    /// element of its length. A length of 0 is an unlimited dimension, which
+    /// napi5 chunks by one.
+    fn write_dataset(&self, group: &rust_hdf5::H5Group, name: &str) -> ADResult<H5Dataset> {
+        fn one<T: H5Type>(
+            group: &rust_hdf5::H5Group,
+            name: &str,
+            value: T,
+        ) -> rust_hdf5::Result<H5Dataset> {
+            let ds = group.new_dataset::<T>().shape([1]).create(name)?;
+            ds.write_raw(&[value])?;
+            Ok(ds)
+        }
+        match self {
+            Self::Int8(v) => one(group, name, *v),
+            Self::UInt8(v) => one(group, name, *v),
+            Self::Int16(v) => one(group, name, *v),
+            Self::UInt16(v) => one(group, name, *v),
+            Self::Int32(v) => one(group, name, *v),
+            Self::UInt32(v) => one(group, name, *v),
+            Self::Int64(v) => one(group, name, *v),
+            Self::UInt64(v) => one(group, name, *v),
+            Self::Float32(v) => one(group, name, *v),
+            Self::Float64(v) => one(group, name, *v),
+            Self::Char(text) => {
+                let (datatype, bytes) = Self::char_type(text);
+                let mut builder = group.new_dataset::<u8>().datatype(datatype).shape([1]);
+                if text.is_empty() {
+                    builder = builder.max_shape(&[None]).chunk(&[1]);
+                }
+                builder.create(name).and_then(|ds| {
+                    ds.write_raw_bytes(&bytes)?;
+                    Ok(ds)
+                })
+            }
+        }
+        .map_err(|e| ADError::UnsupportedConversion(format!("NeXus dataset '{name}': {e}")))
     }
 }
 
@@ -1345,11 +1425,7 @@ mod tests {
         assert_eq!(ds.shape(), vec![1, 2, 3]);
         // Constant title dataset created from the template node text.
         let title = h5file.dataset("scan/measurement/title").unwrap();
-        let title_bytes: Vec<u8> = title.read_raw().unwrap();
-        assert_eq!(
-            String::from_utf8_lossy(&title_bytes).trim_end_matches('\0'),
-            "const-title"
-        );
+        assert_eq!(title.read_strings().unwrap(), ["const-title"]);
 
         std::fs::remove_file(&path).ok();
     }
@@ -1390,17 +1466,14 @@ mod tests {
         wait_saved(&handle, 1);
         let h5file = H5File::open(&path).unwrap();
         let text = |name: &str| {
-            let bytes: Vec<u8> = h5file
+            h5file
                 .dataset(&format!("entry/data/{name}"))
                 .unwrap()
-                .read_raw()
-                .unwrap();
-            String::from_utf8_lossy(&bytes)
-                .trim_end_matches('\0')
-                .to_string()
+                .read_strings()
+                .unwrap()
         };
-        assert_eq!(text("model"), "PluginModel");
-        assert_eq!(text("make"), "FrameMake");
+        assert_eq!(text("model"), ["PluginModel"]);
+        assert_eq!(text("make"), ["FrameMake"]);
         std::fs::remove_file(&path).ok();
     }
 
@@ -1520,6 +1593,114 @@ mod tests {
                 .unwrap(),
             7
         );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A `CONST` node is written in its `outtype`, NX_CHAR when it has none,
+    /// the text read as `sscanf` reads it; an outtype NeXus does not name
+    /// writes nothing (NDFileNexus.cpp:293-310, :427-447, :670-768).
+    #[test]
+    fn const_nodes_are_written_in_their_outtype() {
+        let template = r#"<NXroot><NXentry name="entry"><NXdata name="data">
+              <Attr name="ratio" type="CONST" outtype="NX_FLOAT64">2.5</Attr>
+              <Attr name="offset" type="CONST" outtype="NX_INT16">-5 mm</Attr>
+              <Attr name="wrapped" type="CONST" outtype="NX_UINT8">300</Attr>
+              <Attr name="signal" type="CONST">1</Attr>
+              <Attr name="blank" type="CONST" outtype="NX_CHAR"></Attr>
+              <Attr name="bogus" type="CONST" outtype="NX_COMPLEX">1</Attr>
+              <count type="CONST" outtype="NX_INT32">12 counts</count>
+              <pi type="CONST" outtype="NX_FLOAT32">3.1415</pi>
+              <big type="CONST" outtype="NX_UINT64">-1</big>
+              <bogus type="CONST" outtype="NX_COMPLEX">1</bogus>
+              <frames type="pArray"/>
+            </NXdata></NXentry></NXroot>"#;
+        let path = write_one_frame(template, "nexus_const_outtype", vec![]);
+        let h5 = H5File::open(&path).unwrap();
+        let group = h5
+            .root_group()
+            .group("entry")
+            .unwrap()
+            .group("data")
+            .unwrap();
+        let mut attrs = group.attr_names().unwrap();
+        attrs.sort();
+        assert_eq!(
+            attrs,
+            ["NX_class", "blank", "offset", "ratio", "signal", "wrapped"]
+        );
+        let attr = |name: &str| group.attr(name).unwrap();
+        assert_eq!(attr("ratio").read_numeric::<f64>().unwrap(), 2.5);
+        assert_eq!(attr("offset").read_numeric::<i16>().unwrap(), -5);
+        assert_eq!(attr("wrapped").read_numeric::<u8>().unwrap(), 44);
+        // NX_CHAR is as long as its text; an empty one is HDF5's one byte.
+        for (name, text) in [("signal", "1"), ("blank", "")] {
+            assert!(matches!(
+                attr(name).datatype().unwrap(),
+                DatatypeMessage::FixedString { size: 1, .. }
+            ));
+            assert_eq!(attr(name).read_string().unwrap(), text);
+        }
+
+        let mut datasets = group.dataset_names().unwrap();
+        datasets.sort();
+        assert_eq!(
+            datasets,
+            ["big", "count", "frames", "pi", "timeStamp", "uniqueId"]
+        );
+        let one = |name: &str| {
+            let ds = h5.dataset(&format!("entry/data/{name}")).unwrap();
+            assert_eq!(ds.shape(), [1]);
+            ds
+        };
+        assert_eq!(one("count").read_raw::<i32>().unwrap(), [12]);
+        assert_eq!(one("pi").read_raw::<f32>().unwrap(), [3.1415f32]);
+        assert_eq!(one("big").read_raw::<u64>().unwrap(), [u64::MAX]);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// An NX_CHAR dataset holds one string as long as the length C gives
+    /// NXmakedata: a `CONST` or untyped node's text, an `ND_ATTR` string
+    /// with its terminator. An empty one is HDF5's one-byte string in an
+    /// unlimited dimension, and an undefined `ND_ATTR` writes nothing
+    /// (NDFileNexus.cpp:319-333, :427-475; napi5.c NX5compmakedata64).
+    #[test]
+    fn nx_char_datasets_hold_one_string_of_the_c_length() {
+        let template = r#"<NXroot><NXentry name="entry"><NXdata name="data">
+              <title type="CONST">const-title</title>
+              <empty type="CONST" outtype="NX_CHAR"></empty>
+              <note>free text</note>
+              <make type="ND_ATTR" source="Manufacturer"/>
+              <unset type="ND_ATTR" source="Unset"/>
+              <frames type="pArray"/>
+            </NXdata></NXentry></NXroot>"#;
+        let path = write_one_frame(
+            template,
+            "nexus_nx_char",
+            vec![
+                attribute("Manufacturer", NDAttrValue::String("FrameMake".into())),
+                attribute("Unset", NDAttrValue::Undefined),
+            ],
+        );
+        let h5 = H5File::open(&path).unwrap();
+        for (name, size, text) in [
+            ("title", 11, "const-title"),
+            ("empty", 1, ""),
+            ("note", 9, "free text"),
+            ("make", 10, "FrameMake"),
+        ] {
+            let ds = h5.dataset(&format!("entry/data/{name}")).unwrap();
+            assert_eq!(ds.shape(), [1], "{name}");
+            match ds.datatype().unwrap() {
+                DatatypeMessage::FixedString { size: s, .. } => assert_eq!(s, size, "{name}"),
+                other => panic!("{name} is {other:?}"),
+            }
+            assert_eq!(ds.read_strings().unwrap(), [text], "{name}");
+        }
+        assert_eq!(
+            h5.dataset("entry/data/empty").unwrap().max_shape().unwrap(),
+            [None]
+        );
+        assert!(h5.dataset("entry/data/unset").is_err());
         std::fs::remove_file(&path).ok();
     }
 

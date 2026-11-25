@@ -3988,7 +3988,18 @@ pub(crate) fn write_ndattr_value(
 pub(crate) trait AttrTarget {
     fn scalar<T: H5Type>(&mut self, name: &str, value: &T) -> rust_hdf5::Result<()>;
     fn array<T: H5Type>(&mut self, name: &str, values: &[T]) -> rust_hdf5::Result<()>;
-    fn string(&mut self, name: &str, value: &str) -> rust_hdf5::Result<()>;
+    /// A scalar attribute of `datatype` holding `bytes`.
+    fn typed(
+        &mut self,
+        name: &str,
+        datatype: DatatypeMessage,
+        bytes: Vec<u8>,
+    ) -> rust_hdf5::Result<()>;
+
+    fn string(&mut self, name: &str, value: &str) -> rust_hdf5::Result<()> {
+        let (datatype, bytes) = c_string(value);
+        self.typed(name, datatype, bytes)
+    }
 
     /// writeH5attrInt32 / writeH5attrFloat64 (NDFileHDF5.cpp:1117-1285): one
     /// value is a scalar, any other count a 1-D array.
@@ -4063,8 +4074,13 @@ impl<T: AttrTarget> AttrTarget for Gated<'_, T> {
     fn array<V: H5Type>(&mut self, name: &str, values: &[V]) -> rust_hdf5::Result<()> {
         self.create(name, |t| t.array(name, values))
     }
-    fn string(&mut self, name: &str, value: &str) -> rust_hdf5::Result<()> {
-        self.create(name, |t| t.string(name, value))
+    fn typed(
+        &mut self,
+        name: &str,
+        datatype: DatatypeMessage,
+        bytes: Vec<u8>,
+    ) -> rust_hdf5::Result<()> {
+        self.create(name, |t| t.typed(name, datatype, bytes))
     }
 }
 
@@ -4124,7 +4140,7 @@ fn ndarray_default_attrs(
 
 /// `H5Tcopy(H5T_C_S1)` with `H5Tset_size(size)` and
 /// `H5Tset_strpad(H5T_STR_NULLTERM)`.
-fn c_s1_nullterm(size: usize) -> DatatypeMessage {
+pub(crate) fn c_s1_nullterm(size: usize) -> DatatypeMessage {
     DatatypeMessage::FixedString {
         size: size as u32,
         padding: 0,
@@ -4243,8 +4259,12 @@ impl AttrTarget for &rust_hdf5::H5Group {
     fn array<T: H5Type>(&mut self, name: &str, values: &[T]) -> rust_hdf5::Result<()> {
         self.set_attr_array_numeric(name, values)
     }
-    fn string(&mut self, name: &str, value: &str) -> rust_hdf5::Result<()> {
-        let (datatype, bytes) = c_string(value);
+    fn typed(
+        &mut self,
+        name: &str,
+        datatype: DatatypeMessage,
+        bytes: Vec<u8>,
+    ) -> rust_hdf5::Result<()> {
         self.set_attr_typed(name, datatype, bytes)
     }
 }
@@ -4262,8 +4282,12 @@ impl AttrTarget for &rust_hdf5::H5Dataset {
             .create(name)?
             .write_array(values)
     }
-    fn string(&mut self, name: &str, value: &str) -> rust_hdf5::Result<()> {
-        let (datatype, bytes) = c_string(value);
+    fn typed(
+        &mut self,
+        name: &str,
+        datatype: DatatypeMessage,
+        bytes: Vec<u8>,
+    ) -> rust_hdf5::Result<()> {
         self.set_attr_typed(name, datatype, bytes)
     }
 }
@@ -4279,8 +4303,12 @@ impl AttrTarget for SwmrDataset<'_> {
         self.0
             .set_dataset_attr_array(self.1, name, &[values.len() as u64], values)
     }
-    fn string(&mut self, name: &str, value: &str) -> rust_hdf5::Result<()> {
-        let (datatype, bytes) = c_string(value);
+    fn typed(
+        &mut self,
+        name: &str,
+        datatype: DatatypeMessage,
+        bytes: Vec<u8>,
+    ) -> rust_hdf5::Result<()> {
         self.0.set_dataset_attr_typed(self.1, name, datatype, bytes)
     }
 }
@@ -4296,8 +4324,12 @@ impl AttrTarget for SwmrGroup<'_> {
         self.0
             .set_group_attr_array(self.1, name, &[values.len() as u64], values)
     }
-    fn string(&mut self, name: &str, value: &str) -> rust_hdf5::Result<()> {
-        let (datatype, bytes) = c_string(value);
+    fn typed(
+        &mut self,
+        name: &str,
+        datatype: DatatypeMessage,
+        bytes: Vec<u8>,
+    ) -> rust_hdf5::Result<()> {
         self.0.set_group_attr_typed(self.1, name, datatype, bytes)
     }
 }

@@ -2098,18 +2098,7 @@ impl CaChannel {
         count: u32,
         ioid: u32,
     ) -> CaResult<()> {
-        // C `libca/nciu.cpp::read()` rejects before queueing
-        // when `!accessRightState.readPermit()` (ECA_NORDACCESS).
-        // Pre-fix Rust forwarded the request anyway and let the
-        // server (or a timeout) surface the denial; the cached
-        // access bits from the last CA_PROTO_ACCESS_RIGHTS frame
-        // are the authoritative client-side gate libca consults.
-        if !snap.access_rights.read {
-            return Err(CaError::Protocol(format!(
-                "read denied by cached access rights (matches libca \
-                 nciu::read ECA_NORDACCESS); ioid {ioid}"
-            )));
-        }
+        snap.permit_read()?;
         // C `tcpiiu::readNotifyRequest` (`tcpiiu.cpp:1463-1478`) bounds the
         // requested element count against what the circuit can carry
         // (ECA_TOLARGE past it), then substitutes the channel's native count
@@ -2156,14 +2145,7 @@ impl CaChannel {
         ioid: u32,
         payload: Vec<u8>,
     ) -> CaResult<()> {
-        // C `libca/nciu.cpp::write()` rejects before queueing
-        // when `!accessRightState.writePermit()` (ECA_NOWTACCESS).
-        if !snap.access_rights.write {
-            return Err(CaError::Protocol(format!(
-                "write denied by cached access rights (matches libca \
-                 nciu::write ECA_NOWTACCESS); ioid {ioid}"
-            )));
-        }
+        snap.permit_write()?;
         // C `comQueSend::insertRequestWithPayLoad` refuses a DBR type past
         // `INVALID_DB_REQ` (`comQueSend.cpp:323`, → ECA_BADTYPE) and an array
         // past the peer's message-body limit (`:352-364`, → ECA_BADCOUNT),
@@ -2207,16 +2189,7 @@ impl CaChannel {
         count: u32,
         payload: Vec<u8>,
     ) -> CaResult<()> {
-        // cached-access write gate (see send_write_notify_fast).
-        // The nowait variant otherwise returned Ok(()) after putting
-        // an oversized / forbidden request on the wire.
-        if !snap.access_rights.write {
-            return Err(CaError::Protocol(
-                "write denied by cached access rights (matches libca \
-                 nciu::write ECA_NOWTACCESS)"
-                    .into(),
-            ));
-        }
+        snap.permit_write()?;
         // Same pre-queue type and element bounds as `send_write_notify_fast`
         // — a fire-and-forget put goes through the identical
         // `comQueSend::insertRequestWithPayLoad`, so `ca_array_put` returns
@@ -2314,7 +2287,7 @@ impl CaChannel {
         let mut pending: Vec<Pending> = Vec::new();
 
         for (index, ch) in channels.iter().enumerate() {
-            let snap = match ch.snapshot() {
+            let snap = match ch.snapshot().and_then(|s| s.permit_read().map(|()| s)) {
                 Ok(s) => s,
                 Err(e) => {
                     results[index] = Some(Err(e));
@@ -7146,5 +7119,145 @@ mod deadline_tests {
         )
         .await;
         sent("put_string_array");
+    }
+}
+
+#[cfg(all(test, tokio_backend))]
+mod cached_access_tests {
+    //! libca refuses a request the cached `CA_PROTO_ACCESS_RIGHTS` bits deny
+    //! before queueing it (`nciu.cpp:282,329,350`) and answers ECA_NORDACCESS
+    //! or ECA_NOWTACCESS (`oldChannelNotify.cpp:313-315,457-459,514-516`).
+    use super::*;
+    use epics_base_rs::error::CaOp;
+    use std::sync::atomic::AtomicUsize;
+
+    const READ_ONLY: u32 = 1;
+    const WRITE_ONLY: u32 = 2;
+    const BOUND: Duration = Duration::from_secs(2);
+    const DBR_TIME_DOUBLE: u16 = 20;
+
+    /// What reached the server: the transport route and, when the circuit
+    /// has one, the direct writer.
+    struct Wire {
+        transport: mpsc::UnboundedReceiver<TransportCommand>,
+        direct: mpsc::UnboundedReceiver<Vec<u8>>,
+    }
+
+    impl Wire {
+        fn assert_silent(&mut self, route: &str) {
+            assert!(
+                self.transport.try_recv().is_err(),
+                "{route}: a request reached the transport"
+            );
+            assert!(
+                self.direct.try_recv().is_err(),
+                "{route}: a frame reached the direct writer"
+            );
+        }
+    }
+
+    /// A connected DOUBLE channel granted `rights`, with or without a
+    /// direct writer for its circuit.
+    fn connected(rights: u32, with_writer: bool) -> (CaChannel, Wire) {
+        let (coord_tx, _coord_rx) = mpsc::unbounded_channel();
+        let mut ch = CaChannel::for_test(coord_tx);
+        let (transport_tx, transport) = mpsc::unbounded_channel();
+        ch.transport_tx = transport_tx;
+        let server_addr: SocketAddr = "127.0.0.1:5064".parse().unwrap();
+        ch.snapshots.insert(
+            ch.cid,
+            ChannelSnapshotPublic {
+                sid: 1,
+                native_type: DbFieldType::Double,
+                element_count: 1,
+                server_addr,
+                access_rights: AccessRights::from_u32(rights),
+                state: ChannelState::Connected,
+                server_minor: 13,
+            },
+        );
+        let (write_tx, direct) = mpsc::unbounded_channel();
+        if with_writer {
+            ch.server_writers.insert(
+                (server_addr, ch.priority),
+                DirectServerWriter {
+                    write_tx,
+                    pending_frames: Arc::new(AtomicUsize::new(0)),
+                },
+            );
+        }
+        (ch, Wire { transport, direct })
+    }
+
+    fn status<T>(op: CaOp, result: CaResult<T>) -> Option<u32> {
+        result.err().map(|e| e.to_eca_status(op))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_read_the_cached_rights_deny_answers_no_read_access() {
+        for (route, direct) in [("transport", false), ("direct", true)] {
+            let (ch, mut wire) = connected(WRITE_ONLY, direct);
+            let denied = Some(ECA_NORDACCESS);
+            assert_eq!(
+                status(CaOp::Read, ch.get_with_timeout(BOUND).await),
+                denied,
+                "{route}: get"
+            );
+            assert_eq!(
+                status(
+                    CaOp::Read,
+                    ch.get_with_metadata(DbrClass::Time, BOUND).await
+                ),
+                denied,
+                "{route}: get_with_metadata"
+            );
+            assert_eq!(
+                status(CaOp::Read, ch.get_callback(DBR_TIME_DOUBLE, 1).map(drop)),
+                denied,
+                "{route}: get_callback"
+            );
+            let many = CaChannel::get_many_with_timeout(std::slice::from_ref(&ch), BOUND).await;
+            assert_eq!(
+                status(CaOp::Read, many.into_iter().next().expect("one result")),
+                denied,
+                "{route}: get_many_with_timeout"
+            );
+            wire.assert_silent(route);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_write_the_cached_rights_deny_answers_no_write_access() {
+        for (route, direct) in [("transport", false), ("direct", true)] {
+            let (ch, mut wire) = connected(READ_ONLY, direct);
+            let denied = Some(ECA_NOWTACCESS);
+            let one = EpicsValue::Double(1.0);
+            assert_eq!(
+                status(CaOp::Write, ch.put_with_timeout(&one, BOUND).await),
+                denied,
+                "{route}: put"
+            );
+            assert_eq!(
+                status(CaOp::Write, ch.put_callback(&one).map(drop)),
+                denied,
+                "{route}: put_callback"
+            );
+            assert_eq!(
+                status(CaOp::Write, ch.put_nowait(&one).await),
+                denied,
+                "{route}: put_nowait"
+            );
+            assert_eq!(
+                status(CaOp::Write, ch.put_string("1", BOUND).await),
+                denied,
+                "{route}: put_string"
+            );
+            assert_eq!(
+                status(CaOp::Write, ch.put_string_nowait("1").await),
+                denied,
+                "{route}: put_string_nowait"
+            );
+            wire.assert_silent(route);
+        }
     }
 }

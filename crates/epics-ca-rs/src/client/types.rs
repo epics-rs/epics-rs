@@ -10,6 +10,7 @@ use epics_base_rs::types::{DbFieldType, EpicsValue, PvString};
 
 use crate::channel::AccessRights;
 use crate::client::state::ChannelState;
+use crate::protocol::{ECA_NORDACCESS, ECA_NOWTACCESS};
 
 // --- Virtual-circuit identity ---
 
@@ -143,6 +144,28 @@ pub(crate) struct ChannelSnapshotPublic {
     /// 0 until the circuit's VERSION frame is seen, i.e. pre-V49 —
     /// the same conservative starting point as C's `tcpiiu`.
     pub server_minor: u16,
+}
+
+impl ChannelSnapshotPublic {
+    /// libca's cached-rights gate, ahead of queueing (`nciu.cpp:282,329,350`).
+    /// The refusal carries the status `oldChannelNotify.cpp` answers, in the
+    /// variant the server's own denial of that request arrives as.
+    pub(crate) fn permit_read(&self) -> CaResult<()> {
+        if self.access_rights.read {
+            Ok(())
+        } else {
+            Err(CaError::ServerError(ECA_NORDACCESS))
+        }
+    }
+
+    /// The write half of [`Self::permit_read`].
+    pub(crate) fn permit_write(&self) -> CaResult<()> {
+        if self.access_rights.write {
+            Ok(())
+        } else {
+            Err(CaError::WriteFailed(ECA_NOWTACCESS))
+        }
+    }
 }
 
 /// Shared snapshot registry. Coordinator publishes; CaChannel reads.

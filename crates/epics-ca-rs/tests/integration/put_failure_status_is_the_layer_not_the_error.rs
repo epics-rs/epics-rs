@@ -26,9 +26,9 @@
 #![cfg(tokio_backend)]
 #![cfg(feature = "client-core")]
 
-use epics_base_rs::error::CaError;
+use epics_base_rs::error::{CaError, CaOp};
 use epics_ca_rs::client::{CaClient, CaClientConfig};
-use epics_ca_rs::protocol::{ECA_BADTYPE, ECA_PUTFAIL};
+use epics_ca_rs::protocol::{ECA_BADTYPE, ECA_NOWTACCESS, ECA_PUTFAIL};
 use epics_ca_rs::server::CaServer;
 use serial_test::serial;
 
@@ -135,10 +135,9 @@ async fn a_field_the_channel_cannot_write_is_refused_before_the_put() {
         .put_string("3", fact_budget::FACT_BUDGET)
         .await
         .expect_err("a no-mod field must refuse the put");
-    // The refusal is the access gate's, not the database's: it carries no
-    // server put status, because no put was ever sent.
-    assert!(
-        !matches!(err, CaError::WriteFailed(_) | CaError::ServerError(_)),
+    assert_eq!(
+        err.to_eca_status(CaOp::Write),
+        ECA_NOWTACCESS,
         "STAT is special(SPC_NOMOD): the write must be refused by the access \
          gate above the put, not answered by the database; got {err:?}"
     );

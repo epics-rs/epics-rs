@@ -920,7 +920,8 @@ impl CaError {
             CaError::WriteFailed(code) | CaError::ServerError(code) => *code,
             // C's `rsrvCheckPut` gate, above the put (`camessage.c:741-751`).
             // Its read-side twin ECA_NORDACCESS has no variant of its own —
-            // that one arrives from the wire as `ServerError`.
+            // it rides `ServerError`, from the server's reply or from the
+            // client's cached-rights gate alike.
             CaError::ReadOnlyField(_) => ECA_NOWTACCESS,
             // Everything else is the database refusing: a value the field's
             // converter rejected, a menu string naming no choice, a link field

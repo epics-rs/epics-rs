@@ -497,6 +497,27 @@ impl PvAttrDbrType {
         }
     }
 
+    /// The DBR type C requests for a PV whose CA field type is `field`:
+    /// `DBR_NATIVE` resolves by the field type (PVAttribute.cpp:223-250), so
+    /// a native ENUM is read as `DBR_SHORT`; any other `dbrtype` stands.
+    #[cfg(feature = "ioc")]
+    fn for_field(self, field: epics_base_rs::types::DbFieldType) -> Self {
+        use epics_base_rs::types::DbFieldType as F;
+        if self != Self::Native {
+            return self;
+        }
+        // The internal-only types never come over CA; they take the DBR type
+        // the IOC promotes them to (`EpicsValue::dbr_type`).
+        match field {
+            F::String => Self::String,
+            F::Short | F::Enum => Self::Int16,
+            F::Float => Self::Float32,
+            F::Char | F::UChar => Self::Int8,
+            F::Long | F::UShort => Self::Int32,
+            F::Double | F::Int64 | F::UInt64 | F::ULong => Self::Float64,
+        }
+    }
+
     /// Publish a monitored value as the type this `dbrtype` asked for.
     ///
     /// C requests the type on the wire (`ca_add_masked_array_event(dbrType, …)`,
@@ -611,14 +632,16 @@ pub fn spawn_ca_monitor(
             return;
         };
         while let Some(Ok(snapshot)) = monitor.recv().await {
-            cell.set(dbr_type.publish(epics_value_to_nd_attr(&snapshot.value)));
+            let requested = dbr_type.for_field(snapshot.value.dbr_type());
+            cell.set(requested.publish(epics_value_to_nd_attr(&snapshot.value)));
         }
     })
 }
 
 /// Convert an `epics-ca-rs` [`epics_ca_rs::EpicsValue`] scalar to an
 /// [`NDAttrValue`]. Array values collapse to their first element (an NDArray
-/// attribute is scalar); empty arrays yield `Undefined`.
+/// attribute is scalar); empty arrays yield `Undefined`. The variant only
+/// carries the value: [`PvAttrDbrType::publish`] picks the attribute's type.
 #[cfg(feature = "ioc")]
 fn epics_value_to_nd_attr(value: &epics_ca_rs::EpicsValue) -> NDAttrValue {
     use epics_ca_rs::EpicsValue as E;

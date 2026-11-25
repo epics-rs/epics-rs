@@ -10,9 +10,10 @@ and is never linked into a shipped artefact.
 > with a precision (`{:.3}`, `{:>8.*}`, `{:.p$}`) or the `e` / `E` type must
 > format an argument written `CFloat(..)`.
 
-The caller names the crates and the exemptions: `tests/cfloat_gate.rs` holds
-epics-rs's (`crates/*`, `examples/*`), and epics-rs-iocs runs the same check
-over its members through a git dev-dependency.
+The caller names the crates and the exemptions:
+`tests/integration/cfloat_gate.rs` holds epics-rs's (`crates/*`, `examples/*`),
+and epics-rs-iocs runs the same check over its members through a git
+dev-dependency.
 
 Those placeholders are the workspace's spelling of C's `%.Nf` / `%e`. On a
 raw `f64`, Rust prints `NaN` with its sign dropped where glibc prints `nan` /

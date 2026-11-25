@@ -3,12 +3,11 @@
 //! the table it already applied; N of them on the notify thread allocate
 //! nothing. A table change may allocate: it is a configuration event.
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use alloc_count::thread;
 use asyn_rs::asyn_record::register_port;
 use asyn_rs::error::AsynResult;
 use asyn_rs::interrupt::{InterruptFilter, InterruptValue};
@@ -20,29 +19,6 @@ use asyn_rs::runtime::port::create_port_runtime_unclaimed;
 use asyn_rs::user::AsynUser;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
-
-static ALLOCS: AtomicUsize = AtomicUsize::new(0);
-
-thread_local! {
-    static COUNTING: Cell<bool> = const { Cell::new(false) };
-}
-
-struct Counting;
-
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-        if COUNTING.try_with(Cell::get).unwrap_or(false) {
-            ALLOCS.fetch_add(1, Ordering::SeqCst);
-        }
-        unsafe { System.alloc(l) }
-    }
-    unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-        unsafe { System.dealloc(p, l) }
-    }
-}
-
-#[global_allocator]
-static A: Counting = Counting;
 
 struct EnumPort {
     base: PortDriverBase,
@@ -144,13 +120,11 @@ async fn enum_value_fires_with_a_ring_client_allocate_nothing_on_the_notify_thre
         })
         .collect();
     let mut it = fires.into_iter();
-    let a0 = ALLOCS.load(Ordering::SeqCst);
-    COUNTING.with(|c| c.set(true));
+    let window = thread::open();
     for v in it.by_ref() {
         handle.interrupts().notify(v);
     }
-    COUNTING.with(|c| c.set(false));
-    let allocs = ALLOCS.load(Ordering::SeqCst) - a0;
+    let allocs = window.close().allocs;
     drop(it);
 
     // `>=`: the boot flush may land one more.

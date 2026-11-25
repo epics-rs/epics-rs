@@ -94,6 +94,8 @@ source-guard = { path = "../source-guard" }
 # cannot see each other's `tests/`, and two copies of a retry rule are two
 # chances to retry on the wrong evidence.
 named-port = { path = "../named-port" }
+# Dev-only and path-only: the counting allocator of the `alloc` binary.
+alloc-count = { path = "../alloc-count" }
 tempfile = "3"
 # Already a normal dependency; named here too so `tests/` can open the
 # interruptAccept gate to the post-`iocInit` precondition a real port has
@@ -122,23 +124,3 @@ epics-ca-rs = { workspace = true }
 [[bench]]
 name = "throughput"
 harness = false
-
-# Integration tests of the EPICS-IOC surface — the record device support, the
-# iocsh commands, and `epics_base_rs`'s database — so they exist only when that
-# surface does. In `tests/integration/` that is `#[cfg(feature = "epics")]` on
-# the `mod`; these three keep a process of their own for their counting
-# allocator, so the gate is `required-features` and cargo SKIPS the target,
-# instead of compiling a file whose contents have been cfg'd away to nothing,
-# which reads as a passing test that never ran. `tools/target-cfg-gate` holds
-# both declarations to the files' imports, for every crate rather than this one.
-[[test]]
-name = "asyn_reentry_allocates_nothing"
-required-features = ["epics"]
-
-[[test]]
-name = "enum_notify_allocates_nothing"
-required-features = ["epics"]
-
-[[test]]
-name = "notify_allocates_nothing"
-required-features = ["epics"]

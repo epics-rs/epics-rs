@@ -2,16 +2,15 @@
 //! `callbackRequestProcessCallback(&pasynRecPvt->callback, ...)`
 //! (asynRecord.c:830-831), the `epicsCallback` its private structure owns
 //! (:227): the port thread queues it and the callback thread re-enters the
-//! record, neither allocating. Counted per thread with this binary's own
+//! record, neither allocating. Counted per thread with the alloc binary's
 //! allocator, on the port's actor and the callback bands, over an IOC put
 //! cycle.
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
+use alloc_count::named::{self, Name};
 use asyn_rs::asyn_record::AsynRecord;
 use asyn_rs::error::AsynResult;
 use asyn_rs::port::InterfaceMask;
@@ -25,62 +24,8 @@ use epics_base_rs::types::EpicsValue;
 
 const PORT: &str = "REENTRY";
 
-thread_local! {
-    /// 0 not yet asked, 1 the port's actor, 2 a callback band, 3 any other
-    /// thread. Asking may itself allocate; that reentry reads 3.
-    static ROLE: Cell<u8> = const { Cell::new(0) };
-}
-
-static ARMED: AtomicBool = AtomicBool::new(false);
-static ACTOR: AtomicU64 = AtomicU64::new(0);
-static BAND: AtomicU64 = AtomicU64::new(0);
-
-fn role() -> u8 {
-    ROLE.with(|r| match r.get() {
-        0 => {
-            r.set(3);
-            let role = match std::thread::current().name() {
-                Some(PORT) => 1,
-                Some(n) if n.starts_with("cb") => 2,
-                _ => 3,
-            };
-            r.set(role);
-            role
-        }
-        v => v,
-    })
-}
-
-fn count() {
-    if ARMED.load(Ordering::Relaxed) {
-        match role() {
-            1 => ACTOR.fetch_add(1, Ordering::Relaxed),
-            2 => BAND.fetch_add(1, Ordering::Relaxed),
-            _ => 0,
-        };
-    }
-}
-
-struct Counting;
-
-// SAFETY: forwards every call to `System` unchanged; the gate reads
-// const-initialised thread-locals and atomics.
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        count();
-        unsafe { System.alloc(layout) }
-    }
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        count();
-        unsafe { System.realloc(ptr, layout, size) }
-    }
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(ptr, layout) }
-    }
-}
-
-#[global_allocator]
-static GLOBAL: Counting = Counting;
+/// The port's actor, and the callback bands.
+static THREADS: [Name; 2] = [Name::Exact(PORT), Name::Prefix("cb")];
 
 static READS: AtomicI32 = AtomicI32::new(0);
 
@@ -165,13 +110,13 @@ async fn a_blocking_port_reentry_allocates_nothing() {
     for n in 1..=3 {
         cycle(&db, n).await;
     }
-    ARMED.store(true, Ordering::Relaxed);
+    let window = named::open(&THREADS);
     for n in 4..24 {
         cycle(&db, n).await;
     }
-    ARMED.store(false, Ordering::Relaxed);
+    let [actor, band] = window.close().map(|c| c.allocs);
     assert_eq!(
-        (ACTOR.load(Ordering::Relaxed), BAND.load(Ordering::Relaxed)),
+        (actor, band),
         (0, 0),
         "20 re-entry cycles allocated (actor, callback band)"
     );

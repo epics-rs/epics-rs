@@ -4,53 +4,13 @@
 //! allocates and frees nothing, enum value changes included: the mailbox
 //! coalesces to the latest instead of queueing.
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use alloc_count::{Counts, thread};
 use asyn_rs::interfaces::InterfaceType;
 use asyn_rs::interrupt::{InterruptFilter, InterruptManager, InterruptValue};
 use asyn_rs::param::{EnumEntry, ParamValue};
-
-static ALLOCS: AtomicUsize = AtomicUsize::new(0);
-static FREES: AtomicUsize = AtomicUsize::new(0);
-
-thread_local! {
-    static COUNTING: Cell<bool> = const { Cell::new(false) };
-}
-
-struct Counting;
-
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-        if COUNTING.try_with(Cell::get).unwrap_or(false) {
-            ALLOCS.fetch_add(1, Ordering::SeqCst);
-        }
-        unsafe { System.alloc(l) }
-    }
-    unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-        if COUNTING.try_with(Cell::get).unwrap_or(false) {
-            FREES.fetch_add(1, Ordering::SeqCst);
-        }
-        unsafe { System.dealloc(p, l) }
-    }
-}
-
-#[global_allocator]
-static A: Counting = Counting;
-
-fn counted<R>(f: impl FnOnce() -> R) -> (R, usize, usize) {
-    let (a0, f0) = (ALLOCS.load(Ordering::SeqCst), FREES.load(Ordering::SeqCst));
-    COUNTING.with(|c| c.set(true));
-    let r = f();
-    COUNTING.with(|c| c.set(false));
-    (
-        r,
-        ALLOCS.load(Ordering::SeqCst) - a0,
-        FREES.load(Ordering::SeqCst) - f0,
-    )
-}
 
 fn entry(s: &str, v: i32) -> EnumEntry {
     EnumEntry {
@@ -104,7 +64,7 @@ fn notify_with_a_ring_and_an_enum_client_allocates_and_frees_nothing() {
 
     // The iterator, and the buffer it frees on drop, stay outside the count.
     let mut it = fires.into_iter();
-    let ((), allocs, frees) = counted(|| {
+    let ((), Counts { allocs, frees, .. }) = thread::counted(|| {
         for v in it.by_ref() {
             im.notify(v);
         }
@@ -183,7 +143,7 @@ fn a_flush_with_an_octet_and_an_array_changed_allocates_nothing() {
         .unwrap();
     base.set_int32_param(num, 0, 2).unwrap();
 
-    let (r, allocs, frees) = counted(|| base.call_param_callbacks(0));
+    let (r, Counts { allocs, frees, .. }) = thread::counted(|| base.call_param_callbacks(0));
     r.unwrap();
     assert!(seen.load(Ordering::Relaxed) >= 3, "all three fired");
     assert_eq!(
@@ -214,18 +174,19 @@ fn an_octet_set_allocates_once_for_a_new_value_and_never_for_an_unchanged_one() 
     pl.set_string_param(msg, 0, "first value").unwrap();
 
     let owned = String::from("second value");
-    let (r, allocs, _) = counted(|| pl.set_string_param(msg, 0, &owned));
+    let (r, Counts { allocs, .. }) = thread::counted(|| pl.set_string_param(msg, 0, &owned));
     r.unwrap();
     assert_eq!(allocs, 1, "a new value: the shared buffer, and no Vec");
 
-    let (r, allocs, _) = counted(|| pl.set_string_param(msg, 0, "second value"));
+    let (r, Counts { allocs, .. }) =
+        thread::counted(|| pl.set_string_param(msg, 0, "second value"));
     r.unwrap();
     assert_eq!(allocs, 0, "an unchanged &str");
-    let (r, allocs, _) = counted(|| pl.set_string_param(msg, 0, &owned));
+    let (r, Counts { allocs, .. }) = thread::counted(|| pl.set_string_param(msg, 0, &owned));
     r.unwrap();
     assert_eq!(allocs, 0, "an unchanged String");
     let bytes: &[u8] = b"second value";
-    let (r, allocs, _) = counted(|| pl.set_string_param(msg, 0, bytes));
+    let (r, Counts { allocs, .. }) = thread::counted(|| pl.set_string_param(msg, 0, bytes));
     r.unwrap();
     assert_eq!(allocs, 0, "an unchanged byte slice");
 }
@@ -251,7 +212,7 @@ fn setting_and_flushing_256_params_allocates_nothing() {
         .collect();
 
     let mut fired = 0usize;
-    let (r, allocs, frees) = counted(|| {
+    let (r, Counts { allocs, frees, .. }) = thread::counted(|| {
         for &i in ids.iter().rev() {
             pl.set_int32_param(i, 0, 7).unwrap();
         }
@@ -316,17 +277,17 @@ fn a_flush_into_per_reason_mailboxes_neither_allocates_nor_frees() {
             .set_int32_array(wave, 0, (0..64).map(|k| k + i).collect::<Vec<i32>>())
             .unwrap();
         base.set_int32_param(num, 0, i).unwrap();
-        counted(|| base.call_param_callbacks(0))
+        thread::counted(|| base.call_param_callbacks(0))
     };
     for i in 0..2 {
         flush(i).0.unwrap();
     }
     let (mut allocs, mut frees) = (0, 0);
     for i in 2..258 {
-        let (r, a, f) = flush(i);
+        let (r, c) = flush(i);
         r.unwrap();
-        allocs += a;
-        frees += f;
+        allocs += c.allocs;
+        frees += c.frees;
     }
     assert_eq!(
         (allocs, frees),
@@ -452,17 +413,17 @@ fn a_flush_with_an_async_subscriber_neither_allocates_nor_frees() {
             .set_int32_array(wave, 0, (0..64).map(|k| k + i).collect::<Vec<i32>>())
             .unwrap();
         base.set_int32_param(num, 0, i).unwrap();
-        counted(|| base.call_param_callbacks(0))
+        thread::counted(|| base.call_param_callbacks(0))
     };
     for i in 0..4 {
         flush(i).0.unwrap();
     }
     let (mut allocs, mut frees) = (0, 0);
     for i in 4..260 {
-        let (r, a, f) = flush(i);
+        let (r, c) = flush(i);
         r.unwrap();
-        allocs += a;
-        frees += f;
+        allocs += c.allocs;
+        frees += c.frees;
     }
     assert_eq!(
         (allocs, frees),

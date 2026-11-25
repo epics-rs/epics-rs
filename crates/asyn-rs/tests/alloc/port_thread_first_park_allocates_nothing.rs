@@ -7,12 +7,11 @@
 //! connect while its driver's lock is held, so its thread's first park is that
 //! acquire and the live count climbs through those thresholds.
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
+use alloc_count::thread;
 use asyn_rs::error::AsynResult;
 use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
@@ -20,31 +19,6 @@ use asyn_rs::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 use asyn_rs::user::AsynUser;
 
 const PORTS: usize = 100;
-
-thread_local! {
-    static ALLOCS: Cell<u64> = const { Cell::new(0) };
-}
-
-struct Counting;
-
-// SAFETY: forwards every call to `System` unchanged; the counter is a
-// const-initialised thread-local `Cell`, which never allocates.
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCS.with(|n| n.set(n.get() + 1));
-        unsafe { System.alloc(layout) }
-    }
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(ptr, layout) }
-    }
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        ALLOCS.with(|n| n.set(n.get() + 1));
-        unsafe { System.realloc(ptr, layout, new_size) }
-    }
-}
-
-#[global_allocator]
-static GLOBAL: Counting = Counting;
 
 /// A driver whose connect takes a lock the test holds, and reports what the
 /// acquire cost its thread.
@@ -68,9 +42,9 @@ impl PortDriver for Device {
     fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
         let held = self.gate.try_lock().is_none();
         let _ = self.entered.send(());
-        let before = ALLOCS.with(Cell::get);
+        let window = thread::open();
         drop(self.gate.lock());
-        let allocs = ALLOCS.with(Cell::get) - before;
+        let allocs = window.close().allocs;
         self.contended.store(held, Ordering::SeqCst);
         self.allocs.store(allocs, Ordering::SeqCst);
         self.base_mut().set_connected(true);

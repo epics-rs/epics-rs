@@ -3,55 +3,15 @@
 //! the posting thread: no reply channel and no cancel token, since nothing
 //! answers it and nothing can cancel it or time it out.
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use alloc_count::{Counts, thread};
 use asyn_rs::param::{ParamType, ParamValue};
 use asyn_rs::port::{InterfaceMask, PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::request::{ParamSetValue, SectionScope};
 use asyn_rs::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 use epics_libcom_rs::runtime::interrupt_accept::InterruptGate;
-
-static ALLOCS: AtomicUsize = AtomicUsize::new(0);
-
-thread_local! {
-    static COUNTING: Cell<bool> = const { Cell::new(false) };
-}
-
-struct Counting;
-
-// SAFETY: forwards every call to `System` unchanged; the flag is a
-// const-initialised thread-local `Cell`, which never allocates.
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-        if COUNTING.try_with(Cell::get).unwrap_or(false) {
-            ALLOCS.fetch_add(1, Ordering::SeqCst);
-        }
-        unsafe { System.alloc(l) }
-    }
-    unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-        unsafe { System.dealloc(p, l) }
-    }
-    unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
-        if COUNTING.try_with(Cell::get).unwrap_or(false) {
-            ALLOCS.fetch_add(1, Ordering::SeqCst);
-        }
-        unsafe { System.realloc(p, l, n) }
-    }
-}
-
-#[global_allocator]
-static A: Counting = Counting;
-
-fn counted<R>(f: impl FnOnce() -> R) -> (R, usize) {
-    let a0 = ALLOCS.load(Ordering::SeqCst);
-    COUNTING.with(|c| c.set(true));
-    let r = f();
-    COUNTING.with(|c| c.set(false));
-    (r, ALLOCS.load(Ordering::SeqCst) - a0)
-}
 
 struct Device {
     base: PortDriverBase,
@@ -126,7 +86,8 @@ fn set_params_and_notify_allocates_nothing_on_the_posting_thread() {
     let mut allocs = 0;
     for i in 1..=2 * N {
         let updates = set(reason, i);
-        let (r, a) = counted(|| handle.set_params_and_notify_blocking(0, updates));
+        let (r, Counts { allocs: a, .. }) =
+            thread::counted(|| handle.set_params_and_notify_blocking(0, updates));
         r.unwrap();
         // The read queues behind the post, so the actor has run it.
         assert_eq!(handle.read_int32_blocking(reason, 0).unwrap(), i);
@@ -150,7 +111,7 @@ fn a_held_callbacks_gate_section_allocates_nothing_on_the_posting_thread() {
     let mut allocs = 0;
     for i in 1..=2 * N {
         let g = &mut gate;
-        let (after, opened) = counted(move || {
+        let (after, Counts { allocs: opened, .. }) = thread::counted(move || {
             let mut updates = g.updates();
             updates.push(ParamSetValue::new(reason, 0, ParamValue::Int32(i)));
             g.open(0, None, updates, SectionScope::default()).unwrap()
@@ -161,7 +122,7 @@ fn a_held_callbacks_gate_section_allocates_nothing_on_the_posting_thread() {
         };
         assert_eq!(read, i);
         assert_eq!(posts.load(Ordering::SeqCst), i as usize - 1, "held");
-        let (r, ended) = counted(|| after.end());
+        let (r, Counts { allocs: ended, .. }) = thread::counted(|| after.end());
         r.unwrap();
         // Any queued request runs after the held callbacks.
         handle.read_int32_blocking(reason, 0).unwrap();
@@ -196,7 +157,7 @@ fn a_backlog_of_sections_allocates_nothing_once_one_came_back() {
             std::thread::yield_now();
         }
         let g = &mut gate;
-        let ((), a) = counted(move || {
+        let ((), Counts { allocs: a, .. }) = thread::counted(move || {
             for i in 1..=DEEP as i32 {
                 let mut updates = g.updates();
                 updates.push(ParamSetValue::new(reason, 0, ParamValue::Int32(i)));
@@ -212,7 +173,10 @@ fn a_backlog_of_sections_allocates_nothing_once_one_came_back() {
         assert_eq!(posts.load(Ordering::SeqCst), before + 1 + DEEP);
         allocs.push(a);
     }
-    assert!(allocs[0] >= DEEP, "every section grew updates: {allocs:?}");
+    assert!(
+        allocs[0] >= DEEP as u64,
+        "every section grew updates: {allocs:?}"
+    );
     assert!(
         allocs[2..].iter().all(|&a| a == 0),
         "backlogs of {DEEP} sections: {allocs:?}"

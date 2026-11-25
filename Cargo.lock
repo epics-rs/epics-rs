@@ -230,6 +230,7 @@ dependencies = [
 name = "asyn-rs"
 version = "0.34.2"
 dependencies = [
+ "alloc-count",
  "asyn-rs",
  "bitflags",
  "chrono",

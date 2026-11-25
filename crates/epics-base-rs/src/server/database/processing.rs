@@ -4399,6 +4399,48 @@ impl PvDatabase {
         !self.scan_control().is_exiting()
     }
 
+    /// [`Self::spawn_callback_after`] with no delay: C `callbackRequest`.
+    pub(crate) fn spawn_callback<F>(
+        &self,
+        priority: crate::runtime::task::CallbackPriority,
+        task: F,
+    ) -> crate::runtime::task::BackgroundTaskHandle<()>
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.spawn_callback_after(priority, std::time::Duration::ZERO, task)
+    }
+
+    /// The one spawner of this database's callback-band tasks: C
+    /// `callbackRequestDelayed`. `callbackStop` leaves every callback still
+    /// pending unrun (callback.c:237-260) right after `scanStop`
+    /// (iocInit.c:733-735), so the task ends at its first wake — timer,
+    /// requeue or sleep — after [`Self::accepts_reentry`] turns false. The
+    /// runtime's own stop cannot do this: it is process-wide, comes later,
+    /// and refuses no spawned task.
+    pub(crate) fn spawn_callback_after<F>(
+        &self,
+        priority: crate::runtime::task::CallbackPriority,
+        delay: std::time::Duration,
+        task: F,
+    ) -> crate::runtime::task::BackgroundTaskHandle<()>
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        // The scan cell, not the database: a task must not keep it alive.
+        let scan = Arc::clone(self.scan_control());
+        crate::runtime::task::spawn_background_after(priority, delay, async move {
+            let mut task = std::pin::pin!(task);
+            std::future::poll_fn(|cx| {
+                if scan.is_exiting() {
+                    return std::task::Poll::Ready(());
+                }
+                task.as_mut().poll(cx)
+            })
+            .await
+        })
+    }
+
     /// Cancel any outstanding async re-entry token for `name` (C
     /// `callbackCancelDelayed`): advance the record's generation counter so
     /// every previously-minted [`AsyncToken`] for it becomes stale and its
@@ -4450,7 +4492,7 @@ impl PvDatabase {
         let token = Self::mint_async_token_in(name, rec);
         let prio = rec.read().common.callback_priority();
         let db = self.clone();
-        crate::runtime::task::spawn_background_after(prio, delay, async move {
+        self.spawn_callback_after(prio, delay, async move {
             let _ = token.fire(&db).await;
         });
     }
@@ -4475,11 +4517,8 @@ impl PvDatabase {
         let mut arm = rec.read().delayed_callbacks().arm(name, callback);
         let prio = rec.read().common.callback_priority();
         let db = self.clone();
-        crate::runtime::task::spawn_background_after(prio, delay, async move {
+        self.spawn_callback_after(prio, delay, async move {
             loop {
-                if !db.accepts_reentry() {
-                    return;
-                }
                 let Some(rec) = db.get_record_no_resolve(&arm.name) else {
                     return;
                 };
@@ -4540,7 +4579,7 @@ impl PvDatabase {
         let token = Self::mint_async_token_in(name, rec);
         let prio = rec.read().common.callback_priority();
         let db = self.clone();
-        crate::runtime::task::spawn_background_after(prio, delay, async move {
+        self.spawn_callback_after(prio, delay, async move {
             if !token.is_current() {
                 return;
             }
@@ -4642,7 +4681,7 @@ impl PvDatabase {
         // a live watchdog never keeps the database alive — the tick simply
         // stamps without TSEL if the database is already gone.
         let db = self.async_handle();
-        crate::runtime::task::spawn_background_after(prio, interval, async move {
+        self.spawn_callback_after(prio, interval, async move {
             loop {
                 // A newer arm superseded this task while it waited.
                 if generation.load(std::sync::atomic::Ordering::Acquire) != epoch {
@@ -4902,7 +4941,7 @@ impl PvDatabase {
     ) -> crate::runtime::task::BackgroundTaskHandle<()> {
         let prio = self.record_callback_priority(token.record_name());
         let db = self.clone();
-        crate::runtime::task::spawn_background(prio, async move {
+        self.spawn_callback(prio, async move {
             // `Err` means the sender was dropped without firing (the
             // downstream op vanished); treat it the same as completion so a
             // waiting record is never stranded — `fire` is a no-op if the
@@ -5027,7 +5066,7 @@ impl PvDatabase {
     ) {
         let prio = self.record_callback_priority(token.record_name());
         let db = self.clone();
-        crate::runtime::task::spawn_background(prio, async move {
+        self.spawn_callback(prio, async move {
             let _ = completion.await;
             if !token.is_current() {
                 return;
@@ -9447,12 +9486,9 @@ impl PvDatabase {
         // C pins every put-notify callback to the low band —
         // `callbackSetPriority(priorityLow, &pnotifyPvt->callback)`
         // (`dbNotify.c:131`) — regardless of the record's PRIO.
-        crate::runtime::task::spawn_background(
-            crate::runtime::task::CallbackPriority::Low,
-            async move {
-                db.restart_next_notify_put(&put_name).await;
-            },
-        );
+        self.spawn_callback(crate::runtime::task::CallbackPriority::Low, async move {
+            db.restart_next_notify_put(&put_name).await;
+        });
     }
 
     /// Forward-link / CP / RPRO tail for the simulation-mode path.

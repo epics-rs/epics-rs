@@ -127,7 +127,7 @@ impl PvDatabase {
     fn arm_link_check(&self, name: &[u8], delay: Duration) {
         let db = self.clone();
         let name = crate::types::RecordName::from(name);
-        crate::runtime::task::spawn_background_after(
+        self.spawn_callback_after(
             crate::runtime::task::CallbackPriority::Low,
             delay,
             async move {

@@ -502,6 +502,7 @@ mod declared_fields_are_served;
 mod declared_pp_processes_on_put;
 mod delayed_callbacks_are_independent_timers;
 mod delayed_callbacks_on_the_band;
+mod delayed_callbacks_stop_with_the_scan;
 mod derived_metadata_reproduces_the_replaced_arms;
 mod desc_field_read_as_double_fails;
 mod device_alarm_precedes_check_alarms;

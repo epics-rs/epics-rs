@@ -5311,13 +5311,9 @@ impl PvDatabase {
                             });
                         }
                     };
-                    // `processNextLink`'s own choice (`seqRecord.c:210-215`),
-                    // made before the walk is built so it is not moved twice.
-                    if first.is_zero() {
-                        crate::runtime::task::spawn_background(prio, walk());
-                    } else {
-                        crate::runtime::task::spawn_background_after(prio, first, walk());
-                    }
+                    // `processNextLink`'s own choice (`seqRecord.c:210-215`):
+                    // a zero `first` is `callbackRequest`.
+                    self.spawn_callback_after(prio, first, walk());
                     return MultiOutDispatch::went_async();
                 }
                 // `active` is empty: C's `if (!i) return asyncFinish(prec)`

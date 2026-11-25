@@ -87,6 +87,7 @@
 // match arm, which is otherwise only a warning.
 #![deny(unreachable_patterns)]
 
+pub mod alarm;
 pub mod drivers;
 pub mod error;
 pub(crate) mod escape;

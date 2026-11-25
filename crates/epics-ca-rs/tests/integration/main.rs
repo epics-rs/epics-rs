@@ -63,6 +63,7 @@ mod cli_caput_enum_order;
 mod cli_client_exception;
 mod cli_connect_gate;
 mod cli_dbr_type_race;
+mod cli_denial_output;
 mod cli_env_double_diagnostics;
 mod cli_env_port_diagnostics;
 mod cli_env_timeout;

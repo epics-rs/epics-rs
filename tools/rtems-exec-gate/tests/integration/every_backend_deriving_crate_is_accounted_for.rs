@@ -356,6 +356,7 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ("epics-ca-rs", "tests/integration/cli_client_exception.rs"),
     ("epics-ca-rs", "tests/integration/cli_connect_gate.rs"),
     ("epics-ca-rs", "tests/integration/cli_dbr_type_race.rs"),
+    ("epics-ca-rs", "tests/integration/cli_denial_output.rs"),
     ("epics-ca-rs", "tests/integration/cli_monitor_separator.rs"),
     ("epics-ca-rs", "tests/integration/cli_value_format.rs"),
     (

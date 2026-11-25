@@ -1,4 +1,5 @@
 use clap::{CommandFactory, FromArgMatches, Parser};
+use epics_base_rs::runtime::log::erl_error;
 use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
 use epics_ca_rs::cli::{
     CountPrefix, ValueFormat, ca_error_marker, format_time, format_value, format_value_segment,
@@ -6,6 +7,7 @@ use epics_ca_rs::cli::{
 };
 use epics_ca_rs::client::{CaChannel, CaClient, enum_string_readback_dbr};
 use epics_ca_rs::copt::{self, CTool};
+use epics_ca_rs::protocol::eca_message;
 use epics_ca_rs::{CaError, CaOp, DbFieldType, EpicsValue};
 use epics_libcom_rs::cfmt::CFloat;
 use std::time::SystemTime;
@@ -63,11 +65,13 @@ fn format_client_timestamp() -> String {
 /// The SINGLE owner of what a `caput` readback may write to STDERR.
 ///
 /// C's `caget()` (`caput.c:130-240`) has exactly ONE `fprintf(stderr, ...)`:
-/// the `ca_pend_io` timeout warning (`caput.c:186-188`). Every other outcome
-/// is silent on stderr —
+/// the `ca_pend_io` timeout warning (`caput.c:186-188`), and only a read that
+/// timed out prints it here —
 ///
 /// * a CA error or read denial renders its `*** ...` marker on STDOUT inside
-///   the print loop (`caput.c:200-206`) and `caget()` still returns 0;
+///   the print loop (`caput.c:200-206`) and `caget()` still returns 0. C adds
+///   the timeout line, after waiting out `-w`, only because libca never
+///   uncounts a refused get's IO (`getCopy.cpp:44`); nothing timed out.
 /// * `!nConn` returns 1 from `caput.c:181` BEFORE the print loop, so C emits
 ///   nothing on EITHER stream for that PV.
 ///
@@ -432,6 +436,8 @@ async fn main() {
                 );
                 std::process::exit(1);
             }
+            // C prints the timeout line for every failed menu read (libca never
+            // uncounts a refused get's IO, getCopy.cpp:44); the cause is named here.
             Err(e) => {
                 epics_libcom_rs::stderr_println!("error: {e}");
                 std::process::exit(1);
@@ -569,46 +575,54 @@ async fn main() {
         }
     }
 
-    let result = match &parsed_value {
-        WriteValue::Wire { dbr_type, value } => {
-            // C-tool wire model: send the explicit DBR type (DBR_STRING /
-            // DBR_CHAR) and let the server convert. The CLI `-w` timeout
-            // owns the callback wait, matching caput.c:556-567.
-            if callback {
-                ch.put_as_dbr_with_timeout(*dbr_type, value, timeout).await
-            } else {
-                ch.put_as_dbr_nowait(*dbr_type, value).await
-            }
-        }
-        WriteValue::EnumString(s) => {
-            // ENUM-by-name → DBR_STRING; the server resolves the menu
-            // string. Route through the same explicit-wire-type path as
-            // the numeric/-S writes so the CLI `-w` timeout owns the
-            // callback wait (caput.c:558-567 uses one caTimeout for every
-            // dbrType).
-            let v = epics_ca_rs::EpicsValue::String(s.clone());
-            let dbr = epics_ca_rs::DbFieldType::String as u16;
-            if callback {
-                ch.put_as_dbr_with_timeout(dbr, &v, timeout).await
-            } else {
-                ch.put_as_dbr_nowait(dbr, &v).await
-            }
-        }
-        WriteValue::EnumStringArray(v) => {
-            // ENUM waveform by name — DBR_STRING array, server resolves
-            // each element. Same single timeout owner as above.
-            let arr = epics_ca_rs::EpicsValue::StringArray(v.clone().into());
-            let dbr = epics_ca_rs::DbFieldType::String as u16;
-            if callback {
-                ch.put_as_dbr_with_timeout(dbr, &arr, timeout).await
-            } else {
-                ch.put_as_dbr_nowait(dbr, &arr).await
-            }
+    // C-tool wire model: every value goes under the DBR type the tool chose
+    // (`caput.c:539-541`) and the server converts. An ENUM written by name,
+    // scalar or waveform, is DBR_STRING and the server resolves the menu.
+    let (dbr, value) = match parsed_value {
+        WriteValue::Wire { dbr_type, value } => (dbr_type, value),
+        WriteValue::EnumString(s) => (DbFieldType::String as u16, EpicsValue::String(s)),
+        WriteValue::EnumStringArray(v) => (
+            DbFieldType::String as u16,
+            EpicsValue::StringArray(v.into()),
+        ),
+    };
+    // C reports a put refused when issued and one that failed on completion
+    // under two different lines (`caput.c:552-553`, `:573-574`).
+    let completion = if callback {
+        ch.put_as_dbr_callback(dbr, &value).map(Some)
+    } else {
+        ch.put_as_dbr_no_callback(dbr, &value).map(|()| None)
+    };
+    // Unlike C's fprintf of ERL_ERROR, the word is painted only on a
+    // terminal, as C's errlog paints it (errlog.c:789-793).
+    let completion = match completion {
+        Ok(c) => c,
+        Err(e) => {
+            epics_libcom_rs::stderr_println!(
+                "{} from put operation: {}",
+                erl_error(),
+                eca_message(e.to_eca_status(CaOp::Write))
+            );
+            std::process::exit(1);
         }
     };
-    if let Err(e) = result {
-        epics_libcom_rs::stderr_println!("error: {e}");
-        std::process::exit(1);
+    if let Some(done) = completion {
+        // The CLI `-w` timeout bounds the callback wait (caput.c:565).
+        match epics_base_rs::runtime::task::timeout(timeout, done).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                epics_libcom_rs::stderr_println!(
+                    "{} occurred writing data: {}",
+                    erl_error(),
+                    eca_message(e.to_eca_status(CaOp::Write))
+                );
+                std::process::exit(1);
+            }
+            Err(_) => {
+                epics_libcom_rs::stderr_println!("error: {}", CaError::Timeout);
+                std::process::exit(1);
+            }
+        }
     }
 
     // Re-read for echoing to stdout (matches C caput which always reads the PV
@@ -693,11 +707,9 @@ enum Readback {
     /// text to render, and carrying one only invited the port-invented
     /// `error: channel disconnected` line this replaces.
     Disconnected,
-    /// Any other readback failure. C's `ca_array_get` failing *synchronously*
-    /// — most notably read-access-denied, which libca rejects client-side with
-    /// `ECA_NORDACCESS` before any I/O is outstanding — leaves `ca_pend_io` at
-    /// `ECA_NORMAL`; `caget()` prints a `*** ...` marker for the PV but still
-    /// returns 0 (`caput.c:200-206,239`), so C exits 0.
+    /// Any other readback failure, read-access denial included: `caget()`
+    /// prints a `*** ...` marker for the PV and still returns 0
+    /// (`caput.c:200-206,239`), so C exits 0.
     Other(CaError),
 }
 
@@ -1296,11 +1308,11 @@ mod tests {
         );
     }
 
-    /// C's `caget()` inside caput has exactly ONE `fprintf(stderr, ...)` — the
-    /// `ca_pend_io` timeout warning (`caput.c:186-188`). Everything else is
-    /// silent on stderr: a CA error / read denial renders its `*** ...` marker
-    /// on STDOUT (`caput.c:200-206`), and the `!nConn` path returns from
-    /// `caput.c:181` BEFORE the print loop, emitting nothing on EITHER stream.
+    /// A readback writes to stderr only for a real timeout (`caput.c:186-188`).
+    /// A CA error / read denial renders its `*** ...` marker on STDOUT
+    /// (`caput.c:200-206`) without C's leak-made timeout line, and the
+    /// `!nConn` path returns from `caput.c:181` BEFORE the print loop,
+    /// emitting nothing on EITHER stream.
     ///
     /// Pre-fix, `caput-rs`'s `New :` disconnect path wrote a port-invented
     /// `error: channel disconnected` to stderr (the exit code already matched
@@ -1364,8 +1376,8 @@ mod tests {
 
     #[test]
     fn readback_other_errors_are_nonfatal() {
-        // Read-access-denied and other synchronous CA failures: C's caget still
-        // returns ECA_NORMAL (ca_pend_io never timed out) → caput exits 0.
+        // Read-access-denied and other CA failures: C's caget() prints the
+        // marker and returns 0 (caput.c:239) → caput exits 0.
         assert!(matches!(
             classify_readback(
                 Err(CaError::ServerError(0x178)), // ECA_NORDACCESS

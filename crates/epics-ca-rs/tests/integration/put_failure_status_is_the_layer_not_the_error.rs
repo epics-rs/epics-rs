@@ -145,6 +145,38 @@ async fn a_field_the_channel_cannot_write_is_refused_before_the_put() {
     server.abort();
 }
 
+/// A refused put prints what C `caput` prints for it, `ca_message` of its
+/// status, whichever layer refused it: the database, the cached access
+/// rights, or the client's own string-length check.
+#[tokio::test(flavor = "multi_thread")]
+#[serial(epics_env)]
+async fn a_refused_put_prints_cs_ca_message() {
+    let (client, server) = serve_one_ai().await;
+
+    let long = "x".repeat(40);
+    let mut wrong = Vec::new();
+    for (field, value, text) in [
+        ("PHAS", "32768", "Channel write request failed"),
+        ("STAT", "3", "Write access denied"),
+        ("DESC", long.as_str(), "Invalid string"),
+    ] {
+        let chan = client.create_channel(format!("PUTSTAT:A.{field}"));
+        chan.wait_connected(fact_budget::FACT_BUDGET)
+            .await
+            .expect("connect");
+        let err = chan
+            .put_string(value, fact_budget::FACT_BUDGET)
+            .await
+            .expect_err("refused");
+        if err.to_string() != text {
+            wrong.push((field, err.to_string()));
+        }
+    }
+    assert!(wrong.is_empty(), "printed instead of C's text: {wrong:?}");
+
+    server.abort();
+}
+
 /// The accepted put still reports success — the owner must not turn every
 /// put into a failure status.
 #[tokio::test(flavor = "multi_thread")]

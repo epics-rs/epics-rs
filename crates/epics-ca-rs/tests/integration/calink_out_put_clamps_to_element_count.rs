@@ -28,6 +28,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use epics_base_rs::error::CaOp;
 use epics_base_rs::server::database::{LinkPutOp, LinkRef, LinkSet};
 use epics_base_rs::server::record::OpenLatch;
 use epics_base_rs::server::records::ai::AiRecord;
@@ -35,6 +36,7 @@ use epics_base_rs::server::records::waveform::WaveformRecord;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 use epics_ca_rs::calink::CaLinkResolver;
 use epics_ca_rs::client::{CaClient, CaClientConfig};
+use epics_ca_rs::protocol::ECA_BADCOUNT;
 use epics_ca_rs::server::CaServer;
 use serial_test::serial;
 
@@ -219,8 +221,9 @@ async fn a_direct_client_put_is_still_refused() {
         )
         .await
         .expect_err("libca returns ECA_BADCOUNT for an oversized ca_array_put");
-    assert!(
-        err.to_string().contains("exceeds channel element count"),
-        "the direct-write refusal must stay ECA_BADCOUNT-shaped, got: {err}"
+    assert_eq!(
+        err.to_eca_status(CaOp::Write),
+        ECA_BADCOUNT,
+        "the direct-write refusal must stay ECA_BADCOUNT, got: {err:?}"
     );
 }

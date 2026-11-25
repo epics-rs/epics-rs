@@ -1686,18 +1686,15 @@ async fn within<T>(
 /// synchronously the way libca does.
 fn validate_put_count(snap: &types::ChannelSnapshotPublic, count: u32) -> CaResult<()> {
     if count > snap.element_count {
-        return Err(CaError::Protocol(format!(
-            "put count {} exceeds channel element count {} \
-             (matches libca nciu::write ECA_BADCOUNT)",
-            count, snap.element_count
-        )));
+        return Err(CaError::BadCount);
     }
     Ok(())
 }
 
 /// C `nciu::stringVerify` rejects DBR_STRING elements that
 /// exceed `MAX_STRING_SIZE` (40 bytes including the NUL terminator)
-/// with `ECA_STRTOBIG`. Pre-fix Rust silently truncated long strings
+/// with `badString`, which `oldChannelNotify.cpp:445-447,502-504` answer
+/// `ECA_BADSTR`. Pre-fix Rust silently truncated long strings
 /// to 39 bytes + NUL inside `EpicsValue::to_bytes()`, so a
 /// `put_string()` could write a different value than the caller
 /// supplied. Validate up front so the call fails synchronously.
@@ -1708,10 +1705,7 @@ fn validate_string_length(s: impl AsRef<[u8]>) -> CaResult<()> {
     // C requires room for the trailing NUL: payload >= len + 1.
     let len = s.as_ref().len();
     if len >= MAX_STRING_SIZE {
-        return Err(CaError::Protocol(format!(
-            "string of {len} bytes exceeds MAX_STRING_SIZE - 1 = 39 \
-             (matches libca nciu::stringVerify ECA_STRTOBIG)"
-        )));
+        return Err(CaError::WriteFailed(ECA_BADSTR));
     }
     Ok(())
 }
@@ -2819,11 +2813,7 @@ impl CaChannel {
         // without sending anything. Validate the resolved count up front;
         // `0` (native or autosize) is always in range.
         if request_count > snap.element_count {
-            return Err(CaError::Protocol(format!(
-                "get count {} exceeds channel element count {} \
-                 (matches libca nciu::read ECA_BADCOUNT)",
-                request_count, snap.element_count
-            )));
+            return Err(CaError::BadCount);
         }
 
         let ioid = self.in_flight.alloc_ioid();
@@ -3020,7 +3010,7 @@ impl CaChannel {
     /// [`EpicsValue::Enum`].
     ///
     /// Note: a CA `DBR_STRING` is a fixed 40-byte field, so a `value` of 40
-    /// bytes or more is REJECTED (`ECA_STRTOBIG`), not truncated — libca
+    /// bytes or more is REJECTED (`ECA_BADSTR`), not truncated — libca
     /// `nciu::stringVerify` refuses it before the request is queued (R6-29).
     /// ENUM menu names are well within the 39-byte cap.
     pub async fn put_string(&self, value: &str, timeout: Duration) -> CaResult<()> {
@@ -3055,7 +3045,7 @@ impl CaChannel {
     /// `DBR_ENUM` waveform writes each element as a `DBR_STRING` and the
     /// **server** resolves each menu string. Each element is subject to the
     /// same 39-byte cap as [`Self::put_string`]: an over-long element is
-    /// rejected with `ECA_STRTOBIG`, not truncated.
+    /// rejected with `ECA_BADSTR`, not truncated.
     pub async fn put_string_array(&self, values: &[String], timeout: Duration) -> CaResult<()> {
         let snap = self.snapshot()?;
         validate_put_count(&snap, values.len() as u32)?;
@@ -7123,16 +7113,19 @@ mod deadline_tests {
 }
 
 #[cfg(all(test, tokio_backend))]
-mod cached_access_tests {
-    //! libca refuses a request the cached `CA_PROTO_ACCESS_RIGHTS` bits deny
-    //! before queueing it (`nciu.cpp:282,329,350`) and answers ECA_NORDACCESS
-    //! or ECA_NOWTACCESS (`oldChannelNotify.cpp:313-315,457-459,514-516`).
+mod refused_before_queueing_tests {
+    //! libca refuses a request before queueing it — denied by the cached
+    //! `CA_PROTO_ACCESS_RIGHTS` bits (`nciu.cpp:282,329,350`), a count above
+    //! the channel's, or a string past `MAX_STRING_SIZE` — and answers the
+    //! status `oldChannelNotify.cpp:301-315,370-384,445-459,502-516` maps
+    //! the refusal to.
     use super::*;
     use epics_base_rs::error::CaOp;
     use std::sync::atomic::AtomicUsize;
 
     const READ_ONLY: u32 = 1;
     const WRITE_ONLY: u32 = 2;
+    const READ_WRITE: u32 = 3;
     const BOUND: Duration = Duration::from_secs(2);
     const DBR_TIME_DOUBLE: u16 = 20;
 
@@ -7259,5 +7252,72 @@ mod cached_access_tests {
             );
             wire.assert_silent(route);
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_status_the_client_decides_prints_as_ca_message() {
+        let (ch, _wire) = connected(WRITE_ONLY, false);
+        let err = ch.get_with_timeout(BOUND).await.expect_err("denied");
+        assert_eq!(err.to_string(), "Read access denied");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_count_above_the_channels_answers_bad_count() {
+        let (ch, mut wire) = connected(READ_WRITE, false);
+        let bad = Some(ECA_BADCOUNT);
+        let two = EpicsValue::DoubleArray(vec![1.0, 2.0].into());
+        assert_eq!(
+            status(CaOp::Read, ch.get_callback(DBR_TIME_DOUBLE, 2).map(drop)),
+            bad,
+            "get_callback"
+        );
+        assert_eq!(
+            status(CaOp::Write, ch.put_with_timeout(&two, BOUND).await),
+            bad,
+            "put"
+        );
+        assert_eq!(
+            status(CaOp::Write, ch.put_nowait(&two).await),
+            bad,
+            "put_nowait"
+        );
+        let strings = ["1".to_string(), "2".to_string()];
+        assert_eq!(
+            status(CaOp::Write, ch.put_string_array(&strings, BOUND).await),
+            bad,
+            "put_string_array"
+        );
+        wire.assert_silent("count");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_string_past_39_bytes_answers_bad_string() {
+        let (ch, mut wire) = connected(READ_WRITE, false);
+        let bad = Some(ECA_BADSTR);
+        let long = "x".repeat(40);
+        assert_eq!(
+            status(CaOp::Write, ch.put_string(&long, BOUND).await),
+            bad,
+            "put_string"
+        );
+        assert_eq!(
+            status(CaOp::Write, ch.put_string_nowait(&long).await),
+            bad,
+            "put_string_nowait"
+        );
+        assert_eq!(
+            status(
+                CaOp::Write,
+                ch.put_as_dbr_nowait(0, &EpicsValue::String(long.as_str().into()))
+                    .await
+            ),
+            bad,
+            "put_as_dbr_nowait"
+        );
+        wire.assert_silent("string");
+        ch.put_string_nowait(&long[..39])
+            .await
+            .expect("39 bytes leave room for the NUL");
+        assert!(wire.transport.try_recv().is_ok(), "the 39-byte put is sent");
     }
 }

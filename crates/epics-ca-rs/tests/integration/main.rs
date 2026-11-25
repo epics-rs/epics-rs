@@ -50,6 +50,7 @@ mod calink_local_dbcontext;
 mod calink_lset_contexts;
 mod calink_out_put_clamps_to_element_count;
 mod calink_rights_match_softioc;
+mod caput_callback_timeout;
 mod caput_cli_string_put_prints_what_c_caput_prints;
 mod caput_long_string_readback;
 mod caput_old_read_never_aborts;

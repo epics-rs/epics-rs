@@ -336,6 +336,7 @@ const SCOPE_GATED: &[(&str, &str)] = &[
         "epics-ca-rs",
         "tests/integration/calink_out_put_clamps_to_element_count.rs",
     ),
+    ("epics-ca-rs", "tests/integration/caput_callback_timeout.rs"),
     (
         "epics-ca-rs",
         "tests/integration/caput_cli_string_put_prints_what_c_caput_prints.rs",

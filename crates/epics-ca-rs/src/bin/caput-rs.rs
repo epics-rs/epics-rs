@@ -618,8 +618,10 @@ async fn main() {
                 );
                 std::process::exit(1);
             }
+            // C goes on to read back and exits 0 (caput.c:565-589), which
+            // hides the failure from a script.
             Err(_) => {
-                epics_libcom_rs::stderr_println!("error: {}", CaError::Timeout);
+                epics_libcom_rs::stderr_println!("Write callback operation timed out");
                 std::process::exit(1);
             }
         }

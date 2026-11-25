@@ -459,15 +459,17 @@ impl ReactorPvaServer {
     /// give it a thread of its own. The accept socket stays blocking rather
     /// than joining the poller: an accept loop that parks in `accept()` is
     /// woken by [`shutdown`](Self::shutdown)'s self-connect, which is one
-    /// mechanism instead of two.
-    pub fn serve(&self, reactor: &Reactor) {
+    /// mechanism instead of two. `started` runs once every listener's accept
+    /// thread exists; an `Err` is one that could not be created, with nothing
+    /// accepted.
+    pub fn serve(&self, reactor: &Reactor, started: impl FnOnce()) -> io::Result<()> {
         // From here down `reactor` is the server's own: every connection
         // future, and every task those futures go on to spawn through their
         // clone of it, runs on this server's band rather than the callback
         // pool's.
         let reactor = &self.conn_reactor(reactor);
         self.listeners
-            .serve(|listener| self.accept_loop(listener, reactor));
+            .serve(|listener| self.accept_loop(listener, reactor), started)
     }
 
     /// One listener's accept loop, on its own thread.
@@ -649,7 +651,11 @@ mod tests {
             "test-PVAR-accept".into(),
             PVA_SERVER_PRIORITY,
             StackSizeClass::Medium,
-            move || serving.serve(&harness_reactor()),
+            move || {
+                serving
+                    .serve(&harness_reactor(), || ())
+                    .expect("accept threads")
+            },
         )
         .expect("accept thread spawned");
         (server, accept)
@@ -741,7 +747,11 @@ mod tests {
             "test-PVAR-accept".into(),
             PVA_SERVER_PRIORITY,
             StackSizeClass::Medium,
-            move || serving.serve(&harness_reactor()),
+            move || {
+                serving
+                    .serve(&harness_reactor(), || ())
+                    .expect("accept threads")
+            },
         )
         .expect("accept thread spawned");
         for (ip, port) in [

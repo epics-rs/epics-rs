@@ -912,14 +912,19 @@ impl BlockingPvaServer {
     ///
     /// Blocks the calling thread and takes it to `PVA_SERVER_PRIORITY`, so
     /// give it a thread of its own rather than calling it on a thread that has
-    /// other work.
-    pub fn serve(&self, reactor: &epics_base_rs::runtime::task::Reactor) {
+    /// other work. `started` runs once every listener's accept thread exists;
+    /// an `Err` is one that could not be created, with nothing accepted.
+    pub fn serve(
+        &self,
+        reactor: &epics_base_rs::runtime::task::Reactor,
+        started: impl FnOnce(),
+    ) -> io::Result<()> {
         // From here down `reactor` is the server's own — see the reactor
         // driver's `serve`. It carries the per-connection writer task, which
         // is this driver's one spawned future.
         let reactor = &self.conn_reactor(reactor);
         self.listeners
-            .serve(|listener| self.accept_loop(listener, reactor));
+            .serve(|listener| self.accept_loop(listener, reactor), started)
     }
 
     /// One listener's accept loop, on its own thread.
@@ -3305,7 +3310,11 @@ pub(super) mod tests {
             "test-PVAS-accept".into(),
             PVA_SERVER_PRIORITY,
             StackSizeClass::Medium,
-            move || serving.serve(&harness_reactor()),
+            move || {
+                serving
+                    .serve(&harness_reactor(), || ())
+                    .expect("accept threads")
+            },
         )
         .expect("accept thread spawned");
         (server, accept)
@@ -3584,7 +3593,11 @@ pub(super) mod tests {
             "test-PVAS-accept".into(),
             PVA_SERVER_PRIORITY,
             StackSizeClass::Medium,
-            move || serving.serve(&harness_reactor()),
+            move || {
+                serving
+                    .serve(&harness_reactor(), || ())
+                    .expect("accept threads")
+            },
         )
         .expect("accept thread spawned");
         for ip in [Ipv4Addr::LOCALHOST, Ipv4Addr::new(127, 0, 0, 2)] {
@@ -3622,7 +3635,11 @@ pub(super) mod tests {
             "test-PVAS-accept".into(),
             PVA_SERVER_PRIORITY,
             StackSizeClass::Medium,
-            move || serving.serve(&harness_reactor()),
+            move || {
+                serving
+                    .serve(&harness_reactor(), || ())
+                    .expect("accept threads")
+            },
         )
         .expect("accept thread spawned");
         for (ip, port) in [

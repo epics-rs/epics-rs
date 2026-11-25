@@ -98,7 +98,9 @@ pub trait PvaServerDriver: Send + Sync {
     fn active_connections(&self) -> usize;
 
     /// Run the accept loop on the calling thread until [`shutdown`](Self::shutdown).
-    fn serve(&self, reactor: &Reactor);
+    /// `started` runs once every listener's accept thread exists; an `Err`
+    /// is one that could not be created, and then no listener has accepted.
+    fn serve(&self, reactor: &Reactor, started: Box<dyn FnOnce() + '_>) -> io::Result<()>;
 
     /// Stop the accept loop and end every live connection.
     fn shutdown(&self);
@@ -135,8 +137,8 @@ impl PvaServerDriver for BlockingPvaServer {
         BlockingPvaServer::active_connections(self)
     }
 
-    fn serve(&self, reactor: &Reactor) {
-        BlockingPvaServer::serve(self, reactor)
+    fn serve(&self, reactor: &Reactor, started: Box<dyn FnOnce() + '_>) -> io::Result<()> {
+        BlockingPvaServer::serve(self, reactor, started)
     }
 
     fn shutdown(&self) {
@@ -178,8 +180,8 @@ impl PvaServerDriver for ReactorPvaServer {
         ReactorPvaServer::active_connections(self)
     }
 
-    fn serve(&self, reactor: &Reactor) {
-        ReactorPvaServer::serve(self, reactor)
+    fn serve(&self, reactor: &Reactor, started: Box<dyn FnOnce() + '_>) -> io::Result<()> {
+        ReactorPvaServer::serve(self, reactor, started)
     }
 
     fn shutdown(&self) {

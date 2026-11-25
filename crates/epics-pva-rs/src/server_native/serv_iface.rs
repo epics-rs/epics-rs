@@ -4,6 +4,7 @@
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::sync::OnceLock;
 
 use tracing::{error, warn};
 
@@ -207,6 +208,9 @@ fn bind_serv_iface(addr: SocketAddr, mut fallback: bool) -> PvaResult<(TcpListen
 pub(crate) struct ServListeners {
     listeners: Vec<TcpListener>,
     port: u16,
+    /// [`Self::serve`] is refused the further accept thread at this index.
+    #[cfg(test)]
+    pub(crate) refuse_thread: Option<usize>,
 }
 
 impl ServListeners {
@@ -228,7 +232,12 @@ impl ServListeners {
             PvaError::Io(e) => e,
             e => io::Error::other(e),
         })?;
-        Ok(Self { listeners, port })
+        Ok(Self {
+            listeners,
+            port,
+            #[cfg(test)]
+            refuse_thread: None,
+        })
     }
 
     /// The port every listener without an explicit one bound.
@@ -242,26 +251,59 @@ impl ServListeners {
     }
 
     /// Run `accept` on every listener until each returns: the first on the
-    /// calling thread, each further one on a thread of its own.
-    pub(crate) fn serve(&self, accept: impl Fn(&TcpListener) + Sync) {
+    /// calling thread, each further one on a thread of its own. `started`
+    /// runs once every thread exists, before any listener accepts. A thread
+    /// that cannot be created is the `Err`, and then no listener has
+    /// accepted: pvxs's `Server` throws on a listener it cannot set up
+    /// (`serverconn.cpp:426-449`).
+    pub(crate) fn serve(
+        &self,
+        accept: impl Fn(&TcpListener) + Sync,
+        started: impl FnOnce(),
+    ) -> io::Result<()> {
         use epics_base_rs::runtime::task::{StackSizeClass, spawn_dedicated_thread_scoped};
         let (first, rest) = self.listeners.split_first().expect("bind leaves one");
+        let all_created = OnceLock::new();
         std::thread::scope(|scope| {
-            for listener in rest {
-                let accept = &accept;
-                let spawned = spawn_dedicated_thread_scoped(
-                    scope,
-                    "PVAS-TCP".to_string(),
-                    super::blocking::PVA_SERVER_PRIORITY,
-                    StackSizeClass::Medium,
-                    move || accept(listener),
-                );
+            for (thread, listener) in rest.iter().enumerate() {
+                let (accept, all_created) = (&accept, &all_created);
+                let spawned = match self.refusal(thread) {
+                    Some(refused) => Err(refused),
+                    None => spawn_dedicated_thread_scoped(
+                        scope,
+                        "PVAS-TCP".to_string(),
+                        super::blocking::PVA_SERVER_PRIORITY,
+                        StackSizeClass::Medium,
+                        move || {
+                            if *all_created.wait() {
+                                accept(listener);
+                            }
+                        },
+                    )
+                    .map(drop),
+                };
                 if let Err(e) = spawned {
                     error!(addr = ?listener.local_addr(), "PVA accept thread not started: {e}");
+                    let _ = all_created.set(false);
+                    return Err(e);
                 }
             }
+            started();
+            let _ = all_created.set(true);
             accept(first);
-        });
+            Ok(())
+        })
+    }
+
+    #[cfg(not(test))]
+    fn refusal(&self, _thread: usize) -> Option<io::Error> {
+        None
+    }
+
+    /// A test's stand-in for a target out of threads.
+    #[cfg(test)]
+    fn refusal(&self, thread: usize) -> Option<io::Error> {
+        (self.refuse_thread == Some(thread)).then(|| io::ErrorKind::WouldBlock.into())
     }
 
     /// Wake every accept parked in [`Self::serve`] by dialling it.

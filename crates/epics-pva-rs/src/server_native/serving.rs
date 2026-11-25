@@ -296,16 +296,31 @@ impl BoundPva {
         &self.search
     }
 
-    /// Start the accept loop on `reactor` and the search answers.
+    /// Start the accept loop on `reactor` and the search answers. `Ok` only
+    /// once every serving thread runs: a thread that cannot be created stops
+    /// the ones that did, and every listener is closed when the `Err` returns.
     pub fn serve(self, reactor: &Reactor) -> Result<PvaServing, ServeError> {
         let (udp_port, ended_tx) = (self.udp_port, self.ended_tx);
         let (tcp_alive, tcp_guard) = Liveness::guarded();
         let srv = self.server.clone();
         let reactor = reactor.clone();
-        serving_thread("PVAS-TCP", tcp_guard, ended_tx.clone(), move || {
-            srv.serve(&reactor);
+        let (up_tx, up) = std::sync::mpsc::sync_channel(1);
+        let tcp = serving_thread("PVAS-TCP", tcp_guard, ended_tx.clone(), move || {
+            let started = Box::new(|| drop(up_tx.send(Ok(()))));
+            if let Err(e) = srv.serve(&reactor, started) {
+                let _ = up_tx.send(Err(e));
+            }
             Ok(())
         })?;
+        // Joined before any `Err`: the thread holds a server reference, and
+        // the listeners close with the last one.
+        let up = up
+            .recv()
+            .unwrap_or_else(|_| Err(io::Error::other("PVAS-TCP panicked")));
+        if let Err(e) = up {
+            let _ = tcp.join();
+            return Err(ServeError::Thread("PVAS-TCP", e));
+        }
         let (udp_alive, udp_v6_alive) = match &self.search {
             Ok(search) => {
                 search.answer(SearchReplier {
@@ -322,10 +337,15 @@ impl BoundPva {
         let beacon_stop = Arc::new(BeaconStop::default());
         let (beacons, stop) = (self.beacons, beacon_stop.clone());
         let (_, beacon_guard) = Liveness::guarded();
-        serving_thread("PVAS-beacon", beacon_guard, ended_tx, move || {
+        let beacon = serving_thread("PVAS-beacon", beacon_guard, ended_tx, move || {
             beacons.run(&mut |d| stop.sleep(d));
             Ok(())
-        })?;
+        });
+        if let Err(e) = beacon {
+            self.server.shutdown();
+            let _ = tcp.join();
+            return Err(e);
+        }
         let report = ServerReportHandle {
             bound_tcp_port: self.server.tcp_port(),
             udp_port,
@@ -516,12 +536,23 @@ fn search_thread(
     Ok(alive)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The `serving_thread` refused on this thread: a test's stand-in for a
+    /// target out of threads.
+    static REFUSED: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
+
 fn serving_thread(
     name: &'static str,
     alive: LivenessGuard,
     ended: mpsc::UnboundedSender<PvaResult<()>>,
     body: impl FnOnce() -> PvaResult<()> + Send + 'static,
-) -> Result<(), ServeError> {
+) -> Result<thread::JoinHandle<()>, ServeError> {
+    #[cfg(test)]
+    if REFUSED.get() == Some(name) {
+        return Err(ServeError::Thread(name, io::ErrorKind::WouldBlock.into()));
+    }
     let charge = ThreadCharge::fixed(StackSizeClass::Medium);
     thread::Builder::new()
         .name(name.to_string())
@@ -535,7 +566,6 @@ fn serving_thread(
             drop(alive);
             let _ = ended.send(result);
         })
-        .map(drop)
         .map_err(|e| ServeError::Thread(name, e))
 }
 
@@ -784,6 +814,82 @@ mod tests {
             .recv(&mut buf)
             .expect("a SEARCH_RESPONSE once served");
         assert_eq!(buf[..n][3], Command::SearchResponse.code());
+    }
+
+    /// The two listed interfaces, on one port.
+    const TWO_INTERFACES: [&str; 2] = ["127.0.0.1", "127.0.0.2"];
+
+    /// Each of `interfaces` on `port` refuses a connection.
+    fn assert_nothing_listens(interfaces: &[&str], port: u16) {
+        for &ip in interfaces {
+            let refused = std::net::TcpStream::connect((ip, port))
+                .expect_err("a server that did not start holds no listener");
+            assert_eq!(refused.kind(), io::ErrorKind::ConnectionRefused, "{ip}");
+        }
+    }
+
+    /// pvxs's `Server` throws on a listener it cannot set up
+    /// (`serverconn.cpp:426-449`): a listener whose accept thread cannot be
+    /// created fails the start, and no listener is left in the backlog,
+    /// neither the first nor one whose accept thread already exists.
+    #[test]
+    fn an_accept_thread_not_started_fails_serve_and_closes_every_listener() {
+        let three = ["127.0.0.1", "127.0.0.2", "127.0.0.4"];
+        for (interfaces, refused) in [(&TWO_INTERFACES[..], 0), (&three[..], 1)] {
+            let mut sockets = PvaSockets::bind(on_interfaces(interfaces)).expect("bind");
+            sockets.listeners.refuse_thread = Some(refused);
+            let port = sockets.bound_tcp_port();
+            let started = BoundPva::attach(sockets, test_source())
+                .expect("attach")
+                .serve(&harness_reactor());
+            assert!(
+                matches!(started, Err(ServeError::Thread("PVAS-TCP", _))),
+                "{interfaces:?}: {:?}",
+                started.err()
+            );
+            assert_nothing_listens(interfaces, port);
+        }
+    }
+
+    /// The beacon is the last serving thread: one that cannot be created
+    /// stops the accept threads already running and closes their listeners.
+    #[test]
+    fn a_beacon_thread_not_started_fails_serve_and_closes_every_listener() {
+        let bound = BoundPva::bind(test_source(), on_interfaces(&TWO_INTERFACES)).expect("bind");
+        let port = bound.server().tcp_port();
+        REFUSED.set(Some("PVAS-beacon"));
+        let started = bound.serve(&harness_reactor());
+        REFUSED.set(None);
+        assert!(
+            matches!(started, Err(ServeError::Thread("PVAS-beacon", _))),
+            "{:?}",
+            started.err()
+        );
+        assert_nothing_listens(&TWO_INTERFACES, port);
+    }
+
+    /// Every listed interface is served once `serve` returns: each greets a
+    /// client with the PVA header, while the other's client stays connected.
+    #[test]
+    fn every_listed_interface_is_served() {
+        let serving = BoundPva::bind(test_source(), on_interfaces(&TWO_INTERFACES))
+            .expect("bind")
+            .serve(&harness_reactor())
+            .expect("serve");
+        let port = serving.server().tcp_port();
+        let clients: Vec<_> = TWO_INTERFACES
+            .iter()
+            .map(|ip| std::net::TcpStream::connect((*ip, port)).expect("connect"))
+            .collect();
+        for (mut client, ip) in clients.into_iter().zip(TWO_INTERFACES) {
+            use std::io::Read;
+            client
+                .set_read_timeout(Some(fact_budget::FACT_BUDGET))
+                .unwrap();
+            let mut header = [0u8; crate::proto::PvaHeader::SIZE];
+            client.read_exact(&mut header).expect(ip);
+            assert_eq!(header[0], crate::proto::MAGIC, "{ip}");
+        }
     }
 
     /// Each fixed thread states its class and carries its charge inside the

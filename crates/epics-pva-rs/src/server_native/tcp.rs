@@ -23656,7 +23656,11 @@ mod hosted_subscriber_tests {
             "test-PVAS-accept".into(),
             super::super::blocking::PVA_SERVER_PRIORITY,
             StackSizeClass::Medium,
-            move || serving.serve(&harness_reactor()),
+            move || {
+                serving
+                    .serve(&harness_reactor(), || ())
+                    .expect("accept threads")
+            },
         )
         .expect("accept thread");
         let stream = TcpStream::connect(server.local_addr().expect("addr")).expect("connect");

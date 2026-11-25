@@ -149,8 +149,11 @@ struct OpenExtraDims {
 }
 
 impl OpenExtraDims {
-    fn of(s: &Hdf5Settings) -> Self {
-        let axes = s.extra_dims[..=s.n_extra_dims].iter().rev();
+    /// A Single file opens with nExtraDims 0 (C `openFile`,
+    /// NDFileHDF5.cpp:225-230).
+    fn of(s: &Hdf5Settings, multi_frame: bool) -> Self {
+        let n = if multi_frame { s.n_extra_dims } else { 0 };
+        let axes = s.extra_dims[..=n].iter().rev();
         Self {
             sizes: axes.clone().map(|d| d.size.max(1)).collect(),
             chunks: axes.map(|d| d.chunk).collect(),
@@ -1249,7 +1252,7 @@ impl Hdf5Writer {
             dataset_codec: None,
             open_chunk: Vec::new(),
             open_attr_chunk: 1,
-            open_extra_dims: OpenExtraDims::of(&Hdf5Settings::default()),
+            open_extra_dims: OpenExtraDims::of(&Hdf5Settings::default(), false),
             open_posts: Arc::default(),
             cfg: WriterSettings::new(Hdf5Settings::default()),
             multi_frame: false,
@@ -4577,7 +4580,7 @@ impl NDFileWriter for Hdf5Writer {
         refused?;
         self.current_path = Some(path.to_path_buf());
         self.multi_frame = mode.contains(NDFileOpenMode::MULTIPLE);
-        self.open_extra_dims = OpenExtraDims::of(&self.cfg);
+        self.open_extra_dims = OpenExtraDims::of(&self.cfg, self.multi_frame);
         self.frame_count = 0;
         self.total_runtime = 0.0;
         self.total_bytes = 0;
@@ -8874,6 +8877,88 @@ mod tests {
     #[test]
     fn swmr_positions_place_frames_on_the_extra_dimensions() {
         assert_positions_place_frames_on_the_extra_dimensions(true);
+    }
+
+    /// A Single file has no extra dimensions: C sets nExtraDims to 0 as it
+    /// opens one (NDFileHDF5.cpp:225-230), so a positioned frame needs only
+    /// its first position and the file is the one nExtraDims 0 writes.
+    fn assert_single_files_have_no_extra_dimensions(swmr: bool) {
+        let xml = std::env::temp_dir().join(format!(
+            "adcore_layout_hdf5_single_extra_{swmr}_{}.xml",
+            std::process::id()
+        ));
+        std::fs::write(
+            &xml,
+            r#"<hdf5_layout><group name="entry">
+              <dataset name="data" source="detector" det_default="true"/>
+              <group name="NDAttributes" ndattr_default="true"/>
+            </group></hdf5_layout>"#,
+        )
+        .unwrap();
+        let write = |n_extra: usize, attrs: &[(&str, i32)]| {
+            let path = temp_path(&format!(
+                "hdf5_single_extra_{swmr}_{n_extra}_{}",
+                attrs.len()
+            ));
+            let mut w = Hdf5Writer::new();
+            w.set_layout_filename(xml.to_str().unwrap());
+            w.set_swmr_mode(swmr);
+            w.set_n_extra_dims(n_extra);
+            w.set_extra_dim_size(0, 2);
+            w.set_extra_dim_size(1, 3);
+            w.set_pos_running(true);
+            w.set_dim_att_datasets(true);
+            for (i, name) in ["PosN", "PosX"].into_iter().enumerate() {
+                w.set_pos_name(i, name);
+                w.set_pos_index_name(i, name);
+            }
+            let mut arr = NDArray::with_data(
+                vec![NDDimension::new(4), NDDimension::new(4)],
+                NDDataBuffer::from_vec::<u8>(vec![7; 16]),
+            );
+            for &(name, pos) in attrs {
+                arr.attributes.add(NDAttribute::new_static(
+                    name,
+                    "",
+                    NDAttrSource::Driver,
+                    NDAttrValue::Int32(pos),
+                ));
+            }
+            w.open_file(&path, NDFileOpenMode::WRITE, &arr).unwrap();
+            let written = w.write_file(&Arc::new(arr));
+            assert!(
+                written.is_ok(),
+                "swmr={swmr} nExtraDims={n_extra} {attrs:?}: {written:?}"
+            );
+            w.close_file().unwrap();
+            let h5 = H5File::open(&path).unwrap();
+            let data = h5.dataset("entry/data").unwrap();
+            let file = (
+                data.shape(),
+                data.read_raw::<u8>().unwrap(),
+                ["PosN", "PosX"].map(|n| {
+                    h5.dataset(&format!("entry/NDAttributes/{n}"))
+                        .ok()
+                        .map(|d| (d.shape(), d.read_raw::<i32>().unwrap()))
+                }),
+            );
+            std::fs::remove_file(&path).ok();
+            file
+        };
+        for attrs in [&[("PosN", 1)][..], &[("PosN", 1), ("PosX", 2)]] {
+            assert_eq!(write(1, attrs), write(0, attrs), "swmr={swmr} {attrs:?}");
+        }
+        std::fs::remove_file(&xml).ok();
+    }
+
+    #[test]
+    fn single_files_have_no_extra_dimensions() {
+        assert_single_files_have_no_extra_dimensions(false);
+    }
+
+    #[test]
+    fn swmr_single_files_have_no_extra_dimensions() {
+        assert_single_files_have_no_extra_dimensions(true);
     }
 
     /// A positioned file keeps the extra axes it opened with. posRunning off

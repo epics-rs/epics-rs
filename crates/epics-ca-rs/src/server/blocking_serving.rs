@@ -690,6 +690,59 @@ mod tests {
         }
     }
 
+    /// A start that fails returns while clients fill the backlog of the
+    /// listener it never accepted on.
+    #[test]
+    fn a_failed_start_returns_with_its_backlog_full() {
+        use super::*;
+        use std::net::{TcpStream, UdpSocket};
+        use std::time::Duration;
+
+        let beacon_sink = UdpSocket::bind("127.0.0.1:0").unwrap();
+        // SAFETY: nextest runs this test alone in its process, before the
+        // memoized `addr_list::from_env` first reads these.
+        unsafe {
+            std::env::set_var("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1");
+            std::env::set_var(
+                "EPICS_CAS_BEACON_ADDR_LIST",
+                beacon_sink.local_addr().unwrap().to_string(),
+            );
+            std::env::set_var("EPICS_CAS_AUTO_BEACON_ADDR_LIST", "NO");
+        }
+        let sockets = BlockingRsrvSockets::bind(0, 0).expect("bind");
+        let tcp = sockets.listeners[0].local_addr().unwrap();
+        // Up to the first connect the full backlog leaves unanswered.
+        let waiting: Vec<TcpStream> = std::iter::from_fn(|| {
+            // absence-window: a full backlog drops the SYN, so no reply can
+            // mark it full.
+            TcpStream::connect_timeout(&tcp, Duration::from_millis(200)).ok()
+        })
+        .take(4096)
+        .collect();
+        assert!(waiting.len() < 4096, "the backlog never filled");
+
+        let (done, ended) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let started = BlockingCaServing::serve_with(
+                sockets,
+                Arc::new(PvDatabase::new()),
+                epics_base_rs::server::access_security::new_acf_cell(None),
+                Arc::new(ServerStats::default()),
+                &mut |name| match name {
+                    "CAS-beacon" => Err(io::ErrorKind::OutOfMemory.into()),
+                    _ => Ok(()),
+                },
+            );
+            let _ = done.send(matches!(started, Err(ServeError::Thread("CAS-beacon", _))));
+        });
+        assert_eq!(
+            ended.recv_timeout(fact_budget::FACT_BUDGET),
+            Ok(true),
+            "the failed start did not return ({} clients waiting)",
+            waiting.len()
+        );
+    }
+
     /// A start that fails leaves `casr` with no server to report and the
     /// uptime unstarted, so a start that then succeeds counts from itself.
     #[test]

@@ -401,8 +401,17 @@ enum Run {
     /// Started, showing nothing: no accept, no search reply, no beacon.
     Held,
     Running,
-    /// Final: a stop before the run wins over it.
-    Stopped,
+    /// Final: a stop before the run wins over it. `ran` is whether the run
+    /// came first, the only way a listener can be parked in `accept`.
+    Stopped {
+        ran: bool,
+    },
+}
+
+impl Run {
+    fn is_stopped(self) -> bool {
+        matches!(self, Run::Stopped { .. })
+    }
 }
 
 /// The one [`Run`] a serving's threads read, and the wake for those that
@@ -446,9 +455,14 @@ impl RunControl {
         self.changed.notify_all();
     }
 
-    pub(crate) fn stop(&self) {
-        *self.lock() = Run::Stopped;
+    /// Stop for good; `true` if the serving ran first, every later stop
+    /// answering the same.
+    pub(crate) fn stop(&self) -> bool {
+        let mut state = self.lock();
+        let ran = matches!(*state, Run::Running | Run::Stopped { ran: true });
+        *state = Run::Stopped { ran };
         self.changed.notify_all();
+        ran
     }
 
     /// Wait out [`Run::Held`]; `true` once running, `false` once stopped.
@@ -464,9 +478,9 @@ impl RunControl {
     fn sleep(&self, period: Duration) -> bool {
         let (state, _) = self
             .changed
-            .wait_timeout_while(self.lock(), period, |s| *s != Run::Stopped)
+            .wait_timeout_while(self.lock(), period, |s| !s.is_stopped())
             .unwrap_or_else(|e| e.into_inner());
-        *state == Run::Stopped
+        state.is_stopped()
     }
 }
 
@@ -634,7 +648,7 @@ impl BlockingCaServer {
                     backoff.accepted();
                     // A `shutdown()` wakes the blocking accept by dialing our
                     // own socket; the throwaway connection is dropped here.
-                    if self.run.state() == Run::Stopped {
+                    if self.run.state().is_stopped() {
                         break;
                     }
                     let peer = match stream.peer_addr() {
@@ -710,7 +724,7 @@ impl BlockingCaServer {
                     });
                 }
                 Err(e) => {
-                    if self.run.state() == Run::Stopped {
+                    if self.run.state().is_stopped() {
                         break;
                     }
                     tracing::warn!(
@@ -726,7 +740,7 @@ impl BlockingCaServer {
                     thread::sleep(backoff.failed());
                     // `shutdown()` may have been asked for while we slept, and
                     // its self-dial cannot wake an `accept()` that is failing.
-                    if self.run.state() == Run::Stopped {
+                    if self.run.state().is_stopped() {
                         break;
                     }
                 }
@@ -739,10 +753,13 @@ impl BlockingCaServer {
     /// which reads the same run state between its short-capped `recv_from`
     /// calls.
     pub fn shutdown(&self) {
-        self.run.stop();
         // Wake the blocking `accept()` by connecting to ourselves; the loop
-        // then observes the flag and returns.
-        if let Ok(addr) = self.listener.local_addr() {
+        // then observes the flag and returns. A serving that never ran has no
+        // `accept()` to wake, and nothing drains its backlog: the dial would
+        // block for as long as clients fill it.
+        if self.run.stop()
+            && let Ok(addr) = self.listener.local_addr()
+        {
             let _ = TcpStream::connect(addr);
         }
     }
@@ -1140,7 +1157,7 @@ fn handle_udp_search_blocking(
     let mut batch = SearchReplyBatch::default();
     let mut batch_addr: Option<SocketAddr> = None;
 
-    while run.state() != Run::Stopped {
+    while !run.state().is_stopped() {
         let (len, src) = match socket.recv_from(&mut buf) {
             Ok(v) => v,
             // Idle cap fired: the recv queue is drained, so flush any held

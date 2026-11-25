@@ -172,7 +172,7 @@ server.run().await?;
 # Ok(()) }
 ```
 
-The end-to-end test at `tests/procserv_e2e.rs` shows a complete config
+The end-to-end test at `tests/integration/procserv_e2e.rs` shows a complete config
 literal with TCP listener, key bindings, restart policy and a
 `/bin/cat` child — useful as a copy-paste starting point. It binds the
 listeners itself and hands them over with `ProcServ::with_prebound`,

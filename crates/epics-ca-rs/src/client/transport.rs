@@ -3064,20 +3064,34 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                     let access = pending_access
                         .remove(&hdr.cid)
                         .unwrap_or(AccessRights::from_u32(0));
-                    // now that the server has named this cid,
-                    // subsequent ACCESS_RIGHTS frames for it are
-                    // legitimate post-create updates that must fire
-                    // AccessRightsChanged.
-                    known_cids.insert(hdr.cid);
-                    let _ = event_tx.send(TransportEvent::ChannelCreated {
-                        cid: hdr.cid,
-                        sid: hdr.available,
-                        data_type: hdr.data_type,
-                        element_count: hdr.actual_count(),
-                        access,
-                        server_addr,
-                        priority,
-                    });
+                    // C `nciu::connect` refuses a type outside
+                    // `dbf_type_is_valid` (`nciu.cpp:120-122`).
+                    let event = match DbFieldType::from_u16(hdr.data_type) {
+                        Ok(native_type) => {
+                            // now that the server has named this cid,
+                            // subsequent ACCESS_RIGHTS frames for it are
+                            // legitimate post-create updates that must fire
+                            // AccessRightsChanged.
+                            known_cids.insert(hdr.cid);
+                            TransportEvent::ChannelCreated {
+                                cid: hdr.cid,
+                                sid: hdr.available,
+                                native_type,
+                                element_count: hdr.actual_count(),
+                                access,
+                                server_addr,
+                                priority,
+                            }
+                        }
+                        Err(_) => TransportEvent::ChannelRefused {
+                            cid: hdr.cid,
+                            sid: hdr.available,
+                            data_type: hdr.data_type,
+                            server_addr,
+                            priority,
+                        },
+                    };
+                    let _ = event_tx.send(event);
                 }
                 CA_PROTO_READ_NOTIFY => {
                     // Direct dispatch to the in-flight read registry

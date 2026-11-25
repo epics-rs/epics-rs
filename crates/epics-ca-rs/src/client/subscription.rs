@@ -479,7 +479,7 @@ impl SubscribeType {
     /// again when `native_changed`.
     pub(crate) fn connect(
         &mut self,
-        native_type: u16,
+        native_type: DbFieldType,
         element_count: u32,
         native_changed: bool,
     ) -> (u16, u32) {
@@ -494,16 +494,12 @@ impl SubscribeType {
                     *chosen = None;
                 }
                 *chosen.get_or_insert_with(|| {
-                    // `native_type` is the server-reported CA wire type
-                    // (0..6), so the `+ 14` fallback (only reached if
-                    // `from_u16` fails) lands in the DBR_TIME range.
-                    let dbr_type = DbFieldType::from_u16(native_type)
-                        .map(|t| {
-                            super::subscription_readback_dbr(t, *enum_readback, *float_as_string)
-                        })
-                        .unwrap_or(native_type + 14);
                     (
-                        dbr_type,
+                        super::subscription_readback_dbr(
+                            native_type,
+                            *enum_readback,
+                            *float_as_string,
+                        ),
                         resolve_subscription_count(*req_count, element_count),
                     )
                 })
@@ -654,7 +650,7 @@ impl SubscriptionRegistry {
         &mut self,
         cid: u32,
         new_sid: u32,
-        native_type: u16,
+        native_type: DbFieldType,
         element_count: u32,
         native_changed: bool,
         server_addr: std::net::SocketAddr,
@@ -876,7 +872,7 @@ mod tests {
         let (restored, failed) = reg.restore_for_channel(
             100,
             7,
-            1,
+            DbFieldType::Short,
             1,
             false,
             addr(),
@@ -892,7 +888,7 @@ mod tests {
         let (restored, failed) = reg.restore_for_channel(
             100,
             8,
-            6,
+            DbFieldType::Double,
             3,
             true,
             addr(),
@@ -934,7 +930,7 @@ mod tests {
         let (restored, failed) = reg.restore_for_channel(
             100,
             7,
-            6,
+            DbFieldType::Double,
             1,
             false,
             addr(),
@@ -949,7 +945,7 @@ mod tests {
         let (restored, failed) = reg.restore_for_channel(
             100,
             8,
-            3,
+            DbFieldType::Enum,
             1,
             true,
             addr(),
@@ -982,7 +978,8 @@ mod tests {
 
         // Pre-V413 peer: the autosize 0 has no meaning there, so the
         // channel's native count (4) goes on the wire instead.
-        let (restored, _) = reg.restore_for_channel(100, 7, 1, 4, false, addr(), 12, &tx);
+        let (restored, _) =
+            reg.restore_for_channel(100, 7, DbFieldType::Short, 4, false, addr(), 12, &tx);
         assert_eq!(restored, 1);
         assert_eq!(drained_type(&mut rx).1, 4);
         // The cached cap itself is untouched — only the wire count changed.
@@ -990,7 +987,8 @@ mod tests {
 
         // Same registry, reconnect onto a V413 peer: the 0 travels verbatim.
         reg.subscriptions.get_mut(&1).unwrap().needs_restore = true;
-        let (restored, _) = reg.restore_for_channel(100, 8, 1, 4, false, addr(), 13, &tx);
+        let (restored, _) =
+            reg.restore_for_channel(100, 8, DbFieldType::Short, 4, false, addr(), 13, &tx);
         assert_eq!(restored, 1);
         assert_eq!(drained_type(&mut rx).1, 0);
     }
@@ -1006,7 +1004,8 @@ mod tests {
         reg.add(rec);
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        let (restored, _) = reg.restore_for_channel(100, 7, 1, 4, false, addr(), 13, &tx);
+        let (restored, _) =
+            reg.restore_for_channel(100, 7, DbFieldType::Short, 4, false, addr(), 13, &tx);
         assert_eq!(restored, 1);
         assert_eq!(drained_type(&mut rx), (19, 4));
         assert_eq!(reg.get(1).unwrap().kind.request(), Some((19, 99)));
@@ -1025,7 +1024,7 @@ mod tests {
         let (restored, _) = reg.restore_for_channel(
             100,
             8,
-            6,
+            DbFieldType::Double,
             5,
             true,
             addr(),
@@ -1052,7 +1051,7 @@ mod tests {
         let (restored, _) = reg.restore_for_channel(
             100,
             7,
-            6,
+            DbFieldType::Double,
             5,
             false,
             addr(),
@@ -1070,7 +1069,7 @@ mod tests {
         let (restored, _) = reg2.restore_for_channel(
             200,
             9,
-            6,
+            DbFieldType::Double,
             1,
             false,
             addr(),
@@ -1095,7 +1094,7 @@ mod tests {
         let (restored, _) = reg.restore_for_channel(
             100,
             7,
-            1,
+            DbFieldType::Short,
             5,
             false,
             addr(),
@@ -1109,7 +1108,7 @@ mod tests {
         let (restored, _) = reg.restore_for_channel(
             100,
             8,
-            6,
+            DbFieldType::Double,
             2,
             true,
             addr(),
@@ -1158,7 +1157,7 @@ mod tests {
         let (restored, _) = reg.restore_for_channel(
             100,
             7,
-            6,
+            DbFieldType::Double,
             4,
             false,
             addr(),
@@ -1704,7 +1703,7 @@ mod tests {
         let (restored, _) = reg.restore_for_channel(
             100,
             7,
-            1,
+            DbFieldType::Short,
             1,
             false,
             addr(),
@@ -1719,7 +1718,7 @@ mod tests {
         let (restored, _) = reg.restore_for_channel(
             100,
             8,
-            6,
+            DbFieldType::Double,
             3,
             false,
             addr(),

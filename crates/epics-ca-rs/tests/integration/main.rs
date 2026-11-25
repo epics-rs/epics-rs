@@ -2,6 +2,7 @@
 //! as one binary: test `t` of the former binary `X` is `X::t` here, and
 //! `binary(integration) & test(/^X::/)` selects what `X` ran.
 
+mod a_bad_native_type_refuses_only_its_channel;
 mod a_ca_forward_link_processes_the_remote_record;
 mod a_ca_link_waits_on_its_put_callback;
 mod a_cancelled_subscribe_is_cancelled_on_the_server;

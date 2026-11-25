@@ -218,7 +218,7 @@ pub fn subscription_readback_dbr(
         .unwrap_or_else(|| native.time_dbr_type())
 }
 
-use state::ChannelInner;
+use state::{ChannelInner, Link};
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -3621,9 +3621,9 @@ async fn run_coordinator(
                             cid,
                             pv_name: pv_name.clone(),
                             priority,
-                            state: ChannelState::Searching,
+                            link: Link::Searching,
                             sid: 0,
-                            native_type: None,
+                            last_native: None,
                             element_count: 0,
                             server_addr: None,
                             access_rights: AccessRights::from_u32(0),
@@ -3634,7 +3634,7 @@ async fn run_coordinator(
                         // Process any Found response that arrived before registration.
                         if let Some(server_addr) = pending_found.remove(&cid) {
                             let ch = channels.get_mut(&cid).unwrap();
-                            ch.state = ChannelState::Connecting;
+                            ch.link = Link::Connecting;
                             ch.server_addr = Some(server_addr);
                             server_channels.entry((server_addr, priority)).or_default().insert(cid);
                             let _ = transport_tx.send(TransportCommand::CreateChannel {
@@ -3647,7 +3647,7 @@ async fn run_coordinator(
                     }
                     CoordRequest::WaitConnected { cid, reply } => {
                         if let Some(ch) = channels.get_mut(&cid) {
-                            if ch.state == ChannelState::Connected {
+                            if ch.state() == ChannelState::Connected {
                                 let _ = reply.send(());
                             } else {
                                 ch.conn_tx.add_waiter(reply);
@@ -3672,14 +3672,13 @@ async fn run_coordinator(
                             // which includes an unresponsive circuit's channels:
                             // the EVENT_ADD queues on the live socket and the
                             // server answers it when the circuit recovers.
-                            let installed = ch.state.is_operational();
                             // An installed channel chooses a derived pair now;
                             // otherwise its first connect does.
                             let mut kind = kind;
-                            let request = installed.then(|| {
-                                let native = ch.native_type.expect("installed channel has native type");
-                                kind.connect(native as u16, ch.element_count, false)
-                            });
+                            let request = ch
+                                .link
+                                .installed()
+                                .map(|native| kind.connect(native, ch.element_count, false));
                             // C keeps the user's cap in `netSubscription::count`
                             // and resolves the WIRE count per request via
                             // `getCount(guard, CA_V413(minor))` (`netIO.h:241-251`)
@@ -3708,7 +3707,7 @@ async fn run_coordinator(
                                 priority,
                                 deadband,
                                 consumer,
-                                needs_restore: !installed,
+                                needs_restore: request.is_none(),
                                 last_value: None,
                                 nreplace: 0,
                             });
@@ -3773,7 +3772,7 @@ async fn run_coordinator(
                         // Clear channel on server + clean reverse index
                         let mut cleared_on_server = false;
                         if let Some(ch) = channels.get(&cid) {
-                            if ch.state.is_operational() {
+                            if ch.state().is_operational() {
                                 let _ = transport_tx.send(TransportCommand::ClearChannel {
                                     cid,
                                     sid: ch.sid,
@@ -3783,7 +3782,7 @@ async fn run_coordinator(
                                 cleared_on_server = true;
                             }
                             // Cancel search for any non-connected state
-                            match ch.state {
+                            match ch.state() {
                                 ChannelState::Searching
                                 | ChannelState::Connecting
                                 | ChannelState::Disconnected => {
@@ -3825,7 +3824,7 @@ async fn run_coordinator(
                     }
                     CoordRequest::GetWatchdogDelay { cid, reply } => {
                         let delay = channels.get(&cid).and_then(|ch| {
-                            if !ch.state.is_operational() {
+                            if !ch.state().is_operational() {
                                 return None;
                             }
                             let addr = ch.server_addr?;
@@ -3835,7 +3834,7 @@ async fn run_coordinator(
                     }
                     CoordRequest::GetHostMinorProtocol { cid, reply } => {
                         let v = channels.get(&cid).and_then(|ch| {
-                            if !ch.state.is_operational() {
+                            if !ch.state().is_operational() {
                                 return None;
                             }
                             let addr = ch.server_addr?;
@@ -3852,13 +3851,13 @@ async fn run_coordinator(
                         // unit-testable without the coordinator.
                         let states = channels
                             .values()
-                            .map(|ch| (ch.state, ch.server_addr, ch.priority));
+                            .map(|ch| (ch.state(), ch.server_addr, ch.priority));
                         let _ = reply.send(operational_circuit_count(states));
                     }
                     CoordRequest::Shutdown { reply } => {
                         // Send ClearChannel for all connected channels
                         for ch in channels.values() {
-                            if ch.state.is_operational() {
+                            if ch.state().is_operational() {
                                 if let Some(addr) = ch.server_addr {
                                     let _ = transport_tx.send(TransportCommand::ClearChannel {
                                         cid: ch.cid,
@@ -3933,8 +3932,8 @@ async fn run_coordinator(
                         // ing libca's split between udpiiu (search
                         // wake) and tcpRecvWatchdog (lazy probe).
                         for ch in channels.values() {
-                            if ch.state == ChannelState::Disconnected
-                                || ch.state == ChannelState::Searching
+                            if ch.state() == ChannelState::Disconnected
+                                || ch.state() == ChannelState::Searching
                             {
                                 let _ = search_tx.send(SearchRequest::Schedule {
                                     cid: ch.cid,
@@ -3954,7 +3953,7 @@ async fn run_coordinator(
                         // unit-tested without standing up the full
                         // coordinator. See the function's doc
                         // comment for the full rationale.
-                        let states = channels.values().map(|ch| (ch.state, ch.server_addr));
+                        let states = channels.values().map(|ch| (ch.state(), ch.server_addr));
                         for target in beacon_arrival_targets(states, server_addr) {
                             let _ = transport_tx.send(
                                 TransportCommand::BeaconArrivalNotify {
@@ -3971,12 +3970,12 @@ async fn run_coordinator(
                 match resp {
                     SearchResponse::Found { cid, server_addr } => {
                         if let Some(ch) = channels.get_mut(&cid) {
-                            if ch.state == ChannelState::Searching || ch.state == ChannelState::Disconnected {
+                            if ch.state() == ChannelState::Searching || ch.state() == ChannelState::Disconnected {
                                 let priority = ch.priority;
                                 if let Some(old_addr) = ch.server_addr {
                                     remove_server_channel(&mut server_channels, (old_addr, priority), cid);
                                 }
-                                ch.state = ChannelState::Connecting;
+                                ch.link = Link::Connecting;
                                 ch.server_addr = Some(server_addr);
                                 server_channels.entry((server_addr, priority)).or_default().insert(cid);
                                 let _ = transport_tx.send(TransportCommand::CreateChannel {
@@ -4019,62 +4018,49 @@ async fn run_coordinator(
                 // trip through this match (Option C, Phase A/D). This
                 // arm therefore no longer touches `last_rx_at`.
                 match evt {
-                    TransportEvent::ChannelCreated { cid, sid, data_type, element_count, access, server_addr, priority } => {
+                    TransportEvent::ChannelCreated { cid, sid, native_type, element_count, access, server_addr, priority } => {
                         if let Some(ch) = channels.get_mut(&cid) {
-                            let was_disconnected = matches!(ch.state, ChannelState::Disconnected);
-                            let dbr_type = DbFieldType::from_u16(data_type).ok();
+                            let was_disconnected = matches!(ch.state(), ChannelState::Disconnected);
                             // epics-base `16877577` parity: detect native
                             // DBR type change across reconnects so consumers
                             // (camonitor, archiver) can rebuild their
                             // per-type decoders / display metadata before
                             // the next event flows.
-                            let previous_native = ch.native_type;
-                            let native_changed = match (previous_native, dbr_type) {
-                                (Some(p), Some(c)) => p != c,
-                                (Some(_), None) | (None, Some(_)) => true,
-                                (None, None) => false,
-                            };
-                            ch.state = ChannelState::Connected;
+                            let previous_native = ch.last_native;
+                            let native_changed = previous_native != Some(native_type);
+                            ch.link = Link::Connected(native_type);
                             ch.sid = sid;
-                            ch.native_type = dbr_type;
+                            ch.last_native = Some(native_type);
                             ch.element_count = element_count;
                             ch.server_addr = Some(server_addr);
                             ch.access_rights = access;
                             ch.last_connected_at = Some(std::time::Instant::now());
 
                             // Phase B: publish snapshot for fast-path readers.
-                            // Only publish if we have a usable native_type;
-                            // otherwise the channel is still effectively
-                            // unusable and CaChannel hot paths should fall
-                            // back to "no snapshot → Disconnected".
-                            if let Some(dbr) = dbr_type {
-                                snapshots.insert(
-                                    cid,
-                                    types::ChannelSnapshotPublic {
-                                        sid,
-                                        native_type: dbr,
-                                        element_count,
-                                        server_addr,
-                                        access_rights: access,
-                                        state: ChannelState::Connected,
-                                        // The circuit's VERSION frame is parsed
-                                        // (and its ServerVersion event queued)
-                                        // before the CREATE_CHAN_RESP that
-                                        // produced this event, so the map is
-                                        // populated for any compliant server.
-                                        // A server that never sent VERSION is
-                                        // treated as pre-V49 — C's `tcpiiu`
-                                        // starts from the same conservative
-                                        // minor version.
-                                        server_minor: server_minor_version
-                                            .get(&(server_addr, priority))
-                                            .copied()
-                                            .unwrap_or(0),
-                                    },
-                                );
-                            } else {
-                                snapshots.remove(&cid);
-                            }
+                            snapshots.insert(
+                                cid,
+                                types::ChannelSnapshotPublic {
+                                    sid,
+                                    native_type,
+                                    element_count,
+                                    server_addr,
+                                    access_rights: access,
+                                    state: ChannelState::Connected,
+                                    // The circuit's VERSION frame is parsed
+                                    // (and its ServerVersion event queued)
+                                    // before the CREATE_CHAN_RESP that
+                                    // produced this event, so the map is
+                                    // populated for any compliant server.
+                                    // A server that never sent VERSION is
+                                    // treated as pre-V49 — C's `tcpiiu`
+                                    // starts from the same conservative
+                                    // minor version.
+                                    server_minor: server_minor_version
+                                        .get(&(server_addr, priority))
+                                        .copied()
+                                        .unwrap_or(0),
+                                },
+                            );
 
                             if was_disconnected {
                                 tracing::info!(pv = %ch.pv_name, cid, sid, server = %server_addr, "channel reconnected");
@@ -4120,28 +4106,26 @@ async fn run_coordinator(
                             // `restore_for_channel`; only the consumer-facing
                             // event is gated on a real prior type.
                             if native_changed && previous_native.is_some() {
-                                if let Some(cur) = dbr_type {
-                                    ch.announce(
-                                        &snapshots,
-                                        ConnectionEvent::NativeTypeChanged {
-                                            previous: previous_native,
-                                            current: cur,
-                                        },
-                                    );
-                                    tracing::info!(
-                                        pv = %ch.pv_name,
-                                        previous = ?previous_native,
-                                        current = ?cur,
-                                        "channel native DBR type changed"
-                                    );
-                                }
+                                ch.announce(
+                                    &snapshots,
+                                    ConnectionEvent::NativeTypeChanged {
+                                        previous: previous_native,
+                                        current: native_type,
+                                    },
+                                );
+                                tracing::info!(
+                                    pv = %ch.pv_name,
+                                    previous = ?previous_native,
+                                    current = ?native_type,
+                                    "channel native DBR type changed"
+                                );
                             }
 
                             // Restore subscriptions
                             let (restored, stale) = subscriptions.restore_for_channel(
                                 cid,
                                 sid,
-                                data_type,
+                                native_type,
                                 element_count,
                                 native_changed,
                                 server_addr,
@@ -4198,6 +4182,35 @@ async fn run_coordinator(
                                 sid,
                                 server_addr,
                                 priority,
+                            });
+                        }
+                    }
+                    // libca throws from `nciu::connect` and drops the whole
+                    // circuit with every channel on it (`tcpiiu.cpp:588`);
+                    // only the refused channel is cleared here, and it
+                    // searches again on the reconnect schedule.
+                    TransportEvent::ChannelRefused { cid, sid, data_type, server_addr, priority } => {
+                        let _ = transport_tx.send(TransportCommand::ClearChannel {
+                            cid,
+                            sid,
+                            server_addr,
+                            priority,
+                        });
+                        if let Some(ch) = channels.get_mut(&cid) {
+                            epics_libcom_rs::stderr_println!(
+                                "CA client library: Ignored conn resp with bad native data type {data_type} for \"{}\"",
+                                ch.pv_name
+                            );
+                            remove_server_channel(&mut server_channels, (server_addr, priority), cid);
+                            ch.link = if ch.last_connected_at.is_some() {
+                                Link::Disconnected
+                            } else {
+                                Link::Searching
+                            };
+                            let _ = search_tx.send(SearchRequest::Schedule {
+                                cid,
+                                pv_name: ch.pv_name.clone(),
+                                reason: SearchReason::Reconnect,
                             });
                         }
                     }
@@ -4290,7 +4303,7 @@ async fn run_coordinator(
                             // only means this specific attempt/server failed;
                             // the channel will immediately re-search and may
                             // still connect before the caller's timeout.
-                            ch.state = ChannelState::Disconnected;
+                            ch.link = Link::Disconnected;
                             ch.announce(&snapshots, ConnectionEvent::Disconnected);
                             let _ = search_tx.send(SearchRequest::Schedule {
                                 cid,
@@ -4346,7 +4359,7 @@ async fn run_coordinator(
                         if channels.values().any(|ch| {
                             ch.server_addr == Some(server_addr)
                                 && ch.priority == priority
-                                && ch.state == ChannelState::Connected
+                                && ch.state() == ChannelState::Connected
                         }) {
                             types::dispatch_exception(
                                 &exception_slot,
@@ -4367,7 +4380,7 @@ async fn run_coordinator(
                             |ch| {
                                 ch.server_addr == Some(server_addr)
                                     && ch.priority == priority
-                                    && ch.state == ChannelState::Connected
+                                    && ch.state() == ChannelState::Connected
                             },
                             |_| {},
                         );
@@ -4390,9 +4403,9 @@ async fn run_coordinator(
                         for ch in channels.values_mut() {
                             if ch.server_addr == Some(server_addr)
                                 && ch.priority == priority
-                                && ch.state == ChannelState::Unresponsive
+                                && let Link::Unresponsive(native) = ch.link
                             {
-                                ch.state = ChannelState::Connected;
+                                ch.link = Link::Connected(native);
                                 // The down edge told the receiver no-rights;
                                 // C's connect handlers re-read the held
                                 // permits (`dbCa.c:875-876`,
@@ -4519,10 +4532,11 @@ enum DisconnectKind {
 }
 
 impl DisconnectKind {
-    fn terminal_state(self) -> ChannelState {
-        match self {
-            Self::CircuitGone => ChannelState::Disconnected,
-            Self::Unresponsive => ChannelState::Unresponsive,
+    fn leave(self, link: Link) -> Link {
+        match (self, link) {
+            (Self::Unresponsive, Link::Connected(native)) => Link::Unresponsive(native),
+            (Self::Unresponsive, other) => other,
+            (Self::CircuitGone, _) => Link::Disconnected,
         }
     }
 }
@@ -4595,7 +4609,7 @@ fn disconnect_channels(
         // An unresponsive channel stays on its circuit
         // (`tcpiiu.cpp:929-937` only moves it to `unrespCircuit`), so its
         // permits are held and `ca_write_access` keeps answering them.
-        ch.state = kind.terminal_state();
+        ch.link = kind.leave(ch.link);
         if kind == DisconnectKind::CircuitGone {
             ch.access_rights = NO_RIGHTS;
         }
@@ -4720,7 +4734,7 @@ fn handle_disconnect(
         |ch| {
             ch.server_addr == Some(server_addr)
                 && ch.priority == priority
-                && (ch.state.is_operational() || ch.state == ChannelState::Connecting)
+                && (ch.state().is_operational() || ch.state() == ChannelState::Connecting)
         },
         |ch| {
             // Reconnection backoff: if the connection was short-lived (<30s),
@@ -4921,7 +4935,7 @@ fn cancel_subscription(
     // Same predicate as the EVENT_ADD: the server holds the subscription
     // while the circuit is unresponsive.
     if let Some(ch) = channels.get(&rec.cid)
-        && ch.state.is_operational()
+        && ch.state().is_operational()
         && let Some((data_type, req_count)) = rec.kind.request()
     {
         let server_addr = ch.server_addr.unwrap();
@@ -6442,9 +6456,9 @@ mod disconnect_transition_tests {
             cid,
             pv_name: format!("TEST:PV{cid}").into(),
             priority,
-            state: ChannelState::Connected,
+            link: Link::Connected(DbFieldType::Double),
             sid: 7,
-            native_type: None,
+            last_native: Some(DbFieldType::Double),
             element_count: 1,
             server_addr: Some(addr()),
             access_rights: AccessRights {
@@ -6561,7 +6575,7 @@ mod disconnect_transition_tests {
         );
 
         let ch = channels.get(&42).expect("channel stays registered");
-        assert_eq!(ch.state, ChannelState::Disconnected);
+        assert_eq!(ch.state(), ChannelState::Disconnected);
         assert!(
             !ch.access_rights.read && !ch.access_rights.write,
             "C `setServerAddressUnknown` clears both permits on circuit close"
@@ -6614,7 +6628,7 @@ mod disconnect_transition_tests {
         );
 
         let ch = channels.get(&42).unwrap();
-        assert_eq!(ch.state, ChannelState::Disconnected);
+        assert_eq!(ch.state(), ChannelState::Disconnected);
         assert!(
             !ch.access_rights.read && !ch.access_rights.write,
             "SERVER_DISCONN must reset access rights (C disconnectChannel)"
@@ -6631,7 +6645,7 @@ mod disconnect_transition_tests {
         );
 
         let other = channels.get(&43).unwrap();
-        assert_eq!(other.state, ChannelState::Connected);
+        assert_eq!(other.state(), ChannelState::Connected);
         assert!(
             other.access_rights.read && other.access_rights.write,
             "a sibling cid on the same circuit is untouched"
@@ -6659,12 +6673,12 @@ mod disconnect_transition_tests {
             &in_flight,
             &snapshots,
             DisconnectKind::Unresponsive,
-            |ch| ch.state == ChannelState::Connected,
+            |ch| ch.state() == ChannelState::Connected,
             |_| {},
         );
 
         let ch = channels.get(&42).unwrap();
-        assert_eq!(ch.state, ChannelState::Unresponsive);
+        assert_eq!(ch.state(), ChannelState::Unresponsive);
         assert!(
             ch.access_rights.read && ch.access_rights.write,
             "an unresponsive channel keeps its permits (no setServerAddressUnknown)"

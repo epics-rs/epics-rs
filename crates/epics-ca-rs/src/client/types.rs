@@ -1579,13 +1579,22 @@ pub(crate) enum TransportEvent {
     ChannelCreated {
         cid: u32,
         sid: u32,
-        data_type: u16,
+        native_type: DbFieldType,
         element_count: u32,
         access: AccessRights,
         server_addr: SocketAddr,
         /// priority of the circuit the CREATE_CH_RESP arrived
         /// on. Lets the coordinator clear a late response for an
         /// already-dropped cid on the right circuit.
+        priority: u8,
+    },
+    /// A CREATE_CH_RESP whose native type is no DBF type: the channel is
+    /// not created, though the server allocated `sid` for it.
+    ChannelRefused {
+        cid: u32,
+        sid: u32,
+        data_type: u16,
+        server_addr: SocketAddr,
         priority: u8,
     },
     MonitorData {

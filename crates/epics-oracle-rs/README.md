@@ -114,8 +114,8 @@ skipped oracle is the false-clean we are escaping.
 tests the **harness**, never the port — nothing in them asserts a value the
 port reports, so they keep passing while its field tables are regenerated
 underneath them. The unit half (dbd parsing, case generation, adjudication,
-allowlist staleness) needs no C tree. `tests/oracle.rs` and
-`tests/pva_oracle.rs` boot the real pair, so they need the trees above and fail
+allowlist staleness) needs no C tree. `tests/integration/oracle.rs` and
+`tests/integration/pva_oracle.rs` boot the real pair, so they need the trees above and fail
 loudly rather than skipping when one is absent, on either backend.
 
 **The PVA ground truth is pinned to pvxs 1.5.3**, and both halves of it have to
@@ -131,7 +131,7 @@ DEVIATION to AGREED and retired an allowlist row. Run the lane against an older
 ### Features
 
 `scaler` (default) adds scaler-rs's `scaler` record and its `Asyn Scaler` soft
-port to `oracle-ioc` (`--scaler-soft`), and builds `tests/scaler_oracle.rs`,
+port to `oracle-ioc` (`--scaler-soft`), and builds `tests/integration/scaler_oracle.rs`,
 which diffs the control scaler of `scaler-c8.db` against the C
 `oracleScalerIoc` — `EPICS_ORACLE_SCALER_IOC_BIN`, such as
 `$EPICS_MODULES/oracle-ioc/bin/linux-x86_64/oracleScalerIoc`.

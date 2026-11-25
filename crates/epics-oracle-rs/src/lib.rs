@@ -41,7 +41,7 @@
 //! cargo run -p epics-oracle-rs --bin oracle -- --phase all --json out.json
 //! ```
 //!
-//! From a test: see `tests/oracle.rs`, which boots the pair and asserts the
+//! From a test: see `tests/integration/oracle.rs`, which boots the pair and asserts the
 //! counts reconcile.
 //!
 //! # C reference pins

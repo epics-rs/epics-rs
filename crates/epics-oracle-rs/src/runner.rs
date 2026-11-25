@@ -1421,7 +1421,7 @@ mod bisect_tests {
 /// code is computed from.
 #[cfg(test)]
 mod adjudicate_tests {
-    // The cases driven against the real pair live in `tests/runner_pair.rs`,
+    // The cases driven against the real pair live in `tests/integration/runner_pair.rs`,
     // where cargo builds `oracle-ioc` for them. The rest adjudicate against
     // `FakeIoc` and stay selected on every backend.
     use super::*;

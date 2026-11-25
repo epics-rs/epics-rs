@@ -2104,7 +2104,7 @@ mod tests {
         assert!(spawn_evidence(&src, &tokens()).is_some());
     }
 
-    /// No `use` item at all. `epics-oracle-rs/tests/oracle.rs` spells the path
+    /// No `use` item at all. `epics-oracle-rs/tests/integration/oracle.rs` spells the path
     /// in full, and a module probe that demanded nothing precede `process`
     /// would refuse the commonest spelling there is.
     #[test]

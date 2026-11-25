@@ -2,7 +2,7 @@
 //! `softIocPVX` vs `oracle-ioc --pva`) and check the harness's own invariants
 //! against it.
 //!
-//! Like `tests/oracle.rs`, these assert properties of the **harness**, not of
+//! Like `tests/integration/oracle.rs`, these assert properties of the **harness**, not of
 //! the port — with one deliberate exception noted on
 //! [`at_least_one_channel_agrees`]. The property the harness stakes its
 //! credibility on is that it never turns "I could not measure this" into "this

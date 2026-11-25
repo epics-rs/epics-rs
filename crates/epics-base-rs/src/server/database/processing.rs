@@ -764,6 +764,59 @@ impl DelayedCallbackArm {
     }
 }
 
+/// [`CallbackRequests::verdict`]: no wake since the last poll.
+const UNJUDGED: u8 = 0;
+/// A wake made while the scan facility had not stopped.
+const ADMITTED: u8 = 1;
+/// Wakes all made once it had.
+const REFUSED: u8 = 2;
+
+/// The waker a [`PvDatabase::spawn_callback_after`] task polls its body with:
+/// each wake is that body's next `callbackRequest`, judged as it is made.
+struct CallbackRequests {
+    scan: Arc<crate::server::scan::ScanControl>,
+    /// The judgement of the wakes since the last poll; one admitted wake
+    /// outweighs any refused one.
+    verdict: std::sync::atomic::AtomicU8,
+    /// The runtime task's own waker, as of its last poll.
+    outer: std::sync::Mutex<Option<std::task::Waker>>,
+}
+
+impl CallbackRequests {
+    /// Track `outer` and take the verdict that brought this poll.
+    fn next_poll(&self, outer: &std::task::Waker) -> u8 {
+        let mut held = self.outer.lock().unwrap();
+        if !held.as_ref().is_some_and(|w| w.will_wake(outer)) {
+            *held = Some(outer.clone());
+        }
+        drop(held);
+        self.verdict.swap(UNJUDGED, Ordering::AcqRel)
+    }
+}
+
+impl std::task::Wake for CallbackRequests {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        if self.scan.is_exiting() {
+            let _ = self.verdict.compare_exchange(
+                UNJUDGED,
+                REFUSED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        } else {
+            self.verdict.store(ADMITTED, Ordering::Release);
+        }
+        let outer = self.outer.lock().unwrap().clone();
+        if let Some(outer) = outer {
+            outer.wake();
+        }
+    }
+}
+
 /// What a SoftCallback input dset's `getCallback` reads off the notified
 /// target (`devAiSoftCallback.c:63-79`), held in its devPvt until the
 /// re-entry applies it.
@@ -4424,12 +4477,15 @@ impl PvDatabase {
     }
 
     /// The one spawner of this database's callback-band tasks: C
-    /// `callbackRequestDelayed`. `callbackStop` leaves every callback still
-    /// pending unrun (callback.c:237-260) right after `scanStop`
-    /// (iocInit.c:733-735), so the task ends at its first wake — timer,
-    /// requeue or sleep — after [`Self::accepts_reentry`] turns false. The
-    /// runtime's own stop cannot do this: it is process-wide, comes later,
-    /// and refuses no spawned task.
+    /// `callbackRequestDelayed`, whose expiry is a `callbackRequest`
+    /// (callback.c:404-408). That request reads no state, and `callbackTask`
+    /// empties its ring before it rereads `shutdown` (callback.c:210-235,
+    /// :341-376), so `callbackStop` after `scanStop` (iocInit.c:733-735)
+    /// leaves a callback requested before it to run and one requested after
+    /// it unrun. Each request is judged when it is made: the delay's expiry,
+    /// and every later wake of `task` — a requeue, a sleep's expiry, a
+    /// completion — as the request C's record support makes again. The
+    /// runtime's own stop cannot do this: it is process-wide and comes later.
     pub(crate) fn spawn_callback_after<F>(
         &self,
         priority: crate::runtime::task::CallbackPriority,
@@ -4440,14 +4496,24 @@ impl PvDatabase {
         F: std::future::Future<Output = ()> + Send + 'static,
     {
         // The scan cell, not the database: a task must not keep it alive.
-        let scan = Arc::clone(self.scan_control());
-        crate::runtime::task::spawn_background_after(priority, delay, async move {
+        let requests = Arc::new(CallbackRequests {
+            scan: Arc::clone(self.scan_control()),
+            verdict: std::sync::atomic::AtomicU8::new(UNJUDGED),
+            outer: std::sync::Mutex::new(None),
+        });
+        let admit = {
+            let scan = Arc::clone(&requests.scan);
+            move || !scan.is_exiting()
+        };
+        let inner = std::task::Waker::from(Arc::clone(&requests));
+        crate::runtime::task::spawn_background_after_admitted(priority, delay, admit, async move {
             let mut task = std::pin::pin!(task);
             std::future::poll_fn(|cx| {
-                if scan.is_exiting() {
+                if requests.next_poll(cx.waker()) == REFUSED {
                     return std::task::Poll::Ready(());
                 }
-                task.as_mut().poll(cx)
+                task.as_mut()
+                    .poll(&mut std::task::Context::from_waker(&inner))
             })
             .await
         })

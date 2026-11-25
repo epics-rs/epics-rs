@@ -695,16 +695,32 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
+    spawn_background_after_admitted(priority, delay, || true, future)
+}
+
+/// [`spawn_background_after`] whose request its owner may refuse: `admit` is
+/// asked when the delay expires — at once for a zero delay — which is when C's
+/// timer calls `callbackRequest` (`callback.c:404-408`), and a `false` cancels
+/// the task unrun, its handle resolving as cancelled.
+pub fn spawn_background_after_admitted<F, A>(
+    priority: CallbackPriority,
+    delay: Duration,
+    admit: A,
+    future: F,
+) -> BackgroundTaskHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+    A: FnOnce() -> bool + Send + 'static,
+{
     use crate::runtime::background::spawn_future_after;
-    if delay.is_zero() {
-        return spawn_background(priority, future);
-    }
     let exec = background();
     spawn_future_after(
         &exec.callbacks().handle(),
         &exec.timer().handle(),
         priority,
         delay,
+        admit,
         future,
     )
 }

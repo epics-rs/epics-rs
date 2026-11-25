@@ -578,24 +578,41 @@ where
 /// `callbackRequestDelayed` (`callback.c:404-419`): the timer starts at this
 /// call and the task joins the band's tail when it fires, so the delay runs
 /// from the request, not from when a busy band reaches the task. A zero delay
-/// still goes through the timer, as C's does.
+/// fires at once on the calling thread, as C's timer queue fires it straight
+/// into `callbackRequest`.
 ///
-/// An abort lands at the fire, the task's first chance to be polled.
-pub fn spawn_future_after<F>(
+/// The fire is the task's `callbackRequest` (the timer's `notify`,
+/// `callback.c:404-408`): `admit` is asked there, and a `false` cancels the
+/// task unrun, as a request no band will run. An abort lands at the fire, the
+/// task's first chance to be polled.
+pub fn spawn_future_after<F, A>(
     callbacks: &CallbackHandle,
     timer: &TimerHandle,
     priority: CallbackPriority,
     delay: std::time::Duration,
+    admit: A,
     fut: F,
 ) -> JoinFuture<F::Output>
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
+    A: FnOnce() -> bool + Send + 'static,
 {
     let (join, task) = new_task(callbacks, priority, fut);
-    // The entry owns the task until it fires, so nothing cancels its key;
-    // a timer already shut down drops it, which cancels the task.
-    let _ = timer.schedule_wake(delay, Box::new(move || task.enqueue()));
+    let fire = move || {
+        if admit() {
+            task.enqueue();
+        } else {
+            task.cancel_unrun();
+        }
+    };
+    if delay.is_zero() {
+        fire();
+    } else {
+        // The entry owns the task until it fires, so nothing cancels its key;
+        // a timer already shut down drops it, which cancels the task.
+        let _ = timer.schedule_wake(delay, Box::new(fire));
+    }
     join
 }
 

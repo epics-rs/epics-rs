@@ -1,15 +1,21 @@
 //! C `iocShutdown` stops the callback threads right after the scan facility
-//! (iocInit.c:733-735), and `callbackStop` (callback.c:237-260) leaves every
-//! callback still pending, delayed or not, unrun. So a seq group behind its
-//! `DLYn` (seqRecord.c:214, `processCallback`) and a throttle's cooldown
-//! `valuePut` (throttleRecord.c:595, `delayFuncCallback`) never land once
-//! shutdown has begun; without it they land on time.
+//! (iocInit.c:733-735). `callbackRequest` reads no state and `callbackTask`
+//! empties its ring before it rereads `shutdown` (callback.c:210-235,
+//! :341-376), so a callback requested before `callbackStop` still runs and
+//! one requested after it never does; a delayed one is requested when its
+//! timer fires (callback.c:404-408). So a seq group behind its `DLYn`
+//! (seqRecord.c:214, `processCallback`) and a throttle's cooldown `valuePut`
+//! (throttleRecord.c:595, `delayFuncCallback`) land by when they were
+//! requested, not by when a busy band reaches them.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use epics_base_rs::error::{CaError, CaResult};
+use epics_base_rs::runtime::background::{CallbackBody, CallbackCell};
+use epics_base_rs::runtime::task::{CallbackPriority, request_cell, spawn_background_after};
 use epics_base_rs::server::database::{ProcStack, PvDatabase};
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::record::{ProcessAction, ProcessActions, ProcessOutcome, Record};
@@ -65,6 +71,7 @@ record(seq, "S") {
     field(LNK1, "B.VAL PP")
 }
 record(cooldown, "T") { field(DLY, "0.3") }
+record(cooldown, "U") { field(DLY, "0.05") }
 "#;
 
 async fn ioc() -> Arc<PvDatabase> {
@@ -88,10 +95,68 @@ fn read(db: &PvDatabase, pv: &str) -> f64 {
     db.get_pv(pv).unwrap().to_f64().unwrap()
 }
 
-fn fires(db: &PvDatabase) -> i32 {
-    match db.get_record("T").unwrap().read().record.get_field("FIRES") {
+fn fires(db: &PvDatabase, rec: &str) -> i32 {
+    match db.get_record(rec).unwrap().read().record.get_field("FIRES") {
         Some(EpicsValue::Long(n)) => n,
-        other => panic!("T.FIRES = {other:?}"),
+        other => panic!("{rec}.FIRES = {other:?}"),
+    }
+}
+
+fn pact(db: &PvDatabase, rec: &str) -> bool {
+    db.get_record(rec).unwrap().read().is_processing()
+}
+
+#[derive(Default)]
+struct Hold {
+    running: bool,
+    released: bool,
+}
+
+type Shared = Arc<(Mutex<Hold>, Condvar)>;
+
+struct Holder(Shared);
+
+impl CallbackBody for Holder {
+    fn run(&self) {
+        let (hold, cv) = &*self.0;
+        let mut hold = hold.lock().unwrap();
+        hold.running = true;
+        cv.notify_all();
+        while !hold.released {
+            hold = cv.wait(hold).unwrap();
+        }
+    }
+}
+
+/// The low band's one worker, busy until dropped: what it is asked to run
+/// meanwhile stays requested.
+struct BusyBand(Shared);
+
+impl BusyBand {
+    fn take() -> Self {
+        let shared = Shared::default();
+        request_cell(
+            CallbackPriority::Low,
+            &CallbackCell::new(Holder(shared.clone())),
+        )
+        .unwrap();
+        let (hold, cv) = &*shared;
+        let (held, wait) = cv
+            .wait_timeout_while(hold.lock().unwrap(), fact_budget::FACT_BUDGET, |h| {
+                !h.running
+            })
+            .unwrap();
+        drop(held);
+        assert!(!wait.timed_out(), "the low band never took the holder");
+        BusyBand(shared)
+    }
+}
+
+impl Drop for BusyBand {
+    fn drop(&mut self) {
+        let (hold, cv) = &*self.0;
+        hold.lock().unwrap().released = true;
+        cv.notify_all();
     }
 }
 
@@ -107,6 +172,19 @@ async fn until(what: &str, done: impl Fn() -> bool) {
 async fn past_the_delay() {
     // absence-window: a callback refused at its expiry leaves nothing to wait on.
     epics_base_rs::runtime::task::sleep(Duration::from_secs_f64(DELAY * 2.0)).await;
+}
+
+/// A delay of at most `DELAY` armed before this call has expired and made its
+/// request: the one timer fires in deadline order.
+async fn the_delay_expired() {
+    let expired = Arc::new(AtomicBool::new(false));
+    let flag = expired.clone();
+    drop(spawn_background_after(
+        CallbackPriority::High,
+        Duration::from_secs_f64(DELAY),
+        async move { flag.store(true, Ordering::Release) },
+    ));
+    until("the delay expired", || expired.load(Ordering::Acquire)).await;
 }
 
 #[epics_macros_rs::epics_test]
@@ -142,7 +220,7 @@ async fn a_seq_group_behind_its_delay_never_runs_once_shutdown_began() {
 async fn a_throttle_cooldown_fires_while_the_ioc_runs() {
     let db = ioc().await;
     process(&db, "T").await;
-    until("the cooldown", || fires(&db) == 1).await;
+    until("the cooldown", || fires(&db, "T") == 1).await;
 }
 
 #[epics_macros_rs::epics_test]
@@ -151,5 +229,54 @@ async fn a_throttle_cooldown_never_fires_once_shutdown_began() {
     process(&db, "T").await;
     db.scan_control().stop();
     past_the_delay().await;
-    assert_eq!(fires(&db), 0, "delayFuncCallback ran after scanStop");
+    assert_eq!(fires(&db, "T"), 0, "delayFuncCallback ran after scanStop");
+}
+
+#[epics_macros_rs::epics_test]
+async fn a_seq_group_requested_before_shutdown_runs_once_the_band_frees() {
+    let db = ioc().await;
+    let band = BusyBand::take();
+    process(&db, "S").await;
+    assert_eq!(read(&db, "A"), 0.0);
+    db.scan_control().stop();
+    drop(band);
+    until("A=1", || read(&db, "A") == 1.0).await;
+    // Group 1's delay expires after the stop: a request refused.
+    past_the_delay().await;
+    assert_eq!(read(&db, "B"), 0.0, "group 1 ran after scanStop");
+}
+
+#[epics_macros_rs::epics_test]
+async fn a_seq_group_whose_delay_expired_before_shutdown_runs_once_the_band_frees() {
+    let db = ioc().await;
+    process(&db, "S").await;
+    until("A=1", || read(&db, "A") == 1.0).await;
+    let band = BusyBand::take();
+    the_delay_expired().await;
+    assert_eq!(read(&db, "B"), 0.0);
+    db.scan_control().stop();
+    drop(band);
+    until("B=2", || read(&db, "B") == 2.0).await;
+}
+
+#[epics_macros_rs::epics_test]
+async fn a_throttle_cooldown_that_expired_before_shutdown_fires_once_the_band_frees() {
+    let db = ioc().await;
+    let band = BusyBand::take();
+    process(&db, "U").await;
+    the_delay_expired().await;
+    assert_eq!(fires(&db, "U"), 0);
+    db.scan_control().stop();
+    drop(band);
+    until("the cooldown", || fires(&db, "U") == 1).await;
+}
+
+#[epics_macros_rs::epics_test]
+async fn a_seq_group_requested_after_shutdown_never_runs() {
+    let db = ioc().await;
+    db.scan_control().stop();
+    process(&db, "S").await;
+    assert!(pact(&db, "S"), "the seq went asynchronous");
+    past_the_delay().await;
+    assert_eq!(read(&db, "A"), 0.0, "group 0 ran after scanStop");
 }

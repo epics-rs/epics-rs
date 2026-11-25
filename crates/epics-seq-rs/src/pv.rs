@@ -586,11 +586,18 @@ impl InProcess {
             .subscribe(type_to_ca(ty), count, mask, move |snapshot| {
                 m.deliver(&handler, &snapshot)
             });
-        match sub {
-            Ok(sub) if shared.state.lock().monitor == monid => drop(slot.replace(sub)),
-            Ok(_) => {}
-            Err(e) => subscribe_refused(shared, monid, &e),
-        }
+        let unused = match sub {
+            Ok(sub) if shared.state.lock().monitor == monid => slot.replace(sub),
+            Ok(sub) => Some(sub),
+            Err(e) => {
+                subscribe_refused(shared, monid, &e);
+                None
+            }
+        };
+        // Its drop waits for its running callback, which may wait on a
+        // monitor-off or destroy that waits on `slot`.
+        drop(slot);
+        drop(unused);
     }
 
     /// The put callback's completion: here, when the record's processing
@@ -670,13 +677,19 @@ impl PvVar {
     /// later request fails. It waits for a running callback, so the caller
     /// holds no seq lock across it, as C unlocks `sp->lock` around it.
     pub fn destroy(&self) -> PvStat {
-        let _cb = self.shared.callback.lock();
+        let cb = self.shared.callback.lock();
         self.shared.close();
         // `ca_clear_channel`: the channel's monitor goes with it.
-        match &self.link {
-            Link::InProcess(l) => drop(l.monitor.lock().take()),
-            Link::Network(net) => net.send(Cmd::Clear),
-        }
+        let monitor = match &self.link {
+            Link::InProcess(l) => l.monitor.lock().take(),
+            Link::Network(net) => {
+                net.send(Cmd::Clear);
+                None
+            }
+        };
+        // Its drop waits for its running callback, which takes `cb`.
+        drop(cb);
+        drop(monitor);
         PvStat::Ok
     }
 
@@ -910,21 +923,27 @@ impl PvVar {
     /// `pvVarMonitorOff`: once this returns no event of the monitor runs, so
     /// it must not be called holding a lock the monitor callback takes.
     pub fn monitor_off(&self) -> PvStat {
-        let _cb = self.shared.callback.lock();
+        let cb = self.shared.callback.lock();
         let was_on = std::mem::take(&mut self.shared.state.lock().monitor) != 0;
-        if was_on {
-            match &self.link {
-                Link::InProcess(l) => drop(l.monitor.lock().take()),
-                Link::Network(net) => net.send(Cmd::Chan(ChanCmd::MonitorOff)),
+        let monitor = match &self.link {
+            Link::InProcess(l) if was_on => l.monitor.lock().take(),
+            Link::Network(net) if was_on => {
+                net.send(Cmd::Chan(ChanCmd::MonitorOff));
+                None
             }
-        }
+            _ => None,
+        };
+        // Its drop waits for its running callback, which takes `cb`.
+        drop(cb);
+        drop(monitor);
         PvStat::Ok
     }
 }
 
 impl Drop for PvVar {
-    /// Closes the channel without waiting for a callback in flight, so a
-    /// var may be dropped from anywhere; [`PvVar::destroy`] waits.
+    /// Closes the channel without waiting for a network callback in flight;
+    /// an in-process monitor still on waits for its running callback as in
+    /// [`PvVar::destroy`].
     fn drop(&mut self) {
         self.shared.close();
         if let Link::Network(net) = &self.link {
@@ -1465,6 +1484,138 @@ mod tests {
         release.send(()).unwrap();
         sys.deliver();
         assert_eq!(landed.load(Ordering::SeqCst), 1);
+    }
+
+    /// How long a thread is given to reach a lock it then waits on, which
+    /// gives no sign.
+    const SETTLE: Duration = Duration::from_millis(200);
+
+    /// `call` of `var` on its own thread, its status on the receiver.
+    fn spawned(
+        var: &Arc<PvVar>,
+        call: impl FnOnce(&PvVar) -> PvStat + Send + 'static,
+    ) -> std::sync::mpsc::Receiver<PvStat> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let var = var.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(call(&var));
+        });
+        rx
+    }
+
+    /// Until `fact` holds, or the budget runs out.
+    fn until(what: &str, fact: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+        while !fact() {
+            assert!(std::time::Instant::now() < deadline, "{what}");
+            std::thread::yield_now();
+        }
+    }
+
+    /// The statuses of `calls`, `None` for one not back within the budget,
+    /// leaking `held` then, as nothing may join the threads stuck.
+    fn returned<T>(calls: Vec<std::sync::mpsc::Receiver<PvStat>>, held: T) -> Vec<Option<PvStat>> {
+        let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+        let statuses: Vec<_> = calls
+            .iter()
+            .map(|call| {
+                call.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                    .ok()
+            })
+            .collect();
+        if statuses.contains(&None) {
+            std::mem::forget(held);
+        }
+        statuses
+    }
+
+    /// `calls` of an in-process var, each waiting in turn on a callback of
+    /// the var running, then an event of its monitor waiting behind them:
+    /// each returns once the callback does. `CAC-event` is inside the
+    /// event's subscription while it waits, so a call that drops the
+    /// subscription before letting the callback in would never return.
+    fn queued_behind_a_callback_return(calls: &[fn(&PvVar) -> PvStat]) {
+        let db = served(&["g:h"]);
+        let sys = PvSystem::create(&db);
+        let var = Arc::new(PvVar::create(&sys, "g:h", |_| {}).unwrap());
+        let (event, events) = std::sync::mpsc::channel();
+        var.monitor_on(PvType::Double, 1, move |_| {
+            let _ = event.send(());
+        });
+        sys.deliver();
+        events.try_recv().expect("the first event");
+        let callback = var.shared.callback.lock();
+        let waiting: Vec<_> = calls
+            .iter()
+            .map(|&call| {
+                let call = spawned(&var, call);
+                // absence-window: a call waiting on the callback gives no
+                // sign; the window also queues it ahead of the next.
+                let early = call.recv_timeout(SETTLE);
+                assert!(early.is_err(), "returned inside a callback");
+                call
+            })
+            .collect();
+        post(&db, "g:h", 1.0);
+        // absence-window: `CAC-event` waiting on the callback gives no sign.
+        let early = events.recv_timeout(SETTLE);
+        assert!(early.is_err(), "an event ran inside a callback");
+        drop(callback);
+        let statuses = returned(waiting, (var, sys, db));
+        assert_eq!(statuses, vec![Some(PvStat::Ok); calls.len()]);
+    }
+
+    /// The monitor-off takes the subscription; destroy finds it gone.
+    #[test]
+    fn monitor_off_then_destroy_behind_a_callback_return() {
+        queued_behind_a_callback_return(&[PvVar::monitor_off, PvVar::destroy]);
+    }
+
+    #[test]
+    fn destroy_behind_a_callback_returns() {
+        queued_behind_a_callback_return(&[PvVar::destroy]);
+    }
+
+    /// A monitor-on whose subscription a monitor-off made unused while it
+    /// subscribed returns, as does the monitor-off, with `CAC-event` inside
+    /// that subscription's first event waiting on the monitor-off; and the
+    /// event never runs.
+    #[test]
+    fn a_monitor_on_turned_off_while_it_subscribes_returns() {
+        let db = served(&["g:i"]);
+        let sys = PvSystem::create(&db);
+        let var = Arc::new(PvVar::create(&sys, "g:i", |_| {}).unwrap());
+        let Link::InProcess(link) = &var.link else {
+            panic!("g:i is in-process");
+        };
+        let slot = link.monitor.lock();
+        let (event, events) = std::sync::mpsc::channel();
+        let on = spawned(&var, move |var| {
+            var.monitor_on(PvType::Double, 1, move |_| {
+                let _ = event.send(());
+            })
+        });
+        until("monitor_on took its monid", || var.monitor_is_on());
+        // absence-window: monitor_on waiting on `slot` gives no sign; the
+        // window also queues it there ahead of the monitor-off.
+        assert!(on.recv_timeout(SETTLE).is_err(), "monitor_on returned");
+        let off = spawned(&var, PvVar::monitor_off);
+        until("monitor_off took the monid", || !var.monitor_is_on());
+        let state = var.shared.state.lock();
+        drop(slot);
+        // absence-window: monitor_on waiting on `state` with the unused
+        // subscription, and `CAC-event` inside it on the monitor-off's
+        // callback lock, give no sign.
+        let early = events.recv_timeout(SETTLE);
+        assert!(early.is_err(), "an event ran before monitor_on went on");
+        drop(state);
+        let statuses = returned(vec![on, off], (var.clone(), sys, db));
+        assert_eq!(statuses, [Some(PvStat::Ok); 2]);
+        assert!(!var.monitor_is_on());
+        assert!(
+            events.try_recv().is_err(),
+            "an event of the unused subscription ran"
+        );
     }
 
     /// A post made before a state set's wait returns lands before it runs

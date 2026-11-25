@@ -84,14 +84,15 @@ pub trait ClientChannel: Send + Sync {
     -> Result<Option<PutCompletion>, String>;
 }
 
-/// One `evid`: dropping it is `ca_clear_subscription`. It does not wait
-/// for a callback already running.
+/// One `evid`: dropping it is `ca_clear_subscription`. The drop waits for
+/// the subscription's callback if one is running, unless it drops inside
+/// that callback, and no callback runs after it.
 pub struct ClientSubscription {
     _held: Box<dyn Send>,
 }
 
 impl ClientSubscription {
-    /// A subscription that ends when `held` drops.
+    /// A subscription that ends when `held` drops, which keeps that rule.
     pub fn new(held: impl Send + 'static) -> Self {
         Self {
             _held: Box::new(held),
@@ -337,7 +338,7 @@ impl InProcessEvents {
         events.start_network()?;
         let route = Arc::new(NetworkRoute {
             values: parking_lot::Mutex::new(Some(values)),
-            callback,
+            callback: Callback::new(callback),
         });
         events.network.routes.lock().push(Arc::downgrade(&route));
         // Its first poll is what registers the waker its values wake.
@@ -637,23 +638,57 @@ impl Drop for Run<'_> {
     }
 }
 
+/// A subscription's callback, which its drop cancels: `db_cancel_event`
+/// waits for one running except on its own thread, and none runs after.
+struct Callback {
+    /// Held across each call, and taken by the cancel.
+    running: parking_lot::ReentrantMutex<()>,
+    canceled: AtomicBool,
+    call: Box<dyn Fn(Snapshot) + Send + Sync>,
+}
+
+impl Callback {
+    fn new(call: Box<dyn Fn(Snapshot) + Send + Sync>) -> Self {
+        Self {
+            running: parking_lot::ReentrantMutex::new(()),
+            canceled: AtomicBool::new(false),
+            call,
+        }
+    }
+
+    fn canceled(&self) -> bool {
+        self.canceled.load(Ordering::Acquire)
+    }
+
+    fn call(&self, snapshot: Snapshot) {
+        let _running = self.running.lock();
+        if !self.canceled() {
+            (self.call)(snapshot);
+        }
+    }
+
+    fn cancel(&self) {
+        let _running = self.running.lock();
+        self.canceled.store(true, Ordering::Release);
+    }
+}
+
 /// One subscription's way from an entry to its callback.
 struct Route {
     record: RecordKey,
     notify: StateNotify,
     count: u32,
-    callback: Box<dyn Fn(Snapshot) + Send + Sync>,
-    canceled: AtomicBool,
+    callback: Callback,
 }
 
 impl Route {
     fn deliver(&self, event: MonitorEvent) {
-        if self.canceled.load(Ordering::Acquire) {
+        if self.callback.canceled() {
             return;
         }
         // `callStateNotify`'s `ECA_GETFAIL` reaches no callback here.
         if let Some(snapshot) = self.notify.state_notify(event, self.count) {
-            (self.callback)(snapshot);
+            self.callback.call(snapshot);
         }
     }
 }
@@ -665,7 +700,7 @@ type NetworkValues = Box<dyn FnMut(&mut Context<'_>) -> Poll<Option<Snapshot>> +
 struct NetworkRoute {
     /// `None` once they end or the subscription drops.
     values: parking_lot::Mutex<Option<NetworkValues>>,
-    callback: Box<dyn Fn(Snapshot) + Send + Sync>,
+    callback: Callback,
 }
 
 impl NetworkRoute {
@@ -685,26 +720,24 @@ impl NetworkRoute {
         let Poll::Ready(Some(snapshot)) = next else {
             return false;
         };
-        (self.callback)(snapshot);
+        self.callback.call(snapshot);
         true
     }
 }
 
-/// Dropping it takes no value after; a callback already running goes on.
+/// Dropping it cancels its callback and ends its values.
 struct NetworkSubscription(Arc<NetworkRoute>);
 
 impl Drop for NetworkSubscription {
     fn drop(&mut self) {
+        self.0.callback.cancel();
         let values = self.0.values.lock().take();
         drop(values);
     }
 }
 
 /// A subscription on a context's [`InProcessEvents`]. Dropping it cancels
-/// the event (`db_cancel_event`), and no entry taken after reaches the
-/// callback. It does not wait for a callback already running, as C's
-/// cancel does: a drop can come under a lock that callback takes, so the
-/// client waits itself.
+/// the event (`db_cancel_event`) as dropping a [`ClientSubscription`] does.
 pub struct InProcessSubscription {
     _reader: EventReader,
     route: Arc<Route>,
@@ -712,7 +745,7 @@ pub struct InProcessSubscription {
 
 impl Drop for InProcessSubscription {
     fn drop(&mut self) {
-        self.route.canceled.store(true, Ordering::Release);
+        self.route.callback.cancel();
     }
 }
 
@@ -742,8 +775,7 @@ fn subscribe(
         record: RecordKey::of(channel),
         notify,
         count,
-        callback,
-        canceled: AtomicBool::new(false),
+        callback: Callback::new(callback),
     });
     let context: DeliveryContext = route.clone();
     let reader = channel

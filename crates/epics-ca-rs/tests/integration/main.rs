@@ -88,6 +88,7 @@ mod differential_libca;
 mod discovery_dns_update;
 mod discovery_mdns;
 mod dollar_long_string_record;
+mod dropping_a_subscription_waits_for_its_running_callback;
 mod each_ca_link_opens_its_own_channel;
 mod events_per_chan_clamp_is_reported_at_server_start;
 mod interop_c_client_rust_ioc;

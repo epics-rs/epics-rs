@@ -1,0 +1,13 @@
+error: `Instant::now() + d` adds a `Duration` to a `std::time::Instant`, which panics past the clock's range
+  --> $DIR/main.rs:9:5
+   |
+LL |     Instant::now() + d
+   |     ^^^^^^^^^^^^^^^^^^
+   |
+   = help: take the deadline from `deadline_after` / `deadline_from_now`, or allow the function in dylint.toml with the reason the sum cannot overflow
+   = note: `#[deny(instant_add_duration)]` on by default
+
+error: dylint.toml allows `fn absent` in $DIR/main.rs, which adds no `Duration` to an `Instant` there
+
+error: aborting due to 2 previous errors
+

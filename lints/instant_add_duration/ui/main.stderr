@@ -1,0 +1,67 @@
+error: `now + timeout` adds a `Duration` to a `std::time::Instant`, which panics past the clock's range
+  --> $DIR/main.rs:10:13
+   |
+LL |     let _ = now + timeout;
+   |             ^^^^^^^^^^^^^
+   |
+   = help: take the deadline from `deadline_after` / `deadline_from_now`, or allow the function in dylint.toml with the reason the sum cannot overflow
+   = note: `#[deny(instant_add_duration)]` on by default
+
+error: `Instant::now() + FIXED` adds a `Duration` to a `std::time::Instant`, which panics past the clock's range
+  --> $DIR/main.rs:11:13
+   |
+LL |     let _ = Instant::now() + FIXED;
+   |             ^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: take the deadline from `deadline_after` / `deadline_from_now`, or allow the function in dylint.toml with the reason the sum cannot overflow
+
+error: `next += timeout` adds a `Duration` to a `std::time::Instant`, which panics past the clock's range
+  --> $DIR/main.rs:13:5
+   |
+LL |     next += timeout;
+   |     ^^^^^^^^^^^^^^^
+   |
+   = help: take the deadline from `deadline_after` / `deadline_from_now`, or allow the function in dylint.toml with the reason the sum cannot overflow
+
+error: `now.add(timeout)` adds a `Duration` to a `std::time::Instant`, which panics past the clock's range
+  --> $DIR/main.rs:14:13
+   |
+LL |     let _ = now.add(timeout);
+   |             ^^^^^^^^^^^^^^^^
+   |
+   = help: take the deadline from `deadline_after` / `deadline_from_now`, or allow the function in dylint.toml with the reason the sum cannot overflow
+
+error: `Add::add(now, timeout)` adds a `Duration` to a `std::time::Instant`, which panics past the clock's range
+  --> $DIR/main.rs:15:13
+   |
+LL |     let _ = Add::add(now, timeout);
+   |             ^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: take the deadline from `deadline_after` / `deadline_from_now`, or allow the function in dylint.toml with the reason the sum cannot overflow
+
+error: `<Instant as Add<Duration>>::add(now, timeout)` adds a `Duration` to a `std::time::Instant`, which panics past the clock's range
+  --> $DIR/main.rs:16:13
+   |
+LL |     let _ = <Instant as Add<Duration>>::add(now, timeout);
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: take the deadline from `deadline_after` / `deadline_from_now`, or allow the function in dylint.toml with the reason the sum cannot overflow
+
+error: `next.add_assign(timeout)` adds a `Duration` to a `std::time::Instant`, which panics past the clock's range
+  --> $DIR/main.rs:17:5
+   |
+LL |     next.add_assign(timeout);
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: take the deadline from `deadline_after` / `deadline_from_now`, or allow the function in dylint.toml with the reason the sum cannot overflow
+
+error: `now + timeout` adds a `Duration` to a `std::time::Instant`, which panics past the clock's range
+  --> $DIR/main.rs:18:20
+   |
+LL |     let later = || now + timeout;
+   |                    ^^^^^^^^^^^^^
+   |
+   = help: take the deadline from `deadline_after` / `deadline_from_now`, or allow the function in dylint.toml with the reason the sum cannot overflow
+
+error: aborting due to 8 previous errors
+

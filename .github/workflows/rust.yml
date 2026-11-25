@@ -596,7 +596,8 @@ jobs:
         exit "$rc"
 
   # raw_float_format (lints/raw_float_format) needs a format argument's type,
-  # which only a rustc_private lint sees, so it runs on the nightly its
+  # and instant_add_duration (lints/instant_add_duration) an operator's, which
+  # only a rustc_private lint sees, so they run on the nightly their
   # rust-toolchain.toml pins while the workspace stays on stable. That pin must
   # be a rust-clippy sync date: dylint_driver registers the clippy_utils
   # symbols of the nearest sync, and on any other nightly rustc panics on the
@@ -619,9 +620,12 @@ jobs:
     - name: Lint UI tests
       working-directory: lints/raw_float_format
       run: cargo test
-    - name: raw_float_format
+    - name: instant_add_duration UI tests
+      working-directory: lints/instant_add_duration
+      run: cargo test
+    - name: dylint lints
       run: cargo dylint --all --workspace -- --all-features --keep-going
-    - name: raw_float_format (thread backend)
+    - name: dylint lints (thread backend)
       env:
         EPICS_RS_BUILD_EXEC_BACKEND: thread
       run: cargo dylint --all --workspace -- --all-features --keep-going

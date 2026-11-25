@@ -7,3 +7,15 @@ allow = [
     { path = "tools/dbd-codegen/src/breaktable.rs", arg = "eng", reason = "emits Rust source: {:?} is the f64 literal that round-trips, which a C breakpoint table never prints" },
     { path = "crates/epics-libcom-rs/src/cfmt.rs", arg = "a", reason = "CFloat's own digits: a finite non-negative magnitude, whose Rust digits are exact and to which cfmt adds C's sign, exponent and NaN/inf spelling" },
 ]
+
+# instant_add_duration (lints/instant_add_duration): each entry is a function
+# of `path` whose `Instant + Duration` cannot overflow, and why it does not
+# take the deadline from `deadline_after` / `deadline_from_now`.
+[instant_add_duration]
+allow = [
+    { path = "crates/epics-libcom-rs/src/runtime/time.rs", fn = "far_future", reason = "the owners' saturation itself: now + FAR_FUTURE (30 years) is inside the clock's range" },
+    { path = "crates/epics-libcom-rs/src/runtime/task.rs", fn = "deadline_after", reason = "the backend owner's saturation itself: now + FAR_FUTURE (30 years) is inside the clock's range" },
+    { path = "crates/fact-budget/src/lib.rs", fn = "until", reason = "test-only crate without epics-libcom-rs; FACT_BUDGET is a 60 s constant" },
+    { path = "crates/fact-budget/src/lib.rs", fn = "until_async", reason = "test-only crate without epics-libcom-rs; FACT_BUDGET is a 60 s constant" },
+    { path = "crates/c-ca-tools/src/lib.rs", fn = "wait_for", reason = "test-only crate without epics-libcom-rs; every caller passes the 60 s FACT_BUDGET" },
+]

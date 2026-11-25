@@ -98,7 +98,7 @@ Taken by `epics-base-rs`, `epics-libcom-rs`, `epics-ca-rs`, `epics-pva-rs`,
 cargo nextest run -p source-guard
 ```
 
-20 tests, one per boundary of the rule. `tests/slice_rule.rs` keeps the
+20 tests, one per boundary of the rule. `tests/integration/slice_rule.rs` keeps the
 positional rule it replaced as a named function, so every test that disproves it
 fails if `production` ever goes back to it.
 

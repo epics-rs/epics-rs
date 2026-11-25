@@ -259,7 +259,7 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ),
     (
         "epics-ca-rs",
-        "tests/a_network_ca_inp_count_allocates_nothing.rs",
+        "tests/alloc/a_network_ca_inp_count_allocates_nothing.rs",
     ),
     (
         "epics-ca-rs",
@@ -425,7 +425,7 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ),
     (
         "epics-ca-rs",
-        "tests/scan_thread_monitor_post_allocates_nothing.rs",
+        "tests/alloc/scan_thread_monitor_post_allocates_nothing.rs",
     ),
     (
         "epics-ca-rs",

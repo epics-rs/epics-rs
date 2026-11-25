@@ -2,18 +2,17 @@
 //! channel's element count, `dbCaGetNelements`'s `pca->nelements`
 //! (`dbCa.c:662-670`), and asking it allocates nothing on the scan thread,
 //! whatever units and description the channel's metadata carries. Counted
-//! with this binary's own allocator over 100 cycles. C softIoc, the source
-//! a waveform NELM=16 holding [1,2,3], reads `INPN=16 NUSE=6 VAL=1 2 3 1 2
-//! 3` after two passes.
+//! per thread with the alloc binary's allocator over 100 cycles. C softIoc,
+//! the source a waveform NELM=16 holding [1,2,3], reads `INPN=16 NUSE=6
+//! VAL=1 2 3 1 2 3` after two passes.
 
 #![cfg(tokio_backend)]
 #![cfg(feature = "client-core")]
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use alloc_count::thread;
 use epics_base_rs::error::CaError;
 use epics_base_rs::runtime::task::{MandatoryThread, StackSizeClass, ThreadPriority};
 use epics_base_rs::server::database::{ProcStack, PvDatabase};
@@ -23,36 +22,6 @@ use epics_ca_rs::calink::CaLinkResolver;
 use epics_ca_rs::client::{CaClient, CaClientConfig};
 use epics_ca_rs::server::CaServerBuilder;
 use serial_test::serial;
-
-thread_local! {
-    static COUNTING: Cell<bool> = const { Cell::new(false) };
-    static ALLOCS: Cell<usize> = const { Cell::new(0) };
-}
-
-struct Counting;
-
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if COUNTING.with(Cell::get) {
-            ALLOCS.with(|n| n.set(n.get() + 1));
-        }
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        if COUNTING.with(Cell::get) {
-            ALLOCS.with(|n| n.set(n.get() + 1));
-        }
-        unsafe { System.realloc(ptr, layout, size) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(ptr, layout) }
-    }
-}
-
-#[global_allocator]
-static GLOBAL: Counting = Counting;
 
 const SRC: &str = "NET:SRC";
 
@@ -155,12 +124,12 @@ async fn a_network_ca_inp_count_allocates_nothing() {
         // The thread's first cycle sets up its thread-locals.
         cycle(&mut ProcStack::new());
         let mut visited = ProcStack::new();
-        COUNTING.with(|c| c.set(true));
-        for _ in 0..100 {
-            cycle(&mut visited);
-        }
-        COUNTING.with(|c| c.set(false));
-        tx.send(ALLOCS.with(Cell::get)).unwrap();
+        let ((), counts) = thread::counted(|| {
+            for _ in 0..100 {
+                cycle(&mut visited);
+            }
+        });
+        tx.send(counts.allocs).unwrap();
     });
     let allocs = rx
         .recv_timeout(Duration::from_secs(20))

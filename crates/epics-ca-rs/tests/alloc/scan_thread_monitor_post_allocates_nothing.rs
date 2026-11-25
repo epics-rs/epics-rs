@@ -1,77 +1,23 @@
 //! A process cycle on `scan-0.1` posts to its monitors without allocating:
 //! `db_post_events` fills a free-listed fixed `db_field_log` per monitor
-//! (`dbEvent.c:700-738`, `:876-906`). Counted per thread name with this
-//! binary's own allocator, as monitored minus unmonitored over the same
+//! (`dbEvent.c:700-738`, `:876-906`). Counted per thread name with the
+//! alloc binary's allocator, as monitored minus unmonitored over the same
 //! ticks, the unmonitored cycle's own cost being outside this change.
 
 #![allow(clippy::disallowed_macros, reason = "tests may keep eprintln!")]
 #![cfg(tokio_backend)]
 #![cfg(feature = "client-core")]
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use alloc_count::named::{self, Name};
 use epics_base_rs::server::database::PvDatabase;
 use epics_ca_rs::EpicsValue;
 use epics_ca_rs::client::{CaChannel, CaClient, MonitorHandle};
 use epics_ca_rs::protocol::{CA_PROTO_CREATE_CHAN, CA_PROTO_EVENT_ADD, CaHeader};
 use epics_ca_rs::server::CaServer;
+use serial_test::serial;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-const SCAN_THREAD: &str = "scan-0.1";
-
-thread_local! {
-    /// 0 not yet asked, 1 `scan-0.1`, 2 any other thread. Asking may itself
-    /// allocate; that reentry reads 2 and is not counted.
-    static ON_SCAN: Cell<u8> = const { Cell::new(0) };
-}
-
-static ALLOCS: AtomicU64 = AtomicU64::new(0);
-static FREES: AtomicU64 = AtomicU64::new(0);
-
-fn on_scan() -> bool {
-    ON_SCAN.with(|s| match s.get() {
-        0 => {
-            s.set(2);
-            let yes = std::thread::current().name() == Some(SCAN_THREAD);
-            s.set(if yes { 1 } else { 2 });
-            yes
-        }
-        v => v == 1,
-    })
-}
-
-struct Counting;
-
-// SAFETY: forwards every call to `System` unchanged; the thread test reads a
-// const-initialised thread-local and the counters are atomics.
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if on_scan() {
-            ALLOCS.fetch_add(1, Ordering::Relaxed);
-        }
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        if on_scan() {
-            ALLOCS.fetch_add(1, Ordering::Relaxed);
-        }
-        unsafe { System.realloc(ptr, layout, size) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        if on_scan() {
-            FREES.fetch_add(1, Ordering::Relaxed);
-        }
-        unsafe { System.dealloc(ptr, layout) }
-    }
-}
-
-#[global_allocator]
-static GLOBAL: Counting = Counting;
 
 const N_AO: usize = 20;
 /// stringin and waveform records whose VAL is monitored: a 40-byte string and
@@ -126,26 +72,26 @@ fn tick(db: &PvDatabase) -> u64 {
     }
 }
 
+/// `scan-0.1`, the one thread a [`window`] counts.
+static SCAN: [Name; 1] = [Name::Exact("scan-0.1")];
+
 /// The counters and the tick, read in the idle gap after a sweep, so a
 /// window holds whole sweeps only.
-async fn between_sweeps(db: &PvDatabase) -> (u64, u64, u64) {
+async fn between_sweeps(db: &PvDatabase, scan: &named::Window<1>) -> (u64, u64, u64) {
     let t = tick(db);
     while tick(db) == t {
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
     tokio::time::sleep(Duration::from_millis(40)).await;
-    (
-        ALLOCS.load(Ordering::Relaxed),
-        FREES.load(Ordering::Relaxed),
-        tick(db),
-    )
+    let [counts] = scan.counts();
+    (counts.allocs, counts.frees, tick(db))
 }
 
-async fn window(db: &PvDatabase) -> Window {
+async fn window(db: &PvDatabase, scan: &named::Window<1>) -> Window {
     tokio::time::sleep(Duration::from_secs(1)).await;
-    let (a0, f0, t0) = between_sweeps(db).await;
+    let (a0, f0, t0) = between_sweeps(db, scan).await;
     tokio::time::sleep(Duration::from_secs(3)).await;
-    let (a1, f1, t1) = between_sweeps(db).await;
+    let (a1, f1, t1) = between_sweeps(db, scan).await;
     let w = Window {
         allocs: a1 - a0,
         frees: f1 - f0,
@@ -268,7 +214,9 @@ async fn next_frame(sock: &mut tokio::net::TcpStream, acc: &mut Vec<u8>) -> (CaH
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial(epics_env)]
 async fn a_monitored_scan_cycle_allocates_nothing_on_its_scan_thread() {
+    let scan = named::open(&SCAN);
     let server = CaServer::builder()
         .port(0)
         .db_string(&db(), &Default::default())
@@ -281,7 +229,8 @@ async fn a_monitored_scan_cycle_allocates_nothing_on_its_scan_thread() {
     let db = server.database().clone();
     let _h = tokio::spawn(async move { server.run().await });
     let _scan = epics_base_rs::server::scan::ScanOwner::start(db.clone());
-    // SAFETY: the only test in this binary; set before `CaClient::new()`.
+    // SAFETY: every test touching the process-wide CA env is
+    // `#[serial(epics_env)]`; set before `CaClient::new()`.
     unsafe {
         std::env::set_var("EPICS_CA_ADDR_LIST", format!("127.0.0.1:{port}"));
         std::env::set_var("EPICS_CA_AUTO_ADDR_LIST", "NO");
@@ -291,7 +240,7 @@ async fn a_monitored_scan_cycle_allocates_nothing_on_its_scan_thread() {
         .await
         .expect("seed WF");
 
-    let unwatched = window(&db).await;
+    let unwatched = window(&db, &scan).await;
     // An ao driving its OUT link allocates nothing per process either.
     assert_eq!(
         unwatched.milli_per_tick(),
@@ -309,7 +258,7 @@ async fn a_monitored_scan_cycle_allocates_nothing_on_its_scan_thread() {
     let mut dbnd = monitor(&client, r#"AO2.VAL{"dbnd":{"d":1000}}"#).await;
     let mut ctrl = ctrl_monitor(tcp_port, "AO1").await;
 
-    let watched = window(&db).await;
+    let watched = window(&db, &scan).await;
     assert_eq!(
         watched.milli_per_tick(),
         unwatched.milli_per_tick(),
@@ -362,7 +311,7 @@ async fn a_monitored_scan_cycle_allocates_nothing_on_its_scan_thread() {
     // `arr` is a post-chain filter (`arr.c:177`), run by the event task
     // (`dbEvent.c:985`): its copy never lands on the scan thread.
     let mut arr = monitor(&client, r#"WF.VAL{"arr":{"s":0,"e":1}}"#).await;
-    let with_arr = window(&db).await;
+    let with_arr = window(&db, &scan).await;
     assert_eq!(
         with_arr.milli_per_tick(),
         unwatched.milli_per_tick(),
@@ -379,7 +328,7 @@ async fn a_monitored_scan_cycle_allocates_nothing_on_its_scan_thread() {
     // `dec` is a pre-chain filter: it runs on the log as posted, a reference
     // for a waveform, and copies nothing (`dbnd.c:75`, `sync.c:150`).
     let mut dec = monitor(&client, r#"WF.VAL{"dec":{"n":2}}"#).await;
-    let with_dec = window(&db).await;
+    let with_dec = window(&db, &scan).await;
     assert_eq!(
         with_dec.milli_per_tick(),
         unwatched.milli_per_tick(),
@@ -400,7 +349,7 @@ async fn a_monitored_scan_cycle_allocates_nothing_on_its_scan_thread() {
         refs.push((monitor(&client, &format!("SI{i}")).await, i, true));
         refs.push((monitor(&client, &format!("WF{i}")).await, i, false));
     }
-    let with_refs = window(&db).await;
+    let with_refs = window(&db, &scan).await;
     assert_eq!(
         with_refs.milli_per_tick(),
         unwatched.milli_per_tick(),
@@ -419,7 +368,7 @@ async fn a_monitored_scan_cycle_allocates_nothing_on_its_scan_thread() {
 
     // A stringin VAL subscriber reads the live field at delivery.
     let mut si = monitor(&client, "SI").await;
-    let with_si = window(&db).await;
+    let with_si = window(&db, &scan).await;
     eprintln!(
         "scan-0.1 (allocs, frees) x1000 per tick: unwatched {:?} watched {:?} +arr {:?} +stringin {:?}",
         unwatched.milli_per_tick(),

@@ -1093,6 +1093,7 @@ dependencies = [
 name = "epics-ca-rs"
 version = "0.34.2"
 dependencies = [
+ "alloc-count",
  "arc-swap",
  "async-trait",
  "base64",

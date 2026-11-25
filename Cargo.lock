@@ -1152,6 +1152,7 @@ dependencies = [
 name = "epics-libcom-rs"
 version = "0.34.2"
 dependencies = [
+ "alloc-count",
  "chrono",
  "epics-macros-rs",
  "hostname",

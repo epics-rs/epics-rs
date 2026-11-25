@@ -4,40 +4,14 @@
 //! so a flush after that allocates nothing.
 #![cfg(target_os = "linux")]
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use alloc_count::thread;
 use epics_libcom_rs::runtime::log::{
     errlog_add_listener, errlog_flush, errlog_init, errlog_vprintf,
 };
 use epics_libcom_rs::runtime::task::{in_test_ioc_thread, test_ioc_thread};
-
-thread_local! {
-    static COUNTING: Cell<bool> = const { Cell::new(false) };
-    static ALLOCS: Cell<usize> = const { Cell::new(0) };
-}
-
-struct Counting;
-
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if COUNTING.with(Cell::get) {
-            ALLOCS.with(|n| n.set(n.get() + 1));
-        }
-        // SAFETY: forwarded unchanged.
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        // SAFETY: forwarded unchanged.
-        unsafe { System.dealloc(ptr, layout) }
-    }
-}
-
-#[global_allocator]
-static GLOBAL: Counting = Counting;
 
 static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
@@ -70,17 +44,14 @@ fn a_flush_returns_after_the_pass_that_handled_what_came_before_it() {
         errlog_vprintf(format_args!("own 0\n"));
         errlog_flush();
         assert!(seen("own 0\n"), "the poster's own flush");
-        let n = {
-            ALLOCS.with(|n| n.set(0));
-            COUNTING.with(|c| c.set(true));
+        let ((), counts) = thread::counted(|| {
             for i in 1..=100 {
                 errlog_vprintf(format_args!("own {i}\n"));
                 errlog_flush();
             }
-            COUNTING.with(|c| c.set(false));
-            assert!(in_test_ioc_thread(), "counted off an IOC thread");
-            ALLOCS.with(Cell::get)
-        };
+        });
+        assert!(in_test_ioc_thread(), "counted off an IOC thread");
+        let n = counts.allocs;
         assert!(seen("own 100\n"), "the poster's last flush");
         assert_eq!(n, 0, "allocations in 100 posts and flushes after the first");
     });

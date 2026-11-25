@@ -5,47 +5,17 @@
 //! poster.
 #![cfg(target_os = "linux")]
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
-
+use alloc_count::thread;
 use epics_libcom_rs::runtime::log::{
     ErrlogSevEnum, errlog_init, errlog_messages_lost, errlog_set_console, errlog_sev_vprintf,
     errlog_vprintf,
 };
 use epics_libcom_rs::runtime::task::{in_test_ioc_thread, test_ioc_thread};
 
-thread_local! {
-    static COUNTING: Cell<bool> = const { Cell::new(false) };
-    static ALLOCS: Cell<usize> = const { Cell::new(0) };
-}
-
-struct PosterAllocs;
-
-unsafe impl GlobalAlloc for PosterAllocs {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if COUNTING.with(Cell::get) {
-            ALLOCS.with(|n| n.set(n.get() + 1));
-        }
-        // SAFETY: forwarded unchanged.
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        // SAFETY: forwarded unchanged.
-        unsafe { System.dealloc(ptr, layout) }
-    }
-}
-
-#[global_allocator]
-static GLOBAL: PosterAllocs = PosterAllocs;
-
-fn allocations_in(f: impl FnOnce()) -> usize {
-    ALLOCS.with(|n| n.set(0));
-    COUNTING.with(|c| c.set(true));
-    f();
-    COUNTING.with(|c| c.set(false));
+fn allocations_in(f: impl FnOnce()) -> u64 {
+    let ((), counts) = thread::counted(f);
     assert!(in_test_ioc_thread(), "counted off an IOC thread");
-    ALLOCS.with(Cell::get)
+    counts.allocs
 }
 
 /// A full one-page pipe as the console: the worker blocks in its first write,

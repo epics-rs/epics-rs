@@ -7,40 +7,20 @@
 
 #![cfg(all(target_os = "linux", target_env = "gnu"))]
 
-use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::ffi::c_int;
 use std::sync::{OnceLock, mpsc};
 
+use alloc_count::thread;
 use epics_libcom_rs::runtime::task::{
     MandatoryThread, StackSizeClass, ThreadPriority, block_on_sync,
 };
 
 thread_local! {
+    /// Set over the first drive, which the registrations are counted in.
     static COUNTING: Cell<bool> = const { Cell::new(false) };
-    static ALLOCS: Cell<usize> = const { Cell::new(0) };
     static REGISTRATIONS: Cell<usize> = const { Cell::new(0) };
 }
-
-struct Counting;
-
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if COUNTING.with(Cell::get) {
-            ALLOCS.with(|n| n.set(n.get() + 1));
-        }
-        // SAFETY: forwarded unchanged.
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        // SAFETY: forwarded unchanged.
-        unsafe { System.dealloc(ptr, layout) }
-    }
-}
-
-#[global_allocator]
-static GLOBAL: Counting = Counting;
 
 type ThreadAtexit = unsafe extern "C" fn(unsafe extern "C" fn(*mut u8), *mut u8, *mut u8) -> c_int;
 
@@ -86,9 +66,10 @@ fn the_first_drive_of_an_ioc_thread_allocates_nothing() {
         .spawn(move || {
             COUNTING.with(|c| c.set(true));
             // A scan thread's first pass, as `TickDriver::drive` makes it.
-            block_on_sync(async {}).unwrap();
+            let (r, counts) = thread::counted(|| block_on_sync(async {}));
             COUNTING.with(|c| c.set(false));
-            tx.send((ALLOCS.with(Cell::get), REGISTRATIONS.with(Cell::get)))
+            r.unwrap();
+            tx.send((counts.allocs, REGISTRATIONS.with(Cell::get)))
                 .unwrap();
         })
         .join()

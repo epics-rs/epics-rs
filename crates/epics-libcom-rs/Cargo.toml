@@ -103,6 +103,8 @@ serial_test = "3"
 # the
 # errlog sink stays silent when nothing is listening.
 tracing-subscriber = "0.3"
+# Dev-only and path-only: the counting allocator of the `alloc` binary.
+alloc-count = { path = "../alloc-count" }
 
 # Test-only: `start_paused`, for the timer seam's virtual-clock test.
 [target.'cfg(not(target_os = "rtems"))'.dev-dependencies]

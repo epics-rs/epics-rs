@@ -2639,15 +2639,12 @@ impl PortActor {
     /// `queueRequest` cannot — by *not answering*.
     ///
     /// The scope is the requests C leaves in the lower-priority loop: the
-    /// Connect-priority queue is drained above it with no device checks at all
-    /// (:813-857), and every waived request C queues rides that queue
-    /// (asynShellCommands.c:127,174,245,296; asynRecord.c:562-571). Hence
-    /// `Queued` dispatch and a `Required` connect check — the same requests,
-    /// asked the same way.
-    fn device_scanned(&self, op: &RequestOp, connect: ConnectCheck) -> bool {
+    /// Connect-priority queue is drained above it with no device check and no
+    /// connect attempt at all (:813-857), whatever the request's waiver.
+    fn device_scanned(&self, priority: QueuePriority, connect: ConnectCheck) -> bool {
         connect == ConnectCheck::Required
             && self.driver.base().flags.can_block
-            && Self::c_dispatch(op) == CDispatch::Queued
+            && priority < QueuePriority::Connect
     }
 
     /// Nothing for [`Self::process_one`] to take.
@@ -2719,25 +2716,13 @@ impl PortActor {
             return Scan::Settle(Settle::Synchronous(connect));
         }
         // C drains the Connect queue *before* `autoConnectDevice`
-        // (asynManager.c:813-857): a waived request runs on the dead line
-        // with no connect attempt in front of it. The attempt C makes
+        // (asynManager.c:813-857): a request on it runs with no connect
+        // attempt in front of it, port or device. The attempt C makes
         // *after* that drain (:858-863) is the actor loop's. A scanned
         // request's device waits for its enabled check.
-        let scanned = self.device_scanned(&msg.op, connect);
-        let required = connect == ConnectCheck::Required;
-        if (scanned || required) && self.port_attempt_due() {
+        let scanned = self.device_scanned(msg.priority, connect);
+        if scanned && self.port_attempt_due() {
             return Scan::Connect(Attempt::Port);
-        }
-        if !scanned
-            && required
-            && self.connect_gate().is_ok()
-            && base.is_connected()
-            && self.device_attempt_due(msg.user.addr)
-        {
-            return Scan::Connect(Attempt::Device {
-                addr: msg.user.addr,
-                reason: msg.user.reason,
-            });
         }
         // Every queued request passed the port-level half of `queueRequest`
         // on its caller's thread. A port disabled or down since then is the
@@ -6418,6 +6403,79 @@ mod tests {
             .expect("the request runs once its device is enabled");
         assert_eq!(r.int_val, Some(7));
         assert_eq!(connects.lock().clone(), vec![0, 1]);
+    }
+
+    /// C `portThread` drains the Connect-priority queue with no device check
+    /// and no connect attempt (asynManager.c:813-857): a device-addressed
+    /// disconnect, or any request at that band, runs on the device as it is.
+    #[test]
+    fn a_connect_priority_request_runs_with_no_device_connect_attempt_first() {
+        struct CountingDriver {
+            base: PortDriverBase,
+            calls: Log<(&'static str, i32)>,
+        }
+        impl PortDriver for CountingDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn connect_addr(&mut self, user: &AsynUser) -> AsynResult<()> {
+                self.calls.lock().push(("connect", user.addr));
+                self.base.connect_addr(user.addr);
+                Ok(())
+            }
+            fn disconnect_addr(&mut self, user: &AsynUser) -> AsynResult<()> {
+                self.calls.lock().push(("disconnect", user.addr));
+                self.base.disconnect_addr(user.addr);
+                Ok(())
+            }
+        }
+        let base = multi_device_driver(true).base;
+        let device = base.device_state(1);
+        device.put_connected(false);
+        device.put_auto_connect(true);
+        let calls: Log<(&'static str, i32)> = Default::default();
+        let tx = spawn_actor(CountingDriver {
+            base,
+            calls: calls.clone(),
+        });
+
+        send_and_wait(
+            &tx,
+            RequestOp::DisconnectAddr,
+            AsynUser::new(0).with_addr(1),
+        )
+        .unwrap();
+        assert_eq!(calls.lock().clone(), vec![("disconnect", 1)]);
+
+        send_and_wait(
+            &tx,
+            RequestOp::SetEnable { yes: false },
+            AsynUser::new(0).with_addr(1),
+        )
+        .unwrap();
+        let read = AsynUser::new(0)
+            .with_addr(1)
+            .with_priority(QueuePriority::Connect);
+        let mut reply = send(&tx, RequestOp::Int32Read, read);
+        let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+        let r = loop {
+            match reply.try_recv() {
+                Ok(r) => break r.expect("the read succeeds"),
+                Err(oneshot::error::TryRecvError::Empty) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => panic!("a Connect-priority request on a disabled device never ran: {e}"),
+            }
+        };
+        assert_eq!(r.int_val, Some(7));
+        assert_eq!(
+            calls.lock().clone(),
+            vec![("disconnect", 1)],
+            "no connect attempt before either request"
+        );
     }
 
     /// R15-47, boundary 2: a parked request still expires on its own queue

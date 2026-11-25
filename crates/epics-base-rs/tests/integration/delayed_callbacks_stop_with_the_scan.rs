@@ -18,9 +18,7 @@ use std::time::{Duration, Instant};
 
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::runtime::background::{CallbackBody, CallbackCell};
-use epics_base_rs::runtime::task::{
-    CallbackPriority, background_callback_stats, request_cell, spawn_background_after,
-};
+use epics_base_rs::runtime::task::{CallbackPriority, request_cell, spawn_background_after};
 use epics_base_rs::server::database::{ProcStack, PvDatabase};
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::record::{ProcessAction, ProcessActions, ProcessOutcome, Record};
@@ -289,10 +287,13 @@ async fn a_seq_group_requested_after_shutdown_never_runs() {
 
 const SWAIT_DB: &str = r#"
 record(ao, "SRC") {}
+record(ao, "MARK") {}
 record(swait, "W") { field(SCAN, "I/O Intr") field(INAN, "SRC") field(CALC, "A") }
+record(swait, "X") { field(SCAN, "I/O Intr") field(INAN, "MARK") field(CALC, "A") field(PRIO, "HIGH") }
 "#;
 
-/// A running IOC whose `W` watches `SRC`, its input connected.
+/// A running IOC whose `W` watches `SRC` on the low band and `X` watches
+/// `MARK` on the high one, their inputs connected.
 async fn swait_ioc() -> Arc<PvDatabase> {
     let ioc = IocBuilder::new()
         .register_record_type("swait", || Box::new(SwaitRecord::default()))
@@ -303,14 +304,11 @@ async fn swait_ioc() -> Arc<PvDatabase> {
         .unwrap();
     let db = Arc::clone(ioc.database());
     assert!(ioc.run().await);
-    until("W.INAN connected", || read(&db, "W.INAV") == 0.0).await;
+    until("the inputs connected", || {
+        read(&db, "W.INAV") == 0.0 && read(&db, "X.INAV") == 0.0
+    })
+    .await;
     db
-}
-
-/// Requests queued on the low band's ring: C `callbackQueueStatus`'s
-/// `numUsed` for a one-worker band.
-fn low_band_queued() -> usize {
-    background_callback_stats(false).unwrap()[CallbackPriority::Low.index()].num_used
 }
 
 async fn put(db: &PvDatabase, rec: &str, v: f64) {
@@ -338,10 +336,10 @@ async fn a_swait_input_change_after_shutdown_never_processes_it() {
 async fn a_swait_input_change_before_shutdown_processes_it_once_the_band_frees() {
     let db = swait_ioc().await;
     let band = BusyBand::take();
-    let queued = low_band_queued();
     put(&db, "SRC", 5.0).await;
-    // The recDynLink thread's delivery makes the request.
-    until("the input change's request", || low_band_queued() > queued).await;
+    put(&db, "MARK", 5.0).await;
+    // One event queue delivers SRC's change before MARK's.
+    until("X=5", || read(&db, "X") == 5.0).await;
     assert_eq!(read(&db, "W.A"), 0.0);
     db.scan_control().stop();
     drop(band);

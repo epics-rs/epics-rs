@@ -6,6 +6,7 @@
 mod common;
 mod passes;
 
+mod a_refused_move_completes_past_a_full_band;
 mod axis_from_out_link;
 mod axis_write_status;
 mod boot_moving;

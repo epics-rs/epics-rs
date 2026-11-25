@@ -37,6 +37,7 @@ use epics_base_rs::server::record::{
     FieldMetadataOverride, ProcessOutcome, Record, RecordProcessResult, ScanType,
 };
 use epics_base_rs::types::{DbFieldType, EpicsValue};
+use epics_libcom_rs::runtime::background::{CallbackBody, CallbackCell};
 
 use crate::drivers::option_parse::{is_option_key, option_key};
 use crate::error::{AsynError, AsynResult, AsynStatus};
@@ -534,7 +535,7 @@ pub struct AsynRecord {
     /// the first cycle, the band an unwritten `PRIO` already has.
     callback_priority: epics_libcom_rs::runtime::task::CallbackPriority,
     /// The `asynCallbackSpecial` requests queued on a blocking port.
-    special_lane: Arc<SpecialLane>,
+    special_lane: Arc<CallbackCell<SpecialLane>>,
     /// The record's `asynCallbackSpecial` requests — see
     /// [`Self::special_request`].
     special_cells: Vec<SpecialCell>,
@@ -922,7 +923,7 @@ impl Default for AsynRecord {
             async_ctx: None,
             trace_name: String::new(),
             callback_priority: epics_libcom_rs::runtime::task::CallbackPriority::Low,
-            special_lane: Arc::default(),
+            special_lane: CallbackCell::new(SpecialLane::default()),
             special_cells: Vec::new(),
             process_job: Arc::default(),
             process_cell: None,
@@ -2407,7 +2408,7 @@ impl SpecialRequest {
 /// request the record wrote. The result goes to the record's [`SpecialLane`]
 /// before the cell is released, so a put that reuses the cell never meets it.
 struct SpecialBody {
-    lane: Arc<SpecialLane>,
+    lane: Arc<CallbackCell<SpecialLane>>,
     request: parking_lot::Mutex<SpecialRequest>,
     /// The result of a request that ran in place, for the put that ran it.
     ran_in_place: parking_lot::Mutex<Option<SpecialDone>>,
@@ -2420,7 +2421,7 @@ impl CellBody for SpecialBody {
             (request.run(port), request.prio, request.queued)
         };
         if queued {
-            self.lane.complete(done, prio);
+            SpecialLane::complete(&self.lane, done, prio);
         } else {
             *self.ran_in_place.lock() = Some(done);
         }
@@ -2438,8 +2439,7 @@ impl CellBody for SpecialBody {
                 port: String::new(),
             },
         };
-        self.lane
-            .complete(SpecialDone::NeverRan(e, queued_by), prio);
+        SpecialLane::complete(&self.lane, SpecialDone::NeverRan(e, queued_by), prio);
     }
 
     fn done(self: Arc<Self>) {}
@@ -2516,12 +2516,13 @@ fn read_eos(port: &mut dyn PortCalls, user: &SpecialUser) -> (String, String) {
 }
 
 /// The record half of the `asynCallbackSpecial` requests the record queued on
-/// a blocking port. C's port thread runs each callback whole, in queue order
-/// (asynRecord.c:834-899); here the port half runs on the port's actor
-/// ([`SpecialBody`]), which hands its result over, and one drainer at
-/// a time applies the results under the record's hold in that order. The hold
-/// is never taken on the actor thread: a record holding it may be waiting on
-/// that actor.
+/// a blocking port. C's port thread runs each callback whole, record fields
+/// included, in queue order (asynRecord.c:834-899). Here the port half runs on
+/// the port's actor ([`SpecialBody`]), which hands its result over, and one
+/// drain at a time applies the results under the record's hold in that order,
+/// on the record's band: the hold is never taken on the actor thread, since a
+/// record holding it may be waiting on that actor. The drain is a
+/// [`CallbackCell`], so a full band delays it and never drops it.
 #[derive(Default)]
 struct SpecialLane {
     done: parking_lot::Mutex<SpecialQueue>,
@@ -2539,26 +2540,25 @@ struct SpecialQueue {
 }
 
 impl SpecialLane {
-    /// From the port's actor, as the callback ends: queue the result, and start
-    /// the drainer — C `callbackRequest` — unless it is running.
+    /// From the port's actor, as the callback ends: queue the result, and
+    /// request the drain unless one is running.
     fn complete(
-        self: &Arc<Self>,
+        lane: &Arc<CallbackCell<Self>>,
         done: SpecialDone,
         prio: epics_libcom_rs::runtime::task::CallbackPriority,
     ) {
-        let mut queue = self.done.lock();
+        let mut queue = lane.body().done.lock();
         queue.done.push_back(done);
         if std::mem::replace(&mut queue.draining, true) {
             return;
         }
         drop(queue);
-        let lane = Arc::clone(self);
-        epics_libcom_rs::runtime::task::spawn_blocking_background(prio, move |on| lane.drain(on));
+        if epics_libcom_rs::runtime::task::request_cell(prio, lane).is_err() {
+            lane.body().done.lock().draining = false;
+        }
     }
 
-    /// C's `callbackRequest` body: the band runs it, so it takes the band's
-    /// proof and the blocking seam cannot reach it.
-    fn drain(&self, _on: epics_libcom_rs::runtime::task::OnBand) {
+    fn drain(&self) {
         let record = self.record.lock().clone();
         loop {
             #[cfg(test)]
@@ -2591,6 +2591,12 @@ impl SpecialLane {
     #[cfg(test)]
     fn is_idle(&self) -> bool {
         !self.done.lock().draining
+    }
+}
+
+impl CallbackBody for SpecialLane {
+    fn run(&self) {
+        self.drain();
     }
 }
 
@@ -3222,7 +3228,8 @@ impl AsynRecord {
     /// Every special request queued so far has run and been applied.
     #[cfg(test)]
     fn specials_settled(&self) -> bool {
-        self.special_cells.iter().all(|s| !s.cell.is_outstanding()) && self.special_lane.is_idle()
+        self.special_cells.iter().all(|s| !s.cell.is_outstanding())
+            && self.special_lane.body().is_idle()
     }
 
     fn queue_port_request(&mut self, handle: PortHandle, special: SpecialCell) {
@@ -4594,7 +4601,7 @@ impl Record for AsynRecord {
             let _ = db.put_pv_already_locked(held, passive);
         }));
         *self.process_job.reentry.lock() = Some(db.process_callback(&name));
-        *self.special_lane.record.lock() = Some((name.clone(), db.clone()));
+        *self.special_lane.body().record.lock() = Some((name.clone(), db.clone()));
         self.trace_name = name.to_string();
         self.async_ctx = Some((name, db));
     }
@@ -11601,7 +11608,7 @@ mod tests {
         // Both requests run and release their cells while the drainer is held,
         // so their results are still unapplied.
         let lane = Arc::clone(&rec.special_lane);
-        let gate = lane.gate.lock();
+        let gate = lane.body().gate.lock();
         release.wait();
         while rec.special_cells.iter().any(|s| s.cell.is_outstanding()) {
             std::thread::yield_now();

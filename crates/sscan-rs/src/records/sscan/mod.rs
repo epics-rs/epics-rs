@@ -638,6 +638,8 @@ pub struct SscanRecord {
     pub(crate) name: String,
     pub(crate) handle: Option<AsyncDbHandle>,
     pub(crate) inbox: std::sync::Arc<links::Inbox>,
+    pub(crate) link_events:
+        Option<std::sync::Arc<epics_base_rs::runtime::background::CallbackCell<links::LinkEvents>>>,
     pub(crate) prio: CallbackPriority,
     /// The record's TIME at the start of this pass (the scan's start stamp
     /// once a scan is running).
@@ -746,6 +748,7 @@ impl Default for SscanRecord {
             name: String::new(),
             handle: None,
             inbox: Default::default(),
+            link_events: None,
             prio: CallbackPriority::Low,
             time: WallTime::now(),
             dly_gen: 0,
@@ -1405,6 +1408,7 @@ impl Record for SscanRecord {
 
     fn set_async_context(&mut self, name: RecordName, db: AsyncDbHandle) {
         self.name = String::from_utf8_lossy(name.as_bytes()).into_owned();
+        self.link_events = Some(links::LinkEvents::cell(db.clone(), self.name.clone()));
         self.handle = Some(db);
     }
 

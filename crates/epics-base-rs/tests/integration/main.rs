@@ -1012,6 +1012,7 @@ mod swait_dyn_link_reads_one_element;
 mod swait_flnk_follows_monitor;
 mod swait_flnk_on_put_callback;
 mod swait_fwd_link_releases;
+mod swait_input_change_past_a_full_band;
 mod swait_input_monitor_mask;
 mod swait_inputs_are_dyn_links;
 mod swait_io_intr;

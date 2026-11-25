@@ -9,8 +9,10 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
-use epics_base_rs::runtime::task::spawn_blocking_background;
+use epics_base_rs::runtime::background::{CallbackBody, CallbackCell};
+use epics_base_rs::runtime::task::request_cell;
 use epics_base_rs::runtime::time::deadline_from_now;
+use epics_base_rs::server::database::AsyncDbHandle;
 use epics_base_rs::server::record::OwnFrame;
 use epics_base_rs::server::snapshot::Snapshot;
 use epics_libcom_rs::cfmt::CFloat;
@@ -54,6 +56,26 @@ impl Inbox {
     }
 }
 
+/// The record's [`Inbox`] applied under its lock, as one cell per record: C
+/// runs each link callback on its `recDynLink` thread, and a full band here
+/// delays the events, never drops them.
+pub(crate) struct LinkEvents {
+    h: AsyncDbHandle,
+    name: String,
+}
+
+impl LinkEvents {
+    pub(crate) fn cell(h: AsyncDbHandle, name: String) -> Arc<CallbackCell<Self>> {
+        CallbackCell::new(Self { h, name })
+    }
+}
+
+impl CallbackBody for LinkEvents {
+    fn run(&self) {
+        with_sscan(&self.h, &self.name, |s, own| s.drain_inbox(own));
+    }
+}
+
 use super::*;
 
 impl SscanRecord {
@@ -62,16 +84,12 @@ impl SscanRecord {
     /// threads never wait on that lock and keep feeding a `special` that
     /// holds it.
     fn deliver(&self, li: usize) -> Option<Deliver> {
-        let h = self.handle.clone()?;
-        let name = self.name.clone();
+        let events = self.link_events.clone()?;
         let inbox = self.inbox.clone();
         let prio = self.prio;
         Some(Arc::new(move |generation, event| {
             inbox.push(li, generation, event);
-            let (h, name) = (h.clone(), name.clone());
-            drop(spawn_blocking_background(prio, move |_| {
-                with_sscan(&h, &name, |s, own| s.drain_inbox(own))
-            }));
+            let _ = request_cell(prio, &events);
         }))
     }
 

@@ -8,4 +8,5 @@ mod save_data_vars;
 mod scan_progress;
 mod scanparm;
 mod scanparm_debug;
+mod sscan_link_event_past_a_full_band;
 mod sscan_record;

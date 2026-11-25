@@ -14,7 +14,7 @@ use epics_base_rs::types::{DbFieldType, EpicsValue};
 use super::*;
 use crate::protocol::MAX_TCP;
 use crate::server::tcp::DestroyedCids;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 
 /// A socket that records each write call, or refuses every one once broken.
 #[derive(Default)]

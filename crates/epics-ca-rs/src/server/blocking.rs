@@ -133,8 +133,8 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, SocketAddrV4, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -209,21 +209,26 @@ const CAS_BEACON_PRIORITY: ThreadPriority =
     ThreadPriority::Custom(ThreadPriority::CaServerLow.value() - 3);
 
 /// C `rsrv_online_notify_task` on the calling thread, beaconing `tcp_port`
-/// to `beacon_addrs` until `sleep` reports serving ended.
+/// to `beacon_addrs` from when `run` runs until it stops.
 pub(crate) fn serve_beacons(
     socket: std::net::UdpSocket,
     tcp_port: u16,
     beacon_addrs: &[SocketAddr],
     max_period: Duration,
-    sleep: impl FnMut(Duration) -> bool,
+    run: &RunControl,
 ) {
     let _ = enter_ioc_thread(CAS_BEACON_PRIORITY);
+    // Held with the rest of the start; C beacons from `rsrv_init` on, as
+    // `beacon_ctl` starts at `ctlInit` (`online_notify.c:127`).
+    if !run.wait_for_run() {
+        return;
+    }
     crate::server::beacon::run_blocking_beacon_emitter(
         &socket,
         tcp_port,
         beacon_addrs,
         max_period,
-        sleep,
+        |d| run.sleep(d),
     )
 }
 
@@ -375,7 +380,10 @@ pub struct BlockingCaServer {
     db: Arc<PvDatabase>,
     acf: SharedAcf,
     tcp_port: u16,
-    shutdown: AtomicBool,
+    /// Whether [`serve`](Self::serve) accepts and the search responders
+    /// answer; one for every listener of a
+    /// [`BlockingCaServing`](super::blocking_serving::BlockingCaServing).
+    run: Arc<RunControl>,
     /// The counters `casr` reads, shared by every listener of one
     /// [`BlockingCaServing`](super::blocking_serving::BlockingCaServing);
     /// the served-client count is their connect/disconnect delta (see
@@ -383,6 +391,83 @@ pub struct BlockingCaServer {
     ///
     /// [`active_connections`]: Self::active_connections
     stats: Arc<ServerStats>,
+}
+
+/// What a serving shows its clients, which is nothing until its start runs.
+/// One value for accept, search reply and beacon, where C keeps three
+/// (`castcp_ctl`, `casudp_ctl`, `beacon_ctl`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Run {
+    /// Started, showing nothing: no accept, no search reply, no beacon.
+    Held,
+    Running,
+    /// Final: a stop before the run wins over it.
+    Stopped,
+}
+
+/// The one [`Run`] a serving's threads read, and the wake for those that
+/// wait on it.
+pub(crate) struct RunControl {
+    state: Mutex<Run>,
+    changed: Condvar,
+}
+
+impl RunControl {
+    /// A serving that shows nothing until [`run`](Self::run).
+    pub(crate) fn held() -> Self {
+        Self::new(Run::Held)
+    }
+
+    fn running() -> Self {
+        Self::new(Run::Running)
+    }
+
+    fn new(state: Run) -> Self {
+        Self {
+            state: Mutex::new(state),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Run> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn state(&self) -> Run {
+        *self.lock()
+    }
+
+    /// C `rsrv_run`.
+    pub(crate) fn run(&self) {
+        let mut state = self.lock();
+        if *state == Run::Held {
+            *state = Run::Running;
+        }
+        self.changed.notify_all();
+    }
+
+    pub(crate) fn stop(&self) {
+        *self.lock() = Run::Stopped;
+        self.changed.notify_all();
+    }
+
+    /// Wait out [`Run::Held`]; `true` once running, `false` once stopped.
+    fn wait_for_run(&self) -> bool {
+        let state = self
+            .changed
+            .wait_while(self.lock(), |s| *s == Run::Held)
+            .unwrap_or_else(|e| e.into_inner());
+        *state == Run::Running
+    }
+
+    /// Sleep `period` or until stopped; `true` once stopped.
+    fn sleep(&self, period: Duration) -> bool {
+        let (state, _) = self
+            .changed
+            .wait_timeout_while(self.lock(), period, |s| *s != Run::Stopped)
+            .unwrap_or_else(|e| e.into_inner());
+        *state == Run::Stopped
+    }
 }
 
 /// One served client's place in [`BlockingCaServer::active_connections`],
@@ -442,6 +527,18 @@ impl BlockingCaServer {
         acf: SharedAcf,
         stats: Arc<ServerStats>,
     ) -> std::io::Result<Self> {
+        Self::with_run(listener, db, acf, stats, Arc::new(RunControl::running()))
+    }
+
+    /// [`from_listener`](Self::from_listener), accepting and answering
+    /// searches only while `run` runs.
+    pub(crate) fn with_run(
+        listener: TcpListener,
+        db: Arc<PvDatabase>,
+        acf: SharedAcf,
+        stats: Arc<ServerStats>,
+        run: Arc<RunControl>,
+    ) -> std::io::Result<Self> {
         // Two fallible calls, two different diagnoses — so they must not
         // collapse into one `io::Error` the caller then labels "cannot bind".
         // On RTEMS this is the difference that matters: `bind` succeeds while
@@ -462,7 +559,7 @@ impl BlockingCaServer {
             db,
             acf,
             tcp_port,
-            shutdown: AtomicBool::new(false),
+            run,
             stats,
         })
     }
@@ -493,7 +590,9 @@ impl BlockingCaServer {
     }
 
     /// Run the accept loop until [`shutdown`](Self::shutdown) is requested.
-    /// Blocks the calling thread; run it on its own `std::thread`.
+    /// Blocks the calling thread; run it on its own `std::thread`. A held
+    /// server accepts nothing before it runs; one shut down first returns
+    /// without accepting.
     ///
     /// Each accepted connection **borrows** its two threads — the C `camsgtask`
     /// receiver (`caservertask.c:109`) and its event sender — as one set from
@@ -525,6 +624,9 @@ impl BlockingCaServer {
             epics_base_rs::runtime::taskwd::CheckIn::Unbounded,
             None,
         );
+        if !self.run.wait_for_run() {
+            return;
+        }
         let mut backoff = AcceptBackoff::new();
         for stream in self.listener.incoming() {
             match stream {
@@ -532,7 +634,7 @@ impl BlockingCaServer {
                     backoff.accepted();
                     // A `shutdown()` wakes the blocking accept by dialing our
                     // own socket; the throwaway connection is dropped here.
-                    if self.shutdown.load(Ordering::Acquire) {
+                    if self.run.state() == Run::Stopped {
                         break;
                     }
                     let peer = match stream.peer_addr() {
@@ -608,7 +710,7 @@ impl BlockingCaServer {
                     });
                 }
                 Err(e) => {
-                    if self.shutdown.load(Ordering::Acquire) {
+                    if self.run.state() == Run::Stopped {
                         break;
                     }
                     tracing::warn!(
@@ -624,7 +726,7 @@ impl BlockingCaServer {
                     thread::sleep(backoff.failed());
                     // `shutdown()` may have been asked for while we slept, and
                     // its self-dial cannot wake an `accept()` that is failing.
-                    if self.shutdown.load(Ordering::Acquire) {
+                    if self.run.state() == Run::Stopped {
                         break;
                     }
                 }
@@ -634,9 +736,10 @@ impl BlockingCaServer {
 
     /// Ask the accept loop to stop and unblock it. Idempotent. Also stops the
     /// UDP name-search responder ([`serve_udp_search`](Self::serve_udp_search)),
-    /// which polls the same flag between its short-capped `recv_from` calls.
+    /// which reads the same run state between its short-capped `recv_from`
+    /// calls.
     pub fn shutdown(&self) {
-        self.shutdown.store(true, Ordering::Release);
+        self.run.stop();
         // Wake the blocking `accept()` by connecting to ourselves; the loop
         // then observes the flag and returns.
         if let Ok(addr) = self.listener.local_addr() {
@@ -691,7 +794,7 @@ impl BlockingCaServer {
             &cfg.ignore_addrs,
             self.db.clone(),
             self.tcp_port,
-            &self.shutdown,
+            &self.run,
         )
     }
 }
@@ -984,9 +1087,9 @@ fn flush_held_batch(
     }
 }
 
-/// Serve CA UDP name searches received on `socket`, replying on `reply`,
-/// and dropping any from a source in `ignore` (`casIgnoreAddrs`), until
-/// `shutdown` is set. C
+/// Serve CA UDP name searches received on `socket`, replying on `reply`
+/// while `run` runs, and dropping any from a source in `ignore`
+/// (`casIgnoreAddrs`), until it stops. C
 /// `cast_server` (`cast_server.c:113`): `recvfrom`, decode VERSION + SEARCH,
 /// `sendto` the reply. The decode/respond core is the shared
 /// [`udp::parse_search_datagram`]; only the socket I/O is blocking-specific,
@@ -1005,7 +1108,7 @@ fn handle_udp_search_blocking(
     ignore: &[std::net::Ipv4Addr],
     db: Arc<PvDatabase>,
     tcp_port: u16,
-    shutdown: &AtomicBool,
+    run: &RunControl,
 ) -> CaResult<()> {
     // C `cast_server` reaches the watchdog through `casAttachThreadToClient`
     // (`cast_server.c:151`), the same call its TCP siblings make — the UDP
@@ -1020,7 +1123,7 @@ fn handle_udp_search_blocking(
         epics_base_rs::runtime::taskwd::CheckIn::Unbounded,
         None,
     );
-    // Cap each blocking `recv_from` so the loop can observe `shutdown` between
+    // Cap each blocking `recv_from` so the loop can observe a stop between
     // datagrams. C `cast_server` blocks in `recvfrom` forever; this timeout is
     // only a clean-stop seam and is otherwise transparent to the protocol.
     socket
@@ -1037,11 +1140,11 @@ fn handle_udp_search_blocking(
     let mut batch = SearchReplyBatch::default();
     let mut batch_addr: Option<SocketAddr> = None;
 
-    while !shutdown.load(Ordering::Acquire) {
+    while run.state() != Run::Stopped {
         let (len, src) = match socket.recv_from(&mut buf) {
             Ok(v) => v,
             // Idle cap fired: the recv queue is drained, so flush any held
-            // batch (C flushes on FIONREAD == 0) and re-check `shutdown`.
+            // batch (C flushes on FIONREAD == 0) and re-check `run`.
             Err(ref e) if is_read_timeout(e.kind()) => {
                 flush_held_batch(reply, &mut batch, &mut batch_addr);
                 continue;
@@ -1055,10 +1158,11 @@ fn handle_udp_search_blocking(
                 continue;
             }
         };
-        // C `cast_server.c:182-189`: a source on `casIgnoreAddrs` is dropped
-        // before `camessage`, yet still reaches the FIONREAD flush below.
+        // A start shows clients nothing until it runs, so a search before
+        // then is dropped, as is one from a `casIgnoreAddrs` source
+        // (`cast_server.c:182-189`); both still reach the FIONREAD flush.
         let ignored = matches!(src, SocketAddr::V4(v4) if ignore.contains(v4.ip()));
-        if !ignored {
+        if !ignored && run.state() == Run::Running {
             // Peer-change flush (C `cast_server.c:205-214`): a held batch belongs
             // to its source; if this datagram is from a different peer, flush the
             // held batch to the old peer before adopting the new one.
@@ -1106,7 +1210,7 @@ fn handle_udp_search_blocking(
             Ok(_) => { /* more datagrams pending: hold to coalesce */ }
         }
     }
-    // Shutdown requested: flush any held batch so a buffered reply is not lost.
+    // Stopped: flush any held batch so a buffered reply is not lost.
     flush_held_batch(reply, &mut batch, &mut batch_addr);
     Ok(())
 }
@@ -3755,11 +3859,11 @@ mod tests {
             errlog: Arc::new(AtomicUsize::new(0)),
             elsewhere: errors.clone(),
         };
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let stop = shutdown.clone();
+        let run = Arc::new(RunControl::running());
+        let ctl = run.clone();
         let udp_thread = thread::spawn(move || {
             tracing::subscriber::with_default(recorder, || {
-                handle_udp_search_blocking(&resp, &reply, "CAS-UDP", &[], db, 5064, &stop)
+                handle_udp_search_blocking(&resp, &reply, "CAS-UDP", &[], db, 5064, &ctl)
             })
         });
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -3788,7 +3892,7 @@ mod tests {
             .expect("the responder still answers");
         assert_eq!(search_reply_cids(&rbuf[..n]), vec![7]);
 
-        shutdown.store(true, Ordering::Release);
+        run.stop();
         udp_thread.join().unwrap().unwrap();
     }
 
@@ -3799,8 +3903,8 @@ mod tests {
         let db = seed_db(&[("BLK:IGN", EpicsValue::Double(1.0))]);
         let resp = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
         let resp_addr = resp.local_addr().unwrap();
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let stop = shutdown.clone();
+        let run = Arc::new(RunControl::running());
+        let ctl = run.clone();
         let udp_thread = thread::spawn(move || {
             handle_udp_search_blocking(
                 &resp,
@@ -3809,7 +3913,7 @@ mod tests {
                 &[Ipv4Addr::LOCALHOST],
                 db,
                 5064,
-                &stop,
+                &ctl,
             )
         });
 
@@ -3844,7 +3948,7 @@ mod tests {
             "the ignored source drew a reply"
         );
 
-        shutdown.store(true, Ordering::Release);
+        run.stop();
         udp_thread.join().unwrap().unwrap();
     }
 

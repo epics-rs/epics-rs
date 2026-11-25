@@ -230,7 +230,7 @@ pub fn publish_casr_source(stats: Arc<ServerStats>, addrs: CasrAddrs) {
 /// report — C's two entry points are literally one function
 /// (`rsrv_server.report = casr`, `caservertask.c:1563`), so a second
 /// derivation here could drift from the first.
-fn casr_report_lines(level: i64) -> Vec<String> {
+pub(crate) fn casr_report_lines(level: i64) -> Vec<String> {
     match casr_cell().read().unwrap().as_ref() {
         Some(src) => casr_lines(src.stats.active_clients() as usize, level, &src.addrs),
         None => Vec::new(),

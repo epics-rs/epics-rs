@@ -12,7 +12,7 @@
 //! One case per band rather than one per record type: the record type only
 //! decides *which* work is deferred, while the band is decided by the two
 //! hops every deferral site now shares — `CommonFields::prio` →
-//! `ProcessContext::callback_priority` → `spawn_background`. The observable
+//! `CommonFields::callback_priority` → `spawn_background`. The observable
 //! is the pool's own worker thread, named `cbLow`/`cbMedium`/`cbHigh` after C
 //! `callback.c:324-327`.
 
@@ -24,10 +24,7 @@ use epics_base_rs::server::record::CommonFields;
 async fn band_and_worker_for_prio(prio: i16) -> (CallbackPriority, String) {
     let mut common = CommonFields::default();
     common.prio = prio;
-    // Exactly the hop every record-support deferral site takes: the framework
-    // snapshots `common` before `process()`, the record stashes the band, and
-    // the band is what reaches the pool.
-    let band = common.process_context().callback_priority;
+    let band = common.callback_priority();
     let worker = spawn_background(band, async {
         std::thread::current()
             .name()
@@ -83,20 +80,16 @@ async fn a_prio_outside_the_menu_still_runs_the_work_on_the_low_band() {
 }
 
 /// C re-runs `callbackSetPriority` inside `process()`, so a `PRIO` written
-/// between cycles moves the *next* cycle's work. The snapshot the framework
-/// pushes before each `process()` is what carries that here.
+/// between cycles moves the *next* cycle's work.
 #[epics_macros_rs::epics_test]
 async fn a_prio_written_between_cycles_moves_the_next_cycles_band() {
     let mut common = CommonFields::default();
     common.prio = 0;
-    assert_eq!(
-        common.process_context().callback_priority,
-        CallbackPriority::Low
-    );
+    assert_eq!(common.callback_priority(), CallbackPriority::Low);
     common.prio = 2;
     assert_eq!(
-        common.process_context().callback_priority,
+        common.callback_priority(),
         CallbackPriority::High,
-        "the next cycle's snapshot carries the new PRIO"
+        "the next cycle reads the new PRIO"
     );
 }

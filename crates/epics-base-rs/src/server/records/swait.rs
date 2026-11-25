@@ -7,7 +7,7 @@ use crate::calc::NumericInputs;
 use crate::calc::{Rpcl, eval as calc_eval};
 use crate::error::{CaError, CaResult};
 use crate::runtime::background::{CallbackBody, CallbackCell};
-use crate::runtime::task::{CallbackPriority, request_cell};
+use crate::runtime::task::request_cell;
 use crate::server::database::AsyncDbHandle;
 use crate::server::rec_dyn_link::{
     CaType, Deliver, Io, LinkEvent, LinkHost, LinkSpec, NOTIFY_IN_PROGRESS, RecDynLink,
@@ -213,9 +213,9 @@ pub struct SwaitRecord {
     /// C `caLinkStruct[NUM_LINKS]`, indexed as `pv_status`.
     links: [RecDynLink<Cb>; 14],
     inbox: Arc<Inbox>,
-    /// C `ioProcCb`'s priority, set from PRIO at init (`swaitRecord.c:313`):
-    /// the band link events are applied on.
-    prio: CallbackPriority,
+    /// The band link events are applied on, read at each request. C sets
+    /// `ioProcCb`'s at init and on a `PRIO` special (swaitRecord.c:315, :573).
+    band: crate::server::database::RecordBand,
     /// The `pv_status` and link-name posts owed, a bit per link.
     status_posts: u16,
     name_posts: u16,
@@ -321,7 +321,7 @@ impl Default for SwaitRecord {
             pv_status: [SWAIT_NO_PV; 14],
             links: std::array::from_fn(|_| RecDynLink::default()),
             inbox: Arc::default(),
-            prio: CallbackPriority::Low,
+            band: Default::default(),
             status_posts: 0,
             name_posts: 0,
             fetch_failed: false,
@@ -503,7 +503,7 @@ impl SwaitRecord {
     fn deliver(&self, li: usize) -> Option<Deliver> {
         let events = self.link_events.clone()?;
         let inbox = self.inbox.clone();
-        let prio = self.prio;
+        let band = self.band.clone();
         Some(Arc::new(move |generation, event| {
             let admitted = events.body().h.admits_callback_request();
             inbox
@@ -511,7 +511,7 @@ impl SwaitRecord {
                 .lock()
                 .unwrap()
                 .push_back((li, generation, event, admitted));
-            let _ = request_cell(prio, &events);
+            let _ = request_cell(band.priority(), &events);
         }))
     }
 
@@ -890,12 +890,14 @@ impl Record for SwaitRecord {
         self.async_ctx = Some((name, db));
     }
 
-    /// C `init_record` pass 1's search of every PV name (swaitRecord.c:334-371),
-    /// here where PRIO is known: C sets `ioProcCb`'s band in the same pass.
+    fn set_record_band(&mut self, band: crate::server::database::RecordBand) {
+        self.band = band;
+    }
+
+    /// C `init_record` pass 1's search of every PV name (swaitRecord.c:334-371).
     /// `iocInit` calls this again after the loader did; C adds each link
     /// once, so one already added keeps its channel.
-    fn init_links(&mut self, common: &crate::server::record::CommonFields) {
-        self.prio = common.callback_priority();
+    fn init_links(&mut self, _common: &crate::server::record::CommonFields) {
         for li in 0..self.links.len() {
             if self.links[li].is_added() {
                 continue;

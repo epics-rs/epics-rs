@@ -87,8 +87,8 @@ async fn until(what: &str, fact: impl Fn() -> bool) {
     }
 }
 
-/// `S` takes its link events on the low band, `X` on the high one, once it
-/// has processed; one `recDynLink` thread connects S's trigger before X's.
+/// `S` takes its link events on the low band, `X` on the high one; one
+/// `recDynLink` thread connects S's trigger before X's.
 #[epics_base_rs::epics_test]
 async fn a_trigger_link_connects_after_a_full_band_frees() {
     // `callbackSetQueueSize` and `callbackParallelThreads` before `callbackInit`.
@@ -109,9 +109,6 @@ record(sscan, "X") { field(MPTS, "10") field(NPTS, "5") field(PRIO, "HIGH") }
         .build()
         .await
         .unwrap();
-    // An sscan takes its band from PRIO as it processes.
-    put_field(&db, "X", "PROC", EpicsValue::Short(1)).await;
-
     let full = fill_low_band();
     put_field(&db, "S", "T1PV", EpicsValue::String("D.PROC".into())).await;
     put_field(&db, "X", "T1PV", EpicsValue::String("D.PROC".into())).await;

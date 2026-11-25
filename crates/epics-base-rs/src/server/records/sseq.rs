@@ -466,13 +466,10 @@ pub struct SseqRecord {
     /// pending `DLYn` timer. C cancels the timer only with over 0.1 s left
     /// (:1204) and otherwise lets it finish the abort; here any is superseded.
     finish_now: bool,
-    /// The callback band this record's `PRIO` selects, refreshed from
-    /// [`crate::server::record::ProcessContext`] before every `process()` — C
-    /// `sseqRecord.c:178` `callbackSetPriority(pR->prio, &pcb->callback)`,
-    /// which likewise re-stamps the band the deferred group walk runs on. Low
-    /// until the first cycle, the band a record whose `PRIO` was never written
-    /// already has.
-    callback_priority: crate::runtime::task::CallbackPriority,
+    /// The record's `PRIO` band, read as each deferred step is requested. C
+    /// re-stamps it once per cycle (sseqRecord.c:308), so a `PRIO` put
+    /// mid-walk moves only the next cycle there.
+    band: crate::server::database::RecordBand,
     /// The `DOn`/`STRn` posts this cycle's writes OWE, each with the mask of
     /// the C `db_post_events` call site that made it (see `mark_value_write`).
     /// Drained by [`Record::take_cycle_posted_fields`] — on a put by the put
@@ -521,7 +518,7 @@ impl Default for SseqRecord {
             seq_wake: None,
             async_ctx: None,
             finish_now: false,
-            callback_priority: crate::runtime::task::CallbackPriority::Low,
+            band: Default::default(),
             pending_posts: 0,
             link_gen: LinkStatusGen::default(),
             // An empty link is a CONSTANT link. C `init_record` marks the DOL
@@ -927,8 +924,7 @@ impl SseqRecord {
             let name = name.clone();
             let handle = handle.clone();
             let wake = wake.clone();
-            let prio = self.callback_priority;
-            crate::runtime::task::spawn_background(prio, async move {
+            crate::runtime::task::spawn_background(self.band.priority(), async move {
                 if let Some(rx) = handle.put_link_notify(&name, LNK_FIELDS[i], value).await {
                     // `Err` means the put vanished without firing — treat it as
                     // completion so the step is never stranded.
@@ -960,8 +956,7 @@ impl SseqRecord {
         let name = name.clone();
         let handle = handle.clone();
         let wake = wake.clone();
-        let prio = self.callback_priority;
-        crate::runtime::task::spawn_background(prio, async move {
+        crate::runtime::task::spawn_background(self.band.priority(), async move {
             wake.notified().await;
             if let Some(token) = handle.mint_async_token(&name) {
                 let (waitset, completion) = AsyncDbHandle::new_put_notify();
@@ -1598,11 +1593,8 @@ impl Record for SseqRecord {
         Ok(())
     }
 
-    fn set_process_context(&mut self, ctx: &crate::server::record::ProcessContext) {
-        // C `sseqRecord.c:178` re-runs `callbackSetPriority(pR->prio, ...)`
-        // every time the sequence is (re)armed, so a `PRIO` written between
-        // cycles moves the next one. Same rule here.
-        self.callback_priority = ctx.callback_priority;
+    fn set_record_band(&mut self, band: crate::server::database::RecordBand) {
+        self.band = band;
     }
 
     fn set_async_context(&mut self, name: crate::types::RecordName, db: AsyncDbHandle) {

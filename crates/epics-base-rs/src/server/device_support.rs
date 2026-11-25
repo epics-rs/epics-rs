@@ -1036,11 +1036,12 @@ pub trait DeviceSupport: Send + Sync + 'static {
     /// Called after init() with the record name and scan type.
     fn set_record_info(&mut self, _name: &str, _scan: ScanType) {}
 
-    /// The callback band the record's `PRIO` selects, handed over just
-    /// before [`Self::init`]: C device and record support read `prec->prio`
-    /// in `init_record` for the callbacks they set up there
-    /// (motorRecord.cc:634). Default: ignore.
-    fn set_callback_priority(&mut self, _prio: crate::runtime::task::CallbackPriority) {}
+    /// The record's `PRIO` band, handed over just before [`Self::init`]: a
+    /// device that requests callbacks for its record reads it at each
+    /// request, so a `PRIO` put moves the next one. C motor support fixes
+    /// the band in `init_record` instead (motorRecord.cc:634). Default:
+    /// ignore.
+    fn set_record_band(&mut self, _band: crate::server::database::RecordBand) {}
 
     /// Forward parsed `info("key", "value")` directives from the .db
     /// file to the device support. Default is a no-op; drivers that
@@ -1584,7 +1585,7 @@ fn begin_device_init(
 /// and the PRIO band.
 pub(crate) fn hand_device_its_record(instance: &RecordInstance, dev: &mut dyn DeviceSupport) {
     dev.bind_database(instance.device_done.database());
-    dev.set_callback_priority(instance.common.callback_priority());
+    dev.set_record_band(instance.band.clone());
 }
 
 /// [`init_device_support`] after the dset call.
@@ -1677,7 +1678,7 @@ mod tests {
         record_info_before_init: bool,
         /// Whether `set_record_info` had run by the time `init` ran.
         init_ran: bool,
-        /// The band `set_callback_priority` handed over before `init`.
+        /// The band `set_record_band` handed over, read in `init`.
         prio_at_init: Option<crate::runtime::task::CallbackPriority>,
     }
 
@@ -1698,7 +1699,7 @@ mod tests {
         obs: Arc<Mutex<WireObservation>>,
         info: HashMap<String, String>,
         record_info_set: bool,
-        prio: Option<crate::runtime::task::CallbackPriority>,
+        band: Option<crate::server::database::RecordBand>,
         verdict: InitVerdict,
     }
     impl DeviceSupport for ProbeDev {
@@ -1714,13 +1715,13 @@ mod tests {
         fn apply_record_info(&mut self, info: &HashMap<String, String>) {
             self.info = info.clone();
         }
-        fn set_callback_priority(&mut self, prio: crate::runtime::task::CallbackPriority) {
-            self.prio = Some(prio);
+        fn set_record_band(&mut self, band: crate::server::database::RecordBand) {
+            self.band = Some(band);
         }
         fn init(&mut self, _record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
             let mut o = self.obs.lock().unwrap();
             o.init_ran = true;
-            o.prio_at_init = self.prio;
+            o.prio_at_init = self.band.as_ref().map(|b| b.priority());
             o.record_info_before_init = self.record_info_set;
             o.info_at_init = self.info.keys().cloned().collect();
             match self.verdict {
@@ -1757,7 +1758,7 @@ mod tests {
             obs: Arc::new(Mutex::new(WireObservation::default())),
             info: HashMap::new(),
             record_info_set: false,
-            prio: None,
+            band: None,
             verdict,
         };
         wired("TEST:DEAD", |_| {}, dev).await
@@ -1778,10 +1779,10 @@ mod tests {
                 obs: obs.clone(),
                 info: HashMap::new(),
                 record_info_set: false,
-                prio: None,
+                band: None,
                 verdict: InitVerdict::Live,
             };
-            wired("TEST:PRIO", |instance| instance.common.prio = prio, dev).await;
+            wired("TEST:PRIO", |instance| instance.set_prio(prio), dev).await;
             assert_eq!(obs.lock().unwrap().prio_at_init, Some(band), "PRIO {prio}");
         }
     }
@@ -1867,7 +1868,7 @@ mod tests {
             obs: obs.clone(),
             info: HashMap::new(),
             record_info_set: false,
-            prio: None,
+            band: None,
             verdict: InitVerdict::Live,
         };
 

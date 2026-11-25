@@ -420,7 +420,6 @@ mod tests {
             tse: -2,
             time,
             soft: None,
-            callback_priority: crate::runtime::task::CallbackPriority::Low,
             scan: crate::server::record::ScanType::Passive,
             proc_field: 0,
             tpro: 0,

@@ -21,8 +21,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Instant;
 
 use epics_base_rs::error::{CaError, CaResult};
-use epics_base_rs::runtime::task::CallbackPriority;
-use epics_base_rs::server::database::AsyncDbHandle;
+use epics_base_rs::server::database::{AsyncDbHandle, RecordBand};
 use epics_base_rs::server::record::dbd_generated::DB_COMMON_FIELDS;
 use epics_base_rs::server::record::{
     CycleHooks, DeclaredFields, EventMask, FieldDesc, FieldIx, FieldMetadataOverride,
@@ -640,7 +639,10 @@ pub struct SscanRecord {
     pub(crate) inbox: std::sync::Arc<links::Inbox>,
     pub(crate) link_events:
         Option<std::sync::Arc<epics_base_rs::runtime::background::CallbackCell<links::LinkEvents>>>,
-    pub(crate) prio: CallbackPriority,
+    /// The band every callback request reads at the time it is made. C
+    /// sets it at `init_record` and on a `PRIO` special
+    /// (sscanRecord.c:872-876, :1628); here a `PRIO` put needs neither.
+    pub(crate) band: RecordBand,
     /// The record's TIME at the start of this pass (the scan's start stamp
     /// once a scan is running).
     pub(crate) time: WallTime,
@@ -749,7 +751,7 @@ impl Default for SscanRecord {
             handle: None,
             inbox: Default::default(),
             link_events: None,
-            prio: CallbackPriority::Low,
+            band: RecordBand::default(),
             time: WallTime::now(),
             dly_gen: 0,
             udf_clear: false,
@@ -1249,7 +1251,7 @@ impl SscanRecord {
             return;
         };
         let name = self.name.clone();
-        h.clone().spawn_callback(self.prio, async move {
+        h.clone().spawn_callback(self.band.priority(), async move {
             with_sscan(&h, &name, |s, _| f(s));
         });
     }
@@ -1269,13 +1271,14 @@ impl SscanRecord {
         };
         let name = self.name.clone();
         let wait = epics_base_rs::runtime::time::duration_from_secs(f64::from(secs));
-        h.clone().spawn_callback_after(self.prio, wait, async move {
-            with_sscan(&h, &name, |s, _| {
-                if s.dly_gen == generation {
-                    s.delay_callback();
-                }
+        h.clone()
+            .spawn_callback_after(self.band.priority(), wait, async move {
+                with_sscan(&h, &name, |s, _| {
+                    if s.dly_gen == generation {
+                        s.delay_callback();
+                    }
+                });
             });
-        });
     }
 
     /// C `epicsTimerCancel(precPvt->dlyCallback.timer)`.
@@ -1403,7 +1406,10 @@ impl Record for SscanRecord {
 
     fn set_process_context(&mut self, ctx: &ProcessContext) {
         self.time = ctx.time;
-        self.prio = ctx.callback_priority;
+    }
+
+    fn set_record_band(&mut self, band: RecordBand) {
+        self.band = band;
     }
 
     fn set_async_context(&mut self, name: RecordName, db: AsyncDbHandle) {

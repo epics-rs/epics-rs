@@ -137,14 +137,6 @@ async fn a_special_result_lands_after_a_full_band_frees() {
         .await
         .unwrap();
     db.ioc_init().await;
-    // A record takes its band from PRIO as it processes.
-    db.put_record_field_from_ca_no_notify("H", "PROC", EpicsValue::Long(1))
-        .await
-        .unwrap();
-    until("H's cycle ended", || {
-        !db.get_record("H").unwrap().read().is_processing()
-    })
-    .await;
     put_baud(&db, "L").await;
     until("L's first special applied", || {
         errs(&db, "L") == OPTION_ERROR

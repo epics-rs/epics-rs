@@ -167,13 +167,6 @@ pub struct ThrottleRecord {
     /// OV/SIV link-status classification (C `init_record`/`special` →
     /// `dbNameToAddr`).
     async_ctx: Option<(epics_base_rs::types::RecordName, AsyncDbHandle)>,
-    /// The callback band this record's `PRIO` selects, refreshed from
-    /// [`ProcessContext`](epics_base_rs::server::record::ProcessContext)
-    /// before every `process()` — C reads `prec->prio` at the same point
-    /// (`callbackSetPriority(prec->prio, &pcb->callback)`,
-    /// `seqRecord.c:145-146`). Low until the first cycle, the band an
-    /// unwritten `PRIO` already has.
-    callback_priority: epics_base_rs::runtime::task::CallbackPriority,
     /// Generation gate for OV/SIV link-status refreshes — only the latest
     /// classification may publish, so an init-time snapshot finishing late
     /// cannot clobber a newer `special()` re-point (mirrors sseq; C
@@ -218,7 +211,6 @@ impl Default for ThrottleRecord {
             special_actions: Vec::new(),
             out_written: false,
             async_ctx: None,
-            callback_priority: epics_base_rs::runtime::task::CallbackPriority::Low,
             link_gen: LinkStatusGen::default(),
         }
     }
@@ -810,9 +802,7 @@ impl Record for ThrottleRecord {
     /// `valuePut` posts by hand and stamps only ahead of its own reset
     /// (`throttleRecord.c:602`); `process()` posts WAIT/VAL/DRVLS itself.
     fn cycle_hooks(&self) -> CycleHooks {
-        CycleHooks::CONTEXT
-            .union(CycleHooks::PROCESS_POSTED)
-            .union(CycleHooks::HAND_POSTED_OWN_STAMP)
+        CycleHooks::PROCESS_POSTED.union(CycleHooks::HAND_POSTED_OWN_STAMP)
     }
 
     /// C runs `checkLink` only for an `Ext PV NC` SINP (throttleRecord.c:381).
@@ -937,12 +927,6 @@ impl Record for ThrottleRecord {
             self.out_written = false;
         }
         Ok(())
-    }
-
-    fn set_process_context(&mut self, ctx: &epics_base_rs::server::record::ProcessContext) {
-        // A `PRIO` written between cycles moves the next one, as in C where
-        // `callbackSetPriority` is re-run inside `process()`.
-        self.callback_priority = ctx.callback_priority;
     }
 
     fn set_async_context(&mut self, name: epics_base_rs::types::RecordName, db: AsyncDbHandle) {

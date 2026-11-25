@@ -53,7 +53,7 @@ pub(crate) use links::{
 pub use processing::{
     AsyncDbHandle, AsyncToken, CaLinkInit, DbAddr, DeviceDone, DeviceDoneSource, ExternalCpProcess,
     FieldPut, HeldInstance, InitHold, InputLinkTexts, PostItem, PostRule, ProcStack,
-    ProcessCallback, TokenWatch, hop_floor,
+    ProcessCallback, RecordBand, TokenWatch, hop_floor,
 };
 pub(crate) use processing::{
     DelayedCallbackTimers, NotifiedRead, ReadPolicy, seed_record_constants,

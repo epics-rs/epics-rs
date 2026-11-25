@@ -5420,9 +5420,11 @@ pub struct RecordInstance {
     link_rows: (Option<LinkRow>, Option<LinkRow>),
     // Device support
     pub device: Option<Box<dyn super::super::device_support::DeviceSupport>>,
-    /// The record's device-write completion, which carries the lock-free copy
-    /// of `PRIO`: [`Self::set_prio`] is the one store of both.
+    /// The record's device-write completion.
     pub(crate) device_done: crate::server::database::DeviceDone,
+    /// The lock-free copy of `PRIO`: [`Self::set_prio`] is the one store of
+    /// both.
+    pub(crate) band: crate::server::database::RecordBand,
     /// C `prec->dpvt` for the soft dsets; see [`Dpvt`](crate::server::device_support::Dpvt).
     pub dpvt: crate::server::device_support::Dpvt,
     // Subroutine (for sub records)
@@ -8751,13 +8753,13 @@ impl RecordInstance {
         }
     }
 
-    /// Store `PRIO` and the copy the record's [`DeviceDone`] reads without
-    /// the record lock.
+    /// Store `PRIO` and the [`RecordBand`] every callback request for the
+    /// record reads without the record lock.
     ///
-    /// [`DeviceDone`]: crate::server::database::DeviceDone
+    /// [`RecordBand`]: crate::server::database::RecordBand
     pub fn set_prio(&mut self, prio: i16) {
         self.common.prio = prio;
-        self.device_done.set_prio(prio);
+        self.band.set(prio);
     }
 
     pub fn new_boxed(
@@ -8844,10 +8846,13 @@ impl RecordInstance {
             out_row.and_then(|fields| link_slots.row(fields)),
             dol_row.and_then(|fields| link_slots.row(fields)),
         );
+        let band = crate::server::database::RecordBand::new(common.prio);
+        record.set_record_band(band.clone());
 
         Self {
             destroyed: false,
-            device_done: crate::server::database::DeviceDone::detached(common.prio),
+            device_done: crate::server::database::DeviceDone::detached(band.clone()),
+            band,
             name: name.into(),
             record,
             common,
@@ -14536,6 +14541,7 @@ mod record_cell_layout_tests {
             link_rows,
             device,
             device_done,
+            band,
             dpvt,
             subroutine,
             reprocess_generation,

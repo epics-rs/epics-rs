@@ -3408,14 +3408,6 @@ pub struct ProcessContext {
     /// changes nothing a hook may branch on (the epid record's
     /// `devEpidSoftCallback` TRIG write).
     pub soft: Option<crate::server::device_support::SoftDtyp>,
-    /// The callback band `dbCommon.prio` selects for work this cycle defers —
-    /// C `seqRecord.c:145-146`, which re-runs
-    /// `callbackSetPriority(prec->prio, &pcb->callback)` at the top of every
-    /// `process()` so a `PRIO` written between cycles takes effect on the next
-    /// one. Already converted: a record stashes this and hands it to
-    /// [`crate::runtime::task::spawn_background`] rather than re-deriving a
-    /// band from a raw menu index.
-    pub callback_priority: crate::runtime::task::CallbackPriority,
     /// `dbCommon.scan`: StreamEpics.cc `Stream::process` answers an I/O
     /// Intr record's pass from the input it already has.
     pub scan: crate::server::record::ScanType,
@@ -7760,6 +7752,12 @@ pub trait Record: RecordAny + Send + Sync + 'static {
         _db: crate::server::database::AsyncDbHandle,
     ) {
     }
+
+    /// The record's `PRIO` band, handed over as the record is created and
+    /// before any other hook: a record that requests callbacks reads it at
+    /// each request, as C reads `prec->prio`, so a `PRIO` put moves the next
+    /// one whether or not the record has processed since. Default: ignore.
+    fn set_record_band(&mut self, _band: crate::server::database::RecordBand) {}
 
     /// Framework init hook: called once at record load *after* the common
     /// link fields (`INP`/`OUT`/`FLNK`/...) have been resolved and the

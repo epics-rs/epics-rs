@@ -8,6 +8,8 @@ mod a_refused_octet_or_array_queue_keeps_the_last_alarm;
 mod a_refused_output_queue_raises_its_status_alarm;
 #[cfg(feature = "epics")]
 mod a_special_applies_past_a_full_band;
+#[cfg(feature = "epics")]
+mod a_special_follows_a_prio_put;
 mod an_unbounded_connect_retry_keeps_the_port;
 #[cfg(feature = "epics")]
 mod asyn_errs_posts_ahead_of_the_alarm;

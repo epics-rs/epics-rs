@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use epics_base_rs::error::{CaError, CaResult};
-use epics_base_rs::server::database::{AsyncDbHandle, ProcessCallback};
+use epics_base_rs::server::database::{AsyncDbHandle, ProcessCallback, RecordBand};
 use epics_base_rs::server::recgbl::{alarm_status, rec_gbl_set_sevr};
 use epics_base_rs::server::record::{
     AlarmSeverity, CommonFields, CycleHooks, CycleMarks, CyclePostMask, FieldDeclaration,
@@ -527,13 +527,9 @@ pub struct AsynRecord {
     /// The name as the asyn trace prints it, made once here so the cycle
     /// that copies it into its I/O plan never re-validates the bytes.
     trace_name: String,
-    /// The callback band this record's `PRIO` selects, refreshed from
-    /// `ProcessContext` before every `process()`. C asyn device support
-    /// completes through
-    /// `callbackRequestProcessCallback(&pPvt->callback, pPvt->pr->prio, pPvt->pr)`
-    /// — the record's own PRIO picks the queue the re-entry runs on. Low until
-    /// the first cycle, the band an unwritten `PRIO` already has.
-    callback_priority: epics_libcom_rs::runtime::task::CallbackPriority,
+    /// The record's `PRIO` band, which each request carries and reads as it
+    /// completes: C's `callbackRequestProcessCallback(..., pasynRec->prio, ...)`.
+    band: RecordBand,
     /// The `asynCallbackSpecial` requests queued on a blocking port.
     special_lane: Arc<CallbackCell<SpecialLane>>,
     /// The record's `asynCallbackSpecial` requests — see
@@ -922,7 +918,7 @@ impl Default for AsynRecord {
             drv_user: None,
             async_ctx: None,
             trace_name: String::new(),
-            callback_priority: epics_libcom_rs::runtime::task::CallbackPriority::Low,
+            band: RecordBand::default(),
             special_lane: CallbackCell::new(SpecialLane::default()),
             special_cells: Vec::new(),
             process_job: Arc::default(),
@@ -969,7 +965,7 @@ struct ProcessJob {
 struct ProcessRequest {
     plan: IoPlan,
     /// C `callbackRequestProcessCallback(..., pasynRec->prio, ...)`.
-    prio: epics_libcom_rs::runtime::task::CallbackPriority,
+    band: RecordBand,
     /// C `asynCallbackProcess`'s `canBlock` test (asynRecord.c:828-831): only
     /// a queued cycle ends in the re-process; one `queueRequest` ran in place
     /// is applied by its caller.
@@ -980,7 +976,7 @@ impl Default for ProcessRequest {
     fn default() -> Self {
         Self {
             plan: IoPlan::default(),
-            prio: epics_libcom_rs::runtime::task::CallbackPriority::Low,
+            band: RecordBand::default(),
             queued: false,
         }
     }
@@ -1014,7 +1010,7 @@ impl CellBody for ProcessJob {
     fn done(self: Arc<Self>) {
         let (prio, queued) = {
             let request = self.request.lock();
-            (request.prio, request.queued)
+            (request.band.priority(), request.queued)
         };
         if !queued {
             return;
@@ -2218,7 +2214,7 @@ struct SpecialRequest {
     /// `setEos`'s terminator, `dbTranslateEscape`d.
     eos: Vec<u8>,
     /// C `callbackRequestProcessCallback(..., pasynRec->prio, ...)`.
-    prio: epics_libcom_rs::runtime::task::CallbackPriority,
+    band: RecordBand,
     /// Queued on a blocking port: the result goes to the [`SpecialLane`].
     /// Otherwise it ran in place and the put applies it.
     queued: bool,
@@ -2274,7 +2270,7 @@ impl Default for SpecialRequest {
             key: "",
             value: String::new(),
             eos: Vec::new(),
-            prio: epics_libcom_rs::runtime::task::CallbackPriority::Low,
+            band: RecordBand::default(),
             queued: false,
         }
     }
@@ -2418,7 +2414,7 @@ impl CellBody for SpecialBody {
     fn process(&self, port: &mut dyn PortCalls) {
         let (done, prio, queued) = {
             let request = self.request.lock();
-            (request.run(port), request.prio, request.queued)
+            (request.run(port), request.band.priority(), request.queued)
         };
         if queued {
             SpecialLane::complete(&self.lane, done, prio);
@@ -2430,7 +2426,7 @@ impl CellBody for SpecialBody {
     fn unrun(&self, why: Unrun) {
         let (queued_by, prio) = {
             let request = self.request.lock();
-            (request.what.queued_by(), request.prio)
+            (request.what.queued_by(), request.band.priority())
         };
         let e = match why {
             Unrun::Refused(e) => e,
@@ -3282,7 +3278,10 @@ impl AsynRecord {
             None => {
                 let body = Arc::new(SpecialBody {
                     lane: Arc::clone(&self.special_lane),
-                    request: parking_lot::Mutex::default(),
+                    request: parking_lot::Mutex::new(SpecialRequest {
+                        band: self.band.clone(),
+                        ..SpecialRequest::default()
+                    }),
                     ran_in_place: parking_lot::Mutex::default(),
                 });
                 let cell = handle.new_cell(body.clone());
@@ -3300,7 +3299,6 @@ impl AsynRecord {
             request.user = self.special_user(queue);
             request.option = handle.has_interface(Registry::Option);
             request.octet = handle.has_interface(Registry::Octet);
-            request.prio = self.callback_priority;
         }
         special
     }
@@ -4381,7 +4379,6 @@ impl AsynRecord {
         let user = {
             let mut request = job.request.lock();
             self.fill_io_plan(&mut request.plan, gpib);
-            request.prio = self.callback_priority;
             request.queued = queued;
             io_user(&request.plan).with_priority(crate::port::QueuePriority::Low)
         };
@@ -4606,10 +4603,9 @@ impl Record for AsynRecord {
         self.async_ctx = Some((name, db));
     }
 
-    fn set_process_context(&mut self, ctx: &epics_base_rs::server::record::ProcessContext) {
-        // C re-reads `pPvt->pr->prio` on every completion, so a `PRIO` written
-        // between cycles moves the next one.
-        self.callback_priority = ctx.callback_priority;
+    fn set_record_band(&mut self, band: RecordBand) {
+        self.process_job.request.lock().band = band.clone();
+        self.band = band;
     }
 
     /// The `recGblSetSevr` calls in the `perform*IO` helpers raise a record alarm
@@ -5448,7 +5444,6 @@ impl Record for AsynRecord {
 
     fn cycle_hooks(&self) -> CycleHooks {
         CycleHooks::CYCLE_POSTED
-            .union(CycleHooks::CONTEXT)
             .union(CycleHooks::PROCESS_POSTED)
             .union(CycleHooks::WRITE_POSTED)
     }

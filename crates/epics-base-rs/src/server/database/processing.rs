@@ -346,6 +346,33 @@ impl crate::runtime::background::CallbackBody for ProcessReentry {
     }
 }
 
+/// A record's `PRIO`, one per record and shared by everything that requests
+/// a callback for it, read at request time without the record lock as C
+/// reads `prec->prio` in `callbackRequestProcessCallback`. Only
+/// `RecordInstance::set_prio` stores here, beside `common.prio`.
+#[derive(Clone, Default, Debug)]
+pub struct RecordBand(Arc<std::sync::atomic::AtomicI16>);
+
+impl RecordBand {
+    pub(crate) fn new(prio: i16) -> Self {
+        Self(Arc::new(std::sync::atomic::AtomicI16::new(prio)))
+    }
+
+    pub(crate) fn set(&self, prio: i16) {
+        self.0.store(prio, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// `PRIO` now.
+    pub fn prio(&self) -> i16 {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The band `PRIO` selects now.
+    pub fn priority(&self) -> crate::runtime::task::CallbackPriority {
+        crate::runtime::task::CallbackPriority::from_record_prio(self.prio())
+    }
+}
+
 /// The completion of an asynchronous device read or write: C devAsyn's
 /// `callbackRequestProcessCallback(&pPvt->processCallback, pr->prio, pr)` from
 /// the port thread once the driver call ran, which re-enters the record's
@@ -365,18 +392,18 @@ impl DeviceDone {
         Self::with_db(
             Arc::downgrade(&db.inner),
             record.name.clone(),
-            record.common.prio,
+            record.band.clone(),
             record.reprocess_generation.clone(),
         )
     }
 
     /// A cell no database owns, whose completion runs nothing: the
     /// `RecordInstance` default until `add_loaded_record` installs its own.
-    pub(crate) fn detached(prio: i16) -> Self {
+    pub(crate) fn detached(band: RecordBand) -> Self {
         Self::with_db(
             std::sync::Weak::new(),
             RecordName::from(&b""[..]),
-            prio,
+            band,
             Arc::default(),
         )
     }
@@ -384,14 +411,14 @@ impl DeviceDone {
     fn with_db(
         db: std::sync::Weak<super::PvDatabaseInner>,
         name: RecordName,
-        prio: i16,
+        band: RecordBand,
         generation: Arc<AtomicU64>,
     ) -> Self {
         DeviceDone(crate::runtime::background::CallbackCell::new(
             DeviceReentry {
                 db,
                 name,
-                band: std::sync::atomic::AtomicU8::new(band_index(prio)),
+                band,
                 generation,
                 epoch: AtomicU64::new(0),
                 owed: std::sync::Mutex::new(Owed::default()),
@@ -403,17 +430,7 @@ impl DeviceDone {
     /// The record's band, read without the record lock as C's
     /// `callbackRequestProcessCallback` reads `pr->prio` on the port thread.
     pub fn priority(&self) -> crate::runtime::task::CallbackPriority {
-        use crate::runtime::task::CallbackPriority;
-        match self
-            .0
-            .body()
-            .band
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            1 => CallbackPriority::Medium,
-            2 => CallbackPriority::High,
-            _ => CallbackPriority::Low,
-        }
+        self.0.body().band.priority()
     }
 
     /// The database this record's completion re-enters.
@@ -421,14 +438,6 @@ impl DeviceDone {
         AsyncDbHandle {
             inner: self.0.body().db.clone(),
         }
-    }
-
-    /// Only `RecordInstance::set_prio` stores here, beside `common.prio`.
-    pub(crate) fn set_prio(&self, prio: i16) {
-        self.0
-            .body()
-            .band
-            .store(band_index(prio), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Queue the pass that completes an asynchronous write on `priority`,
@@ -649,21 +658,11 @@ impl<'a> DeviceDoneSource<'a> {
     }
 }
 
-/// `PRIO` as the band index [`DeviceDone::priority`] decodes, folded as
-/// [`crate::runtime::task::CallbackPriority::from_record_prio`] folds it.
-fn band_index(prio: i16) -> u8 {
-    match crate::runtime::task::CallbackPriority::from_record_prio(prio) {
-        crate::runtime::task::CallbackPriority::Low => 0,
-        crate::runtime::task::CallbackPriority::Medium => 1,
-        crate::runtime::task::CallbackPriority::High => 2,
-    }
-}
-
 /// The body of a [`DeviceDone`].
 struct DeviceReentry {
     db: std::sync::Weak<super::PvDatabaseInner>,
     name: RecordName,
-    band: std::sync::atomic::AtomicU8,
+    band: RecordBand,
     /// The record's `reprocess_generation`, and its value when the request
     /// was queued.
     generation: Arc<AtomicU64>,
@@ -4587,10 +4586,10 @@ impl PvDatabase {
     /// For the deferral sites that hold a record *name* rather than a locked
     /// instance. Takes the record's read lock, so it must not be called from
     /// inside that record's own `process()`/`special()` — those run under the
-    /// instance write lock and read the band off
-    /// [`ProcessContext::callback_priority`](crate::server::record::ProcessContext)
-    /// instead. A record that is gone answers `Low`, the band an unwritten
-    /// `PRIO` already has; the work being scheduled for it is a no-op anyway.
+    /// instance write lock and read the band off the [`RecordBand`] handed to
+    /// the record instead. A record that is gone answers `Low`, the band an
+    /// unwritten `PRIO` already has; the work being scheduled for it is a
+    /// no-op anyway.
     pub fn record_callback_priority(
         &self,
         name: impl AsRef<[u8]>,

@@ -86,10 +86,10 @@ impl SscanRecord {
     fn deliver(&self, li: usize) -> Option<Deliver> {
         let events = self.link_events.clone()?;
         let inbox = self.inbox.clone();
-        let prio = self.prio;
+        let band = self.band.clone();
         Some(Arc::new(move |generation, event| {
             inbox.push(li, generation, event);
-            let _ = request_cell(prio, &events);
+            let _ = request_cell(band.priority(), &events);
         }))
     }
 

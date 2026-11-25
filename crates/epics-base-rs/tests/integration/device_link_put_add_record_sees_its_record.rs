@@ -9,7 +9,7 @@ use std::sync::Mutex;
 
 use epics_base_rs::error::{CaResult, LinkRefusal};
 use epics_base_rs::runtime::task::CallbackPriority;
-use epics_base_rs::server::database::AsyncDbHandle;
+use epics_base_rs::server::database::{AsyncDbHandle, RecordBand};
 use epics_base_rs::server::device_support::DeviceSupport;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::record::{DbLinkType, DevSup, Dset, Record, ScanType};
@@ -37,7 +37,7 @@ struct Probe {
     inp: String,
     name: String,
     db: Option<AsyncDbHandle>,
-    prio: Option<CallbackPriority>,
+    band: Option<RecordBand>,
 }
 
 impl DeviceSupport for Probe {
@@ -50,8 +50,8 @@ impl DeviceSupport for Probe {
     fn bind_database(&mut self, db: AsyncDbHandle) {
         self.db = Some(db);
     }
-    fn set_callback_priority(&mut self, prio: CallbackPriority) {
-        self.prio = Some(prio);
+    fn set_record_band(&mut self, band: RecordBand) {
+        self.band = Some(band);
     }
     fn add_record(&mut self, record: &mut dyn Record) -> Result<(), LinkRefusal> {
         ADDED.lock().unwrap().push((
@@ -59,7 +59,7 @@ impl DeviceSupport for Probe {
             record.get_field("PREC"),
             self.inp.clone(),
             self.db.is_some(),
-            self.prio,
+            self.band.as_ref().map(RecordBand::priority),
         ));
         Ok(())
     }
@@ -77,7 +77,7 @@ async fn a_device_link_put_runs_add_record_on_its_record() {
                     inp: ctx.inp.to_string(),
                     name: String::new(),
                     db: None,
-                    prio: None,
+                    band: None,
                 }) as Box<dyn DeviceSupport>
             })
         })

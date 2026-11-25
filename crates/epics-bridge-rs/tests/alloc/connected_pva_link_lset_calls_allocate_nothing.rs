@@ -1,18 +1,18 @@
 //! The per-link calls a record cycle makes on the pva lset allocate nothing
 //! on the record thread for a connected link, on every config route: the
 //! config is shared, never cloned, and the channel lookup borrows its key.
-//! Counted with this binary's own allocator on an IOC thread, while a real
+//! Counted per thread with the alloc binary's allocator on an IOC thread,
+//! while a real
 //! PVA server serves the links.
 //!
 //! Tokio only: the PVA server is.
 #![cfg(all(feature = "pvalink", tokio_backend))]
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use alloc_count::thread;
 use epics_base_rs::runtime::task::{MandatoryThread, StackSizeClass, ThreadPriority};
 use epics_base_rs::server::database::{LinkRef, LinkSet, PvDatabase};
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -20,52 +20,20 @@ use epics_base_rs::server::record::{JlinkValue, OpenLatch, pvajson_identity_key}
 use epics_bridge_rs::pvalink::install_pvalink_resolver;
 use epics_pva_rs::server::PvDatabaseSource;
 use epics_pva_rs::server_native::{PvaServer, PvaServerConfig};
-
-struct Counting;
-
-thread_local! {
-    static COUNTING: Cell<bool> = const { Cell::new(false) };
-    static ALLOCS: Cell<usize> = const { Cell::new(0) };
-}
-
-// SAFETY: forwards every call to `System` unchanged; the counters are
-// const-initialised thread-local `Cell`s, which never allocate.
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if COUNTING.with(Cell::get) {
-            ALLOCS.with(|n| n.set(n.get() + 1));
-        }
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        if COUNTING.with(Cell::get) {
-            ALLOCS.with(|n| n.set(n.get() + 1));
-        }
-        unsafe { System.realloc(ptr, layout, size) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(ptr, layout) }
-    }
-}
-
-#[global_allocator]
-static GLOBAL: Counting = Counting;
+use serial_test::serial;
 
 const CALLS: usize = 100;
 
 /// Allocations `CALLS` runs of `calls` make on this thread, after one run
 /// that decides every config it touches.
-fn allocs(mut calls: impl FnMut()) -> usize {
+fn allocs(mut calls: impl FnMut()) -> u64 {
     calls();
-    ALLOCS.with(|n| n.set(0));
-    COUNTING.with(|c| c.set(true));
-    for _ in 0..CALLS {
-        calls();
-    }
-    COUNTING.with(|c| c.set(false));
-    ALLOCS.with(Cell::get)
+    let ((), counts) = thread::counted(|| {
+        for _ in 0..CALLS {
+            calls();
+        }
+    });
+    counts.allocs
 }
 
 /// Every per-link call a cycle makes on a connected link, by name.
@@ -102,6 +70,7 @@ const CONNECTED_CALLS: &[(&str, fn(&dyn LinkSet, LinkRef<'_>))] = &[
 ];
 
 #[test]
+#[serial(epics_env)]
 fn connected_pva_link_lset_calls_allocate_nothing() {
     // The target IOC runs on its own runtime, off the counted thread.
     let server_rt = tokio::runtime::Builder::new_multi_thread()
@@ -128,8 +97,9 @@ fn connected_pva_link_lset_calls_allocate_nothing() {
         )
         .expect("target PVA server starts")
     });
-    // SAFETY: before the PVA client exists; the server's threads read the
-    // environment only through `std::env`.
+    // SAFETY: every test of this binary that sets the PVA env is
+    // `#[serial(epics_env)]`; before the PVA client exists, and the server's
+    // threads read the environment only through `std::env`.
     unsafe {
         std::env::set_var("EPICS_PVA_NAME_SERVERS", server.tcp_addr().to_string());
         std::env::set_var("EPICS_PVA_ADDR_LIST", "");
@@ -169,7 +139,7 @@ fn connected_pva_link_lset_calls_allocate_nothing() {
                         assert!(Instant::now() < deadline, "{name} never connected");
                         tokio::time::sleep(Duration::from_millis(20)).await;
                     }
-                    let counts: Vec<(&str, usize)> = CONNECTED_CALLS
+                    let counts: Vec<(&str, u64)> = CONNECTED_CALLS
                         .iter()
                         .map(|(call, f)| (*call, allocs(|| f(&resolver, link))))
                         // The trait hands a remote message back as an owned

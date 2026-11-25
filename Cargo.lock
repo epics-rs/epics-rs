@@ -1062,6 +1062,7 @@ dependencies = [
 name = "epics-bridge-rs"
 version = "0.34.2"
 dependencies = [
+ "alloc-count",
  "arc-swap",
  "async-trait",
  "bytes",

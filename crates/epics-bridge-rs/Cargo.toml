@@ -309,6 +309,8 @@ libc = "0.2"
 epics-oracle-rs = { path = "../epics-oracle-rs" }
 # Dev-only and path-only: the retry rule for a test that must name a port.
 named-port = { path = "../named-port" }
+# Dev-only and path-only: the counting allocator of the `alloc` binary.
+alloc-count = { path = "../alloc-count" }
 serial_test = "3"
 tempfile = "3"
 tracing-subscriber = "0.3"

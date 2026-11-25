@@ -2,63 +2,30 @@
 //! on the record thread for a link that never connects, on every config
 //! route. A link's config is decided once, when its key first resolves, and
 //! shared with every later call, so no call builds, parses or clones one.
-//! Counted with this binary's own allocator on an IOC thread.
+//! Counted per thread with the alloc binary's allocator on an IOC thread.
 #![cfg(feature = "pvalink")]
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
 use std::sync::Arc;
 
+use alloc_count::thread;
 use epics_base_rs::runtime::task::{MandatoryThread, StackSizeClass, ThreadPriority};
 use epics_base_rs::server::database::{LinkForward, LinkRef, LinkSet, PvDatabase};
 use epics_base_rs::server::record::{JlinkValue, OpenLatch, pvajson_identity_key};
 use epics_bridge_rs::pvalink::install_pvalink_resolver;
-
-struct Counting;
-
-thread_local! {
-    static COUNTING: Cell<bool> = const { Cell::new(false) };
-    static ALLOCS: Cell<usize> = const { Cell::new(0) };
-}
-
-// SAFETY: forwards every call to `System` unchanged; the counters are
-// const-initialised thread-local `Cell`s, which never allocate.
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if COUNTING.with(Cell::get) {
-            ALLOCS.with(|n| n.set(n.get() + 1));
-        }
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        if COUNTING.with(Cell::get) {
-            ALLOCS.with(|n| n.set(n.get() + 1));
-        }
-        unsafe { System.realloc(ptr, layout, size) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(ptr, layout) }
-    }
-}
-
-#[global_allocator]
-static GLOBAL: Counting = Counting;
+use serial_test::serial;
 
 const CALLS: usize = 100;
 
 /// Allocations `CALLS` runs of `calls` make on this thread, after one run
 /// that decides every config it touches.
-fn allocs(mut calls: impl FnMut()) -> usize {
+fn allocs(mut calls: impl FnMut()) -> u64 {
     calls();
-    ALLOCS.with(|n| n.set(0));
-    COUNTING.with(|c| c.set(true));
-    for _ in 0..CALLS {
-        calls();
-    }
-    COUNTING.with(|c| c.set(false));
-    ALLOCS.with(Cell::get)
+    let ((), counts) = thread::counted(|| {
+        for _ in 0..CALLS {
+            calls();
+        }
+    });
+    counts.allocs
 }
 
 /// Every per-link call a cycle makes on a link that never connects.
@@ -79,11 +46,13 @@ fn unconnected_calls(lset: &dyn LinkSet, name: LinkRef<'_>, forward: &dyn LinkFo
 // RTEMS-EXEC-MODEL-ALLOW(1): checked - runs and passes in the exec-backend
 // build (EPICS_RS_BUILD_EXEC_BACKEND=thread); the runtime only drives setup.
 #[test]
+#[serial(epics_env)]
 fn unconnected_pva_link_lset_calls_allocate_nothing() {
     let closed = named_port::HeldPort::closed_tcp();
-    // SAFETY: the one test in this binary, before any runtime exists, so no
-    // other thread reads the environment. Nothing listens on `closed.port`,
-    // and the hold keeps a stranger from binding it until the test ends.
+    // SAFETY: every test of this binary that sets the PVA env is
+    // `#[serial(epics_env)]`, and this one sets it before its runtime exists.
+    // Nothing listens on `closed.port`, and the hold keeps a stranger from
+    // binding it until the test ends.
     unsafe {
         std::env::set_var(
             "EPICS_PVA_NAME_SERVERS",

@@ -172,7 +172,7 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ),
     (
         "epics-bridge-rs",
-        "tests/connected_pva_link_lset_calls_allocate_nothing.rs",
+        "tests/alloc/connected_pva_link_lset_calls_allocate_nothing.rs",
     ),
     (
         "epics-bridge-rs",
@@ -180,7 +180,7 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ),
     (
         "epics-bridge-rs",
-        "tests/pva_forward_link_dispatch_alloc.rs",
+        "tests/alloc/pva_forward_link_dispatch_alloc.rs",
     ),
     ("epics-bridge-rs", "tests/integration/pva_gateway.rs"),
     (

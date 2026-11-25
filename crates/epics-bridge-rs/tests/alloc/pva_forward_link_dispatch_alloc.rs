@@ -2,54 +2,23 @@
 //! dispatched through the handle the resolver opened it with, so the
 //! record-processing thread allocates nothing for it: pvxs `pvaScanForward`
 //! starts the put and returns (`pvxs/ioc/pvalink_lset.cpp:672-688`). Counted
-//! with this binary's own allocator on the processing thread, against the same
-//! record type with no forward, while a real PVA server receives the puts.
+//! per thread with the alloc binary's allocator on the processing thread,
+//! against the same record type with no forward, while a real PVA server
+//! receives the puts.
 #![cfg(all(feature = "pvalink", tokio_backend))]
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use alloc_count::thread;
 use epics_base_rs::server::database::{ProcStack, PvDatabase};
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
 use epics_bridge_rs::pvalink::install_pvalink_resolver;
 use epics_pva_rs::server::PvDatabaseSource;
 use epics_pva_rs::server_native::{PvaServer, PvaServerConfig};
-
-struct Counting;
-
-thread_local! {
-    static COUNTING: Cell<bool> = const { Cell::new(false) };
-    static ALLOCS: Cell<usize> = const { Cell::new(0) };
-}
-
-// SAFETY: forwards every call to `System` unchanged; the counters are
-// const-initialised thread-local `Cell`s, which never allocate.
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if COUNTING.with(Cell::get) {
-            ALLOCS.with(|n| n.set(n.get() + 1));
-        }
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        if COUNTING.with(Cell::get) {
-            ALLOCS.with(|n| n.set(n.get() + 1));
-        }
-        unsafe { System.realloc(ptr, layout, size) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(ptr, layout) }
-    }
-}
-
-#[global_allocator]
-static GLOBAL: Counting = Counting;
+use serial_test::serial;
 
 const TARGETS: &str = r#"
 record(calc, "T:A") { field(CALC, "VAL+1") }
@@ -92,16 +61,14 @@ async fn process(db: &PvDatabase, rec: &str) {
 }
 
 /// Allocations one process of `rec` makes on this thread, after a warm-up.
-async fn allocs(db: &PvDatabase, rec: &str) -> usize {
+async fn allocs(db: &PvDatabase, rec: &str) -> u64 {
     process(db, rec).await;
     let mut visited = ProcStack::new();
-    ALLOCS.with(|n| n.set(0));
-    COUNTING.with(|c| c.set(true));
+    let window = thread::open();
     db.process_record_with_links(rec, &mut visited)
         .await
         .unwrap();
-    COUNTING.with(|c| c.set(false));
-    ALLOCS.with(Cell::get)
+    window.close().allocs
 }
 
 /// Process `rec` until its forward reaches `target`, which the remote server
@@ -119,6 +86,7 @@ async fn connect(local: &PvDatabase, remote: &PvDatabase, rec: &str, target: &st
 }
 
 #[test]
+#[serial(epics_env)]
 fn a_connected_pva_forward_allocates_nothing_on_the_processing_thread() {
     // The target IOC runs on its own runtime, off the counted thread.
     let server_rt = tokio::runtime::Builder::new_multi_thread()
@@ -135,8 +103,9 @@ fn a_connected_pva_forward_allocates_nothing_on_the_processing_thread() {
         .expect("target PVA server starts");
         (remote, server)
     });
-    // SAFETY: before the PVA client exists; the server's threads read the
-    // environment only through `std::env`.
+    // SAFETY: every test of this binary that sets the PVA env is
+    // `#[serial(epics_env)]`; before the PVA client exists, and the server's
+    // threads read the environment only through `std::env`.
     unsafe {
         std::env::set_var("EPICS_PVA_NAME_SERVERS", server.tcp_addr().to_string());
         std::env::set_var("EPICS_PVA_ADDR_LIST", "");

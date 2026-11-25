@@ -220,6 +220,28 @@ fn code_only(line: &str, in_block: &mut bool) -> String {
 /// Outside a string literal the token is an identifier -- `spawn_softioc`,
 /// `SOFT_IOC_PVX` -- and always counts.
 fn names_ioc_program(code: &str, tokens: &BTreeSet<String>) -> bool {
+    let (outside, literals) = split_literals(code);
+    let outside = outside.to_ascii_lowercase();
+    if tokens.iter().any(|t| outside.contains(t.as_str())) {
+        return true;
+    }
+    let rust_path = |lit: &str| {
+        lit.contains("::")
+            && lit
+                .split("::")
+                .all(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_alphanumeric() || c == '_'))
+    };
+    literals.iter().any(|lit| {
+        !lit.chars().any(char::is_whitespace) && !rust_path(lit) && {
+            let lower = lit.to_ascii_lowercase();
+            tokens.iter().any(|t| lower.contains(t.as_str()))
+        }
+    })
+}
+
+/// One line of code as the text outside its string literals, and the
+/// literals.
+fn split_literals(code: &str) -> (String, Vec<String>) {
     let mut outside = String::new();
     let mut literals: Vec<String> = Vec::new();
     let mut current = String::new();
@@ -249,22 +271,7 @@ fn names_ioc_program(code: &str, tokens: &BTreeSet<String>) -> bool {
     if in_str {
         literals.push(current);
     }
-    let outside = outside.to_ascii_lowercase();
-    if tokens.iter().any(|t| outside.contains(t.as_str())) {
-        return true;
-    }
-    let rust_path = |lit: &str| {
-        lit.contains("::")
-            && lit
-                .split("::")
-                .all(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_alphanumeric() || c == '_'))
-    };
-    literals.iter().any(|lit| {
-        !lit.chars().any(char::is_whitespace) && !rust_path(lit) && {
-            let lower = lit.to_ascii_lowercase();
-            tokens.iter().any(|t| lower.contains(t.as_str()))
-        }
-    })
+    (outside, literals)
 }
 
 /// The `std::process` / `tokio::process` items that start or hold a child,
@@ -502,7 +509,7 @@ fn command_bindings(stmt: &str, names: &ProcessNames, out: &mut BTreeSet<String>
     }
 }
 
-/// Does this file start a child process, and where?
+/// The statements of `code` that build or start a child process.
 ///
 /// The judgement is per STATEMENT, not per file. A method marker on its own
 /// is a name, not a spawn — `Failure::status`, `Response::status` and
@@ -514,7 +521,7 @@ fn command_bindings(stmt: &str, names: &ProcessNames, out: &mut BTreeSet<String>
 /// Constructing a resolved `Command` counts on its own, with no marker: a
 /// builder that hands the `Command` back spawns through its caller, and the
 /// caller is routinely a different file of the same closure.
-fn spawn_site(code: &str) -> bool {
+fn spawn_statements<'a>(stmts: &[Statement<'a>], names: &ProcessNames) -> Vec<Statement<'a>> {
     // Assembled with `concat!` so the live scan cannot match this file on its
     // own marker table -- the same trick the sibling gate uses for its fixtures.
     const SPAWN_METHODS: [&str; 3] = [
@@ -522,35 +529,487 @@ fn spawn_site(code: &str) -> bool {
         concat!(".out", "put()"),
         concat!(".sta", "tus()"),
     ];
-    let names = resolve_process_names(code);
     let mut bound: BTreeSet<String> = BTreeSet::new();
-    for stmt in code.split(';') {
-        command_bindings(stmt, &names, &mut bound);
-        if constructs_command(stmt, &names) {
-            return true;
-        }
-        if !SPAWN_METHODS.iter().any(|m| stmt.contains(m)) {
-            continue;
-        }
-        if names_child_side(stmt, &names) || bound.iter().any(|b| has_path(stmt, b)) {
-            return true;
+    let mut out = Vec::new();
+    for &stmt in stmts {
+        command_bindings(stmt.text, names, &mut bound);
+        let starts = constructs_command(stmt.text, names)
+            || (SPAWN_METHODS.iter().any(|m| stmt.text.contains(m))
+                && (names_child_side(stmt.text, names)
+                    || bound.iter().any(|b| has_path(stmt.text, b))));
+        if starts {
+            out.push(stmt);
         }
     }
-    false
+    out
 }
 
-/// Does this file both name an IOC executable and spawn a process?
+/// One statement of a de-commented file: where it starts in the file, and
+/// the index of its first line among the file's code lines.
+#[derive(Debug, Clone, Copy)]
+struct Statement<'a> {
+    start: usize,
+    first_line: usize,
+    text: &'a str,
+}
+
+/// `code` cut at each `;` and around each `fn` signature and body. A
+/// signature declares its name and parameters and uses neither, yet without
+/// its own cuts it shares a statement with the tail expression of the
+/// function above and with the first statement of its body: `fn
+/// the_softioc_case() { let out = Command::new("caget")` would be one
+/// statement. The cut at a body's `}` keeps an item after it out of the
+/// function's scope.
+fn statements<'a>(code: &'a str, fns: &Functions<'_>) -> Vec<Statement<'a>> {
+    // (where the cut is, how many bytes of `code` it drops)
+    let mut cuts: Vec<(usize, usize)> = code.match_indices(';').map(|(i, _)| (i, 1)).collect();
+    for f in &fns.sigs {
+        cuts.push((f.at, 0));
+        cuts.extend(f.open.map(|b| (b, 1)));
+        cuts.extend(f.close.map(|b| (b, 1)));
+    }
+    cuts.sort_unstable();
+    let mut out = Vec::new();
+    let (mut start, mut first_line) = (0, 0);
+    for (at, len) in cuts.into_iter().chain([(code.len(), 0)]) {
+        let at = at.max(start);
+        let text = &code[start..at];
+        out.push(Statement {
+            start,
+            first_line,
+            text,
+        });
+        first_line += text.matches('\n').count();
+        start = at + len;
+    }
+    out
+}
+
+fn is_ident_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// The identifier `text` starts with, if any.
+fn leading_ident(text: &str) -> &str {
+    let end = text.find(|c: char| !is_ident_char(c)).unwrap_or(text.len());
+    &text[..end]
+}
+
+/// The line of `code` that names an IOC program, else the first that uses a
+/// `visible` binding an IOC program reached.
+fn ioc_line(code: &str, tokens: &BTreeSet<String>, visible: &BTreeSet<&str>) -> Option<usize> {
+    code.split('\n')
+        .position(|line| names_ioc_program(line, tokens))
+        .or_else(|| {
+            without_let_patterns(code).split('\n').position(|line| {
+                let (outside, _) = split_literals(line);
+                visible.iter().any(|r| has_path(&outside, r))
+            })
+        })
+}
+
+fn names_ioc(code: &str, tokens: &BTreeSet<String>, visible: &BTreeSet<&str>) -> bool {
+    ioc_line(code, tokens, visible).is_some()
+}
+
+/// `stmt` with each `let` pattern blanked up to its `=`, lines kept: a
+/// pattern declares a name, and a shadowing `let out` does not use the `out`
+/// before it.
+fn without_let_patterns(stmt: &str) -> String {
+    let mut out = String::with_capacity(stmt.len());
+    let mut rest = stmt;
+    while let Some(i) = rest.find("let ") {
+        let boundary = rest[..i].chars().last().is_none_or(|c| !is_ident_char(c));
+        out.push_str(&rest[..i + 4]);
+        rest = &rest[i + 4..];
+        if !boundary {
+            continue;
+        }
+        let b = rest.as_bytes();
+        let eq = (0..b.len())
+            .find(|&j| {
+                b[j] == b'='
+                    && !matches!(b.get(j + 1), Some(b'=' | b'>'))
+                    && !(j > 0 && matches!(b[j - 1], b'=' | b'!' | b'<' | b'>'))
+            })
+            .unwrap_or(b.len());
+        out.extend(rest[..eq].chars().map(|c| if c == '\n' { c } else { ' ' }));
+        rest = &rest[eq..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Split the text after an opening bracket at its top-level commas, up to the
+/// bracket that closes it. Brackets inside string literals do not nest, and
+/// `<`/`>` nest only where `angle` says the text is a signature, since in a
+/// call's arguments they are comparisons.
+fn bracket_items(after_open: &str, angle: bool) -> Vec<&str> {
+    let mut items = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0;
+    let mut in_str = false;
+    let mut prev = '\0';
+    let mut escaped = false;
+    for (i, c) in after_open.char_indices() {
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_str = false;
+            }
+            prev = c;
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            '<' | '>' if !angle => {}
+            '>' if prev == '-' || prev == '=' => {}
+            '(' | '[' | '{' | '<' => depth += 1,
+            ')' | ']' | '}' | '>' if depth > 0 => depth -= 1,
+            ')' | ']' | '}' => {
+                items.push(&after_open[start..i]);
+                return items;
+            }
+            ',' if depth == 0 => {
+                items.push(&after_open[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        prev = c;
+    }
+    items.push(&after_open[start..]);
+    items
+}
+
+/// How far [`bracket_items`] read: its items, the comma after each but the
+/// last, and the closing bracket.
+fn bracket_len(items: &[&str]) -> usize {
+    items.iter().map(|s| s.len() + 1).sum()
+}
+
+/// The byte spans of a file's string and char literals, and the `}` that
+/// closes each `{` outside them.
+struct LiteralStructure {
+    literals: Vec<(usize, usize)>,
+    ends: BTreeMap<usize, usize>,
+}
+
+/// `None` when a literal or a brace of `code` is left open, which
+/// de-commenting line by line can cause.
+fn literal_structure(code: &str) -> Option<LiteralStructure> {
+    let b = code.as_bytes();
+    let ident = |j: usize| b[j].is_ascii_alphanumeric() || b[j] == b'_';
+    let (mut literals, mut ends, mut open) = (Vec::new(), BTreeMap::new(), Vec::new());
+    let mut i = 0;
+    while i < b.len() {
+        // `r"…"`, `r#"…"#`, `br"…"`: no escapes, closed by a quote and as
+        // many `#`s as opened it.
+        let standalone = i == 0 || !ident(i - 1) || (b[i - 1] == b'b' && (i == 1 || !ident(i - 2)));
+        if b[i] == b'r' && standalone {
+            let hashes = b[i + 1..].iter().take_while(|&&c| c == b'#').count();
+            if b.get(i + 1 + hashes) == Some(&b'"') {
+                let body = i + 2 + hashes;
+                let close = format!("\"{}", "#".repeat(hashes));
+                let end = body + code[body..].find(&close)? + close.len();
+                literals.push((i, end));
+                i = end;
+                continue;
+            }
+        }
+        match b[i] {
+            b'"' => {
+                let mut j = i + 1;
+                while *b.get(j)? != b'"' {
+                    j += if b[j] == b'\\' { 2 } else { 1 };
+                }
+                literals.push((i, j + 1));
+                i = j + 1;
+                continue;
+            }
+            b'\'' => {
+                // `'x'`, `'\''`, `'\u{7d}'`; a lifetime `'a` has no closing
+                // quote after its first character.
+                let rest = &code[i + 1..];
+                let content = if rest.starts_with('\\') {
+                    rest.get(2..).and_then(|r| r.find('\'')).map(|k| k + 2)
+                } else {
+                    rest.chars()
+                        .next()
+                        .map(char::len_utf8)
+                        .filter(|&n| rest[n..].starts_with('\''))
+                };
+                if let Some(n) = content {
+                    literals.push((i, i + n + 2));
+                    i += n + 2;
+                    continue;
+                }
+            }
+            b'{' => open.push(i),
+            b'}' => {
+                ends.insert(open.pop()?, i);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    open.is_empty()
+        .then_some(LiteralStructure { literals, ends })
+}
+
+/// The `fn`s one file defines, and which of them each byte belongs to.
+struct Functions<'a> {
+    sigs: Vec<FnSig<'a>>,
+    /// `false` when [`literal_structure`] could not delimit the bodies:
+    /// every name is then file-wide, which can over-count a spawner but
+    /// never miss one.
+    scoped: bool,
+}
+
+/// One `fn` this file defines.
+struct FnSig<'a> {
+    /// Where its `fn` keyword starts.
+    at: usize,
+    name: &'a str,
+    /// The identifier each non-`self` parameter binds, in order; `""` for a
+    /// parameter that binds a pattern instead of one name.
+    params: Vec<String>,
+    /// The `{` that opens its body; `None` for a declaration without one.
+    open: Option<usize>,
+    /// The `}` that closes it, where the file is [`Functions::scoped`].
+    close: Option<usize>,
+}
+
+impl<'a> Functions<'a> {
+    fn new(code: &'a str) -> Self {
+        let structure = literal_structure(code);
+        let in_literal = |at: usize| {
+            structure
+                .as_ref()
+                .is_some_and(|st| st.literals.iter().any(|&(s, e)| s <= at && at < e))
+        };
+        let mut sigs = fn_signatures(code);
+        sigs.retain(|f| !in_literal(f.at));
+        if let Some(st) = &structure {
+            for f in &mut sigs {
+                f.close = f.open.and_then(|o| st.ends.get(&o).copied());
+            }
+        }
+        Functions {
+            sigs,
+            scoped: structure.is_some(),
+        }
+    }
+
+    /// The function whose body holds byte `at`, innermost first; `None` for
+    /// an item outside every function, or for any byte of an unscoped file.
+    fn scope_at(&self, at: usize) -> Option<usize> {
+        self.sigs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, f)| Some((f.open?, f.close?, i)))
+            .filter(|&(open, close, _)| open < at && at <= close)
+            .max_by_key(|&(open, _, _)| open)
+            .map(|(_, _, i)| i)
+    }
+
+    /// The scope function `i`'s parameters are visible in.
+    fn param_scope(&self, i: usize) -> Option<usize> {
+        self.scoped.then_some(i)
+    }
+}
+
+fn fn_signatures(code: &str) -> Vec<FnSig<'_>> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(i) = code[from..].find("fn ") {
+        let at = from + i;
+        from = at + 3;
+        if code[..at].chars().last().is_some_and(is_ident_char) {
+            continue;
+        }
+        let name = leading_ident(&code[from..]);
+        if name.is_empty() {
+            continue;
+        }
+        let skip_space = |pos: usize| {
+            let rest = code.get(pos..).unwrap_or("");
+            pos + rest.len() - rest.trim_start().len()
+        };
+        let mut pos = skip_space(from + name.len());
+        if code.get(pos..).is_some_and(|r| r.starts_with('<')) {
+            pos = skip_space(pos + 1 + bracket_len(&bracket_items(&code[pos + 1..], true)));
+        }
+        if !code.get(pos..).is_some_and(|r| r.starts_with('(')) {
+            continue;
+        }
+        let items = bracket_items(&code[pos + 1..], true);
+        let params_end = pos + 1 + bracket_len(&items);
+        let params = items
+            .into_iter()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .filter(|p| {
+                let p = p.trim_start_matches('&').trim_start();
+                let p = p.strip_prefix("mut ").unwrap_or(p).trim_start();
+                leading_ident(p) != "self" && !p.starts_with('\'')
+            })
+            .map(|p| {
+                let p = p.strip_prefix("mut ").unwrap_or(p);
+                let ident = leading_ident(p);
+                let typed = p[ident.len()..].trim_start().starts_with(':');
+                if typed {
+                    ident.to_string()
+                } else {
+                    String::new()
+                }
+            })
+            .collect();
+        let open = code
+            .get(params_end..)
+            .and_then(|rest| rest.find(['{', ';']))
+            .map(|j| params_end + j)
+            .filter(|&j| code.as_bytes()[j] == b'{');
+        out.push(FnSig {
+            at,
+            name,
+            params,
+            open,
+            close: None,
+        });
+    }
+    out
+}
+
+/// The names each `let`, `const` or `static` in `stmt` binds. In a `let`
+/// pattern a capitalised word is a variant or a type (`Some(x)`), not a
+/// binding.
+fn bound_names(stmt: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for keyword in ["let ", "const ", "static "] {
+        for (at, _) in stmt.match_indices(keyword) {
+            if stmt[..at]
+                .chars()
+                .last()
+                .is_some_and(|c| is_ident_char(c) || c == '*')
+            {
+                continue; // `outlet `, `*const T`
+            }
+            let rest = &stmt[at + keyword.len()..];
+            if keyword != "let " {
+                let name = leading_ident(rest.strip_prefix("mut ").unwrap_or(rest));
+                if !name.is_empty() && name != "fn" {
+                    out.push(name.to_string());
+                }
+                continue;
+            }
+            let pattern = rest.split(['=', '\n']).next().unwrap_or_default();
+            let pattern = pattern.split(": ").next().unwrap_or_default();
+            out.extend(
+                pattern
+                    .split(|c: char| !is_ident_char(c))
+                    .filter(|w| w.starts_with(|c: char| c.is_lowercase() || c == '_'))
+                    .filter(|w| !matches!(*w, "mut" | "ref" | "_"))
+                    .map(str::to_string),
+            );
+        }
+    }
+    out
+}
+
+/// The calls in `stmt` to a function of this file, with their arguments.
+fn calls_into<'a, V>(stmt: &'a str, fns: &BTreeMap<&str, V>) -> Vec<(&'a str, Vec<&'a str>)> {
+    let mut out = Vec::new();
+    for (i, _) in stmt.match_indices('(') {
+        let head = &stmt[..i];
+        let start = head
+            .char_indices()
+            .rev()
+            .take_while(|(_, c)| is_ident_char(*c))
+            .last()
+            .map_or(i, |(s, _)| s);
+        let name = &stmt[start..i];
+        let defines = head[..start]
+            .trim_end()
+            .strip_suffix("fn")
+            .is_some_and(|b| b.chars().last().is_none_or(|c| !is_ident_char(c)));
+        if name.is_empty() || !fns.contains_key(name) || defines {
+            continue;
+        }
+        out.push((name, bracket_items(&stmt[i + 1..], false)));
+    }
+    out
+}
+
+/// A binding an IOC program reached, and the function it is local to;
+/// `None` for an item outside every function.
+type Reached = BTreeSet<(Option<usize>, String)>;
+
+/// The reached names a statement in `scope` can see.
+fn visible_in(reached: &Reached, scope: Option<usize>) -> BTreeSet<&str> {
+    reached
+        .iter()
+        .filter(|(s, _)| s.is_none() || *s == scope)
+        .map(|(_, name)| name.as_str())
+        .collect()
+}
+
+/// Every binding an IOC program reaches in this file: a `let`, `const` or
+/// `static` whose statement names one or a binding already reached, and a
+/// parameter of this file's function that a call hands one to. A name is
+/// local to the function that binds it; within one, it is not tracked by
+/// block, so a reach over-approximates.
+fn reached_bindings(
+    stmts: &[Statement<'_>],
+    fns: &Functions<'_>,
+    tokens: &BTreeSet<String>,
+) -> Reached {
+    let mut by_name: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for (i, sig) in fns.sigs.iter().enumerate() {
+        by_name.entry(sig.name).or_default().push(i);
+    }
+    let mut reached = Reached::new();
+    loop {
+        let before = reached.len();
+        for stmt in stmts {
+            let scope = fns.scope_at(stmt.start);
+            let mut found = Vec::new();
+            {
+                let visible = visible_in(&reached, scope);
+                if names_ioc(stmt.text, tokens, &visible) {
+                    found.extend(bound_names(stmt.text).into_iter().map(|n| (scope, n)));
+                }
+                for (name, args) in calls_into(stmt.text, &by_name) {
+                    for &i in &by_name[name] {
+                        for (param, arg) in fns.sigs[i].params.iter().zip(&args) {
+                            if !param.is_empty() && names_ioc(arg, tokens, &visible) {
+                                found.push((fns.param_scope(i), param.clone()));
+                            }
+                        }
+                    }
+                }
+            }
+            reached.extend(found);
+        }
+        if reached.len() == before {
+            return reached;
+        }
+    }
+}
+
+/// Where this file hands an IOC executable to a process it starts.
 ///
-/// Both halves are needed. A file that names `softIocPVX` without spawning is
-/// a helper constant; a file that spawns without naming one runs `pvxget` or
-/// `python3`. The two together is what puts an IOC on the host, and it is the
-/// granularity of the verdict anyway — the whole binary is capped or not.
-///
-/// "Spawns" is `spawn_site`: a resolved `process::Command` reached in one
-/// statement, never a method marker on its own.
+/// Naming an IOC and starting a process are not enough apart: a file that
+/// relaunches its own test binary and reads an IOC's source as text does both
+/// and starts no IOC. The name has to reach a statement that builds or starts
+/// a resolved `Command` — written there, or through a binding or parameter it
+/// reached. The evidence is that statement's line where it arrives.
 pub fn spawn_evidence(text: &str, tokens: &BTreeSet<String>) -> Option<String> {
     let mut code = String::with_capacity(text.len());
-    let mut lines: Vec<(usize, String, &str)> = Vec::new();
+    let mut lines: Vec<(usize, &str)> = Vec::new();
     let mut in_block = false;
     for (i, raw) in text.lines().enumerate() {
         let line = code_only(raw, &mut in_block);
@@ -559,15 +1018,21 @@ pub fn spawn_evidence(text: &str, tokens: &BTreeSet<String>) -> Option<String> {
         }
         code.push_str(&line);
         code.push('\n');
-        lines.push((i + 1, line, raw));
+        lines.push((i + 1, raw));
     }
-    if !spawn_site(&code) {
+    let fns = Functions::new(&code);
+    let stmts = statements(&code, &fns);
+    let spawns = spawn_statements(&stmts, &resolve_process_names(&code));
+    if spawns.is_empty() {
         return None;
     }
-    lines
-        .iter()
-        .find(|(_, line, _)| names_ioc_program(line, tokens))
-        .map(|(n, _, raw)| format!("{n}: {}", raw.trim()))
+    let reached = reached_bindings(&stmts, &fns, tokens);
+    spawns.iter().find_map(|stmt| {
+        let visible = visible_in(&reached, fns.scope_at(stmt.start));
+        let k = ioc_line(stmt.text, tokens, &visible)?;
+        let (n, raw) = lines[stmt.first_line + k];
+        Some(format!("{n}: {}", raw.trim()))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2029,6 +2494,31 @@ mod tests {
         assert_eq!(spawn_evidence(&src, &tokens()), None);
     }
 
+    /// Starting a process and naming an IOC are not enough apart: this file
+    /// relaunches its own test binary and reads an IOC's source as text, as
+    /// `epics-ca-rs/src/server/blocking.rs` once did, and starts no IOC.
+    #[test]
+    fn relaunching_itself_beside_an_ioc_source_read_as_text_is_not_a_spawner() {
+        let src = concat!(
+            "use std::proc",
+            "ess::Command;\n",
+            "fn every_thread_states_a_stack_size() {\n",
+            "    let text = include_str!(\"../bin/qsrv-ioc.rs\");\n",
+            "    assert!(text.contains(\"stack_size\"));\n",
+            "}\n",
+            "fn in_a_process_of_its_own() {\n",
+            "    let out = Comm",
+            "and::new(std::env::current_exe().unwrap())\n",
+            "        .args([\"--exact\", \"tests::in_a_process_of_its_own\"])\n",
+            "        .out",
+            "put()\n",
+            "        .unwrap();\n",
+            "    assert!(out.status.success());\n",
+            "}\n"
+        );
+        assert_eq!(spawn_evidence(src, &tokens()), None);
+    }
+
     /// Naming one without spawning it is a helper constant, not a spawner.
     #[test]
     fn naming_an_ioc_without_spawning_is_not_a_spawner() {
@@ -2140,8 +2630,9 @@ mod tests {
     }
 
     /// A spawn marker on a binding this file never built, typed as a
-    /// `Command` by its parameter list. Resolving the type is the only way to
-    /// tell it from `Failure::exit_status`.
+    /// `Command` by its parameter list, and handed the IOC's `Command` by a
+    /// caller. Resolving the type is the only way to tell it from
+    /// `Failure::exit_status`.
     #[test]
     fn a_spawn_on_a_parameter_typed_as_a_command_counts() {
         let src = concat!(
@@ -2150,9 +2641,125 @@ mod tests {
             "fn run(cmd: &mut Command) {\n",
             "    let _ = cmd.sta",
             "tus();\n}\n",
-            "const EXE: &str = \"softIoc\";\n"
+            "const EXE: &str = \"softIoc\";\n",
+            "fn go() {\n",
+            "    let mut ioc = ioc_command(EXE);\n",
+            "    run(&mut ioc);\n",
+            "}\n"
         );
-        assert!(spawn_evidence(src, &tokens()).is_some());
+        assert_eq!(
+            spawn_evidence(src, &tokens()).as_deref(),
+            Some(concat!("3: let _ = cmd.sta", "tus();"))
+        );
+    }
+
+    /// The program may reach the `Command` through the file's own functions:
+    /// `boot_stderr_matches_softioc.rs` hands `CARGO_BIN_EXE_softioc-rs` to
+    /// `boot`, which hands it to `spawn`, which builds the `Command`.
+    #[test]
+    fn a_name_handed_down_to_the_function_that_builds_the_command_counts() {
+        let src = concat!(
+            "use std::proc",
+            "ess::Command;\n",
+            "fn spawn(port: u16, bin: &str) {\n",
+            "    let _ = Comm",
+            "and::new(bin).arg(port.to_string());\n",
+            "}\n",
+            "fn boot(bin: &str) {\n",
+            "    spawn(5064, bin);\n",
+            "}\n",
+            "fn go() {\n",
+            "    boot(env!(\"CARGO_BIN_EXE_softioc-rs\"));\n",
+            "}\n"
+        );
+        assert_eq!(
+            spawn_evidence(src, &tokens()).as_deref(),
+            Some(concat!(
+                "3: let _ = Comm",
+                "and::new(bin).arg(port.to_string());"
+            ))
+        );
+    }
+
+    /// And only through the parameter it is handed to: a call that passes
+    /// the IOC to one parameter does not make another one an IOC.
+    #[test]
+    fn a_name_handed_to_another_parameter_does_not_reach_the_command() {
+        let src = concat!(
+            "use std::proc",
+            "ess::Command;\n",
+            "fn relaunch(test: &str, source: &str) {\n",
+            "    assert!(!source.is_empty());\n",
+            "    let _ = Comm",
+            "and::new(std::env::current_exe().unwrap()).arg(test);\n",
+            "}\n",
+            "fn go() {\n",
+            "    relaunch(\"tests::scan\", include_str!(\"../bin/qsrv-ioc.rs\"));\n",
+            "}\n"
+        );
+        assert_eq!(spawn_evidence(src, &tokens()), None);
+    }
+
+    /// A `let` is local to its function: one function's `out` holding an IOC
+    /// source is not another function's `out`.
+    #[test]
+    fn a_name_bound_in_another_function_does_not_reach_the_command() {
+        let src = concat!(
+            "use std::proc",
+            "ess::Command;\n",
+            "fn source() -> usize {\n",
+            "    let out = include_str!(\"../bin/qsrv-ioc.rs\");\n",
+            "    out.len()\n",
+            "}\n",
+            "fn relaunch(out: &str) {\n",
+            "    let _ = Comm",
+            "and::new(std::env::current_exe().unwrap()).arg(out).sta",
+            "tus();\n",
+            "}\n"
+        );
+        assert_eq!(spawn_evidence(src, &tokens()), None);
+    }
+
+    /// A `let` that shadows a name declares it; the new binding is not the
+    /// IOC source the old one held.
+    #[test]
+    fn a_let_that_rebinds_a_reached_name_does_not_use_it() {
+        let src = concat!(
+            "use std::proc",
+            "ess::Command;\n",
+            "fn relaunch() {\n",
+            "    let out = include_str!(\"../bin/qsrv-ioc.rs\");\n",
+            "    assert!(!out.is_empty());\n",
+            "    let out = Comm",
+            "and::new(std::env::current_exe().unwrap()).out",
+            "put().unwrap();\n",
+            "    assert!(out.status.success());\n",
+            "}\n"
+        );
+        assert_eq!(spawn_evidence(src, &tokens()), None);
+    }
+
+    /// A brace inside a char or raw string literal does not end the function,
+    /// so the IOC bound above it still reaches the `Command` below it. The
+    /// `{`s in `OPEN` keep the file balanced even when its literals are
+    /// misread, so a misread cannot hide behind the unscoped fallback.
+    #[test]
+    fn a_brace_inside_a_literal_does_not_end_the_function() {
+        let src = concat!(
+            "use std::proc",
+            "ess::Command;\n",
+            "const OPEN: (char, &str) = ('{', r#\"a\"{\"b\"#);\n",
+            "fn go() {\n",
+            "    let exe = env!(\"CARGO_BIN_EXE_softioc-rs\");\n",
+            "    let close = ('}', r#\"a\"}\"b\"#);\n",
+            "    let _ = Comm",
+            "and::new(exe).arg(close.1);\n",
+            "}\n"
+        );
+        assert_eq!(
+            spawn_evidence(src, &tokens()).as_deref(),
+            Some(concat!("6: let _ = Comm", "and::new(exe).arg(close.1);"))
+        );
     }
 
     /// THE regression. A spawn marker appearing under `src/` used to make

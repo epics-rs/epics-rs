@@ -194,7 +194,7 @@ pub mod thread {
 
 /// A window on every thread of the process whose name matches.
 pub mod named {
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Condvar, Mutex, PoisonError};
 
     use super::{ARMED, Armed, Counts, MAX_SLOTS, NAME_CAP};
@@ -268,6 +268,9 @@ pub mod named {
 
     static TAKEN: Mutex<bool> = Mutex::new(false);
     static FREED: Condvar = Condvar::new();
+    /// Opens parked on `FREED`: how a test tells an open that waits from one
+    /// not yet made.
+    static WAITING: AtomicUsize = AtomicUsize::new(0);
 
     /// One named window at a time, held from any thread.
     struct Turn;
@@ -276,7 +279,9 @@ pub mod named {
         fn take() -> Turn {
             let mut taken = TAKEN.lock().unwrap_or_else(PoisonError::into_inner);
             while *taken {
+                WAITING.fetch_add(1, Ordering::Release);
                 taken = FREED.wait(taken).unwrap_or_else(PoisonError::into_inner);
+                WAITING.fetch_sub(1, Ordering::Relaxed);
             }
             *taken = true;
             Turn
@@ -287,6 +292,34 @@ pub mod named {
         fn drop(&mut self) {
             *TAKEN.lock().unwrap_or_else(PoisonError::into_inner) = false;
             FREED.notify_one();
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Instant;
+
+        use super::{Name, WAITING, open};
+
+        #[test]
+        fn a_second_named_window_waits_for_the_first() {
+            static OPENED: AtomicBool = AtomicBool::new(false);
+            let first = open(&[Name::Exact("ac-first")]);
+            let second = std::thread::spawn(|| {
+                let _second = open(&[Name::Exact("ac-second")]);
+                OPENED.store(true, Ordering::Release);
+            });
+            let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+            while WAITING.load(Ordering::Acquire) == 0 {
+                assert!(!OPENED.load(Ordering::Acquire), "opened beside the first");
+                assert!(Instant::now() < deadline, "the second open never waited");
+                std::thread::yield_now();
+            }
+            assert!(!OPENED.load(Ordering::Acquire), "opened beside the first");
+            drop(first);
+            second.join().unwrap();
+            assert!(OPENED.load(Ordering::Acquire));
         }
     }
 }

@@ -5,8 +5,7 @@
 use std::cell::Cell;
 use std::hint::black_box;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use alloc_count::named::{self, Name};
 use alloc_count::{Counting, Counts, exempt, thread};
@@ -229,19 +228,4 @@ fn a_thread_is_matched_by_its_name_again_under_the_next_window() {
     worker.run();
     let [elsewhere, again] = window.close().map(|c| c.allocs);
     assert_eq!((first, elsewhere, again), (1, 0, 1));
-}
-
-#[test]
-fn a_second_named_window_waits_for_the_first() {
-    static OPENED: AtomicBool = AtomicBool::new(false);
-    let first = named::open(&[Name::Exact("ac-first")]);
-    let second = std::thread::spawn(|| {
-        let _second = named::open(&[Name::Exact("ac-second")]);
-        OPENED.store(true, Ordering::Release);
-    });
-    std::thread::sleep(Duration::from_millis(100));
-    assert!(!OPENED.load(Ordering::Acquire), "opened beside the first");
-    drop(first);
-    second.join().unwrap();
-    assert!(OPENED.load(Ordering::Acquire));
 }

@@ -97,6 +97,9 @@ dependencies = [
 [[package]]
 name = "alloc-count"
 version = "0.34.2"
+dependencies = [
+ "fact-budget",
+]
 
 [[package]]
 name = "android_system_properties"

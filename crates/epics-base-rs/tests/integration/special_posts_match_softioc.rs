@@ -273,12 +273,14 @@ async fn acalcout_calc_posts_match_oracle() {
     assert_eq!(cam.put("AC.OCAL", "B+(").await, ["v AC.OCLV -1 0 0"]);
 }
 
-/// sseq's DLYn `special()` re-quantizes and posts DLY1 whichever DLY was put,
-/// DBE_VALUE alone, before dbPut posts the field itself (sseqRecord.c:1023-1031).
-/// calc oracle IOC, `camonitor SQ.DLY1 SQ.DLY3`:
+/// sseq's DLYn `special()` re-quantizes and posts the DLYn put, DBE_VALUE
+/// alone, before dbPut posts the field itself (sseqRecord.c:1140-1156,
+/// dbAccess.c:1403-1418). The calc oracle IOC posts DLY1 instead on a DLY3
+/// put (`-v DLY1 0, DLY3 1.5`), a C defect not copied: its `special` never
+/// adds `lnkIndex` to `plinkGroup`. `camonitor SQ.DLY1 SQ.DLY3`:
 ///
 /// ```text
-/// caput SQ.DLY3 1.5   -v DLY1 0, DLY3 1.5   -l DLY3 1.5   -a nothing
+/// caput SQ.DLY3 1.5   -v DLY3 1.5, DLY3 1.5   -l DLY3 1.5   -a nothing
 /// caput SQ.DLY1 2     -v DLY1 2, DLY1 2     -l DLY1 2     -a nothing
 /// ```
 #[epics_macros_rs::epics_test]
@@ -287,7 +289,7 @@ async fn sseq_dly_posts_match_oracle() {
     assert_eq!(
         cam.put("SQ.DLY3", "1.5").await,
         [
-            "v SQ.DLY1 0 17 3",
+            "v SQ.DLY3 1.5 17 3",
             "v SQ.DLY3 1.5 17 3",
             "l SQ.DLY3 1.5 17 3"
         ]

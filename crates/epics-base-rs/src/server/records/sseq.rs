@@ -56,8 +56,8 @@ const STR_FIELDS: [&str; NUM_STEPS] = [
 /// The posts [`SseqRecord::mark_value_write`] can owe: step `i`'s written
 /// view (`DBE_VALUE|DBE_LOG`) and derived view (`DBE_VALUE`) for a numeric
 /// write at `4i`, `4i + 1`, for a string write at `4i + 2`, `4i + 3`; then
-/// a `DLYn` put's DLY1 post at [`DLY1_POST`]; then the `ABORT` `special()`'s
-/// `busy`, `aborting` and `waiting` posts from [`BUSY_POST`].
+/// a `DLYn` put's post of that `DLYn` from [`DLY_POST`]; then the `ABORT`
+/// `special()`'s `busy`, `aborting` and `waiting` posts from [`BUSY_POST`].
 const VALUE_WRITE_POSTS_NAMED: [(&str, CyclePostMask); POSTS] = {
     let mut table = [("", CyclePostMask::Value); POSTS];
     let mut i = 0;
@@ -68,7 +68,11 @@ const VALUE_WRITE_POSTS_NAMED: [(&str, CyclePostMask); POSTS] = {
         table[4 * i + 3] = (DO_FIELDS[i], CyclePostMask::Value);
         i += 1;
     }
-    table[DLY1_POST] = ("DLY1", CyclePostMask::Value);
+    let mut i = 0;
+    while i < NUM_STEPS {
+        table[DLY_POST + i] = (DLY_FIELDS[i], CyclePostMask::Value);
+        i += 1;
+    }
     table[BUSY_POST] = ("BUSY", CyclePostMask::Value);
     table[ABORTING_POST] = ("ABORTING", CyclePostMask::Value);
     let mut i = 0;
@@ -78,11 +82,14 @@ const VALUE_WRITE_POSTS_NAMED: [(&str, CyclePostMask); POSTS] = {
     }
     table
 };
-const DLY1_POST: usize = 4 * NUM_STEPS;
-const BUSY_POST: usize = DLY1_POST + 1;
+const DLY_POST: usize = 4 * NUM_STEPS;
+const BUSY_POST: usize = DLY_POST + NUM_STEPS;
 const ABORTING_POST: usize = BUSY_POST + 1;
 const WTG_POST: usize = ABORTING_POST + 1;
 const POSTS: usize = WTG_POST + NUM_STEPS;
+const DLY_FIELDS: [&str; NUM_STEPS] = [
+    "DLY1", "DLY2", "DLY3", "DLY4", "DLY5", "DLY6", "DLY7", "DLY8", "DLY9", "DLYA",
+];
 const LNK_FIELDS: [&str; NUM_STEPS] = [
     "LNK1", "LNK2", "LNK3", "LNK4", "LNK5", "LNK6", "LNK7", "LNK8", "LNK9", "LNKA",
 ];
@@ -1349,12 +1356,11 @@ impl Record for SseqRecord {
         )
     }
 
-    /// C `sseqRecord.c:1155` posts the re-quantized DLY1 with a bare
-    /// `DBE_VALUE`, not the framework default `DBE_VALUE | DBE_LOG`;
-    /// `asyncFinish` posts `abort` and `aborting` with `MonitorMask`,
-    /// `DBE_VALUE` plus the alarm bit (`:471`, `:481-482`).
+    /// C `asyncFinish` posts `abort` and `aborting` with `MonitorMask`,
+    /// `DBE_VALUE` plus the alarm bit (`sseqRecord.c:471`, `:481-482`), not
+    /// the framework default `DBE_VALUE | DBE_LOG`.
     fn value_only_change_fields(&self) -> &'static [&'static str] {
-        &["DLY1", "ABORT", "ABORTING"]
+        &["ABORT", "ABORTING"]
     }
 
     /// C `sseqRecord.c::asyncFinish` (474) posts `VAL` on EVERY process:
@@ -1490,26 +1496,14 @@ impl Record for SseqRecord {
         if !after {
             return Ok(());
         }
-        // A put to any DLYn re-quantizes DLY1 — yes, DLY1, not the field that
-        // was written. C `sseqRecord.c::special` (1140-1156) computes
-        // `lnkIndex` from the put field and then never applies it, unlike the
-        // STRn case right above it which does `plinkGroup += lnkIndex`:
-        //
-        //     lnkIndex = ((char *)paddr->pfield - (char *)&pR->dly1) /
-        //                sizeof(struct linkGroup);
-        //     plinkGroup = (struct linkGroup *)&pR->dly1;
-        //     plinkGroup->dly = epicsThreadSleepQuantum() *
-        //                       NINT(plinkGroup->dly/epicsThreadSleepQuantum());
-        //     db_post_events(pR, &plinkGroup->dly, DBE_VALUE);
-        //
-        // So `plinkGroup` still points at the DLY1 group. The put DLYn keeps
-        // its raw value and DLY1 is what gets rounded and posted. Present since
-        // the record was moved into the calc module (calc c9115f8) and never
-        // corrected upstream; it is C's observable behaviour, so it is the
-        // contract. (Every DLYn IS quantized — at init, see `init_record`.)
-        if Self::step_index_from_suffix(field).is_some_and(|(_, p)| p == "DLY") {
-            self.steps[0].dly = crate::runtime::time::quantize_to_sleep_quantum(self.steps[0].dly);
-            self.pending_posts |= 1 << DLY1_POST;
+        // A put to DLYn quantizes and posts that DLYn. C defect not copied
+        // (sseqRecord.c:1150-1155): `special` computes `lnkIndex` and never
+        // adds it to `plinkGroup`, as the STRn case above does, so C rounds
+        // and posts DLY1 and leaves the written DLYn raw.
+        if let Some((step, "DLY")) = Self::step_index_from_suffix(field) {
+            self.steps[step].dly =
+                crate::runtime::time::quantize_to_sleep_quantum(self.steps[step].dly);
+            self.pending_posts |= 1 << (DLY_POST + step);
             return Ok(());
         }
         // A put to a DOL/LNK/WAIT field re-classifies the link diagnostics
@@ -2490,13 +2484,12 @@ mod tests {
             "a STRn put posts only the derived DOn = atof(s)"
         );
 
-        // C's DLYn special posts DLY1 whichever DLY was written.
         rec.special("DLY3", true, &Default::default()).unwrap();
         assert_eq!(
             rec.take_cycle_posted_fields()
                 .map(|(f, m)| (name(f), m))
                 .collect::<Vec<_>>(),
-            vec![("DLY1", CyclePostMask::Value)],
+            vec![("DLY3", CyclePostMask::Value)],
         );
         rec.special("LNK1", true, &Default::default()).unwrap();
         assert!(rec.take_cycle_posted_fields().is_empty());

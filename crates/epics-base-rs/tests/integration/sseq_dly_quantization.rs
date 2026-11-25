@@ -11,13 +11,10 @@
 //!       db_post_events(pR, &plinkGroup->dly, DBE_VALUE);
 //!   ```
 //!
-//! * `sseqRecord.c::special` (1140-1156), on a put to any `DLY1..DLYA`, rounds
-//!   **DLY1** — it computes `lnkIndex` from the written field and then never
-//!   applies it to `plinkGroup` (the `STRn` case immediately above it does:
-//!   `plinkGroup += lnkIndex`). So the field the client wrote keeps its raw
-//!   value and DLY1 is what gets rounded and posted. That is C's observable
-//!   behaviour — present since the record moved into the calc module — so the
-//!   port reproduces it rather than "fixing" it.
+//! * `sseqRecord.c::special` (1140-1156), on a put to a `DLYn`, rounds it and
+//!   posts it with `DBE_VALUE`. C means the written `DLYn` but rounds and
+//!   posts DLY1, because it never adds `lnkIndex` to `plinkGroup` as the
+//!   `STRn` case above it does; the port rounds and posts the `DLYn` written.
 //!
 //! The port stored and used the raw value at both sites, so a `DLY3=0.003`
 //! waited 3 ms where C waits 0, and every DLYn read back unrounded.
@@ -26,9 +23,11 @@
 //! and macOS, and `NINT(f) = (long)(f > 0 ? f+0.5 : f-0.5)` (sseqRecord.c:67).
 
 use epics_base_rs::runtime::time::thread_sleep_quantum;
+use epics_base_rs::server::event_queue::EventReader;
+use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::record::Record;
 use epics_base_rs::server::records::sseq::SseqRecord;
-use epics_base_rs::types::EpicsValue;
+use epics_base_rs::types::{DbFieldType, EpicsValue};
 
 fn dly(rec: &SseqRecord, n: &str) -> f64 {
     rec.get_field(&format!("DLY{n}"))
@@ -92,8 +91,6 @@ async fn r9_70_init_rounds_every_dly_to_a_clock_tick() {
     }
 }
 
-/// A put to DLY1 quantizes DLY1 — the one index where C's `special` quirk and
-/// the obvious reading agree.
 #[epics_macros_rs::epics_test]
 async fn r9_70_put_to_dly1_quantizes_dly1() {
     let mut rec = SseqRecord::default();
@@ -107,28 +104,17 @@ async fn r9_70_put_to_dly1_quantizes_dly1() {
     );
 }
 
-/// C's `special` quirk, pinned: a put to DLYA rounds DLY1 and leaves DLYA raw.
 #[epics_macros_rs::epics_test]
-async fn r9_70_put_to_dlya_quantizes_dly1_and_leaves_dlya_raw() {
+async fn r9_70_put_to_dlya_quantizes_dlya_and_leaves_dly1_alone() {
     let mut rec = SseqRecord::default();
-    // DLY1 left unrounded on purpose, so the quirk is observable.
+    // DLY1 left unrounded, so a round of the wrong field shows.
     rec.put_field("DLY1", EpicsValue::Double(0.037)).unwrap();
     rec.put_field("DLYA", EpicsValue::Double(0.083)).unwrap();
 
     rec.special("DLYA", true, &Default::default()).unwrap();
 
-    assert_eq!(
-        dly(&rec, "1"),
-        expect_quantized(0.037),
-        "C `special` never advances `plinkGroup` by `lnkIndex`, so the put to \
-         DLYA rounds DLY1 (0.037 → 0.04)"
-    );
-    assert_eq!(
-        dly(&rec, "A"),
-        0.083,
-        "the field actually written keeps its raw value — C rounds DLY1, not \
-         DLYA (sseqRecord.c:1150-1155)"
-    );
+    assert_eq!(dly(&rec, "A"), expect_quantized(0.083));
+    assert_eq!(dly(&rec, "1"), 0.037);
 }
 
 /// Oracle symptom (read/mon): the DEFAULT `DLYn` is `0.0`, and C's `NINT`
@@ -181,33 +167,55 @@ async fn r9_70_huge_put_to_dly1_overflows_to_c_long_min() {
     );
 }
 
-/// The framework put path (`special` after the store) must show the same
-/// thing end to end: DLYA raw, DLY1 rounded.
+/// The values `reader` has been sent since it was last read.
+fn posted(reader: &mut EventReader) -> Vec<Option<f64>> {
+    std::iter::from_fn(|| reader.try_recv().ok())
+        .map(|e| e.value().as_value().and_then(|v| v.to_f64()))
+        .collect()
+}
+
+/// A put to DLYA, end to end: `special` posts the rounded DLYA with
+/// `DBE_VALUE` before the put posts it with `DBE_VALUE | DBE_LOG`
+/// (dbAccess.c:1403-1418), and DLY1 is neither changed nor posted.
 #[epics_macros_rs::epics_test]
-async fn r9_70_framework_put_path_matches_c() {
+async fn r9_70_put_to_dlya_posts_the_rounded_dlya() {
     use epics_base_rs::server::database::PvDatabase;
 
     let db = PvDatabase::new();
-    let mut rec = SseqRecord::default();
-    rec.put_field("DLY1", EpicsValue::Double(0.037)).unwrap();
-    db.add_record("SQ", Box::new(rec)).await.unwrap();
+    db.add_record("SQ", Box::new(SseqRecord::default()))
+        .await
+        .unwrap();
+    // Unrounded, past the init that rounds every DLYn, so a round of the
+    // wrong field shows.
+    db.get_record("SQ")
+        .unwrap()
+        .write()
+        .record
+        .put_field("DLY1", EpicsValue::Double(0.037))
+        .unwrap();
+    let subscribe = |field: &str, sid: u32, mask: EventMask| {
+        let mut reader = db
+            .get_record("SQ")
+            .unwrap()
+            .write()
+            .add_subscriber(field, sid, DbFieldType::Double, mask.bits())
+            .unwrap_or_else(|_| panic!("a {field} subscription must be accepted"));
+        posted(&mut reader);
+        reader
+    };
+    let mut dlya_value = subscribe("DLYA", 1, EventMask::VALUE);
+    let mut dlya_log = subscribe("DLYA", 2, EventMask::LOG);
+    let mut dly1 = subscribe("DLY1", 3, EventMask::VALUE | EventMask::LOG);
 
     db.put_pv("SQ.DLYA", EpicsValue::Double(0.083))
         .await
         .unwrap();
 
-    let inst = db.get_record("SQ").unwrap();
-    let g = inst.read();
-    assert_eq!(
-        g.record.get_field("DLYA").and_then(|v| v.to_f64()),
-        Some(0.083),
-        "a CA put to DLYA leaves DLYA raw"
-    );
-    assert_eq!(
-        g.record.get_field("DLY1").and_then(|v| v.to_f64()),
-        Some(expect_quantized(0.037)),
-        "...and rounds DLY1 instead"
-    );
+    let rounded = Some(expect_quantized(0.083));
+    assert_eq!(posted(&mut dlya_value), vec![rounded, rounded]);
+    assert_eq!(posted(&mut dlya_log), vec![rounded]);
+    assert_eq!(posted(&mut dly1), vec![]);
+    assert_eq!(db.get_pv("SQ.DLY1").unwrap().to_f64(), Some(0.037));
 }
 
 /// C returns from pass 0 before the quantize (`sseqRecord.c:167`), so DLYn

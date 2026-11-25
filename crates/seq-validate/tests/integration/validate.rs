@@ -270,8 +270,8 @@ fn check(stem: &str, report: &Report, golden: &str) {
 #[test]
 fn check_takes_c_s_other_safe_monitor_runs() {
     for run in [
-        include_str!("c/safeMonitor.read-late.tap"),
-        include_str!("c/safeMonitor.write-late.tap"),
+        include_str!("../c/safeMonitor.read-late.tap"),
+        include_str!("../c/safeMonitor.write-late.tap"),
     ] {
         let Tap {
             plan,
@@ -290,7 +290,7 @@ fn check_takes_c_s_other_safe_monitor_runs() {
             diags,
             done: Some(0),
         };
-        check("safeMonitor", &report, include_str!("c/safeMonitor.tap"));
+        check("safeMonitor", &report, include_str!("../c/safeMonitor.tap"));
     }
 }
 
@@ -301,7 +301,7 @@ macro_rules! validate {
             validate(
                 &seq_validate::$module::$prog,
                 $stem,
-                include_str!(concat!("c/", $stem, ".tap")),
+                include_str!(concat!("../c/", $stem, ".tap")),
                 Duration::from_secs($secs),
             )
             .await;
@@ -426,7 +426,7 @@ mod ioc {
                 validate_ioc(
                     &seq_validate::$module::$prog,
                     $stem,
-                    include_str!(concat!("c/", $stem, ".tap")),
+                    include_str!(concat!("../c/", $stem, ".tap")),
                     Duration::from_secs($secs),
                 )
                 .await;

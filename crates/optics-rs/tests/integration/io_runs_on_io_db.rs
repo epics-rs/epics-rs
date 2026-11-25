@@ -122,7 +122,7 @@ async fn debug_lines_name_the_program() {
     if std::env::var_os(DEBUG_CHILD).is_none() {
         let out = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
-                "debug_lines_name_the_program",
+                "io_runs_on_io_db::debug_lines_name_the_program",
                 "--exact",
                 "--nocapture",
                 "--test-threads=1",

@@ -377,8 +377,8 @@ const STAGES: &[Stage] = &[
 #[epics_base_rs::epics_test]
 async fn debug_prints_c_lines() {
     if std::env::var_os(CHILD).is_none() {
-        let trace = trace_of("debug_prints_c_lines");
-        let c: Vec<&str> = include_str!("oracle/filterDrive_debug.txt")
+        let trace = trace_of("filter_drive_runs_the_c_states::debug_prints_c_lines");
+        let c: Vec<&str> = include_str!("../oracle/filterDrive_debug.txt")
             .lines()
             .collect();
         assert_eq!(trace, c);
@@ -436,8 +436,8 @@ const STAGES7: &[Stage] = &[
 #[epics_base_rs::epics_test]
 async fn seven_blades_print_c_lines() {
     if std::env::var_os(CHILD).is_none() {
-        let trace = trace_of("seven_blades_print_c_lines");
-        let c: Vec<&str> = include_str!("oracle/filterDrive_debug7.txt")
+        let trace = trace_of("filter_drive_runs_the_c_states::seven_blades_print_c_lines");
+        let c: Vec<&str> = include_str!("../oracle/filterDrive_debug7.txt")
             .lines()
             .collect();
         assert_eq!(trace, c);
@@ -493,7 +493,7 @@ async fn seventeen_free_blades_leave_the_table_empty() {
         ]
         .concat();
         assert_eq!(
-            trace_of("seventeen_free_blades_leave_the_table_empty"),
+            trace_of("filter_drive_runs_the_c_states::seventeen_free_blades_leave_the_table_empty"),
             want
         );
         return;

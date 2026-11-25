@@ -18,9 +18,8 @@
 //!   `FIFO_SIZE` replies read in one go are all lost. The hand port
 //!   dropped only the oldest reply.
 
-mod hsc1_mock;
-#[path = "hsc1_mock/rig.rs"]
-mod rig;
+use crate::hsc1_mock;
+use crate::hsc1_mock_rig as rig;
 
 use std::time::Duration;
 
@@ -815,7 +814,7 @@ async fn debug_lines_name_the_program() {
     if std::env::var_os(CHILD).is_none() {
         let out = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
-                "debug_lines_name_the_program",
+                "xia_slit_runs_the_c_states::debug_lines_name_the_program",
                 "--exact",
                 "--nocapture",
                 "--test-threads=1",

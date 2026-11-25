@@ -614,7 +614,7 @@ async fn a_live_bad_omtx_calc_alerts() {
     if std::env::var_os(CHILD).is_none() {
         let out = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
-                "a_live_bad_omtx_calc_alerts",
+                "orient_reads_monitor_vars::a_live_bad_omtx_calc_alerts",
                 "--exact",
                 "--nocapture",
                 "--test-threads=1",
@@ -630,7 +630,7 @@ async fn a_live_bad_omtx_calc_alerts() {
         let lines: Vec<String> = String::from_utf8(out.stdout)
             .unwrap()
             .lines()
-            .filter_map(|l| l.find("orient").map(|i| l[i..].to_string()))
+            .filter_map(|l| l.find("orient:").map(|i| l[i..].to_string()))
             .collect();
         assert_eq!(
             lines,
@@ -916,7 +916,7 @@ async fn debug_prints_msg_and_the_debug_lines() {
     if std::env::var_os(CHILD).is_none() {
         let out = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
-                "debug_prints_msg_and_the_debug_lines",
+                "orient_reads_monitor_vars::debug_prints_msg_and_the_debug_lines",
                 "--exact",
                 "--nocapture",
                 "--test-threads=1",
@@ -947,7 +947,7 @@ async fn debug_prints_msg_and_the_debug_lines() {
         .peekable();
         // The first line follows libtest's own.
         for line in stdout.lines() {
-            let line = line.find("orient").map_or(line, |i| &line[i..]);
+            let line = line.find("orient:").map_or(line, |i| &line[i..]);
             if want.peek() == Some(&line) {
                 want.next();
             }

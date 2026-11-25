@@ -9,7 +9,7 @@
 //! its timing fell. A bo or mbbo is read at RVAL, the field the oracle
 //! read.
 
-mod qxbpm_mock;
+use crate::qxbpm_mock;
 
 use asyn_rs::asyn_record::AsynRecord;
 use asyn_rs::drivers::ip_port::DrvAsynIPPort;

@@ -355,7 +355,7 @@ fn trace_of(test: &str) -> Vec<String> {
 #[epics_base_rs::epics_test]
 async fn debug_prints_c_lines() {
     if std::env::var_os(CHILD).is_none() {
-        let trace = trace_of("debug_prints_c_lines");
+        let trace = trace_of("hr_reads_monitor_vars::debug_prints_c_lines");
         assert_eq!(
             trace,
             [

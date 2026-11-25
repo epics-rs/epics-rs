@@ -16,8 +16,9 @@
 //! order, the port's `monitor_cycle` in its subscriber walk's.
 
 // RTEMS-EXEC-MODEL-ALLOW(1): checked, not waived — passes on the exec backend
-// (`EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p optics-rs
-// --test table_monitor_posts_from_its_saved_copy`); no CA server is built.
+// (`EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p optics-rs --test
+// integration table_monitor_posts_from_its_saved_copy::`); no CA server is
+// built.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

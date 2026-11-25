@@ -1107,7 +1107,7 @@ fn trace_of(test: &str) -> Vec<String> {
 #[epics_base_rs::epics_test]
 async fn debug_prints_c_lines() {
     if std::env::var_os(CHILD).is_none() {
-        let trace = trace_of("debug_prints_c_lines");
+        let trace = trace_of("kohzu_init_runs_the_theta_command_path::debug_prints_c_lines");
         // C's Linux run races the monitor of waitForCmndEnter's own
         // pvPut(kohzuMoving) (kohzuCtl.st:723) against waitForCmnd's whens.
         // This follows C's delivery on CAC-event above the state set

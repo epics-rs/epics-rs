@@ -15,9 +15,8 @@
 //!   reads `communications error: <SEVR>`, and C only gets there through the
 //!   asyn record's SEVR after a read times out.
 
-mod hsc1_mock;
-#[path = "hsc1_mock/rig.rs"]
-mod rig;
+use crate::hsc1_mock;
+use crate::hsc1_mock_rig as rig;
 
 use std::time::Duration;
 

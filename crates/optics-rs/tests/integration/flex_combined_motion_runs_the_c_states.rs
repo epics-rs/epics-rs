@@ -543,7 +543,7 @@ async fn debug_lines_name_the_program() {
     if std::env::var_os(CHILD).is_none() {
         let out = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
-                "debug_lines_name_the_program",
+                "flex_combined_motion_runs_the_c_states::debug_lines_name_the_program",
                 "--exact",
                 "--nocapture",
                 "--test-threads=1",

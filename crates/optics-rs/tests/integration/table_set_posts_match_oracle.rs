@@ -19,7 +19,7 @@
 
 // RTEMS-EXEC-MODEL-ALLOW(2): checked, not waived — both pass on the exec backend
 // (`EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p optics-rs
-// --test table_set_posts_match_oracle`); no CA server is built.
+// --test integration table_set_posts_match_oracle::`); no CA server is built.
 
 use std::collections::HashMap;
 use std::sync::Arc;

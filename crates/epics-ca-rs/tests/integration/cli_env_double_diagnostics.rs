@@ -10,11 +10,11 @@
 //! Defaulting "EPICS_CA_CONN_TMO" = 30.000000                <- cac.cpp:194
 //! ```
 //!
-//! and, for the search period (`udpiiu.cpp:86-89`):
+//! and, for the search period (`udpiiu.cpp:88-92`):
 //!
 //! ```text
 //! Unable to find a real number in EPICS_CA_MAX_SEARCH_PERIOD=abc
-//! EPICS "EPICS_CA_MAX_SEARCH_PERIOD" wasn't a real number
+//! EPICS "EPICS_CA_MAX_SEARCH_PERIOD" was not a positive real number
 //! Setting "EPICS_CA_MAX_SEARCH_PERIOD" = 300.000000 seconds
 //! ```
 //!
@@ -119,10 +119,33 @@ fn max_search_period_reject_prints_cs_lines() {
     let err = caget_stderr("EPICS_CA_MAX_SEARCH_PERIOD", "abc");
     for line in [
         "Unable to find a real number in EPICS_CA_MAX_SEARCH_PERIOD=abc",
-        "EPICS \"EPICS_CA_MAX_SEARCH_PERIOD\" wasn't a real number",
+        "EPICS \"EPICS_CA_MAX_SEARCH_PERIOD\" was not a positive real number",
         "Setting \"EPICS_CA_MAX_SEARCH_PERIOD\" = 300.000000 seconds",
     ] {
         assert!(err.contains(line), "missing {line:?} in stderr:\n{err}");
+    }
+}
+
+/// `nan` and `inf` parse, so no parse diagnostic is due, but they fail C's
+/// `finite(maxPeriod)` gate (`udpiiu.cpp:77` @`ce775a80c`): the period resets
+/// to its default and C says so.
+#[test]
+fn max_search_period_non_finite_is_refused_like_c() {
+    for value in ["nan", "inf"] {
+        let err = caget_stderr("EPICS_CA_MAX_SEARCH_PERIOD", value);
+        assert!(
+            !err.contains("Unable to find a real number"),
+            "{value} is a valid double for strtod:\n{err}"
+        );
+        for line in [
+            "EPICS \"EPICS_CA_MAX_SEARCH_PERIOD\" was not a positive real number",
+            "Setting \"EPICS_CA_MAX_SEARCH_PERIOD\" = 300.000000 seconds",
+        ] {
+            assert!(
+                err.contains(line),
+                "{value}: missing {line:?} in stderr:\n{err}"
+            );
+        }
     }
 }
 
@@ -169,7 +192,7 @@ fn max_search_period_below_lower_limit_is_named() {
 ///
 /// C reads `EPICS_CAS_BEACON_PERIOD` in the single beacon thread
 /// (`online_notify.c:52-64`), so the compiled `softIoc` prints one
-/// "float fetch failed" pair for a bad value. The port resolved the server's
+/// "was not a positive real number" pair for a bad value. The port resolved the server's
 /// UDP config from three points in startup (`bind_tcp_listeners`,
 /// `bind_sockets`, `CaServer::run`) and so printed the pair three times.
 // The only case here that spawns `softioc-rs` rather than `caget-rs`; that
@@ -228,7 +251,7 @@ fn beacon_period_reject_is_diagnosed_once_per_process() {
 
     for line in [
         "Unable to find a real number in EPICS_CAS_BEACON_PERIOD=garbage",
-        "EPICS \"EPICS_CAS_BEACON_PERIOD\" float fetch failed",
+        "EPICS \"EPICS_CAS_BEACON_PERIOD\" was not a positive real number",
         "Setting \"EPICS_CAS_BEACON_PERIOD\" = 15.000000",
     ] {
         assert_eq!(

@@ -229,16 +229,12 @@ fn search_timer_count(period_secs: f64) -> u32 {
 /// to C `udpiiu.cpp::getMaxPeriod` (`epics-base:modules/ca/src/client/udpiiu.cpp:68-94`):
 ///
 /// - env unset → the documented default of 300 s.
-/// - env set and parses as a real number → that value, clamped *up*
+/// - env set to a finite positive real number → that value, clamped *up*
 ///   to the 60 s lower limit if below it. C applies no upper clamp
 ///   to the period itself (the upper bound is on the derived timer
 ///   count, not the period).
-/// - env set but not a real number → keep the 300 s default
-///   (C's `longStatus != 0` branch).
-///
-/// C does not reject negative or zero values — they pass `parse` and
-/// are caught by the `< 60` lower-limit clamp — so this mirrors C by
-/// clamping rather than filtering.
+/// - env set to anything else — not a number, `nan`, `inf`, zero or
+///   negative → the 300 s default, said out loud.
 ///
 /// Resolved once per process (C `udpiiu`'s constructor calls `getMaxPeriod`
 /// once and keeps the result): a second read could pick up a mutated
@@ -256,10 +252,10 @@ fn resolve_max_search_period_secs() -> f64 {
     // Unset resolves to the compiled default string and parses, silently — so
     // only a set-but-bad value reaches the error arm.
     let v = match param.double() {
-        Ok(v) => v,
-        // C `getMaxPeriod` (`udpiiu.cpp:85-90`), verbatim.
-        Err(_) => {
-            epics_libcom_rs::stderr_println!("EPICS \"{name}\" wasn't a real number");
+        Ok(v) if v.is_finite() && v > 0.0 => v,
+        // C `getMaxPeriod` (`udpiiu.cpp:77`, `:86-92`), verbatim.
+        _ => {
+            epics_libcom_rs::stderr_println!("EPICS \"{name}\" was not a positive real number");
             epics_libcom_rs::stderr_println!(
                 "Setting \"{name}\" = {:.6} seconds",
                 CFloat(default_secs)
@@ -267,12 +263,8 @@ fn resolve_max_search_period_secs() -> f64 {
             return default_secs;
         }
     };
-    // C `udpiiu.cpp:78-83`: below the 60 s lower limit, say so and clamp.
-    // NaN takes this branch too — C's `maxPeriod < lowerLimit` is false for
-    // it and C then drives its timer wheel off a NaN period; clamping is the
-    // one deviation here, because a NaN tick would stop the client searching
-    // altogether.
-    if v.is_nan() || v < MAX_SEARCH_PERIOD_LOWER_LIMIT_SECS {
+    // C `udpiiu.cpp:78-84`: below the 60 s lower limit, say so and clamp.
+    if v < MAX_SEARCH_PERIOD_LOWER_LIMIT_SECS {
         epics_libcom_rs::stderr_println!("\"{name}\" out of range (low)");
         epics_libcom_rs::stderr_println!(
             "Setting \"{name}\" = {:.6} seconds",
@@ -289,11 +281,6 @@ fn resolve_max_search_period_secs() -> f64 {
     // seconds, so the boundary lands on the same side as C's for every input:
     // 8388.607 passes, 8388.608 (== 0.032 * 2^18) clamps, verified against the
     // compiled caget.
-    //
-    // The one deviation is `inf`, where C's cast is undefined and the compiled
-    // caget aborts in malloc with a nTimers of garbage size. Rust's `as u32`
-    // saturates, so an infinite period clamps to the same 4194.304 s any other
-    // out-of-range period gets.
     if search_timer_count(v) > MAX_SEARCH_TIMER_COUNT {
         let capped = max_search_period_upper_limit_secs();
         epics_libcom_rs::stderr_println!("\"{name}\" out of range (high)");
@@ -2314,7 +2301,7 @@ mod tests {
     /// `EPICS_CA_MAX_SEARCH_PERIOD` must follow the C
     /// `udpiiu.cpp::getMaxPeriod` semantics — default 300 s when
     /// unset, lower-limited at 60 s when explicitly set below it,
-    /// default kept on a non-numeric value.
+    /// default kept on a value that is not a finite positive number.
     ///
     /// Pre-fix Rust defaulted to 30 s when unset (not the documented
     /// C 300 s) and accepted any positive value verbatim, so a
@@ -2374,16 +2361,17 @@ mod tests {
             "a non-numeric value must fall back to the 300 s default"
         );
 
-        // Negative / zero are not real-number rejections in C — they
-        // parse and are caught by the lower-bound clamp.
-        unsafe { std::env::set_var("EPICS_CA_MAX_SEARCH_PERIOD", "-5") };
-        assert_eq!(
-            resolve_max_search_period_secs(),
-            60.0,
-            "a negative value must clamp to the 60 s lower bound, not default"
-        );
-        unsafe { std::env::set_var("EPICS_CA_MAX_SEARCH_PERIOD", "0") };
-        assert_eq!(resolve_max_search_period_secs(), 60.0);
+        // Values that parse but are not finite and positive fail C's
+        // `finite(maxPeriod) && maxPeriod > 0.0` gate (`udpiiu.cpp:77`) and
+        // reset to the default, not to the lower bound.
+        for value in ["-5", "0", "nan", "inf", "-inf"] {
+            unsafe { std::env::set_var("EPICS_CA_MAX_SEARCH_PERIOD", value) };
+            assert_eq!(
+                resolve_max_search_period_secs(),
+                300.0,
+                "{value} must fall back to the 300 s default"
+            );
+        }
 
         // Restore the environment for any later serial test.
         match restore {

@@ -45,6 +45,7 @@ mod lso_posts;
 mod mantissa_exponent_converter;
 mod oracle;
 mod pcre_internal;
+mod process_callback_after_scan_stop;
 mod protocol;
 mod put_failed_line;
 mod raw_converter;

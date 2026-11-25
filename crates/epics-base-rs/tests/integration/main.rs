@@ -101,6 +101,7 @@ mod acf_calc_rejects_assignment;
 mod add_record_runs_init_pass_one_tail;
 mod add_record_runs_init_passes;
 mod addressed_type_is_the_dbf_type;
+mod admitted_work_runs_after_scan_stop;
 mod aftc_gap_is_the_stamp_difference;
 mod after_ioc_running_echoes_each_line;
 mod after_ioc_running_refuses_like_c;

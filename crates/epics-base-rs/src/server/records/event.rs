@@ -99,6 +99,10 @@ impl EventHandle {
     pub fn name(&self) -> &[u8] {
         &self.0
     }
+
+    pub(crate) fn into_name(self) -> Arc<[u8]> {
+        self.0
+    }
 }
 
 fn put_pv_string(slot: &mut PvString, value: EpicsValue, field: &str) -> CaResult<()> {

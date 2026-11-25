@@ -63,7 +63,14 @@ impl PvDatabase {
     /// so a full ring drops the request with C's overflow line. The frame
     /// runs to its end on that thread, as C's `onceTask` holds `dbScanLock`
     /// through `dbProcess`: the next request cannot start before it.
+    ///
+    /// A request once the scan has stopped is never run, as C `scanStop`
+    /// ends `onceTask` behind what was queued before it (`dbScan.c:179-181`,
+    /// :717).
     pub fn scan_once(&self, name: &[u8]) {
+        if self.scan_control().is_exiting() {
+            return;
+        }
         let db = self.clone();
         let record = RecordName::from(name);
         let _ = crate::runtime::task::background_scan_once(

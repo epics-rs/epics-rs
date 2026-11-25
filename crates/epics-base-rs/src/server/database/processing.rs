@@ -301,11 +301,16 @@ pub struct ProcessCallback(Arc<crate::runtime::background::CallbackCell<ProcessR
 
 impl ProcessCallback {
     /// C `callbackRequestProcessCallback(&cb, priority, prec)`. A request
-    /// while one is queued is taken by that one; `Err` is a full band.
+    /// while one is queued is taken by that one; `Err` is a full band. One
+    /// made once the database's scan has stopped never runs, and is `Ok` as
+    /// C's after `callbackStop` is.
     pub fn request(
         &self,
         priority: crate::runtime::task::CallbackPriority,
     ) -> Result<(), crate::runtime::background::CallbackError> {
+        if !admits_cell_request(&self.0.body().db) {
+            return Ok(());
+        }
         crate::runtime::task::request_cell(priority, &self.0)
     }
 
@@ -431,7 +436,9 @@ impl DeviceDone {
 
     /// Queue the pass that completes an asynchronous write on `priority`. The
     /// write's alarm is the device's own, read through `last_alarm` on that
-    /// pass. `Err` is a full band, which C's caller ignores as well.
+    /// pass. `Err` is a full band, which C's caller ignores as well; a
+    /// request once the scan has stopped runs nothing, as
+    /// [`ProcessCallback::request`]'s.
     pub fn complete(
         &self,
         priority: crate::runtime::task::CallbackPriority,
@@ -455,7 +462,8 @@ impl DeviceDone {
     /// Queue the pass that ends a [`ReadStart::Pending`](crate::server::device_support::ReadStart::Pending)
     /// read on `priority`: the record's `process()` again with PACT set, whose
     /// [`DeviceSupport::read`](crate::server::device_support::DeviceSupport::read)
-    /// applies what the device read. `Err` is a full band.
+    /// applies what the device read. `Err` is a full band; a request once the
+    /// scan has stopped runs nothing, as [`ProcessCallback::request`]'s.
     pub fn reprocess(
         &self,
         priority: crate::runtime::task::CallbackPriority,
@@ -473,10 +481,15 @@ impl DeviceDone {
         priority: crate::runtime::task::CallbackPriority,
         completion: Completion,
     ) -> Result<(), crate::runtime::background::CallbackError> {
+        let body = self.0.body();
+        // Judged before it is owed: a run already draining the cell takes
+        // what it finds owed, admitted or not.
+        if !admits_cell_request(&body.db) {
+            return Ok(());
+        }
         if !self.push(completion) {
             return Ok(());
         }
-        let body = self.0.body();
         crate::runtime::task::request_cell(priority, &self.0).inspect_err(|_| {
             // No run will drain them: lost, as C loses a refused
             // `callbackRequest`, so the next pass owed requests afresh.
@@ -820,9 +833,18 @@ impl std::task::Wake for CallbackRequests {
 
 /// Whether a `callbackRequest` made now runs: not once the scan facility has
 /// stopped, as C `iocShutdown` runs `callbackStop` right after `scanStop`
-/// (iocInit.c:733-735).
+/// (iocInit.c:733-735). Judged once, when the request is made: what it
+/// admits runs to its end, as `callbackTask` empties its ring before it
+/// rereads `shutdown` (callback.c:210-235).
 fn admits_callback_request(scan: &crate::server::scan::ScanControl) -> bool {
     !scan.is_exiting()
+}
+
+/// [`admits_callback_request`] for the database a callback cell holds: a
+/// request that outlives it is refused.
+fn admits_cell_request(db: &std::sync::Weak<super::PvDatabaseInner>) -> bool {
+    db.upgrade()
+        .is_some_and(|inner| admits_callback_request(&inner.scan_ctl))
 }
 
 /// What a SoftCallback input dset's `getCallback` reads off the notified
@@ -1211,6 +1233,19 @@ impl AsyncDbHandle {
         if let Some(db) = self.db() {
             db.spawn_callback_after(priority, delay, task);
         }
+    }
+
+    /// C `callbackRequest` of a record or device support's own callback
+    /// `cell`, judged against this database's scan as [`Self::spawn_callback`]
+    /// is: whether a run of it will come. None does once the scan has
+    /// stopped or the database is gone, nor when the band is full.
+    pub fn request_callback<B: crate::runtime::background::CallbackBody>(
+        &self,
+        priority: crate::runtime::task::CallbackPriority,
+        cell: &Arc<crate::runtime::background::CallbackCell<B>>,
+    ) -> bool {
+        admits_cell_request(&self.inner)
+            && crate::runtime::task::request_cell(priority, cell).is_ok()
     }
 
     /// Whether a `callbackRequest` made now would run.
@@ -4490,18 +4525,10 @@ impl PvDatabase {
         generation: &AtomicU64,
         epoch: u64,
     ) -> CaResult<()> {
-        if generation.load(Ordering::Acquire) != epoch || !self.accepts_reentry() {
+        if generation.load(Ordering::Acquire) != epoch {
             return Ok(());
         }
         self.run_process_frame(target, &mut ProcStack::new(), true, true, false)
-    }
-
-    /// Whether a callback-band re-entry may still process: not once the
-    /// database's scan facility has stopped. C `iocShutdown` runs
-    /// `callbackStop` right after `scanStop` (iocInit.c:733-735), so a
-    /// completion a port delivers while closing at exit processes nothing.
-    fn accepts_reentry(&self) -> bool {
-        !self.scan_control().is_exiting()
     }
 
     /// [`Self::spawn_callback_after`] with no delay: C `callbackRequest`.
@@ -8697,21 +8724,7 @@ impl PvDatabase {
                     // on the callback path, not recursively inside this cycle.
                     if !skip_out && plan.posts_output_event {
                         if let Some(event_name) = instance.record.output_event() {
-                            let db = self.clone();
-                            // Middle band, not this record's PRIO: C `postEvent`
-                            // fires one `callbackRequest` per non-empty band and
-                            // each carries the *scanned* record's priority
-                            // (`dbScan.c:513-527`), a fan-out the port's single
-                            // Event list cannot express (`scan_index.rs`
-                            // `post_event_named`). The poster's own PRIO is not
-                            // the answer, so this keeps `callbackRequest`'s
-                            // general band (`callback.h:42`).
-                            crate::runtime::task::spawn_background(
-                                crate::runtime::task::CallbackPriority::Medium,
-                                async move {
-                                    db.post_event_named(event_name.as_bytes()).await;
-                                },
-                            );
+                            self.request_event_post(event_name);
                         }
                     }
 
@@ -10485,9 +10498,6 @@ impl PvDatabase {
     /// [`Self::complete_async_record`] on the calling thread: a
     /// [`DeviceDone`]'s callback band runs it.
     fn complete_async_write(&self, name: &[u8]) -> CaResult<()> {
-        if !self.accepts_reentry() {
-            return Ok(());
-        }
         // Alias-aware entry — same pattern as
         // `process_record_with_links_inner`. `name` may arrive as an alias
         // from an async device-support callback that captured the original
@@ -10524,9 +10534,6 @@ impl PvDatabase {
         canonical: RecordName,
         rec: InFrame<'_>,
     ) -> CaResult<()> {
-        if !self.accepts_reentry() {
-            return Ok(());
-        }
         self.complete_async_record_inner(canonical, rec, &mut ProcStack::new())
     }
 
@@ -10664,21 +10671,7 @@ impl PvDatabase {
                 // `process_record_with_links_inner`.
                 if !skip_out {
                     if let Some(event_name) = instance.output_event() {
-                        let db = self.clone();
-                        // Middle band, not this record's PRIO: C `postEvent`
-                        // fires one `callbackRequest` per non-empty band and
-                        // each carries the *scanned* record's priority
-                        // (`dbScan.c:513-527`), a fan-out the port's single
-                        // Event list cannot express (`scan_index.rs`
-                        // `post_event_named`). The poster's own PRIO is not
-                        // the answer, so this keeps `callbackRequest`'s
-                        // general band (`callback.h:42`).
-                        crate::runtime::task::spawn_background(
-                            crate::runtime::task::CallbackPriority::Medium,
-                            async move {
-                                db.post_event_named(event_name.as_bytes()).await;
-                            },
-                        );
+                        self.request_event_post(event_name);
                     }
                 }
 

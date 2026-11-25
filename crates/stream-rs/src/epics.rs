@@ -35,7 +35,7 @@ use std::time::Duration;
 
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::runtime::background::{CallbackBody, CallbackCell};
-use epics_base_rs::runtime::task::{CallbackPriority, request_cell, spawn_background_after};
+use epics_base_rs::runtime::task::{CallbackPriority, spawn_background_after};
 use epics_base_rs::server::database::{
     AsyncDbHandle, DbAddr, DeviceDone, DeviceDoneSource, FieldPut, HeldInstance, InitHold,
     ProcessCallback, UnheldLinkPut,
@@ -629,10 +629,10 @@ impl Shared {
 
     fn issue_process(&self, request: u64) {
         let prio = CallbackPriority::from_record_prio(self.prio.load(Ordering::Relaxed));
-        let queued = self
-            .process_callback
-            .get()
-            .is_some_and(|cell| request_cell(prio, cell).is_ok());
+        let queued = match (self.db.get(), self.process_callback.get()) {
+            (Some(db), Some(cell)) => db.request_callback(prio, cell),
+            _ => false,
+        };
         if !queued {
             // refused: no run will come for it
             self.served(request);

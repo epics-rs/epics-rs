@@ -5454,23 +5454,7 @@ impl PvDatabase {
         let Some(event) = rec.read().record.software_event().cloned() else {
             return;
         };
-        // C `postEvent` queues callbacks on the scan ring buffer —
-        // the event-scanned records run on a separate callback thread,
-        // NOT recursively inside this process cycle. Spawn the routed
-        // post so a chain of event records cannot recurse unboundedly
-        // and the current cycle's FLNK/CP dispatch is not blocked.
-        let db = self.clone();
-        // Middle band, not any record's PRIO: C `postEvent` fires one
-        // `callbackRequest` per non-empty band, each carrying the *scanned*
-        // record's priority (`dbScan.c:513-527`), and the port keeps one Event
-        // list rather than three (`scan_index.rs` `post_event_named`), so
-        // there is no per-band fan-out to name here.
-        crate::runtime::task::spawn_background(
-            crate::runtime::task::CallbackPriority::Medium,
-            async move {
-                db.post_event_named(event.name()).await;
-            },
-        );
+        self.request_event_post(event.into_name());
     }
 
     fn canonical_name(&self, name: impl AsRef<[u8]>) -> RecordName {

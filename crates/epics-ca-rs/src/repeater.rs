@@ -283,8 +283,9 @@ pub async fn ensure_repeater(repeater_port: u16) {
         return;
     }
 
-    // No repeater running — spawn one
-    spawn_repeater();
+    // No repeater running — spawn one. Off the reactor: the spawn waits out
+    // the child's O(OPEN_MAX) descriptor loop, 128 ms at OPEN_MAX 2^20.
+    let _ = epics_base_rs::runtime::task::spawn_blocking(spawn_repeater).await;
 
     // Give it a moment to start, then register
     epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(50)).await;
@@ -445,6 +446,8 @@ fn spawn_detached(bin: &std::path::Path) -> bool {
 /// Unix: every descriptor past stdio closes at exec, as C closes them
 /// (posix/osdProcess.c:110-126); std marks its own CLOEXEC, not those our
 /// parent left us. Marked rather than closed, so std's exec-error pipe works.
+/// On Linux the daemon starts on SCHED_OTHER, as C drops a client's
+/// SCHED_FIFO before exec (posix/osdProcess.c:128-137).
 #[cfg(not(windows))]
 fn spawn_detached(bin: &std::path::Path) -> bool {
     use std::os::unix::process::CommandExt;
@@ -455,12 +458,17 @@ fn spawn_detached(bin: &std::path::Path) -> bool {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    // SAFETY: the hook only calls fcntl, which is async-signal-safe.
+    // SAFETY: the hook only calls fcntl and sched_setscheduler, plain
+    // syscalls that take no lock, on a parameter built before the fork.
     unsafe {
+        #[cfg(target_os = "linux")]
+        let other: libc::sched_param = std::mem::zeroed();
         cmd.pre_exec(move || {
             for fd in 3..open_max as libc::c_int {
                 libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
             }
+            #[cfg(target_os = "linux")]
+            libc::sched_setscheduler(0, libc::SCHED_OTHER, &other);
             Ok(())
         });
     }
@@ -856,5 +864,62 @@ mod tests {
             ready
         };
         assert_eq!(ready, 1, "the daemon holds the write end");
+    }
+
+    /// A client thread on SCHED_FIFO starts the daemon on SCHED_OTHER.
+    /// Excluded from `profile.ci` by name: it fails, not skips, where the
+    /// process may not have SCHED_FIFO.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_daemon_started_from_a_fifo_thread_runs_sched_other() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("policy");
+        let daemon = dir.path().join("daemon");
+        // Field 41 of /proc/<pid>/stat is the policy: 0 SCHED_OTHER, 1 SCHED_FIFO.
+        std::fs::write(
+            &daemon,
+            format!(
+                "#!/bin/sh\ncut -d' ' -f41 /proc/$$/stat > '{0}.tmp' && mv '{0}.tmp' '{0}'\n",
+                out.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&daemon, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (fifo, spawned) = std::thread::spawn(move || {
+            // SAFETY: a plain C struct, valid all-zero.
+            let mut param: libc::sched_param = unsafe { std::mem::zeroed() };
+            param.sched_priority = 1;
+            // SAFETY: this thread, with a stack-local param.
+            let fifo = unsafe {
+                libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_FIFO, &param)
+            };
+            (fifo, fifo == 0 && spawn_detached(&daemon))
+        })
+        .join()
+        .unwrap();
+        assert_eq!(
+            fifo, 0,
+            "this pin needs root or a non-zero RLIMIT_RTPRIO; without it the reset is unverified"
+        );
+        assert!(spawned);
+
+        let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+        let policy = loop {
+            if let Ok(policy) = std::fs::read_to_string(&out) {
+                break policy;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the daemon never reported its policy"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        assert_eq!(
+            policy.trim(),
+            "0",
+            "the daemon must run SCHED_OTHER (0), not the client's SCHED_FIFO (1)"
+        );
     }
 }

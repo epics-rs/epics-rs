@@ -3,10 +3,13 @@
 //! callback unless it drops inside that callback, and no callback runs
 //! after it. C's `db_cancel_event` waits through `db_sync_event` off the
 //! event task (`dbEvent.c:613-634`), and a network clear takes the
-//! context's recursive `cbMutex` the receive thread calls under.
+//! context's recursive `cbMutex` the receive thread calls under. On the
+//! context's `CAC-callback` thread a drop waits for none, so callbacks that
+//! drop each other's subscriptions all return; a callback whose delivery
+//! had begun may run on after that drop, and none passes it later.
 #![cfg(feature = "client-core")]
 
-// RTEMS-EXEC-MODEL-ALLOW(1): measured - all five tests pass under
+// RTEMS-EXEC-MODEL-ALLOW(1): measured - all ten tests pass under
 // `EPICS_RS_BUILD_EXEC_BACKEND=thread`, where the tokio runtime that hosts
 // them here is not built.
 
@@ -15,7 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::runtime::task::{background_init, block_on_sync};
@@ -329,6 +332,104 @@ impl Held {
     }
 }
 
+/// A flag one thread sets and another waits on.
+#[derive(Default)]
+struct Flag {
+    set: Mutex<bool>,
+    changed: Condvar,
+}
+
+impl Flag {
+    fn set(&self) {
+        *self.set.lock().unwrap() = true;
+        self.changed.notify_all();
+    }
+
+    /// Whether it is set, within the budget.
+    fn wait(&self) -> bool {
+        let set = self.set.lock().unwrap();
+        *self
+            .changed
+            .wait_timeout_while(set, fact_budget::FACT_BUDGET, |s| !*s)
+            .unwrap()
+            .0
+    }
+}
+
+/// What the callbacks of `H` and `C` saw, in the order they ran.
+#[derive(Debug, PartialEq)]
+enum Seen {
+    H(f64),
+    C(f64),
+}
+
+/// `I1`, an in-process subscription of `B`, and `N1`, a network one of
+/// `DROPWAIT:AO`, whose callbacks on 5.0 and 7.0 each wait for the other
+/// to be in, then drop the other's subscription and report it.
+struct Crossing {
+    i1_in: Arc<Flag>,
+    dropped: mpsc::Receiver<String>,
+}
+
+impl Crossing {
+    fn new(ctx: &CaClientContext, net: &dyn ClientChannel) -> Self {
+        let i1: Arc<Mutex<Option<InProcessSubscription>>> = Arc::default();
+        let n1: Arc<Mutex<Option<ClientSubscription>>> = Arc::default();
+        let (i1_in, n1_in) = (Arc::new(Flag::default()), Arc::new(Flag::default()));
+        let (dropped_tx, dropped) = mpsc::channel();
+        let (first_tx, first) = mpsc::channel();
+        let (slot, me, other, d, f) = (
+            n1.clone(),
+            i1_in.clone(),
+            n1_in.clone(),
+            dropped_tx.clone(),
+            first_tx.clone(),
+        );
+        let i = monitor_in_process(ctx, "B", DBR_DOUBLE, move |v| {
+            if v != 5.0 {
+                let _ = f.send(());
+                return;
+            }
+            me.set();
+            other.wait();
+            let n = slot.lock().unwrap().take();
+            drop(n);
+            let on = thread::current().name().unwrap_or_default().to_string();
+            let _ = d.send(format!("I1's drop of N1 on {on}"));
+        });
+        let (slot, me, other, d, f) = (i1.clone(), n1_in, i1_in.clone(), dropped_tx, first_tx);
+        let n = monitor(net, move |v| {
+            if v != 7.0 {
+                let _ = f.send(());
+                return;
+            }
+            me.set();
+            other.wait();
+            let i = slot.lock().unwrap().take();
+            drop(i);
+            let _ = d.send("N1's drop of I1".to_string());
+        });
+        for _ in 0..2 {
+            first
+                .recv_timeout(fact_budget::FACT_BUDGET)
+                .expect("a first value");
+        }
+        *i1.lock().unwrap() = Some(i);
+        *n1.lock().unwrap() = Some(n);
+        Self { i1_in, dropped }
+    }
+
+    /// The drops that returned, each within the budget.
+    fn drops_returned(&self) -> Vec<String> {
+        (0..2)
+            .map_while(|_| self.dropped.recv_timeout(fact_budget::FACT_BUDGET).ok())
+            .collect()
+    }
+}
+
+/// The thread that delivers the context's events in place of `CAC-event`.
+const CALLER: &str = "caller";
+
 /// A drop of an in-process subscription on another thread returns only once
 /// its running callback has.
 #[test]
@@ -440,11 +541,6 @@ fn a_network_subscription_dropped_inside_its_callback_returns() {
 #[test]
 #[serial(epics_env)]
 fn no_in_process_callback_runs_after_its_drop() {
-    #[derive(Debug, PartialEq)]
-    enum Seen {
-        H(f64),
-        C(f64),
-    }
     on_a_blocking_thread(|| {
         let gate = Arc::new(Gate::default());
         let iocs = Iocs::start(&gate);
@@ -482,6 +578,233 @@ fn no_in_process_callback_runs_after_its_drop() {
             |s: &Seen| matches!(s, Seen::H(_)),
             |s| *s == Seen::C(1.0),
             |left| seen.recv_timeout(left).ok(),
+        );
+    });
+}
+
+/// An in-process callback drops a network subscription while that
+/// subscription's callback drops the in-process one: both drops return.
+#[test]
+#[serial(epics_env)]
+fn callbacks_dropping_each_others_subscription_return() {
+    on_a_blocking_thread(|| {
+        let iocs = Iocs::start(&Arc::new(Gate::default()));
+        let ctx = iocs.downstream.ca_client();
+        let net = connect(&ctx, "DROPWAIT:AO");
+        let crossing = Crossing::new(&ctx, &*net);
+        iocs.post_downstream("B", 5.0);
+        iocs.post_upstream(7.0);
+        let returned = crossing.drops_returned();
+        if returned.len() < 2 {
+            // `CAC-event` and `CAC-callback` wait on each other; nothing may
+            // join them.
+            std::mem::forget((net, ctx, iocs));
+        }
+        assert_eq!(returned.len(), 2, "drops that returned: {returned:?}");
+    });
+}
+
+/// The same with `I1` run by a caller's delivery in place of `CAC-event`.
+#[test]
+#[serial(epics_env)]
+fn a_callers_delivery_and_a_network_callback_dropping_each_others_subscription_return() {
+    on_a_blocking_thread(|| {
+        let iocs = Iocs::start(&Arc::new(Gate::default()));
+        let ctx = iocs.downstream.ca_client();
+        let net = connect(&ctx, "DROPWAIT:AO");
+        let crossing = Crossing::new(&ctx, &*net);
+        // Once the caller's delivery runs `C`'s callback, that callback posts
+        // `B`'s 5.0, which the same delivery takes next.
+        let posted = Arc::new(AtomicBool::new(false));
+        let (db, p) = (iocs.downstream.clone(), posted.clone());
+        let _i0 = monitor_in_process(&ctx, "C", DBR_DOUBLE, move |_| {
+            if thread::current().name() == Some(CALLER) && !p.swap(true, Ordering::SeqCst) {
+                post(&db, "B", 5.0);
+            }
+        });
+        let (events, db) = (ctx.events().clone(), iocs.downstream.clone());
+        let caller = thread::Builder::new()
+            .name(CALLER.into())
+            .spawn(move || {
+                let end = Instant::now() + fact_budget::FACT_BUDGET;
+                let mut v = 0.0;
+                while !posted.load(Ordering::SeqCst) && Instant::now() < end {
+                    v += 1.0;
+                    post(&db, "C", v);
+                    events.deliver();
+                }
+            })
+            .expect("spawn the caller");
+        assert!(crossing.i1_in.wait(), "I1 never ran");
+        iocs.post_upstream(7.0);
+        let returned = crossing.drops_returned();
+        if returned.len() < 2 {
+            // The caller and `CAC-callback` wait on each other; nothing may
+            // join them.
+            std::mem::forget((net, ctx, iocs));
+        }
+        assert_eq!(returned.len(), 2, "drops that returned: {returned:?}");
+        assert!(
+            returned.contains(&format!("I1's drop of N1 on {CALLER}")),
+            "I1 ran on the caller's delivery: {returned:?}"
+        );
+        caller.join().unwrap();
+    });
+}
+
+/// A network callback drops an in-process subscription whose callback is
+/// running: another network subscription's value lands while that
+/// in-process callback runs on.
+#[test]
+#[serial(epics_env)]
+fn a_network_value_lands_while_a_network_callback_drops_a_running_in_process_one() {
+    on_a_blocking_thread(|| {
+        let iocs = Iocs::start(&Arc::new(Gate::default()));
+        let ctx = iocs.downstream.ca_client();
+        let net = connect(&ctx, "DROPWAIT:AO");
+        let held = Arc::new(Held::default());
+        let (tx, b_values) = mpsc::channel();
+        let h = held.clone();
+        let i1 = monitor_in_process(&ctx, "B", DBR_DOUBLE, move |v| {
+            let _ = tx.send(v);
+            h.on(v, 5.0);
+        });
+        assert_eq!(b_values.recv_timeout(fact_budget::FACT_BUDGET), Ok(0.0));
+        let slot = Arc::new(Mutex::new(Some(i1)));
+        let dropping = Arc::new(Flag::default());
+        let d = dropping.clone();
+        let _n1 = monitor(&*net, move |v| {
+            if v == 7.0 {
+                d.set();
+                let i = slot.lock().unwrap().take();
+                drop(i);
+            }
+        });
+        let (tx, n2_values) = mpsc::channel();
+        let _n2 = monitor(&*net, move |v| {
+            let _ = tx.send(v);
+        });
+        assert_eq!(n2_values.recv_timeout(fact_budget::FACT_BUDGET), Ok(0.0));
+        let release = Release(&held.gate);
+        iocs.post_downstream("B", 5.0);
+        held.gate.until_held();
+        iocs.post_upstream(7.0);
+        assert!(dropping.wait(), "N1 never saw 7.0");
+        iocs.post_upstream(8.0);
+        let landed = loop {
+            match n2_values.recv_timeout(fact_budget::FACT_BUDGET) {
+                Ok(8.0) => break true,
+                Ok(_) => {}
+                Err(_) => break false,
+            }
+        };
+        drop(release);
+        assert!(landed, "N2's 8.0 while N1's drop of the running I1");
+    });
+}
+
+/// A network callback drops an in-process subscription while `CAC-event`
+/// reads its record for a value already taken: that value reaches no
+/// callback.
+#[test]
+#[serial(epics_env)]
+fn no_in_process_callback_runs_after_a_network_callback_drops_it() {
+    on_a_blocking_thread(|| {
+        let gate = Arc::new(Gate::default());
+        let iocs = Iocs::start(&gate);
+        let ctx = iocs.downstream.ca_client();
+        let net = connect(&ctx, "DROPWAIT:AO");
+        let (tx, seen) = mpsc::channel();
+        let h = tx.clone();
+        // A control type, so the read takes the record's limits.
+        let sub = monitor_in_process(&ctx, "H", DBR_CTRL_DOUBLE, move |v| {
+            let _ = h.send(Seen::H(v));
+        });
+        assert_eq!(
+            seen.recv_timeout(fact_budget::FACT_BUDGET),
+            Ok(Seen::H(0.0))
+        );
+        let _c = monitor_in_process(&ctx, "C", DBR_DOUBLE, move |v| {
+            let _ = tx.send(Seen::C(v));
+        });
+        assert_eq!(
+            seen.recv_timeout(fact_budget::FACT_BUDGET),
+            Ok(Seen::C(0.0))
+        );
+        let slot = Arc::new(Mutex::new(Some(sub)));
+        let dropped = Arc::new(Flag::default());
+        let d = dropped.clone();
+        let _n1 = monitor(&*net, move |v| {
+            if v == 7.0 {
+                let sub = slot.lock().unwrap().take();
+                drop(sub);
+                d.set();
+            }
+        });
+        let db = iocs.downstream.clone();
+        thread::scope(|s| {
+            let release = Release(&gate);
+            let poster = s.spawn(move || post(&db, "H", 1.0));
+            gate.until_held();
+            iocs.post_upstream(7.0);
+            assert!(dropped.wait(), "N1's drop of H's subscription returned");
+            drop(release);
+            poster.join().unwrap();
+        });
+        iocs.post_downstream("C", 1.0);
+        fact_budget::barrier::until(
+            "a callback after a network callback dropped its subscription",
+            |s: &Seen| matches!(s, Seen::H(_)),
+            |s| *s == Seen::C(1.0),
+            |left| seen.recv_timeout(left).ok(),
+        );
+    });
+}
+
+/// An in-process callback, on `CAC-event`, drops a network subscription
+/// whose callback is running: the drop returns only once that callback has.
+#[test]
+#[serial(epics_env)]
+fn an_in_process_callbacks_drop_waits_for_a_running_network_callback() {
+    on_a_blocking_thread(|| {
+        let iocs = Iocs::start(&Arc::new(Gate::default()));
+        let ctx = iocs.downstream.ca_client();
+        let net = connect(&ctx, "DROPWAIT:AO");
+        let held = Arc::new(Held::default());
+        let (tx, n1_values) = mpsc::channel();
+        let h = held.clone();
+        let n1 = monitor(&*net, move |v| {
+            let _ = tx.send(v);
+            h.on(v, 7.0);
+        });
+        assert_eq!(n1_values.recv_timeout(fact_budget::FACT_BUDGET), Ok(0.0));
+        let slot = Arc::new(Mutex::new(Some(n1)));
+        let (began_tx, began) = mpsc::channel();
+        let (ended_tx, ended) = mpsc::channel();
+        let h = held.clone();
+        let _i1 = monitor_in_process(&ctx, "B", DBR_DOUBLE, move |v| {
+            if v == 5.0 {
+                let _ = began_tx.send(());
+                let n = slot.lock().unwrap().take();
+                drop(n);
+                let _ = ended_tx.send(h.ended.load(Ordering::SeqCst));
+            }
+        });
+        let release = Release(&held.gate);
+        iocs.post_upstream(7.0);
+        held.gate.until_held();
+        iocs.post_downstream("B", 5.0);
+        began
+            .recv_timeout(fact_budget::FACT_BUDGET)
+            .expect("the drop never began");
+        // absence-window: a drop that does not wait returns inside it, with
+        // the callback held; one that waits gives no sign.
+        thread::sleep(SETTLE);
+        drop(release);
+        assert_eq!(
+            ended.recv_timeout(fact_budget::FACT_BUDGET),
+            Ok(true),
+            "N1's callback had ended when I1's drop of it returned"
         );
     });
 }

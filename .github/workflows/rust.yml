@@ -629,3 +629,20 @@ jobs:
       env:
         EPICS_RS_BUILD_EXEC_BACKEND: thread
       run: cargo dylint --all --workspace -- --all-features --keep-going
+
+  # A fixed sleep or a literal timeout in a test is a bet on the runner's
+  # speed. Test code held 2823 of them at 451531667, so the gate counts only
+  # what a change adds over its merge base, and needs the history to find it.
+  fixed-wait:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: 1.99.0
+    - name: No fixed wait added to a test
+      env:
+        BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+      run: cargo run -q -p fixed-wait-gate -- "$BASE"

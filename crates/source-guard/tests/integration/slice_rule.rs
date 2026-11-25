@@ -5,7 +5,7 @@
 //! being disproved: every test that names it fails if `production` goes back
 //! to it.
 
-use source_guard::{Comments, production_str as production};
+use source_guard::{Comments, production_str as production, test_lines};
 
 /// The rule eleven guards carried, verbatim.
 fn positionally(src: &str) -> &str {
@@ -371,4 +371,82 @@ fn a_brace_in_a_string_on_the_head_line_opens_no_block() {
     let got = production(src, Comments::Keep);
     assert!(got.contains("fn prod()"), "{got:?}");
     assert!(!got.contains("banned()"), "{got:?}");
+}
+
+/// A test attribute compiles its function only under `cfg(test)`, so the
+/// function is test code wherever it sits: a lint crate's `src/lib.rs` keeps
+/// its `#[test] fn ui()` at the top level, and a file reached through a
+/// `#[cfg(test)] mod x;` holds column-0 `#[test]`s. An attribute that only
+/// names a test crate, and a macro that emits `#[test]`, are production.
+#[test]
+fn a_test_attribute_takes_its_function_and_nothing_else() {
+    for attr in [
+        "#[test]",
+        "#[tokio::test(flavor = \"multi_thread\")]",
+        "#[epics_macros_rs::epics_test]",
+    ] {
+        let src =
+            format!("fn ship() {{}}\n{attr}\n#[ignore]\nasync fn t() {{\n    marker();\n}}\n");
+        let prod = production(&src, Comments::Keep);
+        assert!(!prod.contains("marker()"), "`{attr}`: {prod}");
+        assert!(prod.contains("fn ship()"), "`{attr}`: {prod}");
+    }
+    for src in [
+        "#[serial_test::serial]\nfn ships() {\n    marker();\n}\n",
+        "fn emit() -> T {\n    quote! {\n        #[test]\n        #vis fn #name() {\n            marker();\n        }\n    }\n}\n",
+    ] {
+        assert!(
+            production(src, Comments::Keep).contains("marker()"),
+            "production code left the slice: {src}"
+        );
+    }
+}
+
+/// `test_lines` is the complement of the slice: a line is test code exactly
+/// when `production_str` blanks it, except the documentation and attributes
+/// above the item, which the slice blanks and the item does not own.
+#[test]
+fn test_lines_marks_the_lines_the_slice_blanks() {
+    const SRC: &str = "\
+fn ship() {
+    a();
+}
+/// helper
+#[cfg(test)]
+fn helper() {
+    b();
+}
+mod m {
+    #[test]
+    fn t() {
+        c();
+    }
+}
+";
+    let test = test_lines(SRC);
+    let prod: Vec<&str> = SRC.lines().collect();
+    let blanked = production(SRC, Comments::Keep);
+    let marked: Vec<usize> = (0..prod.len())
+        .filter(|&i| test[i])
+        .map(|i| i + 1)
+        .collect();
+    assert_eq!(marked, [5, 6, 7, 8, 10, 11, 12, 13], "{test:?}");
+    for (i, (orig, slice)) in prod.iter().zip(blanked.lines()).enumerate() {
+        if test[i] {
+            assert_eq!(
+                slice,
+                "",
+                "line {} is test code but stayed in the slice",
+                i + 1
+            );
+        }
+        if !test[i] && i != 3 {
+            assert_eq!(
+                slice,
+                *orig,
+                "line {} left the slice but is not test code",
+                i + 1
+            );
+        }
+    }
 }

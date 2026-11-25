@@ -26,7 +26,10 @@
 //! and `#[cfg(any(target_os = "rtems", test))]` is not — those seven items in
 //! `epics-libcom-rs`'s task seam ship on RTEMS, and a rule that matched the
 //! substring `test` would have quietly dropped them from the census that
-//! exists to cover them.
+//! exists to cover them. A test attribute (`#[test]`, `#[tokio::test]`,
+//! `#[epics_test]`) compiles its item only under `cfg(test)`, so that item is
+//! test code too. [`test_lines`] is the same rule read the other way, for a
+//! guard over test code.
 //!
 //! Excluded lines are **blanked, not deleted**, so a 1-based line number taken
 //! from the slice still names the same line of the original file. Guards that
@@ -147,6 +150,26 @@ pub fn production(src: &'static str, comments: Comments) -> &'static str {
         .or_insert_with(|| String::leak(production_str(src, comments)))
 }
 
+/// Per line of `src`: whether it lies in a test-only item, the lines
+/// [`production_str`] blanks. An item's documentation and the attributes
+/// above its first test-only one are not in it.
+pub fn test_lines(src: &str) -> Vec<bool> {
+    let lines: Vec<&str> = src.lines().collect();
+    let (code_line, code_text) = code_view(src, &lex(src));
+    let mut out = vec![false; lines.len()];
+    let mut i = 0usize;
+    while i < lines.len() {
+        match test_only_item_at(&lines, &code_line, &code_text, i) {
+            Some(past) => {
+                out[i..past].fill(true);
+                i = past;
+            }
+            None => i += 1,
+        }
+    }
+    out
+}
+
 /// The index just past the column-0 test-only item beginning at `i`, or `None`
 /// if no such item begins there.
 ///
@@ -159,7 +182,9 @@ fn test_only_item_at(
     i: usize,
 ) -> Option<usize> {
     // A `#[cfg(test)]` that is fixture text or commented out opens nothing.
-    if !code_line[i] || !cfg_is_test_only(lines[i].trim_start()) {
+    let opener = lines[i].trim_start();
+    let test_attr = is_test_attr(opener);
+    if !code_line[i] || !(test_attr || cfg_is_test_only(opener)) {
         return None;
     }
     // The item's own indentation. The rule is the same at every depth: a
@@ -177,6 +202,12 @@ fn test_only_item_at(
     // The head line as syntax: a `{` in a string or a `;` in a trailing
     // comment is not one.
     let head = code_text.get(item)?;
+    // A test attribute takes only a function. Anything else under one is a
+    // macro emitting it — `quote! { #[test] #vis fn #name() .. }` in
+    // `epics-macros-rs` — and that is production code.
+    if test_attr && !is_fn_head(head) {
+        return None;
+    }
     let opens = head.matches('{').count();
     let closes = head.matches('}').count();
     if opens > 0 && opens == closes {
@@ -211,6 +242,49 @@ fn cfg_is_test_only(line: &str) -> bool {
         return false;
     };
     pred_is_test_only(pred)
+}
+
+/// Does this line carry a test attribute, one whose path ends in `test` or
+/// `_test`: `#[test]`, `#[tokio::test(flavor = "multi_thread")]`,
+/// `#[epics_macros_rs::epics_test]`?
+fn is_test_attr(line: &str) -> bool {
+    let Some(body) = line.strip_prefix("#[").and_then(|r| r.strip_suffix(']')) else {
+        return false;
+    };
+    let path = body.split('(').next().unwrap_or(body).trim_end();
+    let last = path.rsplit("::").next().unwrap_or(path);
+    last == "test" || last.ends_with("_test")
+}
+
+/// Does this line begin a function: `fn`, after any of `pub(..)`, `const`,
+/// `async`, `unsafe` and `extern "C"`?
+fn is_fn_head(head: &str) -> bool {
+    let mut rest = head.trim_start();
+    loop {
+        let word = rest
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .next()
+            .unwrap_or("");
+        match word {
+            "fn" => return true,
+            "pub" | "const" | "async" | "unsafe" | "extern" => {
+                rest = rest[word.len()..].trim_start();
+                if rest.starts_with('(') {
+                    let Some(close) = rest.find(')') else {
+                        return false;
+                    };
+                    rest = rest[close + 1..].trim_start();
+                }
+                if let Some(abi) = rest.strip_prefix('"') {
+                    let Some(close) = abi.find('"') else {
+                        return false;
+                    };
+                    rest = abi[close + 1..].trim_start();
+                }
+            }
+            _ => return false,
+        }
+    }
 }
 
 /// `cfg` predicate implication, read rather than matched.

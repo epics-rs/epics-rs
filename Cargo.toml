@@ -55,6 +55,9 @@ default-members = [
     # Rust's `NaN` where the C IOC prints `nan` / `-nan`, and only a bare run
     # sees the file that adds one.
     "tools/cfloat-gate",
+    # The fixed-wait ratchet's boundary tests. The gate itself needs a merge
+    # base, so it is `cargo run -p fixed-wait-gate`, and CI's `fixed-wait` job.
+    "tools/fixed-wait-gate",
 ]
 resolver = "3"
 

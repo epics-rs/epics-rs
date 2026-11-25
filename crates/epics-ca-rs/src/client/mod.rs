@@ -1677,21 +1677,85 @@ async fn within<T>(
         .unwrap_or(Err(CaError::Timeout))
 }
 
-/// libca `nciu::read`'s gate ahead of queueing, in its order: the read
-/// right, then `countIn > this->count` as `ECA_BADCOUNT`
-/// (`nciu.cpp:282-287`). Every read passes it before its waiter exists.
-fn admit_read(snap: &ChannelSnapshotPublic, count: u32) -> CaResult<()> {
-    snap.permit_read()?;
-    validate_count(snap, count)
-}
+/// The fields of [`ReadAdmit`] and [`WriteAdmit`] are private to this
+/// module, so outside it only `admit_read` / `admit_write` can make one, and
+/// the READ_NOTIFY / WRITE / WRITE_NOTIFY senders and their
+/// `TransportCommand`s take one.
+mod admission {
+    use super::*;
 
-/// libca `nciu::write`'s gate, both overloads, in their order: the write
-/// right, the count, then each string (`nciu.cpp:329-337,350-358`).
-fn admit_write(snap: &ChannelSnapshotPublic, value: &EpicsValue) -> CaResult<()> {
-    snap.permit_write()?;
-    validate_count(snap, value.count())?;
-    validate_put_strings(value)
+    /// A READ_NOTIFY that passed [`admit_read`]: its DBR type and the element
+    /// count it carries on the wire.
+    pub(crate) struct ReadAdmit {
+        data_type: u16,
+        count: u32,
+    }
+
+    impl ReadAdmit {
+        pub(crate) fn data_type(&self) -> u16 {
+            self.data_type
+        }
+
+        pub(crate) fn count(&self) -> u32 {
+            self.count
+        }
+    }
+
+    /// A write that passed [`admit_write`], with the bytes it was admitted for.
+    pub(crate) struct WriteAdmit {
+        count: u32,
+        payload: Vec<u8>,
+    }
+
+    impl WriteAdmit {
+        pub(crate) fn count(&self) -> u32 {
+            self.count
+        }
+
+        pub(crate) fn into_parts(self) -> (u32, Vec<u8>) {
+            (self.count, self.payload)
+        }
+    }
+
+    /// libca `nciu::read`'s gate ahead of queueing, in its order: the read
+    /// right, then `countIn > this->count` as `ECA_BADCOUNT`
+    /// (`nciu.cpp:282-287`), then `tcpiiu::readNotifyRequest`'s
+    /// (`tcpiiu.cpp:1463-1478`): the type, the bound of what the circuit can
+    /// carry (ECA_TOLARGE), and the native count for a zero (autosize)
+    /// request to a peer before CA_V413, which would read `m_count == 0` as
+    /// "no elements". Every read passes it before its waiter exists.
+    pub(super) fn admit_read(
+        snap: &ChannelSnapshotPublic,
+        data_type: u16,
+        count: u32,
+    ) -> CaResult<ReadAdmit> {
+        snap.permit_read()?;
+        validate_count(snap, count)?;
+        let count = crate::protocol::read_notify_wire_count(
+            count,
+            snap.element_count,
+            data_type,
+            snap.server_minor,
+        )?;
+        Ok(ReadAdmit { data_type, count })
+    }
+
+    /// libca `nciu::write`'s gate, both overloads, in their order: the write
+    /// right, the count, then each string (`nciu.cpp:329-337,350-358`).
+    pub(super) fn admit_write(
+        snap: &ChannelSnapshotPublic,
+        value: &EpicsValue,
+    ) -> CaResult<WriteAdmit> {
+        snap.permit_write()?;
+        validate_count(snap, value.count())?;
+        validate_put_strings(value)?;
+        Ok(WriteAdmit {
+            count: value.count(),
+            payload: value.to_bytes(),
+        })
+    }
 }
+use admission::{ReadAdmit, WriteAdmit, admit_read, admit_write};
 
 /// `countIn > this->count` is `outOfBounds`, `ECA_BADCOUNT`.
 fn validate_count(snap: &ChannelSnapshotPublic, count: u32) -> CaResult<()> {
@@ -2015,15 +2079,15 @@ impl CaChannel {
     }
 
     fn build_read_notify_frame(
-        sid: u32,
-        data_type: u16,
-        count: u32,
+        snap: &ChannelSnapshotPublic,
+        admit: &ReadAdmit,
         ioid: u32,
-        peer_minor: u16,
     ) -> CaResult<Vec<u8>> {
+        let count = admit.count();
+        let peer_minor = snap.server_minor;
         let mut hdr = CaHeader::new(CA_PROTO_READ_NOTIFY);
-        hdr.data_type = data_type;
-        hdr.cid = sid;
+        hdr.data_type = admit.data_type();
+        hdr.cid = snap.sid;
         hdr.available = ioid;
         // C parity (`comQueSend.cpp:285`): extended form is needed for
         // `nElem >= 0xffff`, not just `> 0xffff`. Routing 0xFFFF
@@ -2098,37 +2162,17 @@ impl CaChannel {
     fn send_read_notify_fast(
         &self,
         snap: &ChannelSnapshotPublic,
-        data_type: u16,
-        count: u32,
+        admit: ReadAdmit,
         ioid: u32,
     ) -> CaResult<()> {
-        // C `tcpiiu::readNotifyRequest` (`tcpiiu.cpp:1463-1478`) bounds the
-        // requested element count against what the circuit can carry
-        // (ECA_TOLARGE past it), then substitutes the channel's native count
-        // for a zero (autosize) request when the peer predates CA_V413 —
-        // those servers have no zero-count autosize contract and would read
-        // `m_count == 0` as "no elements".
-        let count = crate::protocol::read_notify_wire_count(
-            count,
-            snap.element_count,
-            data_type,
-            snap.server_minor,
-        )?;
         if let Some(writer) = self.direct_writer(snap.server_addr) {
-            return writer.send_frame(Self::build_read_notify_frame(
-                snap.sid,
-                data_type,
-                count,
-                ioid,
-                snap.server_minor,
-            )?);
+            return writer.send_frame(Self::build_read_notify_frame(snap, &admit, ioid)?);
         }
 
         self.transport_tx
             .send(TransportCommand::ReadNotify {
                 sid: snap.sid,
-                data_type,
-                count,
+                admit,
                 ioid,
                 server_addr: snap.server_addr,
                 priority: self.priority,
@@ -2144,9 +2188,8 @@ impl CaChannel {
         &self,
         snap: &ChannelSnapshotPublic,
         data_type: u16,
-        count: u32,
+        admit: WriteAdmit,
         ioid: u32,
-        payload: Vec<u8>,
     ) -> CaResult<()> {
         // C `comQueSend::insertRequestWithPayLoad` refuses a DBR type past
         // `INVALID_DB_REQ` (`comQueSend.cpp:323`, → ECA_BADTYPE) and an array
@@ -2156,8 +2199,9 @@ impl CaChannel {
         // unframeable request on the wire — and so a caller-chosen type from
         // `put_as_dbr_*` is answered locally instead of costing the circuit
         // the server would drop it on.
-        crate::protocol::check_write_request(count, data_type, snap.server_minor)?;
+        crate::protocol::check_write_request(admit.count(), data_type, snap.server_minor)?;
         if let Some(writer) = self.direct_writer(snap.server_addr) {
+            let (count, payload) = admit.into_parts();
             return writer.send_frame(Self::build_write_frame(
                 CA_PROTO_WRITE_NOTIFY,
                 snap.sid,
@@ -2173,31 +2217,27 @@ impl CaChannel {
             .send(TransportCommand::WriteNotify {
                 sid: snap.sid,
                 data_type,
-                count,
                 ioid,
-                payload,
+                admit,
                 server_addr: snap.server_addr,
                 priority: self.priority,
             })
             .map_err(|_| CaError::Shutdown)
     }
 
-    /// Send `value` as a fire-and-forget `CA_PROTO_WRITE`. See
+    /// Send the admitted value as a fire-and-forget `CA_PROTO_WRITE`. See
     /// [`Self::send_write_notify_fast`] for the `data_type` contract.
     fn send_write_nowait_fast(
         &self,
         snap: &ChannelSnapshotPublic,
         data_type: u16,
-        value: &EpicsValue,
+        admit: WriteAdmit,
     ) -> CaResult<()> {
-        admit_write(snap, value)?;
-        let count = value.count();
-        let payload = value.to_bytes();
         // Same pre-queue type and element bounds as `send_write_notify_fast`
         // — a fire-and-forget put goes through the identical
         // `comQueSend::insertRequestWithPayLoad`, so `ca_array_put` returns
         // ECA_BADTYPE / ECA_BADCOUNT synchronously rather than sending.
-        crate::protocol::check_write_request(count, data_type, snap.server_minor)?;
+        crate::protocol::check_write_request(admit.count(), data_type, snap.server_minor)?;
         // Bind the identity to the request before the request exists on the
         // wire, at the one site both routes pass through. A plain write has
         // no ioid and no completion, so this record is the only thing that
@@ -2207,6 +2247,7 @@ impl CaChannel {
             .write_identities
             .insert(self.cid, Arc::clone(&self.pv_name));
         if let Some(writer) = self.direct_writer(snap.server_addr) {
+            let (count, payload) = admit.into_parts();
             return writer.send_frame(Self::build_write_frame(
                 CA_PROTO_WRITE,
                 snap.sid,
@@ -2223,8 +2264,7 @@ impl CaChannel {
                 sid: snap.sid,
                 cid: self.cid,
                 data_type,
-                count,
-                payload,
+                admit,
                 server_addr: snap.server_addr,
                 priority: self.priority,
             })
@@ -2290,11 +2330,11 @@ impl CaChannel {
         let mut pending: Vec<Pending> = Vec::new();
 
         for (index, ch) in channels.iter().enumerate() {
-            let snap = match ch
+            let (snap, admit) = match ch
                 .snapshot()
-                .and_then(|s| admit_read(&s, s.element_count).map(|()| s))
+                .and_then(|s| admit_read(&s, s.native_type as u16, s.element_count).map(|a| (s, a)))
             {
-                Ok(s) => s,
+                Ok(admitted) => admitted,
                 Err(e) => {
                     results[index] = Some(Err(e));
                     continue;
@@ -2330,26 +2370,7 @@ impl CaChannel {
                 // Refill the reusable Sender slot. The dispatcher takes
                 // this on response without removing the DashMap entry.
                 *cached.slot.lock() = Some(reply_tx);
-                let count = match crate::protocol::read_notify_wire_count(
-                    cached.element_count,
-                    cached.element_count,
-                    cached.data_type,
-                    snap.server_minor,
-                ) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        ch.in_flight.reads.remove(&cached.ioid);
-                        results[index] = Some(Err(e));
-                        continue;
-                    }
-                };
-                let frame = match Self::build_read_notify_frame(
-                    cached.sid,
-                    cached.data_type,
-                    count,
-                    cached.ioid,
-                    snap.server_minor,
-                ) {
+                let frame = match Self::build_read_notify_frame(&snap, &admit, cached.ioid) {
                     Ok(f) => f,
                     Err(e) => {
                         // Unframeable for this peer — drop the borrowed
@@ -2377,26 +2398,7 @@ impl CaChannel {
                         reply_tx,
                     },
                 );
-                let count = match crate::protocol::read_notify_wire_count(
-                    snap.element_count,
-                    snap.element_count,
-                    snap.native_type as u16,
-                    snap.server_minor,
-                ) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        ch.in_flight.reads.remove(&ioid);
-                        results[index] = Some(Err(e));
-                        continue;
-                    }
-                };
-                let frame = match Self::build_read_notify_frame(
-                    snap.sid,
-                    snap.native_type as u16,
-                    count,
-                    ioid,
-                    snap.server_minor,
-                ) {
+                let frame = match Self::build_read_notify_frame(&snap, &admit, ioid) {
                     Ok(f) => f,
                     Err(e) => {
                         ch.in_flight.reads.remove(&ioid);
@@ -2441,12 +2443,7 @@ impl CaChannel {
                 match pending_read.kind {
                     PendingKind::Cold {
                         ioid, in_flight, ..
-                    } => match ch.send_read_notify_fast(
-                        &snap,
-                        snap.native_type as u16,
-                        snap.element_count,
-                        ioid,
-                    ) {
+                    } => match ch.send_read_notify_fast(&snap, admit, ioid) {
                         Ok(()) => pending.push(Pending {
                             index,
                             reply_rx: pending_read.reply_rx,
@@ -2816,8 +2813,7 @@ impl CaChannel {
     ) -> CaResult<PendingRead> {
         // Resolve the request mode (`Fixed(0)` → native count; `Autosize`
         // passes its count through, including the `0` autosize request).
-        let request_count = count.resolve(snap.element_count);
-        admit_read(&snap, request_count)?;
+        let admit = admit_read(&snap, request_type, count.resolve(snap.element_count))?;
 
         let ioid = self.in_flight.alloc_ioid();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -2837,7 +2833,7 @@ impl CaChannel {
             ioid,
             reply_rx,
         };
-        self.send_read_notify_fast(&snap, request_type, request_count, ioid)?;
+        self.send_read_notify_fast(&snap, admit, ioid)?;
         Ok(read)
     }
 
@@ -2878,9 +2874,7 @@ impl CaChannel {
         dbr_type: u16,
         value: &EpicsValue,
     ) -> CaResult<PendingWrite> {
-        admit_write(snap, value)?;
-        let count = value.count();
-        let payload = value.to_bytes();
+        let admit = admit_write(snap, value)?;
         let ioid = self.in_flight.alloc_ioid();
         let (reply_tx, reply_rx) = oneshot::channel();
         // Direct registry insert (Option C Phase A).
@@ -2890,7 +2884,7 @@ impl CaChannel {
             ioid,
             reply_rx,
         };
-        self.send_write_notify_fast(snap, dbr_type, count, ioid, payload)?;
+        self.send_write_notify_fast(snap, dbr_type, admit, ioid)?;
         Ok(write)
     }
 
@@ -2927,7 +2921,7 @@ impl CaChannel {
         // Native encoding to match the native-typed header; see
         // `issue_write_notify`.
         let value = value.convert_to(snap.native_type);
-        self.send_write_nowait_fast(&snap, snap.native_type as u16, &value)
+        self.send_write_nowait_fast(&snap, snap.native_type as u16, admit_write(&snap, &value)?)
     }
 
     /// Write `value`'s payload under an explicit DBR wire type
@@ -2979,7 +2973,8 @@ impl CaChannel {
     /// [`Self::put_as_dbr_nowait`] for a caller that cannot await:
     /// `ca_array_put`'s status is known once the request is queued.
     pub fn put_as_dbr_no_callback(&self, dbr_type: u16, value: &EpicsValue) -> CaResult<()> {
-        self.send_write_nowait_fast(&self.snapshot()?, dbr_type, value)
+        let snap = self.snapshot()?;
+        self.send_write_nowait_fast(&snap, dbr_type, admit_write(&snap, value)?)
     }
 
     /// Write a string value to the channel as `DBR_STRING` (DBR type 0)
@@ -3010,7 +3005,9 @@ impl CaChannel {
     /// value as `DBR_STRING` via `CA_PROTO_WRITE` without waiting for
     /// server acknowledgement.
     pub async fn put_string_nowait(&self, value: &str) -> CaResult<()> {
-        self.send_write_nowait_fast(&self.snapshot()?, 0, &EpicsValue::String(value.into()))
+        let snap = self.snapshot()?;
+        let value = EpicsValue::String(value.into());
+        self.send_write_nowait_fast(&snap, 0, admit_write(&snap, &value)?)
     }
 
     /// Array variant of [`Self::put_string`] — writes `values` as a
@@ -3034,7 +3031,8 @@ impl CaChannel {
     /// Fire-and-forget variant of [`Self::put_string_array`].
     pub async fn put_string_array_nowait(&self, values: &[String]) -> CaResult<()> {
         let value = EpicsValue::StringArray(values.iter().map(PvString::from).collect());
-        self.send_write_nowait_fast(&self.snapshot()?, 0, &value)
+        let snap = self.snapshot()?;
+        self.send_write_nowait_fast(&snap, 0, admit_write(&snap, &value)?)
     }
 
     pub async fn subscribe(&self) -> CaResult<MonitorHandle> {
@@ -4438,7 +4436,7 @@ async fn run_coordinator(
                                                         let ioid = in_flight
                                                             .register_sub_update(cid, sub_id);
                                                         let _ = transport_tx.send(
-                                                            TransportCommand::ReadNotify {
+                                                            TransportCommand::SubscriptionUpdate {
                                                                 sid: ch.sid,
                                                                 data_type,
                                                                 count,

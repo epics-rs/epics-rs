@@ -1717,6 +1717,11 @@ fn cmd_circuit_key(cmd: &TransportCommand) -> Option<CircuitKey> {
             priority,
             ..
         }
+        | TransportCommand::SubscriptionUpdate {
+            server_addr,
+            priority,
+            ..
+        }
         | TransportCommand::Write {
             server_addr,
             priority,
@@ -1786,6 +1791,32 @@ fn process_command(
         }
         TransportCommand::ReadNotify {
             sid,
+            admit,
+            ioid,
+            server_addr,
+            priority,
+        } => {
+            let peer_minor = peer_minor_of(connections, (server_addr, priority));
+            let Some(frame) =
+                read_notify_frame(sid, admit.data_type(), admit.count(), ioid, peer_minor)
+            else {
+                dispatch_read_error(
+                    in_flight,
+                    ioid,
+                    Answer::local(Err(epics_base_rs::error::CaError::BadCount)),
+                );
+                return;
+            };
+            send_frame(
+                connections,
+                server_writers,
+                (server_addr, priority),
+                frame,
+                event_tx,
+            );
+        }
+        TransportCommand::SubscriptionUpdate {
+            sid,
             data_type,
             count,
             ioid,
@@ -1793,30 +1824,19 @@ fn process_command(
             priority,
         } => {
             let peer_minor = peer_minor_of(connections, (server_addr, priority));
-            let mut hdr = CaHeader::new(CA_PROTO_READ_NOTIFY);
-            hdr.data_type = data_type;
-            hdr.cid = sid;
-            hdr.available = ioid;
-            // C parity (`comQueSend.cpp:285`): extended form for
-            // `nElem >= 0xffff`. See `build_read_notify_frame` in
-            // client/mod.rs for the same boundary in the fast path.
-            if count >= 0xFFFF {
-                if hdr.set_payload_size(0, count, peer_minor).is_err() {
-                    dispatch_read_error(
-                        in_flight,
-                        ioid,
-                        Answer::local(Err(epics_base_rs::error::CaError::BadCount)),
-                    );
-                    return;
-                }
-            } else {
-                hdr.count = count as u16;
-            }
+            let Some(frame) = read_notify_frame(sid, data_type, count, ioid, peer_minor) else {
+                dispatch_read_error(
+                    in_flight,
+                    ioid,
+                    Answer::local(Err(epics_base_rs::error::CaError::BadCount)),
+                );
+                return;
+            };
             send_frame(
                 connections,
                 server_writers,
                 (server_addr, priority),
-                hdr.to_bytes_extended().to_vec(),
+                frame,
                 event_tx,
             );
         }
@@ -1824,12 +1844,12 @@ fn process_command(
             sid,
             cid,
             data_type,
-            count,
-            payload,
+            admit,
             server_addr,
             priority,
         } => {
             let peer_minor = peer_minor_of(connections, (server_addr, priority));
+            let (count, payload) = admit.into_parts();
             // Same framing owner as the direct-writer path
             // (`CaChannel::build_write_frame`): C
             // `comQueSend::insertRequestWithPayLoad`.
@@ -1868,13 +1888,13 @@ fn process_command(
         TransportCommand::WriteNotify {
             sid,
             data_type,
-            count,
             ioid,
-            payload,
+            admit,
             server_addr,
             priority,
         } => {
             let peer_minor = peer_minor_of(connections, (server_addr, priority));
+            let (count, payload) = admit.into_parts();
             let Ok(frame) = crate::protocol::build_put_frame(
                 CA_PROTO_WRITE_NOTIFY,
                 sid,
@@ -2064,6 +2084,28 @@ fn send_frame(
 /// Single reader of the per-circuit version published by `read_loop`, so
 /// every request framed by [`process_command`] gates the extended header
 /// on the same value libca feeds `insertRequestHeader` as `v49Ok`.
+/// A `CA_PROTO_READ_NOTIFY` header, in the extended form for
+/// `nElem >= 0xffff` (`comQueSend.cpp:285`), as `build_read_notify_frame` in
+/// client/mod.rs frames the fast path; `None` when the peer predates it.
+fn read_notify_frame(
+    sid: u32,
+    data_type: u16,
+    count: u32,
+    ioid: u32,
+    peer_minor: u16,
+) -> Option<Vec<u8>> {
+    let mut hdr = CaHeader::new(CA_PROTO_READ_NOTIFY);
+    hdr.data_type = data_type;
+    hdr.cid = sid;
+    hdr.available = ioid;
+    if count >= 0xFFFF {
+        hdr.set_payload_size(0, count, peer_minor).ok()?;
+    } else {
+        hdr.count = count as u16;
+    }
+    Some(hdr.to_bytes_extended().to_vec())
+}
+
 fn peer_minor_of(connections: &HashMap<CircuitKey, ServerConnection>, circuit: CircuitKey) -> u16 {
     connections
         .get(&circuit)

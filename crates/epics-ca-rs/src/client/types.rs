@@ -10,6 +10,7 @@ use epics_base_rs::types::{DbFieldType, EpicsValue, PvString};
 
 use crate::channel::AccessRights;
 use crate::client::state::ChannelState;
+use crate::client::{ReadAdmit, WriteAdmit};
 use crate::protocol::{ECA_NORDACCESS, ECA_NOWTACCESS};
 
 // --- Virtual-circuit identity ---
@@ -1486,6 +1487,16 @@ pub(crate) enum TransportCommand {
     },
     ReadNotify {
         sid: u32,
+        admit: ReadAdmit,
+        ioid: u32,
+        server_addr: SocketAddr,
+        priority: u8,
+    },
+    /// The READ_NOTIFY a subscription re-issues under its own id when its
+    /// circuit recovers. C `tcpiiu::subscriptionUpdateRequest`
+    /// (`tcpiiu.cpp:1610-1641`) sends it without `nciu::read`'s gate.
+    SubscriptionUpdate {
+        sid: u32,
         data_type: u16,
         count: u32,
         ioid: u32,
@@ -1501,17 +1512,15 @@ pub(crate) enum TransportCommand {
         /// (`cac::writeExcep` reads `hdr.m_available`).
         cid: u32,
         data_type: u16,
-        count: u32,
-        payload: Vec<u8>,
+        admit: WriteAdmit,
         server_addr: SocketAddr,
         priority: u8,
     },
     WriteNotify {
         sid: u32,
         data_type: u16,
-        count: u32,
         ioid: u32,
-        payload: Vec<u8>,
+        admit: WriteAdmit,
         server_addr: SocketAddr,
         priority: u8,
     },

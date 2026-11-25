@@ -8,13 +8,15 @@
 //! Needs the `ioc` feature.
 #![cfg(feature = "ioc")]
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ad_core_rs::attributes::{NDAttrValue, NDAttributeSource};
 use ad_core_rs::driver::ndarray_driver::NDArrayDriverBase;
 use ad_core_rs::plugin::runtime::ASYN_CANBLOCK;
 use asyn_rs::port::InterfaceMask;
+use asyn_rs::services::PortServices;
+use asyn_rs::trace::{TraceFile, TraceMask};
 use epics_base_rs::server::access_security::new_acf_cell;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::records::longin::LonginRecord;
@@ -51,6 +53,16 @@ async fn wait_for(drv: &NDArrayDriverBase, name: &str, want: NDAttrValue) {
     }
 }
 
+/// The monitor events the attribute on `pv` has traced so far.
+fn monitor_events(log: &std::path::Path, pv: &str) -> usize {
+    let line = format!("PVAttribute:monitorCallback: PV={pv}");
+    std::fs::read_to_string(log)
+        .unwrap()
+        .lines()
+        .filter(|l| l.ends_with(&line))
+        .count()
+}
+
 fn deadbanded(mdel: i32, adel: i32) -> LonginRecord {
     let mut rec = LonginRecord::new(0);
     rec.mdel = mdel;
@@ -64,6 +76,20 @@ fn deadbanded(mdel: i32, adel: i32) -> LonginRecord {
 // its reactor is `#[tokio::test]`'s own, which the backend does not remove.
 #[tokio::test]
 async fn log_only_and_alarm_only_posts_leave_the_attribute_alone() {
+    let log_file = std::env::temp_dir().join(format!(
+        "pv-attribute-monitor-mask-{}.log",
+        std::process::id()
+    ));
+    let services = PortServices::global();
+    let trace = services.trace();
+    trace.set_trace_file(
+        None,
+        TraceFile::File(Arc::new(Mutex::new(
+            std::fs::File::create(&log_file).unwrap(),
+        ))),
+    );
+    trace.set_trace_mask(None, TraceMask::ERROR | TraceMask::FLOW);
+
     let (db, _) = IocBuilder::new()
         .record(LOG_PV, deadbanded(100, 0))
         .record(ALARM_PV, deadbanded(100, 100))
@@ -140,6 +166,8 @@ async fn log_only_and_alarm_only_posts_leave_the_attribute_alone() {
         .expect("a fed EPICS_PV attribute loads clean");
     wait_for(&drv, "Log", NDAttrValue::Int32(0)).await;
     wait_for(&drv, "Alarm", NDAttrValue::Int32(0)).await;
+    let log_events = monitor_events(&log_file, LOG_PV);
+    let alarm_events = monitor_events(&log_file, ALARM_PV);
 
     // Inside MDEL=100 but past ADEL=0: DBE_LOG only.
     log.put_with_timeout(&EpicsValue::Long(5), FACT_BUDGET)
@@ -150,13 +178,6 @@ async fn log_only_and_alarm_only_posts_leave_the_attribute_alone() {
         .put_with_timeout(&EpicsValue::Long(20), FACT_BUDGET)
         .await
         .expect("put Alarm");
-    // absence-window: the attribute keeps only its latest value, so no later
-    // post can show that these two never arrived; a posted event reaches it
-    // within milliseconds.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert_eq!(attribute_value(&drv, "Log"), NDAttrValue::Int32(0));
-    assert_eq!(attribute_value(&drv, "Alarm"), NDAttrValue::Int32(0));
-
     // Past MDEL: DBE_VALUE, which the attribute does follow.
     log.put_with_timeout(&EpicsValue::Long(500), FACT_BUDGET)
         .await
@@ -167,4 +188,9 @@ async fn log_only_and_alarm_only_posts_leave_the_attribute_alone() {
         .expect("put Alarm");
     wait_for(&drv, "Log", NDAttrValue::Int32(500)).await;
     wait_for(&drv, "Alarm", NDAttrValue::Int32(500)).await;
+    // CA delivers a subscription's events in order, so a masked post that
+    // had been delivered is traced before the 500 is.
+    assert_eq!(monitor_events(&log_file, LOG_PV), log_events + 1);
+    assert_eq!(monitor_events(&log_file, ALARM_PV), alarm_events + 1);
+    let _ = std::fs::remove_file(&log_file);
 }

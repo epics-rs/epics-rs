@@ -84,20 +84,21 @@ impl NDAttrSource {
     }
 }
 
-/// Data type tags for NDAttribute values.
+/// Data type tags for NDAttribute values, numbered as C's
+/// `NDAttrDataType_t` (NDAttribute.h:44-58).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NDAttrDataType {
-    Int8,
-    UInt8,
-    Int16,
-    UInt16,
-    Int32,
-    UInt32,
-    Int64,
-    UInt64,
-    Float32,
-    Float64,
-    String,
+    Int8 = 0,
+    UInt8 = 1,
+    Int16 = 2,
+    UInt16 = 3,
+    Int32 = 4,
+    UInt32 = 5,
+    Int64 = 6,
+    UInt64 = 7,
+    Float32 = 8,
+    Float64 = 9,
+    String = 10,
 }
 
 /// Typed value stored in an NDAttribute.
@@ -505,6 +506,22 @@ impl PvAttrDbrType {
     /// count on the wire, and the attribute's data type. A CHAR field asked
     /// for as `DBR_STRING` is read as its whole `DBR_CHAR` array. `None` is
     /// C's unknown-DBF arm, which never subscribes.
+    /// C's `chtype` for this `dbrtype`, `DBR_NATIVE` being -1
+    /// (PVAttribute.h:21), as `connectCallback` traces it.
+    #[cfg(feature = "ioc")]
+    fn chtype(self) -> i32 {
+        match self {
+            Self::Native => -1,
+            Self::String => 0,
+            Self::Int16 => 1,
+            Self::Float32 => 2,
+            Self::Enum => 3,
+            Self::Int8 => 4,
+            Self::Int32 => 5,
+            Self::Float64 => 6,
+        }
+    }
+
     #[cfg(feature = "ioc")]
     fn request(
         self,
@@ -611,8 +628,14 @@ pub fn spawn_ca_monitor(
     let dbr_type = source.dbr_type;
     let cell = source.cell().clone();
     runtime.spawn(async move {
-        use epics_ca_rs::protocol::DBE_VALUE;
+        use asyn_rs::trace::TraceMask;
+        use epics_ca_rs::CaError;
+        use epics_ca_rs::client::ConnectionEvent;
+        use epics_ca_rs::protocol::{DBE_VALUE, ECA_DISCONN};
         use tokio::sync::broadcast::error::RecvError;
+        // C prints through an asynUser on no port, which reads the global
+        // trace mask (PVAttribute.cpp:23-27).
+        let trace = asyn_rs::services::PortServices::global().trace().clone();
         let channel = client.create_channel(&pv_name);
         // The snapshot `info` reads is published before `Connected` is sent,
         // so taking the events first cannot miss the connect.
@@ -625,11 +648,41 @@ pub fn spawn_ca_monitor(
                 return;
             }
         };
+        let dbf_type = info.native_type as u16;
+        trace.print(
+            None,
+            None,
+            0,
+            TraceMask::FLOW,
+            format_args!(
+                "PVAttribute:connectCallback: Connect event, PV={pv_name}, chanId={:p}, dbfType={dbf_type}, elementCount={}, dbrType={}\n",
+                &channel,
+                info.element_count,
+                dbr_type.chtype()
+            ),
+        );
         let Some((wire_type, count, data_type)) =
             dbr_type.request(info.native_type, info.element_count)
         else {
+            trace.print(
+                None,
+                None,
+                0,
+                TraceMask::ERROR,
+                format_args!("PVAttribute:connectCallback: unknown DBF type = {dbf_type}\n"),
+            );
             return;
         };
+        trace.print(
+            None,
+            None,
+            0,
+            TraceMask::FLOW,
+            format_args!(
+                "PVAttribute:connectCallback: Connect event, PV={pv_name}, chanId={:p}, type={}\n",
+                &channel, data_type as i32
+            ),
+        );
         let Ok(wire_type) = epics_ca_rs::client::DbrType::new(wire_type) else {
             return;
         };
@@ -639,17 +692,65 @@ pub fn spawn_ca_monitor(
         else {
             return;
         };
-        while let Some(update) = monitor.recv().await {
-            match update {
-                Ok(snapshot) => cell.set(decode_pv_value(data_type, &snapshot.value)),
-                // C keeps the value from before the outage; no IOC vouches
-                // for it until the first value after the reconnect.
-                Err(epics_ca_rs::CaError::ServerError(epics_ca_rs::protocol::ECA_DISCONN)) => {
-                    cell.set(NDAttrValue::Undefined)
-                }
-                // C skips an event whose status is not ECA_NORMAL and keeps
-                // the subscription (PVAttribute.cpp:125-130).
-                Err(_) => {}
+        let mut events_open = true;
+        loop {
+            tokio::select! {
+                update = monitor.recv() => match update {
+                    None => return,
+                    // C keeps the value from before the outage; no IOC vouches
+                    // for it until the first value after the reconnect. libca
+                    // never hands a disconnect to the monitor callback
+                    // (oldSubscription.cpp:80), so neither is it traced here.
+                    Some(Err(CaError::ServerError(ECA_DISCONN))) => {
+                        cell.set(NDAttrValue::Undefined)
+                    }
+                    Some(update) => {
+                        trace.print(
+                            None,
+                            None,
+                            0,
+                            TraceMask::FLOW,
+                            format_args!("PVAttribute:monitorCallback: PV={pv_name}\n"),
+                        );
+                        match update {
+                            Ok(snapshot) => cell.set(decode_pv_value(data_type, &snapshot.value)),
+                            // C skips an event whose status is not ECA_NORMAL
+                            // and keeps the subscription (PVAttribute.cpp:125-130).
+                            Err(CaError::ServerError(status)) => trace.print(
+                                None,
+                                None,
+                                0,
+                                TraceMask::ERROR,
+                                format_args!(
+                                    "PVAttribute:monitorCallback: CA returns eha.status={status}\n"
+                                ),
+                            ),
+                            // An error the client raised itself carries no ECA
+                            // status; its text stands in for the number.
+                            Err(e) => trace.print(
+                                None,
+                                None,
+                                0,
+                                TraceMask::ERROR,
+                                format_args!("PVAttribute:monitorCallback: CA returns {e}\n"),
+                            ),
+                        }
+                    }
+                },
+                event = events.recv(), if events_open => match event {
+                    Ok(ConnectionEvent::Disconnected) => trace.print(
+                        None,
+                        None,
+                        0,
+                        TraceMask::FLOW,
+                        format_args!(
+                            "PVAttribute:connectCallback: Disconnect event, PV={pv_name}, chanId={:p}\n",
+                            &channel
+                        ),
+                    ),
+                    Err(RecvError::Closed) => events_open = false,
+                    _ => {}
+                },
             }
         }
     })

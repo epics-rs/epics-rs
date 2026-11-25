@@ -831,6 +831,7 @@ mod refused_put_notify_answers_at_completion;
 mod refused_put_reports_after_the_hold;
 mod relink_drops_a_staged_external_put;
 mod reports_print_bytes;
+mod reprocess_now_completes_a_read_the_band_refuses;
 mod resolved_report_is_dbgetlink_status;
 mod restore_runs_the_after_put_special;
 mod rpro_scans_once;

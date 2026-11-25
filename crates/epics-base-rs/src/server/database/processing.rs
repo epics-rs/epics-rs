@@ -496,6 +496,18 @@ impl DeviceDone {
         }
     }
 
+    /// [`Self::reprocess`] on the calling thread: C devMcaAsyn's port-thread
+    /// callback, which runs `dbScanLock; process; dbScanUnlock` itself
+    /// (devMcaAsyn.c:359-361, :381-383) and so never meets a full band. The
+    /// caller holds no lock set. A run already draining the cell on another
+    /// thread takes this pass after its own.
+    pub fn reprocess_now(&self) {
+        use crate::runtime::background::CallbackBody;
+        if self.push(Completion::Read) {
+            self.0.body().run();
+        }
+    }
+
     /// Owe `completion`; true when the cell was idle, so the caller owns
     /// the run that drains it.
     fn push(&self, completion: Completion) -> bool {

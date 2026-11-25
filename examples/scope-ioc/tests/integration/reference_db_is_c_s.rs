@@ -3,7 +3,7 @@
 //! and scanned `TimeBase_RBV` on I/O Intr, which C never posts
 //! (testAsynPortDriver.cpp:71).
 
-mod common;
+use crate::common;
 
 use common::records;
 use epics_base_rs::reference::{ReferenceTree, reference_path};
@@ -12,7 +12,7 @@ use epics_base_rs::reference::{ReferenceTree, reference_path};
 fn every_record_has_c_s_type_and_fields() {
     let c_path = reference_path(ReferenceTree::Modules, "asyn/db/testAsynPortDriver.db");
     let c = records(&std::fs::read_to_string(&c_path).unwrap());
-    let rs = records(include_str!("../db/scopeSimulator.db"));
+    let rs = records(include_str!("../../db/scopeSimulator.db"));
     assert_eq!(
         c.keys().collect::<Vec<_>>(),
         rs.keys().collect::<Vec<_>>(),

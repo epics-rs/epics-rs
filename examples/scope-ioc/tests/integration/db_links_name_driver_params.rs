@@ -1,6 +1,6 @@
 //! Every INP/OUT link in `scopeSimulator.db` names a driver parameter.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 
@@ -11,7 +11,7 @@ use scope_ioc::driver::ScopeSimulator;
 #[test]
 fn every_link_names_a_driver_parameter() {
     let driver = ScopeSimulator::new("scopeDbParams", Arc::new(Notify::new()));
-    let missing: Vec<_> = records(include_str!("../db/scopeSimulator.db"))
+    let missing: Vec<_> = records(include_str!("../../db/scopeSimulator.db"))
         .into_values()
         .flat_map(|(_, fields)| fields)
         .filter(|(name, _)| name == "INP" || name == "OUT")

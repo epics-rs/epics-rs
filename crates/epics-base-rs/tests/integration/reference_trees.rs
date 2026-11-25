@@ -3,9 +3,8 @@
 //!
 //! This lives in a `reference_*` integration module rather than beside
 //! `epics_base_rs::reference` because CI has no reference checkout, and
-//! `profile.ci` excludes it by that name: `binary(/^reference_/)` for a
-//! binary of its own, `binary(integration) & test(/^reference_/)` for a module
-//! of the merged one. Left in the lib it would need a rule of its own.
+//! `profile.ci` excludes it by that name, `binary(integration) &
+//! test(/^reference_/)`. Left in the lib it would need a rule of its own.
 
 use epics_base_rs::reference::{ReferenceTree, reference_path, reference_root};
 use epics_base_rs::runtime::sync::CMutex;

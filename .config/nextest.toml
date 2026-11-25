@@ -151,12 +151,11 @@ default-filter = """
 # fails on `reference.rs`'s panic instead, which is how linux-rt and
 # rtems-exec-model were caught.
 #
-# One rule, not a list: a test binary that reads a reference tree is named
-# `reference_*`, and `binary(/^reference_/)` excludes them all; in a crate
-# whose tests are merged into `tests/integration/`, the module is named
-# `reference_*` and `binary(integration) & test(/^reference_/)` excludes it.
+# One rule, not a list: a test module of `tests/integration/` that reads a
+# reference tree is named `reference_*`, and `binary(integration) &
+# test(/^reference_/)` excludes them all.
 # The `epics-base-rs` test `reference_consumers_are_excluded_from_profile_ci`
-# fails a test file that calls the resolver and neither rule excludes.
+# fails a test file that calls the resolver and no term excludes.
 [profile.ci]
 fail-fast = false
 retries = 2
@@ -172,7 +171,6 @@ default-filter = """
     (binary(integration) & test(/^wire_golden_pvxs::/)) |
     (binary(integration) & test(/^wire_golden_ext::/)) |
     (binary(integration) & test(/^interop_pvxs::/)) |
-    binary(/^reference_/) |
     (binary(integration) & test(/^reference_/)) |
     package(epics-oracle-rs) |
     (binary(integration) & test(=rt_priority_default::the_default_gets_fifo_where_the_process_may_have_it)) |

@@ -33,6 +33,9 @@ default-members = [
     # And again: the production-slice rule every source guard in the workspace
     # runs on. Its own boundary tests are what keep a guard from going quiet.
     "crates/source-guard",
+    # And the counting allocator every crate's `alloc` test binary installs:
+    # its boundary tests are what keep a window from passing on nothing.
+    "crates/alloc-count",
     # Same reason again: the IOC-spawn census checks .config/nextest.toml
     # against the sources, so a new test binary that spawns an IOC without
     # being declared in a test-group is red on the commit that adds it.

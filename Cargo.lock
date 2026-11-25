@@ -1030,6 +1030,7 @@ version = "0.0.0"
 name = "epics-base-rs"
 version = "0.34.2"
 dependencies = [
+ "alloc-count",
  "arc-swap",
  "async-trait",
  "bytes",

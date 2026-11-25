@@ -1,76 +1,25 @@
 //! The over-run report of a periodic scan thread allocates nothing on it: C's
 //! `periodicTask` prints it with `errlogPrintf` (`dbScan.c:830-841`), which
 //! formats into the buffer errlog allocated at init. A slow host trips the
-//! report in any allocation-counted window. Counted per thread name in this
-//! binary's own allocator, across over-runs forced by holding TICK's write
+//! report in any allocation-counted window. Counted per thread name in the
+//! alloc binary's allocator, across over-runs forced by holding TICK's write
 //! lock past each deadline until the report fires.
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use alloc_count::named::{self, Name};
 use epics_base_rs::runtime::log::{
     errlog_add_listener, errlog_console_paints, errlog_flush, errlog_remove_listener,
     errlog_vprintf,
 };
 use epics_base_rs::server::ioc_builder::IocBuilder;
 
-const SCAN_THREAD: &str = "scan-0.1";
+static SCAN_THREAD: [Name; 1] = [Name::Exact("scan-0.1")];
 
-thread_local! {
-    /// 0 not yet asked, 1 `scan-0.1`, 2 any other thread. Asking may itself
-    /// allocate; that reentry reads 2 and is not counted.
-    static ON_SCAN: Cell<u8> = const { Cell::new(0) };
-}
-
-static ARMED: AtomicBool = AtomicBool::new(false);
-static CALLS: AtomicUsize = AtomicUsize::new(0);
 static REPORTED: AtomicBool = AtomicBool::new(false);
-
-fn on_scan() -> bool {
-    ON_SCAN.with(|s| match s.get() {
-        0 => {
-            s.set(2);
-            let yes = std::thread::current().name() == Some(SCAN_THREAD);
-            s.set(if yes { 1 } else { 2 });
-            yes
-        }
-        v => v == 1,
-    })
-}
-
-fn count() {
-    if ARMED.load(Ordering::Relaxed) && on_scan() {
-        CALLS.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-struct Counting;
-
-// SAFETY: forwards every call to `System` unchanged; the thread test reads a
-// const-initialised thread-local and the counters are atomics.
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        count();
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        count();
-        unsafe { System.realloc(ptr, layout, size) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        count();
-        unsafe { System.dealloc(ptr, layout) }
-    }
-}
-
-#[global_allocator]
-static GLOBAL: Counting = Counting;
 
 const DB: &str = r#"record(calc, "TICK") { field(SCAN, ".1 second") field(CALC, "VAL+1") }"#;
 
@@ -106,7 +55,7 @@ async fn an_over_run_report_allocates_nothing_on_the_scan_thread() {
         epics_base_rs::runtime::task::sleep(Duration::from_millis(20)).await;
     }
 
-    ARMED.store(true, Ordering::SeqCst);
+    let window = named::open(&SCAN_THREAD);
     // C reports the tenth over-run in a row once 10 s have passed since the
     // thread started (`dbScan.c:830`): hold every sweep past its deadline
     // until it does.
@@ -137,13 +86,13 @@ async fn an_over_run_report_allocates_nothing_on_the_scan_thread() {
     while ticks() < reported + 2.0 {
         epics_base_rs::runtime::task::sleep(Duration::from_millis(20)).await;
     }
-    ARMED.store(false, Ordering::SeqCst);
+    let [scan] = window.close();
     drop(owner);
     errlog_remove_listener(listener);
 
     assert_eq!(
-        CALLS.load(Ordering::SeqCst),
-        0,
+        (scan.allocs, scan.frees),
+        (0, 0),
         "allocations and frees on scan-0.1 across over-runs and their report"
     );
 }

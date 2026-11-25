@@ -2,13 +2,14 @@
 //! under `dbScanLock`: `errlogVprintf` formats into the slot `errlogInitPvt`
 //! allocated (`errlog.c:121-144`), and the worker hands listeners that slot.
 //! So neither the poster, a thread not ok-to-block, nor the delivery to a
-//! listener allocates per message. Each thread counts its own allocations.
+//! listener allocates per message. Counted per thread with the alloc binary's
+//! allocator, on the poster and on the errlog worker.
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use alloc_count::named::{self, Name};
+use alloc_count::thread;
 use epics_base_rs::runtime::log::{
     errlog_add_listener, errlog_flush, errlog_remove_listener, errlog_vprintf,
     install_console_subscriber,
@@ -18,33 +19,9 @@ use epics_base_rs::runtime::task::{
 };
 use epics_base_rs::server::ioc_builder::IocBuilder;
 
-thread_local! {
-    static COUNTING: Cell<bool> = const { Cell::new(false) };
-    static ALLOCS: Cell<usize> = const { Cell::new(0) };
-}
+/// The errlog worker, `epicsThreadCreateOpt("errlog", …)` (`errlog.c:568`).
+static WORKER: [Name; 1] = [Name::Exact("errlog")];
 
-struct Counting;
-
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if COUNTING.with(Cell::get) {
-            ALLOCS.with(|n| n.set(n.get() + 1));
-        }
-        // SAFETY: forwarded unchanged.
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        // SAFETY: forwarded unchanged.
-        unsafe { System.dealloc(ptr, layout) }
-    }
-}
-
-#[global_allocator]
-static GLOBAL: Counting = Counting;
-
-/// The errlog worker's own count, published by the listener it runs.
-static DELIVERY_ALLOCS: AtomicUsize = AtomicUsize::new(0);
 static DELIVERED: AtomicUsize = AtomicUsize::new(0);
 
 #[epics_macros_rs::epics_test]
@@ -60,8 +37,6 @@ async fn a_thousand_reports_under_a_hold_allocate_nothing() {
     let rec = db.get_record("R:AO").unwrap();
 
     let listener = errlog_add_listener(|_| {
-        COUNTING.with(|c| c.set(true));
-        DELIVERY_ALLOCS.store(ALLOCS.with(Cell::get), Ordering::Relaxed);
         DELIVERED.fetch_add(1, Ordering::Relaxed);
     });
 
@@ -74,20 +49,20 @@ async fn a_thousand_reports_under_a_hold_allocate_nothing() {
         // listener snapshot on its first pass.
         errlog_vprintf(format_args!("warm\n"));
         errlog_flush();
-        let before = DELIVERY_ALLOCS.load(Ordering::Relaxed);
+        let worker = named::open(&WORKER);
 
         let guard = rec.write();
-        ALLOCS.with(|n| n.set(0));
-        COUNTING.with(|c| c.set(true));
+        let poster = thread::open();
         for i in 0..1000 {
             errlog_vprintf(format_args!("R:AO: refused put {i}\n"));
         }
-        COUNTING.with(|c| c.set(false));
+        let poster = poster.close().allocs;
         drop(guard);
         errlog_flush();
-        tx.send((ALLOCS.with(Cell::get), before)).unwrap();
+        let [delivery] = worker.close().map(|c| c.allocs);
+        tx.send((poster, delivery)).unwrap();
     });
-    let (poster, before) = rx.recv().unwrap();
+    let (poster, delivery) = rx.recv().unwrap();
     errlog_remove_listener(listener);
 
     assert_eq!(
@@ -99,8 +74,7 @@ async fn a_thousand_reports_under_a_hold_allocate_nothing() {
         "nothing was delivered"
     );
     assert_eq!(
-        DELIVERY_ALLOCS.load(Ordering::Relaxed) - before,
-        0,
+        delivery, 0,
         "allocations on the errlog worker delivering the burst"
     );
 }

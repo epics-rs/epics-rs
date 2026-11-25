@@ -1,83 +1,36 @@
 //! A `dbCommon` link's parse is built before the record's hold and the one it
 //! replaces is dropped after it, as C `dbPutFieldLink` parses ahead of
 //! `dbScanLock` (`dbAccess.c:1101`, `:1123`): the hold only moves pointers.
-//! Counted with this binary's own allocator on the calling thread.
+//! Counted with the alloc binary's allocator on the calling thread.
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use alloc_count::thread;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::record::{LinkFieldType, RecordCell, parse_link_field};
 
-struct Counting;
-
-thread_local! {
-    static COUNTING: Cell<bool> = const { Cell::new(false) };
-    static ALLOCS: Cell<usize> = const { Cell::new(0) };
-    static FREES: Cell<usize> = const { Cell::new(0) };
-    static HELD_ALLOCS: Cell<usize> = const { Cell::new(0) };
-    static HELD_FREES: Cell<usize> = const { Cell::new(0) };
+/// Whether this thread holds a record now.
+fn holding() -> bool {
+    RecordCell::live_borrows_on_this_thread() > 0
 }
-
-fn count(
-    all: &'static std::thread::LocalKey<Cell<usize>>,
-    held: &'static std::thread::LocalKey<Cell<usize>>,
-) {
-    if COUNTING.with(Cell::get) {
-        all.with(|n| n.set(n.get() + 1));
-        if RecordCell::live_borrows_on_this_thread() > 0 {
-            held.with(|n| n.set(n.get() + 1));
-        }
-    }
-}
-
-// SAFETY: forwards every call to `System` unchanged; the counters are
-// const-initialised thread-local `Cell`s, which never allocate.
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        count(&ALLOCS, &HELD_ALLOCS);
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        count(&ALLOCS, &HELD_ALLOCS);
-        unsafe { System.realloc(ptr, layout, size) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        count(&FREES, &HELD_FREES);
-        unsafe { System.dealloc(ptr, layout) }
-    }
-}
-
-#[global_allocator]
-static GLOBAL: Counting = Counting;
 
 /// (allocations, frees, allocations under a hold, frees under a hold) made
-/// by `f` on this thread.
-fn counted<T>(f: impl FnOnce() -> T) -> (T, [usize; 4]) {
-    start();
+/// by `f` on this thread; a realloc is an allocation, not a free.
+fn counted<T>(f: impl FnOnce() -> T) -> (T, [u64; 4]) {
+    let window = thread::open_split(holding);
     let out = f();
-    (out, stop())
+    (out, stop(window))
 }
 
-fn start() {
-    for c in [&ALLOCS, &FREES, &HELD_ALLOCS, &HELD_FREES] {
-        c.with(|n| n.set(0));
-    }
-    COUNTING.with(|c| c.set(true));
-}
-
-fn stop() -> [usize; 4] {
-    COUNTING.with(|c| c.set(false));
+fn stop(window: thread::Window) -> [u64; 4] {
+    let (all, held) = window.close_split();
     assert!(
         epics_base_rs::runtime::task::in_test_ioc_thread(),
         "counted off an IOC thread"
     );
-    [&ALLOCS, &FREES, &HELD_ALLOCS, &HELD_FREES].map(|c| c.with(Cell::get))
+    [all.allocs, all.deallocs, held.allocs, held.deallocs]
 }
 
 async fn ioc(db: &str) -> Arc<PvDatabase> {
@@ -179,9 +132,9 @@ record(ai, "LOCAL001") {}
 
     let mut held = Vec::new();
     for (db, converted) in [(&rewrites, 1), (&stays, 0)] {
-        start();
+        let window = thread::open_split(holding);
         let n = db.initialize_link_locality().await;
-        let [_, _, held_allocs, held_frees] = stop();
+        let [_, _, held_allocs, held_frees] = stop(window);
         assert_eq!(n, converted, "links made external");
         held.push((held_allocs, held_frees));
     }

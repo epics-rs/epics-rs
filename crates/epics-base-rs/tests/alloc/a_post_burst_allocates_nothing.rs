@@ -1,14 +1,13 @@
 //! A record's posts run under its hold, so a steady-state burst — the posts,
 //! the consumer's wake — may neither allocate nor free. C's
 //! `db_queue_event_log` takes a free-list entry and signals `ppendsem`.
-//! Counted with this binary's own allocator on the calling thread.
+//! Counted with the alloc binary's allocator on the calling thread.
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Wake};
 
+use alloc_count::{Counts, thread};
 use epics_base_rs::server::event_queue::{
     CircuitEvent, EventUser, LogKind, PostBurst, PostOutcome, attach, event_que_size,
 };
@@ -16,43 +15,6 @@ use epics_base_rs::server::pv::MonitorEvent;
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::snapshot::Snapshot;
 use epics_base_rs::types::EpicsValue;
-
-struct Counting;
-
-thread_local! {
-    static COUNTING: Cell<bool> = const { Cell::new(false) };
-    static CALLS: Cell<usize> = const { Cell::new(0) };
-    static FREES: Cell<usize> = const { Cell::new(0) };
-}
-
-fn count() {
-    if COUNTING.with(Cell::get) {
-        CALLS.with(|n| n.set(n.get() + 1));
-    }
-}
-
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        count();
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        count();
-        unsafe { System.realloc(ptr, layout, size) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        count();
-        if COUNTING.with(Cell::get) {
-            FREES.with(|n| n.set(n.get() + 1));
-        }
-        unsafe { System.dealloc(ptr, layout) }
-    }
-}
-
-#[global_allocator]
-static GLOBAL: Counting = Counting;
 
 struct Wakes(AtomicUsize);
 
@@ -95,21 +57,14 @@ fn a_steady_state_burst_allocates_and_frees_nothing_body() {
     for round in 0..4 {
         let events = [ev(round), ev(round + 100)];
         let [ea, eb] = events;
-        CALLS.with(|n| n.set(0));
-        COUNTING.with(|c| c.set(true));
-        {
+        let ((), counts) = counted(|| {
             let mut burst = PostBurst::new();
             a.post_in(&mut burst, ea);
             b.post_in(&mut burst, eb);
-        }
-        COUNTING.with(|c| c.set(false));
-        assert!(
-            epics_base_rs::runtime::task::in_test_ioc_thread(),
-            "counted off an IOC thread"
-        );
+        });
         // C's ring is allocated with the queue, so the first round is
         // steady state too.
-        assert_eq!(CALLS.with(Cell::get), 0, "round {round}");
+        assert_eq!((counts.allocs, counts.frees), (0, 0), "round {round}");
         if round > 0 {
             assert_eq!(wakes.0.load(Ordering::SeqCst), round as usize);
         }
@@ -135,32 +90,21 @@ fn a_parked_poll_recv_reader_costs_its_post_nothing_body() {
     for round in 0..4 {
         let event = ev(round);
         assert!(reader.poll_recv(&mut cx).is_pending());
-        CALLS.with(|n| n.set(0));
-        COUNTING.with(|c| c.set(true));
-        sink.post(event);
-        COUNTING.with(|c| c.set(false));
-        assert!(
-            epics_base_rs::runtime::task::in_test_ioc_thread(),
-            "counted off an IOC thread"
-        );
-        assert_eq!(CALLS.with(Cell::get), 0, "round {round}");
+        let (_, counts) = counted(|| sink.post(event));
+        assert_eq!((counts.allocs, counts.frees), (0, 0), "round {round}");
         assert_eq!(wakes.0.load(Ordering::SeqCst), round as usize + 1);
         assert!(matches!(reader.poll_recv(&mut cx), Poll::Ready(Some(_))));
     }
 }
 
-/// `f` under the counter: (allocator calls, frees).
-fn counted<R>(f: impl FnOnce() -> R) -> (R, usize, usize) {
-    CALLS.with(|n| n.set(0));
-    FREES.with(|n| n.set(0));
-    COUNTING.with(|c| c.set(true));
-    let r = f();
-    COUNTING.with(|c| c.set(false));
+/// `f` under the counter.
+fn counted<R>(f: impl FnOnce() -> R) -> (R, Counts) {
+    let (r, counts) = thread::counted(f);
     assert!(
         epics_base_rs::runtime::task::in_test_ioc_thread(),
         "counted off an IOC thread"
     );
-    (r, CALLS.with(Cell::get), FREES.with(Cell::get))
+    (r, counts)
 }
 
 /// Every arm of C `db_queue_event_log` on a by-value monitor writes into the
@@ -178,8 +122,12 @@ fn a_val_post_allocates_nothing_on_any_arm_body() {
     let mut replaced = 0;
     for v in 0..event_que_size() as i32 {
         let event = ev(v);
-        let (outcome, calls, _) = counted(|| sink.post(event));
-        assert_eq!(calls, 0, "post {v}: {outcome:?}");
+        let (outcome, counts) = counted(|| sink.post(event));
+        assert_eq!(
+            (counts.allocs, counts.frees),
+            (0, 0),
+            "post {v}: {outcome:?}"
+        );
         match outcome {
             PostOutcome::Appended { .. } => appended += 1,
             PostOutcome::Replaced => replaced += 1,
@@ -191,8 +139,12 @@ fn a_val_post_allocates_nothing_on_any_arm_body() {
     user.flow_ctrl_on();
     for v in 0..3 {
         let event = ev(v);
-        let (outcome, calls, _) = counted(|| sink.post(event));
-        assert_eq!(calls, 0, "flow control post {v}: {outcome:?}");
+        let (outcome, counts) = counted(|| sink.post(event));
+        assert_eq!(
+            (counts.allocs, counts.frees),
+            (0, 0),
+            "flow control post {v}: {outcome:?}"
+        );
     }
     assert_eq!(reader.npend(), 1, "flow control replaced in place");
 }
@@ -222,16 +174,19 @@ fn a_filter_copy_is_freed_on_replace_or_by_the_consumer_only_body() {
     let user = EventUser::new();
     let (sink, mut reader) = attach(&user, 1, LogKind::Ref);
     let first = owned(1.0);
-    let (_, _, frees) = counted(|| sink.post(first));
-    assert_eq!(frees, 0, "an append keeps the copy");
+    let (_, counts) = counted(|| sink.post(first));
+    assert_eq!(counts.deallocs, 0, "an append keeps the copy");
     user.flow_ctrl_on();
     let second = owned(2.0);
-    let (outcome, _, frees) = counted(|| sink.post(second));
+    let (outcome, counts) = counted(|| sink.post(second));
     assert_eq!(outcome, PostOutcome::Replaced);
-    assert!(frees > 0, "the replace frees the copy it displaces");
+    assert!(
+        counts.deallocs > 0,
+        "the replace frees the copy it displaces"
+    );
     user.flow_ctrl_off();
-    let (event, _, frees) = counted(|| reader.try_recv().unwrap());
-    assert_eq!(frees, 0, "taking the entry moves the copy out");
-    let (_, _, frees) = counted(|| drop(event));
-    assert!(frees > 0, "the consumer frees it");
+    let (event, counts) = counted(|| reader.try_recv().unwrap());
+    assert_eq!(counts.deallocs, 0, "taking the entry moves the copy out");
+    let ((), counts) = counted(|| drop(event));
+    assert!(counts.deallocs > 0, "the consumer frees it");
 }

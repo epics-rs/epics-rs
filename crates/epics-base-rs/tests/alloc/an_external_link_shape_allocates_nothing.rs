@@ -1,52 +1,21 @@
 //! A scan cycle asks an external link for its DBF type, element count and
 //! put admission without allocating: C reads them off the `caLink`
 //! (`dbCaGetLinkDBFtype` / `dbCaGetNelements`, `dbCa.c:633-675`), whatever
-//! units and description the channel's metadata carries. Counted with this
-//! binary's own allocator on the scan thread, 100 cycles; a local CA link,
+//! units and description the channel's metadata carries. Counted with the
+//! alloc binary's allocator on the scan thread, 100 cycles; a local CA link,
 //! the target served by this database.
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use alloc_count::thread;
 use epics_base_rs::error::CaError;
 use epics_base_rs::runtime::task::{MandatoryThread, StackSizeClass, ThreadPriority};
 use epics_base_rs::server::database::{ProcStack, PvDatabase};
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::records::acalcout::AcalcoutRecord;
 use epics_base_rs::server::records::scalcout::ScalcoutRecord;
-
-thread_local! {
-    static COUNTING: Cell<bool> = const { Cell::new(false) };
-    static ALLOCS: Cell<usize> = const { Cell::new(0) };
-}
-
-struct Counting;
-
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if COUNTING.with(Cell::get) {
-            ALLOCS.with(|n| n.set(n.get() + 1));
-        }
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        if COUNTING.with(Cell::get) {
-            ALLOCS.with(|n| n.set(n.get() + 1));
-        }
-        unsafe { System.realloc(ptr, layout, size) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(ptr, layout) }
-    }
-}
-
-#[global_allocator]
-static GLOBAL: Counting = Counting;
 
 const DB: &str = r#"
 record(ai, "X") { field(EGU, "mm") field(DESC, "d") }
@@ -87,7 +56,7 @@ async fn ioc() -> Arc<PvDatabase> {
 }
 
 /// What 100 cycles of `rec` allocate on a scan thread.
-fn allocs(db: &Arc<PvDatabase>, rec: &'static str) -> usize {
+fn allocs(db: &Arc<PvDatabase>, rec: &'static str) -> u64 {
     let (tx, rx) = std::sync::mpsc::channel();
     let db = db.clone();
     MandatoryThread::new("scan-1", ThreadPriority::ScanLow, StackSizeClass::Big).spawn(move || {
@@ -100,13 +69,11 @@ fn allocs(db: &Arc<PvDatabase>, rec: &'static str) -> usize {
             cycle(&mut ProcStack::new());
         }
         let mut visited = ProcStack::new();
-        ALLOCS.with(|n| n.set(0));
-        COUNTING.with(|c| c.set(true));
+        let window = thread::open();
         for _ in 0..100 {
             cycle(&mut visited);
         }
-        COUNTING.with(|c| c.set(false));
-        tx.send(ALLOCS.with(Cell::get)).unwrap();
+        tx.send(window.close().allocs).unwrap();
     });
     rx.recv_timeout(fact_budget::FACT_BUDGET)
         .expect("the cycle wedged")

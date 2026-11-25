@@ -1,49 +1,22 @@
 //! The put row is picked under the destination record's lock, so it must not
-//! clone the field to learn its shape. Counted with this binary's own
+//! clone the field to learn its shape. Counted with the alloc binary's
 //! allocator; only the calling thread's allocations inside `count` are seen.
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
 use std::collections::HashMap;
 
+use alloc_count::thread;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::record::{coerce_put_value, dbput_coerce_value};
 use epics_base_rs::types::c_parse::Converted;
 use epics_base_rs::types::{DbFieldType, EpicsValue, PvString};
 
-struct Counting;
-
-thread_local! {
-    static COUNTING: Cell<bool> = const { Cell::new(false) };
-    static ALLOCS: Cell<usize> = const { Cell::new(0) };
-}
-
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if COUNTING.with(Cell::get) {
-            ALLOCS.with(|n| n.set(n.get() + 1));
-        }
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(ptr, layout) }
-    }
-}
-
-#[global_allocator]
-static GLOBAL: Counting = Counting;
-
-fn count<T>(f: impl FnOnce() -> T) -> (T, usize) {
-    ALLOCS.with(|n| n.set(0));
-    COUNTING.with(|c| c.set(true));
-    let out = f();
-    COUNTING.with(|c| c.set(false));
+fn count<T>(f: impl FnOnce() -> T) -> (T, u64) {
+    let (out, counts) = thread::counted(f);
     assert!(
         epics_base_rs::runtime::task::in_test_ioc_thread(),
         "counted off an IOC thread"
     );
-    (out, ALLOCS.with(Cell::get))
+    (out, counts.allocs)
 }
 
 #[test]

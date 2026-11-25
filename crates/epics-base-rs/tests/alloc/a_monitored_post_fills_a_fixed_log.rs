@@ -2,56 +2,19 @@
 //! own fields (`db_create_field_log`, `dbEvent.c:700-738`): stat, sevr, the
 //! amsg cut to 39 bytes and a NUL, time, utag, and a scalar value. Nothing
 //! else is built, so a monitored post allocates no more than an unmonitored
-//! one. Counted with this binary's own allocator on the calling thread.
+//! one. Counted with the alloc binary's allocator on the calling thread.
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Wake};
 
+use alloc_count::thread;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::event_queue::{EventUser, no_context};
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
-
-struct Counting;
-
-thread_local! {
-    static COUNTING: Cell<bool> = const { Cell::new(false) };
-    static ALLOCS: Cell<usize> = const { Cell::new(0) };
-    static FREES: Cell<usize> = const { Cell::new(0) };
-}
-
-fn count(n: &'static std::thread::LocalKey<Cell<usize>>) {
-    if COUNTING.with(Cell::get) {
-        n.with(|n| n.set(n.get() + 1));
-    }
-}
-
-// SAFETY: forwards every call to `System` unchanged; the counters are
-// const-initialised thread-local `Cell`s, which never allocate.
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        count(&ALLOCS);
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        count(&ALLOCS);
-        unsafe { System.realloc(ptr, layout, size) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        count(&FREES);
-        unsafe { System.dealloc(ptr, layout) }
-    }
-}
-
-#[global_allocator]
-static GLOBAL: Counting = Counting;
 
 const DB: &str = r#"
 record(calc, "C") { field(CALC, "A") }
@@ -70,27 +33,25 @@ async fn ioc() -> Arc<PvDatabase> {
 
 /// Allocations and frees per `dbPut` of `C.VAL`, whose non-pp value field
 /// posts from `dbPut` itself (`dbAccess.c:1414`).
-async fn per_put(db: &PvDatabase) -> (usize, usize) {
+async fn per_put(db: &PvDatabase) -> (u64, u64) {
     for n in 0..10 {
         db.put_pv("C.VAL", EpicsValue::Double(f64::from(n)))
             .await
             .unwrap();
     }
-    const N: usize = 100;
-    ALLOCS.with(|n| n.set(0));
-    FREES.with(|n| n.set(0));
-    COUNTING.with(|c| c.set(true));
+    const N: u64 = 100;
+    let window = thread::open();
     for n in 0..N {
         db.put_pv("C.VAL", EpicsValue::Double(n as f64))
             .await
             .unwrap();
     }
-    COUNTING.with(|c| c.set(false));
+    let counts = window.close();
     assert!(
         epics_base_rs::runtime::task::in_test_ioc_thread(),
         "counted off an IOC thread"
     );
-    (ALLOCS.with(Cell::get) / N, FREES.with(Cell::get) / N)
+    (counts.allocs / N, counts.deallocs / N)
 }
 
 /// The post a `dbPut` makes to a monitored field costs it nothing over the

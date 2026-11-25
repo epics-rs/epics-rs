@@ -1,49 +1,18 @@
 //! A lend of a record to device code allocates nothing on release, whatever
 //! the type: a release that cloned a string field out by name was a malloc
 //! per I/O Intr callback, and per cycle on the scan thread for a held-API
-//! device. Counted with this binary's own allocator on the calling thread,
+//! device. Counted with the alloc binary's allocator on the calling thread,
 //! every string metadata field set.
 
-#[path = "integration/module_records/mod.rs"]
+#[path = "../integration/module_records/mod.rs"]
 mod module_records;
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
 use std::collections::HashMap;
 
+use alloc_count::thread;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::record::dbd_generated::{RECORD_TYPES, record_fields};
 use epics_base_rs::types::DbFieldType;
-
-struct Counting;
-
-thread_local! {
-    static COUNTING: Cell<bool> = const { Cell::new(false) };
-    static ALLOCS: Cell<usize> = const { Cell::new(0) };
-}
-
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if COUNTING.with(Cell::get) {
-            ALLOCS.with(|n| n.set(n.get() + 1));
-        }
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        if COUNTING.with(Cell::get) {
-            ALLOCS.with(|n| n.set(n.get() + 1));
-        }
-        unsafe { System.realloc(ptr, layout, size) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(ptr, layout) }
-    }
-}
-
-#[global_allocator]
-static GLOBAL: Counting = Counting;
 
 /// The string fields the metadata reads.
 const STRING_SOURCES: &[&str] = &[
@@ -92,13 +61,11 @@ async fn a_lend_allocates_nothing_on_any_record_type_body() {
             handle.with_record(&name, |_| {});
         }
         const N: usize = 100;
-        ALLOCS.with(|n| n.set(0));
-        COUNTING.with(|c| c.set(true));
+        let window = thread::open();
         for _ in 0..N {
             handle.with_record(&name, |_| {});
         }
-        COUNTING.with(|c| c.set(false));
-        let allocs = ALLOCS.with(Cell::get);
+        let allocs = window.close().allocs;
         if allocs != 0 {
             allocating.push(format!("{record_type}: {allocs} in {N} lends"));
         }

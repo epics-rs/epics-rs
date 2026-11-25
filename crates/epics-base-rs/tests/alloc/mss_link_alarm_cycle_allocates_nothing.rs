@@ -4,50 +4,17 @@
 //! 232`). Here the copy shares the source's text and a steady message is a
 //! pointer compare, so the reader's cycle allocates nothing — the message
 //! changing included: only the source's own new text is an allocation.
-//! Counted on a primed IOC thread with this binary's own allocator.
+//! Counted on a primed IOC thread with the alloc binary's allocator.
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use alloc_count::thread;
 use epics_base_rs::runtime::task::{MandatoryThread, StackSizeClass, ThreadPriority};
 use epics_base_rs::server::database::{ProcStack, PvDatabase};
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::recgbl::alarm_status;
 use epics_base_rs::server::record::AlarmSeverity;
-
-thread_local! {
-    static COUNTING: Cell<bool> = const { Cell::new(false) };
-    static ALLOCS: Cell<usize> = const { Cell::new(0) };
-}
-
-struct Counting;
-
-// SAFETY: forwards every call to `System` unchanged; the counters are
-// const-initialised thread-local `Cell`s, which never allocate.
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if COUNTING.with(Cell::get) {
-            ALLOCS.with(|n| n.set(n.get() + 1));
-        }
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        if COUNTING.with(Cell::get) {
-            ALLOCS.with(|n| n.set(n.get() + 1));
-        }
-        unsafe { System.realloc(ptr, layout, size) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(ptr, layout) }
-    }
-}
-
-#[global_allocator]
-static GLOBAL: Counting = Counting;
 
 const DB: &str = r#"
 record(ai, "MSS:SRC") {}
@@ -55,7 +22,7 @@ record(ai, "MSS:RD") { field(INP, "MSS:SRC NPP MSS") }
 "#;
 
 /// Allocations 100 cycles of `MSS:RD` make on a primed scan thread.
-fn allocs(db: Arc<PvDatabase>) -> usize {
+fn allocs(db: Arc<PvDatabase>) -> u64 {
     let (tx, rx) = std::sync::mpsc::channel();
     MandatoryThread::new("scan-1", ThreadPriority::ScanLow, StackSizeClass::Big).spawn(move || {
         for _ in 0..3 {
@@ -63,14 +30,12 @@ fn allocs(db: Arc<PvDatabase>) -> usize {
                 .unwrap();
         }
         let mut visited = ProcStack::new();
-        ALLOCS.with(|n| n.set(0));
-        COUNTING.with(|c| c.set(true));
+        let window = thread::open();
         for _ in 0..100 {
             db.process_record_with_links_already_locked("MSS:RD", &mut visited)
                 .unwrap();
         }
-        COUNTING.with(|c| c.set(false));
-        tx.send(ALLOCS.with(Cell::get)).unwrap();
+        tx.send(window.close().allocs).unwrap();
     });
     rx.recv().unwrap()
 }

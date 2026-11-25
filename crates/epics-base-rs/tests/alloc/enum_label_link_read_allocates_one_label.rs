@@ -1,38 +1,14 @@
 //! A `DBR_STRING` link read of an enum VAL renders one state label: a
 //! stringin reading an mbbi with 16 states, or a bo, allocates no more per
 //! process than one reading another stringin.
-//! Counted with this binary's own allocator over 1000 processes; only the
+//! Counted with the alloc binary's allocator over 1000 processes; only the
 //! calling thread's allocations inside `count` are seen.
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
 use std::collections::HashMap;
 
+use alloc_count::thread;
 use epics_base_rs::server::database::{ProcStack, PvDatabase};
 use epics_base_rs::server::ioc_builder::IocBuilder;
-
-struct Counting;
-
-thread_local! {
-    static COUNTING: Cell<bool> = const { Cell::new(false) };
-    static ALLOCS: Cell<usize> = const { Cell::new(0) };
-}
-
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if COUNTING.with(Cell::get) {
-            ALLOCS.with(|n| n.set(n.get() + 1));
-        }
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(ptr, layout) }
-    }
-}
-
-#[global_allocator]
-static GLOBAL: Counting = Counting;
 
 const DB: &str = r#"
 record(mbbi, "M") {
@@ -49,21 +25,20 @@ record(stringin, "SI_B") { field(INP, "B NPP") }
 record(stringin, "SI_S") { field(INP, "S NPP") }
 "#;
 
-async fn allocs_over_1000(db: &PvDatabase, rec: &str) -> usize {
+async fn allocs_over_1000(db: &PvDatabase, rec: &str) -> u64 {
     let mut stack = ProcStack::new();
     db.process_record_with_links(rec, &mut stack).await.unwrap();
-    ALLOCS.with(|n| n.set(0));
-    COUNTING.with(|c| c.set(true));
+    let window = thread::open();
     for _ in 0..1000 {
         let mut stack = ProcStack::new();
         db.process_record_with_links(rec, &mut stack).await.unwrap();
     }
-    COUNTING.with(|c| c.set(false));
+    let allocs = window.close().allocs;
     assert!(
         epics_base_rs::runtime::task::in_test_ioc_thread(),
         "counted off an IOC thread"
     );
-    ALLOCS.with(Cell::get)
+    allocs
 }
 
 #[test]

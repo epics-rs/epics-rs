@@ -2,74 +2,25 @@
 //! watched or not: C's `dbProcess` reaches each link through its parsed
 //! `DBLINK` (`dbAccess.c` `dbGetLink`) and resolves no link metadata, which
 //! `dbGet` reads only when a consumer asks (`dbDbLink.c:414-415`). Counted
-//! per thread name with this binary's own allocator.
+//! per thread name with the alloc binary's allocator.
 //!
 //! Tokio only: the thread backend's scan driver allocates a waker per park
 //! (`ThreadWaker::for_current_thread`), a count that varies per tick.
 
 #![cfg(tokio_backend)]
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use alloc_count::named::{self, Name};
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::database::db_access::DbSubscription;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::scan::ScanOwner;
 use epics_base_rs::types::EpicsValue;
 
-const SCAN_THREAD: &str = "scan-0.1";
-
-thread_local! {
-    /// 0 not yet asked, 1 `scan-0.1`, 2 any other thread. Asking may itself
-    /// allocate; that reentry reads 2 and is not counted.
-    static ON_SCAN: Cell<u8> = const { Cell::new(0) };
-}
-
-static ALLOCS: AtomicU64 = AtomicU64::new(0);
-
-fn on_scan() -> bool {
-    ON_SCAN.with(|s| match s.get() {
-        0 => {
-            s.set(2);
-            let yes = std::thread::current().name() == Some(SCAN_THREAD);
-            s.set(if yes { 1 } else { 2 });
-            yes
-        }
-        v => v == 1,
-    })
-}
-
-struct Counting;
-
-// SAFETY: forwards every call to `System` unchanged; the thread test reads a
-// const-initialised thread-local and the counter is an atomic.
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if on_scan() {
-            ALLOCS.fetch_add(1, Ordering::Relaxed);
-        }
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        if on_scan() {
-            ALLOCS.fetch_add(1, Ordering::Relaxed);
-        }
-        unsafe { System.realloc(ptr, layout, size) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(ptr, layout) }
-    }
-}
-
-#[global_allocator]
-static GLOBAL: Counting = Counting;
+static SCAN_THREAD: [Name; 1] = [Name::Exact("scan-0.1")];
 
 const N: usize = 20;
 
@@ -113,26 +64,28 @@ fn tick(db: &PvDatabase) -> u64 {
     }
 }
 
-/// The counter and the tick, read in the idle gap after a sweep, so a window
-/// holds whole sweeps only.
-fn between_sweeps(db: &PvDatabase) -> (u64, u64) {
+/// The tick, read in the idle gap after a sweep, so a window holds whole
+/// sweeps only.
+fn between_sweeps(db: &PvDatabase) -> u64 {
     let t = tick(db);
     while tick(db) == t {
         std::thread::sleep(Duration::from_millis(1));
     }
     std::thread::sleep(Duration::from_millis(40));
-    (ALLOCS.load(Ordering::Relaxed), tick(db))
+    tick(db)
 }
 
 /// Allocations per tick on `scan-0.1`, over at least 20 ticks.
 fn allocs_per_tick(db: &PvDatabase) -> (u64, u64) {
     std::thread::sleep(Duration::from_secs(1));
-    let (a0, t0) = between_sweeps(db);
+    let t0 = between_sweeps(db);
+    let window = named::open(&SCAN_THREAD);
     std::thread::sleep(Duration::from_secs(2));
-    let (a1, t1) = between_sweeps(db);
+    let t1 = between_sweeps(db);
+    let [allocs] = window.close().map(|c| c.allocs);
     let ticks = t1 - t0;
     assert!(ticks >= 10, "scan-0.1 ran {ticks} ticks in 2 s");
-    (a1 - a0, ticks)
+    (allocs, ticks)
 }
 
 /// The cycle allocates nothing unwatched, and `monitors` subscribers per

@@ -9,9 +9,8 @@ use std::fmt;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::thread;
-use std::time::Duration;
 
 use epics_base_rs::runtime::task::{Reactor, StackSizeClass};
 use epics_base_rs::runtime::worker_pool::ThreadCharge;
@@ -23,7 +22,7 @@ use super::config::PvaServerConfig;
 use super::driver::{self, BeaconSender, DriverKind, PvaServerDriver};
 use super::report::{Liveness, LivenessGuard, Running, ServerReportHandle, pvxs_config_text};
 use super::search_engine::{SearchReplier, ServerInterfaces};
-use super::serv_iface::ServListeners;
+use super::serv_iface::{ServListeners, ServeGate};
 use super::shared_pv::SharedSource;
 use super::source::DynSource;
 use crate::error::{PvaError, PvaResult};
@@ -96,37 +95,22 @@ impl Drop for SearchSockets {
     }
 }
 
-/// How [`BoundPva::serve`] ended, once it has.
-enum Started {
-    Running(SearchReplier),
-    Failed,
+/// The one decision that lets clients see the server, the listeners'
+/// [`ServeGate`], and who answers a SEARCH once it opens: every accept loop,
+/// search answer and beacon waits on it, `serve` opens it only once every
+/// serving thread exists, and a stop closes all three. pvxs's
+/// `Server::Pvt::start` enables its listeners, search and beacon timer in
+/// turn and only logs an error between them (`server.cpp:555-599`), so its
+/// start cannot partly fail.
+struct RunGate {
+    gate: Arc<ServeGate>,
+    replier: OnceLock<SearchReplier>,
 }
 
-/// The one decision that lets clients see the server: every accept loop,
-/// search answer and beacon waits on it, and `serve` makes it only once
-/// every serving thread exists. pvxs's `Server::Pvt::start` enables its
-/// listeners, search and beacon timer in turn and only logs an error between
-/// them (`server.cpp:555-599`), so its start cannot partly fail.
-#[derive(Default)]
-struct RunGate(OnceLock<Started>);
-
 impl RunGate {
-    /// Who answers a SEARCH: nobody before the start succeeded.
+    /// Who answers a SEARCH: nobody unless the server serves.
     fn replier(&self) -> Option<&SearchReplier> {
-        match self.0.get() {
-            Some(Started::Running(replier)) => Some(replier),
-            _ => None,
-        }
-    }
-
-    /// Until `serve` has ended; whether it succeeded.
-    fn wait(&self) -> bool {
-        matches!(self.0.wait(), Started::Running(_))
-    }
-
-    /// The first decision is final.
-    fn decide(&self, started: Started) {
-        let _ = self.0.set(started);
+        self.replier.get().filter(|_| self.gate.serving())
     }
 }
 
@@ -139,16 +123,18 @@ struct Starting {
 }
 
 impl Starting {
-    /// Every thread exists: let them serve, and let them go.
+    /// Every thread exists: let them serve as `replier`, unless a stop came
+    /// first, and let them go.
     fn open(mut self, replier: SearchReplier) {
-        self.run.decide(Started::Running(replier));
+        let _ = self.run.replier.set(replier);
+        self.run.gate.open();
         self.threads.clear();
     }
 }
 
 impl Drop for Starting {
     fn drop(&mut self) {
-        self.run.decide(Started::Failed);
+        self.run.gate.fail();
         for thread in self.threads.drain(..) {
             let _ = thread.join();
         }
@@ -218,7 +204,10 @@ impl PvaSockets {
                 cause,
             })?;
         let (ended_tx, ended) = mpsc::unbounded_channel();
-        let run = Arc::new(RunGate::default());
+        let run = Arc::new(RunGate {
+            gate: listeners.gate().clone(),
+            replier: OnceLock::new(),
+        });
         let search = match search {
             Ok(sockets) => Ok(read_search(
                 sockets,
@@ -352,7 +341,10 @@ impl BoundPva {
     /// beacons, all at once and only when every serving thread exists. A
     /// thread that cannot be created fails the start with nothing accepted,
     /// answered or beaconed: the threads already made are joined and every
-    /// listener is closed when the `Err` returns.
+    /// listener is closed when the `Err` returns. A server shut down before
+    /// or during the start opens nothing and still returns `Ok`, as one shut
+    /// down just after it does: which side of the start a stop lands on is a
+    /// race, so the result must not depend on it.
     pub fn serve(self, reactor: &Reactor) -> Result<PvaServing, ServeError> {
         self.serve_with(reactor, &mut |_| Ok(()))
     }
@@ -364,7 +356,6 @@ impl BoundPva {
         reactor: &Reactor,
         admit: &mut dyn FnMut(&'static str) -> io::Result<()>,
     ) -> Result<PvaServing, ServeError> {
-        let beacon_stop = Arc::new(BeaconStop::default());
         let mut starting = Starting {
             run: self.run.clone(),
             threads: Vec::with_capacity(2),
@@ -380,7 +371,7 @@ impl BoundPva {
             move || {
                 let started = Box::new(|| {
                     let _ = up_tx.send(Ok(()));
-                    run.wait()
+                    run.gate.wait()
                 });
                 if let Err(e) = srv.serve(&conn_reactor, started) {
                     let _ = up_tx.send(Err(e));
@@ -392,7 +383,7 @@ impl BoundPva {
         up.recv()
             .unwrap_or_else(|_| Err(io::Error::other("PVAS-TCP panicked")))
             .map_err(|e| ServeError::Thread("PVAS-TCP", e))?;
-        let (beacons, stop, run) = (self.beacons, beacon_stop.clone(), self.run.clone());
+        let (beacons, run) = (self.beacons, self.run.clone());
         let (_, beacon_guard) = Liveness::guarded();
         let beacon = serving_thread(
             admit,
@@ -400,8 +391,8 @@ impl BoundPva {
             beacon_guard,
             self.ended_tx.clone(),
             move || {
-                if run.wait() {
-                    beacons.run(&mut |d| stop.sleep(d));
+                if run.gate.wait() {
+                    beacons.run(&mut |d| run.gate.sleep(d));
                 }
                 Ok(())
             },
@@ -439,7 +430,6 @@ impl BoundPva {
         };
         Ok(PvaServing {
             server: self.server,
-            beacon_stop,
             kind: self.kind,
             _search: self.search,
             ended: self.ended,
@@ -453,7 +443,6 @@ impl BoundPva {
 /// dropped task does.
 pub struct PvaServing {
     server: Arc<dyn PvaServerDriver>,
-    beacon_stop: Arc<BeaconStop>,
     kind: DriverKind,
     /// Held for its drop, which ends the search readers.
     _search: SearchBind,
@@ -485,31 +474,6 @@ impl PvaServing {
 impl Drop for PvaServing {
     fn drop(&mut self) {
         self.server.shutdown();
-        self.beacon_stop.stop();
-    }
-}
-
-/// The `PVAS-beacon` thread's sleep, cut short when serving ends.
-#[derive(Default)]
-struct BeaconStop {
-    stopped: Mutex<bool>,
-    wake: Condvar,
-}
-
-impl BeaconStop {
-    /// Sleep `period` or until [`stop`](Self::stop); `true` once stopped.
-    fn sleep(&self, period: Duration) -> bool {
-        let stopped = self.stopped.lock().unwrap_or_else(|e| e.into_inner());
-        let (stopped, _) = self
-            .wake
-            .wait_timeout_while(stopped, period, |s| !*s)
-            .unwrap_or_else(|e| e.into_inner());
-        *stopped
-    }
-
-    fn stop(&self) {
-        *self.stopped.lock().unwrap_or_else(|e| e.into_inner()) = true;
-        self.wake.notify_all();
     }
 }
 
@@ -1024,6 +988,7 @@ mod tests {
     #[test]
     fn a_busy_accept_loop_shuts_down_with_a_full_backlog() {
         use fact_budget::FACT_BUDGET;
+        use std::sync::Mutex;
         use std::sync::mpsc::{Receiver, SyncSender, channel, sync_channel};
         use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 
@@ -1290,6 +1255,123 @@ mod tests {
                     .recv(&mut buf)
                     .expect("a SEARCH_RESPONSE once served");
                 assert_eq!(buf[..n][3], Command::SearchResponse.code());
+            }
+        }
+    }
+
+    /// A stop before, during or just after the start leaves `serve` `Ok`
+    /// either way, and from the stop the server answers no SEARCH and sends
+    /// no beacon, on either driver: a stopped server advertises nothing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stopped_server_answers_no_search_and_sends_no_beacon() {
+        use crate::proto::Command;
+        use crate::server_native::blocking::tests::origin_tag_member;
+        use fact_budget::FACT_BUDGET;
+        use std::net::UdpSocket;
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum Stop {
+            Before,
+            During,
+            After,
+        }
+        let codec = crate::codec::PvaCodec { big_endian: false };
+        for kind in [DriverKind::Blocking, DriverKind::Reactor] {
+            for stop in [Stop::Before, Stop::During, Stop::After] {
+                let beacons = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+                let mut sockets = PvaSockets::bind(PvaServerConfig {
+                    beacon_destinations: vec![beacons.local_addr().unwrap().into()],
+                    ..on_interfaces(&["127.0.0.1"])
+                })
+                .expect("bind");
+                sockets.kind = kind;
+                let udp_port = sockets.report_handle().report().udp_port;
+                let member = origin_tag_member(udp_port);
+                member.set_read_timeout(Some(FACT_BUDGET)).unwrap();
+                let (client, sink) = (
+                    UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap(),
+                    UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap(),
+                );
+                socket2::SockRef::from(&client)
+                    .set_multicast_if_v4(&Ipv4Addr::LOCALHOST)
+                    .unwrap();
+                let group =
+                    SocketAddr::from((epics_base_rs::net::ORIGIN_TAG_MCAST_GROUP, udp_port));
+                // Whether a SEARCH for `dut` on the group is answered: a
+                // unicast one queued behind it on the collector is forwarded
+                // to the group only once the collector has sent any answer.
+                let answered = |seq: u32| {
+                    let reply = client.local_addr().unwrap().port();
+                    let mut frame =
+                        crate::codec::PvaCodec::build_origin_tag_prefix(Ipv4Addr::LOCALHOST)
+                            .to_vec();
+                    frame.extend(codec.build_search(seq, 7, "dut", [127, 0, 0, 1], reply, false));
+                    client.send_to(&frame, group).unwrap();
+                    let probe = format!("probe.{seq}");
+                    let reply = sink.local_addr().unwrap().port();
+                    let unicast = codec.build_search(seq, 8, &probe, [127, 0, 0, 1], reply, true);
+                    client
+                        .send_to(&unicast, (Ipv4Addr::LOCALHOST, udp_port))
+                        .unwrap();
+                    let mut buf = [0u8; 1500];
+                    loop {
+                        let n = member.recv(&mut buf).expect("the probe's forward");
+                        if buf[..n].windows(probe.len()).any(|w| w == probe.as_bytes()) {
+                            break;
+                        }
+                    }
+                    client.set_nonblocking(true).unwrap();
+                    let reply = client.recv(&mut buf);
+                    client.set_nonblocking(false).unwrap();
+                    reply.is_ok_and(|n| buf[..n][3] == Command::SearchResponse.code())
+                };
+
+                let bound = BoundPva::attach(sockets, test_source()).expect("attach");
+                let server = bound.server().clone();
+                if stop == Stop::Before {
+                    server.shutdown();
+                }
+                let mut serving = bound
+                    .serve_with(&harness_reactor(), &mut |name| {
+                        if stop == Stop::During && name == "PVAS-beacon" {
+                            server.shutdown();
+                        }
+                        Ok(())
+                    })
+                    .unwrap_or_else(|e| panic!("{kind:?} {stop:?}: {e}"));
+                if stop == Stop::After {
+                    beacons.set_read_timeout(Some(FACT_BUDGET)).unwrap();
+                    beacons.recv(&mut [0u8; 256]).expect("a beacon once served");
+                    assert!(answered(1), "{kind:?}: not served before the stop");
+                    server.shutdown();
+                }
+                assert!(!answered(3), "{kind:?} {stop:?}: a SEARCH answered");
+                // The accept and beacon threads both end at the stop, so
+                // no beacon follows.
+                let deadline = Instant::now() + FACT_BUDGET;
+                for _ in 0..2 {
+                    loop {
+                        if let Ok(ended) = serving.ended.try_recv() {
+                            ended.expect("a serving thread's end");
+                            break;
+                        }
+                        assert!(
+                            Instant::now() < deadline,
+                            "{kind:?} {stop:?}: still beaconing or accepting after the stop"
+                        );
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                }
+                if stop != Stop::After {
+                    beacons.set_nonblocking(true).unwrap();
+                    let beacon = beacons.recv(&mut [0u8; 256]);
+                    assert!(
+                        beacon
+                            .as_ref()
+                            .is_err_and(|e| e.kind() == io::ErrorKind::WouldBlock),
+                        "{kind:?} {stop:?}: beaconed {beacon:?}"
+                    );
+                }
             }
         }
     }

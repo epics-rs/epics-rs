@@ -904,15 +904,10 @@ pub(crate) struct ClientState {
     channels: HashMap<u32, ChannelEntry>,
     /// Keyed by slot, never sub_id, which a client may install twice.
     subscriptions: HashMap<epics_base_rs::server::event_queue::AttachId, SubscriptionEntry>,
-    channel_access: HashMap<u32, AccessLevel>,
-    /// per-SID write-trap mask of the ACF rule that resolved
-    /// the channel's access level. Kept parallel to `channel_access`
-    /// (same key set, inserted/removed together) because the trap
-    /// flag has no `CA_PROTO_ACCESS_RIGHTS` wire representation — it
-    /// is consumed only by TRAPWRITE put-logging dispatch, never
-    /// diffed for access-rights transition frames. Mirrors C
-    /// `pasgclient->trapMask` (`asLibRoutines.c:1048`).
-    channel_trap: HashMap<u32, bool>,
+    /// Per SID, the rights the client was last sent in
+    /// `CA_PROTO_ACCESS_RIGHTS`. Only [`reeval_access_rights`] compares
+    /// against it, to send a notice on a transition; no check reads it.
+    advertised_access: HashMap<u32, AccessLevel>,
     /// Monitor ids [`destroy_channel`] retired but could not finish tearing
     /// down, because the delivery machinery lives in the driver's own
     /// registry. Drained by the driver after each dispatch — see
@@ -1122,8 +1117,7 @@ impl ClientState {
         Self {
             channels: HashMap::new(),
             subscriptions: HashMap::new(),
-            channel_access: HashMap::new(),
-            channel_trap: HashMap::new(),
+            advertised_access: HashMap::new(),
             retired_subscriptions: Vec::new(),
             retired: HashMap::new(),
             hostname: HostIdentity::Claimed(Vec::new()),
@@ -1314,24 +1308,24 @@ impl ClientState {
         }
     }
 
-    /// Return the type-state-wrapped access token for a
-    /// SID. Op handlers MUST consult this — direct reads of the
-    /// underlying `channel_access` HashMap bypass the typed gate
-    /// and recreate the missed-path defects fixed in rounds 38-39.
-    /// Missing SIDs map to a "denied" token so a corrupted
-    /// channel-table state can never silently grant access.
-    fn lookup_access(&self, sid: u32) -> crate::server::access_token::CaAccessChecked {
+    /// The type-state-wrapped access token for a SID, which every op
+    /// handler checks through. Computed from the ACF as it stands, as C
+    /// `asCheckGet`/`rsrvCheckPut` read the `pasgclient->access` asLib
+    /// updates before it notifies anyone (`asLibRoutines.c:1056-1059`,
+    /// `camessage.c:2608-2617`), so a revoked right is refused even while
+    /// the change's notice is still unsent. A SID with no channel is denied.
+    async fn current_access(&self, sid: u32) -> crate::server::access_token::CaAccessChecked {
         use crate::server::access_token::CaAccessChecked;
-        match self.channel_access.get(&sid).copied() {
-            Some(level) => {
-                // the trap mask is kept in a parallel map
-                // populated alongside `channel_access`. A missing
-                // entry means the rule carried no trap option.
-                let rule_was_trap = self.channel_trap.get(&sid).copied().unwrap_or(false);
-                CaAccessChecked::from_level(level, rule_was_trap)
-            }
-            None => CaAccessChecked::denied(),
-        }
+        let Some(entry) = self.channels.get(&sid) else {
+            return CaAccessChecked::denied();
+        };
+        let (bits, rule_was_trap) = self.compute_access(&entry.target).await;
+        let level = match bits {
+            3 => AccessLevel::ReadWrite,
+            1 => AccessLevel::Read,
+            _ => AccessLevel::NoAccess,
+        };
+        CaAccessChecked::from_level(level, rule_was_trap)
     }
 
     /// Evaluate `cfg`'s rules for `asg_name`.
@@ -2773,8 +2767,7 @@ fn destroy_channel(
     conn_events: Option<&broadcast::Sender<ServerConnectionEvent>>,
 ) -> Option<ChannelEntry> {
     let entry = state.channels.remove(&sid)?;
-    state.channel_access.remove(&sid);
-    state.channel_trap.remove(&sid);
+    state.advertised_access.remove(&sid);
     if let Some(tx) = conn_events {
         let _ = tx.send(ServerConnectionEvent::ChannelCleared {
             peer,
@@ -3342,7 +3335,7 @@ pub(crate) async fn dispatch_message(
                 }
             }
 
-            let (access, rule_was_trap) = state.compute_access(&target).await;
+            let (access, _) = state.compute_access(&target).await;
             let access_level = match access {
                 3 => AccessLevel::ReadWrite,
                 1 => AccessLevel::Read,
@@ -3367,11 +3360,7 @@ pub(crate) async fn dispatch_message(
                     subscriptions: Vec::new(),
                 },
             );
-            state.channel_access.insert(sid, access_level);
-            // keep the trap-mask map in lockstep with
-            // `channel_access` so `lookup_access` always finds a
-            // consistent pair for this SID.
-            state.channel_trap.insert(sid, rule_was_trap);
+            state.advertised_access.insert(sid, access_level);
 
             let mut ar = CaHeader::new(CA_PROTO_ACCESS_RIGHTS);
             ar.cid = client_cid;
@@ -3563,12 +3552,12 @@ pub(crate) async fn dispatch_message(
             }
 
             // Type-state:
-            // `state.lookup_access(sid)` is the only path to the
-            // access cache. `require_read()` returns a witness on
+            // `state.current_access(sid)` is the only path to the
+            // current rights. `require_read()` returns a witness on
             // success and an `AccessDenied` carrying the matching
             // ECA code on failure — no `if access ==` ad-hoc
             // comparison, no missing-entry default to argue about.
-            let _read_grant = match state.lookup_access(sid).require_read() {
+            let _read_grant = match state.current_access(sid).await.require_read() {
                 Ok(g) => g,
                 Err(denied) => {
                     if is_notify {
@@ -4413,7 +4402,7 @@ pub(crate) async fn serve_write_head(
         // `require_write` returns the matching ECA code on
         // denial.
         let entry_cid = entry.cid;
-        let write_grant = match state.lookup_access(sid).require_write() {
+        let write_grant = match state.current_access(sid).await.require_write() {
             Ok(g) => g,
             Err(denied) => {
                 if is_notify {
@@ -4547,8 +4536,8 @@ pub(crate) async fn serve_write_head(
     // deprecated WRITE carrying a bad type to a channel the peer cannot
     // write is now a silent drop, not ECA_NOWTACCESS + keep.
     //
-    // A type-state WRITE gate: `lookup_access` is the only path to the
-    // cache; the witness ensures the matching ECA code reaches the wire.
+    // A type-state WRITE gate: `current_access` is the only path to the
+    // rights; the witness ensures the matching ECA code reaches the wire.
     let wire_type = match AcceptedWriteType::classify(hdr.data_type) {
         Some(t) => t,
         None => {
@@ -4638,7 +4627,7 @@ pub(crate) async fn serve_write_head(
     };
 
     let write_grant = if is_notify {
-        let write_grant = match state.lookup_access(sid).require_write() {
+        let write_grant = match state.current_access(sid).await.require_write() {
             Ok(g) => g,
             Err(denied) => {
                 // route through the refinement helper so
@@ -4674,7 +4663,7 @@ pub(crate) async fn serve_write_head(
         // `cac::exception` never fired, so a `caput` from a read-only
         // peer looked like it had succeeded even though the value never
         // reached the DB.
-        match state.lookup_access(sid).require_write() {
+        match state.current_access(sid).await.require_write() {
             Ok(g) => g,
             Err(denied) => {
                 send_ca_error(
@@ -5962,7 +5951,7 @@ pub(crate) async fn register_subscription(
     // not re-arm anything. Capture access as a flag and let
     // the install path below populate the `denied` gate so
     // `reeval_access_rights` can flip it later (Bug 4 parity).
-    let access_denied = state.lookup_access(sid).require_read().is_err();
+    let access_denied = state.current_access(sid).await.require_read().is_err();
 
     let target = entry.target.clone();
     // C `pevext`, handed to `db_add_event` as `user_arg`: every entry of this
@@ -6275,14 +6264,17 @@ async fn next_event_step(
     let ctrl = control.recv();
     tokio::pin!(readers, writes, woke, ctrl);
 
-    match select(select(select(readers, writes), woke), ctrl).await {
-        Either::Left((Either::Left((Either::Left((step, _writes)), _woke)), _ctrl)) => step,
-        Either::Left((Either::Left((Either::Right(((res, idx), _readers)), _woke)), _ctrl)) => {
-            EventStep::WriteDone(idx, res)
-        }
-        Either::Left((Either::Right((TableWake::Destroyed, _)), _ctrl)) => EventStep::Destroyed,
-        Either::Left((Either::Right((TableWake::AccessChanged, _)), _ctrl)) => {
+    // C `event_task` runs its extra labor, which sends an access change's
+    // `CA_PROTO_ACCESS_RIGHTS`, before `event_read` (`dbEvent.c:1051`,
+    // `:1059`): a backlog of updates must not hold the notice back.
+    match select(select(woke, select(readers, writes)), ctrl).await {
+        Either::Left((Either::Left((TableWake::Destroyed, _)), _ctrl)) => EventStep::Destroyed,
+        Either::Left((Either::Left((TableWake::AccessChanged, _)), _ctrl)) => {
             EventStep::AccessChanged
+        }
+        Either::Left((Either::Right((Either::Left((step, _writes)), _woke)), _ctrl)) => step,
+        Either::Left((Either::Right((Either::Right(((res, idx), _readers)), _woke)), _ctrl)) => {
+            EventStep::WriteDone(idx, res)
         }
         Either::Right((ctrl_msg, _)) => EventStep::Control(ctrl_msg),
     }
@@ -6866,20 +6858,16 @@ async fn reeval_access_rights(state: &mut ClientState, writer: &Outbox) -> CaRes
     // Mirror C: only emit on actual transition.
     let mut transitions: Vec<(u32, AccessLevel, AccessLevel)> = Vec::new();
     for (sid, cid, target) in chan_info {
-        let (new_access, new_rule_was_trap) = state.compute_access(&target).await;
+        let (new_access, _) = state.compute_access(&target).await;
         let new_level = match new_access {
             3 => AccessLevel::ReadWrite,
             1 => AccessLevel::Read,
             _ => AccessLevel::NoAccess,
         };
         let old_level = state
-            .channel_access
+            .advertised_access
             .insert(sid, new_level)
             .unwrap_or(AccessLevel::NoAccess);
-        // an ACF reload can change which rule grants
-        // access (e.g. a new TRAPWRITE rule), so the trap mask
-        // must be refreshed alongside the level.
-        state.channel_trap.insert(sid, new_rule_was_trap);
         if old_level == new_level {
             continue;
         }
@@ -18645,6 +18633,270 @@ mod unrouted_command_tests {
                 13
             )]
         );
+    }
+}
+
+#[cfg(test)]
+mod access_change_tests {
+    //! asLib updates a client's access before it notifies anyone
+    //! (`asLibRoutines.c:1056-1059`): rsrv's checks read the new value at
+    //! once (`camessage.c:2608-2617`), and the event task sends the
+    //! `CA_PROTO_ACCESS_RIGHTS` ahead of its queued updates
+    //! (`dbEvent.c:1051`, `:1059`).
+    use super::*;
+    use crate::protocol::{
+        CA_MINOR_VERSION, CA_PROTO_ERROR, CA_PROTO_VERSION, ECA_NORDACCESS, ECA_NORMAL,
+        ECA_NOWTACCESS, pad_string,
+    };
+    use epics_base_rs::server::access_security::{AcfCell, new_acf_cell, parse_acf};
+    use epics_base_rs::server::database::PvDatabase;
+    use epics_base_rs::types::{DBR_DOUBLE, EpicsValue};
+
+    const READ_WRITE: &str = "ASG(DEFAULT) {\n    RULE(1, READ)\n    RULE(1, WRITE)\n}\n";
+    const READ_ONLY: &str = "ASG(DEFAULT) {\n    RULE(1, READ)\n}\n";
+    const NO_ACCESS: &str = "ASG(DEFAULT) {\n    RULE(1, NONE)\n}\n";
+    const PEER: &str = "127.0.0.1:55992";
+
+    fn frames(drain: &mut crate::server::outbox::OutboxDrain) -> Vec<Vec<u8>> {
+        std::iter::from_fn(|| drain.try_next().map(|f| f.to_vec())).collect()
+    }
+
+    fn word(frame: &[u8], at: usize) -> u32 {
+        u32::from_be_bytes(frame[at..at + 4].try_into().unwrap())
+    }
+
+    async fn dispatch(
+        state: &mut ClientState,
+        db: &Arc<PvDatabase>,
+        outbox: &Outbox,
+        hdr: CaHeader,
+        payload: &[u8],
+    ) {
+        dispatch_message(
+            &hdr,
+            payload,
+            state,
+            db,
+            outbox,
+            PEER.parse().unwrap(),
+            None,
+            SubscriptionDelivery::HandOff,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// A circuit with channel cid 0x1234 open on `AR:LIVE` (1.5) under a
+    /// read-write ACF, its replies drained. Returns the channel's sid.
+    async fn open(
+        db: &Arc<PvDatabase>,
+    ) -> (
+        AcfCell,
+        ClientState,
+        Outbox,
+        crate::server::outbox::OutboxDrain,
+        u32,
+    ) {
+        db.add_pv("AR:LIVE", EpicsValue::Double(1.5)).await.unwrap();
+        let acf = new_acf_cell(Some(parse_acf(READ_WRITE).unwrap()));
+        let mut state = ClientState::new(acf.clone(), 5064, db.clone());
+        let (outbox, mut drain) = crate::server::outbox::channel();
+        let mut version = CaHeader::new(CA_PROTO_VERSION);
+        version.count = CA_MINOR_VERSION;
+        dispatch(&mut state, db, &outbox, version, &[]).await;
+        let name = pad_string("AR:LIVE");
+        let mut create = CaHeader::new(CA_PROTO_CREATE_CHAN);
+        create.cid = 0x1234;
+        create.available = CA_MINOR_VERSION as u32;
+        create.postsize = name.len() as u16;
+        dispatch(&mut state, db, &outbox, create, &name).await;
+        let sid = *state.channels.keys().next().unwrap();
+        let _ = frames(&mut drain);
+        (acf, state, outbox, drain, sid)
+    }
+
+    /// Nothing re-evaluates this circuit after `asInit`, as nothing does
+    /// while its event thread is stuck sending to a client that stopped
+    /// reading: the checks alone must see the change.
+    // RTEMS-EXEC-MODEL-ALLOW(2): both run and pass under
+    // `EPICS_RS_BUILD_EXEC_BACKEND=thread`.
+    #[tokio::test]
+    async fn a_revoked_right_is_refused_before_its_notice_is_sent() {
+        let db = Arc::new(PvDatabase::new());
+        let (acf, mut state, outbox, mut drain, sid) = open(&db).await;
+        let mut read = CaHeader::new(CA_PROTO_READ_NOTIFY);
+        read.data_type = DBR_DOUBLE;
+        read.count = 1;
+        read.cid = sid;
+        read.available = 7;
+        // The ECA status a READ_NOTIFY reply carries in its cid word.
+        async fn read_status(
+            state: &mut ClientState,
+            db: &Arc<PvDatabase>,
+            outbox: &Outbox,
+            drain: &mut crate::server::outbox::OutboxDrain,
+            read: CaHeader,
+        ) -> u32 {
+            dispatch(state, db, outbox, read, &[]).await;
+            let out = frames(drain);
+            assert_eq!(out.len(), 1);
+            assert_eq!(
+                u16::from_be_bytes([out[0][0], out[0][1]]),
+                CA_PROTO_READ_NOTIFY
+            );
+            word(&out[0], 8)
+        }
+
+        acf.install_async(parse_acf(READ_ONLY).unwrap()).await;
+        let mut write = CaHeader::new(CA_PROTO_WRITE);
+        write.data_type = DBR_DOUBLE;
+        write.count = 1;
+        write.cid = sid;
+        write.available = 1;
+        write.postsize = 8;
+        dispatch(&mut state, &db, &outbox, write, &42.0f64.to_be_bytes()).await;
+        let out = frames(&mut drain);
+        assert_eq!(out.len(), 1, "one reply to the write");
+        assert_eq!(u16::from_be_bytes([out[0][0], out[0][1]]), CA_PROTO_ERROR);
+        assert_eq!(word(&out[0], 12), ECA_NOWTACCESS);
+        assert_eq!(
+            db.find_pv("AR:LIVE").unwrap().get(),
+            EpicsValue::Double(1.5)
+        );
+        assert_eq!(
+            read_status(&mut state, &db, &outbox, &mut drain, read).await,
+            ECA_NORMAL
+        );
+
+        acf.install_async(parse_acf(NO_ACCESS).unwrap()).await;
+        assert_eq!(
+            read_status(&mut state, &db, &outbox, &mut drain, read).await,
+            ECA_NORDACCESS
+        );
+    }
+
+    /// The client's socket, by command, in the order frames reach it: the
+    /// event thread's staged frames and the replies its table sends share
+    /// one send buffer, as `BlockingClient` and `EventSendBuf` do.
+    #[derive(Clone, Default)]
+    struct Wire(Arc<std::sync::Mutex<Vec<u16>>>);
+
+    impl Wire {
+        fn push(&self, frame: &[u8]) {
+            self.0
+                .lock()
+                .unwrap()
+                .push(u16::from_be_bytes([frame[0], frame[1]]));
+        }
+    }
+
+    impl EventSink for Wire {
+        fn stage(&mut self, frame: &[u8]) -> std::io::Result<()> {
+            self.push(frame);
+            Ok(())
+        }
+        fn send(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct Locked {
+        state: ClientState,
+        drain: crate::server::outbox::OutboxDrain,
+        wire: Wire,
+    }
+
+    impl LockedClient for Locked {
+        fn state(&mut self) -> &mut ClientState {
+            &mut self.state
+        }
+        fn send_queued(&mut self) -> bool {
+            for frame in frames(&mut self.drain) {
+                self.wire.push(&frame);
+            }
+            true
+        }
+        fn channels_retired(&mut self) -> bool {
+            self.send_queued()
+        }
+    }
+
+    /// An access change that lands with monitor updates queued is sent
+    /// first, however many are queued.
+    #[tokio::test]
+    async fn an_access_change_is_sent_ahead_of_queued_updates() {
+        use std::future::Future;
+        let db = Arc::new(PvDatabase::new());
+        let (acf, mut state, outbox, drain, sid) = open(&db).await;
+        let mut add = CaHeader::new(CA_PROTO_EVENT_ADD);
+        add.data_type = DBR_DOUBLE;
+        add.count = 1;
+        add.cid = sid;
+        add.available = 0xAB;
+        let mut mon_info = vec![0u8; 16];
+        mon_info[12..14].copy_from_slice(&5u16.to_be_bytes());
+        let Ok(SubscriptionOutcome::HandedOff(r)) = register_subscription(
+            &add,
+            &mon_info,
+            &state,
+            &outbox,
+            SubscriptionDelivery::HandOff,
+            || 0,
+        )
+        .await
+        else {
+            panic!("EVENT_ADD refused");
+        };
+        let (ctl_tx, mut ctl_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut blk_subs = std::collections::HashMap::new();
+        crate::server::blocking::hand_off_subscription(&mut state, &mut blk_subs, &ctl_tx, r);
+        // The initial value, then two updates.
+        let pv = db.find_pv("AR:LIVE").unwrap();
+        pv.set(EpicsValue::Double(2.0));
+        pv.set(EpicsValue::Double(3.0));
+
+        let (access_tx, access) = broadcast::channel(4);
+        acf.install_async(parse_acf(READ_ONLY).unwrap()).await;
+        access_tx.send(()).unwrap();
+
+        let events = state.event_user();
+        let wire = Wire::default();
+        let table = ClientTable {
+            client: Arc::new(tokio::sync::Mutex::new(Locked {
+                state,
+                drain,
+                wire: wire.clone(),
+            })),
+            destroyed: db.pv_destroyed_events(),
+            access,
+            outbox,
+            peer: PEER.parse().unwrap(),
+        };
+        let (task_tx, task_rx) = tokio::sync::mpsc::unbounded_channel();
+        while let Ok(msg) = ctl_rx.try_recv() {
+            task_tx.send(msg).unwrap();
+        }
+        let mut task = std::pin::pin!(run_event_task(
+            events,
+            task_rx,
+            table,
+            wire.clone(),
+            CircuitMinor::new(CA_MINOR_VERSION),
+        ));
+        // Run the event thread until it waits.
+        assert!(
+            task.as_mut()
+                .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+                .is_pending()
+        );
+        let sent = wire.0.lock().unwrap().clone();
+        assert_eq!(sent.first(), Some(&CA_PROTO_ACCESS_RIGHTS), "{sent:?}");
+        assert!(
+            sent.len() > 1 && sent[1..].iter().all(|&c| c == CA_PROTO_EVENT_ADD),
+            "the queued updates follow: {sent:?}"
+        );
+        drop(task_tx);
+        task.await;
     }
 }
 

@@ -20,10 +20,8 @@
 //! actor trailing deeper than it ever has grows the storage it then reuses
 //! (asyn's `a_backlog_of_sections_allocates_nothing_once_one_came_back`).
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use std::task::{Context, Waker};
 use std::time::Duration;
 
@@ -36,80 +34,17 @@ use ad_core_rs::plugin::runtime::{
     create_plugin_runtime, wire_downstream,
 };
 use ad_core_rs::plugin::wiring::WiringRegistry;
+use alloc_count::exempt;
+use alloc_count::named::{self, Name};
 use asyn_rs::interrupt::InterruptFilter;
 use asyn_rs::param::ParamValue;
 use asyn_rs::port::{InterfaceMask, PortFlags};
 use epics_libcom_rs::runtime::interrupt_accept::InterruptGate;
 use epics_libcom_rs::runtime::task::test_block_on;
 
-static ALLOCS: AtomicUsize = AtomicUsize::new(0);
-static COUNTING: AtomicBool = AtomicBool::new(false);
-
-thread_local! {
-    /// The driver's own work on the publishing thread, which is not the
-    /// plugin path.
-    static EXEMPT: Cell<bool> = const { Cell::new(false) };
-    /// 0 not yet asked, 1 libtest's `main`, which only waits for the test's
-    /// thread, 2 any other thread. Asking may itself allocate; that reentry
-    /// reads 1 and is not counted.
-    static HARNESS: Cell<u8> = const { Cell::new(0) };
-}
-
-fn harness() -> bool {
-    HARNESS.with(|h| match h.get() {
-        0 => {
-            h.set(1);
-            let yes = std::thread::current().name() == Some("main");
-            h.set(if yes { 1 } else { 2 });
-            yes
-        }
-        v => v == 1,
-    })
-}
-
-struct Counting;
-
-impl Counting {
-    fn note(&self) {
-        if COUNTING.load(Ordering::Relaxed)
-            && !EXEMPT.try_with(Cell::get).unwrap_or(false)
-            && !harness()
-        {
-            ALLOCS.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-}
-
-// SAFETY: forwards every call to `System` unchanged; the counter and the
-// const-initialised thread-locals never allocate, and the one name lookup
-// reenters as libtest's thread.
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        self.note();
-        unsafe { System.alloc(layout) }
-    }
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        self.note();
-        unsafe { System.alloc_zeroed(layout) }
-    }
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        self.note();
-        unsafe { System.realloc(ptr, layout, size) }
-    }
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(ptr, layout) }
-    }
-}
-
-#[global_allocator]
-static GLOBAL: Counting = Counting;
-
-fn exempt<R>(f: impl FnOnce() -> R) -> R {
-    EXEMPT.with(|e| e.set(true));
-    let r = f();
-    EXEMPT.with(|e| e.set(false));
-    r
-}
+/// libtest's `main`, which only waits for the test's thread, apart from
+/// every other thread.
+static THREADS: [Name; 2] = [Name::Exact("main"), Name::Any];
 
 /// Hands its input on, as NDPluginStats does (NDPluginStats.cpp:651).
 struct Forward;
@@ -217,7 +152,7 @@ const PLUGIN_ATTRIBUTES: &str = r#"<Attributes>
 
 /// A lend of a port to a caller's thread: its cancel token, its reply
 /// channel and the no-op request the actor parks on.
-const LEND: usize = 3;
+const LEND: u64 = 3;
 
 #[test]
 fn a_steady_frame_through_two_plugins_allocates_nothing() {
@@ -234,14 +169,14 @@ fn a_steady_frame_through_two_plugins_allocates_nothing() {
         Some(PLUGIN_ATTRIBUTES),
     );
     assert!(
-        filed <= LEND * FRAMES,
+        filed <= LEND * FRAMES as u64,
         "{filed} allocations in {FRAMES} frames through a plugin with an attributes file"
     );
 }
 
 /// The allocations of `FRAMES` frames, each carrying `attributes`, through
 /// a fresh chain on `ports` whose forwarding plugin loads `file`.
-fn steady_allocs(ports: [&str; 2], attributes: &[&str], file: Option<&str>) -> usize {
+fn steady_allocs(ports: [&str; 2], attributes: &[&str], file: Option<&str>) -> u64 {
     let wiring = Arc::new(WiringRegistry::new());
     let seen = Arc::new(AtomicUsize::new(0));
     let tagged = Arc::new(AtomicUsize::new(0));
@@ -298,11 +233,11 @@ fn steady_allocs(ports: [&str; 2], attributes: &[&str], file: Option<&str>) -> u
     output.add(forward.array_sender().clone());
     let publisher = ArrayPublisher::new(Arc::new(parking_lot::Mutex::new(output)));
 
+    let mut window = None;
     for i in 0..WARM + FRAMES {
         if i == WARM {
             quiesce(&[&forward, &sink]);
-            ALLOCS.store(0, Ordering::SeqCst);
-            COUNTING.store(true, Ordering::SeqCst);
+            window = Some(named::open(&THREADS));
         }
         // The driver's `pArrays[0]`, released and allocated again
         // (simDetector.cpp:625-638); its fill is not the plugin path.
@@ -338,12 +273,12 @@ fn steady_allocs(ports: [&str; 2], attributes: &[&str], file: Option<&str>) -> u
             std::thread::yield_now();
         }
     }
-    COUNTING.store(false, Ordering::SeqCst);
+    let [_, others] = window.unwrap().close();
     let evaluated = if file.is_some() { WARM + FRAMES } else { 0 };
     assert_eq!(
         tagged.load(Ordering::Relaxed),
         evaluated,
         "frames carrying Cnt"
     );
-    ALLOCS.load(Ordering::SeqCst)
+    others.allocs
 }

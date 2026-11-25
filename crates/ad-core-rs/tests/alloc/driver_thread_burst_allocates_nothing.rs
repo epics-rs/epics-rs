@@ -6,84 +6,16 @@
 //!
 //! Only the driver's thread is counted, and not its fill of the frame.
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use ad_core_rs::ndarray::{NDDataType, NDDimension};
 use ad_core_rs::ndarray_pool::DriverPool;
 use ad_core_rs::plugin::channel::{ArrayPublisher, NDArrayOutput, ndarray_channel};
 use ad_core_rs::runtime as rt;
-
-static ALLOCS: AtomicUsize = AtomicUsize::new(0);
-static COUNTING: AtomicBool = AtomicBool::new(false);
+use alloc_count::{exempt, thread};
 
 const DRIVER: &str = "AllocCountDet";
-
-thread_local! {
-    /// The driver's fill of the frame, which is its compute and not the loop.
-    static EXEMPT: Cell<bool> = const { Cell::new(false) };
-    /// 0 not yet asked, 1 the driver's thread, 2 any other. Asking may itself
-    /// allocate; that reentry reads 2 and is not counted.
-    static ON_DRIVER: Cell<u8> = const { Cell::new(0) };
-}
-
-fn on_driver() -> bool {
-    ON_DRIVER.with(|d| match d.get() {
-        0 => {
-            d.set(2);
-            let yes = std::thread::current().name() == Some(DRIVER);
-            d.set(if yes { 1 } else { 2 });
-            yes
-        }
-        v => v == 1,
-    })
-}
-
-struct Counting;
-
-impl Counting {
-    fn note(&self) {
-        if COUNTING.load(Ordering::Relaxed)
-            && !EXEMPT.try_with(Cell::get).unwrap_or(false)
-            && on_driver()
-        {
-            ALLOCS.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-}
-
-// SAFETY: every method forwards to `System` unchanged; the counter is an
-// atomic, const-initialised thread-locals never allocate, and the one name
-// lookup reenters as another thread's.
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        self.note();
-        unsafe { System.alloc(layout) }
-    }
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        self.note();
-        unsafe { System.alloc_zeroed(layout) }
-    }
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        self.note();
-        unsafe { System.realloc(ptr, layout, size) }
-    }
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(ptr, layout) }
-    }
-}
-
-#[global_allocator]
-static GLOBAL: Counting = Counting;
-
-fn exempt<R>(f: impl FnOnce() -> R) -> R {
-    EXEMPT.with(|e| e.set(true));
-    let r = f();
-    EXEMPT.with(|e| e.set(false));
-    r
-}
 
 /// Past the 33rd frame, where the plugin queue grows the second of the two
 /// 32-slot blocks it then recycles, and short of the 128 units of budget a
@@ -121,17 +53,20 @@ fn a_driver_threads_frame_burst_allocates_nothing() {
     output.add(sender);
     let publisher = ArrayPublisher::new(Arc::new(parking_lot::Mutex::new(output)));
     let pool = DriverPool::standalone(0);
+    let allocs = Arc::new(AtomicU64::new(0));
+    let counted = Arc::clone(&allocs);
 
     rt::run_thread_named(
         DRIVER,
         rt::ThreadPriority::Medium,
         rt::StackSizeClass::Medium,
         move || async move {
+            // Held across the awaits: the future never leaves this thread.
+            let mut window = None;
             for i in 0..WARM + FRAMES {
                 cmd_rx.recv().await.unwrap();
                 if i == WARM {
-                    ALLOCS.store(0, Ordering::SeqCst);
-                    COUNTING.store(true, Ordering::SeqCst);
+                    window = Some(thread::open());
                 }
                 let frame = exempt(|| {
                     pool.owner()
@@ -150,7 +85,7 @@ fn a_driver_threads_frame_burst_allocates_nothing() {
                     std::thread::yield_now();
                 }
             }
-            COUNTING.store(false, Ordering::SeqCst);
+            counted.store(window.unwrap().close().allocs, Ordering::SeqCst);
         },
     )
     .join()
@@ -158,7 +93,7 @@ fn a_driver_threads_frame_burst_allocates_nothing() {
     consumer.join().unwrap();
 
     assert_eq!(
-        ALLOCS.load(Ordering::SeqCst),
+        allocs.load(Ordering::SeqCst),
         0,
         "{FRAMES} frames on the driver thread after {WARM} warm-up ones"
     );

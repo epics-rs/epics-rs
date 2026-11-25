@@ -100,6 +100,7 @@ mod long_string_plain_monitor_counts;
 mod lsi_val_reads_past_len_to_its_nul;
 mod network_and_in_process_callbacks_never_wait_on_each_other;
 mod network_monitor_callback_may_block;
+mod network_subscription_count_matches_rsrv;
 mod plain_write_fails_on_the_process_status;
 mod property_tests;
 mod protocol_tests;

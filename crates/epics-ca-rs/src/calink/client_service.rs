@@ -15,7 +15,7 @@ use epics_base_rs::server::snapshot::Snapshot;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
 use super::CaLinkResolver;
-use crate::client::{CaChannel, ConnectionEvent, EnumReadback, MonitorHandle};
+use crate::client::{CaChannel, ConnectionEvent, DbrType, MonitorHandle};
 
 #[async_trait::async_trait]
 impl CaClientService for CaLinkResolver {
@@ -114,12 +114,13 @@ impl ClientChannel for NetChannel {
         mask: u16,
         callback: Box<dyn Fn(Snapshot) + Send + Sync>,
     ) -> Result<ClientSubscription, String> {
+        let dbr_type = DbrType::new(dbr_type).map_err(|e| e.to_string())?;
         let handle = self
             .channel
-            .subscribe_with_mask_readback_count(0.0, mask, EnumReadback::Native, false, Some(count))
+            .subscribe_with_mask_dbr_type(mask, dbr_type, count)
             .await
             .map_err(|e| e.to_string())?;
-        let mut values = Box::pin(values(handle, dbr_base(dbr_type)));
+        let mut values = Box::pin(values(handle));
         self.events
             .subscribe_network(Box::new(move |cx| values.poll_next_unpin(cx)), callback)
     }
@@ -147,19 +148,13 @@ impl ClientChannel for NetChannel {
     }
 }
 
-/// Each value of `handle`, as `base` when it has one.
-fn values(
-    handle: MonitorHandle,
-    base: Option<DbFieldType>,
-) -> impl futures_util::Stream<Item = Snapshot> + Send {
-    futures_util::stream::unfold(handle, move |mut handle| async move {
+/// Each value of `handle`.
+fn values(handle: MonitorHandle) -> impl futures_util::Stream<Item = Snapshot> + Send {
+    futures_util::stream::unfold(handle, |mut handle| async move {
         loop {
             // An error event (the disconnect) delivers nothing; the
             // subscription resumes on the reconnect.
-            if let Ok(mut snapshot) = handle.recv().await? {
-                if let Some(base) = base {
-                    snapshot.value = snapshot.value.convert_to(base);
-                }
+            if let Ok(snapshot) = handle.recv().await? {
                 return Some((snapshot, handle));
             }
         }

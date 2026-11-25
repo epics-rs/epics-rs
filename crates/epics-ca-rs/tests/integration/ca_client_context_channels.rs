@@ -13,7 +13,7 @@ use epics_base_rs::server::database::{ClientChannel, ClientSubscription, Connect
 use epics_base_rs::server::ioc_app::{IocApplication, RunOutcome};
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::server::snapshot::Snapshot;
-use epics_base_rs::types::{DBR_CTRL_DOUBLE, DBR_TIME_DOUBLE, EpicsValue};
+use epics_base_rs::types::{DBR_CTRL_DOUBLE, DBR_STRING, DBR_TIME_DOUBLE, EpicsValue};
 use epics_ca_rs::calink::{install_calink_resolver, register_calink_commands};
 use epics_ca_rs::protocol::{CA_PROTO_READ_NOTIFY, CA_PROTO_SEARCH, CaHeader};
 use epics_ca_rs::server::CaServer;
@@ -211,6 +211,63 @@ async fn an_unserved_name_goes_to_the_network_context() {
     )
     .await;
     serving.join().unwrap();
+    // SAFETY: `#[serial(epics_env)]`.
+    unsafe {
+        std::env::remove_var("EPICS_CA_SERVER_PORT");
+    }
+}
+
+/// A network subscription asks for its DBR type on the wire, as
+/// `ca_create_subscription(DBR_STRING, ...)` does, so a `DBR_STRING`
+/// monitor of an enum delivers the server's state string.
+#[epics_macros_rs::epics_test]
+#[serial(epics_env)]
+async fn a_network_string_monitor_of_an_enum_delivers_its_state_string() {
+    let server = CaServer::builder()
+        .port(0)
+        .db_string(
+            "record(bi, \"CCNET:BI\") { field(ZNAM, \"Open\") field(ONAM, \"Closed\") field(VAL, \"1\") }\n",
+            &std::collections::HashMap::new(),
+        )
+        .expect("db")
+        .build()
+        .await
+        .expect("CA server");
+    let port = server.udp_port();
+    let serving = tokio::spawn(async move { server.run().await });
+    // SAFETY: `#[serial(epics_env)]`.
+    unsafe {
+        std::env::set_var("EPICS_CA_SERVER_PORT", port.to_string());
+    }
+    with_ioc(
+        "record(ao, \"CC:LOCAL\") {}\n",
+        format!("127.0.0.1:{port}"),
+        move |db| async move {
+            let bi = db
+                .ca_client()
+                .create_channel("CCNET:BI")
+                .await
+                .expect("a network half is registered");
+            assert_eq!(
+                within("never connected", bi.next_connection()).await,
+                Some(Connection::Connected)
+            );
+            let (tx, mut monitor) = tokio::sync::mpsc::unbounded_channel();
+            let callback = Box::new(move |s: Snapshot| {
+                let _ = tx.send(s.value);
+            });
+            let _sub = bi
+                .subscribe(DBR_STRING, 1, 5, callback)
+                .await
+                .expect("monitor");
+            assert_eq!(
+                within("no first event", monitor.recv()).await,
+                Some(EpicsValue::String("Closed".into()))
+            );
+        },
+    )
+    .await;
+    serving.abort();
     // SAFETY: `#[serial(epics_env)]`.
     unsafe {
         std::env::remove_var("EPICS_CA_SERVER_PORT");

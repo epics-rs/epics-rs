@@ -982,6 +982,8 @@ pub trait DeviceSupport: Send + Sync + 'static {
     ///   that the framework will execute after process()
     /// - `did_compute`: if true, the record's built-in compute was already
     ///   performed (e.g., device support ran PID), so process() should skip it
+    ///
+    /// An `Err` is [`DeviceReadOutcome::failed`].
     fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
         let _ = record;
         Ok(DeviceReadOutcome::ok())
@@ -1354,6 +1356,10 @@ pub trait DeviceSupport: Send + Sync + 'static {
     /// every pass; on the pass a [`ReadStart::Pending`] completion re-entered,
     /// [`DeviceDoneSource::pact`](crate::server::database::DeviceDoneSource::pact)
     /// is set, and a device that reads what landed answers `Synchronous`.
+    /// An `Err` refuses the read: the pass goes on with no value read and the
+    /// device's [`last_alarm`](Self::last_alarm), READ_ALARM and INVALID
+    /// filling what it left unset, as C `processAi` ends a refused
+    /// `queueRequest` (devAsynInt32.c:838-854).
     /// The default has no submit-only path.
     fn read_begin(
         &mut self,

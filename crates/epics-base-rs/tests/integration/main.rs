@@ -63,6 +63,7 @@ mod a_record_with_no_dset_refuses_to_process;
 mod a_refusal_carries_the_block_s_last_message;
 mod a_refused_choice_prints_cs_line;
 mod a_refused_common_field_fails_the_load;
+mod a_refused_read_keeps_val;
 mod a_refused_subl_put_drops_its_cp_subscription;
 mod a_relink_completes_the_put_callback_in_flight;
 mod a_rights_change_flips_the_shared_entry;

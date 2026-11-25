@@ -7823,51 +7823,52 @@ impl PvDatabase {
                             self.apply_pact_exit(name, cycle_end.take());
                             return Ok(());
                         }
-                        let read = match begun {
-                            Ok(_) if facts.device_reads_own => {
-                                let (record, own) = instance.split_own();
-                                dev.read_own(record, own)
-                            }
-                            Ok(_) => dev.read_common(&mut *instance.record, &mut instance.common),
-                            Err(e) => Err(e),
-                        };
-                        match read {
-                            Ok(read_outcome) => {
-                                let status = read_outcome.status;
-                                device_did_compute = status.skips_conversion();
-                                if status.read_failed() {
-                                    read_produced_no_value = true;
-                                    cycle_status.io(Err(DbStatus::FAILED));
+                        let refused = begun.is_err();
+                        // A read that errs or was refused sourced no value, as
+                        // C's `-1` from `read_ai` misses `if (status==0)
+                        // convert` (aiRecord.c:158). C prints nothing for it
+                        // (`aiRecord.c:482`, `dbAccess.c:612`).
+                        let read_outcome = begun
+                            .and_then(|_| {
+                                if facts.device_reads_own {
+                                    let (record, own) = instance.split_own();
+                                    dev.read_own(record, own)
+                                } else {
+                                    dev.read_common(&mut *instance.record, &mut instance.common)
                                 }
-                                device_read_computed = matches!(
-                                    status,
-                                    crate::server::device_support::DeviceReadStatus::Computed
-                                );
-                                // A C dset writes `prec->udf` itself, before
-                                // its `return` — `devBiSoft.c::readLocked` and
-                                // `devBiDbState.c:67` clear it, `devAsynInt32.c
-                                // :902` sets it. Ours cannot reach `dbCommon`
-                                // through the `&mut dyn Record` it holds, so the
-                                // framework — the single owner of the UDF
-                                // transition — applies what the outcome states,
-                                // HERE, before the record's own rule below: C's
-                                // order is dset first, `process()` second, and
-                                // for the record types that re-derive
-                                // unconditionally the second write is what wins.
-                                use crate::server::device_support::DeviceUdf;
-                                match read_outcome.udf() {
-                                    DeviceUdf::Untouched => {}
-                                    DeviceUdf::Defined => instance.common.udf = 0,
-                                    DeviceUdf::Undefined => instance.common.udf = 1,
-                                }
-                                if !read_outcome.actions.is_empty() {
-                                    device_actions = Some(read_outcome.actions);
-                                }
-                            }
-                            // C prints nothing for a failed `read_ai`
-                            // (`aiRecord.c:482`, `dbAccess.c:612`); the device
-                            // support says what it has to.
-                            Err(_) => cycle_status.io(Err(DbStatus::FAILED)),
+                            })
+                            .unwrap_or_else(|_| {
+                                crate::server::device_support::DeviceReadOutcome::failed()
+                            });
+                        let status = read_outcome.status;
+                        device_did_compute = status.skips_conversion();
+                        if status.read_failed() {
+                            read_produced_no_value = true;
+                            cycle_status.io(Err(DbStatus::FAILED));
+                        }
+                        device_read_computed = matches!(
+                            status,
+                            crate::server::device_support::DeviceReadStatus::Computed
+                        );
+                        // A C dset writes `prec->udf` itself, before
+                        // its `return` — `devBiSoft.c::readLocked` and
+                        // `devBiDbState.c:67` clear it, `devAsynInt32.c
+                        // :902` sets it. Ours cannot reach `dbCommon`
+                        // through the `&mut dyn Record` it holds, so the
+                        // framework — the single owner of the UDF
+                        // transition — applies what the outcome states,
+                        // HERE, before the record's own rule below: C's
+                        // order is dset first, `process()` second, and
+                        // for the record types that re-derive
+                        // unconditionally the second write is what wins.
+                        use crate::server::device_support::DeviceUdf;
+                        match read_outcome.udf() {
+                            DeviceUdf::Untouched => {}
+                            DeviceUdf::Defined => instance.common.udf = 0,
+                            DeviceUdf::Undefined => instance.common.udf = 1,
+                        }
+                        if !read_outcome.actions.is_empty() {
+                            device_actions = Some(read_outcome.actions);
                         }
                         instance.device = Some(dev);
                         if rec.callbacks_owed() {
@@ -7876,7 +7877,9 @@ impl PvDatabase {
                         }
                         // An input's device raises its alarm in `readValue`,
                         // ahead of the record body.
-                        if !plan.output_stage {
+                        if refused {
+                            apply_refused_read_alarm(instance);
+                        } else if !plan.output_stage {
                             apply_device_alarm(instance, is_soft);
                         }
                     }
@@ -12942,6 +12945,22 @@ fn apply_hard_device_alarm(instance: &mut RecordInstance) {
         crate::server::record::AlarmSeverity::from_u16(alarm.sevr),
         alarm.msg,
     );
+}
+
+/// A refused `read_begin`'s alarm: the device's own, with READ_ALARM and
+/// INVALID filling what it left unset, as C `processAi` maps a refused
+/// `queueRequest` through `asynStatusToEpicsAlarm` (asynEpicsUtils.c:234-266).
+fn apply_refused_read_alarm(instance: &mut RecordInstance) {
+    use crate::server::recgbl::alarm_status::{NO_ALARM, READ_ALARM};
+    use crate::server::record::AlarmSeverity;
+    let alarm = instance.device.as_ref().and_then(|d| d.last_alarm());
+    let (stat, sevr, msg) = alarm.map_or((NO_ALARM, 0, ""), |a| (a.stat, a.sevr, a.msg));
+    let stat = if stat == NO_ALARM { READ_ALARM } else { stat };
+    let sevr = match AlarmSeverity::from_u16(sevr) {
+        AlarmSeverity::NoAlarm => AlarmSeverity::Invalid,
+        sevr => sevr,
+    };
+    crate::server::recgbl::rec_gbl_set_sevr_msg(&mut instance.common, stat, sevr, msg);
 }
 
 /// Shared tail of a simulated (`SIMM` != NO) process cycle — the part of

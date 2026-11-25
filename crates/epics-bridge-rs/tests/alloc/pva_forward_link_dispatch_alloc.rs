@@ -18,6 +18,7 @@ use epics_base_rs::types::EpicsValue;
 use epics_bridge_rs::pvalink::install_pvalink_resolver;
 use epics_pva_rs::server::PvDatabaseSource;
 use epics_pva_rs::server_native::{PvaServer, PvaServerConfig};
+use fact_budget::FACT_BUDGET;
 use serial_test::serial;
 
 const TARGETS: &str = r#"
@@ -74,7 +75,7 @@ async fn allocs(db: &PvDatabase, rec: &str) -> u64 {
 /// Process `rec` until its forward reaches `target`, which the remote server
 /// processes once per put.
 async fn connect(local: &PvDatabase, remote: &PvDatabase, rec: &str, target: &str) {
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + FACT_BUDGET;
     while val(remote, target) == 0.0 {
         assert!(
             Instant::now() < deadline,
@@ -140,7 +141,7 @@ fn a_connected_pva_forward_allocates_nothing_on_the_processing_thread() {
         // them once this thread yields.
         let before = val(&remote, "T:A");
         process(&local, "PVA").await;
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + FACT_BUDGET;
         while val(&remote, "T:A") == before {
             assert!(
                 Instant::now() < deadline,

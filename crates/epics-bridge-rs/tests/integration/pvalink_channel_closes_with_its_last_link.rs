@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
 use epics_bridge_rs::pvalink::install_pvalink_resolver;
+use fact_budget::FACT_BUDGET;
 
 const DB: &str = r#"
 record(ai, "H") { field(INP, {pva:{pv:"T:OLD"}}) }
@@ -57,7 +58,7 @@ async fn a_put_moving_the_last_link_off_a_channel_closes_it() {
     .await
     .unwrap();
     // The new channel opens on the reactor.
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + FACT_BUDGET;
     while !channels().iter().any(|pv| pv == "T:NEW") {
         assert!(Instant::now() < deadline, "T:NEW never opened");
         tokio::time::sleep(Duration::from_millis(20)).await;

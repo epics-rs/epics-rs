@@ -5,12 +5,12 @@
 #![cfg(tokio_backend)]
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use epics_bridge_rs::qsrv::{BridgeProvider, QsrvMount, QsrvPvStore};
 use epics_pva_rs::client::PvaClient;
 use epics_pva_rs::pvdata::{PvField, ScalarValue};
 use epics_pva_rs::server_native::{PvaServer, PvaServerConfig};
+use fact_budget::FACT_BUDGET;
 use parking_lot::Mutex;
 
 const DB: &str = r#"record(ao, "ORD:ao") {}"#;
@@ -47,7 +47,7 @@ async fn ioc() -> Ioc {
         PvaServer::start(composite, PvaServerConfig::isolated()).expect("qsrv server starts");
     let client = PvaClient::builder()
         .server_addr(server.tcp_addr())
-        .timeout(Duration::from_secs(5))
+        .timeout(FACT_BUDGET)
         .build();
     Ioc {
         _server: server,
@@ -84,7 +84,7 @@ async fn stale_puts(
         )
         .await
         .expect("subscribe");
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(FACT_BUDGET, async {
         while latest.lock().is_none() {
             tokio::task::yield_now().await;
         }

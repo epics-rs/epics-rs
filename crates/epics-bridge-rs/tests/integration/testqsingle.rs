@@ -606,9 +606,9 @@ async fn arr_channel_filter_applies_to_get_matching_monitor() {
         let rec = db.get_record("TEST:filt_wf").expect("rec");
         rec.write().notify_field("VAL", EventMask::VALUE);
     }
-    let ev = tokio::time::timeout(std::time::Duration::from_secs(2), mon.recv())
+    let ev = tokio::time::timeout(fact_budget::FACT_BUDGET, mon.recv())
         .await
-        .expect("monitor event within 2s")
+        .expect("monitor event")
         .expect("snapshot");
     let PvField::Structure(ev) = ev else {
         panic!("expected an NT structure, got {ev:?}");
@@ -1773,7 +1773,8 @@ async fn a_dollar_put_is_bounded_by_sizv_not_40() {
 }
 
 /// Every value a `qsrvSingle` monitor on `name` posts: `put` runs at the
-/// first 300 ms without an event, and the next quiet 300 ms ends the watch.
+/// first 300 ms without an event, its first update is awaited, and the next
+/// quiet 300 ms ends the watch.
 async fn monitor_values(
     db: &Arc<PvDatabase>,
     name: &str,
@@ -1787,16 +1788,24 @@ async fn monitor_values(
     let mut seen = Vec::new();
     let mut put = Some(Box::pin(put));
     loop {
-        match tokio::time::timeout(std::time::Duration::from_millis(300), mon.recv()).await {
-            Ok(Some(PvField::Structure(ev))) => {
-                seen.push(extract_value(&ev).expect("value").clone())
-            }
-            Ok(Some(ev)) => panic!("expected an NT structure, got {ev:?}"),
-            Ok(None) => break,
+        // absence-window: 300 ms without an event ends the unprompted posts, then the put's.
+        let quiet = tokio::time::timeout(std::time::Duration::from_millis(300), mon.recv()).await;
+        let ev = match quiet {
+            Ok(ev) => ev,
             Err(_) => match put.take() {
-                Some(p) => p.await,
+                Some(p) => {
+                    p.await;
+                    tokio::time::timeout(fact_budget::FACT_BUDGET, mon.recv())
+                        .await
+                        .expect("the put posted no update")
+                }
                 None => break,
             },
+        };
+        match ev {
+            Some(PvField::Structure(ev)) => seen.push(extract_value(&ev).expect("value").clone()),
+            Some(ev) => panic!("expected an NT structure, got {ev:?}"),
+            None => break,
         }
     }
     seen

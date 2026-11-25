@@ -313,6 +313,7 @@ mod exec_model {
             }
             // One settle read: `main` prints sequentially, so anything it was
             // ever going to print lands within this margin of the listing.
+            // absence-window: no STAGE5 line follows the listing.
             std::thread::sleep(Duration::from_secs(1));
             console = read_log();
             assert!(

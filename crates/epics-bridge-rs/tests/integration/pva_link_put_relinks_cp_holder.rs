@@ -17,6 +17,7 @@ use epics_base_rs::types::EpicsValue;
 use epics_bridge_rs::pvalink::install_pvalink_resolver;
 use epics_pva_rs::server::PvDatabaseSource;
 use epics_pva_rs::server_native::{PvaServer, PvaServerConfig};
+use fact_budget::FACT_BUDGET;
 
 const HOLDER: &str = r#"
 record(calc, "H") { field(INPA, {pva:{pv:"T:OLD", proc:"CP"}}) field(CALC, "A") field(FLNK, "CNT") }
@@ -31,7 +32,7 @@ fn value(db: &PvDatabase, name: &str) -> f64 {
 }
 
 async fn wait_for(db: &PvDatabase, name: &str, want: f64) {
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + FACT_BUDGET;
     while value(db, name) != want {
         assert!(
             Instant::now() < deadline,
@@ -103,6 +104,7 @@ async fn a_cp_pvalink_put_scans_on_the_new_channel_only() {
     post(&remote, "T:OLD", 9.0).await;
     // A sentinel on NEW after OLD's post: once it lands, OLD's monitor has
     // had as long as NEW's to reach the holder.
+    // absence-window: OLD's post must not process the holder.
     tokio::time::sleep(Duration::from_millis(500)).await;
     post(&remote, "T:NEW", 6.0).await;
     wait_for(&db, "H", 6.0).await;
@@ -118,6 +120,7 @@ async fn a_cp_pvalink_put_scans_on_the_new_channel_only() {
         .unwrap();
     let scans = value(&db, "CNT");
     post(&remote, "T:NEW", 7.0).await;
+    // absence-window: a post on the removed link's channel must not process the holder.
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(
         value(&db, "CNT"),

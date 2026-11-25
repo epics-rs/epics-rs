@@ -19,6 +19,7 @@ use epics_bridge_rs::ca_gateway::{
 use epics_oracle_rs::ioc::{
     BootError, BootNames, LogPolicy, OutputTail, Side, boot_on_free_port_claiming,
 };
+use fact_budget::FACT_BUDGET;
 use tokio::sync::RwLock;
 
 async fn manager(db: Arc<PvDatabase>) -> UpstreamManager {
@@ -218,7 +219,7 @@ impl StallRig {
             accepted,
             proxy,
         };
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + FACT_BUDGET;
         while tokio::net::TcpStream::connect(upstream).await.is_err() {
             assert!(
                 std::time::Instant::now() < deadline,

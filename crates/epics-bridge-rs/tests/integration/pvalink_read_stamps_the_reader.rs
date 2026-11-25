@@ -31,6 +31,7 @@ use epics_base_rs::types::{EpicsValue, WallTime};
 use epics_bridge_rs::pvalink::install_pvalink_resolver;
 use epics_pva_rs::server::PvDatabaseSource;
 use epics_pva_rs::server_native::{PvaServer, PvaServerConfig};
+use fact_budget::FACT_BUDGET;
 
 const REMOTE: &str = r#"
 record(ai, "SRC") { field(VAL, "3") info(Q:time:tag, "nsec:lsb:20") }
@@ -68,7 +69,7 @@ async fn dbpf(db: &PvDatabase, rec: &str, field: &str, value: EpicsValue) {
 
 /// Processes `rec` until it reads without an alarm.
 async fn until_clean(db: &PvDatabase, rec: &str) -> (WallTime, u64) {
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + FACT_BUDGET;
     loop {
         let (time, utag, sevr) = process(db, rec).await;
         if sevr == AlarmSeverity::NoAlarm {

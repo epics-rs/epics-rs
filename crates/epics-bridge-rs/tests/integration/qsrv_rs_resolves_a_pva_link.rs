@@ -63,6 +63,7 @@ async fn qsrv_rs_resolves_a_pva_link_as_soft_ioc_pva() {
         |tcp| async move {
             let client = PvaClient::builder()
                 .server_addr(std::net::SocketAddr::from(([127, 0, 0, 1], tcp)))
+                // not-a-wait: a timed-out get reads as None and the FACT_BUDGET poll retries it.
                 .timeout(Duration::from_secs(2))
                 .build();
             let deadline = Instant::now() + FACT_BUDGET;

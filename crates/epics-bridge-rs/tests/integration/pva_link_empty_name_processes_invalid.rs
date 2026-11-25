@@ -80,6 +80,7 @@ async fn empty_pva_name_processes_link_invalid_and_opens_nothing() {
                 .or_else(epics_base_rs::error::CaError::unless_process_status)
                 .unwrap_or_else(|e| panic!("{rec}: {e:?}"));
         }
+        // absence-window: three passes 50 ms apart let a wrongly opened channel show.
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     for rec in &records {

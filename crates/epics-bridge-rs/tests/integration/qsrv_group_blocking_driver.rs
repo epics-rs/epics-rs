@@ -45,6 +45,7 @@ use epics_pva_rs::server::PvDatabaseSource;
 use epics_pva_rs::server_native::blocking::BlockingPvaServer;
 use epics_pva_rs::server_native::composite::CompositeSource;
 use epics_pva_rs::server_native::config::PvaServerConfig;
+use fact_budget::FACT_BUDGET;
 
 const MEMBERS: usize = 20;
 const GROUP_PV: &str = "TESTB:BIG";
@@ -58,8 +59,8 @@ fn member_name(i: usize) -> String {
 /// counters are bumped from the client's callback threads, so polling from
 /// the test task observes cross-thread progress without coupling to the
 /// callback's execution context.
-async fn wait_for(cond: impl Fn() -> bool, deadline: Duration, what: &str) {
-    let end = Instant::now() + deadline;
+async fn wait_for(cond: impl Fn() -> bool, what: &str) {
+    let end = Instant::now() + FACT_BUDGET;
     while !cond() {
         assert!(Instant::now() < end, "timed out waiting for: {what}");
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -69,7 +70,7 @@ async fn wait_for(cond: impl Fn() -> bool, deadline: Duration, what: &str) {
 fn client(addr: SocketAddr) -> PvaClient {
     PvaClient::builder()
         .server_addr(addr)
-        .timeout(Duration::from_secs(2))
+        .timeout(FACT_BUDGET)
         .build()
 }
 
@@ -165,14 +166,12 @@ async fn group_flood_starves_neither_the_scalar_monitor_nor_a_fresh_get() {
     let big = big_updates.clone();
     wait_for(
         move || big.load(Ordering::SeqCst) >= 1,
-        Duration::from_secs(10),
         "the group monitor's connect-time snapshot over the blocking driver",
     )
     .await;
     let v0 = v0_updates.clone();
     wait_for(
         move || v0.load(Ordering::SeqCst) >= 1,
-        Duration::from_secs(10),
         "the scalar monitor's connect-time snapshot over the blocking driver",
     )
     .await;
@@ -212,14 +211,13 @@ async fn group_flood_starves_neither_the_scalar_monitor_nor_a_fresh_get() {
     // permanently. Client dial machinery shares the callback pool with the
     // server's forwarders, so a wedged band freezes this too.
     let c_get = client(addr);
-    let get_result = tokio::time::timeout(Duration::from_secs(10), c_get.pvget(SCALAR_PV)).await;
+    let get_result = tokio::time::timeout(FACT_BUDGET, c_get.pvget(SCALAR_PV)).await;
 
     // The §9.15 victim: the unrelated scalar monitor must keep delivering
     // WHILE the group floods. On the band-task drain it stopped dead here.
     let v0 = v0_updates.clone();
     wait_for(
         move || v0.load(Ordering::SeqCst) >= v0_before + 3,
-        Duration::from_secs(10),
         "scalar monitor updates during a group flood (§9.15: it delivered 3 \
          in-flight updates and then nothing, permanently)",
     )
@@ -229,7 +227,6 @@ async fn group_flood_starves_neither_the_scalar_monitor_nor_a_fresh_get() {
     let big = big_updates.clone();
     wait_for(
         move || big.load(Ordering::SeqCst) >= big_before + 3,
-        Duration::from_secs(10),
         "group monitor updates during its own flood (§9.15: snapshot only)",
     )
     .await;

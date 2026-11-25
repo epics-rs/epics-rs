@@ -19,6 +19,7 @@ use epics_base_rs::types::EpicsValue;
 use epics_ca_rs::server::CaServer;
 use epics_pva_rs::client::PvaClient;
 use epics_pva_rs::pvdata::{PvField, ScalarValue};
+use fact_budget::FACT_BUDGET;
 
 use crate::qsrv_named_ports;
 
@@ -69,9 +70,10 @@ async fn qsrv_rs_resolves_a_ca_link_as_soft_ioc() {
         |tcp| async move {
             let client = PvaClient::builder()
                 .server_addr(std::net::SocketAddr::from(([127, 0, 0, 1], tcp)))
+                // not-a-wait: a timed-out get reads as None and the FACT_BUDGET poll retries it.
                 .timeout(Duration::from_secs(2))
                 .build();
-            let deadline = Instant::now() + Duration::from_secs(10);
+            let deadline = Instant::now() + FACT_BUDGET;
             while Instant::now() < deadline {
                 if let got @ Some((5.0, 0)) = value_and_severity(&client, "DST").await {
                     return got;

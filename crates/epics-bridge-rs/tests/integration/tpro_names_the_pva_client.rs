@@ -20,12 +20,12 @@
 #![cfg(tokio_backend)]
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use epics_bridge_rs::qsrv::{BridgeProvider, QsrvMount, QsrvPvStore};
 use epics_pva_rs::client::PvaClient;
 use epics_pva_rs::pv_request::PvRequestExpr;
 use epics_pva_rs::server_native::{PvaServer, PvaServerConfig};
+use fact_budget::FACT_BUDGET;
 
 const CHILD: &str = "TPRO_PVA_CLIENT_CHILD";
 const TEST: &str = "tpro_names_the_pva_client::a_pva_put_traces_with_the_peer_s_name";
@@ -116,7 +116,7 @@ async fn a_pva_put_traces_with_the_peer_s_name() {
         PvaClient::builder()
             .server_addr(server.tcp_addr())
             .user("u")
-            .timeout(Duration::from_secs(5))
+            .timeout(FACT_BUDGET)
             .build()
     };
     client().pvput("X.PROC", "1").await.expect("put X.PROC");

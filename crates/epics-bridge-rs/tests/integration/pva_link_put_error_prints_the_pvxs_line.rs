@@ -121,6 +121,7 @@ fn a_refused_pva_link_put_prints_the_pvxs_line() {
         "the put outlived the disconnect:\n{text}"
     );
     sh.capture_until("dbjlr WR 1", "conn=F #disconn=1");
+    // absence-window: no third put-error line follows the disconnect.
     std::thread::sleep(Duration::from_millis(500));
     sh.line("exit");
     drop(sh);

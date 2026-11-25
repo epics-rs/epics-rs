@@ -94,5 +94,6 @@ async fn a_group_put_to_an_active_record_prints_the_pvxs_line() {
             .await
             .unwrap();
     }
+    // absence-window: the RPRO reprocesses (ODLY 0.3 s) print no further onPut line.
     tokio::time::sleep(Duration::from_millis(1000)).await;
 }

@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use epics_pva_rs::client::PvaClient;
 use epics_pva_rs::pvdata::{PvField, ScalarValue};
+use fact_budget::FACT_BUDGET;
 
 const DB: &str = r#"record(ai, "A") {
     field(VAL, "1.5") field(EGU, "mm") field(PREC, "2")
@@ -56,9 +57,10 @@ async fn a_single_record_and_a_group_answer_as_softiocpvx() {
             let server = SocketAddr::from((Ipv4Addr::LOCALHOST, tcp));
             let client = PvaClient::builder()
                 .server_addr(server)
+                // not-a-wait: a timed-out get errs and the FACT_BUDGET loop retries it.
                 .timeout(Duration::from_secs(2))
                 .build();
-            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            let deadline = std::time::Instant::now() + FACT_BUDGET;
             let group = loop {
                 match client.pvget_from("G", server).await {
                     Ok(v) => break v,
@@ -78,7 +80,7 @@ async fn a_single_record_and_a_group_answer_as_softiocpvx() {
                 )
                 .await
                 .expect("monitor A");
-            let first = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+            let first = tokio::time::timeout(FACT_BUDGET, rx.recv()).await;
             drop(sub);
             Some((group, first.expect("no monitor event on A").unwrap()))
         },

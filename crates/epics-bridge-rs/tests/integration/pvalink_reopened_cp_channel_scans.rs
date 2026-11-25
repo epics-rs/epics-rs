@@ -15,6 +15,7 @@ use epics_base_rs::types::EpicsValue;
 use epics_bridge_rs::pvalink::install_pvalink_resolver;
 use epics_pva_rs::server::PvDatabaseSource;
 use epics_pva_rs::server_native::{PvaServer, PvaServerConfig};
+use fact_budget::FACT_BUDGET;
 
 const REMOTE: &str = r#"
 record(ai, "SRC") { field(VAL, "1") }
@@ -27,7 +28,7 @@ record(ai, "H") { field(INP, {pva:{pv:"SRC", proc:"CP"}}) }
 
 /// Waits until `H` holds `want`.
 async fn until_h(db: &PvDatabase, want: f64) {
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + FACT_BUDGET;
     while db.get_pv("H").ok().and_then(|v| v.to_f64()) != Some(want) {
         assert!(Instant::now() < deadline, "H never read {want}");
         tokio::time::sleep(Duration::from_millis(20)).await;

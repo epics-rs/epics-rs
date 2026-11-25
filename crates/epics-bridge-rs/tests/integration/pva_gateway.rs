@@ -53,6 +53,7 @@ use epics_pva_rs::server_native::source::{AccessChecked, ChannelContext, OpError
 use epics_pva_rs::server_native::{
     ChannelSource, PvaServer, PvaServerConfig, SharedPV, SharedSource,
 };
+use fact_budget::FACT_BUDGET;
 
 /// `epics:nt/NTScalar:1.0` descriptor wrapping a `double value` —
 /// the shape every real IOC / QSRV PV exposes. A bare top-level
@@ -94,7 +95,7 @@ async fn gateway_get_forwards_upstream_value() {
     let upstream_client = Arc::new(
         PvaClient::builder()
             .server_addr(us_addr)
-            .timeout(Duration::from_secs(2))
+            .timeout(FACT_BUDGET)
             .build(),
     );
 
@@ -137,7 +138,7 @@ async fn gateway_monitor_fans_out_to_two_clients() {
     let upstream_client = Arc::new(
         PvaClient::builder()
             .server_addr(us_addr)
-            .timeout(Duration::from_secs(2))
+            .timeout(FACT_BUDGET)
             .build(),
     );
 
@@ -184,14 +185,11 @@ async fn gateway_monitor_fans_out_to_two_clients() {
             .await;
     });
 
-    // Let the subscriptions establish.
-    tokio::time::sleep(Duration::from_millis(400)).await;
-
     // Drain initial events (both clients must see the seed value).
-    let initial1 = recv_within(&mut rx1, Duration::from_secs(2))
+    let initial1 = recv_within(&mut rx1, FACT_BUDGET)
         .await
         .expect("client 1 initial");
-    let initial2 = recv_within(&mut rx2, Duration::from_secs(2))
+    let initial2 = recv_within(&mut rx2, FACT_BUDGET)
         .await
         .expect("client 2 initial");
     assert_eq!(initial1, 0.0);
@@ -202,18 +200,24 @@ async fn gateway_monitor_fans_out_to_two_clients() {
     // an under-loaded test runner can squash to-latest.
     for v in [1.0_f64, 2.0, 3.0] {
         us_pv.try_post(nt_double_value(v));
-        // tiny breather so the broadcast fan-out keeps up.
+        // not-a-wait: a breather so the fan-out keeps up; only the last value is asserted.
         tokio::time::sleep(Duration::from_millis(80)).await;
     }
 
-    let last1 = drain_to_latest(&mut rx1, Duration::from_secs(3))
-        .await
-        .expect("client 1 saw an update");
-    let last2 = drain_to_latest(&mut rx2, Duration::from_secs(3))
-        .await
-        .expect("client 2 saw an update");
-    assert_eq!(last1, 3.0);
-    assert_eq!(last2, 3.0);
+    for rx in [&mut rx1, &mut rx2] {
+        fact_budget::barrier::until_async(
+            "a downstream client never saw the last post",
+            |_| false,
+            |v: &f64| *v == 3.0,
+            async |remaining| {
+                tokio::time::timeout(remaining, rx.recv())
+                    .await
+                    .ok()
+                    .flatten()
+            },
+        )
+        .await;
+    }
 
     h1.abort();
     h2.abort();
@@ -242,7 +246,7 @@ async fn gateway_155_monitor_seeds_current_value_once() {
     let upstream_client = Arc::new(
         PvaClient::builder()
             .server_addr(us_addr)
-            .timeout(Duration::from_secs(2))
+            .timeout(FACT_BUDGET)
             .build(),
     );
 
@@ -276,13 +280,12 @@ async fn gateway_155_monitor_seeds_current_value_once() {
             .await;
     });
 
-    // Wait until the seed has arrived (up to 3 s on loopback), then a
-    // short extra settle so a regressed SECOND seed frame — emitted
-    // back-to-back with the first — would also land before we count.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    // Wait until the seed has arrived.
+    let deadline = tokio::time::Instant::now() + FACT_BUDGET;
     while received.lock().unwrap().is_empty() && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    // absence-window: a regressed SECOND seed frame, back-to-back with the first, lands here.
     tokio::time::sleep(Duration::from_millis(400)).await;
     assert_eq!(
         *received.lock().unwrap(),
@@ -293,10 +296,11 @@ async fn gateway_155_monitor_seeds_current_value_once() {
 
     // One real upstream post delivers exactly one more frame.
     us_pv.try_post(nt_double_value(8.0));
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let deadline = tokio::time::Instant::now() + FACT_BUDGET;
     while received.lock().unwrap().len() < 2 && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    // absence-window: a duplicate seed after the update lands here.
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(
         *received.lock().unwrap(),
@@ -325,24 +329,13 @@ async fn recv_within(rx: &mut tokio::sync::mpsc::Receiver<f64>, timeout: Duratio
         .flatten()
 }
 
-async fn drain_to_latest(
-    rx: &mut tokio::sync::mpsc::Receiver<f64>,
-    timeout: Duration,
-) -> Option<f64> {
-    let deadline = tokio::time::Instant::now() + timeout;
-    let mut last: Option<f64> = None;
-    while tokio::time::Instant::now() < deadline {
-        match tokio::time::timeout(Duration::from_millis(150), rx.recv()).await {
-            Ok(Some(v)) => last = Some(v),
-            Ok(None) => break,
-            Err(_) => {
-                if last.is_some() {
-                    break;
-                }
-            }
-        }
+/// Poll `cond` until it holds; fail with `what` after [`FACT_BUDGET`].
+async fn wait_until(what: &str, cond: impl Fn() -> bool) {
+    let deadline = tokio::time::Instant::now() + FACT_BUDGET;
+    while !cond() {
+        assert!(tokio::time::Instant::now() < deadline, "{what}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    last
 }
 
 /// when `control_prefix` is set, downstream clients should be
@@ -354,7 +347,7 @@ async fn gateway_control_prefix_cache_size() {
     let upstream_client = Arc::new(
         PvaClient::builder()
             .server_addr(us_addr)
-            .timeout(Duration::from_secs(2))
+            .timeout(FACT_BUDGET)
             .build(),
     );
 
@@ -394,7 +387,7 @@ async fn gateway_control_prefix_cache_size() {
     // touches the subscription-keyed monitor cache, only a monitor
     // inserts a cache entry. Keep the subscription alive across the read.
     let mon = gw.client_config();
-    let (tx, _rx) = tokio::sync::mpsc::channel::<f64>(8);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<f64>(8);
     let mon_task = tokio::spawn(async move {
         let _ = mon
             .pvmonitor("GW:CTRL:PV", move |value| {
@@ -405,8 +398,10 @@ async fn gateway_control_prefix_cache_size() {
             .await;
     });
 
-    // Let the subscription establish so the gateway inserts a cache entry.
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    // The monitor's seed is served from the gateway's cache entry.
+    recv_within(&mut rx, FACT_BUDGET)
+        .await
+        .expect("the monitor's seed");
 
     let snap = ds
         .pvget_full("gw:cacheSize")
@@ -437,13 +432,13 @@ async fn multi_tenant_gateway_routes_to_correct_upstream() {
     let client_a = Arc::new(
         PvaClient::builder()
             .server_addr(addr_a)
-            .timeout(Duration::from_secs(2))
+            .timeout(FACT_BUDGET)
             .build(),
     );
     let client_b = Arc::new(
         PvaClient::builder()
             .server_addr(addr_b)
-            .timeout(Duration::from_secs(2))
+            .timeout(FACT_BUDGET)
             .build(),
     );
 
@@ -453,6 +448,7 @@ async fn multi_tenant_gateway_routes_to_correct_upstream() {
         .add_upstream("A", client_a)
         .add_upstream("B", client_b)
         .add_downstream("merged", server_config, &["A", "B"], None)
+        // not-a-wait: the upstream without the name times out here before the next is asked.
         .connect_timeout(Duration::from_secs(2))
         .start(&test_reactor())
         .expect("multi-tenant start");
@@ -506,13 +502,13 @@ async fn multi_tenant_downstream_acl_denies_pv() {
     let client_s = Arc::new(
         PvaClient::builder()
             .server_addr(addr_s)
-            .timeout(Duration::from_secs(2))
+            .timeout(FACT_BUDGET)
             .build(),
     );
     let client_o = Arc::new(
         PvaClient::builder()
             .server_addr(addr_o)
-            .timeout(Duration::from_secs(2))
+            .timeout(FACT_BUDGET)
             .build(),
     );
 
@@ -527,6 +523,7 @@ async fn multi_tenant_downstream_acl_denies_pv() {
         .add_upstream("O", client_o)
         .add_downstream("restricted", server_config, &["S", "O"], None)
         .downstream_access(Some(acl), false, None)
+        // not-a-wait: the upstream without the name times out here before the next is asked.
         .connect_timeout(Duration::from_secs(2))
         .start(&test_reactor())
         .expect("multi-tenant start");
@@ -537,6 +534,7 @@ async fn multi_tenant_downstream_acl_denies_pv() {
     let ds = server.client_config();
 
     // Denied: the ACL short-circuits before reaching upstream S.
+    // absence-window: the denied name must not resolve.
     let denied = tokio::time::timeout(Duration::from_secs(3), ds.pvget_full("SECRET:VAL")).await;
     match denied {
         Ok(Ok(snap)) => panic!("ACL-denied PV must not resolve: got {:?}", snap.value),
@@ -569,7 +567,7 @@ async fn multi_tenant_downstream_read_only_rejects_put() {
     let upstream = Arc::new(
         PvaClient::builder()
             .server_addr(us_addr)
-            .timeout(Duration::from_secs(2))
+            .timeout(FACT_BUDGET)
             .build(),
     );
 
@@ -579,7 +577,7 @@ async fn multi_tenant_downstream_read_only_rejects_put() {
         .add_upstream("U", upstream)
         .add_downstream("ro", server_config, &["U"], None)
         .downstream_access(None, true, None)
-        .connect_timeout(Duration::from_secs(2))
+        .connect_timeout(FACT_BUDGET)
         .start(&test_reactor())
         .expect("multi-tenant start");
 
@@ -634,7 +632,7 @@ async fn critical1_read_only_gateway_rejects_put() {
     let upstream = Arc::new(
         PvaClient::builder()
             .server_addr(us_addr)
-            .timeout(Duration::from_secs(2))
+            .timeout(FACT_BUDGET)
             .build(),
     );
     let mut cfg = gateway_cfg(upstream);
@@ -671,7 +669,7 @@ async fn critical1_acl_layer_denies_pv() {
     let upstream = Arc::new(
         PvaClient::builder()
             .server_addr(us_addr)
-            .timeout(Duration::from_secs(2))
+            .timeout(FACT_BUDGET)
             .build(),
     );
     let mut cfg = gateway_cfg(upstream);
@@ -683,7 +681,7 @@ async fn critical1_acl_layer_denies_pv() {
     let gw = PvaGateway::start(&test_reactor(), cfg).expect("acl gateway start");
 
     let ds = gw.client_config();
-    // The ACL-denied PV must not resolve through the gateway.
+    // absence-window: the ACL-denied PV must not resolve through the gateway.
     let result = tokio::time::timeout(Duration::from_secs(3), ds.pvget_full("SECRET:PV")).await;
     match result {
         Ok(Ok(snap)) => panic!("ACL-denied PV must not resolve: got {:?}", snap.value),
@@ -705,7 +703,7 @@ async fn critical1_audit_layer_records_put() {
     let upstream = Arc::new(
         PvaClient::builder()
             .server_addr(us_addr)
-            .timeout(Duration::from_secs(2))
+            .timeout(FACT_BUDGET)
             .build(),
     );
 
@@ -797,7 +795,7 @@ async fn br_r6_gateway_typed_put_passthrough() {
     let upstream_client = Arc::new(
         PvaClient::builder()
             .server_addr(us_addr)
-            .timeout(Duration::from_secs(2))
+            .timeout(FACT_BUDGET)
             .build(),
     );
     // Use GatewayChannelSource directly — same put_value code path, no
@@ -872,7 +870,7 @@ async fn gateway_is_writable_proxies_upstream_connection_not_cache_presence() {
     let upstream_client = Arc::new(
         PvaClient::builder()
             .server_addr(us_addr)
-            .timeout(Duration::from_secs(2))
+            .timeout(FACT_BUDGET)
             .build(),
     );
     let cache = ChannelCache::new(
@@ -939,7 +937,7 @@ async fn br_r41_typed_subscribe_delivers_updates() {
     let upstream_client = Arc::new(
         PvaClient::builder()
             .server_addr(us_addr)
-            .timeout(Duration::from_secs(2))
+            .timeout(FACT_BUDGET)
             .build(),
     );
     let cache = ChannelCache::new(
@@ -971,16 +969,16 @@ async fn br_r41_typed_subscribe_delivers_updates() {
     });
     pv.try_post(update_val);
 
-    // Drain until 42.0 arrives or 2 s elapses. The updates-only stream
+    // Drain until 42.0 arrives. The updates-only stream
     // carries no connect-time 1.0, so 42.0 is the first (and only) item.
     // Pre-fix: tx_inner was dropped → broadcast permanently empty → this
     // loop times out.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let deadline = tokio::time::Instant::now() + FACT_BUDGET;
     let update = loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         let v = tokio::time::timeout(remaining, rx.recv())
             .await
-            .expect("update must arrive within 2s (pre-fix tx_inner dropped → blocks forever)")
+            .expect("update must arrive (pre-fix tx_inner dropped → blocks forever)")
             .expect("channel must be open");
         if scalar_double(&v) == Some(42.0) {
             break v;
@@ -1037,7 +1035,7 @@ async fn br_99_decoded_monitor_gets_finish_on_upstream_descriptor_change() {
     let upstream_client = Arc::new(
         PvaClient::builder()
             .server_addr(us_addr)
-            .timeout(Duration::from_secs(2))
+            .timeout(FACT_BUDGET)
             .build(),
     );
     let gw =
@@ -1050,6 +1048,9 @@ async fn br_99_decoded_monitor_gets_finish_on_upstream_descriptor_change() {
     // (`Finished`, or `Disconnected` as a fallback boundary shape).
     let (fin_raw_tx, mut fin_raw_rx) = tokio::sync::mpsc::channel::<()>(1);
     let (fin_pipe_tx, mut fin_pipe_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let seen_raw = Arc::new(std::sync::Mutex::new(Vec::<f64>::new()));
+    let seen_pipe = Arc::new(std::sync::Mutex::new(Vec::<f64>::new()));
+    let (raw_cb, pipe_cb) = (seen_raw.clone(), seen_pipe.clone());
 
     // pvxs default mask: maskConnected=true, maskDisconnected=false — so
     // both Finished and Disconnected reach the callback.
@@ -1062,6 +1063,11 @@ async fn br_99_decoded_monitor_gets_finish_on_upstream_descriptor_change() {
     let h_raw = tokio::spawn(async move {
         let _ = c_raw
             .pvmonitor_events("GW:BR99:PV", Some(&raw_req), mask, move |ev| {
+                if let MonitorEvent::Data { value, .. } = &ev
+                    && let Some(d) = scalar_double(value)
+                {
+                    raw_cb.lock().unwrap().push(d);
+                }
                 if matches!(ev, MonitorEvent::Finished | MonitorEvent::Disconnected) {
                     let _ = fin_raw_tx.try_send(());
                 }
@@ -1077,6 +1083,11 @@ async fn br_99_decoded_monitor_gets_finish_on_upstream_descriptor_change() {
     let h_pipe = tokio::spawn(async move {
         let _ = c_pipe
             .pvmonitor_events("GW:BR99:PV", Some(&pipe_req), mask, move |ev| {
+                if let MonitorEvent::Data { value, .. } = &ev
+                    && let Some(d) = scalar_double(value)
+                {
+                    pipe_cb.lock().unwrap().push(d);
+                }
                 if matches!(ev, MonitorEvent::Finished | MonitorEvent::Disconnected) {
                     let _ = fin_pipe_tx.try_send(());
                 }
@@ -1084,12 +1095,19 @@ async fn br_99_decoded_monitor_gets_finish_on_upstream_descriptor_change() {
             .await;
     });
 
-    // Let both subscriptions establish; the gateway's shared upstream
-    // monitor delivers the seed (1.0) and caches `latest_raw`, which arms
+    // Both subscriptions take the seed (1.0) and the update through the
+    // gateway's shared upstream monitor, which caches `latest_raw` and so arms
     // `signal_disconnect_boundary` (it no-ops without a cached snapshot).
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    let took = |seen: &std::sync::Mutex<Vec<f64>>, v: f64| seen.lock().unwrap().contains(&v);
+    wait_until("both monitors take the seed", || {
+        took(&seen_raw, 1.0) && took(&seen_pipe, 1.0)
+    })
+    .await;
     us_pv.try_post(nt_double_value(2.0));
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_until("both monitors take the update", || {
+        took(&seen_raw, 2.0) && took(&seen_pipe, 2.0)
+    })
+    .await;
 
     // Upstream descriptor change: close() revokes the descriptor and drops
     // all subscribers. The upstream server sends MONITOR FINISH to the
@@ -1099,13 +1117,13 @@ async fn br_99_decoded_monitor_gets_finish_on_upstream_descriptor_change() {
 
     // BOTH monitors must observe the boundary within the timeout. Pre-fix
     // the pipelined (decoded) monitor never does → its recv times out.
-    tokio::time::timeout(Duration::from_secs(5), fin_raw_rx.recv())
+    tokio::time::timeout(FACT_BUDGET, fin_raw_rx.recv())
         .await
         .expect(
             "raw-path monitor must observe a boundary on upstream descriptor change (timed out)",
         )
         .expect("raw-path monitor boundary channel must not close empty");
-    tokio::time::timeout(Duration::from_secs(5), fin_pipe_rx.recv())
+    tokio::time::timeout(FACT_BUDGET, fin_pipe_rx.recv())
         .await
         .expect("decoded/pipelined monitor must observe a boundary on upstream descriptor change (pre-fix this hangs)")
         .expect("decoded/pipelined monitor boundary channel must not close empty");
@@ -1141,7 +1159,7 @@ async fn br_99_decoded_monitor_gets_finish_on_upstream_descriptor_change() {
 /// alarm value.
 ///
 /// Proven by mutation: with the `conn_cb` wiring in
-/// `channel_cache::spawn_upstream_monitor` removed, this times out at 10 s.
+/// `channel_cache::spawn_upstream_monitor` removed, this times out.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn gw_plain_upstream_loss_fires_the_disconnect_boundary() {
     use epics_pva_rs::client_native::ops_v2::{MonitorEvent, MonitorEventMask};
@@ -1151,7 +1169,7 @@ async fn gw_plain_upstream_loss_fires_the_disconnect_boundary() {
     let upstream_client = Arc::new(
         PvaClient::builder()
             .server_addr(us_addr)
-            .timeout(Duration::from_secs(2))
+            .timeout(FACT_BUDGET)
             .build(),
     );
     let gw =
@@ -1159,6 +1177,8 @@ async fn gw_plain_upstream_loss_fires_the_disconnect_boundary() {
     let c = gw.client_config();
 
     let (boundary_tx, mut boundary_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<f64>::new()));
+    let seen_cb = seen.clone();
     // `field(value)` is the full mask for this single-field PV and carries no
     // pipeline option, so the downstream monitor is raw-path eligible and is
     // served straight off the gateway's raw fanout — the stream
@@ -1171,6 +1191,11 @@ async fn gw_plain_upstream_loss_fires_the_disconnect_boundary() {
                 Some(&req),
                 MonitorEventMask::default(),
                 move |ev| {
+                    if let MonitorEvent::Data { value, .. } = &ev
+                        && let Some(d) = scalar_double(value)
+                    {
+                        seen_cb.lock().unwrap().push(d);
+                    }
                     if matches!(ev, MonitorEvent::Finished | MonitorEvent::Disconnected) {
                         let _ = boundary_tx.try_send(());
                     }
@@ -1179,13 +1204,19 @@ async fn gw_plain_upstream_loss_fires_the_disconnect_boundary() {
             .await;
     });
 
-    // Let the downstream monitor establish and the gateway's shared upstream
-    // monitor deliver a value: `signal_disconnect_boundary` is idempotent per
-    // outage by no-opping without a cached snapshot, so the cache must be
-    // armed before the loss for the boundary to mean anything.
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    // The downstream monitor takes the seed and an update through the
+    // gateway's shared upstream monitor: `signal_disconnect_boundary` is
+    // idempotent per outage by no-opping without a cached snapshot, so the
+    // cache must be armed before the loss for the boundary to mean anything.
+    wait_until("the monitor takes the seed", || {
+        seen.lock().unwrap().contains(&1.0)
+    })
+    .await;
     us_pv.try_post(nt_double_value(2.0));
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    wait_until("the monitor takes the update", || {
+        seen.lock().unwrap().contains(&2.0)
+    })
+    .await;
 
     // PLAIN upstream loss: the server value is dropped, which aborts its
     // listeners and interrupts every connection. No MONITOR FINISH, no
@@ -1194,7 +1225,7 @@ async fn gw_plain_upstream_loss_fires_the_disconnect_boundary() {
     // handle does not return.
     drop(us_server);
 
-    tokio::time::timeout(Duration::from_secs(10), boundary_rx.recv())
+    tokio::time::timeout(FACT_BUDGET, boundary_rx.recv())
         .await
         .expect(
             "a plain upstream loss must revoke the cached value with a \
@@ -1251,7 +1282,7 @@ async fn gw60_slow_pipelined_downstream_converges_to_latest_under_overflow() {
     let upstream_client = Arc::new(
         PvaClient::builder()
             .server_addr(us_addr)
-            .timeout(Duration::from_secs(2))
+            .timeout(FACT_BUDGET)
             .build(),
     );
     let gw =
@@ -1278,6 +1309,7 @@ async fn gw60_slow_pipelined_downstream_converges_to_latest_under_overflow() {
                     // Slow consumer: delay each delivery so ACKs lag and the
                     // server monitor queue overflows into its squash path.
                     if slow_cb.load(Ordering::Relaxed) {
+                        // not-a-wait: the slow consumer's stall per delivery.
                         std::thread::sleep(Duration::from_millis(50));
                     }
                 }
@@ -1286,7 +1318,7 @@ async fn gw60_slow_pipelined_downstream_converges_to_latest_under_overflow() {
     });
 
     // Subscription establishes; the seed (0.0) is delivered.
-    tokio::time::sleep(Duration::from_millis(700)).await;
+    wait_until("the seed is delivered", || !seen.lock().unwrap().is_empty()).await;
 
     // Fast burst, far faster than the 50 ms/event slow consumer ⟹ overflow.
     const N: i64 = 80;
@@ -1294,10 +1326,15 @@ async fn gw60_slow_pipelined_downstream_converges_to_latest_under_overflow() {
         us_pv.try_post(nt_double_value(i as f64));
     }
 
-    // Let the overflow build and the slow consumer chew the coalesced backlog,
-    // then stop slowing so it drains the squash queue down to the latest.
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // The slow consumer chews the coalesced backlog down to the final post,
+    // then stops slowing.
+    wait_until(
+        "the slow pipelined downstream never reached the final post (GW-60)",
+        || seen.lock().unwrap().last() == Some(&(N as f64)),
+    )
+    .await;
     slow.store(false, Ordering::Relaxed);
+    // absence-window: a stale trailing frame would follow the final post here.
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     let seen_final = seen.lock().unwrap().clone();
@@ -1349,6 +1386,7 @@ async fn gw60_slow_pipelined_downstream_converges_to_latest_under_overflow() {
 async fn r18_25_slow_pipelined_downstream_does_not_starve_co_subscribers() {
     use epics_pva_rs::client_native::ops_v2::{MonitorEvent, MonitorEventMask};
     use epics_pva_rs::pv_request::PvRequestExpr;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     fn extract_double(v: &PvField) -> Option<f64> {
         if let PvField::Structure(s) = v {
@@ -1367,7 +1405,7 @@ async fn r18_25_slow_pipelined_downstream_does_not_starve_co_subscribers() {
     let upstream_client = Arc::new(
         PvaClient::builder()
             .server_addr(us_addr)
-            .timeout(Duration::from_secs(2))
+            .timeout(FACT_BUDGET)
             .build(),
     );
     let gw =
@@ -1377,6 +1415,9 @@ async fn r18_25_slow_pipelined_downstream_does_not_starve_co_subscribers() {
     // callback quickly enough to ACK. Its window closes and stays closed.
     let slow_client = gw.client_config();
     let slow_req = PvRequestExpr::parse("record[pipeline=true,queueSize=2]").expect("pvRequest");
+    let (release, wedge) = std::sync::mpsc::channel::<()>();
+    let wedged = Arc::new(AtomicBool::new(false));
+    let wedged_cb = wedged.clone();
     let h_slow = tokio::spawn(async move {
         let _ = slow_client
             .pvmonitor_events(
@@ -1384,10 +1425,11 @@ async fn r18_25_slow_pipelined_downstream_does_not_starve_co_subscribers() {
                 Some(&slow_req),
                 MonitorEventMask::default(),
                 move |ev| {
-                    // Wedged for longer than the whole test: the window closes
+                    // Wedged until the test drops `release`: the window closes
                     // on its first delivery and never reopens.
                     if let MonitorEvent::Data { .. } = ev {
-                        std::thread::sleep(Duration::from_secs(5));
+                        wedged_cb.store(true, Ordering::Relaxed);
+                        let _ = wedge.recv();
                     }
                 },
             )
@@ -1415,20 +1457,30 @@ async fn r18_25_slow_pipelined_downstream_does_not_starve_co_subscribers() {
             .await;
     });
 
-    // Both subscriptions establish and take their seed; the slow one is now
-    // wedged inside its first callback with a closed window.
-    tokio::time::sleep(Duration::from_millis(900)).await;
+    // Both subscriptions take their seed; the slow one is then wedged inside
+    // its first callback with a closed window.
+    wait_until("both subscriptions take their seed", || {
+        wedged.load(Ordering::Relaxed) && !seen.lock().unwrap().is_empty()
+    })
+    .await;
     let before = seen.lock().unwrap().len();
 
     // Upstream keeps posting. Every one of these must reach the healthy
     // downstream — the slow one's backpressure is its own problem.
     for i in 1..=20i64 {
         us_pv.try_post(nt_double_value(i as f64));
+        // not-a-wait: spaces the posts; the wait for the last one follows.
         tokio::time::sleep(Duration::from_millis(30)).await;
     }
-    tokio::time::sleep(Duration::from_millis(700)).await;
+    wait_until(
+        "the healthy co-subscriber never reached the latest post while the \
+         slow pipelined client stalled",
+        || seen.lock().unwrap().last() == Some(&20.0),
+    )
+    .await;
 
     let seen_final = seen.lock().unwrap().clone();
+    drop(release);
     h_slow.abort();
     h_fast.abort();
 
@@ -1552,7 +1604,7 @@ async fn gateway_get_frames_upstream_marks_not_a_full_mask() {
     let upstream_client = Arc::new(
         PvaClient::builder()
             .server_addr(us_addr)
-            .timeout(Duration::from_secs(2))
+            .timeout(FACT_BUDGET)
             .build(),
     );
     let gw = PvaGateway::start(
@@ -1691,7 +1743,7 @@ async fn r18_28_gateway_monitor_seed_declares_whole_structure() {
     let upstream_client = Arc::new(
         PvaClient::builder()
             .server_addr(us_addr)
-            .timeout(Duration::from_secs(2))
+            .timeout(FACT_BUDGET)
             .build(),
     );
     let cache = ChannelCache::new(
@@ -1805,7 +1857,7 @@ async fn r18_27_gateway_forwards_the_upstream_status_verbatim() {
     let upstream_client = Arc::new(
         PvaClient::builder()
             .server_addr(us_addr)
-            .timeout(Duration::from_secs(2))
+            .timeout(FACT_BUDGET)
             .build(),
     );
     let gw =

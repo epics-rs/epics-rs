@@ -96,9 +96,9 @@ async fn start_seeded(mon: &mut epics_bridge_rs::qsrv::group::GroupMonitor, db: 
     for h in mon.activation_handles() {
         h.enable(db).await;
     }
-    tokio::time::timeout(std::time::Duration::from_secs(2), mon.poll())
+    tokio::time::timeout(fact_budget::FACT_BUDGET, mon.poll())
         .await
-        .expect("the seeds post within 2s")
+        .expect("the seeds post")
         .expect("the seed post");
 }
 
@@ -118,9 +118,9 @@ async fn first_update(
         .expect("a group monitor has a START gate")
         .set_active(true)
         .await;
-    tokio::time::timeout(std::time::Duration::from_secs(2), seed.updates.recv())
+    tokio::time::timeout(fact_budget::FACT_BUDGET, seed.updates.recv())
         .await
-        .expect("the seeds post within 2s")
+        .expect("the seeds post")
         .expect("the seed post")
 }
 
@@ -388,9 +388,9 @@ async fn group_monitor_subscribes_archive_log_events() {
         let rec = db.get_record("TEST:level").expect("rec exists");
         rec.write().notify_field("VAL", EventMask::LOG);
     }
-    let snap = tokio::time::timeout(Duration::from_millis(500), mon.poll())
+    let snap = tokio::time::timeout(fact_budget::FACT_BUDGET, mon.poll())
         .await
-        .expect("LOG event must reach the group monitor within 500ms")
+        .expect("LOG event must reach the group monitor")
         .expect("snapshot delivered");
     assert_eq!(
         snap.marked,
@@ -418,10 +418,10 @@ async fn group_monitor_subscribes_archive_log_events() {
         let rec = db.get_record("TEST:level").expect("rec exists");
         rec.write().notify_field("VAL", EventMask::LOG);
     }
+    // absence-window: an ARCHIVE-only self-trigger event posts nothing.
+    let quiet = tokio::time::timeout(Duration::from_millis(200), mon.poll()).await;
     assert!(
-        tokio::time::timeout(Duration::from_millis(200), mon.poll())
-            .await
-            .is_err(),
+        quiet.is_err(),
         "an ARCHIVE-only self-trigger event marks nothing — pvxs's \
          subscriptionPost returns on `empty && !first`"
     );
@@ -466,6 +466,7 @@ async fn allconst_group_monitor_poll_parks_instead_of_finishing() {
 
     // poll() must PARK (the wire layer already sent the one initial frame);
     // there is no member event source, so it must NOT resolve to None.
+    // absence-window: poll() parks rather than resolving.
     let polled = tokio::time::timeout(Duration::from_millis(500), mon.poll()).await;
     assert!(
         polled.is_err(),
@@ -522,6 +523,7 @@ async fn allconst_group_subscribe_stays_open_then_tears_down_on_cancel() {
     // Open half: the stream stays quiet (the wire layer owns the single
     // initial frame) and OPEN — no FINISH/close. A pre-fix close would make
     // recv() resolve to None within the window.
+    // absence-window: the stream neither posts nor closes.
     let recv = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await;
     assert!(
         recv.is_err(),
@@ -535,7 +537,8 @@ async fn allconst_group_subscribe_stays_open_then_tears_down_on_cancel() {
     // it forever.
     drop(rx);
     let mut returned = false;
-    for _ in 0..400 {
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while std::time::Instant::now() < deadline {
         if Arc::strong_count(&db) == baseline {
             returned = true;
             break;
@@ -765,7 +768,6 @@ async fn group_monitor_stamps_atomic_true_while_get_reports_operation_atomicity(
     use epics_base_rs::server::recgbl::EventMask;
     use epics_bridge_rs::qsrv::group::GroupMonitor;
     use epics_bridge_rs::qsrv::provider::PvaMonitor;
-    use std::time::Duration;
 
     // Extract `record._options.atomic` from a posted/returned value.
     fn atomic_of(s: &PvStructure) -> bool {
@@ -822,9 +824,9 @@ async fn group_monitor_stamps_atomic_true_while_get_reports_operation_atomicity(
         let rec = db.get_record(rec_name).expect("rec exists");
         rec.write().notify_field("VAL", EventMask::VALUE);
     }
-    let snap = tokio::time::timeout(Duration::from_secs(2), mon.poll())
+    let snap = tokio::time::timeout(fact_budget::FACT_BUDGET, mon.poll())
         .await
-        .expect("first monitor delta within 2s")
+        .expect("first monitor delta")
         .expect("snapshot");
     mon.stop().await;
     assert!(
@@ -959,7 +961,6 @@ async fn br_fr12_named_trigger_marks_only_target() {
     use epics_base_rs::server::recgbl::EventMask;
     use epics_bridge_rs::qsrv::group::GroupMonitor;
     use epics_bridge_rs::qsrv::provider::PvaMonitor;
-    use std::time::Duration;
 
     let db = make_db().await;
     let provider = Arc::new(BridgeProvider::new(db.clone()));
@@ -988,9 +989,9 @@ async fn br_fr12_named_trigger_marks_only_target() {
         let rec = db.get_record("TEST:level").expect("rec exists");
         rec.write().notify_field("VAL", EventMask::VALUE);
     }
-    let ev = tokio::time::timeout(Duration::from_millis(500), mon.poll())
+    let ev = tokio::time::timeout(fact_budget::FACT_BUDGET, mon.poll())
         .await
-        .expect("level event wakes poll within 500ms")
+        .expect("level event wakes poll")
         .expect("snapshot");
     assert_eq!(
         ev.marked,
@@ -1004,9 +1005,9 @@ async fn br_fr12_named_trigger_marks_only_target() {
         let rec = db.get_record("TEST:count").expect("rec exists");
         rec.write().notify_field("VAL", EventMask::VALUE);
     }
-    let ev = tokio::time::timeout(Duration::from_millis(500), mon.poll())
+    let ev = tokio::time::timeout(fact_budget::FACT_BUDGET, mon.poll())
         .await
-        .expect("count event wakes poll within 500ms")
+        .expect("count event wakes poll")
         .expect("snapshot");
     assert_eq!(
         ev.marked,
@@ -1029,7 +1030,6 @@ async fn r14_32_pure_self_trigger_marks_the_self_member() {
     use epics_base_rs::server::recgbl::EventMask;
     use epics_bridge_rs::qsrv::group::GroupMonitor;
     use epics_bridge_rs::qsrv::provider::PvaMonitor;
-    use std::time::Duration;
 
     let db = make_db().await;
     let provider = Arc::new(BridgeProvider::new(db.clone()));
@@ -1055,9 +1055,9 @@ async fn r14_32_pure_self_trigger_marks_the_self_member() {
         let rec = db.get_record("TEST:level").expect("rec exists");
         rec.write().notify_field("VAL", EventMask::VALUE);
     }
-    let ev = tokio::time::timeout(Duration::from_millis(500), mon.poll())
+    let ev = tokio::time::timeout(fact_budget::FACT_BUDGET, mon.poll())
         .await
-        .expect("level event wakes poll within 500ms")
+        .expect("level event wakes poll")
         .expect("snapshot");
     assert_eq!(
         ev.marked,
@@ -1083,7 +1083,6 @@ async fn br113_quiet_member_does_not_block_active_member_update() {
     use epics_base_rs::server::recgbl::EventMask;
     use epics_bridge_rs::qsrv::group::GroupMonitor;
     use epics_bridge_rs::qsrv::provider::PvaMonitor;
-    use std::time::Duration;
 
     let db = make_db().await;
     let provider = Arc::new(BridgeProvider::new(db.clone()));
@@ -1102,7 +1101,7 @@ async fn br113_quiet_member_does_not_block_active_member_update() {
         let rec = db.get_record("TEST:level").expect("rec exists");
         rec.write().notify_field("VAL", EventMask::VALUE);
     }
-    let ev = tokio::time::timeout(Duration::from_millis(500), mon.poll())
+    let ev = tokio::time::timeout(fact_budget::FACT_BUDGET, mon.poll())
         .await
         .expect("active member's update must flow without waiting for the quiet member")
         .expect("snapshot");
@@ -1597,7 +1596,7 @@ async fn group_monitor_stop_disables_member_subscriptions() {
 
     // Active (post-START): a member post wakes the group poll.
     post(&db).await;
-    tokio::time::timeout(Duration::from_secs(2), mon.poll())
+    tokio::time::timeout(fact_budget::FACT_BUDGET, mon.poll())
         .await
         .expect("event must be delivered while the group monitor is active")
         .expect("snapshot");
@@ -1608,6 +1607,7 @@ async fn group_monitor_stop_disables_member_subscriptions() {
         h.set_active(false).await;
     }
     post(&db).await;
+    // absence-window: a stopped group monitor delivers no event.
     let stopped = tokio::time::timeout(Duration::from_millis(300), mon.poll()).await;
     assert!(
         stopped.is_err(),
@@ -1619,7 +1619,7 @@ async fn group_monitor_stop_disables_member_subscriptions() {
         h.set_active(true).await;
     }
     post(&db).await;
-    tokio::time::timeout(Duration::from_secs(2), mon.poll())
+    tokio::time::timeout(fact_budget::FACT_BUDGET, mon.poll())
         .await
         .expect("event must be delivered after the group monitor resumes")
         .expect("snapshot");
@@ -2120,7 +2120,6 @@ async fn group_flood_does_not_stall_scalar_monitor_delivery() {
     use epics_bridge_rs::qsrv::provider::PvaMonitor;
     use epics_pva_rs::server_native::source::ChannelSource;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::Duration;
 
     let db = Arc::new(PvDatabase::new());
     let mut members = String::new();
@@ -2195,7 +2194,7 @@ async fn group_flood_does_not_stall_scalar_monitor_delivery() {
             rec.write()
                 .notify_field("VAL", EventMask::VALUE | EventMask::ALARM);
         }
-        tokio::time::timeout(Duration::from_secs(2), scalar_mon.recv())
+        tokio::time::timeout(fact_budget::FACT_BUDGET, scalar_mon.recv())
             .await
             .unwrap_or_else(|_| {
                 panic!("scalar delivery stalled under the group flood (round {round})")
@@ -2204,7 +2203,7 @@ async fn group_flood_does_not_stall_scalar_monitor_delivery() {
     }
 
     // The flooded group's own stream flows too (coalesced, not wedged).
-    tokio::time::timeout(Duration::from_secs(2), group_mon.poll())
+    tokio::time::timeout(fact_budget::FACT_BUDGET, group_mon.poll())
         .await
         .expect("group delivery keeps up under its own flood")
         .expect("assembled group update");
@@ -2446,10 +2445,18 @@ async fn a_dollar_text_member_serves_what_softiocpvx_serves() {
     start_seeded(&mut mon, &db).await;
     put("again").await;
     let mut posted = Vec::new();
-    while let Ok(Some(ev)) = tokio::time::timeout(Duration::from_millis(300), mon.poll()).await {
+    let mut next = tokio::time::timeout(fact_budget::FACT_BUDGET, mon.poll())
+        .await
+        .expect("the put posts");
+    while let Some(ev) = next {
         for path in ev.marked.clone().unwrap_or_default() {
             posted.push((path.clone(), member(&ev.value, &path)));
         }
+        // absence-window: 300 ms without an event ends the put's posts.
+        next = tokio::time::timeout(Duration::from_millis(300), mon.poll())
+            .await
+            .ok()
+            .flatten();
     }
     mon.stop().await;
     posted.sort_by(|a, b| a.0.cmp(&b.0));

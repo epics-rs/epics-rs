@@ -15,6 +15,7 @@ use epics_base_rs::server::database::{ProcStack, PvDatabase};
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
 use epics_bridge_rs::pvalink::install_pvalink_resolver;
+use fact_budget::FACT_BUDGET;
 
 const DB: &str = r#"
 record(ai, "L:INP") { field(INP, {pva:{pv:"L:NOSUCH", local:true}}) }
@@ -35,10 +36,11 @@ async fn stderr_of<T>(lines: usize, f: impl Future<Output = T>) -> (T, String) {
     };
     let out = f.await;
     let read = || std::fs::read_to_string(sink.path()).expect("stderr capture");
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + FACT_BUDGET;
     while read().lines().count() < lines && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    // absence-window: a duplicate line would follow within this margin.
     tokio::time::sleep(Duration::from_millis(200)).await;
     // SAFETY: restoring what this function replaced.
     unsafe {
@@ -85,6 +87,7 @@ async fn unfulfilled_local_link_opens_no_channel_and_prints_pvxs_line() {
                 .process_record_with_links(rec, &mut ProcStack::new())
                 .await;
         }
+        // absence-window: three passes 50 ms apart let a wrongly opened channel show.
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let channels = resolver.channel_diagnostics();

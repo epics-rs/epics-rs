@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use epics_pva_rs::client::PvaClient;
 use epics_pva_rs::pvdata::{PvField, ScalarValue};
+use fact_budget::FACT_BUDGET;
 
 /// `(value, alarm.severity)` of `pv`'s NTScalar.
 async fn value_and_severity(client: &PvaClient, pv: &str) -> Option<(f64, i32)> {
@@ -46,6 +47,13 @@ async fn dual_ioc_rs_resolves_a_pva_link_as_soft_ioc_pva() {
          record(ai, \"DST\") { field(INP, {pva:\"SRC\"}) field(SCAN, \"1 second\") }\n",
     )
     .unwrap();
+    let client_at = |tcp: u16| {
+        PvaClient::builder()
+            .server_addr(std::net::SocketAddr::from(([127, 0, 0, 1], tcp)))
+            // not-a-wait: a timed-out get reads as None and the FACT_BUDGET poll retries it.
+            .timeout(Duration::from_secs(2))
+            .build()
+    };
     let mut candidates = named_port::Candidates::new(named_port::free_for_tcp_and_udp);
     for tcp in candidates.by_ref() {
         // The link's client reaches this IOC's own server by name server
@@ -87,12 +95,9 @@ async fn dual_ioc_rs_resolves_a_pva_link_as_soft_ioc_pva() {
         // The link's first name-server connect can land before the
         // listener is up, and its retry comes 10 s later (pvxs
         // `tcpNSCheckInterval`).
-        let client = PvaClient::builder()
-            .server_addr(std::net::SocketAddr::from(([127, 0, 0, 1], tcp)))
-            .timeout(Duration::from_secs(2))
-            .build();
+        let client = client_at(tcp);
         let mut got = None;
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + FACT_BUDGET;
         while got.is_none() && Instant::now() < deadline && child.try_wait().unwrap().is_none() {
             got = value_and_severity(&client, "DST")
                 .await

@@ -24,6 +24,7 @@ use epics_base_rs::types::EpicsValue;
 use epics_bridge_rs::pvalink::install_pvalink_resolver;
 use epics_pva_rs::server::PvDatabaseSource;
 use epics_pva_rs::server_native::{PvaServer, PvaServerConfig};
+use fact_budget::FACT_BUDGET;
 
 const REMOTE: &str = r#"
 record(waveform, "W") { field(FTVL, "DOUBLE") field(NELM, "16") }
@@ -62,7 +63,7 @@ async fn until_count(db: &PvDatabase, rec: &str, count: i64) {
         .find(|(field, _, _)| field == "INP")
         .unwrap();
     let inp = inp.external().expect("a PVA link");
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + FACT_BUDGET;
     while db.external_link_metadata(inp).and_then(|m| m.element_count) != Some(count) {
         assert!(Instant::now() < deadline, "{rec}.INP never counted {count}");
         tokio::time::sleep(Duration::from_millis(20)).await;

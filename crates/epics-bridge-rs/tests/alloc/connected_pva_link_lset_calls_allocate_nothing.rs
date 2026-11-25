@@ -20,6 +20,7 @@ use epics_base_rs::server::record::{JlinkValue, OpenLatch, pvajson_identity_key}
 use epics_bridge_rs::pvalink::install_pvalink_resolver;
 use epics_pva_rs::server::PvDatabaseSource;
 use epics_pva_rs::server_native::{PvaServer, PvaServerConfig};
+use fact_budget::FACT_BUDGET;
 use serial_test::serial;
 
 const CALLS: usize = 100;
@@ -132,7 +133,7 @@ fn connected_pva_link_lset_calls_allocate_nothing() {
                     let open = OpenLatch::default();
                     let link = LinkRef::new(name.as_bytes(), &open);
                     resolver.connect_link(link, None).await;
-                    let deadline = Instant::now() + Duration::from_secs(20);
+                    let deadline = Instant::now() + FACT_BUDGET;
                     while !(resolver.is_connected(link)
                         && resolver.get_cached_value(link).is_some())
                     {

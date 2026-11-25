@@ -18,12 +18,12 @@
 #![cfg(tokio_backend)]
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use epics_bridge_rs::qsrv::{BridgeProvider, QsrvMount, QsrvPvStore};
 use epics_pva_rs::client::PvaClient;
 use epics_pva_rs::pvdata::{PvField, ScalarValue};
 use epics_pva_rs::server_native::{PvaServer, PvaServerConfig};
+use fact_budget::FACT_BUDGET;
 
 const DB: &str = r#"record(ai, "T") { field(VAL, "1") field(PINI, "YES") }"#;
 
@@ -79,7 +79,7 @@ async fn a_ts_value_mode_serves_its_probe_type_and_options() {
     let addr = server.tcp_addr();
     let client = PvaClient::builder()
         .server_addr(addr)
-        .timeout(Duration::from_secs(5))
+        .timeout(FACT_BUDGET)
         .build();
 
     let get = async |name: &str| {

@@ -18,6 +18,7 @@ use epics_base_rs::types::EpicsValue;
 use epics_bridge_rs::pvalink::install_pvalink_resolver;
 use epics_pva_rs::server::PvDatabaseSource;
 use epics_pva_rs::server_native::{PvaServer, PvaServerConfig};
+use fact_budget::FACT_BUDGET;
 
 const HOLDERS: &str = r#"
 record(calc, "H:INP") { field(INPA, "{pva:{pv:'T:A',proc:'CP'}}") field(CALC, "A") field(FLNK, "N:INP") }
@@ -37,7 +38,7 @@ fn value(db: &PvDatabase, name: &str) -> f64 {
 }
 
 async fn wait_for(db: &PvDatabase, name: &str, want: f64) {
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + FACT_BUDGET;
     while value(db, name) != want {
         assert!(
             Instant::now() < deadline,
@@ -99,6 +100,8 @@ async fn only_an_input_pvalink_scans_on_update() {
         }
         wait_for(&db, "H:INP", v).await;
     }
+    wait_for(&db, "N:INP", 4.0).await;
+    // absence-window: the DF, SEQ and FL holders must stay unscanned.
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(value(&db, "N:INP"), 4.0, "INP CP: the connect and 3 posts");
     for counter in ["N:DF", "N:SEQ", "H:FL"] {

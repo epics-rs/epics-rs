@@ -47,16 +47,24 @@ async fn a_down_ca_link_opens_no_pva_channel() {
     for _ in 0..3 {
         db.process_record("N").await.unwrap();
     }
+    let diags = || -> Vec<String> {
+        r.channel_diagnostics()
+            .into_iter()
+            .map(|d| format!("{d:?}"))
+            .collect()
+    };
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    while !diags().iter().any(|d| d.contains("PROBE:NOWHERE:P")) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the pva link opened no channel: {:#?}",
+            diags()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    // absence-window: a pva channel for the CA link's name opens no later than P's.
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    let diags: Vec<_> = r
-        .channel_diagnostics()
-        .into_iter()
-        .map(|d| format!("{d:?}"))
-        .collect();
-    assert!(
-        diags.iter().any(|d| d.contains("PROBE:NOWHERE:P")),
-        "the pva link opened its channel: {diags:#?}"
-    );
+    let diags = diags();
     assert!(
         !diags.iter().any(|d| d.contains("PROBE:NOWHERE:A")),
         "a CA link opened a pva channel: {diags:#?}"

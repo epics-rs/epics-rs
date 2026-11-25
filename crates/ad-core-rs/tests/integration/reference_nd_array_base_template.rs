@@ -39,7 +39,7 @@ fn every_record_has_c_s_type_and_fields() {
         "ADCore/ADApp/Db/NDArrayBase.template",
     );
     let c = records(&std::fs::read_to_string(&c_path).unwrap());
-    let rs = records(include_str!("../db/NDArrayBase.template"));
+    let rs = records(include_str!("../../db/NDArrayBase.template"));
     assert_eq!(
         c.keys().collect::<Vec<_>>(),
         rs.keys().collect::<Vec<_>>(),

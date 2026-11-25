@@ -105,8 +105,9 @@ async fn an_epics_pv_attribute_is_fed_from_the_installed_ca_client() {
     let port = server.udp_port();
     tokio::spawn(async move { server.run().await });
 
-    // SAFETY: this is the only test in this file that touches the environment,
-    // and it does so before `CaClient::new` snapshots its resolver config.
+    // SAFETY: under nextest, the repo's runner, each test runs in its own
+    // process, and this is before `CaClient::new` snapshots its resolver
+    // config.
     unsafe {
         std::env::set_var("EPICS_CA_ADDR_LIST", format!("127.0.0.1:{port}"));
         std::env::set_var("EPICS_CA_AUTO_ADDR_LIST", "NO");

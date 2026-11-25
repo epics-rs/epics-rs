@@ -523,27 +523,10 @@ enum CoordRequest {
         mask: u16,
         deadband: f64,
         consumer: subscription::Consumer,
-        /// Requested element-count cap (`camonitor -#`), or `None` for the
-        /// full native count. Carried onto the subscription record and
-        /// clamped to the channel's native element count at connect-time by
-        /// the single owner [`subscription::resolve_subscription_count`]
-        /// (C `camonitor.c:169`), so it works even though the subscribe is
-        /// issued before the channel connects.
-        req_count: Option<u32>,
-        /// Which ENUM readback type the subscription requests: `Native`
-        /// (keep `DBR_TIME_ENUM` — the plain library/gateway subscribe),
-        /// `Label` (the `camonitor` default, `DBR_TIME_STRING`), or
-        /// `Numeric` (`camonitor -n`, `DBR_TIME_INT`). See [`EnumReadback`].
-        /// Applied by the coordinator at connect-time type derivation, so it
-        /// works even though the subscribe is issued before the channel
-        /// connects.
-        enum_readback: EnumReadback,
-        /// When set, a FLOAT/DOUBLE field is subscribed in its
-        /// `DBR_TIME_STRING` form so the server renders the value to a
-        /// string at record precision (`camonitor -s` / `floatAsString`;
-        /// C `camonitor.c:162-166`). Folded into the readback derivation
-        /// after the ENUM case, mirroring C's `else if`.
-        float_as_string: bool,
+        /// The DBR type and count: derived at connect-time from the native
+        /// type (so a subscribe issued before connect works), or fixed by
+        /// the caller.
+        kind: subscription::SubscribeType,
         /// the coordinator owns the `subid` table, so it
         /// allocates the id (probing live subscriptions) and returns
         /// it here rather than accepting one minted at the call site.
@@ -1936,6 +1919,28 @@ impl ReqCount {
     }
 }
 
+/// A DBR type a subscription names, `0..=LAST_BUFFER_TYPE`. Its own type,
+/// so a mask or a count cannot be passed in its place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DbrType(u16);
+
+impl DbrType {
+    /// `code` as a request type; past `LAST_BUFFER_TYPE` it is
+    /// `CaError::UnsupportedType`, libca's `ECA_BADTYPE`
+    /// (`oldChannelNotify.cpp:551`).
+    pub fn new(code: u16) -> CaResult<Self> {
+        if code > epics_base_rs::types::LAST_BUFFER_TYPE {
+            return Err(CaError::UnsupportedType(code));
+        }
+        Ok(Self(code))
+    }
+
+    /// The type code on the wire.
+    pub fn code(self) -> u16 {
+        self.0
+    }
+}
+
 impl CaChannel {
     pub async fn wait_connected(&self, timeout: Duration) -> CaResult<()> {
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -3229,6 +3234,20 @@ impl CaChannel {
         float_as_string: bool,
         req_count: Option<u32>,
     ) -> CaResult<MonitorHandle> {
+        self.subscribe_handle(
+            deadband,
+            mask,
+            subscription::SubscribeType::derived(enum_readback, float_as_string, req_count),
+        )
+        .await
+    }
+
+    async fn subscribe_handle(
+        &self,
+        deadband: f64,
+        mask: u16,
+        kind: subscription::SubscribeType,
+    ) -> CaResult<MonitorHandle> {
         let env = epics_base_rs::runtime::env::get_lossy("EPICS_CA_MONITOR_QUEUE")
             .and_then(|s| s.parse::<usize>().ok());
         let queue_size = resolve_monitor_queue_size(env);
@@ -3239,14 +3258,7 @@ impl CaChannel {
             slot: coalesce_slot.clone(),
         };
         let subid = self
-            .subscribe_consumer(
-                deadband,
-                mask,
-                enum_readback,
-                float_as_string,
-                req_count,
-                consumer,
-            )
+            .subscribe_consumer(deadband, mask, kind, consumer)
             .await?;
         Ok(MonitorHandle {
             subid,
@@ -3283,19 +3295,56 @@ impl CaChannel {
             callback: Box::new(callback),
             gone: monitor.gone.clone(),
         };
-        monitor.subid = self
-            .subscribe_consumer(0.0, mask, EnumReadback::Native, false, None, consumer)
-            .await?;
+        let kind = subscription::SubscribeType::derived(EnumReadback::Native, false, None);
+        monitor.subid = self.subscribe_consumer(0.0, mask, kind, consumer).await?;
         Ok(monitor)
+    }
+
+    /// Subscribe in `dbr_type` for `count` elements, as
+    /// `ca_create_subscription(type, count, ...)` does: the server converts
+    /// each event to that type, and the pair is kept across reconnects and
+    /// native-type changes. `count` 0 is CA autosize; a count past the
+    /// native one is clamped per request (`netIO.h:241-251`).
+    ///
+    /// ```no_run
+    /// # async fn f(ch: epics_ca_rs::client::CaChannel) -> epics_ca_rs::CaResult<()> {
+    /// use epics_base_rs::types::DBR_TIME_DOUBLE;
+    /// use epics_ca_rs::client::DbrType;
+    /// use epics_ca_rs::protocol::DBE_VALUE;
+    /// let monitor = ch
+    ///     .subscribe_with_mask_dbr_type(DBE_VALUE, DbrType::new(DBR_TIME_DOUBLE)?, 0)
+    ///     .await?;
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// The type and the mask cannot be swapped:
+    ///
+    /// ```compile_fail,E0308
+    /// # async fn f(ch: epics_ca_rs::client::CaChannel) {
+    /// use epics_base_rs::types::DBR_TIME_DOUBLE;
+    /// use epics_ca_rs::protocol::DBE_VALUE;
+    /// let _ = ch.subscribe_with_mask_dbr_type(DBR_TIME_DOUBLE, DBE_VALUE, 0).await;
+    /// # }
+    /// ```
+    pub async fn subscribe_with_mask_dbr_type(
+        &self,
+        mask: u16,
+        dbr_type: DbrType,
+        count: u32,
+    ) -> CaResult<MonitorHandle> {
+        self.subscribe_handle(
+            0.0,
+            mask,
+            subscription::SubscribeType::Fixed { dbr_type, count },
+        )
+        .await
     }
 
     async fn subscribe_consumer(
         &self,
         deadband: f64,
         mask: u16,
-        enum_readback: EnumReadback,
-        float_as_string: bool,
-        req_count: Option<u32>,
+        kind: subscription::SubscribeType,
         consumer: subscription::Consumer,
     ) -> CaResult<u32> {
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -3304,9 +3353,7 @@ impl CaChannel {
             mask,
             deadband,
             consumer,
-            req_count,
-            enum_readback,
-            float_as_string,
+            kind,
             reply: reply_tx,
         });
 
@@ -3691,7 +3738,7 @@ async fn run_coordinator(
                                 .push(reply);
                         }
                     }
-                    CoordRequest::Subscribe { cid, mask, deadband, consumer, req_count, enum_readback, float_as_string, reply } => {
+                    CoordRequest::Subscribe { cid, mask, deadband, consumer, kind, reply } => {
                         if let Some(ch) = channels.get(&cid) {
                             let server_addr = ch.server_addr.unwrap_or_else(|| {
                                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
@@ -3703,23 +3750,13 @@ async fn run_coordinator(
                             // the EVENT_ADD queues on the live socket and the
                             // server answers it when the circuit recovers.
                             let installed = ch.state.is_operational();
-                            // Single owner of the subscribe-time readback
-                            // derivation: ENUM substituted per enum_readback
-                            // (Label→DBR_TIME_STRING, Numeric→DBR_TIME_INT,
-                            // Native→keep), else FLOAT/DOUBLE under -s becomes
-                            // DBR_TIME_STRING, else native TIME type
-                            // (C camonitor.c:155-166).
-                            let data_type = ch
-                                .native_type
-                                .map(|t| subscription_readback_dbr(t, enum_readback, float_as_string));
-                            // Single owner of the reqElems→wire-count rule: a
-                            // `-#` cap is clamped to the native element count,
-                            // no cap resolves to wire 0 (autosize) (C
-                            // camonitor.c:168-169). Reconnect re-resolves via
-                            // restore_for_channel against the fresh count.
-                            let count = ch
-                                .native_type
-                                .map(|_| subscription::resolve_subscription_count(req_count, ch.element_count));
+                            // An installed channel chooses a derived pair now;
+                            // otherwise its first connect does.
+                            let mut kind = kind;
+                            let request = installed.then(|| {
+                                let native = ch.native_type.expect("installed channel has native type");
+                                kind.connect(native as u16, ch.element_count, false)
+                            });
                             // C keeps the user's cap in `netSubscription::count`
                             // and resolves the WIRE count per request via
                             // `getCount(guard, CA_V413(minor))` (`netIO.h:241-251`)
@@ -3742,22 +3779,7 @@ async fn run_coordinator(
                             subscriptions.add(subscription::SubscriptionRecord {
                                 subid,
                                 cid,
-                                data_type,
-                                count,
-                                // Requested cap preserved across reconnects;
-                                // restore_for_channel re-clamps it to the
-                                // fresh native count each connect.
-                                req_count,
-                                // The public subscribe API auto-derives the
-                                // DBR type from the channel's native type, so
-                                // it must re-derive on NativeTypeChanged. The
-                                // `enum_readback` / `float_as_string`
-                                // preferences are carried on the record so the
-                                // restore re-derivation applies the same
-                                // substitution chain.
-                                type_user_supplied: false,
-                                enum_readback,
-                                float_as_string,
+                                kind,
                                 mask,
                                 server_addr,
                                 priority,
@@ -3768,9 +3790,7 @@ async fn run_coordinator(
                                 nreplace: 0,
                             });
 
-                            if installed {
-                                let data_type =
-                                    data_type.expect("installed channel has native type");
+                            if let Some((data_type, count)) = request {
                                 // C `tcpiiu::subscriptionRequest`
                                 // (`tcpiiu.cpp:1572-1585`): resolve the wire
                                 // count, then bound it against what the circuit
@@ -3778,7 +3798,7 @@ async fn run_coordinator(
                                 // never installed and `ca_create_subscription`
                                 // returns ECA_TOLARGE.
                                 let wire_count = crate::protocol::subscription_wire_count(
-                                    count.expect("installed channel has element count"),
+                                    count,
                                     ch.element_count,
                                     data_type,
                                     peer_minor,
@@ -4465,9 +4485,7 @@ async fn run_coordinator(
                         for cid in recovered_cids {
                             for sub_id in subscriptions.for_cid(cid) {
                                 if let Some(rec) = subscriptions.get(sub_id) {
-                                    if let (Some(data_type), Some(_count)) =
-                                        (rec.data_type, rec.count)
-                                    {
+                                    if let Some((data_type, req_count)) = rec.kind.request() {
                                         if let Some(ch) = channels.get(&cid) {
                                             if let Some(addr) = ch.server_addr {
                                                 let peer_minor = server_minor_version
@@ -4475,7 +4493,7 @@ async fn run_coordinator(
                                                     .copied()
                                                     .unwrap_or(0);
                                                 match crate::protocol::read_notify_wire_count(
-                                                    rec.count.unwrap_or(0),
+                                                    req_count,
                                                     ch.element_count,
                                                     data_type,
                                                     peer_minor,
@@ -4981,7 +4999,7 @@ fn cancel_subscription(
     // while the circuit is unresponsive.
     if let Some(ch) = channels.get(&rec.cid)
         && ch.state.is_operational()
-        && let Some(data_type) = rec.data_type
+        && let Some((data_type, req_count)) = rec.kind.request()
     {
         let server_addr = ch.server_addr.unwrap();
         // C `tcpiiu::subscriptionCancelRequest` (`tcpiiu.cpp:1659`)
@@ -4997,7 +5015,7 @@ fn cancel_subscription(
             subid,
             data_type,
             count: crate::protocol::subscription_cancel_wire_count(
-                rec.count.unwrap_or(0),
+                req_count,
                 ch.element_count,
                 peer_minor,
             ),

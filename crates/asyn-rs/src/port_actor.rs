@@ -1098,6 +1098,17 @@ enum CDispatch {
     Queued,
 }
 
+/// What [`PortActor::scan_device`] makes of a request.
+enum DeviceScan {
+    /// Out of the scan's scope, or its device passed.
+    Take,
+    /// The device is disabled (asynManager.c:877).
+    PassOver,
+    /// The device is still down and the request has a timeout callback
+    /// (:885-887).
+    TimeOut,
+}
+
 /// Which `dpCommon` a request resolves to — C `findDpCommon`
 /// (asynManager.c:538-545). `locateDevice` (:576) hands back NULL unless the
 /// port carries `ASYN_MULTIDEVICE`, so an addr names a device only there;
@@ -2598,6 +2609,32 @@ impl PortActor {
             && Self::c_dispatch(op) == CDispatch::Queued
     }
 
+    /// C `portThread`'s per-request device checks (asynManager.c:877-888), in
+    /// its order: a disabled device's request is passed over before anything
+    /// is attempted on the device (:877 above :879).
+    fn scan_device(&mut self, msg: &ActorMessage, connect: ConnectCheck) -> DeviceScan {
+        if !self.device_scanned(&msg.op, connect) {
+            return DeviceScan::Take;
+        }
+        let addr = msg.user.addr;
+        // The request keeps its place in the queue: it runs when the device is
+        // re-enabled, and its queue timer still expires under it if it never is.
+        if self.driver.base().check_device_enabled(addr).is_err() {
+            return DeviceScan::PassOver;
+        }
+        self.auto_connect_device(addr, msg.user.reason);
+        // :885-887 guards on `timeoutUser != 0`: `createAsynUser`'s second
+        // argument is optional (asynRecord.c:307-308 passes one,
+        // devAsynInt32.c:212 passes 0), and `queueRequest` refuses
+        // `timeout > 0.0` without it (:1592-1597). Here the reply channel *is*
+        // that callback, so the request reports the queue timeout its own timer
+        // would.
+        if msg.timeout_user() && self.driver.base().check_device_connected(addr).is_err() {
+            return DeviceScan::TimeOut;
+        }
+        DeviceScan::Take
+    }
+
     fn pop_next(&mut self) -> Option<ActorMessage> {
         self.dequeued.take().or_else(|| self.heap.pop())
     }
@@ -2671,8 +2708,12 @@ impl PortActor {
                 // C drains the Connect queue *before* `autoConnectDevice`
                 // (asynManager.c:813-857): a waived request runs on the dead line
                 // with no connect attempt in front of it. The attempt C makes
-                // *after* that drain (:858-863) is the actor loop's.
-                if connect == ConnectCheck::Required {
+                // *after* that drain (:858-863) is the actor loop's. A scanned
+                // request's device waits for its enabled check
+                // ([`Self::scan_device`]).
+                if self.device_scanned(&msg.op, connect) {
+                    self.auto_connect_port();
+                } else if connect == ConnectCheck::Required {
                     self.auto_connect_device(msg.user.addr, msg.user.reason);
                 }
                 // Every queued request passed the port-level half of `queueRequest`
@@ -2688,37 +2729,13 @@ impl PortActor {
                     msg.refuse(e);
                     return None;
                 }
-                if self.device_scanned(&msg.op, connect) {
-                    // :877 `if(!pdpCommon->enabled) continue;` — the request keeps
-                    // its place in the queue. It runs when the device is re-enabled,
-                    // and its queue timer still expires under it if it never is.
-                    if self
-                        .driver
-                        .base()
-                        .check_device_enabled(msg.user.addr)
-                        .is_err()
-                    {
+                match self.scan_device(&msg, connect) {
+                    DeviceScan::Take => {}
+                    DeviceScan::PassOver => {
                         self.parked.push(msg);
                         return None;
                     }
-                    // :879-888 — auto-connect has already run above (C calls it at
-                    // :879); a device still down diverts the request to its
-                    // *timeout* callback rather than `processUser`, but only when
-                    // one was registered (`:886` guards on `timeoutUser != 0`;
-                    // `createAsynUser`'s second argument is optional —
-                    // asynRecord.c:307-308 passes one, devAsynInt32.c:212 passes
-                    // 0). A request that asked for a timeout always has one:
-                    // `queueRequest` refuses `timeout > 0.0` without it
-                    // (:1592-1597). Here the reply channel *is* that callback, so
-                    // the request reports the same queue timeout its own timer
-                    // would.
-                    if msg.timeout_user()
-                        && self
-                            .driver
-                            .base()
-                            .check_device_connected(msg.user.addr)
-                            .is_err()
-                    {
+                    DeviceScan::TimeOut => {
                         msg.time_out(self.driver.base().port_name.to_string());
                         return None;
                     }
@@ -6019,6 +6036,69 @@ mod tests {
             .expect("actor dropped the parked reply")
             .expect("the parked request runs once its device is enabled");
         assert_eq!(r.int_val, Some(7));
+    }
+
+    /// C `portThread` passes a disabled device's request over (asynManager.c:877)
+    /// before it auto-connects the device (:879): the device sees no connect
+    /// while it is disabled, and its connect comes once it is re-enabled.
+    #[test]
+    fn a_disabled_device_sees_no_connect_attempt_while_its_request_waits() {
+        struct CountingDriver {
+            base: PortDriverBase,
+            connects: Arc<parking_lot::Mutex<Vec<i32>>>,
+        }
+        impl PortDriver for CountingDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn connect_addr(&mut self, user: &AsynUser) -> AsynResult<()> {
+                self.connects.lock().push(user.addr);
+                self.base.connect_addr(user.addr);
+                Ok(())
+            }
+        }
+        let mut base = multi_device_driver(true).base;
+        for addr in [0, 1] {
+            let device = base.device_state(addr);
+            device.put_connected(false);
+            device.put_auto_connect(true);
+        }
+        base.disable_addr(1);
+        let connects = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let tx = spawn_actor(CountingDriver {
+            base,
+            connects: connects.clone(),
+        });
+
+        let mut waiting = send(&tx, RequestOp::Int32Read, AsynUser::new(0).with_addr(1));
+        // Queued after it in the same band, so it is scanned after it.
+        let r = send_and_wait(&tx, RequestOp::Int32Read, AsynUser::new(0).with_addr(0)).unwrap();
+        assert_eq!(r.int_val, Some(7));
+        assert!(
+            matches!(waiting.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+            "a disabled device's request stays queued"
+        );
+        assert_eq!(
+            connects.lock().clone(),
+            vec![0],
+            "only the enabled device was connected"
+        );
+
+        send_and_wait(
+            &tx,
+            RequestOp::SetEnable { yes: true },
+            AsynUser::new(0).with_addr(1),
+        )
+        .unwrap();
+        let r = waiting
+            .blocking_recv()
+            .expect("actor dropped the reply")
+            .expect("the request runs once its device is enabled");
+        assert_eq!(r.int_val, Some(7));
+        assert_eq!(connects.lock().clone(), vec![0, 1]);
     }
 
     /// R15-47, boundary 2: a parked request still expires on its own queue

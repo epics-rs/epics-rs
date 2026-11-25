@@ -10,6 +10,7 @@ mod common_plugins_reads_only_c_macros;
 mod common_plugins_request_paths;
 mod epics_pv_attribute_monitor_mask;
 mod epics_pv_attribute_native_types;
+mod epics_pv_attribute_wire_type;
 mod epics_pv_attributes_are_fed;
 mod nd_codec_settings_saves_c_set;
 mod nd_stats_settings_saves_reset_sseqs;

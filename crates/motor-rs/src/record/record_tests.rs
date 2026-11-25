@@ -9371,6 +9371,107 @@ fn test_jog_away_from_limit_does_not_stop() {
     assert!(rec.ctrl.jogr != 0, "jog keeps running");
 }
 
+/// HLM=100/LLM=-100 and JVEL=1 on an initialized record: a forward jog
+/// violates once RBV passes 99 (C 1466-1468). MRES=0.01, so a status at
+/// 9950 steps reads back 99.5.
+fn jog_window_record() -> MotorRecord {
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 0.01;
+    rec.init_record(1).unwrap();
+    rec.put_field("HLM", EpicsValue::Double(100.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-100.0)).unwrap();
+    rec.put_field("JVEL", EpicsValue::Double(1.0)).unwrap();
+    rec
+}
+
+fn status_pass(rec: &mut MotorRecord, pos: f64, moving: bool) -> ProcessEffects {
+    rec.set_event(MotorEvent::DeviceUpdate(status_at(pos, moving)));
+    rec.do_process()
+}
+
+/// A put processed on the same pass as a moving status: C evaluates LVIO
+/// once (1463-1484), so the violation it raises is not re-evaluated
+/// away by the released button.
+#[test]
+fn test_put_riding_a_moving_status_into_the_jog_window_keeps_lvio() {
+    let mut rec = jog_window_record();
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
+    rec.do_process();
+    status_pass(&mut rec, 5000.0, true);
+    assert_eq!(rec.get_field("LVIO"), Some(EpicsValue::Short(0)));
+
+    rec.put_field("SPMG", EpicsValue::Short(SpmgMode::Go as i16))
+        .unwrap();
+    let e = status_pass(&mut rec, 9950.0, true);
+    assert!(stops(&e), "{:?}", e.commands);
+    assert_eq!(rec.get_field("LVIO"), Some(EpicsValue::Short(1)));
+    assert_eq!(rec.get_field("JOGF"), Some(EpicsValue::Short(0)));
+}
+
+/// C runs enter_do_work's LVIO on the stopped-status pass too, after
+/// postProcess restarted the jog family (JOG_STOP -> JOG_BL1, 906-942):
+/// JOGF pressed again during the deceleration and a readback that
+/// overshot into the window stop the backlash and release the button.
+#[test]
+fn test_jog_backlash_restarted_inside_the_jog_window_is_stopped() {
+    let mut rec = jog_window_record();
+    rec.put_field("BDST", EpicsValue::Double(2.0)).unwrap();
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
+    rec.do_process();
+    status_pass(&mut rec, 9850.0, true);
+    rec.put_field("JOGF", EpicsValue::Short(0)).unwrap();
+    assert!(stops(&rec.do_process()));
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
+    rec.do_process();
+
+    let e = status_pass(&mut rec, 9950.0, false);
+    let backlash = e.commands.iter().position(|c| {
+        matches!(c, MotorCommand::MoveAbsolute { position, .. } if (position - 9750.0).abs() < 1e-6)
+    });
+    let stop = e
+        .commands
+        .iter()
+        .position(|c| matches!(c, MotorCommand::Stop { .. }));
+    assert!(
+        matches!((backlash, stop), (Some(b), Some(s)) if b < s),
+        "{:?}",
+        e.commands
+    );
+    assert_eq!(rec.get_field("LVIO"), Some(EpicsValue::Short(1)));
+    assert_eq!(rec.get_field("JOGF"), Some(EpicsValue::Short(0)));
+}
+
+/// maybeRetry's give-up re-arms a held jog as MIP_JOG_REQ (1063-1065);
+/// enter_do_work's LVIO (1463-1484) sees no jog bit before do_work
+/// dispatches the jog (2080-2120, checked against VAL), so a readback
+/// already in the jog window stops nothing on the give-up pass.
+#[test]
+fn test_retry_give_up_refires_a_held_jog_after_the_lvio_check() {
+    let mut rec = jog_window_record();
+    rec.put_field("RTRY", EpicsValue::Short(1)).unwrap();
+    rec.put_field("VAL", EpicsValue::Double(98.5)).unwrap();
+    rec.do_process();
+    status_pass(&mut rec, 9700.0, true);
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
+    rec.do_process();
+    let e = status_pass(&mut rec, 9920.0, false);
+    assert!(moves_to(&e, 9850.0), "the one retry: {:?}", e.commands);
+    status_pass(&mut rec, 9920.0, true);
+
+    let e = status_pass(&mut rec, 9920.0, false);
+    assert!(
+        e.commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveVelocity { velocity, .. } if *velocity > 0.0)),
+        "{:?}",
+        e.commands
+    );
+    assert!(!stops(&e), "{:?}", e.commands);
+    assert_eq!(rec.get_field("LVIO"), Some(EpicsValue::Short(0)));
+    assert_eq!(rec.get_field("JOGF"), Some(EpicsValue::Short(1)));
+    assert_eq!(rec.get_field("MISS"), Some(EpicsValue::Short(1)));
+}
+
 #[test]
 fn test_home_search_disables_lvio_check() {
     // C 1471-1472: MIP_HOME forces lvio = false even when the readback
@@ -12645,6 +12746,7 @@ fn test_stop_during_queued_home_does_not_home() {
 fn test_stop_during_queued_jog_does_not_jog() {
     let mut rec = moving_to_50(0);
     rec.put_field("DHLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     queue_jog_behind_pause_stop(&mut rec);
     assert!(rec.stat.mip.contains(MipFlags::JOGF | MipFlags::STOP));
     rec.ctrl.stop = 1;
@@ -12661,6 +12763,24 @@ fn test_stop_during_queued_jog_does_not_jog() {
     );
     assert!(rec.ctrl.jogf != 0);
     assert_eq!(rec.stat.mip, MipFlags::empty());
+}
+
+/// C 1475-1484: a rising soft-limit violation releases every motion
+/// button, whatever the stop path then does with the axis.
+#[test]
+fn test_soft_limit_violation_on_queued_jog_releases_buttons() {
+    let mut rec = moving_to_50(0);
+    rec.put_field("DHLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    queue_jog_behind_pause_stop(&mut rec);
+    rec.ctrl.homr = 1;
+
+    rec.process_motor_info(&status_at(100_050.0, true));
+    let e = rec.check_completion();
+    assert_eq!(rec.get_field("LVIO"), Some(EpicsValue::Short(1)));
+    assert_eq!(e.commands, [MotorCommand::stop_axis()]);
+    assert_eq!(rec.get_field("JOGF"), Some(EpicsValue::Short(0)));
+    assert_eq!(rec.get_field("HOMR"), Some(EpicsValue::Short(0)));
 }
 
 fn jogging() -> MotorRecord {

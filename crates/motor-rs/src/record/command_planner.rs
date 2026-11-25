@@ -3,6 +3,7 @@ use super::*;
 impl MotorRecord {
     /// Plan and start a motion from a user write.
     pub fn plan_motion(&mut self, src: CommandSource) -> ProcessEffects {
+        self.recompute_lvio_during_motion();
         self.put_do_work(src, ProcReason::NothingDone)
     }
 
@@ -15,13 +16,6 @@ impl MotorRecord {
         // a pass that returns from the stop/SPMG top block below drops
         // it exactly like C's early return(OK) before line 1938.
         let res_reanchor = std::mem::take(&mut self.internal.res_reanchor);
-
-        // C enter_do_work (1463-1484) re-evaluates LVIO on EVERY process
-        // pass before do_work — including put-processing passes, since
-        // HLM/LLM/DHLM/DLLM are pp(TRUE). A rising violation sets
-        // stop = 1 (1480), which the latent-stop gate below consumes in
-        // this same pass, exactly like C's do_work stop branch.
-        self.recompute_lvio_during_motion();
 
         // C do_work evaluates `pmr->stop` and `spmg != lspg` at the TOP
         // of every put-processing pass, before any other work
@@ -1937,6 +1931,7 @@ impl MotorRecord {
                     // skip leaves the put's DMOV blink unrestored, so its
                     // 1489 gate drops the move (C defect, not copied).
                     let mut effects = ProcessEffects::default();
+                    self.recompute_lvio_during_motion();
                     if self.put_rides() || !self.take_latent_stop(&mut effects) {
                         self.callback_do_work(&mut effects);
                     }
@@ -1965,13 +1960,12 @@ impl MotorRecord {
                     effects.process_exit = true;
                 } else if self.put_rides() {
                     // The orphan's pass is the put's.
+                    self.recompute_lvio_during_motion();
                     return self.do_work(ProcReason::NothingDone);
                 }
                 effects
             }
             None if idle_status_pass || self.stat.mip.contains(MipFlags::DELAY_ACK) => {
-                // C enter_do_work's LVIO (1463-1484) runs on every pass.
-                self.recompute_lvio_during_motion();
                 // C process (1301-1409): a CALLBACK_DATA pass on an idle
                 // record runs the stopped branch — LOAD_P collapse
                 // (1405-1409), the pp pass (1382-1402) — before falling
@@ -1981,7 +1975,10 @@ impl MotorRecord {
                 // pass ends the wait whatever processed the record.
                 self.check_completion()
             }
-            None => self.do_work(ProcReason::NothingDone),
+            None => {
+                self.recompute_lvio_during_motion();
+                self.do_work(ProcReason::NothingDone)
+            }
         }
     }
 
@@ -2023,12 +2020,6 @@ impl MotorRecord {
         // transition to Stop/Pause), it is dropped unconsumed and the
         // existing latent handling owns the pass.
         if std::mem::take(&mut self.internal.res_reanchor) {
-            // C enter_do_work LVIO (1463-1484) precedes do_work.
-            if self.recompute_lvio_during_motion() {
-                let mut effects = ProcessEffects::default();
-                self.take_latent_stop(&mut effects);
-                return effects;
-            }
             let top_block_returns = self.ctrl.stop != 0
                 || (self.ctrl.spmg != self.internal.lspg
                     && matches!(self.ctrl.spmg, SpmgMode::Stop | SpmgMode::Pause));
@@ -2041,13 +2032,10 @@ impl MotorRecord {
 
         // A pass with no command source — in the live IOC the process
         // cycle a put to a field that sets no last_write triggers
-        // (HLM/LLM/DHLM/DLLM are pp(TRUE) in C). C still runs the
-        // enter_do_work LVIO re-evaluation (1463-1484) on it: a limit
-        // lowered onto a running jog must stop the axis on the write
-        // pass. do_work's home/jog/tweak sections then act on latched
-        // button state and its chain end may fire the implicit GET_INFO
-        // (2546-2557, NOTHING_DONE passes only).
-        self.recompute_lvio_during_motion();
+        // (HLM/LLM/DHLM/DLLM are pp(TRUE) in C), whose entry LVIO stops a
+        // jog the lowered limit now violates. do_work's home/jog/tweak
+        // sections then act on latched button state and its chain end may
+        // fire the implicit GET_INFO (2546-2557, NOTHING_DONE passes only).
         let mut effects = ProcessEffects::default();
         if !self.take_latent_stop(&mut effects) && !self.jog_stop_section(&mut effects) {
             self.dispatch_latent_collection(&mut effects, reason);

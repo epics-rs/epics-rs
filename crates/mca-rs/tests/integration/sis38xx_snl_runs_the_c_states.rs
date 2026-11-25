@@ -45,7 +45,7 @@ async fn boot(num_signals: &str) -> Ioc {
         .register_record_type(asyn, asyn_factory)
         .register_record_type("busy", || Box::new(BusyRecord::default()))
         .register_device_support("mca", &SOFT_MCA, || Box::new(mca_rs::SoftMca))
-        .db_string(include_str!("SIS38XX_soft.db"), &macros)
+        .db_string(include_str!("../SIS38XX_soft.db"), &macros)
         .unwrap()
         .build()
         .await
@@ -179,7 +179,7 @@ async fn the_program_prints_what_c_prints() {
         ] {
             let out = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
-                    "the_program_prints_what_c_prints",
+                    "sis38xx_snl_runs_the_c_states::the_program_prints_what_c_prints",
                     "--exact",
                     "--nocapture",
                     "--test-threads=1",
@@ -195,7 +195,11 @@ async fn the_program_prints_what_c_prints() {
             );
             let printed: Vec<_> = stdout
                 .lines()
-                .map(|l| l.trim_start_matches("test the_program_prints_what_c_prints ... "))
+                .map(|l| {
+                    l.trim_start_matches(
+                        "test sis38xx_snl_runs_the_c_states::the_program_prints_what_c_prints ... ",
+                    )
+                })
                 .filter(|l| l.starts_with("SIS") || l.contains("NUM_SIGNALS") || l.contains(">>>"))
                 .collect();
             assert_eq!(printed, lines, "NUM_SIGNALS={case}\n{stdout}");

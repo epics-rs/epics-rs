@@ -19,8 +19,9 @@ fn run(shell: &IocShell, line: &str) -> String {
 
 // RTEMS-EXEC-MODEL-ALLOW(1): checked, not waived — ran and passed on the
 // exec backend (`EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p
-// mca-rs --all-features --test dbstatic_dumps_list_mca`). The runtime only
-// feeds `BlockingBridge::capture` for the shell; no CA server is built.
+// mca-rs --all-features --test integration dbstatic_dumps_list_mca::`). The
+// runtime only feeds `BlockingBridge::capture` for the shell; no CA server
+// is built.
 #[test]
 fn the_factory_adds_the_record_type_to_the_dumps_dbstaticlib_c_3304() {
     let _ = mca_rs::mca_record_factory();

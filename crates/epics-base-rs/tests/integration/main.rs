@@ -975,6 +975,7 @@ mod sseq_link_status_at_put;
 mod sseq_link_status_follows_connection;
 mod sseq_link_status_posts_like_check_links;
 mod sseq_lnk_destination_typed;
+mod sseq_loaded_do_keeps_its_value;
 mod sseq_monitor_posts_from_its_own_copies;
 mod sseq_refused_putcallback_aborts;
 mod sseq_start_posts_every_wtg;

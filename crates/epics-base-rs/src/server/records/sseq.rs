@@ -369,7 +369,8 @@ impl SseqStep {
     /// `special()` on a `STRn` put (:1129-1137), `init_record` (:243-249), and
     /// the `processCallback` link read (:657-661, :676-680). A write that
     /// updates one view and leaves the other stale is the defect — so no site
-    /// assigns `dov`/`str_val` directly; every one goes through this pair.
+    /// assigns `dov`/`str_val` directly; every one goes through this pair,
+    /// except the `.db` load (`load_field`), which `init_record` reconciles.
     ///
     /// `PREC` is `DBF_SHORT` and reaches C's
     /// `cvtDoubleToString(double, char*, epicsUInt16 prec)` by implicit
@@ -1906,6 +1907,18 @@ impl Record for SseqRecord {
         // override (`acalcout.rs:1672`) already routes through here; this is the
         // same rule.
         crate::server::record::put_field_internal_default(self, name, value)
+    }
+
+    /// A `.db` `DOn`/`STRn` stores its own view only, as C `dbPutString` does
+    /// with no `special()`; `init_record` reconciles the pair before the
+    /// record runs, so `DOn` is never rounded to PREC at load.
+    fn load_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
+        match (Self::step_index_from_suffix(name), value) {
+            (Some((idx, "DO")), EpicsValue::Double(dov)) => self.steps[idx].dov = dov,
+            (Some((idx, "STR")), EpicsValue::String(s)) => self.steps[idx].str_val = s,
+            (_, value) => return self.put_field(name, value),
+        }
+        Ok(())
     }
 
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {

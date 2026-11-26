@@ -1123,6 +1123,17 @@ impl LinkReadAs {
         }
     }
 
+    /// This request at `n` elements, C's `dbGetLink(.., &nelements)` with
+    /// the count `dbGetNelements` gave (`compressRecord.c:328-342`); a scalar
+    /// one is one element already.
+    pub(crate) fn asking(self, n: usize) -> Self {
+        match self {
+            Self::Array { dbr, .. } => Self::Array { dbr, n_request: n },
+            Self::CharArrayAsString { .. } => Self::CharArrayAsString { max_elements: n },
+            other => other,
+        }
+    }
+
     /// The scalar `dbrType` this request names; `None` for the native read and
     /// the char-array one, which name none.
     pub(crate) fn dbr_type(self) -> Option<crate::types::DbFieldType> {
@@ -7673,9 +7684,10 @@ pub trait Record: RecordAny + Send + Sync + 'static {
 
     /// INP's `dbIsLinkConnected && dbGetNelements` — `None` where that test
     /// fails — told to a type that declares [`CycleHooks::INP_NELEMENTS`]
-    /// after its pre-input actions and before the INP read, whatever that
-    /// read then delivers. `false` refuses the read: the cycle neither reads
-    /// INP nor raises the alarm a failed `dbGetLink` would.
+    /// after its pre-input actions and before the INP read, which asks that
+    /// many elements, whatever it then delivers. `false` refuses the read:
+    /// the cycle neither reads INP nor raises the alarm a failed `dbGetLink`
+    /// would.
     fn set_inp_nelements(&mut self, _nelements: Option<i64>) -> bool {
         true
     }

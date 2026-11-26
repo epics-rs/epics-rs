@@ -3711,6 +3711,11 @@ trait SoftDbValue: Sized {
     ) -> (Option<Self>, Self::Left, Option<super::links::SourceAlarm>);
     /// Lands [`Self::Left`] in the reader's INP buffer.
     fn land(left: Self::Left, record: &mut dyn crate::server::record::Record);
+    /// `request` at `n` elements ([`LinkReadAs::asking`](crate::server::record::LinkReadAs::asking)):
+    /// a scalar one is one element already.
+    fn asking(request: Self::Request, _n: usize) -> Self::Request {
+        request
+    }
 }
 
 impl SoftDbValue for f64 {
@@ -3802,6 +3807,13 @@ impl SoftDbValue for EpicsValue {
         if let Some(left) = left {
             record.land_failed_array_read("INP", *left);
         }
+    }
+
+    fn asking(
+        read_as: crate::server::record::LinkReadAs,
+        n: usize,
+    ) -> crate::server::record::LinkReadAs {
+        read_as.asking(n)
     }
 }
 
@@ -6063,11 +6075,17 @@ impl PvDatabase {
             return None;
         }
         // C `dbGetNelements`, settled with the address; told before the read,
-        // whose failure must still find what the count decided. A refused
-        // count takes the general path, which carries the refusal.
-        if tell_nelements && !reader.set_inp_nelements(Some(i64::from(at.final_no_elements))) {
-            return None;
-        }
+        // whose failure must still find what the count decided, and asked
+        // for. A refused count takes the general path, which carries the
+        // refusal.
+        let request = if tell_nelements {
+            if !reader.set_inp_nelements(Some(i64::from(at.final_no_elements))) {
+                return None;
+            }
+            V::asking(request, at.final_no_elements as usize)
+        } else {
+            request
+        };
         let (value, left, alarm) = V::read(self, rec.set(), link, at, &*reader, request);
         let inherited = self.input_link_inheritance(rec, link, alarm);
         if let Some((ms, alarm)) = inherited {
@@ -6486,9 +6504,11 @@ impl PvDatabase {
         // conversion applied to it either.
         // Asked with the guard released (a self-referencing INP resolves
         // through this record), and told before the read, whose failure
-        // must still find what the count decided. A count the record refuses
-        // leaves no INP to read (`compressRecord.c:328-331`).
+        // must still find what the count decided, and which asks that many.
+        // A count the record refuses leaves no INP to read
+        // (`compressRecord.c:328-331`).
         let mut inp_refused = false;
+        let mut inp_request = inp_request;
         let inp = match inp {
             Some(inp_parsed)
                 if plan
@@ -6499,6 +6519,12 @@ impl PvDatabase {
                 let reads = guard.hold().record.set_inp_nelements(nelements);
                 guard.release();
                 inp_refused = !reads;
+                if let (Some(crate::server::record::InputLinkRequest::As(read_as)), Some(n)) = (
+                    &mut inp_request,
+                    nelements.and_then(|n| usize::try_from(n).ok()),
+                ) {
+                    *read_as = read_as.asking(n);
+                }
                 reads.then_some(inp_parsed)
             }
             inp => inp,

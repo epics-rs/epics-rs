@@ -307,8 +307,7 @@ async fn interop_r11_pvxget_via_name_server_resolves_pv_on_rust_server() {
     );
 
     // Brief breathing room so background TCP teardown completes
-    // before the test process exits and trips the bind-port check
-    // in the next test (cargo serialises within-binary tests).
+    // before the test process exits.
     tokio::time::sleep(Duration::from_millis(50)).await;
 }
 

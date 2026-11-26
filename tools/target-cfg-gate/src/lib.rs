@@ -26,15 +26,14 @@
 //!
 //! # Why a derivation and not a list
 //!
-//! `crates/asyn-rs/tests/epics_only_tests_declare_their_feature.rs` enforced
-//! exactly this rule from a hand-written list of three needles, for one crate
-//! and one feature. It is superseded by this crate because the list is the
-//! part that rots: the workspace has 131 gated module paths and 98 optional
-//! dependency declarations, and a needle list covers the ones somebody
-//! thought of. Both halves here are read out of the sources -- the module
-//! tree under `src/lib.rs` for the requirement, the target's own attributes
-//! and manifest block for the declaration -- so a module gated tomorrow is
-//! covered tomorrow.
+//! An asyn-rs test once enforced exactly this rule from a hand-written list of
+//! three needles, for one crate and one feature. It is superseded by this
+//! crate because the list is the part that rots: the workspace has 131 gated
+//! module paths and 98 optional dependency declarations, and a needle list
+//! covers the ones somebody thought of. Both halves here are read out of the
+//! sources -- the module tree under `src/lib.rs` for the requirement, the
+//! target's own attributes and manifest block for the declaration -- so a
+//! module gated tomorrow is covered tomorrow.
 //!
 //! # The axes it reasons over
 //!

@@ -3434,7 +3434,8 @@ fn expect_char(
 ///
 /// A field the record does not own carries its default in `CommonFields`
 /// instead; there is no record storage here to write it into, and
-/// `tests/dbd_initial_parity.rs` is what holds those to the `.dbd`.
+/// `tests/integration/common_field_initials.rs` is what holds those to the
+/// `.dbd`.
 fn apply_dbd_initials(record: &mut Box<dyn Record>) -> CaResult<()> {
     // The `.dbd` is the source, so the initials come from the GENERATED table —
     // `crate::server::record::dbd_generated`, which `tools/dbd-codegen` emits

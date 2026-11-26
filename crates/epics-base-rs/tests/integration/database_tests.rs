@@ -10913,10 +10913,10 @@ async fn sel_specified_mode_freezes_value_when_selected_link_fails() {
 }
 
 // Specified-mode NVL failure also gates: C `fetch_values` returns the
-// failed NVL read status BEFORE fetching any input, so do_sel is
-// skipped. Here NVL points at a non-existent record while INPA holds a
-// valid source (3.0). Pre-fix Rust fell back to the stale SELN, fetched
-// INPA, and recomputed VAL=3.0; post-fix VAL freezes at 7.0.
+// failed NVL read status BEFORE fetching any input (`selRecord.c:423-425`),
+// so do_sel is skipped and INPA is never read. Here NVL points at a
+// non-existent record while INPA holds a valid source (3.0): VAL freezes at
+// 7.0 and A keeps 1.0.
 #[epics_macros_rs::epics_test]
 async fn sel_specified_mode_freezes_value_when_nvl_link_fails() {
     use epics_base_rs::server::records::sel::SelRecord;
@@ -10933,6 +10933,9 @@ async fn sel_specified_mode_freezes_value_when_nvl_link_fails() {
     sel.nvl = "NO_SUCH_NVL".into();
     sel.inpa = "R8N_SRC".into();
     db.add_record("R8N_SEL", Box::new(sel)).await.unwrap();
+    db.put_pv("R8N_SEL.A", EpicsValue::Double(1.0))
+        .await
+        .unwrap();
 
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("R8N_SEL", &mut visited)
@@ -10947,6 +10950,11 @@ async fn sel_specified_mode_freezes_value_when_nvl_link_fails() {
         ),
         other => panic!("expected Double(7.0), got {other:?}"),
     }
+    assert_eq!(
+        db.get_pv("R8N_SEL.A").unwrap().to_f64(),
+        Some(1.0),
+        "INPA is not read"
+    );
 }
 
 // Control: an *empty* selected link is NOT a fetch failure. C

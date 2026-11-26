@@ -1845,19 +1845,17 @@ struct AsubDynamicSub {
     /// `Some` → swap the live subroutine and set ONAM to `snam` (the name
     /// changed and was found in the registry).
     swap: Option<Arc<crate::server::record::Subroutine>>,
-    /// `true` → do not run the subroutine this cycle, matching C skipping
-    /// `do_sub`: the link read failed, or the changed name was not registered
-    /// (`S_db_BadSub`).
-    skip_run: bool,
+    /// `true` → C `fetch_values` returns here, before A..U: the link read
+    /// failed, or the changed name was not registered (`S_db_BadSub`). Goes
+    /// to the cycle's fetch gate, which skips the inputs and `do_sub`.
+    stops_fetch: bool,
 }
 
 /// Apply an aSub LFLG=READ resolution (from
 /// [`PvDatabase::resolve_asub_dynamic_subroutine`]) to a locked record: write
-/// the read-back SNAM, swap the subroutine + set ONAM when the name changed,
-/// and arm the one-shot suppress flag when the name was bad. The single apply
-/// owner, shared by the engine path ([`PvDatabase::process_record_with_links_inner`])
-/// and the foreign path ([`PvDatabase::process_record`]); the skip is consumed
-/// uniformly by `RecordInstance::run_registered_subroutine`.
+/// the read-back SNAM, and swap the subroutine + set ONAM when the name
+/// changed. A failed resolution is not acted on here: the input stage's fetch
+/// gate already skipped the inputs and armed the `do_sub` skip.
 fn apply_asub_dynamic_sub(instance: &mut RecordInstance, ds: &AsubDynamicSub) {
     if let Some(snam) = &ds.snam {
         let _ = instance
@@ -1871,12 +1869,6 @@ fn apply_asub_dynamic_sub(instance: &mut RecordInstance, ds: &AsubDynamicSub) {
                 .record
                 .put_field("ONAM", EpicsValue::String(snam.as_str().into()));
         }
-    }
-    // One-shot, armed by any reason and cleared only by its owner
-    // (`run_registered_subroutine`): armed, never cleared here, so a failed
-    // `fetch_values` that armed it before this hook still skips the run.
-    if ds.skip_run {
-        instance.skip_subroutine_this_cycle();
     }
 }
 
@@ -2715,6 +2707,11 @@ enum HeldFetch {
 #[derive(Default)]
 struct FetchFold {
     resolved: u64,
+    /// C `fetch_values` returned before its input loop: the read that names
+    /// what the loop reads or runs failed — sel's `NVL` (`selRecord.c:423-425`),
+    /// aSub's `SUBL` or the unregistered name it delivered
+    /// (`aSubRecord.c:256-265`). Set before the loop, which then reads nothing.
+    stopped_before_inputs: bool,
     /// This cycle's `fetch_values()` outcome — non-zero status in C, i.e.
     /// "the record body must not run" — under every policy but the sel one.
     fetch_values_failed: bool,
@@ -2757,9 +2754,10 @@ impl FetchFold {
         false
     }
 
-    /// C `fetch_values`' return, folded with the sel gate into the ONE
-    /// boolean delivered to `Record::set_fetch_gate_failed` (calc/calcout/
-    /// scalcout/acalcout/swait/sel) and `suppress_subroutine_run` (sub/aSub).
+    /// C `fetch_values`' return, folded with its early return before the
+    /// loop and the sel gate into the ONE boolean delivered to
+    /// `Record::set_fetch_gate_failed` (calc/calcout/scalcout/acalcout/swait/
+    /// sel) and `suppress_subroutine_run` (sub/aSub).
     ///
     /// C `selRecord.c::fetch_values` returns the status of its LAST
     /// `dbGetLink` (`:434-437` assigns `status` unguarded every pass), and
@@ -2768,13 +2766,13 @@ impl FetchFold {
     /// `dbGetLink` on an unset OR constant link returns success
     /// (`dbConstGetValue`), and the field it would have written keeps its
     /// init-seeded value, which flows into `do_sel`.
-    fn failed(&self, policy: InputFetchPolicy, sel_nvl_read_failed: bool) -> bool {
+    fn failed(&self, policy: InputFetchPolicy) -> bool {
         let failed = if matches!(policy, InputFetchPolicy::ReadAllGateOnLastFailure) {
             self.last_input_read_failed
         } else {
             self.fetch_values_failed
         };
-        failed || sel_nvl_read_failed
+        failed || self.stopped_before_inputs
     }
 }
 
@@ -2997,7 +2995,7 @@ impl PvDatabase {
                 break;
             }
         }
-        let fetch_values_failed = fold.failed(policy, false);
+        let fetch_values_failed = fold.failed(policy);
         let inst = guard.hold();
         inst.set_fetch_gate_failed(fetch_values_failed);
         if fetch_values_failed {
@@ -5398,11 +5396,11 @@ impl PvDatabase {
         };
 
         let Some(name) = name else {
-            // Link read failed — C `if (status) return status` skips do_sub.
+            // Link read failed — C `if (status) return status`, before A..U.
             return Some(AsubDynamicSub {
                 snam: None,
                 swap: None,
-                skip_run: true,
+                stops_fetch: true,
             });
         };
 
@@ -5413,21 +5411,21 @@ impl PvDatabase {
                 Some(f) => Some(AsubDynamicSub {
                     snam: Some(name),
                     swap: Some(f),
-                    skip_run: false,
+                    stops_fetch: false,
                 }),
-                // Name changed but not registered — C returns S_db_BadSub,
-                // skipping do_sub; ONAM is left unchanged so it retries.
+                // Name changed but not registered — C returns S_db_BadSub
+                // before A..U; ONAM is left unchanged so it retries.
                 None => Some(AsubDynamicSub {
                     snam: Some(name),
                     swap: None,
-                    skip_run: true,
+                    stops_fetch: true,
                 }),
             }
         } else {
             Some(AsubDynamicSub {
                 snam: Some(name),
                 swap: None,
-                skip_run: false,
+                stops_fetch: false,
             })
         }
     }
@@ -6374,9 +6372,15 @@ impl PvDatabase {
             }
         };
         // The reads between here and the multi-input loop — pre-input
-        // actions, INP, DOL, NVL — go through the by-name link readers, which
-        // take the record's lock themselves; the loop takes the guard back.
-        if inp.is_some() || dol_info.is_some() || plan.sel_nvl || !pre_input_actions.is_empty() {
+        // actions, INP, DOL, NVL, SUBL — go through the by-name link readers,
+        // which take the record's lock themselves; the loop takes the guard
+        // back.
+        if inp.is_some()
+            || dol_info.is_some()
+            || plan.sel_nvl
+            || plan.resolves_subroutine_from_link
+            || !pre_input_actions.is_empty()
+        {
             guard.release();
         }
 
@@ -6627,6 +6631,16 @@ impl PvDatabase {
         // What the cycle applies to SELN (DBF_USHORT, selRecord.dbd.pod:295).
         let sel_seln = sel_selector;
 
+        // aSub LFLG=READ: read the subroutine name from the SUBL link and, if
+        // it changed, re-resolve the function. C `aSubRecord.c::fetch_values`
+        // does this before A..U (`:256-265`). `None` for everything that is
+        // not an aSub in READ mode.
+        let asub_dynamic = if plan.resolves_subroutine_from_link {
+            self.resolve_asub_dynamic_subroutine(rec, visited)
+        } else {
+            None
+        };
+
         // 1.5. Multi-input link fetch (calc/calcout/sel/sub)
         // C's `fetch_values` runs inside `process()`, under the record lock
         // it entered with, and each `dbGetLink` writes its result straight
@@ -6646,7 +6660,11 @@ impl PvDatabase {
         // the `multi_input_links` fetch, and the pre-process ReadDbLink reads.
         // Built only for a type that reads it.
         let resolved_link_fields = pre_input_resolved;
-        let mut fold = FetchFold::default();
+        let mut fold = FetchFold {
+            stopped_before_inputs: sel_nvl_read_failed
+                || asub_dynamic.as_ref().is_some_and(|ds| ds.stops_fetch),
+            ..FetchFold::default()
+        };
         let fetch_values_failed = {
             // The shape questions — what a failed read means
             // (`input_fetch_policy`), whether a constant delivers at process
@@ -6654,66 +6672,72 @@ impl PvDatabase {
             // are settled when the type is compiled, so the cycle carries
             // them rather than asking the record.
             let input_fetch_policy = plan.input_fetch_policy;
-            let instance = guard.hold();
-            // Restrict to the record's active inputs this cycle (sel
-            // `Specified` → only INP[SELN]); `None` = fetch every link, which
-            // is every record type but `sel` / `swait` and every pass of them
-            // that does not narrow. That unrestricted case is what the cycle
-            // pre-read at its top — see `read_input_link_texts` — so it is
-            // taken here rather than read a second time. A restriction that
-            // selects nothing is still a restriction: the `Option`, not the
-            // emptiness, says whether the record narrowed its inputs this
-            // pass.
-            let restricted: Option<InputLinkTexts> = if plan.narrows_input_links {
-                instance
-                    .record
-                    .select_input_links(sel_selector)
-                    .map(|subset| input_link_texts.read_narrowed(instance, subset))
-            } else {
-                None
-            };
-            let link_texts = restricted.as_ref().unwrap_or(input_link_texts);
-            let declared = link_texts.links();
-            // The record's cache is indexed by its OWN list; a narrowed list
-            // maps each of its slots back by name.
-            let own = link_texts.own();
-            let own_list = std::ptr::eq(declared, own);
-            // Over the set links only: C's loop visits every declared link,
-            // but an unset one is a `dbConstGetValue` success with nothing to
-            // deliver, so the passes it would make here are no-ops.
-            let mut wired = link_texts.wired();
-            while wired != 0 {
-                let slot = wired.trailing_zeros() as usize;
-                wired &= wired - 1;
-                let (link_field, val_field) = declared[slot];
-                let cache_slot = if own_list {
-                    Some(slot)
+            // C `fetch_values` returns before this loop when the read that
+            // names what it reads or runs failed — sel's NVL, aSub's SUBL or
+            // the unregistered name it delivered — so no input is read.
+            if !fold.stopped_before_inputs {
+                let instance = guard.hold();
+                // Restrict to the record's active inputs this cycle (sel
+                // `Specified` → only INP[SELN]); `None` = fetch every link, which
+                // is every record type but `sel` / `swait` and every pass of them
+                // that does not narrow. That unrestricted case is what the cycle
+                // pre-read at its top — see `read_input_link_texts` — so it is
+                // taken here rather than read a second time. A restriction that
+                // selects nothing is still a restriction: the `Option`, not the
+                // emptiness, says whether the record narrowed its inputs this
+                // pass.
+                let restricted: Option<InputLinkTexts> = if plan.narrows_input_links {
+                    instance
+                        .record
+                        .select_input_links(sel_selector)
+                        .map(|subset| input_link_texts.read_narrowed(instance, subset))
                 } else {
-                    own.iter().position(|(lf, _)| *lf == link_field)
+                    None
                 };
-                debug_assert!(
-                    cache_slot.is_some(),
-                    "select_input_links must narrow to a subset of multi_input_links"
-                );
-                let Some(cache_slot) = cache_slot else {
-                    continue;
-                };
-                debug_assert_eq!(
-                    own[cache_slot],
-                    (link_field, val_field),
-                    "a narrowed link is the same pair as its multi_input_links entry"
-                );
-                let Some(outcome) = self.fetch_multi_input(guard, plan, own, cache_slot, visited)
-                else {
-                    continue;
-                };
-                if fold.note(
-                    input_fetch_policy,
-                    cache_slot,
-                    slot + 1 == declared.len(),
-                    outcome,
-                ) {
-                    break;
+                let link_texts = restricted.as_ref().unwrap_or(input_link_texts);
+                let declared = link_texts.links();
+                // The record's cache is indexed by its OWN list; a narrowed list
+                // maps each of its slots back by name.
+                let own = link_texts.own();
+                let own_list = std::ptr::eq(declared, own);
+                // Over the set links only: C's loop visits every declared link,
+                // but an unset one is a `dbConstGetValue` success with nothing to
+                // deliver, so the passes it would make here are no-ops.
+                let mut wired = link_texts.wired();
+                while wired != 0 {
+                    let slot = wired.trailing_zeros() as usize;
+                    wired &= wired - 1;
+                    let (link_field, val_field) = declared[slot];
+                    let cache_slot = if own_list {
+                        Some(slot)
+                    } else {
+                        own.iter().position(|(lf, _)| *lf == link_field)
+                    };
+                    debug_assert!(
+                        cache_slot.is_some(),
+                        "select_input_links must narrow to a subset of multi_input_links"
+                    );
+                    let Some(cache_slot) = cache_slot else {
+                        continue;
+                    };
+                    debug_assert_eq!(
+                        own[cache_slot],
+                        (link_field, val_field),
+                        "a narrowed link is the same pair as its multi_input_links entry"
+                    );
+                    let Some(outcome) =
+                        self.fetch_multi_input(guard, plan, own, cache_slot, visited)
+                    else {
+                        continue;
+                    };
+                    if fold.note(
+                        input_fetch_policy,
+                        cache_slot,
+                        slot + 1 == declared.len(),
+                        outcome,
+                    ) {
+                        break;
+                    }
                 }
             }
 
@@ -6724,18 +6748,15 @@ impl PvDatabase {
             // delivered no value": `dbGetLink` on an unset OR constant link
             // returns success (`dbConstGetValue`), and the field it would have
             // written keeps its init-seeded value, which flows into `do_sel`.
-            // `Specified` mode returns early on a failed NVL read
-            // (`selRecord.c:423-425`), before any INP is touched. Only `sel`
-            // reads NVL, so this needs no record-type test.
-            let fetch_values_failed = fold.failed(input_fetch_policy, sel_nvl_read_failed);
+            let fetch_values_failed = fold.failed(input_fetch_policy);
 
             // The outcome, delivered here under the guard the loop holds: to
             // `Record::set_fetch_gate_failed` for the records that compute in
             // their own `process()` (calc/calcout/scalcout/acalcout/swait/sel)
             // — written on EVERY cycle, `false` included, so the flag cannot
             // outlive the cycle it belongs to — and, for sub/aSub, whose body
-            // is the framework-dispatched subroutine, to the same one-shot
-            // skip the bad-SNAM path arms (C `subRecord.c:144-147`,
+            // is the framework-dispatched subroutine, to the one-shot do_sub
+            // skip (C `subRecord.c:144-147`,
             // `aSubRecord.c:216-218`: `status = fetch_values(prec); if
             // (status == 0) status = do_sub(prec);`), consumed by the single
             // owner `run_registered_subroutine`.
@@ -6747,9 +6768,9 @@ impl PvDatabase {
             fetch_values_failed
         };
         let resolved = fold.resolved;
-        // The two stages below read this record by name through the shared
-        // lock, so they run with the guard released.
-        if plan.string_input || plan.resolves_subroutine_from_link {
+        // The string-input fetch below reads this record by name through the
+        // shared lock, so it runs with the guard released.
+        if plan.string_input {
             guard.release();
         }
 
@@ -6795,17 +6816,6 @@ impl PvDatabase {
             } else {
                 self.fetch_string_inputs(rec, name, visited, &mut link_alarms)
             };
-
-        // aSub LFLG=READ: re-read the subroutine name from the SUBL link and,
-        // if it changed, re-resolve the function — computed here, before the
-        // process write lock, so the SUBL link read cannot deadlock against
-        // this record (C `aSubRecord.c::fetch_values`). `None` for everything
-        // that is not an aSub in READ mode.
-        let asub_dynamic = if plan.resolves_subroutine_from_link {
-            self.resolve_asub_dynamic_subroutine(rec, visited)
-        } else {
-            None
-        };
 
         InputStage {
             is_soft,
@@ -8053,8 +8063,7 @@ impl PvDatabase {
                 instance.set_process_continuation(is_continuation);
 
                 // Apply the aSub LFLG=READ resolution computed above (outside the
-                // lock). The single apply owner; the bad-sub skip is carried on the
-                // instance and consumed by `run_registered_subroutine`.
+                // lock). The single apply owner.
                 if let Some(ds) = links
                     .and_then(|l| l.rare.as_ref())
                     .and_then(|r| r.asub_dynamic.as_ref())

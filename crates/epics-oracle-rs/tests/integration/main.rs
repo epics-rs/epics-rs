@@ -3,6 +3,7 @@
 //! `binary(integration) & test(/^X::/)` selects what `X` ran.
 
 mod calc_fetch_stop_oracle;
+mod fetch_prologue_oracle;
 mod oracle;
 mod oracle_ioc_db_load_fails_as_softioc_d;
 mod oracle_ioc_iocinit_line;

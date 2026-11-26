@@ -1,6 +1,8 @@
-//! aSub LFLG=READ with a SUBL naming no registered subroutine (or none at all)
-//! takes `apply_asub_dynamic_sub`'s skip arm: SNAM follows the link, ONAM stays,
-//! the subroutine is not run, and the cycle ends NO_ALARM with VAL untouched.
+//! aSub LFLG=READ with a SUBL naming no registered subroutine (or none at all):
+//! SNAM follows the link, ONAM stays, the subroutine is not run, and the cycle
+//! ends NO_ALARM with VAL untouched. The unregistered name returns from
+//! `fetch_values` before INPA is read (`aSubRecord.c:263-264`), so A keeps its
+//! value; the empty one skips the lookup and A is read.
 //! softIoc R7.0.10.1, `AB` SUBL -> stringin "nosuch", `AE` SUBL -> stringin "",
 //! `caput PROC 1` on each:
 //!
@@ -33,8 +35,9 @@ fn get(db: &PvDatabase, pv: &str) -> EpicsValue {
     db.get_pv(pv).unwrap()
 }
 
-async fn check(db: &PvDatabase, rec: &str, snam: &str) {
+async fn check(db: &PvDatabase, rec: &str, snam: &str, a: f64) {
     process(db, rec).await;
+    assert_eq!(get(db, &format!("{rec}.A")).to_f64(), Some(a), "{rec}.A");
     assert_eq!(get(db, &format!("{rec}.SNAM")).text_g(), snam, "{rec}.SNAM");
     assert_eq!(get(db, &format!("{rec}.ONAM")).text_g(), "", "{rec}.ONAM");
     assert_eq!(
@@ -64,8 +67,30 @@ async fn a_bad_or_empty_subl_skips_the_run_and_ends_no_alarm() {
         .unwrap()
         .0;
 
-    check(&db, "AB", "nosuch").await;
-    check(&db, "AE", "").await;
+    check(&db, "AB", "nosuch", 0.0).await;
+    check(&db, "AE", "", 3.0).await;
     // The skip is one-shot: a second cycle on the same names ends the same way.
-    check(&db, "AB", "nosuch").await;
+    check(&db, "AB", "nosuch", 0.0).await;
+}
+
+/// A SUBL read that fails returns from `fetch_values` (`aSubRecord.c:257-258`)
+/// before INPA too; the oracle's C reads A unchanged.
+#[epics_macros_rs::epics_test]
+async fn a_failed_subl_read_leaves_the_inputs_unread() {
+    let db = IocBuilder::new()
+        .db_string(
+            r#"
+record(ao, "SRC") { field(VAL, "3") }
+record(aSub, "AF") { field(LFLG, "READ") field(SUBL, "NOSUCH") field(INPA, "SRC") }
+"#,
+            &std::collections::HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap()
+        .0;
+
+    process(&db, "AF").await;
+    assert_eq!(get(&db, "AF.A").to_f64(), Some(0.0));
 }

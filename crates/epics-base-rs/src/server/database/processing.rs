@@ -14148,13 +14148,17 @@ impl PvDatabase {
             return simple(&pv);
         }
         let parts = super::DbNameParts::of(name);
-        let char_view = parts.char_view().then_some(request);
         let cell = self.get_record(parts.record)?;
         let field = cell.canonical_field(parts.field_or_val()).into_owned();
         self.no_elements(&cell, &field)?;
-        if char_view.is_some() {
+        if parts.char_view() {
             self.char_addressed(&cell, &field, None)?;
         }
+        // `getAttrValue` answers chars from the attribute's text with or
+        // without `$` (`dbAccess.c:879-892,950-953`).
+        let attribute_chars = matches!(request.dbr, DbFieldType::Char | DbFieldType::UChar)
+            && self.attribute_field_type(&cell, &field).is_some();
+        let char_view = (parts.char_view() || attribute_chars).then_some(request);
         let own = own.and_then(|own| Some((self.get_record(own.name())?, own)));
         let own = own.as_ref().map(|(cell, own)| (&**cell, *own));
         if let Some(got) = self.db_get_held(&cell, &field, char_view, own, read) {
@@ -14215,12 +14219,12 @@ impl PvDatabase {
 }
 
 /// What [`PvDatabase::db_get_owed`] reads of a field, its set held: through
-/// its `$` address, as the [`CharGet`] asks, when there is one.
+/// its `$` address, or an attribute's text, as the [`CharGet`] asks.
 type FieldRead<T> =
     fn(&PvDatabase, &Arc<RecordCell>, &str, Option<CharGet>, ReadPolicy<'_>) -> Option<T>;
 
 /// `dbGet`'s request type and `nRequest`, which a read through a `$`
-/// address converts in (`CharView::get`).
+/// address, or of an attribute's text, converts in (`CharView::get`).
 #[derive(Clone, Copy)]
 pub(crate) struct CharGet {
     dbr: DbFieldType,
@@ -14283,7 +14287,7 @@ fn dbr_string_at(
         .flatten()
 }
 
-/// `dbGet` of `get` through `field`'s `$` address.
+/// `dbGet` of `get` through `field`'s `$` address or attribute text.
 fn char_get_at(
     cell: &RecordCell,
     field: &str,

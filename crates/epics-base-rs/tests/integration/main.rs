@@ -126,6 +126,7 @@ mod alias_name_is_bytes;
 mod alias_refusals_speak_create_alias;
 mod an_alarm_band_put_outlives_the_metadata_cache;
 mod an_array_read_as_one_element_is_its_element_0;
+mod an_attribute_reads_only_as_text;
 mod an_emptied_input_link_clears_the_fetch_gate;
 mod an_out_link_cp_discard_prints_cs_warning;
 mod an_owed_callback_runs_when_its_dset_call_returns;

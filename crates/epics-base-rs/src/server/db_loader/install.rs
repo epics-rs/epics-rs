@@ -499,14 +499,11 @@ pub(crate) async fn install_records<H: InstallHost>(
                         }
                         reached
                     };
-                    // Pass 1's link reads take other records' locks, so they
-                    // run with this record's lock down, as the barrier's do.
-                    let mut reads = reached.then(|| host.db().read_init_links(&rec_arc));
-                    let mut inst = rec_arc.write();
-                    if let Some(reads) = &mut reads {
-                        let owed = inst.run_init_pass1(&name, reads, err);
-                        inst = host.db().pay_device_init(&rec_arc, inst, owed, &name, err);
-                    }
+                    let inst = if reached {
+                        host.db().run_init_pass1(&rec_arc, &name, err)
+                    } else {
+                        rec_arc.write()
+                    };
                     rec_arc.settle_addr_facts(&inst);
                 }
             }

@@ -1,5 +1,5 @@
-//! A record type's `init_record(1)` runs its own C loop over the links it
-//! declares in `Record::init_link_reads`, each answered as C's `dbGetLink`
+//! A record type's `init_record(1)` runs its own C loop, naming one link at a
+//! time through `Record::init_record_step`, each answered as C's `dbGetLink`
 //! answers inside `init_record` (`tableRecord.c:1106-1133`): a DB link
 //! delivers its target converted to the requested type, an NPP link without
 //! processing it and a PP link after `dbScanPassive` processes it
@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use epics_base_rs::error::CaResult;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::recgbl::simm::LinkFetch;
-use epics_base_rs::server::record::{FieldDesc, InitLinkReads, LinkReadAs, ProcessOutcome, Record};
+use epics_base_rs::server::record::{FieldDesc, LinkReadAs, ProcessOutcome, Record};
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
 /// What each record's `init_record(1)` left in `R0`/`R1`, by record.
@@ -28,6 +28,8 @@ struct Readback {
     links: [String; 2],
     gate: [bool; 2],
     r: [f64; 2],
+    /// The axis whose link the last step named.
+    at: usize,
     seen: Seen,
 }
 
@@ -81,32 +83,36 @@ impl Record for Readback {
         Ok(())
     }
 
-    fn init_link_reads(&self) -> &'static [(&'static str, LinkReadAs)] {
-        &[("L0", LinkReadAs::Double), ("L1", LinkReadAs::Double)]
-    }
-
-    fn init_record_with_links(&mut self, reads: &mut InitLinkReads) -> CaResult<()> {
-        for (i, link) in ["L0", "L1"].into_iter().enumerate() {
-            self.r[i] = 0.0;
-            if !self.gate[i] {
-                continue;
+    fn init_record_step(
+        &mut self,
+        answer: Option<LinkFetch>,
+    ) -> CaResult<Option<(&'static str, LinkReadAs)>> {
+        let from = match answer {
+            None => 0,
+            Some(LinkFetch::Value(v)) => {
+                self.r[self.at] = v.to_f64().unwrap_or(f64::NAN);
+                self.at + 1
             }
-            match reads.get(link) {
-                LinkFetch::Value(v) => self.r[i] = v.to_f64().unwrap_or(f64::NAN),
-                LinkFetch::NoData => {}
-                LinkFetch::Failed => break,
+            Some(LinkFetch::NoData) => self.at + 1,
+            Some(LinkFetch::Failed) => 2,
+        };
+        for i in from..2 {
+            self.r[i] = 0.0;
+            if self.gate[i] {
+                self.at = i;
+                return Ok(Some((["L0", "L1"][i], LinkReadAs::Double)));
             }
         }
         self.seen
             .lock()
             .unwrap()
             .push((self.name.clone(), self.r[0], self.r[1]));
-        Ok(())
+        Ok(None)
     }
 }
 
 #[epics_macros_rs::epics_test]
-async fn init_record_with_links_runs_the_records_own_c_loop() {
+async fn init_record_step_runs_the_records_own_c_loop() {
     let seen: Seen = Arc::default();
     let factory = seen.clone();
     // The readers load before their sources: C reads at pass 1, after every
@@ -118,6 +124,7 @@ async fn init_record_with_links_runs_the_records_own_c_loop() {
                 links: Default::default(),
                 gate: [true; 2],
                 r: [-1.0; 2],
+                at: 0,
                 seen: factory.clone(),
             })
         })
@@ -217,6 +224,7 @@ async fn an_init_pp_read_holds_the_reader_pact() {
                 links: Default::default(),
                 gate: [true, false],
                 r: [-1.0; 2],
+                at: 0,
                 seen: factory.clone(),
             })
         })
@@ -253,6 +261,7 @@ async fn the_eager_and_merge_inits_read_their_links() {
         links: Default::default(),
         gate: [true; 2],
         r: [-1.0; 2],
+        at: 0,
         seen: factory.clone(),
     };
     let make = readback.clone();

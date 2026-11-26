@@ -3295,7 +3295,7 @@ pub(crate) fn attach_device_support(
 /// Returns whether C's `init_record` REACHED ITS TAIL — `false` is C's `return
 /// S_db_BadSub` (either miss) and C's `prec->pact = TRUE; return 0` (an empty
 /// `sub` SNAM), both of which skip everything below them. The init owner
-/// ([`record::RecordInstance::run_init_pass1`]) calls this from inside pass 1
+/// ([`record::RecordInstance::init_pass1_tail`]) calls this from inside pass 1
 /// and honours the answer, so the tail is unreachable by construction rather
 /// than by a per-record-type opt-out.
 ///

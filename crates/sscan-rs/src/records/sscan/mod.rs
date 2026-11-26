@@ -22,10 +22,11 @@ use std::time::Instant;
 
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::database::{AsyncDbHandle, RecordBand};
+use epics_base_rs::server::recgbl::simm::LinkFetch;
 use epics_base_rs::server::record::dbd_generated::DB_COMMON_FIELDS;
 use epics_base_rs::server::record::{
-    CycleHooks, DeclaredFields, EventMask, FieldDesc, FieldIx, FieldMetadataOverride,
-    InitLinkReads, OwnFrame, ProcessContext, ProcessOutcome, Record, ScanType, Special,
+    CycleHooks, DeclaredFields, EventMask, FieldDesc, FieldIx, FieldMetadataOverride, LinkReadAs,
+    OwnFrame, ProcessContext, ProcessOutcome, Record, ScanType, Special,
 };
 use epics_base_rs::types::{DbFieldType, EpicsValue, PvString, RecordName, WallTime};
 
@@ -1323,9 +1324,13 @@ impl Record for SscanRecord {
         Ok(())
     }
 
-    fn init_record_own(&mut self, _reads: &mut InitLinkReads, own: OwnFrame<'_>) -> CaResult<()> {
+    fn init_record_own(
+        &mut self,
+        _answer: Option<LinkFetch>,
+        own: OwnFrame<'_>,
+    ) -> CaResult<Option<(&'static str, LinkReadAs)>> {
         self.init_pass1(own);
-        Ok(())
+        Ok(None)
     }
 
     fn process_own(&mut self, own: OwnFrame<'_>) -> CaResult<ProcessOutcome> {

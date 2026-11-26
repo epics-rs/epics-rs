@@ -9059,8 +9059,7 @@ impl RecordInstance {
     /// record and hands it to the `iocInit` drain, and the loader's merge into
     /// a live record. Both run the three halves as C's three whole-database
     /// walks: this one, then [`Self::run_add_record`], then
-    /// [`Self::run_init_pass1`] against what
-    /// [`crate::server::database::PvDatabase::read_init_links`] read.
+    /// [`crate::server::database::PvDatabase::run_init_pass1`].
     ///
     /// C `doInitRecord0`: the prologue and `init_record(prec, 0)`. Returns
     /// whether the record's `init_record` gets past its dset test, i.e.
@@ -9138,28 +9137,51 @@ impl RecordInstance {
         }
     }
 
-    /// C `doInitRecord1`: `init_record(prec, 1)` and the init tail, for a
-    /// record pass 0 reached. A device that lends held leaves its dset init,
-    /// and the tail after it, for
-    /// [`crate::server::database::PvDatabase::pay_device_init`].
-    #[must_use]
-    pub(crate) fn run_init_pass1(
+    /// One step of C `doInitRecord1`'s `init_record(prec, 1)`, for a record
+    /// pass 0 reached: [`crate::server::record::Record::init_record_step`].
+    /// Returns the link the record reads next, which
+    /// [`crate::server::database::PvDatabase::run_init_pass1`] reads.
+    pub(crate) fn init_pass1_step(
         &mut self,
         name: &str,
-        reads: &mut crate::server::record::InitLinkReads,
+        answer: Option<crate::server::recgbl::simm::LinkFetch>,
+    ) -> Option<(&'static str, crate::server::record::LinkReadAs)> {
+        let _init = crate::server::database::InitPass::enter();
+        let step = if self.has_hook(crate::server::record::CycleHooks::OWN_FRAME) {
+            let (record, own) = self.split_own();
+            record.init_record_own(answer, own)
+        } else {
+            self.record.init_record_step(answer)
+        };
+        step.unwrap_or_else(|e| {
+            crate::stderr_println!("init_record(1) failed for {name}: {e}");
+            None
+        })
+    }
+
+    /// The link `field` names, as a read of it at init resolves it: the link
+    /// the record holds, else the field's text parsed.
+    pub(crate) fn init_read_link(&self, field: &str) -> Arc<ParsedLink> {
+        match self.stored_link_shared(field) {
+            Some(link) => Arc::clone(link),
+            None => Arc::new(parse_link_v2(
+                self.link_text(field)
+                    .as_ref()
+                    .map_or(&b""[..], |t| t.as_bytes()),
+            )),
+        }
+    }
+
+    /// The rest of C `doInitRecord1` once `init_record(prec, 1)`'s steps are
+    /// done. A device that lends held leaves its dset init, and the tail after
+    /// it, for [`crate::server::database::PvDatabase::pay_device_init`].
+    #[must_use]
+    pub(crate) fn init_pass1_tail(
+        &mut self,
+        name: &str,
         err: &dyn Fn(&str),
     ) -> Option<crate::server::device_support::OwedDeviceInit> {
         let _init = crate::server::database::InitPass::enter();
-        let init = if self.has_hook(crate::server::record::CycleHooks::OWN_FRAME) {
-            let (record, own) = self.split_own();
-            record.init_record_own(reads, own)
-        } else {
-            self.record.init_record_with_links(reads)
-        };
-        if let Err(e) = init {
-            crate::stderr_println!("init_record(1) failed for {name}: {e}");
-        }
-        reads.apply(&mut self.common);
         // C `pdset->common.init_record(prec)` — the driver's own init, which
         // every record type calls from INSIDE `init_record` once the dset test
         // above has passed (`aiRecord.c:115-124`, `aoRecord.c:121-133`). It
@@ -9184,7 +9206,7 @@ impl RecordInstance {
         None
     }
 
-    /// [`Self::run_init_pass1`] after the dset init.
+    /// [`Self::init_pass1_tail`] after the dset init.
     pub(crate) fn finish_init_pass1(&mut self, name: &str, err: &dyn Fn(&str)) {
         // C `subRecord.c:107-129` / `aSubRecord.c:139-160` — the INAM call and
         // the SNAM lookup, also inside pass 1. `false` is C's early return

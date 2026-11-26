@@ -26,6 +26,7 @@ mod pf4_runs_the_c_states;
 mod sncqxbpm_runs_the_c_states;
 mod table_init_counts_a_pva_limit_axis;
 mod table_init_reads_its_motors;
+mod table_init_reads_only_what_c_reads;
 mod table_link_kind;
 mod table_monitor_posts_from_its_saved_copy;
 mod table_posts_only_what_monitor_posts;

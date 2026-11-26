@@ -5625,10 +5625,14 @@ pub trait Record: RecordAny + Send + Sync + 'static {
         Ok(())
     }
 
-    /// [`Self::init_record_with_links`], for a type that declares
+    /// [`Self::init_record_step`], for a type that declares
     /// [`CycleHooks::OWN_FRAME`].
-    fn init_record_own(&mut self, reads: &mut InitLinkReads, _own: OwnFrame<'_>) -> CaResult<()> {
-        self.init_record_with_links(reads)
+    fn init_record_own(
+        &mut self,
+        answer: Option<crate::server::recgbl::simm::LinkFetch>,
+        _own: OwnFrame<'_>,
+    ) -> CaResult<Option<(&'static str, LinkReadAs)>> {
+        self.init_record_step(answer)
     }
 
     /// Did `init_record` leave the record PERMANENTLY ACTIVE — C's
@@ -7778,20 +7782,19 @@ pub trait Record: RecordAny + Send + Sync + 'static {
     /// Additive, framework-set-hook pattern. Default: ignore.
     fn init_links(&mut self, _common: &crate::server::record::CommonFields) {}
 
-    /// The links C's `init_record(prec, 1)` reads with `dbGetLink`, each with
-    /// the DBR type it requests. The framework reads them once at `iocInit`,
-    /// after every record's pass 0, and hands the answers to
-    /// [`Self::init_record_with_links`].
-    fn init_link_reads(&self) -> &'static [(&'static str, LinkReadAs)] {
-        &[]
-    }
-
-    /// Pass 1 of `init_record`. A type that declares
-    /// [`Self::init_link_reads`] overrides this and runs its C loop over
-    /// `reads`: store, gate, zero or stop on each answer as its C
-    /// `init_record` does.
-    fn init_record_with_links(&mut self, _reads: &mut InitLinkReads) -> CaResult<()> {
-        self.init_record(1)
+    /// Pass 1 of `init_record`, one C `dbGetLink` at a time: `answer` is
+    /// `None` to begin the pass, else the answer to the read the previous
+    /// step named. A step returns the next link C's `init_record(prec, 1)`
+    /// reads, with the DBR type it requests, or `None` once the pass is done.
+    /// The framework makes every read, with this record let go, so a read
+    /// sees the record as the steps before it left it; a type whose C pass
+    /// reads links overrides this and stores, gates, zeroes or stops on each
+    /// answer as its C `init_record` does.
+    fn init_record_step(
+        &mut self,
+        _answer: Option<crate::server::recgbl::simm::LinkFetch>,
+    ) -> CaResult<Option<(&'static str, LinkReadAs)>> {
+        self.init_record(1).map(|()| None)
     }
 
     /// Called by the framework before process() to indicate whether device
@@ -10740,17 +10743,8 @@ pub(crate) fn seed_trackers_from_val<R: Record + ?Sized>(rec: &mut R) {
     }
 }
 
-/// The answers to a record's [`Record::init_link_reads`], as C's
-/// `dbGetLink` would have given them inside `init_record(prec, 1)`.
-pub struct InitLinkReads {
-    reads: Vec<(&'static str, InitRead)>,
-    /// What the reads the record took did to its pending alarm, in the order
-    /// it took them: `recGblSetSevr` keeps the first status of the highest
-    /// severity, so order decides which one wins a tie.
-    effects: Vec<InitReadEffect>,
-}
-
-/// One link's answer and what taking it does to the reader.
+/// One link's answer to a `dbGetLink` C's `init_record(prec, 1)` makes, and
+/// what taking it does to the reader.
 pub(crate) struct InitRead {
     pub(crate) fetch: crate::server::recgbl::simm::LinkFetch,
     /// `recGblInheritSevrMsg` on a successful read (`dbDbLink.c:228-232`).
@@ -10774,71 +10768,38 @@ pub(crate) enum InitGetFailure {
     Disconn,
 }
 
-enum InitReadEffect {
-    Disconn(&'static str),
-    LinkAlarm(&'static str),
-    Inherit(
-        crate::server::record::MonitorSwitch,
-        crate::server::database::LinkAlarm,
-    ),
-}
-
-impl InitLinkReads {
-    /// The answers, by link field. A link absent from them reads as an
-    /// unset link: success, nothing written.
-    pub(crate) fn new(reads: Vec<(&'static str, InitRead)>) -> Self {
-        Self {
-            reads,
-            effects: Vec::new(),
-        }
-    }
-
-    /// `dbGetLink(&prec->link, ...)`. A failed read raises LINK/INVALID on the
-    /// record, as `dbGetLink`'s `setLinkAlarm` does (`dbLink.c:338-339`), and a
-    /// good one folds the source's alarm by the link's MS flag, but only for a
-    /// link the record actually reads.
-    pub fn get(&mut self, link: &str) -> crate::server::recgbl::simm::LinkFetch {
+impl InitRead {
+    /// Raise on the reader of `link` what this read raises as its
+    /// `dbGetLink` returns: LINK/INVALID for a failed read
+    /// (`dbLink.c:338-339`), the source's alarm by the link's MS flag for a
+    /// good one. The answer the record's step takes.
+    pub(crate) fn land(
+        self,
+        common: &mut crate::server::record::CommonFields,
+        link: &'static str,
+    ) -> crate::server::recgbl::simm::LinkFetch {
         use crate::server::recgbl::simm::LinkFetch;
-        let Some((name, read)) = self.reads.iter().find(|(name, _)| *name == link) else {
-            return LinkFetch::NoData;
-        };
-        match (&read.fetch, &read.inherit) {
-            (LinkFetch::Failed, _) => match read.failure {
+        match (&self.fetch, &self.inherit) {
+            (LinkFetch::Failed, _) => match self.failure {
                 InitGetFailure::NoLset => {}
-                InitGetFailure::LinkAlarm => self.effects.push(InitReadEffect::LinkAlarm(name)),
-                InitGetFailure::Disconn => {
-                    self.effects.push(InitReadEffect::Disconn(name));
-                    self.effects.push(InitReadEffect::LinkAlarm(name));
+                InitGetFailure::LinkAlarm => {
+                    crate::server::recgbl::rec_gbl_set_link_alarm(common, link)
                 }
-            },
-            (LinkFetch::Value(_), Some((ms, alarm))) => {
-                self.effects
-                    .push(InitReadEffect::Inherit(*ms, alarm.clone()));
-            }
-            _ => {}
-        }
-        read.fetch.clone()
-    }
-
-    /// Fold what the taken reads did into the record's pending alarm.
-    pub(crate) fn apply(&self, common: &mut crate::server::record::CommonFields) {
-        for effect in &self.effects {
-            match effect {
-                InitReadEffect::Disconn(field) => {
+                InitGetFailure::Disconn => {
                     crate::server::recgbl::rec_gbl_set_sevr_msg(
                         common,
                         crate::server::recgbl::alarm_status::LINK_ALARM,
                         crate::server::record::AlarmSeverity::Invalid,
-                        crate::server::record::SparseText::link_disconn(field),
+                        crate::server::record::SparseText::link_disconn(link),
                     );
+                    crate::server::recgbl::rec_gbl_set_link_alarm(common, link);
                 }
-                InitReadEffect::LinkAlarm(field) => {
-                    crate::server::recgbl::rec_gbl_set_link_alarm(common, field);
-                }
-                InitReadEffect::Inherit(ms, alarm) => {
-                    crate::server::database::inherit_sevr_msg(common, *ms, alarm);
-                }
+            },
+            (LinkFetch::Value(_), Some((ms, alarm))) => {
+                crate::server::database::inherit_sevr_msg(common, *ms, alarm);
             }
+            _ => {}
         }
+        self.fetch
     }
 }

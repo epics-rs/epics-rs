@@ -11804,7 +11804,7 @@ impl PvDatabase {
 /// (`aoRecord.c:112` before `:127`, `lsoRecord.c:82` before `:85`,
 /// `aSubRecord.c:126` before the SNAM lookup at `:139`), so a device that
 /// reads back at init sees the seed and overwrites it. Only
-/// `RecordInstance::run_init_pass1` calls this, before `init_device_support`.
+/// `RecordInstance::init_pass1_tail` calls this, before `init_device_support`.
 ///
 /// [`Record::constant_init_links`]: crate::server::record::Record::constant_init_links
 pub(crate) fn seed_record_constants(instance: &mut RecordInstance) {

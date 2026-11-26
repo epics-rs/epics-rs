@@ -1253,9 +1253,12 @@ impl PvDatabase {
         // `get_pv`.
         if let Some(pv) = self.shadowing_pv(db) {
             return DbLinkAnswer::Shadowed {
-                final_field_type: self
-                    .get_record(&db.target().record)
-                    .and_then(|rec| final_field_type(&rec)),
+                field: self.get_record(&db.target().record).map(|rec| {
+                    crate::server::record::ShadowedField {
+                        final_field_type: final_field_type(&rec),
+                        rec,
+                    }
+                }),
                 pv,
             };
         }
@@ -2440,12 +2443,13 @@ impl PvDatabase {
             .map(link_dbf_to_field_type)
     }
 
-    /// C `doResolveLinks`' `openLink` (`iocInit.c:535-559`) for each
-    /// external link of `rec_arc`, once per record
-    /// ([`RecordCell::claim_link_opens`]); a link its lset opens without one
-    /// is bound by [`RecordInstance::bind_no_lset`], a forward link it opens
-    /// gets its handle ([`Self::bind_external_forward`]). Runs ahead of the
-    /// record's init reads.
+    /// C `doResolveLinks`' `dbInitLink` (`iocInit.c:535-559`) for each link
+    /// of `rec_arc`, once per record ([`RecordCell::claim_link_opens`]): a DB
+    /// link's answer is opened ([`Self::open_db_link`]), an external link's
+    /// lset `openLink`ed; a link its lset opens without one is bound by
+    /// [`RecordInstance::bind_no_lset`], a forward link it opens gets its
+    /// handle ([`Self::bind_external_forward`]). Runs ahead of the record's
+    /// init reads.
     ///
     /// [`RecordCell::claim_link_opens`]: crate::server::record::RecordCell::claim_link_opens
     /// [`RecordInstance::bind_no_lset`]: crate::server::record::RecordInstance::bind_no_lset
@@ -2454,6 +2458,9 @@ impl PvDatabase {
             return;
         }
         let links = Self::installed_links(&rec_arc.read());
+        for (_, link) in &links {
+            self.open_db_link(link);
+        }
         let opened: Vec<(String, super::LinkOpen)> = links
             .into_iter()
             .filter_map(|(field, link)| {
@@ -2488,11 +2495,22 @@ impl PvDatabase {
             instance.name.as_bytes(),
             field,
         );
-        let open = instance
-            .stored_link_shared(field)
-            .and_then(|link| self.open_link(holder, link));
-        if let Some(open) = open {
+        let Some(link) = instance.stored_link_shared(field) else {
+            return;
+        };
+        self.open_db_link(link);
+        if let Some(open) = self.open_link(holder, link) {
             self.bind_opened(instance, field, open);
+        }
+    }
+
+    /// The `dbChannelOpen` of `link` when it is a DB link — `dbDbInitLink`'s
+    /// (`dbDbLink.c:96`), or the put's (`dbAccess.c:1107-1108`): the answer
+    /// every later read and classification of it takes its type and count
+    /// from.
+    fn open_db_link(&self, link: &crate::server::record::ParsedLink) {
+        if let crate::server::record::ParsedLink::Db(db) = link {
+            self.db_link_answer(db);
         }
     }
 
@@ -4275,9 +4293,10 @@ impl PvDatabase {
                     ),
                     // Non-local ⇒ CA link in C (`dbInitLink` locality).
                     DbLinkAnswer::External => return external(db.external(), LinkType::Ca),
-                    DbLinkAnswer::Shadowed {
-                        final_field_type, ..
-                    } => (None, 1, final_field_type),
+                    DbLinkAnswer::Shadowed { field, .. } => match field {
+                        Some(field) => (Some(field.rec), 1, field.final_field_type),
+                        None => (None, 1, None),
+                    },
                     DbLinkAnswer::Absent => (None, 1, None),
                 };
                 let target = match target {

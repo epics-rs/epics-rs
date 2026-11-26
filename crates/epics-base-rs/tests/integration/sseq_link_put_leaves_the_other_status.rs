@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use epics_base_rs::server::database::PvDatabase;
+use epics_base_rs::server::database::{PutSplit, PvDatabase};
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::server::records::sseq::SseqRecord;
 use epics_base_rs::types::EpicsValue;
@@ -20,9 +20,8 @@ fn status(db: &PvDatabase, pv: &str) -> i16 {
     db.get_pv(pv).unwrap().to_f64().unwrap() as i16
 }
 
-/// Runs each `(field, value)` put and its `special()` under one hold of S's
-/// write lock, as the put path does, so every refresh token is issued before
-/// any classification posts.
+/// Runs each `(field, value)` `dbPutField` under one hold of S, so every
+/// refresh token is issued before any classification posts.
 async fn puts_under_one_lock(puts: &[(&str, EpicsValue)]) -> PvDatabase {
     let db = PvDatabase::new();
     db.add_record("L", Box::new(AiRecord::new(3.0)))
@@ -34,17 +33,18 @@ async fn puts_under_one_lock(puts: &[(&str, EpicsValue)]) -> PvDatabase {
     db.ioc_init().await;
     // S's init classification must have posted before the puts.
     epics_base_rs::runtime::task::sleep(Duration::from_millis(100)).await;
-    {
-        let rec = db.get_record("S").unwrap();
-        let mut guard = rec.write();
+    db.put_many_locked(&["S"], puts.len(), |held| {
         for (field, value) in puts {
-            guard.record.put_field(field, value.clone()).unwrap();
-            guard
-                .record
-                .special(field, true, &Default::default())
-                .unwrap();
+            let rec = held.record(0).unwrap();
+            held.put_record_field_from_ca_no_notify(
+                rec,
+                field,
+                value.clone(),
+                PutSplit::DbPutField,
+            )
+            .unwrap();
         }
-    }
+    });
     db
 }
 

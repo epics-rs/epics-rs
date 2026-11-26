@@ -1399,6 +1399,32 @@ impl AsyncDbHandle {
         self.db()?.parsed_link_target_field_type(link)
     }
 
+    /// `PvDatabase::db_link_answer`: `db`'s cached answer. `None` if the
+    /// database is gone.
+    pub(crate) fn db_link_answer(
+        &self,
+        db: &crate::server::record::DbLink,
+    ) -> Option<crate::server::record::DbLinkAnswer> {
+        Some(self.db()?.db_link_answer(db))
+    }
+
+    /// The links `record` stores in `fields`, the parses its reads take.
+    /// `None` if the record or the database is gone.
+    pub(crate) fn stored_links(
+        &self,
+        record: impl AsRef<[u8]>,
+        fields: &[&str],
+    ) -> Option<Vec<Option<std::sync::Arc<crate::server::record::ParsedLink>>>> {
+        let rec = self.db()?.get_record(record.as_ref())?;
+        let inst = rec.read();
+        Some(
+            fields
+                .iter()
+                .map(|f| inst.stored_link_shared(f).cloned())
+                .collect(),
+        )
+    }
+
     /// See `PvDatabase::link_check_classified`.
     pub fn link_check_classified(
         &self,
@@ -5005,8 +5031,8 @@ impl PvDatabase {
     ///
     /// C `dbNameToAddr` → `pAddr->field_type`, no filter applied: a `DB_LINK`
     /// whose target record is on this IOC reports its addressed field's
-    /// type, from which sseq's `DTn`/`LTn` take the link's filtered type
-    /// ([`ChannelName::final_field_type`](crate::server::database::filters::ChannelName)). A constant or
+    /// type, from which a DB link's answer takes its filtered type
+    /// ([`ChannelName::final_field_type_through`](crate::server::database::filters::ChannelName)). A constant or
     /// `CA`/`PVA` (external) link returns `None` — epics-base-rs has no
     /// client-side introspection of a remote field's type, so the caller
     /// renders those as the `DBF_unknown` sentinel.

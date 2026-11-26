@@ -2769,6 +2769,12 @@ impl<'a> OwnFrame<'a> {
         self.common
     }
 
+    /// The link the record stores in `field`, when `field` is one of its
+    /// type's links.
+    pub(crate) fn link(self, field: &str) -> Option<&'a std::sync::Arc<super::ParsedLink>> {
+        self.link_slots.parse_of(field)
+    }
+
     /// The record this frame is lent for, whose code is `record`.
     pub fn of(self, record: &'a dyn Record) -> OwnRecord<'a> {
         OwnRecord {
@@ -9484,7 +9490,7 @@ pub(crate) mod tests {
             "calc" | "sel" => CycleHooks::INPUT_FETCH,
             "aSub" => CycleHooks::MONITOR_SETS,
             "longout" => CycleHooks::OUTPUT_HOOKS,
-            "sseq" => CycleHooks::ALL,
+            "sseq" => CycleHooks::ALL.union(CycleHooks::OWN_FRAME),
             "scalcout" => CycleHooks::ALL
                 .union(CycleHooks::PUT_REPORT)
                 .union(CycleHooks::LINK_CHECK),

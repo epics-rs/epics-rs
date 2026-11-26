@@ -411,24 +411,35 @@ pub fn classify_link(
     role: LinkRole,
     rule: LinkRule,
 ) -> (i16, i16) {
-    use crate::server::record::{LinkFieldType, ParsedLink, parse_link_field};
+    use crate::server::record::{LinkFieldType, parse_link_field};
     let ftype = match role {
         LinkRole::Input => LinkFieldType::In,
         LinkRole::Output => LinkFieldType::Out,
     };
-    let parsed = parse_link_field(link.as_ref(), ftype);
+    classify_parsed_link(handle, &parse_link_field(link.as_ref(), ftype), rule)
+}
+
+/// [`classify_link`] of a link already parsed for its field. A DB link is
+/// classified by its cached answer, so a record's stored link reports the
+/// type and locality its channel opened with, the ones its reads take.
+pub(crate) fn classify_parsed_link(
+    handle: &AsyncDbHandle,
+    parsed: &crate::server::record::ParsedLink,
+    rule: LinkRule,
+) -> (i16, i16) {
+    use crate::server::record::{DbLinkAnswer, ParsedLink};
     // Base calcout asks `dbLinkIsConstant`; synApps and sseq ask
     // `type == CONSTANT` and send a `{const:…}` JSON link to `dbNameToAddr`
     // of its `pv_link.pvname`, a union member a JSON link never set. That C
     // defect is not copied: a constant lset is constant.
-    if crate::server::recgbl::simm::is_constant(&parsed) {
+    if crate::server::recgbl::simm::is_constant(parsed) {
         return (LINK_CON, DBF_UNKNOWN);
     }
     // Base calcout asks the lset (`dbLink.c:220-235`): a hardware link has
     // none, so it is constant; a state link's is neither constant nor
     // volatile (`lnkState.c:213-214`), so it is local.
     if rule == LinkRule::Volatile {
-        match &parsed {
+        match parsed {
             ParsedLink::Hw(_) => return (LINK_CON, DBF_UNKNOWN),
             ParsedLink::State(_) => return (LINK_LOC, DBF_UNKNOWN),
             _ => {}
@@ -436,19 +447,19 @@ pub fn classify_link(
     }
     // `dbNameToAddr` decides the status; the type is the one the link's
     // channel delivers, through its filters.
-    let final_type = |link: &ParsedLink| {
-        let ParsedLink::Db(db) = link else {
-            return None;
-        };
-        handle
-            .parsed_link_target_field_type(link)
-            .map(|t| db.target().final_field_type(t))
+    let local = |db: &crate::server::record::DbLink| match handle.db_link_answer(db)? {
+        DbLinkAnswer::Local(at) => Some(at.final_field_type),
+        DbLinkAnswer::Shadowed { field, .. } => field.map(|f| f.final_field_type),
+        DbLinkAnswer::Absent | DbLinkAnswer::External => None,
     };
-    let local = match &parsed {
-        ParsedLink::Db(_) => final_type(&parsed),
+    let local = match parsed {
+        ParsedLink::Db(db) => local(db),
         // `dbNameToAddr(pvname)`, the modifier aside.
         ParsedLink::Ca(ca) if rule == LinkRule::Locality => {
-            final_type(&crate::server::record::parse_link_v2(ca.pv.as_bytes()))
+            match crate::server::record::parse_link_v2(ca.pv.as_bytes()) {
+                ParsedLink::Db(db) => local(&db),
+                _ => None,
+            }
         }
         _ => None,
     };
@@ -456,7 +467,7 @@ pub fn classify_link(
     // dbCaTask is paused until `dbCaRun` (dbCa.c:1173, iocInit.c:260), and
     // `special()` does not ask. Only `checkLinks` reads the connection.
     match local {
-        Some(dbf) => (LINK_LOC, dbf as i16),
+        Some(dbf) => (LINK_LOC, dbf.map_or(DBF_NOACCESS, dbf_static_code)),
         None => (LINK_EXT_NC, DBF_UNKNOWN),
     }
 }

@@ -116,6 +116,48 @@ async fn sseq_reads_nothing_from_a_noaccess_source() {
     assert_eq!(db.get_pv("T.VAL").unwrap(), EpicsValue::Double(5.0));
 }
 
+/// C opens a DB link's channel at `iocInit` (`dbDbInitLink`) or at the put
+/// that installs it (`dbAddLink`), and reads its address from then on: an
+/// mbbo with no states is `DBF_USHORT` there (`mbboRecord.c` `cvt_dbaddr`),
+/// so a state named later retypes neither `DT1`/`LT1` nor the step's read.
+#[epics_macros_rs::epics_test]
+async fn sseq_link_keeps_the_type_its_channel_opened_with() {
+    let db = ioc("record(mbbo, \"M\") {}\n\
+         record(mbbo, \"MP\") {}\n\
+         record(sseq, \"SQ\") { field(DO1, \"0\") field(DOL1, \"M.VAL\") field(LNK1, \"MP.VAL\") }\n")
+    .await;
+    for pv in ["M.ZRST", "MP.ZRST"] {
+        db.put_pv(pv, EpicsValue::String("zero".into()))
+            .await
+            .unwrap();
+    }
+    let get = |f: &str| db.get_pv(format!("SQ.{f}")).unwrap();
+    let opened_ushort = |when: &str| {
+        let seen = (get("DT1"), get("LT1"), get("STR1"));
+        let want = (
+            EpicsValue::Short(4),
+            EpicsValue::Short(4),
+            EpicsValue::String("0".into()),
+        );
+        assert_eq!(seen, want, "{when}");
+    };
+    run(&db, "SQ", idle("SQ")).await;
+    opened_ushort("first cycle");
+    // A name added moves the name maps; the link still names `M`.
+    db.add_pv("OTHER", EpicsValue::Double(0.0)).await.unwrap();
+    run(&db, "SQ", idle("SQ")).await;
+    opened_ushort("after a name map change");
+    // A put of the link opens it again, `M` now `DBF_ENUM`.
+    db.put_pv_no_process("SQ.DOL1", EpicsValue::String("M.VAL".into()))
+        .await
+        .unwrap();
+    run(&db, "SQ", idle("SQ")).await;
+    assert_eq!(
+        (get("DT1"), get("STR1")),
+        (EpicsValue::Short(11), EpicsValue::String("zero".into()))
+    );
+}
+
 /// A `FTVL=STRING` waveform's `VAL` addresses as `DBF_STRING` once its
 /// `cvt_dbaddr` has run, so scalcout puts `OSV` there, not `OVAL`.
 #[epics_macros_rs::epics_test]

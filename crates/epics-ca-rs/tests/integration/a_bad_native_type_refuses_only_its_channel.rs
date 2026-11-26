@@ -11,14 +11,17 @@
 #![cfg(feature = "client-core")]
 
 use std::collections::HashSet;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_ca_rs::client::{CaClient, ConnectionEvent};
-use epics_ca_rs::protocol::{CA_PROTO_CREATE_CHAN, CA_PROTO_SEARCH, CaHeader};
+use epics_ca_rs::protocol::{
+    CA_PROTO_CREATE_CHAN, CA_PROTO_REPEATER_CONFIRM, CA_PROTO_REPEATER_REGISTER,
+    CA_PROTO_RSRV_IS_UP, CA_PROTO_SEARCH, CA_PROTO_SERVER_DISCONN, CaHeader,
+};
 use epics_ca_rs::server::CaServer;
 use epics_ca_rs::{CaError, DbFieldType};
 use serial_test::serial;
@@ -33,21 +36,25 @@ const LATER: &str = "REFUSE:LATER";
 const BAD_TYPE: u16 = 7;
 const REFUSAL: &str = "Ignored conn resp with bad native data type 7";
 
-/// The cids the client created `BAD` under, and how many of their replies
-/// the proxy has retyped.
+/// The cids the client created `BAD` under, how many of their replies the
+/// proxy has retyped, and when it retyped each. With `disconnect`, the proxy
+/// follows each retyped reply with a `CA_PROTO_SERVER_DISCONN` for its cid.
 #[derive(Default)]
 struct Retype {
     cids: Mutex<HashSet<u32>>,
     sent: AtomicUsize,
+    at: Mutex<Vec<Instant>>,
+    disconnect: bool,
 }
 
 /// Relay one direction of a circuit frame by frame, handing each frame to
-/// `edit` first. The PVs are scalars, so no extended header appears.
+/// `edit` first, which may append frames to it. The PVs are scalars, so no
+/// extended header appears.
 async fn relay(
     mut from: OwnedReadHalf,
     mut to: OwnedWriteHalf,
     retype: Arc<Retype>,
-    edit: fn(&mut [u8], &Retype),
+    edit: fn(&mut Vec<u8>, &Retype),
 ) {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -80,7 +87,7 @@ fn cmmd_and_cid(frame: &[u8]) -> (u16, u32) {
 }
 
 /// Client to server: note the cid of every create of `BAD`.
-fn note_bad_creates(frame: &mut [u8], retype: &Retype) {
+fn note_bad_creates(frame: &[u8], retype: &Retype) {
     let (cmmd, cid) = cmmd_and_cid(frame);
     let name = &frame[CaHeader::SIZE..];
     let name = &name[..name.iter().position(|&b| b == 0).unwrap_or(name.len())];
@@ -90,17 +97,23 @@ fn note_bad_creates(frame: &mut [u8], retype: &Retype) {
 }
 
 /// Server to client: give the reply to a create of `BAD` the bad type.
-fn retype_bad_replies(frame: &mut [u8], retype: &Retype) {
+fn retype_bad_replies(frame: &mut Vec<u8>, retype: &Retype) {
     let (cmmd, cid) = cmmd_and_cid(frame);
     if cmmd == CA_PROTO_CREATE_CHAN && retype.cids.lock().unwrap().contains(&cid) {
         frame[4..6].copy_from_slice(&BAD_TYPE.to_be_bytes());
+        retype.at.lock().unwrap().push(Instant::now());
         retype.sent.fetch_add(1, Ordering::SeqCst);
+        if retype.disconnect {
+            let mut disconn = CaHeader::new(CA_PROTO_SERVER_DISCONN);
+            disconn.cid = cid;
+            frame.extend_from_slice(&disconn.to_bytes());
+        }
     }
 }
 
-/// Serve the three PVs behind the retyping proxy: the proxy's search port,
-/// and its count of retyped replies.
-async fn served_behind_retyping_proxy() -> (u16, Arc<Retype>) {
+/// Serve the three PVs behind a proxy that retypes as `retype` says: the
+/// proxy's search port, and its record of retyped replies.
+async fn served_behind_retyping_proxy(retype: Retype) -> (u16, Arc<Retype>) {
     let server = CaServer::builder()
         .port(0)
         .record(GOOD, AiRecord::new(1.0))
@@ -155,7 +168,7 @@ async fn served_behind_retyping_proxy() -> (u16, Arc<Retype>) {
         }
     });
 
-    let retype = Arc::new(Retype::default());
+    let retype = Arc::new(retype);
     let shared = retype.clone();
     tokio::spawn(async move {
         loop {
@@ -167,7 +180,7 @@ async fn served_behind_retyping_proxy() -> (u16, Arc<Retype>) {
             };
             let (cr, cw) = client.into_split();
             let (sr, sw) = upstream.into_split();
-            tokio::spawn(relay(cr, sw, shared.clone(), note_bad_creates));
+            tokio::spawn(relay(cr, sw, shared.clone(), |f, r| note_bad_creates(f, r)));
             tokio::spawn(relay(sr, cw, shared.clone(), retype_bad_replies));
         }
     });
@@ -180,7 +193,7 @@ async fn served_behind_retyping_proxy() -> (u16, Arc<Retype>) {
 #[tokio::test(flavor = "multi_thread")]
 #[serial(epics_env)]
 async fn a_bad_native_type_refuses_its_channel_and_spares_the_circuit() {
-    let (search_port, retype) = served_behind_retyping_proxy().await;
+    let (search_port, retype) = served_behind_retyping_proxy(Retype::default()).await;
     // SAFETY: `#[serial(epics_env)]` keeps every env-touching test apart, and
     // `CaClient::new` snapshots its resolver configuration.
     unsafe {
@@ -257,11 +270,11 @@ async fn a_bad_native_type_refuses_its_channel_and_spares_the_circuit() {
 }
 
 /// `caget` on the refused PV prints libca's text with the type once per
-/// refused reply, re-searches on the reconnect schedule rather than at once,
-/// and times the PV's connect out.
+/// refused reply, re-searches only after the refusal hold rather than at
+/// once, and times the PV's connect out.
 #[tokio::test(flavor = "multi_thread")]
 async fn caget_logs_each_refusal_once_and_reports_the_pv_unconnected() {
-    let (search_port, retype) = served_behind_retyping_proxy().await;
+    let (search_port, retype) = served_behind_retyping_proxy(Retype::default()).await;
     let out = Command::new(env!("CARGO_BIN_EXE_caget-rs"))
         .args(["-w", "3", BAD])
         .env("EPICS_CA_ADDR_LIST", format!("127.0.0.1:{search_port}"))
@@ -280,8 +293,8 @@ async fn caget_logs_each_refusal_once_and_reports_the_pv_unconnected() {
         logged, refused,
         "one line per refused reply; stderr: {stderr:?}"
     );
-    // The reconnect schedule's tick is at least 2 s, so 3 s hold at most one
-    // re-search after the first refusal.
+    // The refusal hold is one normal tick, at least 2 s, so 3 s hold at most
+    // one re-search after the first refusal.
     assert!(refused <= 2, "{refused} refusals in 3 s");
     assert!(
         stderr.contains(&format!("Channel connect timed out: '{BAD}' not found.")),
@@ -289,4 +302,138 @@ async fn caget_logs_each_refusal_once_and_reports_the_pv_unconnected() {
     );
     assert_eq!(stdout, "");
     assert_eq!(out.status.code(), Some(1), "stderr: {stderr:?}");
+}
+
+/// One normal search tick at `EPICS_CA_MAX_SEARCH_PERIOD=60`: the period over
+/// the 30 search buckets, which is also the tick's 2 s floor.
+const NORMAL_TICK: Duration = Duration::from_secs(2);
+
+/// When the proxy retyped its `n`th reply, once it has.
+async fn nth_refusal(retype: &Retype, n: usize) -> Instant {
+    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    loop {
+        let at = retype.at.lock().unwrap().get(n - 1).copied();
+        if let Some(at) = at {
+            return at;
+        }
+        assert!(Instant::now() < deadline, "refusal {n} never came");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// The client's beacon socket: the first source port that sends
+/// `REPEATER_REGISTER` twice, as the client re-sends it until confirmed; a
+/// one-shot "is a repeater running?" probe sends once.
+async fn registered_client(repeater: &UdpSocket) -> SocketAddr {
+    let mut ports = Vec::new();
+    let mut buf = [0u8; 64];
+    tokio::time::timeout(fact_budget::FACT_BUDGET, async {
+        loop {
+            let (n, src) = repeater.recv_from(&mut buf).await.expect("repeater recv");
+            match CaHeader::from_bytes(&buf[..n]) {
+                Ok(h) if h.cmmd == CA_PROTO_REPEATER_REGISTER => {}
+                _ => continue,
+            }
+            if ports.contains(&src.port()) {
+                return src;
+            }
+            ports.push(src.port());
+        }
+    })
+    .await
+    .expect("no port re-sent REPEATER_REGISTER")
+}
+
+/// When the proxy refused each of the first `n` creates of `BAD`, for a
+/// client that beacons from ever-new servers hold on its fast search tick
+/// from the first refusal on: every beacon wakes its searching channels.
+#[cfg(feature = "client")]
+async fn refusals_under_a_beacon_burst(retype: Retype, n: usize) -> Vec<Instant> {
+    let (search_port, retype) = served_behind_retyping_proxy(retype).await;
+    let repeater = UdpSocket::bind("0.0.0.0:0").await.expect("bind repeater");
+    // SAFETY: `#[serial(epics_env)]` keeps every env-touching test apart, and
+    // `CaClient::new` snapshots its resolver configuration.
+    unsafe {
+        std::env::set_var("EPICS_CA_ADDR_LIST", format!("127.0.0.1:{search_port}"));
+        std::env::set_var("EPICS_CA_AUTO_ADDR_LIST", "NO");
+        std::env::set_var("EPICS_CA_SERVER_PORT", search_port.to_string());
+        std::env::set_var(
+            "EPICS_CA_REPEATER_PORT",
+            repeater.local_addr().unwrap().port().to_string(),
+        );
+        std::env::set_var("EPICS_CA_MAX_SEARCH_PERIOD", "60");
+    }
+    let client = CaClient::new().await.expect("CA client");
+    let beacon_socket = registered_client(&repeater).await;
+    repeater
+        .send_to(
+            &CaHeader::new(CA_PROTO_REPEATER_CONFIRM).to_bytes(),
+            beacon_socket,
+        )
+        .await
+        .expect("send CONFIRM");
+
+    let _bad = client.create_channel(BAD);
+    let mut at = vec![nth_refusal(&retype, 1).await];
+    let burst = tokio::spawn(async move {
+        for port in 1..=u16::MAX {
+            let mut beacon = CaHeader::new(CA_PROTO_RSRV_IS_UP);
+            beacon.count = port;
+            beacon.cid = 1;
+            beacon.available = u32::from(Ipv4Addr::LOCALHOST);
+            let _ = repeater.send_to(&beacon.to_bytes(), beacon_socket).await;
+            // not-a-wait: pacing between beacons, each a server never seen
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    });
+    for i in 2..=n {
+        at.push(nth_refusal(&retype, i).await);
+    }
+    burst.abort();
+
+    // SAFETY: `#[serial(epics_env)]`.
+    unsafe {
+        std::env::remove_var("EPICS_CA_ADDR_LIST");
+        std::env::remove_var("EPICS_CA_AUTO_ADDR_LIST");
+        std::env::remove_var("EPICS_CA_SERVER_PORT");
+        std::env::remove_var("EPICS_CA_REPEATER_PORT");
+        std::env::remove_var("EPICS_CA_MAX_SEARCH_PERIOD");
+    }
+    at
+}
+
+/// A refused channel searches again one normal tick after its refusal at the
+/// earliest; beacons waking it do not bring that forward.
+#[cfg(feature = "client")]
+#[tokio::test(flavor = "multi_thread")]
+#[serial(epics_env)]
+async fn a_beacon_burst_does_not_hasten_a_refused_channels_search() {
+    let at = refusals_under_a_beacon_burst(Retype::default(), 3).await;
+    for (n, pair) in (2..).zip(at.windows(2)) {
+        let gap = pair[1].duration_since(pair[0]);
+        assert!(
+            gap >= NORMAL_TICK,
+            "refusal {n} came {gap:?} after the one before it, under one normal tick"
+        );
+    }
+}
+
+/// A server that retires the refused cid at once sends
+/// `CA_PROTO_SERVER_DISCONN`, which re-queues the channel as a reconnect;
+/// that does not bring its next search forward either.
+#[cfg(feature = "client")]
+#[tokio::test(flavor = "multi_thread")]
+#[serial(epics_env)]
+async fn a_server_disconnect_does_not_hasten_a_refused_channels_search() {
+    let retype = Retype {
+        disconnect: true,
+        ..Retype::default()
+    };
+    let at = refusals_under_a_beacon_burst(retype, 2).await;
+    let gap = at[1].duration_since(at[0]);
+    assert!(
+        gap >= NORMAL_TICK,
+        "the refusal after a server disconnect came {gap:?} after the first, \
+         under one normal tick"
+    );
 }

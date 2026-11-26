@@ -1401,6 +1401,8 @@ pub(crate) enum SearchReason {
     Reconnect,
     /// Beacon anomaly detected for the server this channel was on.
     BeaconAnomaly,
+    /// The server refused the channel it announced; it would refuse again.
+    Refused,
 }
 
 pub(crate) enum SearchRequest {

@@ -128,6 +128,8 @@ const N_SEARCH_BUCKETS: usize = 30;
 ///   (client.cpp:213) with `holdoff = 0` — the typical Active→
 ///   disconnect case sits in the current bucket and the next 1 Hz
 ///   tick fires the broadcast. Latency ≤ 1 s.
+/// - `Refused`: `current_bucket`, but its `hold_until` keeps it off the
+///   wire until one normal tick has passed.
 ///
 /// Cascade-spread (5000 channels disconnecting simultaneously) is
 /// handled by the natural O(N / nBuckets) per-tick rate-limit and
@@ -138,7 +140,7 @@ fn placement_bucket(current_bucket: usize, reason: SearchReason) -> usize {
         SearchReason::Initial | SearchReason::BeaconAnomaly => {
             (current_bucket + 1) % N_SEARCH_BUCKETS
         }
-        SearchReason::Reconnect => current_bucket,
+        SearchReason::Reconnect | SearchReason::Refused => current_bucket,
     }
 }
 
@@ -371,6 +373,9 @@ struct PendingSearch {
     attempt: u32,
     #[allow(dead_code)]
     last_attempt: Option<Instant>,
+    /// No SEARCH for this channel goes out before this instant. Set by a
+    /// `Refused` schedule only; a later schedule or poke never shortens it.
+    hold_until: Option<Instant>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1657,6 +1662,21 @@ fn handle_request(state: &mut SearchEngineState, req: SearchRequest) -> Option<u
 
             let search_payload = build_search_payload(cid, pv_name.as_bytes());
 
+            // The refusal hold: one normal tick of real time, which a
+            // re-schedule of a still-held channel carries over.
+            let carried = state
+                .pending
+                .get(&cid)
+                .and_then(|p| p.hold_until)
+                .filter(|until| *until > Instant::now());
+            let hold_until = if reason == SearchReason::Refused {
+                carried.max(Some(epics_base_rs::runtime::time::deadline_from_now(
+                    normal_tick().get(),
+                )))
+            } else {
+                carried
+            };
+
             // Drop any stale entry before re-scheduling.
             state.remove_channel(cid);
 
@@ -1679,6 +1699,7 @@ fn handle_request(state: &mut SearchEngineState, req: SearchRequest) -> Option<u
                 bucket,
                 attempt: 0,
                 last_attempt: None,
+                hold_until,
             };
             state.buckets[bucket].push(cid);
             state.pending.insert(cid, p);
@@ -1697,9 +1718,9 @@ fn handle_request(state: &mut SearchEngineState, req: SearchRequest) -> Option<u
             // avoid. `BeaconAnomaly` for a NEW cid likewise relies on
             // fast-tick mode (`poke()` above) to retransmit within ~6 s
             // instead of firing right away.
-            match reason {
-                SearchReason::Initial => Some(cid),
-                SearchReason::Reconnect | SearchReason::BeaconAnomaly => None,
+            match (reason, hold_until) {
+                (SearchReason::Initial, None) => Some(cid),
+                _ => None,
             }
         }
 
@@ -2075,6 +2096,12 @@ async fn process_bucket(
             let Some(p) = pending.get_mut(&sid) else {
                 continue;
             };
+            if p.hold_until.is_some_and(|until| until > now) {
+                let next = (current + 1) % N_SEARCH_BUCKETS;
+                p.bucket = next;
+                buckets[next].push(sid);
+                continue;
+            }
             p.last_attempt = Some(now);
             p.attempt = p.attempt.saturating_add(1);
             let attempt = p.attempt;

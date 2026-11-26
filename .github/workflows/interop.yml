@@ -125,6 +125,18 @@ jobs:
       with:
         key: all-features
 
+    # The cached reference trees link the image's libevent and libssl, and
+    # `ubuntu-latest` names a different image over time. The caches are keyed
+    # on the image's release, and the libraries go in on every run, because a
+    # cache hit restores the binaries but not what they load.
+    - name: Install the reference trees' system libraries
+      id: image
+      run: |
+        . /etc/os-release
+        echo "os=${ID}-${VERSION_ID}" >> "$GITHUB_OUTPUT"
+        sudo apt-get update
+        sudo apt-get install -y libevent-dev libssl-dev cmake
+
     # ── EPICS reference build ──────────────────────────────────
     # Cache /opt/epics across runs. Cache key bumps when version
     # changes. ~3 GB; full first-time build ~12 min, cache restore
@@ -139,7 +151,7 @@ jobs:
       uses: actions/cache@v4
       with:
         path: /opt/epics-base
-        key: epics-base-${{ env.EPICS_BASE_VERSION }}-pva-ubuntu-latest
+        key: epics-base-${{ env.EPICS_BASE_VERSION }}-pva-${{ steps.image.outputs.os }}
 
     - name: Build epics-base if cache miss
       if: steps.cache-epics.outputs.cache-hit != 'true'
@@ -162,13 +174,11 @@ jobs:
         # -v2: earlier cached trees could miss the libpvxs SONAME
         # symlinks, so pvx* failed with "libpvxs.so.1.3: cannot open
         # shared object file". Bump forces one clean rebuild.
-        key: pvxs-${{ env.PVXS_VERSION }}-base-${{ env.EPICS_BASE_VERSION }}-ubuntu-latest-v2
+        key: pvxs-${{ env.PVXS_VERSION }}-base-${{ env.EPICS_BASE_VERSION }}-${{ steps.image.outputs.os }}-v2
 
     - name: Build pvxs if cache miss
       if: steps.cache-pvxs.outputs.cache-hit != 'true'
       run: |
-        sudo apt-get update
-        sudo apt-get install -y libevent-dev libssl-dev
         sudo mkdir -p /opt/pvxs
         sudo chown $USER /opt/pvxs
         # Built where it is cached, as the TLS tree is: its binaries find
@@ -192,13 +202,11 @@ jobs:
       uses: actions/cache@v4
       with:
         path: /opt/pvxs-tls
-        key: pvxs-tls-${{ env.PVXS_TLS_COMMIT }}-base-${{ env.EPICS_BASE_VERSION }}-ubuntu-latest-v2
+        key: pvxs-tls-${{ env.PVXS_TLS_COMMIT }}-base-${{ env.EPICS_BASE_VERSION }}-${{ steps.image.outputs.os }}-v2
 
     - name: Build TLS pvxs if cache miss
       if: steps.cache-pvxs-tls.outputs.cache-hit != 'true'
       run: |
-        sudo apt-get update
-        sudo apt-get install -y libssl-dev cmake
         sudo mkdir -p /opt/pvxs-tls
         sudo chown $USER /opt/pvxs-tls
         # Built where it is cached. The binaries carry RUNPATHs to the build
@@ -209,8 +217,8 @@ jobs:
         git init -q .
         git fetch --depth 1 https://github.com/epics-base/pvxs.git ${{ env.PVXS_TLS_COMMIT }}
         git checkout FETCH_HEAD
-        # The local build links the bundled libevent submodule; the
-        # system one is not used, so no libevent-dev is installed.
+        # The local build links the bundled libevent submodule, not the
+        # system one.
         git submodule update --init --depth 1 bundle/libevent
         echo "EPICS_BASE=/opt/epics-base" > configure/RELEASE.local
         make -C bundle -j2 libevent

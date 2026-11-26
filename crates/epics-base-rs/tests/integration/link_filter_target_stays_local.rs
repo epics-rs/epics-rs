@@ -153,3 +153,38 @@ async fn a_filtered_link_joins_its_source_lock_set() {
     members.sort();
     assert_eq!(members, ["ai", "src", "wf"]);
 }
+
+/// C keeps a link's chain on its `dbChannel` for every `dbDbGetValue`, and
+/// `dec` passes a read log (`decimate.c:64`), so its counter never drops a
+/// read: each read of the same link delivers the slice, never the raw `VAL`
+/// a dropped log falls back to (`dbDbLink.c:206-219`).
+#[epics_macros_rs::epics_test]
+async fn a_decimated_link_delivers_every_read() {
+    let db = IocBuilder::new()
+        .db_string(
+            r#"
+record(waveform, "src") {
+    field(NELM, "10")
+    field(FTVL, "SHORT")
+    field(INP, [1, 2, 3, 4, 5, 6, 7, 8])
+}
+record(ai, "dec") { field(INP, "src.{\"dec\":{\"n\":3},\"arr\":{\"s\":2,\"e\":2}}") }
+"#,
+            &std::collections::HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap()
+        .0;
+    db.initialize_link_locality().await;
+    process(&db, "src").await;
+    for read in 1..=3 {
+        process(&db, "dec").await;
+        assert_eq!(
+            db.get_pv("dec").unwrap().to_f64().unwrap(),
+            3.0,
+            "read {read}"
+        );
+    }
+}

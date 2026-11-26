@@ -1487,14 +1487,21 @@ pub(crate) enum DbLinkAnswer {
         pv: std::sync::Arc<crate::server::pv::ProcessVariable>,
         /// The record field it shadows; `None` when no record has the name.
         field: Option<ShadowedField>,
+        /// As [`ResolvedTarget::chain`](super::record_instance::ResolvedTarget::chain).
+        chain: Option<std::sync::Arc<FilterChain>>,
     },
     /// A name this IOC serves, but no readable record field; the by-name
     /// path decides.
-    Absent,
+    Absent {
+        /// As [`ResolvedTarget::chain`](super::record_instance::ResolvedTarget::chain).
+        chain: Option<std::sync::Arc<FilterChain>>,
+    },
     /// Not served here: C `dbInitLink` hands it to `dbCaAddLink`
     /// (`dbLink.c:118-130`), and so is settled like an address.
     External,
 }
+
+type FilterChain = crate::server::database::filters::FilterChain;
 
 /// The record field a [`DbLinkAnswer::Shadowed`] PV shadows.
 pub(crate) struct ShadowedField {
@@ -1566,6 +1573,7 @@ enum CachedAnswer {
         f64_slot: Option<super::record_trait::FieldSlot>,
         final_no_elements: u32,
         final_field_type: Option<crate::types::DbFieldType>,
+        chain: Option<std::sync::Arc<FilterChain>>,
     },
     Shadowed {
         pv: std::sync::Arc<crate::server::pv::ProcessVariable>,
@@ -1573,8 +1581,11 @@ enum CachedAnswer {
             std::sync::Weak<super::record_instance::RecordCell>,
             Option<crate::types::DbFieldType>,
         )>,
+        chain: Option<std::sync::Arc<FilterChain>>,
     },
-    Absent,
+    Absent {
+        chain: Option<std::sync::Arc<FilterChain>>,
+    },
     External,
 }
 
@@ -1588,14 +1599,18 @@ impl CachedAnswer {
                 f64_slot: target.f64_slot,
                 final_no_elements: target.final_no_elements,
                 final_field_type: target.final_field_type,
+                chain: target.chain.clone(),
             },
-            DbLinkAnswer::Shadowed { pv, field } => CachedAnswer::Shadowed {
+            DbLinkAnswer::Shadowed { pv, field, chain } => CachedAnswer::Shadowed {
                 pv: pv.clone(),
                 field: field
                     .as_ref()
                     .map(|f| (std::sync::Arc::downgrade(&f.rec), f.final_field_type)),
+                chain: chain.clone(),
             },
-            DbLinkAnswer::Absent => CachedAnswer::Absent,
+            DbLinkAnswer::Absent { chain } => CachedAnswer::Absent {
+                chain: chain.clone(),
+            },
             DbLinkAnswer::External => CachedAnswer::External,
         }
     }
@@ -1610,6 +1625,7 @@ impl CachedAnswer {
                 f64_slot,
                 final_no_elements,
                 final_field_type,
+                chain,
             } => DbLinkAnswer::Local(super::record_instance::ResolvedTarget {
                 rec: rec.upgrade()?,
                 name: name.clone(),
@@ -1617,8 +1633,9 @@ impl CachedAnswer {
                 f64_slot: *f64_slot,
                 final_no_elements: *final_no_elements,
                 final_field_type: *final_field_type,
+                chain: chain.clone(),
             }),
-            CachedAnswer::Shadowed { pv, field } => DbLinkAnswer::Shadowed {
+            CachedAnswer::Shadowed { pv, field, chain } => DbLinkAnswer::Shadowed {
                 pv: pv.clone(),
                 field: match field {
                     Some((rec, final_field_type)) => Some(ShadowedField {
@@ -1627,8 +1644,11 @@ impl CachedAnswer {
                     }),
                     None => None,
                 },
+                chain: chain.clone(),
             },
-            CachedAnswer::Absent => DbLinkAnswer::Absent,
+            CachedAnswer::Absent { chain } => DbLinkAnswer::Absent {
+                chain: chain.clone(),
+            },
             CachedAnswer::External => DbLinkAnswer::External,
         })
     }
@@ -1644,10 +1664,11 @@ impl CachedAnswer {
                 same(rec, &target.rec)
             }
             (
-                CachedAnswer::Shadowed { pv, field },
+                CachedAnswer::Shadowed { pv, field, .. },
                 DbLinkAnswer::Shadowed {
                     pv: fresh_pv,
                     field: fresh_field,
+                    ..
                 },
             ) => {
                 std::sync::Arc::ptr_eq(pv, fresh_pv)
@@ -1657,7 +1678,7 @@ impl CachedAnswer {
                         _ => false,
                     }
             }
-            (CachedAnswer::Absent, DbLinkAnswer::Absent)
+            (CachedAnswer::Absent { .. }, DbLinkAnswer::Absent { .. })
             | (CachedAnswer::External, DbLinkAnswer::External) => true,
             _ => false,
         }

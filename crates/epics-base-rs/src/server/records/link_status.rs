@@ -450,7 +450,7 @@ pub(crate) fn classify_parsed_link(
     let local = |db: &crate::server::record::DbLink| match handle.db_link_answer(db)? {
         DbLinkAnswer::Local(at) => Some(at.final_field_type),
         DbLinkAnswer::Shadowed { field, .. } => field.map(|f| f.final_field_type),
-        DbLinkAnswer::Absent | DbLinkAnswer::External => None,
+        DbLinkAnswer::Absent { .. } | DbLinkAnswer::External => None,
     };
     let local = match parsed {
         ParsedLink::Db(db) => local(db),

@@ -4964,6 +4964,9 @@ pub(crate) struct ResolvedTarget {
     /// a DBR type, settled with [`Self::final_no_elements`]; `None` for one
     /// no DBR type serves (`DBF_NOACCESS`).
     pub(crate) final_field_type: Option<DbFieldType>,
+    /// The link's filter chain, parsed once as the channel opens: C keeps
+    /// it on the link's `dbChannel` for every `dbDbGetValue`.
+    pub(crate) chain: Option<Arc<crate::server::database::filters::FilterChain>>,
 }
 
 /// Where a DB link's local target comes from — `PvDatabase` in production.

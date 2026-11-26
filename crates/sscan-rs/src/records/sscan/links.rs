@@ -127,21 +127,18 @@ impl SscanRecord {
             ));
             SSCAN_RECORD_CONNECT_WAIT_SECONDS.store(0, Ordering::Relaxed);
         }
-        // C sleeps a whole second between checks.
-        let secs = knob(&SSCAN_RECORD_CONNECT_WAIT_SECONDS).max(0);
-        for _ in 0..secs {
+        // C checks once per whole-second sleep; this returns at the event
+        // that clears `busy`.
+        let secs = knob(&SSCAN_RECORD_CONNECT_WAIT_SECONDS).max(0) as u64;
+        let deadline = deadline_from_now(std::time::Duration::from_secs(secs));
+        loop {
             self.drain_inbox(own);
             if !busy(self) {
                 return;
             }
-            let second = deadline_from_now(std::time::Duration::from_secs(1));
-            while self.inbox.wait(second) {
-                self.drain_inbox(own);
+            if !self.inbox.wait(deadline) {
+                break;
             }
-        }
-        self.drain_inbox(own);
-        if !busy(self) {
-            return;
         }
         self.errlog(&format!(
             "{}:special:connect still in progress for link {}.  Trying new PV name.",

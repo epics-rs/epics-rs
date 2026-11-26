@@ -6,7 +6,6 @@
 //! `time_at_last_recv` do (`caserverio.c:72`, `camsgtask.c:113`).
 //!
 //! Ports are always ephemeral (`:0`), never the real 5064.
-#![cfg(tokio_backend)]
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -22,7 +21,9 @@ use epics_ca_rs::protocol::{
     CA_MINOR_VERSION, CA_PROTO_CREATE_CHAN, CA_PROTO_ECHO, CA_PROTO_EVENT_ADD, CA_PROTO_VERSION,
     CaHeader,
 };
+#[cfg(tokio_backend)]
 use epics_ca_rs::server::CaServer;
+use epics_ca_rs::server::blocking::BlockingCaServer;
 use fact_budget::{FACT_BUDGET, barrier};
 
 const PV: &str = "IDLE:MONITORED";
@@ -173,6 +174,7 @@ fn assert_monitor_only_client_kept(addr: SocketAddr, db: Arc<PvDatabase>) {
     poster.join().expect("poster thread");
 }
 
+#[cfg(tokio_backend)]
 #[test]
 fn the_async_loop_keeps_a_monitor_only_client_past_the_cap() {
     set_inactivity_cap();
@@ -207,4 +209,29 @@ fn the_async_loop_keeps_a_monitor_only_client_past_the_cap() {
 
     let _ = stop_tx.send(());
     let _ = server_thread.join();
+}
+
+#[test]
+fn the_blocking_loop_keeps_a_monitor_only_client_past_the_cap() {
+    set_inactivity_cap();
+    let db = Arc::new(PvDatabase::new());
+    block_on_sync(db.add_pv(PV, EpicsValue::Double(0.0)))
+        .expect("no async runtime on this thread")
+        .expect("add_pv");
+    let server = Arc::new(
+        BlockingCaServer::bind(
+            "127.0.0.1:0",
+            db.clone(),
+            epics_base_rs::server::access_security::new_acf_cell(None),
+        )
+        .expect("bind ephemeral port"),
+    );
+    let addr = server.local_addr().expect("local_addr");
+    let srv = server.clone();
+    let accept = thread::spawn(move || srv.serve());
+
+    assert_monitor_only_client_kept(addr, db);
+
+    server.shutdown();
+    let _ = accept.join();
 }

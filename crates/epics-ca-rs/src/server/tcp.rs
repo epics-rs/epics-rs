@@ -36,8 +36,9 @@ use tokio::sync::broadcast;
 /// A C client receiving a continuous monitor stream may never send
 /// `CA_PROTO_ECHO` (libca resets its echo timer on every received frame from
 /// the server), so an inactivity timeout based purely on incoming reads
-/// produces false-positive disconnects on healthy connections. Operators who
-/// want a defensive cap (e.g., NAT environments where TCP keepalive is
+/// produces false-positive disconnects on healthy connections; the cap runs
+/// from the last byte read or written instead ([`CircuitActivity`]). Operators
+/// who want a defensive cap (e.g., NAT environments where TCP keepalive is
 /// unreliable) can set `EPICS_CAS_INACTIVITY_TMO` to a positive value;
 /// values < 30 are clamped to 30 to avoid pathological short timeouts.
 pub(crate) fn inactivity_timeout() -> Option<Duration> {
@@ -54,19 +55,17 @@ fn resolve_inactivity_timeout() -> Option<Duration> {
 }
 
 /// When a circuit last moved a byte either way, which is what
-/// [`inactivity_timeout`] measures idleness from: rsrv keeps the same pair,
-/// `time_at_last_send` and `time_at_last_recv` (`caserverio.c:72`,
-/// `camsgtask.c:113`).
-#[cfg(tokio_backend)]
-struct CircuitActivity {
+/// [`inactivity_timeout`] measures idleness from on both drivers: rsrv keeps
+/// the same pair, `time_at_last_send` and `time_at_last_recv`
+/// (`caserverio.c:72`, `camsgtask.c:113`).
+pub(crate) struct CircuitActivity {
     since: std::time::Instant,
     /// Nanoseconds from `since` to the latest byte read or written.
     last: std::sync::atomic::AtomicU64,
 }
 
-#[cfg(tokio_backend)]
 impl CircuitActivity {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             since: std::time::Instant::now(),
             last: std::sync::atomic::AtomicU64::new(0),
@@ -74,20 +73,23 @@ impl CircuitActivity {
     }
 
     /// Bytes moved just now.
-    fn touch(&self) {
+    pub(crate) fn touch(&self) {
         let at = u64::try_from(self.since.elapsed().as_nanos()).unwrap_or(u64::MAX);
         self.last.fetch_max(at, Ordering::Relaxed);
     }
 
     /// What is left of `cap` since bytes last moved; `None` once it has run out.
-    fn idle_remaining(&self, cap: Duration) -> Option<Duration> {
+    pub(crate) fn idle_remaining(&self, cap: Duration) -> Option<Duration> {
         let idle = self
             .since
             .elapsed()
             .saturating_sub(Duration::from_nanos(self.last.load(Ordering::Relaxed)));
         cap.checked_sub(idle).filter(|left| !left.is_zero())
     }
+}
 
+#[cfg(tokio_backend)]
+impl CircuitActivity {
     /// Resolves once `cap` passes with no byte moved.
     async fn idle_for(&self, cap: Duration) {
         while let Some(left) = self.idle_remaining(cap) {

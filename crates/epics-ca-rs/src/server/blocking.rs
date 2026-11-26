@@ -160,12 +160,12 @@ use crate::server::outbox::{self, OutboxDrain};
 use crate::server::recv::{Admit, Gate, RecvAccumulator};
 use crate::server::stats::ServerStats;
 use crate::server::tcp::{
-    AdmittedPut, Blocked, CancelInfo, ChannelTarget, ClientState, ClientTable, Dispatched,
-    EventTaskControl, LockedClient, MonitorDelivery, RegisteredSubscription, SubscriptionDelivery,
-    SubscriptionOutcome, WriteHeadOutcome, cancel_subscription_reply, dispatch_message,
-    is_peer_disconnect, log_circuit, print_forcing_disconnect, refuse_bad_tcp_command,
-    register_subscription, report_gate_error, resume_dispatch, resume_write, run_event_task,
-    serve_write_head,
+    AdmittedPut, Blocked, CancelInfo, ChannelTarget, CircuitActivity, ClientState, ClientTable,
+    Dispatched, EventTaskControl, LockedClient, MonitorDelivery, RegisteredSubscription,
+    SubscriptionDelivery, SubscriptionOutcome, WriteHeadOutcome, cancel_subscription_reply,
+    dispatch_message, is_peer_disconnect, log_circuit, print_forcing_disconnect,
+    refuse_bad_tcp_command, register_subscription, report_gate_error, resume_dispatch,
+    resume_write, run_event_task, serve_write_head,
 };
 use crate::server::udp::{self, SearchReplyBatch};
 
@@ -1294,8 +1294,7 @@ fn command_drives_without_spawn(cmmd: u16) -> bool {
 
 /// `WouldBlock` / `TimedOut` from a blocking read mean the read timeout fired
 /// (`SO_RCVTIMEO`, set portably via `std`'s `set_read_timeout`; only when a cap
-/// is configured). Treated as an idle close, matching `handle_client`'s
-/// inactivity branch.
+/// is configured).
 fn is_read_timeout(kind: std::io::ErrorKind) -> bool {
     matches!(
         kind,
@@ -1309,18 +1308,47 @@ fn is_read_timeout(kind: std::io::ErrorKind) -> bool {
 /// at `MAX_TCP`, like C's `casExpandSendBuffer`-less default.
 pub(crate) struct SendBuf<W = TcpStream> {
     sock: Arc<W>,
+    activity: Arc<CircuitActivity>,
     buf: Vec<u8>,
+}
+
+/// A circuit write that marks the circuit active once a byte has gone out.
+struct MarkingWrites<'a, W> {
+    sock: W,
+    activity: &'a CircuitActivity,
+}
+
+impl<W: Write> Write for MarkingWrites<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.sock.write(buf)?;
+        if n > 0 {
+            self.activity.touch();
+        }
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.sock.flush()
+    }
 }
 
 impl<W> SendBuf<W>
 where
     for<'a> &'a W: Write,
 {
-    fn new(sock: Arc<W>) -> Self {
+    fn new(sock: Arc<W>, activity: Arc<CircuitActivity>) -> Self {
         Self {
             sock,
+            activity,
             buf: Vec::with_capacity(crate::protocol::MAX_TCP),
         }
+    }
+
+    fn wire(&self) -> crate::server::send::RetryTransient<MarkingWrites<'_, &W>> {
+        crate::server::send::RetryTransient(MarkingWrites {
+            sock: &*self.sock,
+            activity: &self.activity,
+        })
     }
 
     /// C `cas_copy_in_header` (its flush, `caserverio.c:280-286`) +
@@ -1332,7 +1360,7 @@ where
             self.send()?;
         }
         if frame.len() > crate::protocol::MAX_TCP {
-            return crate::server::send::RetryTransient(&*self.sock).write_all(frame);
+            return self.wire().write_all(frame);
         }
         self.buf.extend_from_slice(frame);
         Ok(())
@@ -1372,7 +1400,7 @@ where
         if self.buf.is_empty() {
             return Ok(());
         }
-        let sent = crate::server::send::RetryTransient(&*self.sock).write_all(&self.buf);
+        let sent = self.wire().write_all(&self.buf);
         self.buf.clear();
         sent
     }
@@ -1632,9 +1660,8 @@ fn handle_client_blocking(
     // `rsrv`'s default (`camsgtask` blocks in `recv` with no idle cap).
     // `set_read_timeout` sets SO_RCVTIMEO on Unix (incl. RTEMS) and is portable
     // to Windows, unlike the former raw-libc helper.
-    stream
-        .set_read_timeout(crate::server::tcp::inactivity_timeout())
-        .map_err(CaError::Io)?;
+    let cap = crate::server::tcp::inactivity_timeout();
+    stream.set_read_timeout(cap).map_err(CaError::Io)?;
 
     // One socket, two roles: a blocking read handle owned by this thread, and
     // a write handle behind the SEND_LOCK, so the monitor thread (S1c) can
@@ -1689,7 +1716,8 @@ fn handle_client_blocking(
 
     let stream = Arc::new(stream);
     let mut reader: &TcpStream = &stream;
-    let send_lock = Arc::new(Mutex::new(SendBuf::new(stream.clone())));
+    let activity = Arc::new(CircuitActivity::new());
+    let send_lock = Arc::new(Mutex::new(SendBuf::new(stream.clone(), activity.clone())));
 
     let (outbox, drain) = outbox::channel();
     let mut state = ClientState::new(acf, tcp_port, db.clone());
@@ -1791,12 +1819,21 @@ fn handle_client_blocking(
 
             let n = match reader.read(&mut buf) {
                 Ok(0) => break, // graceful EOF
-                Ok(n) => n,
+                Ok(n) => {
+                    activity.touch();
+                    n
+                }
                 // Peer vanished mid-session (RST / broken pipe / truncated) is a
                 // clean disconnect, not a server error — same rule as
                 // `handle_client` (`is_peer_disconnect`).
                 Err(ref e) if is_peer_disconnect(e.kind()) => break,
                 Err(ref e) if is_read_timeout(e.kind()) => {
+                    // SO_RCVTIMEO only wakes the read: bytes written since it
+                    // was armed leave the rest of the cap to run.
+                    if let Some(left) = cap.and_then(|cap| activity.idle_remaining(cap)) {
+                        reader.set_read_timeout(Some(left)).map_err(CaError::Io)?;
+                        continue;
+                    }
                     tracing::warn!(
                         target: "epics_ca_rs::server::blocking",
                         %peer, "CA client idle (SO_RCVTIMEO), closing"

@@ -2464,8 +2464,8 @@ struct MultiInputLink<'a> {
     link_field: &'static str,
     val_field: &'static str,
     parsed: &'a crate::server::record::ParsedLink,
-    /// The text route of the target the fetch resolved `parsed` to.
-    text_route: Option<super::char_view::LinkTextRoute>,
+    /// The route of the target the fetch resolved `parsed` to.
+    route: Option<super::char_view::LinkRoute>,
     /// [`Record::input_link_request`](crate::server::record::Record::input_link_request) for the link — C's `dbrType` argument
     /// to `dbGetLink`.
     request: crate::server::record::InputLinkRequest,
@@ -2539,7 +2539,7 @@ impl PvDatabase {
         let store_raw = self.convert_link_fetch_as(
             Reader::Held(&mut *record, reader.set()),
             link.link_field,
-            super::links::ReadLink::Resolved(link.parsed, link.text_route),
+            super::links::ReadLink::Resolved(link.parsed, link.route),
             link.request,
             &mut fetch,
             render,
@@ -2896,7 +2896,15 @@ impl PvDatabase {
             );
             InputLinkRequest::As(LinkReadAs::Native)
         } else {
-            entry.link_request(&*inst.record, link_field, generation)
+            match entry.link_request(&*inst.record, link_field, generation) {
+                // Every link before this one has landed: the loops visit
+                // them in order, under this hold.
+                InputLinkRequest::FromEarlierLinks => inst
+                    .record
+                    .input_link_read_as_from_earlier_links(link_field)
+                    .map_or(InputLinkRequest::NotRead, InputLinkRequest::As),
+                request => request,
+            }
         };
         // C's `default: break`: the record's switch has no case for this
         // link, so `dbGetLink` is never called — no PP of the source, no
@@ -2905,11 +2913,13 @@ impl PvDatabase {
             return not_read_slot();
         }
         let (parsed, target) = entry.target(self, rec.unframed(), cache_slot);
-        let text_route = target.and_then(|at| at.text_route);
+        let route = target.and_then(|at| at.route);
         // The native funnel is these readers' `DBR_DOUBLE`, which a `$`
         // link's or attribute's text answers itself, never its char image.
         let request = match request {
-            InputLinkRequest::As(LinkReadAs::Native) if text_route.is_some() => {
+            InputLinkRequest::As(LinkReadAs::Native)
+                if route.and_then(super::char_view::LinkRoute::text).is_some() =>
+            {
                 InputLinkRequest::As(LinkReadAs::Double)
             }
             request => request,
@@ -2964,7 +2974,7 @@ impl PvDatabase {
             link_field,
             val_field,
             parsed,
-            text_route,
+            route,
             request,
         };
         Some(self.land_multi_input(record, common, rec, &link, plan, read))
@@ -11324,10 +11334,12 @@ impl PvDatabase {
             Some(LinkReadAs::Array { dbr, n_request })
                 if value.is_array()
                     && value.db_field_type() == dbr
-                    && dbr != crate::types::DbFieldType::Enum =>
+                    && dbr != crate::types::DbFieldType::Enum
+                    && self.read_link_route(link).is_none() =>
             {
-                // The source already holds the request's element type: a
-                // truncate and a move, not a conversion.
+                // The source already holds the request's element type, and
+                // `dbGet` takes no route past the convert: a truncate and a
+                // move, not a conversion.
                 let mut value = value;
                 value.truncate(n_request);
                 *fetch = LinkFetch::Value(value);
@@ -11421,7 +11433,7 @@ impl PvDatabase {
             request.renders_at_source(),
         );
         let link = target.map_or(super::links::ReadLink::Unresolved(link), |at| {
-            super::links::ReadLink::Resolved(link, at.text_route)
+            super::links::ReadLink::Resolved(link, at.route)
         });
         let store_raw = self.convert_link_fetch_as(
             Reader::Frame(rec),
@@ -11482,7 +11494,7 @@ impl PvDatabase {
             InputLinkRequest::As(read_as) => Some(read_as),
             // C's `default:` arm — the record's switch has no case for this
             // link, so `dbGetLink` is never called.
-            InputLinkRequest::NotRead => None,
+            InputLinkRequest::NotRead | InputLinkRequest::FromEarlierLinks => None,
             InputLinkRequest::FromSource => from_source(&self.resolve_out_target(link)),
         }
     }
@@ -11509,7 +11521,7 @@ impl PvDatabase {
                 render,
                 ReadDest::Frame(rec, link_field),
             ),
-            InputLinkRequest::NotRead => return None,
+            InputLinkRequest::NotRead | InputLinkRequest::FromEarlierLinks => return None,
             InputLinkRequest::FromSource => {
                 self.typed_input_value(rec, link_field, link, value, render)
             }

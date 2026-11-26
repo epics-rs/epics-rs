@@ -203,12 +203,27 @@ impl PrintfRecord {
                 L::LongLong => LinkReadAs::UInt64,
                 L::None | L::Long => LinkReadAs::ULong,
             },
-            b's' if d.long => LinkReadAs::CharArrayAsString {
-                max_elements: usize::MAX,
-            },
+            // A `*` precision's cap is its slot's value, which the fetch
+            // settles (`input_link_read_as_from_earlier_links`).
+            b's' if d.long => Self::ls_read(if d.star_prec {
+                0
+            } else {
+                d.precision.unwrap_or(0)
+            }),
             b's' => LinkReadAs::String,
             _ if d.length == L::Short => LinkReadAs::Float,
             _ => LinkReadAs::Double,
+        }
+    }
+
+    /// `%ls` at `precision` reads `precision + 1` chars, 0 no cap
+    /// (`printfRecord.c:231-235`).
+    fn ls_read(precision: usize) -> LinkReadAs {
+        LinkReadAs::CharArrayAsString {
+            max_elements: match precision {
+                0 => usize::MAX,
+                p => p + 1,
+            },
         }
     }
 
@@ -225,7 +240,9 @@ impl PrintfRecord {
 
     /// The request of each INP0..INP9 slot FMT consumes, per
     /// [`Self::directive_read`]; C's `doPrintf` never calls `dbGetLink` on
-    /// an unconsumed slot, so it is [`InputLinkRequest::NotRead`].
+    /// an unconsumed slot, so it is [`InputLinkRequest::NotRead`]. A `%ls`
+    /// after a `*` precision is [`InputLinkRequest::FromEarlierLinks`]: C
+    /// reads the `*` first and asks for that many chars plus one.
     ///
     /// Deliberate deviation, stated precisely: this map is computed at
     /// FETCH time under the no-failure slot pairing. When a `*` width
@@ -269,7 +286,11 @@ impl PrintfRecord {
             if slot >= out.len() {
                 break;
             }
-            out[slot] = InputLinkRequest::As(*read);
+            out[slot] = if d.star_prec && d.conv == b's' && d.long {
+                InputLinkRequest::FromEarlierLinks
+            } else {
+                InputLinkRequest::As(*read)
+            };
             slot += 1;
         }
         out
@@ -983,6 +1004,16 @@ impl Record for PrintfRecord {
             Some(idx) => self.requests[idx],
             None => InputLinkRequest::As(LinkReadAs::Native),
         }
+    }
+
+    /// `%.*ls`: the `*` slot just before this one, landed this cycle, at
+    /// the `DBR_SHORT` C reads it at; negative is 0 (`printfRecord.c:176-177`).
+    fn input_link_read_as_from_earlier_links(&self, link_field: &str) -> Option<LinkReadAs> {
+        let star = Self::inp_index(link_field)?.checked_sub(1)?;
+        let precision = Self::typed(&self.vals[star], LinkReadAs::Short)
+            .and_then(|v| v.as_int_i64())
+            .unwrap_or(0);
+        Some(Self::ls_read(usize::try_from(precision).unwrap_or(0)))
     }
 
     fn input_links_generation(&self) -> Option<u64> {

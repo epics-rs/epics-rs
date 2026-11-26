@@ -36,6 +36,7 @@ mod pvxsr_lists_the_builtin_source;
 mod qsrv2_disabled_still_serves;
 mod qsrv_app_declares_pva_link_type;
 mod qsrv_app_group_file;
+mod qsrv_dollar_string_ends_like_dbget;
 mod qsrv_group_blocking_driver;
 mod qsrv_put_fails_on_the_process_status;
 mod qsrv_remote_log;

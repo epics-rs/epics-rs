@@ -1273,6 +1273,12 @@ pub enum InputLinkRequest {
     /// The request depends on the source's DBF class / element count: resolve
     /// the target and ask [`Record::input_link_read_as_from_source`].
     FromSource,
+    /// The request depends on what the links before this one landed this
+    /// cycle (printf's `*` precision): the multi-input fetch, which lands
+    /// them in order, asks [`Record::input_link_read_as_from_earlier_links`]
+    /// under the hold it reads this link under. Anywhere else it reads
+    /// nothing.
+    FromEarlierLinks,
 }
 
 impl InputLinkRequest {
@@ -1282,7 +1288,7 @@ impl InputLinkRequest {
     pub(crate) fn renders_at_source(self) -> bool {
         match self {
             Self::As(read_as) => read_as.renders_at_source(),
-            Self::NotRead => false,
+            Self::NotRead | Self::FromEarlierLinks => false,
             Self::FromSource => true,
         }
     }
@@ -4693,7 +4699,9 @@ pub trait Record: RecordAny + Send + Sync + 'static {
     ) -> Option<crate::types::DbFieldType> {
         match self.soft_input_request(soft) {
             InputLinkRequest::As(read_as) => read_as.dbr_type(),
-            InputLinkRequest::NotRead | InputLinkRequest::FromSource => None,
+            InputLinkRequest::NotRead
+            | InputLinkRequest::FromSource
+            | InputLinkRequest::FromEarlierLinks => None,
         }
         .or_else(|| crate::server::record::record_instance::declared_field_type_of(self, "VAL"))
     }
@@ -7525,6 +7533,15 @@ pub trait Record: RecordAny + Send + Sync + 'static {
         source: &OutTarget,
     ) -> Option<LinkReadAs> {
         let _ = (link_field, source);
+        Some(LinkReadAs::Native)
+    }
+
+    /// The request for a link whose [`Self::input_link_request`] answered
+    /// [`InputLinkRequest::FromEarlierLinks`], asked with every link before
+    /// it already landed this cycle. `None` reads nothing. Reached ONLY
+    /// through that answer.
+    fn input_link_read_as_from_earlier_links(&self, link_field: &str) -> Option<LinkReadAs> {
+        let _ = link_field;
         Some(LinkReadAs::Native)
     }
 

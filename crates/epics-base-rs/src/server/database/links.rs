@@ -133,12 +133,12 @@ impl ReadDest<'_> {
 #[derive(Clone, Copy)]
 pub(crate) enum ReadLink<'a> {
     /// Resolved by the caller for its read: the
-    /// [`ResolvedTarget::text_route`] of its local target, none without one.
+    /// [`ResolvedTarget::route`] of its local target, none without one.
     ///
-    /// [`ResolvedTarget::text_route`]: crate::server::record::record_instance::ResolvedTarget::text_route
+    /// [`ResolvedTarget::route`]: crate::server::record::record_instance::ResolvedTarget::route
     Resolved(
         &'a crate::server::record::ParsedLink,
-        Option<super::char_view::LinkTextRoute>,
+        Option<super::char_view::LinkRoute>,
     ),
     /// Not resolved by the caller: a conversion resolves it.
     Unresolved(&'a crate::server::record::ParsedLink),
@@ -295,6 +295,29 @@ fn text_route_read(
         .map(EpicsValue::String),
         LinkReadAs::Array { dbr, n_request } => Some(route.read(dbr)?.get(text, n_request)),
         scalar => element_0(route.read(scalar.dbr_type()?)?.get(text, 1)),
+    }
+}
+
+/// C `dbGet` of a `$` `DBF_STRING` field's read log `image` at an array
+/// request, which [`string_chars_get`](super::char_view::string_chars_get)
+/// ends at the reader's count. `None` for a request that reads element 0 or
+/// strings, and where `dbGet` only converts the log.
+fn string_chars_read(
+    read_as: crate::server::record::LinkReadAs,
+    image: &EpicsValue,
+) -> Option<EpicsValue> {
+    use super::char_view::string_chars_get;
+    use crate::server::record::LinkReadAs;
+    match read_as {
+        LinkReadAs::Array { dbr, n_request } if dbr != DbFieldType::String => {
+            string_chars_get(image, dbr, n_request)
+        }
+        LinkReadAs::CharArrayAsString { max_elements } => {
+            string_chars_get(image, DbFieldType::Char, max_elements)
+                .and_then(|read| char_bytes_as_string(&read, max_elements))
+                .map(EpicsValue::String)
+        }
+        _ => None,
     }
 }
 
@@ -1208,18 +1231,30 @@ impl PvDatabase {
         }
     }
 
-    /// The text route of `link`'s local target ([`ResolvedTarget::text_route`]),
-    /// which every read of it is answered through.
+    /// The route of `link`'s local target ([`ResolvedTarget::route`]), which
+    /// every read of it is answered through.
     ///
-    /// [`ResolvedTarget::text_route`]: crate::server::record::record_instance::ResolvedTarget::text_route
+    /// [`ResolvedTarget::route`]: crate::server::record::record_instance::ResolvedTarget::route
     #[inline]
-    pub(crate) fn text_route_of(
+    pub(crate) fn route_of(
         &self,
         link: &crate::server::record::ParsedLink,
-    ) -> Option<super::char_view::LinkTextRoute> {
+    ) -> Option<super::char_view::LinkRoute> {
         match link {
-            crate::server::record::ParsedLink::Db(db) => self.db_link_addr(db)?.text_route,
+            crate::server::record::ParsedLink::Db(db) => self.db_link_addr(db)?.route,
             _ => None,
+        }
+    }
+
+    /// [`ReadLink`]'s route, resolved here for an unresolved link.
+    #[inline]
+    pub(crate) fn read_link_route(
+        &self,
+        link: ReadLink<'_>,
+    ) -> Option<super::char_view::LinkRoute> {
+        match link {
+            ReadLink::Resolved(_, route) => route,
+            ReadLink::Unresolved(link) => self.route_of(link),
         }
     }
 
@@ -1299,18 +1334,21 @@ impl PvDatabase {
         }
         use crate::server::record::record_instance::PutAddr;
         let field = &db.target().field;
-        let (put, no_elements) = if db.target().string_view {
+        let (put, no_elements, string_chars) = if db.target().string_view {
             match PutAddr::resolve_chars_in(&rec, field) {
-                Some(put) => (
-                    put,
-                    super::char_view::CharAddr::of(self, &rec, field)
-                        .map_or(1, |addr| addr.no_elements()),
-                ),
+                Some(put) => {
+                    let addr = super::char_view::CharAddr::of(self, &rec, field);
+                    (
+                        put,
+                        addr.map_or(1, |addr| addr.no_elements()),
+                        addr.is_some_and(|addr| addr.reads_string_chars()),
+                    )
+                }
                 None => return DbLinkAnswer::Absent { chain },
             }
         } else {
             let no_elements = rec.no_elements(field).map_or(1, |n| n as usize);
-            (PutAddr::resolve_in(&rec, field), no_elements)
+            (PutAddr::resolve_in(&rec, field), no_elements, false)
         };
         let final_no_elements = chain
             .as_ref()
@@ -1318,22 +1356,23 @@ impl PvDatabase {
         // `dbGet` takes `getAttrValue` on `SPC_ATTRIBUTE`, which `$` leaves
         // alone, and `getLinkValue` on a link field's type unless a filter
         // replaced its log; one element of a bare link never reaches `dbGet`.
-        use super::char_view::{LinkTextRoute, TextRoute};
-        let text_route = if self.attribute_field_type(&rec, field).is_some() {
-            Some(LinkTextRoute::Get(TextRoute::Attribute))
+        // A `$` string keeps its `pfldDes` through any filter.
+        use super::char_view::{LinkRoute, LinkTextRoute, TextRoute};
+        let route = if self.attribute_field_type(&rec, field).is_some() {
+            Some(LinkRoute::Text(LinkTextRoute::Get(TextRoute::Attribute)))
         } else if !put
             .field()
             .desc
             .is_some_and(|d| crate::types::link_class_of(d).is_some())
         {
-            None
+            string_chars.then_some(LinkRoute::StringChars)
         } else if put.field().char_view() || chain.as_deref().is_some_and(|c| !c.is_empty()) {
             chain
                 .as_deref()
                 .map_or(Some(TextRoute::Link), |c| TextRoute::Link.after(c))
-                .map(LinkTextRoute::Get)
+                .map(|route| LinkRoute::Text(LinkTextRoute::Get(route)))
         } else {
-            Some(LinkTextRoute::BareLink)
+            Some(LinkRoute::Text(LinkTextRoute::BareLink))
         };
         DbLinkAnswer::Local(crate::server::record::record_instance::ResolvedTarget {
             f64_slot: (db.target_is_val() && chain.is_none())
@@ -1345,7 +1384,7 @@ impl PvDatabase {
             put,
             final_no_elements: final_no_elements as u32,
             chain,
-            text_route,
+            route,
         })
     }
 
@@ -1775,15 +1814,17 @@ impl PvDatabase {
             ReadLink::Resolved(_, route) => route,
             // A link field reads as its text, so nothing else can be one.
             ReadLink::Unresolved(link) if matches!(value, EpicsValue::String(_)) => {
-                self.text_route_of(link)
+                self.route_of(link)
             }
             ReadLink::Unresolved(_) => None,
         };
-        route.is_some_and(|route| {
-            route
-                .of_request(crate::server::record::LinkReadAs::Native)
-                .is_none()
-        })
+        route
+            .and_then(super::char_view::LinkRoute::text)
+            .is_some_and(|route| {
+                route
+                    .of_request(crate::server::record::LinkReadAs::Native)
+                    .is_none()
+            })
     }
 
     /// [`Self::apply_link_read_as`]'s converting arms, out of the native
@@ -1797,14 +1838,20 @@ impl PvDatabase {
         render: Option<crate::server::record::record_instance::SourceRender>,
         dest: ReadDest<'_>,
     ) -> Converted {
+        use super::char_view::LinkRoute;
         use crate::server::record::LinkReadAs;
-        let (link, route) = match link {
-            ReadLink::Resolved(link, route) => (link, route),
-            ReadLink::Unresolved(link) => (link, self.text_route_of(link)),
-        };
-        if let Some(route) = route {
-            return text_route_read(route, read_as, value).ok_or(None);
+        match self.read_link_route(link) {
+            Some(LinkRoute::Text(route)) => {
+                return text_route_read(route, read_as, value).ok_or(None);
+            }
+            Some(LinkRoute::StringChars) => {
+                if let Some(read) = string_chars_read(read_as, &value) {
+                    return Ok(read);
+                }
+            }
+            None => {}
         }
+        let link = link.parsed();
         let read = match read_as {
             LinkReadAs::Native => Some(value),
             // C `dbGetLink(..., DBR_DOUBLE, ...)`: an array source contributes
@@ -2301,7 +2348,7 @@ impl PvDatabase {
         else {
             return (Err(None), None);
         };
-        let link = ReadLink::Resolved(link, at.text_route);
+        let link = ReadLink::Resolved(link, at.route);
         match self.apply_link_read_as(Some(held), link, read_as, value, render, dest) {
             Ok(value) => (Ok(value), alarm),
             failed => (failed, None),
@@ -2338,7 +2385,7 @@ impl PvDatabase {
         let (Some(v), alarm, _) = self.read_db_at(Some(held), db, at, false) else {
             return (None, None);
         };
-        let f = match at.text_route {
+        let f = match at.route.and_then(super::char_view::LinkRoute::text) {
             Some(route) => text_route_read(route, crate::server::record::LinkReadAs::Double, v)
                 .and_then(|v| v.to_f64()),
             None => link_value_as_f64(v),
@@ -6260,8 +6307,8 @@ impl PvDatabase {
 }
 
 /// A `$` address's link read: the view is taken under `instance`'s hold and
-/// its `DBF_CHAR` image built after releasing it. `None` is a field `$` does
-/// not apply to, which `dbChannelTest` refuses.
+/// its `DBF_CHAR` read log built after releasing it. `None` is a field `$`
+/// does not apply to, which `dbChannelTest` refuses.
 #[cold]
 #[inline(never)]
 fn char_image_after_hold(
@@ -6270,7 +6317,7 @@ fn char_image_after_hold(
 ) -> Option<EpicsValue> {
     let view = super::char_view::char_view(&instance, field);
     drop(instance);
-    view.map(super::char_view::CharView::into_chars)
+    view.map(super::char_view::CharView::into_read_log)
 }
 
 /// The source alarm a read of `db` reports, taken under the read's hold:

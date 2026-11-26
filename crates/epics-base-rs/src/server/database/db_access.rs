@@ -329,15 +329,36 @@ impl PostStage {
         (!post.is_empty() || dollar.is_some()).then_some(Self { post, dollar })
     }
 
-    /// The event as read, `None` where the post chain drops it.
+    /// The event as read, `None` where the post chain drops it; a `$`
+    /// channel's as pvxs reads it
+    /// ([`DollarView::read`](crate::server::database::char_view::DollarView::read)).
     pub fn read(&self, event: MonitorEvent) -> Option<MonitorEvent> {
-        self.read_request(event, usize::MAX)
+        self.read_with(event, |view, image, log| view.read(image, log))
     }
 
-    /// [`Self::read`] by a `dbGet` of `n_request` elements, a CA client's
-    /// count, which a `$` channel's chars are cut to
+    /// [`Self::read`] by a `dbGet` of `n_request` elements of `dbr`, a CA
+    /// client's request
     /// ([`DollarView::read_request`](crate::server::database::char_view::DollarView::read_request)).
-    pub fn read_request(&self, mut event: MonitorEvent, n_request: usize) -> Option<MonitorEvent> {
+    pub fn read_request(
+        &self,
+        event: MonitorEvent,
+        dbr: crate::types::DbFieldType,
+        n_request: usize,
+    ) -> Option<MonitorEvent> {
+        self.read_with(event, |view, image, log| {
+            view.read_request(image, log, dbr, n_request)
+        })
+    }
+
+    fn read_with(
+        &self,
+        mut event: MonitorEvent,
+        get: impl FnOnce(
+            crate::server::database::char_view::DollarView,
+            EpicsValue,
+            EpicsValue,
+        ) -> EpicsValue,
+    ) -> Option<MonitorEvent> {
         let image = self.dollar.map(|view| {
             let image = view.render(event.replace_value(EpicsValue::Long(0)));
             event.replace_value(image.clone());
@@ -349,7 +370,7 @@ impl PostStage {
         }
         if let Some((view, image)) = image {
             let log = event.replace_value(EpicsValue::Long(0));
-            event.replace_value(view.read_request(image, log, n_request));
+            event.replace_value(get(view, image, log));
         }
         Some(event)
     }

@@ -12166,7 +12166,7 @@ mod non_graceful_disconnect_teardown_tests {
 
     /// Regression: a `$` long-string channel on a string SimplePv must
     /// advertise CHAR[40], not the native DBR_STRING/1. The channel stores
-    /// `long_string` and every delivery path runs `apply_long_string` to
+    /// `long_string` and every delivery path reads its `DollarView` to
     /// emit CHAR[40], so the SimplePv arm must override the advertised
     /// type/count to match — like the RecordField arm and C
     /// dbChannel.c:486-505.

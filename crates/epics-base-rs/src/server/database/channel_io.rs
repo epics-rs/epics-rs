@@ -75,11 +75,10 @@ pub enum LongStringMode {
     /// Ordinary field: deliver the value verbatim.
     Plain,
     /// Client appended `$`: the field is delivered as C's `DBR_CHAR`
-    /// address of it, `no_elements` long (`dbAccess.c:682-701`).
+    /// address of it (`dbAccess.c:682-701`).
     DollarChar {
-        no_elements: u32,
-        nul_at_count: bool,
-        /// The `DBR_CHAR` image the channel's post chain runs on.
+        /// The `DBR_CHAR` image the channel's post chain runs on, and the
+        /// read `dbGet` makes of it.
         view: crate::server::database::char_view::DollarView,
     },
     /// Plain access to a long-string *record* field (lsi/lso VAL & OVAL,
@@ -211,8 +210,6 @@ pub async fn channel_create(
                     DbFieldType::Char,
                     40u32,
                     LongStringMode::DollarChar {
-                        no_elements: 40,
-                        nul_at_count: true,
                         view: crate::server::database::char_view::DollarView::of_string(
                             40,
                             &channel.chain,
@@ -299,8 +296,6 @@ fn record_channel_shape(
         let addr = CharAddr::of(db, rec, field)?;
         let no_elements = addr.no_elements as u32;
         let mode = LongStringMode::DollarChar {
-            no_elements,
-            nul_at_count: addr.nul_at_count(),
             view: DollarView::of_addr(addr, rec.form_string(), field, chain),
         };
         return Some((DbFieldType::Char, no_elements, mode));
@@ -382,7 +377,7 @@ pub fn get_full_snapshot(
         // does not collapse the char view back to a string the way pvxs does
         // (`iocsource.cpp:133-136`); it serves the `DBR_CHAR[40]` array C's
         // `dbChannelCreate` actually produced. So the view is applied AFTER
-        // the snapshot, by the CA server's `apply_long_string_mode`
+        // the snapshot, by the CA server's `DeliveryStage`
         // from the `LongStringMode` the channel stored, and its eligibility
         // gate already ran at CREATE_CHANNEL (CREATE_CH_FAIL, this file's
         // `parse_channel_name` call site).
@@ -765,8 +760,6 @@ record(state, "state") {}
             let view = char_view(instance, field)?;
             let no_elements = view.no_elements as u32;
             let mode = LongStringMode::DollarChar {
-                no_elements,
-                nul_at_count: view.nul_at_count(),
                 view: DollarView::of(instance, field, chain)?,
             };
             return Some((DbFieldType::Char, no_elements, mode));

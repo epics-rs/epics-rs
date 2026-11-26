@@ -1574,7 +1574,7 @@ enum CachedAnswer {
         final_no_elements: u32,
         final_field_type: Option<crate::types::DbFieldType>,
         chain: Option<std::sync::Arc<FilterChain>>,
-        text_route: Option<crate::server::database::char_view::LinkTextRoute>,
+        route: Option<crate::server::database::char_view::LinkRoute>,
     },
     Shadowed {
         pv: std::sync::Arc<crate::server::pv::ProcessVariable>,
@@ -1601,7 +1601,7 @@ impl CachedAnswer {
                 final_no_elements: target.final_no_elements,
                 final_field_type: target.final_field_type,
                 chain: target.chain.clone(),
-                text_route: target.text_route,
+                route: target.route,
             },
             DbLinkAnswer::Shadowed { pv, field, chain } => CachedAnswer::Shadowed {
                 pv: pv.clone(),
@@ -1628,7 +1628,7 @@ impl CachedAnswer {
                 final_no_elements,
                 final_field_type,
                 chain,
-                text_route,
+                route,
             } => DbLinkAnswer::Local(super::record_instance::ResolvedTarget {
                 rec: rec.upgrade()?,
                 name: name.clone(),
@@ -1637,7 +1637,7 @@ impl CachedAnswer {
                 final_no_elements: *final_no_elements,
                 final_field_type: *final_field_type,
                 chain: chain.clone(),
-                text_route: *text_route,
+                route: *route,
             }),
             CachedAnswer::Shadowed { pv, field, chain } => DbLinkAnswer::Shadowed {
                 pv: pv.clone(),

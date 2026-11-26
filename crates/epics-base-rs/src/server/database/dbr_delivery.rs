@@ -12,31 +12,13 @@ use crate::server::pv::{LogValue, MonitorEvent};
 use crate::server::snapshot::Snapshot;
 use crate::types::EpicsValue;
 
-/// A `$` channel's delivery: the value as `dbGet` reads it through the
-/// `DBR_CHAR` address, see
-/// [`posted_char_view`](crate::server::database::char_view::posted_char_view).
-/// `requested_count` is `dbGet`'s `nRequest` (0 for autosize); the wire
-/// pads to a fixed request count, as C `read_reply` does.
-pub fn apply_long_string(
-    v: crate::types::EpicsValue,
-    no_elements: u32,
-    nul_at_count: bool,
-    requested_count: u32,
-) -> crate::types::EpicsValue {
-    let n = match requested_count {
-        0 => no_elements,
-        r => r.min(no_elements),
-    };
-    crate::server::database::char_view::posted_char_view(v, n as usize, nul_at_count)
-}
-
 /// Convert a long-string *record* field's snapshot value from
 /// `EpicsValue::CharArray` to a scalar `EpicsValue::String`. C
 /// `cvt_dbaddr` presents lsi/lso VAL & OVAL and printf VAL as a scalar
 /// `DBF_STRING` with `no_elements = 1` (lsiRecord.c:141-143,
 /// lsoRecord.c:183-185, printfRecord.c:415-417); the record stores the
 /// value as a NUL-terminable CHAR array (the long-string carrier). This
-/// is the inverse of [`apply_long_string`] — the conversion the CA
+/// is the inverse of a `$` read — the conversion the CA
 /// boundary applies for *plain* (non-`$`) access so the channel ships a
 /// single `DBR_STRING` element. The buffer is decoded verbatim (no
 /// UTF-8 validation, matching pvxs raw-byte storage) up to its first
@@ -59,24 +41,6 @@ pub fn apply_native_long_string(v: crate::types::EpicsValue) -> crate::types::Ep
     }
 }
 
-/// Apply the boundary conversion selected by `mode` to a delivery
-/// snapshot before DBR encoding.
-pub fn apply_long_string_mode(
-    v: crate::types::EpicsValue,
-    mode: LongStringMode,
-    requested_count: u32,
-) -> crate::types::EpicsValue {
-    match mode {
-        LongStringMode::DollarChar {
-            no_elements,
-            nul_at_count,
-            ..
-        } => apply_long_string(v, no_elements, nul_at_count, requested_count),
-        LongStringMode::NativeString => apply_native_long_string(v),
-        LongStringMode::Plain | LongStringMode::Text(_) => v,
-    }
-}
-
 /// What one CA subscription does to each event between its queue and the
 /// wire: the channel's post chain, on a `$` channel's char image, then the
 /// long-string boundary conversion, then for a link or an attribute the text
@@ -96,6 +60,8 @@ pub struct DeliveryStage {
 #[derive(Clone)]
 struct StageTransform {
     post: Option<std::sync::Arc<crate::server::database::db_access::PostStage>>,
+    /// The request type `dbGet` converts to.
+    dbr: crate::types::DbFieldType,
     long_string_mode: LongStringMode,
     text: Option<TextStep>,
     st_e: Option<EnumSource>,
@@ -182,14 +148,17 @@ impl DeliveryStage {
         data_type: u16,
     ) -> Self {
         let dollar = match long_string_mode {
-            LongStringMode::DollarChar { view, .. } if !post.is_empty() => Some(view),
+            LongStringMode::DollarChar { view } => Some(view),
             _ => None,
         };
+        // A type no `dbGet` reads is refused before any read is encoded.
+        let dbr =
+            crate::types::native_type_for_dbr(data_type).unwrap_or(crate::types::DbFieldType::Char);
         // The route left once the post chain ran: a log a filter replaced
         // is converted as the field.
         let route = match long_string_mode {
             LongStringMode::Text(route) => route.after(&post),
-            LongStringMode::DollarChar { view, .. } => view.source().text_route(),
+            LongStringMode::DollarChar { view } => view.source().text_route(),
             _ => None,
         };
         // `DBR_CLASS_NAME` reads the record type, not the field
@@ -211,6 +180,7 @@ impl DeliveryStage {
         .then(|| {
             Box::new(StageTransform {
                 post,
+                dbr,
                 long_string_mode,
                 text,
                 st_e,
@@ -265,7 +235,7 @@ impl DeliveryStage {
         // An autosize request reads the field's own count, which a log the
         // filters grew (`ts`) is cut to.
         let n_request = self.item_count(requested_count) as usize;
-        let mut event = Self::convert(transform, event, requested_count, n_request)?;
+        let mut event = Self::convert(transform, event, n_request)?;
         if let Some(TextStep::Read(read)) = transform.text {
             let text = event.replace_value(crate::types::EpicsValue::Long(0));
             event.replace_value(read.get(
@@ -281,12 +251,13 @@ impl DeliveryStage {
     fn convert(
         transform: &StageTransform,
         event: crate::server::pv::MonitorEvent,
-        requested_count: u32,
         n_request: usize,
     ) -> Option<crate::server::pv::MonitorEvent> {
         let mut event = match &transform.post {
-            // A `$` view's read is already `dbGet`'s chars for this count.
-            Some(post) if post.reads_chars() => return post.read_request(event, n_request),
+            // A `$` view's read is already `dbGet`'s for this request.
+            Some(post) if post.reads_chars() => {
+                return post.read_request(event, transform.dbr, n_request);
+            }
             Some(post) => {
                 let mut event = post.read(event)?;
                 if event.value().as_value().map_or(0, |v| v.count() as usize) > n_request {
@@ -298,16 +269,9 @@ impl DeliveryStage {
             }
             None => event,
         };
-        if !matches!(
-            transform.long_string_mode,
-            LongStringMode::Plain | LongStringMode::Text(_)
-        ) {
+        if transform.long_string_mode == LongStringMode::NativeString {
             let value = event.replace_value(crate::types::EpicsValue::Long(0));
-            event.replace_value(apply_long_string_mode(
-                value,
-                transform.long_string_mode,
-                requested_count,
-            ));
+            event.replace_value(apply_native_long_string(value));
         }
         Some(event)
     }

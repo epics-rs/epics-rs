@@ -4691,7 +4691,10 @@ impl NativeRead {
         if Arc::ptr_eq(&target.rec, reader)
             || db.policy == LinkProcessPolicy::ProcessPassive
             || channel.json_suffix.is_some()
-            || target.text_route.is_some()
+            || target
+                .route
+                .and_then(crate::server::database::char_view::LinkRoute::text)
+                .is_some()
         {
             return None;
         }
@@ -4957,9 +4960,10 @@ pub(crate) struct ResolvedTarget {
     /// The link's filter chain, parsed once as the channel opens: C keeps
     /// it on the link's `dbChannel` for every `dbDbGetValue`.
     pub(crate) chain: Option<Arc<crate::server::database::filters::FilterChain>>,
-    /// The text every read of the target is answered from, never converted:
-    /// an attribute's with or without `$`, a link's (`dbAccess.c:944-953`).
-    pub(crate) text_route: Option<crate::server::database::char_view::LinkTextRoute>,
+    /// How `dbGet` answers a read of the target past the plain convert:
+    /// from the text of an attribute or a link (`dbAccess.c:944-953`), or a
+    /// `$` string's char log at the reader's request.
+    pub(crate) route: Option<crate::server::database::char_view::LinkRoute>,
 }
 
 /// Where a DB link's local target comes from — `PvDatabase` in production.

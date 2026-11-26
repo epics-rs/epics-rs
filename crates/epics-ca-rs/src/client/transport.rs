@@ -302,10 +302,15 @@ pub fn dial_pool_probe() -> (usize, usize, usize, usize) {
 /// names differ across unixes (`TCP_KEEPIDLE` on Linux and the BSDs,
 /// `TCP_KEEPALIVE` on Darwin) and `libc` does not define the Darwin spelling
 /// at all, so hand-rolling it here would trade one working call for a per-OS
-/// table. See [`set_circuit_keepalive`]'s RTEMS sibling for the one target
-/// where `socket2` is not in the dependency graph.
-#[cfg(not(any(exec_backend, ca_blocking_client)))]
-fn set_circuit_keepalive(stream: &TcpStream) {
+/// table. Generic so both transports' streams reach it: the choice of
+/// syscall follows the target, never the backend. See
+/// [`set_circuit_keepalive`]'s RTEMS sibling for the one target where
+/// `socket2` is not in the dependency graph.
+#[cfg(not(target_os = "rtems"))]
+fn set_circuit_keepalive<'s, S>(stream: &'s S)
+where
+    socket2::SockRef<'s>: From<&'s S>,
+{
     let sock = socket2::SockRef::from(stream);
     let keepalive = socket2::TcpKeepalive::new()
         .with_time(CIRCUIT_KEEPALIVE_IDLE)
@@ -314,20 +319,19 @@ fn set_circuit_keepalive(stream: &TcpStream) {
     let _ = sock.set_tcp_keepalive(&keepalive);
 }
 
-/// The same ladder through raw `libc`, for the transport `socket2` cannot
-/// reach.
+/// The same ladder through raw `libc`, for the target `socket2` cannot reach.
 ///
 /// `socket2` is host-only in this crate's manifest (it does not build for
-/// `armv7-rtems-eabihf`), so the blocking transport sets the three options
-/// itself — the shape `server/blocking.rs:551` already uses for the server's
-/// listening sockets. RTEMS's stack is FreeBSD's (`libbsd`), so the constants
-/// are the BSD ones (`TCP_KEEPIDLE` = 256, `TCP_KEEPINTVL` = 512), supplied by
-/// `libc` for the target.
+/// `armv7-rtems-eabihf`), so RTEMS sets the three options itself — the shape
+/// `server/blocking.rs:551` already uses for the server's listening sockets.
+/// RTEMS's stack is FreeBSD's (`libbsd`), so the constants are the BSD ones
+/// (`TCP_KEEPIDLE` = 256, `TCP_KEEPINTVL` = 512), supplied by `libc` for the
+/// target.
 ///
 /// Failures are ignored, exactly as on the `socket2` path: keepalive is a
 /// backstop under CA's own echo watchdog (`ECHO_TIMEOUT_SECS`), not the
 /// mechanism that detects a dead circuit.
-#[cfg(all(unix, any(exec_backend, ca_blocking_client)))]
+#[cfg(target_os = "rtems")]
 fn set_circuit_keepalive(stream: &std::net::TcpStream) {
     use std::os::fd::AsRawFd;
 
@@ -5843,6 +5847,59 @@ mod connect_deadline_tests {
              (C tcpiiu.cpp:606-661 has none)",
             outcome.map(|c| c.is_some())
         );
+    }
+}
+
+/// A dialed circuit carries the keepalive ladder on whichever transport the
+/// build selected; Linux-only because the client's socket is found through
+/// `/proc/self/fd`.
+#[cfg(all(test, target_os = "linux"))]
+mod circuit_keepalive_tests {
+    use super::*;
+    use std::os::fd::BorrowedFd;
+
+    /// `(SO_KEEPALIVE, idle, interval)` of the open socket connecting `local`
+    /// to `peer`, read back from the OS.
+    fn keepalive_of(local: SocketAddr, peer: SocketAddr) -> (bool, Duration, Duration) {
+        for entry in std::fs::read_dir("/proc/self/fd").expect("read /proc/self/fd") {
+            let name = entry.expect("fd entry").file_name();
+            let Ok(raw) = name.to_string_lossy().parse::<std::os::fd::RawFd>() else {
+                continue;
+            };
+            // SAFETY: only getsockname/getpeername/getsockopt are issued; an
+            // fd closed during the scan fails them with EBADF, and a reused
+            // one fails the address match.
+            let fd = unsafe { BorrowedFd::borrow_raw(raw) };
+            let sock = socket2::SockRef::from(&fd);
+            let ends = (
+                sock.local_addr().ok().and_then(|a| a.as_socket()),
+                sock.peer_addr().ok().and_then(|a| a.as_socket()),
+            );
+            if ends == (Some(local), Some(peer)) {
+                return (
+                    sock.keepalive().expect("SO_KEEPALIVE"),
+                    sock.keepalive_time().expect("TCP_KEEPIDLE"),
+                    sock.keepalive_interval().expect("TCP_KEEPINTVL"),
+                );
+            }
+        }
+        panic!("no socket in this process connects {local} to {peer}");
+    }
+
+    #[epics_macros_rs::epics_test]
+    async fn a_dialed_circuit_probes_after_15_s_idle_then_every_5_s() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let server = listener.local_addr().expect("local_addr");
+        let circuit = dial_ca(server).await.expect("dial a live listener");
+        let (_server_end, client) = listener.accept().expect("accept");
+
+        assert_eq!(
+            keepalive_of(client, server),
+            (true, Duration::from_secs(15), Duration::from_secs(5)),
+            "the circuit's socket must have SO_KEEPALIVE on with 15 s idle \
+             and 5 s between probes"
+        );
+        drop(circuit);
     }
 }
 

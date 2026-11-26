@@ -9,3 +9,4 @@ mod oracle_ioc_pini_order;
 mod pva_oracle;
 mod runner_pair;
 mod scaler_oracle;
+mod sseq_atof_oracle;

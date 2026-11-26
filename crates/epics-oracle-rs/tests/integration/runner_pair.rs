@@ -18,7 +18,7 @@ use epics_oracle_rs::runner::{
 };
 
 /// Point `RustIoc::binary` at the binary cargo built for this target.
-fn built_oracle_ioc() {
+pub(super) fn built_oracle_ioc() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         // SAFETY: first call in the process, before any thread of this test

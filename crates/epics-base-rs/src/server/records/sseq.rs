@@ -391,11 +391,11 @@ impl SseqStep {
     }
 
     /// Write the step's value FROM its string view, re-deriving the numeric
-    /// view — the single owner of `s → dov` (C `dov = atof(s)`). The string
-    /// is kept byte-exact; a non-numeric string is `0.0`, exactly as `atof`
-    /// reports it.
+    /// view — the single owner of `s → dov` (C `dov = atof(s)`). `atof` is
+    /// `strtod`'s prefix, not a strict parse: `"12abc"` is 12, and text with
+    /// no number 0. The string is kept byte-exact.
     fn set_string(&mut self, s: PvString) -> StepWrite {
-        let dov = EpicsValue::String(s.clone()).to_f64().unwrap_or(0.0);
+        let dov = crate::runtime::stdlib::strtod(s.as_bytes()).value;
         let w = StepWrite {
             numeric_changed: self.dov != dov,
             string_changed: self.str_val != s,
@@ -2442,6 +2442,24 @@ mod tests {
             Some(EpicsValue::String("3.70".into())),
             "the later DOn put must overwrite the earlier STRn"
         );
+    }
+
+    /// `atof` takes `strtod`'s prefix; the `DOn` the C oracle reads after
+    /// each `STRn` put (`epics-oracle-rs` `sseq_atof_oracle`).
+    #[test]
+    fn test_sseq_str_put_takes_the_atof_prefix() {
+        let mut rec = SseqRecord::new();
+        for (s, dov) in [
+            ("0123456789abc", 123456789.0),
+            ("  -3.5e2xyz", -350.0),
+            ("0x1p3", 8.0),
+            ("+.5e", 0.5),
+            ("1,5", 1.0),
+            ("", 0.0),
+        ] {
+            rec.put_field("STR1", EpicsValue::String(s.into())).unwrap();
+            assert_eq!(rec.get_field("DO1"), Some(EpicsValue::Double(dov)), "{s:?}");
+        }
     }
 
     /// R16-2, init boundary — C `init_record` (sseqRecord.c:243-249)

@@ -453,6 +453,11 @@ pub struct SseqRecord {
     phase: SeqPhase,
     active: Vec<usize>,
     cursor: usize,
+    /// No further step fires; the sequence finishes once `in_flight` drains
+    /// (C `processCallback`'s abort gate, sseqRecord.c:621-627). Set by an
+    /// `ABORT` put while busy, whatever it wrote, and by a refused
+    /// put-callback; cleared by `finish`.
+    stopping: bool,
     steps: [SseqStep; NUM_STEPS],
     /// The `WAITn` put-callbacks currently outstanding (C the still-`waiting`
     /// entries of `pcb->plinkGroups`). A step is dispatched without awaiting
@@ -524,6 +529,7 @@ impl Default for SseqRecord {
             phase: SeqPhase::Idle,
             active: Vec::new(),
             cursor: 0,
+            stopping: false,
             steps,
             in_flight: Vec::new(),
             seq_wake: None,
@@ -840,11 +846,11 @@ impl SseqRecord {
                     // remaining step is skipped: `processNextLink` takes the
                     // no-delay path (`:443`, gated on `!pR->abort`) and the
                     // callback it requests bails at `processCallback`'s abort
-                    // gate (`:621-627`) straight into `asyncFinish`. Emptying
-                    // the cursor is that skip; outstanding callbacks from
-                    // earlier steps still drain first.
-                    self.cursor = self.active.len();
-                    return self.advance_sequence(live);
+                    // gate (`:621-627`) straight into `asyncFinish`.
+                    // Outstanding callbacks from earlier steps still drain
+                    // first.
+                    self.stopping = true;
+                    return self.drain_abort(live);
                 }
                 self.cursor += 1;
                 return self.advance_sequence(live);
@@ -1060,6 +1066,7 @@ impl SseqRecord {
         }
         self.active.clear();
         self.cursor = 0;
+        self.stopping = false;
         self.phase = SeqPhase::Idle;
         // Drop the per-sequence concurrency state. Any waiter still running
         // holds its own `done` Arc and a clone of the (now replaced-on-next-
@@ -1395,12 +1402,10 @@ impl Record for SseqRecord {
         // An abort in flight drains the outstanding put-callbacks, then
         // finishes — C `processNextLink` under `pR->abort` returns until the
         // last callback drains, and `process` takes the `pact` path to
-        // `asyncFinish`. The gate is `abort`, the flag C's `processCallback`
-        // itself tests (`sseqRecord.c:621`), not the `aborting` request flag:
-        // a client abort sets both (the put stores `abort`, `special` raises
-        // `aborting`), while a refused `dbCaPutLinkCallback` sets only `abort`
-        // (`:745-748`) and must stop the sequence just the same.
-        let mut outcome = if self.busy != 0 && self.abort != 0 {
+        // `asyncFinish`. The gate is the machine's `stopping`, not the
+        // record's `abort`: an `ABORT` put stores what the client wrote, 0
+        // included, and only the machine knows the sequence was stopped.
+        let mut outcome = if self.stopping {
             self.drain_abort(&mut live)
         } else {
             // `busy == 0` (phase `Idle`) is a genuine start: the framework
@@ -1454,7 +1459,7 @@ impl Record for SseqRecord {
         // has elapsed (sseqRecord.c:643-666). The per-step `ReprocessAfter`
         // re-enters in phase `Fire` with `cursor` on that step, so the DOL
         // read is scoped to exactly that step here — not all steps up front.
-        if self.phase == SeqPhase::Fire && self.cursor < self.active.len() {
+        if self.phase == SeqPhase::Fire && !self.stopping {
             let i = self.active[self.cursor];
             let mut actions = Vec::with_capacity(2);
             if self.steps[i].reads_dol() {
@@ -1566,7 +1571,7 @@ impl Record for SseqRecord {
                 self.pending_posts |= 1 << (WTG_POST + i);
             }
             self.in_flight.clear();
-            self.cursor = self.active.len();
+            self.stopping = true;
             // With `in_flight` empty the drain finishes immediately on
             // re-entry: wake the parked phase-`Wait` task, or request a fresh
             // re-entry if somehow not blocked.
@@ -1581,7 +1586,7 @@ impl Record for SseqRecord {
         self.pending_posts |= 1 << ABORTING_POST;
         // No further step dispatches; the drain only waits out the in-flight
         // callbacks.
-        self.cursor = self.active.len();
+        self.stopping = true;
         // C cancels a pending `DLYn` delay timer and completes the abort
         // immediately (sseqRecord.c:1194-1215); when instead blocked on a
         // put-callback it lets the outstanding callback wake the finish —

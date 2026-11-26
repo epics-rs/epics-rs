@@ -495,65 +495,81 @@ async fn sseq_each_lnkn_dispatched_exactly_once_and_clears_busy() {
 /// never fires, `BUSY`/`ABORT`/`ABORTING` reset, and the superseded delay
 /// re-entry is a structural no-op (the `AsyncToken` generation gate) — no
 /// stale double-dispatch.
+///
+/// C `special` never reads the value an `ABORT` put wrote (`sseqRecord.c:
+/// 1158-1215`), so a put of 0 aborts here exactly as a put of 1 does.
 #[epics_macros_rs::epics_test]
 async fn sseq_abort_during_delay_finishes_without_dispatch() {
     let db = PvDatabase::new();
     // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
     db.ca_link_init();
-    let count = Arc::new(AtomicU32::new(0));
-    db.add_record(
-        "SSEQ_AB_TGT",
-        Box::new(CountingTarget {
-            process_count: count.clone(),
-        }),
-    )
-    .await
-    .unwrap();
-
-    let mut sseq = SseqRecord::new();
-    sseq.selm = 0;
-    // A single step with a long delay so the abort lands while the
-    // sequence is parked in phase `Fire`, before the step writes.
-    sseq.put_field("DLY1", EpicsValue::Double(5.0)).unwrap();
-    sseq.put_field("DO1", EpicsValue::Double(11.0)).unwrap();
-    sseq.put_field("LNK1", EpicsValue::String("SSEQ_AB_TGT PP".into()))
-        .unwrap();
-    db.add_record("SSEQ_AB", Box::new(sseq)).await.unwrap();
-
-    kick(&db, "SSEQ_AB").await;
-    // BUSY is raised synchronously at the start; confirm the sequence is
-    // running and parked on the 5 s delay.
-    poll_short(&db, "SSEQ_AB.BUSY", 1, "sequence started").await;
-    assert_eq!(
-        count.load(Ordering::SeqCst),
-        0,
-        "step must not have fired yet (still in its delay)"
-    );
-
-    // Abort. C `special(ABORT)` cancels the delay and finishes now.
-    db.put_pv("SSEQ_AB.ABORT", EpicsValue::Short(1))
+    let mut counts = Vec::new();
+    for written in [1, 0] {
+        let (rec, tgt) = (format!("SSEQ_AB{written}"), format!("SSEQ_AB{written}_TGT"));
+        let count = Arc::new(AtomicU32::new(0));
+        db.add_record(
+            &tgt,
+            Box::new(CountingTarget {
+                process_count: count.clone(),
+            }),
+        )
         .await
         .unwrap();
 
-    poll_short(&db, "SSEQ_AB.BUSY", 0, "abort finishes the sequence").await;
-    // finish() resets abort/aborting.
-    assert_eq!(
-        read_short(db.get_pv("SSEQ_AB.ABORT").ok()),
-        0,
-        "ABORT cleared by asyncFinish"
-    );
-    assert_eq!(
-        read_short(db.get_pv("SSEQ_AB.ABORTING").ok()),
-        0,
-        "ABORTING cleared by asyncFinish"
-    );
+        let mut sseq = SseqRecord::new();
+        sseq.selm = 0;
+        // A single step with a long delay so the abort lands while the
+        // sequence is parked in phase `Fire`, before the step writes.
+        sseq.put_field("DLY1", EpicsValue::Double(5.0)).unwrap();
+        sseq.put_field("DO1", EpicsValue::Double(11.0)).unwrap();
+        sseq.put_field("LNK1", EpicsValue::String(format!("{tgt} PP").into()))
+            .unwrap();
+        db.add_record(&rec, Box::new(sseq)).await.unwrap();
+
+        kick(&db, &rec).await;
+        // BUSY is raised synchronously at the start; confirm the sequence is
+        // running and parked on the 5 s delay.
+        poll_short(&db, &format!("{rec}.BUSY"), 1, "sequence started").await;
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            0,
+            "step must not have fired yet (still in its delay)"
+        );
+
+        // Abort. C `special(ABORT)` cancels the delay and finishes now.
+        db.put_pv(&format!("{rec}.ABORT"), EpicsValue::Short(written))
+            .await
+            .unwrap();
+
+        poll_short(
+            &db,
+            &format!("{rec}.BUSY"),
+            0,
+            &format!("ABORT = {written} finishes the sequence"),
+        )
+        .await;
+        // finish() resets abort/aborting.
+        assert_eq!(
+            read_short(db.get_pv(&format!("{rec}.ABORT")).ok()),
+            0,
+            "ABORT = {written}: ABORT cleared by asyncFinish"
+        );
+        assert_eq!(
+            read_short(db.get_pv(&format!("{rec}.ABORTING")).ok()),
+            0,
+            "ABORT = {written}: ABORTING cleared by asyncFinish"
+        );
+        counts.push((written, count));
+    }
     // Settle: the aborted step's write must never land.
     epics_base_rs::runtime::task::sleep(Duration::from_millis(40)).await;
-    assert_eq!(
-        count.load(Ordering::SeqCst),
-        0,
-        "an aborted step must not dispatch its LNKn"
-    );
+    for (written, count) in counts {
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            0,
+            "ABORT = {written}: an aborted step must not dispatch its LNKn"
+        );
+    }
 }
 
 /// Boundary — a hung `WAITn` put-callback (downstream that never

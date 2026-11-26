@@ -198,6 +198,7 @@ neither mode applies; see `11-tls-design.md`.
 
 Force a TCP client disconnect after this many seconds with no byte read
 or written on the circuit. Default: 600. Minimum: 30.
+0 (or a negative value) disables it.
 
 This is a belt-and-suspenders cap — OS-level keepalive (15 s/5 s)
 should detect half-open connections within ~30 s, but on

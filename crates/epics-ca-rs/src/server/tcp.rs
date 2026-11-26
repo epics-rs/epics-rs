@@ -26,21 +26,26 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufWriter};
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 
-/// Optional application-level idle timeout before forcibly closing a TCP
-/// client. Disabled by default — OS-level TCP keepalive (set in `accept_loop`,
-/// 15s idle + 5s probes) is the primary half-open detector and matches C
-/// epics-base rsrv (`caservertask.c:1457-1463` sets `SO_KEEPALIVE` and
-/// refuses the connection if it fails; C has no application-level idle timeout
-/// at all — the socket option is its only half-open detector).
+/// `EPICS_CAS_INACTIVITY_TMO` when unset or unparseable
+/// (`doc/08-environment.md`).
+const DEFAULT_INACTIVITY_TMO: Duration = Duration::from_secs(600);
+
+/// The floor a positive `EPICS_CAS_INACTIVITY_TMO` is raised to.
+const MIN_INACTIVITY_TMO_SECS: f64 = 30.0;
+
+/// Application-level idle cap before forcibly closing a TCP client, on both
+/// drivers. C rsrv has none: `caservertask.c:1457-1463` sets `SO_KEEPALIVE`
+/// and refuses the connection if it fails, its only half-open detector. The
+/// cap backs up keepalive (set in `accept_loop`, 15s idle + 5s probes) where
+/// it is unreliable, such as behind NAT.
 ///
 /// A C client receiving a continuous monitor stream may never send
 /// `CA_PROTO_ECHO` (libca resets its echo timer on every received frame from
 /// the server), so an inactivity timeout based purely on incoming reads
 /// produces false-positive disconnects on healthy connections; the cap runs
-/// from the last byte read or written instead ([`CircuitActivity`]). Operators
-/// who want a defensive cap (e.g., NAT environments where TCP keepalive is
-/// unreliable) can set `EPICS_CAS_INACTIVITY_TMO` to a positive value;
-/// values < 30 are clamped to 30 to avoid pathological short timeouts.
+/// from the last byte read or written instead ([`CircuitActivity`]).
+///
+/// `None` means the cap is off, which only a value of 0 or below asks for.
 pub(crate) fn inactivity_timeout() -> Option<Duration> {
     static RESOLVED: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
     *RESOLVED.get_or_init(resolve_inactivity_timeout)
@@ -48,10 +53,14 @@ pub(crate) fn inactivity_timeout() -> Option<Duration> {
 
 /// The uncached resolution behind [`inactivity_timeout`].
 fn resolve_inactivity_timeout() -> Option<Duration> {
-    crate::estdlib::env_double("EPICS_CAS_INACTIVITY_TMO")
-        .ok()
-        .filter(|v| *v > 0.0)
-        .map(|v| crate::estdlib::duration_from_secs(v.max(30.0)))
+    match crate::estdlib::env_double("EPICS_CAS_INACTIVITY_TMO") {
+        Ok(v) if v <= 0.0 => None,
+        Ok(v) if v > 0.0 => Some(crate::estdlib::duration_from_secs(
+            v.max(MIN_INACTIVITY_TMO_SECS),
+        )),
+        // Unset, unreadable, or NaN (which fails both comparisons above).
+        _ => Some(DEFAULT_INACTIVITY_TMO),
+    }
 }
 
 /// When a circuit last moved a byte either way, which is what
@@ -2723,8 +2732,6 @@ where
                         Ok(Err(e)) => break 'client_loop Err(e.into()),
                         Err(idle) => {
                             // Inactivity timeout — close the connection.
-                            // Disabled by default (matches C rsrv); fires only
-                            // when EPICS_CAS_INACTIVITY_TMO is set explicitly.
                             tracing::warn!(
                                 target: "epics_ca_rs::server",
                                 peer = %state.peer,
@@ -14634,19 +14641,24 @@ mod send_tmo_env_tests {
     #[test]
     #[serial_test::serial]
     fn inactivity_tmo_boundaries() {
+        // `doc/08-environment.md`: default 600, minimum 30, 0 disables.
+        let default = Some(Duration::from_secs(600));
+        let floor = Some(Duration::from_secs(30));
         let cases: &[(Option<&str>, Option<Duration>)] = &[
-            // Disabled by default; an unparseable value keeps it disabled.
-            (None, None),
-            (Some(""), None),
-            (Some("abc"), None),
-            (Some("1e400"), None),
-            // NaN fails the `> 0.0` gate, as every C comparison against it does.
-            (Some("nan"), None),
+            // Unset, empty or unreadable, NaN included: the default.
+            (None, default),
+            (Some(""), default),
+            (Some("abc"), default),
+            (Some("1e400"), default),
+            (Some("nan"), default),
+            // 0 or below turns the cap off.
             (Some("0"), None),
             (Some("-1"), None),
-            // Positive values are honoured, floored at 30 s.
+            // A positive value is honoured, raised to the 30 s floor.
+            (Some("10"), floor),
+            (Some("30"), floor),
             (Some("60"), Some(Duration::from_secs(60))),
-            (Some("1"), Some(Duration::from_secs(30))),
+            (Some("600"), Some(Duration::from_secs(600))),
             (Some("0x40"), Some(Duration::from_secs(64))),
             (Some("inf"), Some(epics_base_rs::runtime::time::FAR_FUTURE)),
         ];

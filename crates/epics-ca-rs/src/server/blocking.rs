@@ -1293,8 +1293,7 @@ fn command_drives_without_spawn(cmmd: u16) -> bool {
 }
 
 /// `WouldBlock` / `TimedOut` from a blocking read mean the read timeout fired
-/// (`SO_RCVTIMEO`, set portably via `std`'s `set_read_timeout`; only when a cap
-/// is configured).
+/// (`SO_RCVTIMEO`, set portably via `std`'s `set_read_timeout`).
 fn is_read_timeout(kind: std::io::ErrorKind) -> bool {
     matches!(
         kind,
@@ -1652,12 +1651,12 @@ fn handle_client_blocking(
     // `write` under the send lock until the peer reads or resets. C parks in
     // `send` under `SEND_LOCK` for exactly as long, so the BEHAVIOUR here is
     // C-faithful and is deliberately left alone; only the rationale was wrong.
-    // The bound, when one is wanted, is `EPICS_CAS_INACTIVITY_TMO` below —
-    // off by default, as in C. (Measured on rtems-libbsd.)
+    // The bound is `EPICS_CAS_INACTIVITY_TMO` below, which C does not have.
+    // (Measured on rtems-libbsd.)
     stream.set_nodelay(true).map_err(CaError::Io)?;
     epics_base_rs::runtime::socket::enable_keepalive(&stream).map_err(CaError::Io)?;
-    // `None` (no configured cap) leaves the socket in pure blocking mode — C
-    // `rsrv`'s default (`camsgtask` blocks in `recv` with no idle cap).
+    // `None` (the cap turned off) leaves the socket in pure blocking mode, as C
+    // `camsgtask` blocks in `recv` with no idle cap.
     // `set_read_timeout` sets SO_RCVTIMEO on Unix (incl. RTEMS) and is portable
     // to Windows, unlike the former raw-libc helper.
     let cap = crate::server::tcp::inactivity_timeout();

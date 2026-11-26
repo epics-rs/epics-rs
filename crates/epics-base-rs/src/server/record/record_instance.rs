@@ -2822,16 +2822,6 @@ impl FieldAddr {
     pub(crate) fn char_view(&self) -> bool {
         self.char_view
     }
-
-    /// The text `dbGet` answers every request of this `$` address from: a
-    /// link keeps its `DBF_xxLINK` and an attribute its `SPC_ATTRIBUTE`, so
-    /// the `DBR_CHAR` image is not what a conversion starts from.
-    pub(crate) fn text_route(&self) -> Option<crate::server::database::char_view::TextRoute> {
-        if !self.char_view {
-            return None;
-        }
-        crate::server::database::char_view::source_of(self.desc).text_route()
-    }
 }
 
 /// How `dbPut` stores into a [`PutAddr`]: C's `dbFastPutConvertRoutine`
@@ -4701,7 +4691,7 @@ impl NativeRead {
         if Arc::ptr_eq(&target.rec, reader)
             || db.policy == LinkProcessPolicy::ProcessPassive
             || channel.json_suffix.is_some()
-            || target.put.field().text_route().is_some()
+            || target.text_route.is_some()
         {
             return None;
         }
@@ -4967,6 +4957,10 @@ pub(crate) struct ResolvedTarget {
     /// The link's filter chain, parsed once as the channel opens: C keeps
     /// it on the link's `dbChannel` for every `dbDbGetValue`.
     pub(crate) chain: Option<Arc<crate::server::database::filters::FilterChain>>,
+    /// The text every read of the target is answered from, never converted:
+    /// an attribute's with or without `$`, a link's with `$`
+    /// (`dbAccess.c:944-953`).
+    pub(crate) text_route: Option<crate::server::database::char_view::TextRoute>,
 }
 
 /// Where a DB link's local target comes from — `PvDatabase` in production.

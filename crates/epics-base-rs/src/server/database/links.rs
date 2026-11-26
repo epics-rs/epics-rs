@@ -129,6 +129,29 @@ impl ReadDest<'_> {
     }
 }
 
+/// The link a value converted at the reader's request was read through.
+#[derive(Clone, Copy)]
+pub(crate) enum ReadLink<'a> {
+    /// Resolved by the caller for its read: the
+    /// [`ResolvedTarget::text_route`] of its local target, none without one.
+    ///
+    /// [`ResolvedTarget::text_route`]: crate::server::record::record_instance::ResolvedTarget::text_route
+    Resolved(
+        &'a crate::server::record::ParsedLink,
+        Option<super::char_view::TextRoute>,
+    ),
+    /// Not resolved by the caller: a conversion resolves it.
+    Unresolved(&'a crate::server::record::ParsedLink),
+}
+
+impl<'a> ReadLink<'a> {
+    pub(crate) fn parsed(self) -> &'a crate::server::record::ParsedLink {
+        match self {
+            ReadLink::Resolved(link, _) | ReadLink::Unresolved(link) => link,
+        }
+    }
+}
+
 /// A link read converted at the reader's request. `Err` is a non-zero
 /// status, with the reader's buffer as the read left it when it wrote part
 /// of it.
@@ -1184,20 +1207,17 @@ impl PvDatabase {
         }
     }
 
-    /// The text route of `link`'s `$` address on a local link field or
-    /// attribute ([`FieldAddr::text_route`]), which every read of it is
-    /// answered through.
+    /// The text route of `link`'s local target ([`ResolvedTarget::text_route`]),
+    /// which every read of it is answered through.
     ///
-    /// [`FieldAddr::text_route`]: crate::server::record::record_instance::FieldAddr::text_route
+    /// [`ResolvedTarget::text_route`]: crate::server::record::record_instance::ResolvedTarget::text_route
     #[inline]
     pub(crate) fn text_route_of(
         &self,
         link: &crate::server::record::ParsedLink,
     ) -> Option<super::char_view::TextRoute> {
         match link {
-            crate::server::record::ParsedLink::Db(db) if db.target().string_view => {
-                self.db_link_addr(db)?.put.field().text_route()
-            }
+            crate::server::record::ParsedLink::Db(db) => self.db_link_addr(db)?.text_route,
             _ => None,
         }
     }
@@ -1294,6 +1314,15 @@ impl PvDatabase {
         let final_no_elements = chain
             .as_ref()
             .map_or(no_elements, |chain| chain.final_element_count(no_elements));
+        // `dbGet` takes `getAttrValue` on `SPC_ATTRIBUTE`, which `$` leaves
+        // alone, and `getLinkValue` on a link `$` keeps `DBF_xxLINK`.
+        let text_route = if self.attribute_field_type(&rec, field).is_some() {
+            Some(super::char_view::TextRoute::Attribute)
+        } else if put.field().char_view() {
+            super::char_view::source_of(put.field().desc).text_route()
+        } else {
+            None
+        };
         DbLinkAnswer::Local(crate::server::record::record_instance::ResolvedTarget {
             f64_slot: (db.target_is_val() && chain.is_none())
                 .then(|| super::field_io::double_slot(put.field()))
@@ -1304,6 +1333,7 @@ impl PvDatabase {
             put,
             final_no_elements: final_no_elements as u32,
             chain,
+            text_route,
         })
     }
 
@@ -1681,7 +1711,14 @@ impl PvDatabase {
         let Some(value) = value else {
             return (empty_read_fetch(link), None, None);
         };
-        match self.apply_link_read_as(held, link, read_as, value, render, dest) {
+        match self.apply_link_read_as(
+            held,
+            ReadLink::Unresolved(link),
+            read_as,
+            value,
+            render,
+            dest,
+        ) {
             Ok(v) => (LinkFetch::Value(v), alarm, None),
             Err(left) => (LinkFetch::Failed, None, left),
         }
@@ -1703,7 +1740,7 @@ impl PvDatabase {
     pub(crate) fn apply_link_read_as(
         &self,
         held: Option<&crate::server::database::SetGuard>,
-        link: &crate::server::record::ParsedLink,
+        link: ReadLink<'_>,
         read_as: crate::server::record::LinkReadAs,
         value: EpicsValue,
         render: Option<crate::server::record::record_instance::SourceRender>,
@@ -1720,14 +1757,18 @@ impl PvDatabase {
     fn convert_link_read(
         &self,
         held: Option<&crate::server::database::SetGuard>,
-        link: &crate::server::record::ParsedLink,
+        link: ReadLink<'_>,
         read_as: crate::server::record::LinkReadAs,
         value: EpicsValue,
         render: Option<crate::server::record::record_instance::SourceRender>,
         dest: ReadDest<'_>,
     ) -> Converted {
         use crate::server::record::LinkReadAs;
-        if let Some(route) = self.text_route_of(link) {
+        let (link, route) = match link {
+            ReadLink::Resolved(link, route) => (link, route),
+            ReadLink::Unresolved(link) => (link, self.text_route_of(link)),
+        };
+        if let Some(route) = route {
             return text_route_read(route, read_as, value).ok_or(None);
         }
         let read = match read_as {
@@ -2226,6 +2267,7 @@ impl PvDatabase {
         else {
             return (Err(None), None);
         };
+        let link = ReadLink::Resolved(link, at.text_route);
         match self.apply_link_read_as(Some(held), link, read_as, value, render, dest) {
             Ok(value) => (Ok(value), alarm),
             failed => (failed, None),
@@ -2262,7 +2304,7 @@ impl PvDatabase {
         let (Some(v), alarm, _) = self.read_db_at(Some(held), db, at, false) else {
             return (None, None);
         };
-        let f = match at.put.field().text_route() {
+        let f = match at.text_route {
             Some(route) => text_route_read(route, crate::server::record::LinkReadAs::Double, v)
                 .and_then(|v| v.to_f64()),
             None => link_value_as_f64(v),

@@ -2464,6 +2464,8 @@ struct MultiInputLink<'a> {
     link_field: &'static str,
     val_field: &'static str,
     parsed: &'a crate::server::record::ParsedLink,
+    /// The text route of the target the fetch resolved `parsed` to.
+    text_route: Option<super::char_view::TextRoute>,
     /// [`Record::input_link_request`](crate::server::record::Record::input_link_request) for the link — C's `dbrType` argument
     /// to `dbGetLink`.
     request: crate::server::record::InputLinkRequest,
@@ -2537,7 +2539,7 @@ impl PvDatabase {
         let store_raw = self.convert_link_fetch_as(
             Reader::Held(&mut *record, reader.set()),
             link.link_field,
-            link.parsed,
+            super::links::ReadLink::Resolved(link.parsed, link.text_route),
             link.request,
             &mut fetch,
             render,
@@ -2903,10 +2905,11 @@ impl PvDatabase {
             return not_read_slot();
         }
         let (parsed, target) = entry.target(self, rec.unframed(), cache_slot);
+        let text_route = target.and_then(|at| at.text_route);
         // The native funnel is these readers' `DBR_DOUBLE`, which a `$`
         // link's or attribute's text answers itself, never its char image.
         let request = match request {
-            InputLinkRequest::As(LinkReadAs::Native) if self.text_route_of(parsed).is_some() => {
+            InputLinkRequest::As(LinkReadAs::Native) if text_route.is_some() => {
                 InputLinkRequest::As(LinkReadAs::Double)
             }
             request => request,
@@ -2961,6 +2964,7 @@ impl PvDatabase {
             link_field,
             val_field,
             parsed,
+            text_route,
             request,
         };
         Some(self.land_multi_input(record, common, rec, &link, plan, read))
@@ -11211,7 +11215,7 @@ impl PvDatabase {
         self.convert_link_fetch_as(
             Reader::Frame(reader),
             link_field,
-            link,
+            super::links::ReadLink::Unresolved(link),
             request,
             &mut fetch,
             render,
@@ -11283,7 +11287,7 @@ impl PvDatabase {
         &self,
         reader: Reader<'_>,
         link_field: &'static str,
-        link: &crate::server::record::ParsedLink,
+        link: super::links::ReadLink<'_>,
         request: crate::server::record::InputLinkRequest,
         fetch: &mut crate::server::recgbl::simm::LinkFetch,
         render: Option<crate::server::record::record_instance::SourceRender>,
@@ -11300,7 +11304,7 @@ impl PvDatabase {
         &self,
         reader: Reader<'_>,
         link_field: &'static str,
-        link: &crate::server::record::ParsedLink,
+        link: super::links::ReadLink<'_>,
         request: crate::server::record::InputLinkRequest,
         fetch: &mut crate::server::recgbl::simm::LinkFetch,
         render: Option<crate::server::record::record_instance::SourceRender>,
@@ -11310,7 +11314,7 @@ impl PvDatabase {
         let LinkFetch::Value(value) = std::mem::replace(fetch, LinkFetch::NoData) else {
             unreachable!("gated by convert_link_fetch_as");
         };
-        match reader.read_as(self, link_field, link, request) {
+        match reader.read_as(self, link_field, link.parsed(), request) {
             None => false,
             Some(LinkReadAs::Array { dbr, n_request })
                 if value.is_array()
@@ -11411,6 +11415,9 @@ impl PvDatabase {
             target,
             request.renders_at_source(),
         );
+        let link = target.map_or(super::links::ReadLink::Unresolved(link), |at| {
+            super::links::ReadLink::Resolved(link, at.text_route)
+        });
         let store_raw = self.convert_link_fetch_as(
             Reader::Frame(rec),
             link_field,
@@ -11491,7 +11498,7 @@ impl PvDatabase {
         let read = match request {
             InputLinkRequest::As(read_as) => self.apply_link_read_as(
                 Some(rec.set()),
-                link,
+                super::links::ReadLink::Unresolved(link),
                 read_as,
                 value,
                 render,
@@ -11525,6 +11532,7 @@ impl PvDatabase {
             return Err(None);
         };
         let dest = ReadDest::Frame(rec, link_field);
+        let link = super::links::ReadLink::Unresolved(link);
         self.apply_link_read_as(Some(rec.set()), link, read_as, value, render, dest)
     }
 

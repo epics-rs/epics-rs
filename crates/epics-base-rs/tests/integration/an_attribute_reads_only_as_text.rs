@@ -8,9 +8,21 @@ use std::sync::Arc;
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
+use epics_base_rs::server::recgbl::alarm_status::LINK_ALARM;
+use epics_base_rs::server::record::AlarmSeverity;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
-const DB: &str = r#"record(ai, "AI") { field(DESC, "7") }"#;
+const DB: &str = r#"
+record(ai, "AI") { field(DESC, "7") }
+record(calc, "NUM") {
+    field(INPA, "AI.NUM")
+    field(CALC, "A")
+}
+record(calc, "DESC") {
+    field(INPA, "AI.DESC")
+    field(CALC, "A")
+}
+"#;
 
 async fn ioc() -> Arc<PvDatabase> {
     let (db, _) = IocBuilder::new()
@@ -67,4 +79,27 @@ async fn an_attribute_refuses_a_numeric_read() {
         get("AI.DESC", DbFieldType::Double),
         Some(EpicsValue::Double(7.0))
     );
+}
+
+fn alarm(db: &PvDatabase, rec: &str) -> (AlarmSeverity, u16) {
+    let inst = db.get_record(rec).unwrap();
+    let inst = inst.read();
+    (inst.common.sevr, inst.common.stat)
+}
+
+/// A link reads the attribute through the same `getAttrValue`
+/// (`dbDbLink.c:188`), so calc's `DBR_DOUBLE` fetch fails, `dbGetLink`
+/// raises LINK/INVALID (`dbLink.c:338-339`), and `A` and `VAL` keep their
+/// values (`calcRecord.c:120`). A link to the declared field reads it.
+#[epics_macros_rs::epics_test]
+async fn a_numeric_link_read_of_an_attribute_raises_link_invalid() {
+    let db = ioc().await;
+    db.process_record("NUM").await.unwrap();
+    assert_eq!(alarm(&db, "NUM"), (AlarmSeverity::Invalid, LINK_ALARM));
+    assert_eq!(db.get_pv("NUM.A").unwrap(), EpicsValue::Double(0.0));
+    assert_eq!(db.get_pv("NUM.VAL").unwrap(), EpicsValue::Double(0.0));
+
+    db.process_record("DESC").await.unwrap();
+    assert_eq!(alarm(&db, "DESC"), (AlarmSeverity::NoAlarm, 0));
+    assert_eq!(db.get_pv("DESC.VAL").unwrap(), EpicsValue::Double(7.0));
 }

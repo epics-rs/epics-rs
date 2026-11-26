@@ -540,6 +540,7 @@ mod dset_init_status_zero_converts;
 mod dtyp_is_a_device_menu_index;
 mod dtyp_with_no_device_menu_is_refused;
 mod each_link_has_its_own_put_notify_blocker;
+mod each_notify_restart_takes_its_own_callback;
 mod each_run_opens_its_own_prompt;
 mod empty_dtyp_binds_the_first_device;
 mod empty_put_arm_follows_the_field_declaration;

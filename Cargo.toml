@@ -118,6 +118,19 @@ codegen-units = 1
 inherits = "release"
 strip = "symbols"
 
+# No debuginfo, not even line tables: it is most of what a test build writes
+# (12059ffc07's all-features build: 109,470 MB with line tables, 48,809 MB
+# without). A panic keeps its file:line; backtrace frames and a debugger's
+# source view do not. For those, `--profile debugging` (nextest:
+# `--cargo-profile debugging`) builds into its own target/debugging, so
+# switching back and forth rebuilds neither.
+[profile.dev]
+debug = 0
+
+[profile.debugging]
+inherits = "dev"
+debug = true
+
 
 # RTEMS 6 (armv7-rtems-eabihf) needs libc definitions no published 0.2 release
 # carries yet: `time_t`/`clock_t`/`clockid_t`/`dev_t`/`ino_t`/`off_t`/`rlim_t`

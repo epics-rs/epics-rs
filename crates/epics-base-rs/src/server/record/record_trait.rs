@@ -3250,10 +3250,9 @@ pub struct ProcessOutcome {
 pub enum PostStage {
     /// Posted there, `DBE_VALUE` (`sseqRecord.c:304`, `scanparmRecord.c:250`).
     Output,
-    /// Posted by the cycle's `monitor()` change walk with the field's mask,
-    /// after `recGblResetAlarms` (`asyncFinish`'s `abort`/`aborting`,
-    /// `:471`, `:479-482`, which the type declares `DBE_VALUE` plus the alarm
-    /// bit through [`Record::value_only_change_fields`]).
+    /// Posted by the cycle's `monitor()` walk, after `recGblResetAlarms`, as
+    /// the type declares the field (`asyncFinish`'s `abort`/`aborting`,
+    /// `:471`, `:479-482`, from sseq's own marks).
     Monitor,
 }
 

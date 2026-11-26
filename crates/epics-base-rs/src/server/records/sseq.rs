@@ -57,7 +57,9 @@ const STR_FIELDS: [&str; NUM_STEPS] = [
 /// view (`DBE_VALUE|DBE_LOG`) and derived view (`DBE_VALUE`) for a numeric
 /// write at `4i`, `4i + 1`, for a string write at `4i + 2`, `4i + 3`; then
 /// a `DLYn` put's post of that `DLYn` from [`DLY_POST`]; then the `ABORT`
-/// `special()`'s `busy`, `aborting` and `waiting` posts from [`BUSY_POST`].
+/// `special()`'s `busy`, `aborting` and `waiting` posts from [`BUSY_POST`];
+/// last `asyncFinish`'s `abort` and `aborting` posts with `MonitorMask`
+/// (`sseqRecord.c:471`, `:481-482`), VAL's own mask here.
 const VALUE_WRITE_POSTS_NAMED: [(&str, CyclePostMask); POSTS] = {
     let mut table = [("", CyclePostMask::Value); POSTS];
     let mut i = 0;
@@ -80,13 +82,17 @@ const VALUE_WRITE_POSTS_NAMED: [(&str, CyclePostMask); POSTS] = {
         table[WTG_POST + i] = (WTG_FIELDS[i], CyclePostMask::Value);
         i += 1;
     }
+    table[ABORT_DONE_POST] = ("ABORT", CyclePostMask::MonitorValue);
+    table[ABORTING_DONE_POST] = ("ABORTING", CyclePostMask::MonitorValue);
     table
 };
 const DLY_POST: usize = 4 * NUM_STEPS;
 const BUSY_POST: usize = DLY_POST + NUM_STEPS;
 const ABORTING_POST: usize = BUSY_POST + 1;
 const WTG_POST: usize = ABORTING_POST + 1;
-const POSTS: usize = WTG_POST + NUM_STEPS;
+const ABORT_DONE_POST: usize = WTG_POST + NUM_STEPS;
+const ABORTING_DONE_POST: usize = ABORT_DONE_POST + 1;
+const POSTS: usize = ABORTING_DONE_POST + 1;
 const DLY_FIELDS: [&str; NUM_STEPS] = [
     "DLY1", "DLY2", "DLY3", "DLY4", "DLY5", "DLY6", "DLY7", "DLY8", "DLY9", "DLYA",
 ];
@@ -213,9 +219,13 @@ impl LinkCheckTail for [SseqStep; NUM_STEPS] {
 /// tell `DBE_VALUE|DBE_LOG` from a bare `DBE_VALUE`) nor that a client `caput`
 /// to `DOn` already posted `DOn` on the put path. So the record marks both, and
 /// the framework's change loop must not see them at all.
-static VALUE_PAIR_FIELDS: [&str; 2 * NUM_STEPS] = [
+///
+/// `ABORT` and `ABORTING` follow: `asyncFinish` posts both whenever `abort`
+/// is set (`:477-482`), so a refusal that never raised `aborting` still posts
+/// it, which no change test can see.
+static MARK_POSTED_FIELDS: [&str; 2 * NUM_STEPS + 2] = [
     "DO1", "DO2", "DO3", "DO4", "DO5", "DO6", "DO7", "DO8", "DO9", "DOA", "STR1", "STR2", "STR3",
-    "STR4", "STR5", "STR6", "STR7", "STR8", "STR9", "STRA",
+    "STR4", "STR5", "STR6", "STR7", "STR8", "STR9", "STRA", "ABORT", "ABORTING",
 ];
 
 /// The fields a process cycle may post; see `process_posted_fields`.
@@ -1006,8 +1016,8 @@ impl SseqRecord {
     /// now would expose `BUSY == 0` with `LNKn` unwritten — a state C cannot
     /// produce. The `waiting`, `abort` and `aborting` clears travel out as
     /// [`ProcessAction::PutInLinkStage`] after them, stored once they have run;
-    /// `monitor()`'s walk posts `abort` and `aborting` after
-    /// `recGblResetAlarms` with its mask (`:471`, `:479-482`). `busy` is a
+    /// `abort` and `aborting` post from their marks in `monitor()`'s walk,
+    /// after `recGblResetAlarms` with its mask (`:471`, `:479-482`). `busy` is a
     /// [`ProcessAction::PutAfterEpilogue`], stored and posted after
     /// `recGblFwdLink` and the stamp (`:499-505`), so an FLNK target still
     /// reads `BUSY == 1` as it does in C — and posted whatever it held, as
@@ -1027,13 +1037,17 @@ impl SseqRecord {
                 value: CycleValue::Short(0),
                 post: PostStage::Monitor,
             });
+            self.pending_posts |= 1 << ABORT_DONE_POST;
         }
-        if self.aborting != 0 {
+        // C clears `aborting` only under `abort`, so an `ABORT = 0` put while
+        // busy leaves it set there for good; it is cleared here too.
+        if self.abort != 0 || self.aborting != 0 {
             live.push(ProcessAction::PutInLinkStage {
                 field: "ABORTING",
                 value: CycleValue::Short(0),
                 post: PostStage::Monitor,
             });
+            self.pending_posts |= 1 << ABORTING_DONE_POST;
         }
         for i in 0..NUM_STEPS {
             if self.steps[i].waiting != 0 {
@@ -1332,10 +1346,9 @@ impl Record for SseqRecord {
         )
     }
 
-    /// C change-detects neither view of a step's value pair; see
-    /// `VALUE_PAIR_FIELDS`.
+    /// See `MARK_POSTED_FIELDS`.
     fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
-        &VALUE_PAIR_FIELDS
+        &MARK_POSTED_FIELDS
     }
 
     /// C's process path posts these and nothing else (`asyncFinish` :474-505,
@@ -1350,13 +1363,6 @@ impl Record for SseqRecord {
                 )
             },
         )
-    }
-
-    /// C `asyncFinish` posts `abort` and `aborting` with `MonitorMask`,
-    /// `DBE_VALUE` plus the alarm bit (`sseqRecord.c:471`, `:481-482`), not
-    /// the framework default `DBE_VALUE | DBE_LOG`.
-    fn value_only_change_fields(&self) -> &'static [&'static str] {
-        &["ABORT", "ABORTING"]
     }
 
     /// C `sseqRecord.c::asyncFinish` (474) posts `VAL` on EVERY process:

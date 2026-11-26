@@ -218,6 +218,53 @@ async fn a_refused_put_callback_aborts_the_whole_sequence() {
     );
 }
 
+/// `asyncFinish` posts `aborting` whenever `abort` is set (`sseqRecord.c:
+/// 477-482`), with `MonitorMask` (`DBE_VALUE` plus alarm bits, no `DBE_LOG`),
+/// so a refusal that never raised `aborting` still delivers one `ABORTING 0`.
+/// The admitted sequence never aborts and posts no `ABORTING`.
+#[epics_macros_rs::epics_test]
+async fn an_aborted_finish_posts_aborting_once_even_when_it_never_rose() {
+    for (prefix, admission, want) in [
+        ("SS_ABG", PutAdmission::Refused, vec![EpicsValue::Short(0)]),
+        ("SS_NAB", PutAdmission::Connected, vec![]),
+    ] {
+        let db = PvDatabase::new();
+        // C `dbCaLinkInit`: no build starts the `dbCaLink` worker here.
+        db.ca_link_init();
+        three_step_sseq(&db, prefix, admission).await;
+        let (mut value_rx, mut log_rx) = {
+            let cell = db.get_record(prefix).unwrap();
+            let mut inst = cell.write();
+            let mut sub = |sid, mask: EventMask| {
+                inst.add_subscriber("ABORTING", sid, DbFieldType::Short, mask.bits())
+                    .expect("an ABORTING subscription must be accepted")
+            };
+            (sub(1, EventMask::VALUE), sub(2, EventMask::LOG))
+        };
+
+        kick(&db, prefix).await;
+        poll_short(
+            &db,
+            &format!("{prefix}.BUSY"),
+            0,
+            "the sequence must finish",
+        )
+        .await;
+        // `asyncFinish` queues its `aborting` post before it stores `BUSY = 0`
+        // (`:481-482`, `:504`), so `BUSY == 0` closes both claims below.
+
+        let mut got = Vec::new();
+        while let Ok(ev) = value_rx.try_recv() {
+            got.push(ev.value().as_value().cloned().unwrap());
+        }
+        assert_eq!(got, want, "{prefix}: DBE_VALUE events on ABORTING");
+        assert!(
+            log_rx.try_recv().is_err(),
+            "{prefix}: `MonitorMask` carries no DBE_LOG"
+        );
+    }
+}
+
 /// The refusal's line goes to stdout, as C's `printf` does.
 #[cfg(unix)]
 #[epics_macros_rs::epics_test]

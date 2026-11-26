@@ -9,6 +9,7 @@ mod interop_helpers_pv_builders;
 mod a_put_resolves_after_its_monitor_callback;
 mod a_put_resolves_beside_its_own_monitor_future;
 mod a_union_array_root_pv_keeps_its_variants_on_the_wire;
+mod blocking_resolver_pause;
 mod cli_missing_pv_name_exit;
 mod cli_timeout_text;
 mod cli_unknown_iface;

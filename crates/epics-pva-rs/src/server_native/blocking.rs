@@ -78,9 +78,9 @@
 //! # Shutdown: one wake primitive, three triggers
 //!
 //! A thread cannot be aborted the way the hosted accept loop aborts a task in
-//! its `JoinSet`, and PVA's `op_timeout` defaults to ~64,000 s so `SO_RCVTIMEO`
-//! cannot stand in either (§1.6, §4.2c). So there is exactly one way a parked
-//! connection thread is woken here — `ConnWake::wake`, i.e.
+//! its `JoinSet`, and the accepted socket carries no `SO_RCVTIMEO` to stand in
+//! either (§4.2c). So there is exactly one way a parked connection thread is
+//! woken here — `ConnWake::wake`, i.e.
 //! `shutdown(Shutdown::Both)` on that connection's socket — and all three
 //! termination triggers go through it:
 //!
@@ -548,14 +548,9 @@ pub(super) fn serve_connection_blocking(
         writer: writer_worker,
     } = pumps;
     let _ = stream.set_nodelay(true);
-    // SO_RCVTIMEO (the same move CA's blocking driver makes), fatal: every
-    // target that runs this accepts it, RTEMS included. Note the receive
-    // timeout is NOT a shutdown mechanism here: `op_timeout` defaults to
-    // ~64,000 s, so it is effectively infinite (§1.6). What ends a parked
-    // reader is the `shutdown` below.
-    stream
-        .set_read_timeout(Some(config.op_timeout))
-        .map_err(PvaError::Io)?;
+    // No SO_RCVTIMEO: a wall-time receive bound ends the reader while a
+    // resolver pause holds reads off by choice. `handle_connection_io`'s
+    // `op_timeout` watchdog, which skips the pause, alone judges a stall.
     let send_timeout = config.send_timeout;
     // No SO_SNDTIMEO: it is not needed on any target:
     // `blocking_io::write_frame_deadline` waits for writability against
@@ -2118,8 +2113,8 @@ pub(super) mod tests {
     ///
     /// The retire assertion rests on `runtime::blocking_io`'s wait, not on
     /// the park: a local `shutdown(Shutdown::Both)` returns a connection
-    /// parked in `read` behind the ~64,000 s `op_timeout` (§1.6) at once on
-    /// unix (`POLLHUP`), and within the wait's `WAKE_POLL_PERIOD` on Windows,
+    /// parked in an unbounded `read` at once on unix (`POLLHUP`), and within
+    /// the wait's `WAKE_POLL_PERIOD` on Windows,
     /// which does not return the parked `recv` itself (measured, PR #56 CI
     /// 2026-07-24: all eight of these tests timed out on their retire bounds
     /// on both Windows runners while the park carried the bound).
@@ -2358,8 +2353,8 @@ pub(super) mod tests {
     }
 
     /// Boundary: the reader is parked in `read` — the common state, and the
-    /// one nothing else can end. `op_timeout` is ~64,000 s by default (§1.6),
-    /// so if the socket shutdown does not return that `read`, nothing does.
+    /// one nothing else can end. The socket has no receive bound, so if the
+    /// socket shutdown does not return that `read`, nothing does.
     ///
     /// Mutation-checked: make `ConnWake::wake` a no-op and this test fails on
     /// its retire bound instead of hanging, because `wait_retired` is bounded.
@@ -2824,8 +2819,7 @@ pub(super) mod tests {
     /// `op_timeout` after reads resume — not before, and not a tick later
     /// than that. On a [`ManualClock`], as above; a tick is known evaluated
     /// once the ticker arms a deadline past the clock, and `idle_timeout`
-    /// is set past every advance so only this watchdog can close. `op_timeout`
-    /// is long in wall time because it is also the socket's `SO_RCVTIMEO`.
+    /// is set past every advance so only this watchdog can close.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_read_stall_watchdog_skips_a_resolver_pause_and_closes_at_op_timeout() {
         use super::super::tcp::{CREATE_CHANNEL_QUEUE_DEPTH, CREATE_CHANNEL_RESOLVE_CONCURRENCY};

@@ -1236,10 +1236,28 @@ impl PvDatabase {
         db: &crate::server::record::DbLink,
     ) -> crate::server::record::DbLinkAnswer {
         use crate::server::record::DbLinkAnswer;
+        // One parse settles both the count and the type the filters leave.
+        let chain = db
+            .target()
+            .json_suffix
+            .as_deref()
+            .map(super::filters::parse_filter_chain);
+        // `dbChannelFinalFieldType`, read off what `rec` settled: the target
+        // may be the reader, held by the caller.
+        let final_field_type = |rec: &RecordCell| {
+            self.db_link_field_type(db, rec)
+                .map(|t| db.target().final_field_type_through(t, chain.as_ref()))
+                .and_then(crate::types::DbfCode::served_type)
+        };
         // A simple PV spelling the target shadows it, as in `put_pv` and
         // `get_pv`.
         if let Some(pv) = self.shadowing_pv(db) {
-            return DbLinkAnswer::Shadowed(pv);
+            return DbLinkAnswer::Shadowed {
+                final_field_type: self
+                    .get_record(&db.target().record)
+                    .and_then(|rec| final_field_type(&rec)),
+                pv,
+            };
         }
         let Some((name, rec)) = self.lookup_record(&db.target().record) else {
             return if self.has_name_no_resolve(&db.target().record) {
@@ -1266,16 +1284,14 @@ impl PvDatabase {
             let no_elements = rec.no_elements(field).map_or(1, |n| n as usize);
             (PutAddr::resolve_in(&rec, field), no_elements)
         };
-        let final_no_elements = match db.target().json_suffix.as_deref() {
-            Some(suffix) => {
-                super::filters::parse_filter_chain(suffix).final_element_count(no_elements)
-            }
-            None => no_elements,
-        };
+        let final_no_elements = chain
+            .as_ref()
+            .map_or(no_elements, |chain| chain.final_element_count(no_elements));
         DbLinkAnswer::Local(crate::server::record::record_instance::ResolvedTarget {
             f64_slot: (db.target_is_val() && db.target().json_suffix.is_none())
                 .then(|| super::field_io::double_slot(put.field()))
                 .flatten(),
+            final_field_type: final_field_type(&rec),
             rec,
             name,
             put,
@@ -1289,7 +1305,7 @@ impl PvDatabase {
         match self.db_link_answer(db) {
             DbLinkAnswer::Local(at) => LinkTarget::Local(at.rec),
             DbLinkAnswer::External => LinkTarget::External,
-            DbLinkAnswer::Shadowed(_) | DbLinkAnswer::Absent => {
+            DbLinkAnswer::Shadowed { .. } | DbLinkAnswer::Absent => {
                 self.link_target(&db.target().record)
             }
         }
@@ -1320,7 +1336,7 @@ impl PvDatabase {
             // target gone again by then has nothing readable this cycle.
             LinkTarget::Local(_) => match self.db_link_answer(db) {
                 DbLinkAnswer::Local(at) => self.target_value_of(&at.rec, db, at.put.field()),
-                DbLinkAnswer::Shadowed(pv) => {
+                DbLinkAnswer::Shadowed { pv, .. } => {
                     TargetValue::NoRecord(Some(simple_pv_read(target, &pv)))
                 }
                 DbLinkAnswer::Absent | DbLinkAnswer::External => TargetValue::NoRecord(None),
@@ -2351,7 +2367,7 @@ impl PvDatabase {
                 crate::server::record::DbLinkAnswer::Local(at) => {
                     return self.read_db_at(None, db, &at, render);
                 }
-                crate::server::record::DbLinkAnswer::Shadowed(pv) => {
+                crate::server::record::DbLinkAnswer::Shadowed { pv, .. } => {
                     return (Some(simple_pv_read(db.target(), &pv)), None, None);
                 }
                 crate::server::record::DbLinkAnswer::External => {
@@ -3613,7 +3629,7 @@ impl PvDatabase {
                     owned = at;
                     (Some(&owned), None)
                 }
-                DbLinkAnswer::Shadowed(pv) => (None, Some(pv)),
+                DbLinkAnswer::Shadowed { pv, .. } => (None, Some(pv)),
                 DbLinkAnswer::Absent => (None, None),
                 DbLinkAnswer::External => {
                     return self.write_db_external(frame, db, src, src_out);
@@ -4207,7 +4223,10 @@ impl PvDatabase {
     ///
     /// [`OutTarget::no_elements`] is [`RecordCell::no_elements`](crate::server::record::RecordCell::no_elements),
     /// `dbNameToAddr`'s, with no filter applied; [`OutTarget::final_elements`]
-    /// is [`Self::link_nelements`], `dbGetNelements`'s, through the filters.
+    /// is `dbGetNelements`'s, through the filters. The type splits the same
+    /// way: [`OutTarget::field_type`] and [`OutTarget::final_field_type`].
+    /// Both final facts are the ones the link's cached answer settled
+    /// ([`Self::db_link_answer`]), so no cycle parses the filter suffix.
     pub(crate) fn resolve_out_target(&self, link: &crate::server::record::ParsedLink) -> OutTarget {
         use crate::server::record::LinkType;
         let external = |link: crate::server::record::ExternalRef<'_>, link_type: LinkType| {
@@ -4222,7 +4241,7 @@ impl PvDatabase {
                     let n = m.element_count.unwrap_or(1).max(1);
                     OutTarget {
                         field_type: m.dbf_type.map(|t| link_dbf_to_field_type(t).dbf_code()),
-                        dbr_field_type: m.dbf_type.map(link_dbf_to_field_type),
+                        final_field_type: m.dbf_type.map(link_dbf_to_field_type),
                         no_elements: n,
                         final_elements: n,
                         link_type,
@@ -4243,16 +4262,32 @@ impl PvDatabase {
                     link_type: LinkType::Db,
                     ..OutTarget::UNRESOLVED
                 };
+                use crate::server::record::DbLinkAnswer;
                 let addressed = db.target();
-                let target = match self.db_link_target(db) {
-                    LinkTarget::Local(rec) => rec,
-                    LinkTarget::LocalNotRecord => return UNADDRESSED,
-                    // Non-local ⇒ CA link in C (`dbInitLink` locality).
-                    LinkTarget::External => return external(db.external(), LinkType::Ca),
-                };
                 // Taken before the target lock: a cache miss resolves the
-                // address, which reads the target.
-                let final_elements = self.link_nelements(link).map_or(1, |n| n.max(1));
+                // address, which reads the target. `dbGetNelements` and
+                // `dbGetLinkDBFtype` are what the answer settled.
+                let (target, final_elements, final_field_type) = match self.db_link_answer(db) {
+                    DbLinkAnswer::Local(at) => (
+                        Some(at.rec),
+                        i64::from(at.final_no_elements).max(1),
+                        at.final_field_type,
+                    ),
+                    // Non-local ⇒ CA link in C (`dbInitLink` locality).
+                    DbLinkAnswer::External => return external(db.external(), LinkType::Ca),
+                    DbLinkAnswer::Shadowed {
+                        final_field_type, ..
+                    } => (None, 1, final_field_type),
+                    DbLinkAnswer::Absent => (None, 1, None),
+                };
+                let target = match target {
+                    Some(rec) => rec,
+                    None => match self.link_target(&addressed.record) {
+                        LinkTarget::Local(rec) => rec,
+                        LinkTarget::LocalNotRecord => return UNADDRESSED,
+                        LinkTarget::External => return external(db.external(), LinkType::Ca),
+                    },
+                };
                 let guard = target.read();
                 // `dbNameToAddr` of a `$` address: a string's `DBF_CHAR` view,
                 // or a link's own type, read as `DBR_CHAR`, and its
@@ -4261,7 +4296,7 @@ impl PvDatabase {
                     return match super::char_view::char_view(&guard, &addressed.field) {
                         Some(view) => OutTarget {
                             field_type: Some(view.field_type),
-                            dbr_field_type: Some(DbFieldType::Char),
+                            final_field_type,
                             no_elements: (view.no_elements as i64).max(1),
                             final_elements,
                             link_type: LinkType::Db,
@@ -4278,7 +4313,7 @@ impl PvDatabase {
                 let no_elements = target.no_elements(&addressed.field).map_or(1, i64::from);
                 OutTarget {
                     field_type,
-                    dbr_field_type: field_type.and_then(crate::types::DbfCode::served_type),
+                    final_field_type,
                     no_elements: no_elements.max(1),
                     final_elements,
                     link_type: LinkType::Db,
@@ -4296,7 +4331,7 @@ impl PvDatabase {
             // string.
             crate::server::record::ParsedLink::State(_) => OutTarget {
                 field_type: Some(crate::types::DbfCode::Short),
-                dbr_field_type: Some(DbFieldType::Short),
+                final_field_type: Some(DbFieldType::Short),
                 no_elements: 1,
                 final_elements: 1,
                 link_type: LinkType::Json,
@@ -4331,7 +4366,7 @@ impl PvDatabase {
                 DbLinkAnswer::External => self.external_link_shape(db.external())?.element_count,
                 // No record field: a simple PV, or a name C's CA link never
                 // connects to.
-                DbLinkAnswer::Shadowed(_) | DbLinkAnswer::Absent => None,
+                DbLinkAnswer::Shadowed { .. } | DbLinkAnswer::Absent => None,
             },
             // `dbCaGetNelements` (`dbCa.c:662-670`) reads `pca->nelements`;
             // pvxs `pvaGetElements` (`pvalink_lset.cpp:243-258`).

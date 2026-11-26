@@ -395,7 +395,7 @@ pub trait LinkCheckTail {
 }
 
 /// Classify one DOL/LNK/INP/OUT link string into its connection-status menu
-/// index and the target field type, as `init_record` and `special()` do
+/// index and its `dbGetLinkDBFtype`, as `init_record` and `special()` do
 /// under `rule` (sseqRecord.c:203-240; calcoutRecord.c:160-189;
 /// sCalcoutRecord.c:254-285). `role` parses it as its field does: an output
 /// drops `CP`/`CPP`, so `OUT "X CP"` is a DB link.
@@ -434,11 +434,21 @@ pub fn classify_link(
             _ => {}
         }
     }
+    // `dbNameToAddr` decides the status; the type is the one the link's
+    // channel delivers, through its filters.
+    let final_type = |link: &ParsedLink| {
+        let ParsedLink::Db(db) = link else {
+            return None;
+        };
+        handle
+            .parsed_link_target_field_type(link)
+            .map(|t| db.target().final_field_type(t))
+    };
     let local = match &parsed {
-        ParsedLink::Db(_) => handle.parsed_link_target_field_type(&parsed),
+        ParsedLink::Db(_) => final_type(&parsed),
         // `dbNameToAddr(pvname)`, the modifier aside.
         ParsedLink::Ca(ca) if rule == LinkRule::Locality => {
-            handle.link_target_field_type(ca.pv.as_bytes())
+            final_type(&crate::server::record::parse_link_v2(ca.pv.as_bytes()))
         }
         _ => None,
     };

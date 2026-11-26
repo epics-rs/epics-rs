@@ -84,9 +84,9 @@ async fn has_pv_takes_the_char_view() {
     }
 }
 
-/// `dbGetLinkDBFtype` of a DB link to a `$` name, and sseq's `DTn` and
-/// `DOLnV` from the `dbNameToAddr` its `init_record` makes
-/// (`sseqRecord.c:208-219`).
+/// `dbNameToAddr`'s type of a DB link to a `$` name, sseq's `DOLnV` from it
+/// (`sseqRecord.c:208-219`), and its `DTn` from `dbGetLinkDBFtype`, which
+/// serves a `$` link field as `DBR_CHAR` and a plain one as `DBR_STRING`.
 #[epics_macros_rs::epics_test]
 async fn a_link_to_a_char_view_is_a_char_link() {
     let db = ioc().await;
@@ -101,8 +101,8 @@ async fn a_link_to_a_char_view_is_a_char_link() {
     let get = |pv| db.get_pv(pv).unwrap();
     assert_eq!(get("SQ.DT1"), EpicsValue::Short(1));
     assert_eq!(get("SQ.DT2"), EpicsValue::Short(1));
-    assert_eq!(get("SQ.DT3"), EpicsValue::Short(14));
-    assert_eq!(get("SQ.DT5"), EpicsValue::Short(14));
+    assert_eq!(get("SQ.DT3"), EpicsValue::Short(1));
+    assert_eq!(get("SQ.DT5"), EpicsValue::Short(0));
     assert_eq!(get("SQ.DOL4V"), EpicsValue::Enum(0));
     assert_eq!(get("SQ.DT4"), EpicsValue::Short(-1));
 }

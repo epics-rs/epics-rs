@@ -1483,7 +1483,13 @@ pub(crate) enum DbLinkAnswer {
     /// A local record — C's `dbAddr`.
     Local(super::record_instance::ResolvedTarget),
     /// A simple PV spelling the target `REC.FLD`, which shadows the field.
-    Shadowed(std::sync::Arc<crate::server::pv::ProcessVariable>),
+    /// `final_field_type` is the shadowed field's, as
+    /// [`ResolvedTarget::final_field_type`](super::record_instance::ResolvedTarget::final_field_type)
+    /// would give it.
+    Shadowed {
+        pv: std::sync::Arc<crate::server::pv::ProcessVariable>,
+        final_field_type: Option<crate::types::DbFieldType>,
+    },
     /// A name this IOC serves, but no readable record field; the by-name
     /// path decides.
     Absent,
@@ -1545,8 +1551,12 @@ enum CachedAnswer {
         put: super::record_instance::PutAddr,
         f64_slot: Option<super::record_trait::FieldSlot>,
         final_no_elements: u32,
+        final_field_type: Option<crate::types::DbFieldType>,
     },
-    Shadowed(std::sync::Arc<crate::server::pv::ProcessVariable>),
+    Shadowed {
+        pv: std::sync::Arc<crate::server::pv::ProcessVariable>,
+        final_field_type: Option<crate::types::DbFieldType>,
+    },
     Absent,
     External,
 }
@@ -1603,6 +1613,7 @@ impl DbLink {
                     put,
                     f64_slot,
                     final_no_elements,
+                    final_field_type,
                 } => {
                     if let Some(rec) = rec.upgrade() {
                         return DbLinkAnswer::Local(super::record_instance::ResolvedTarget {
@@ -1611,10 +1622,19 @@ impl DbLink {
                             put: *put,
                             f64_slot: *f64_slot,
                             final_no_elements: *final_no_elements,
+                            final_field_type: *final_field_type,
                         });
                     }
                 }
-                CachedAnswer::Shadowed(pv) => return DbLinkAnswer::Shadowed(pv.clone()),
+                CachedAnswer::Shadowed {
+                    pv,
+                    final_field_type,
+                } => {
+                    return DbLinkAnswer::Shadowed {
+                        pv: pv.clone(),
+                        final_field_type: *final_field_type,
+                    };
+                }
                 CachedAnswer::Absent => return DbLinkAnswer::Absent,
                 CachedAnswer::External => return DbLinkAnswer::External,
             }
@@ -1627,8 +1647,15 @@ impl DbLink {
                 put: target.put,
                 f64_slot: target.f64_slot,
                 final_no_elements: target.final_no_elements,
+                final_field_type: target.final_field_type,
             },
-            DbLinkAnswer::Shadowed(pv) => CachedAnswer::Shadowed(pv.clone()),
+            DbLinkAnswer::Shadowed {
+                pv,
+                final_field_type,
+            } => CachedAnswer::Shadowed {
+                pv: pv.clone(),
+                final_field_type: *final_field_type,
+            },
             DbLinkAnswer::Absent => CachedAnswer::Absent,
             DbLinkAnswer::External => CachedAnswer::External,
         };

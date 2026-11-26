@@ -10,7 +10,7 @@ use crate::server::record::{
     CycleMarks, CyclePostMask, LinkReadAs, OutTarget, PostStage, ProcessAction, ProcessActions,
     ProcessOutcome, Record, RecordProcessResult, parse_link_v2, parse_output_link_v2,
 };
-use crate::types::{DbfCode, EpicsValue, PvString};
+use crate::types::{DbFieldType, EpicsValue, PvString};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Notify;
@@ -1680,25 +1680,21 @@ impl Record for SseqRecord {
         _link_field: &str,
         source: &OutTarget,
     ) -> Option<LinkReadAs> {
-        match source.field_type? {
-            DbfCode::String
-            | DbfCode::Enum
-            | DbfCode::Menu
-            | DbfCode::Device
-            | DbfCode::Inlink
-            | DbfCode::Outlink
-            | DbfCode::Fwdlink => Some(LinkReadAs::String),
-            DbfCode::Char | DbfCode::UChar => Some(LinkReadAs::CharArrayAsString {
+        // `dbGetLinkDBFtype` is a DBR type: `MENU`/`DEVICE` arrive as `ENUM`,
+        // the link classes as `STRING`.
+        match source.final_field_type? {
+            DbFieldType::String | DbFieldType::Enum => Some(LinkReadAs::String),
+            DbFieldType::Char | DbFieldType::UChar => Some(LinkReadAs::CharArrayAsString {
                 // C `if (n_elements>40) n_elements=40` against `char s[40]`.
                 max_elements: source.final_elements.clamp(1, SSEQ_STRING_SIZE as i64) as usize,
             }),
-            DbfCode::Short
-            | DbfCode::UShort
-            | DbfCode::Long
-            | DbfCode::ULong
-            | DbfCode::Float
-            | DbfCode::Double => Some(LinkReadAs::Double),
-            DbfCode::Int64 | DbfCode::UInt64 | DbfCode::NoAccess => None,
+            DbFieldType::Short
+            | DbFieldType::UShort
+            | DbFieldType::Long
+            | DbFieldType::ULong
+            | DbFieldType::Float
+            | DbFieldType::Double => Some(LinkReadAs::Double),
+            DbFieldType::Int64 | DbFieldType::UInt64 => None,
         }
     }
 
@@ -1760,15 +1756,11 @@ impl Record for SseqRecord {
             return None;
         };
         let step = &self.steps[i];
-        match target.field_type? {
-            DbfCode::String
-            | DbfCode::Enum
-            | DbfCode::Menu
-            | DbfCode::Device
-            | DbfCode::Inlink
-            | DbfCode::Outlink
-            | DbfCode::Fwdlink => Some(EpicsValue::String(step.str_val.clone())),
-            DbfCode::Char | DbfCode::UChar => {
+        match target.final_field_type? {
+            DbFieldType::String | DbFieldType::Enum => {
+                Some(EpicsValue::String(step.str_val.clone()))
+            }
+            DbFieldType::Char | DbFieldType::UChar => {
                 if target.final_elements > 1 {
                     // C puts `n` bytes straight out of the 40-byte `s`, so the
                     // string is NUL-padded out to the requested count.
@@ -1780,15 +1772,15 @@ impl Record for SseqRecord {
                     Some(EpicsValue::Double(step.dov))
                 }
             }
-            DbfCode::Short
-            | DbfCode::UShort
-            | DbfCode::Long
-            | DbfCode::ULong
-            | DbfCode::Float
-            | DbfCode::Double => Some(EpicsValue::Double(step.dov)),
-            // C's switch has no `DBF_INT64`/`DBF_UINT64` or `DBF_NOACCESS`
-            // case → `default: break` → no put.
-            DbfCode::Int64 | DbfCode::UInt64 | DbfCode::NoAccess => None,
+            DbFieldType::Short
+            | DbFieldType::UShort
+            | DbFieldType::Long
+            | DbFieldType::ULong
+            | DbFieldType::Float
+            | DbFieldType::Double => Some(EpicsValue::Double(step.dov)),
+            // C's switch has no `DBF_INT64`/`DBF_UINT64` case → `default:
+            // break` → no put.
+            DbFieldType::Int64 | DbFieldType::UInt64 => None,
         }
     }
 

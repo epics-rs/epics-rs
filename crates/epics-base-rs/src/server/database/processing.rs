@@ -5003,10 +5003,10 @@ impl PvDatabase {
     /// Resolve a link's target field [`DbFieldType`] for a LOCAL `DB_LINK`,
     /// or `None` for a constant / external / unresolvable link.
     ///
-    /// Parity of C `dbGetLinkDBFtype` as `sseqRecord.c:checkLinks`
-    /// (sseqRecord.c:884-941) uses it to fill the `DTn`/`LTn` diagnostics:
-    /// a `DB_LINK` whose target record is on this IOC reports its addressed
-    /// field's type (C `dbNameToAddr` → `pAddr->field_type`). A constant or
+    /// C `dbNameToAddr` → `pAddr->field_type`, no filter applied: a `DB_LINK`
+    /// whose target record is on this IOC reports its addressed field's
+    /// type, from which sseq's `DTn`/`LTn` take the link's filtered type
+    /// ([`ChannelName::final_field_type`](crate::server::database::filters::ChannelName)). A constant or
     /// `CA`/`PVA` (external) link returns `None` — epics-base-rs has no
     /// client-side introspection of a remote field's type, so the caller
     /// renders those as the `DBF_unknown` sentinel.
@@ -5025,8 +5025,18 @@ impl PvDatabase {
         // Through the split: a filtered link's raw halves name a record that
         // does not exist (`SRC.VAL[0]` whole, field `VAL`), so `get_record`
         // missed and every filtered DB link reported no type at all.
+        let rec = self.get_record(&db.target().record)?;
+        self.db_link_field_type(db, &rec)
+    }
+
+    /// [`Self::parsed_link_target_field_type`] of `db` on `rec`, its target
+    /// record, from the facts `rec` settled.
+    pub(crate) fn db_link_field_type(
+        &self,
+        db: &crate::server::record::DbLink,
+        rec: &crate::server::record::RecordCell,
+    ) -> Option<crate::types::DbfCode> {
         let addressed = db.target();
-        let rec = self.get_record(&addressed.record)?;
         let field = if addressed.field.is_empty() {
             "VAL"
         } else {
@@ -5035,9 +5045,9 @@ impl PvDatabase {
         // C `dbNameToAddr` takes no lock, and table's `init_record` asks
         // under its own set.
         if addressed.string_view {
-            return self.char_addressed(&rec, field, None).map(|(t, _)| t);
+            return self.char_addressed(rec, field, None).map(|(t, _)| t);
         }
-        self.addressed_field_type(&rec, field, None)
+        self.addressed_field_type(rec, field, None)
     }
 
     /// Create a put-notify wait-set for a downstream operation a record is

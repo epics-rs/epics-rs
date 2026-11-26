@@ -2474,7 +2474,7 @@ mod tests {
     fn out_target(field_type: Option<DbfCode>, no_elements: i64, link_type: LinkType) -> OutTarget {
         OutTarget {
             field_type,
-            dbr_field_type: field_type.and_then(DbfCode::served_type),
+            final_field_type: field_type.and_then(DbfCode::served_type),
             no_elements,
             final_elements: no_elements,
             link_type,

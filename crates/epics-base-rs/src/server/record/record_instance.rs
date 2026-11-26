@@ -4960,6 +4960,10 @@ pub(crate) struct ResolvedTarget {
     /// field's `addr.no_elements` through the link's filter chain, settled
     /// with the address as `dbChannelCreate` settles it at link init.
     pub(crate) final_no_elements: u32,
+    /// `dbGetLinkDBFtype` of the link: its channel's `final_type`, served as
+    /// a DBR type, settled with [`Self::final_no_elements`]; `None` for one
+    /// no DBR type serves (`DBF_NOACCESS`).
+    pub(crate) final_field_type: Option<DbFieldType>,
 }
 
 /// Where a DB link's local target comes from — `PvDatabase` in production.

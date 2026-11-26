@@ -2,10 +2,12 @@
 //! the declared `DBF_*` code, retyped only by a `SPC_DBADDR` field's
 //! `cvt_dbaddr` — never `mapDBFToDBR`'s collapse of it. A menu stays
 //! `DBF_MENU`, `DTYP` `DBF_DEVICE`, a link its link class, and a field nothing
-//! retypes (`TIME`, `BKPT`, `MLOK`, `calc.RPCL`) `DBF_NOACCESS`. sseq keeps the
-//! code in `DTn`/`LTn` (`sseqRecord.c:208-211`, `:227-230`) and its step
-//! switches have no case for `DBF_NOACCESS` (`:643-705`, `:714-792`), so such
-//! a step neither reads nor puts; `devsCalcoutSoft` puts `OSV` to a target
+//! retypes (`TIME`, `BKPT`, `MLOK`, `calc.RPCL`) `DBF_NOACCESS`. sseq's
+//! `DTn`/`LTn` hold the DBR type `dbGetLinkDBFtype` delivers, which C's
+//! `init_record` code reaches at the first `special`/`checkLinks`
+//! (`sseqRecord.c:1016`, `:1069`), and its step switches have no case for
+//! `DBR_NOACCESS` (`:643-705`, `:714-792`), so such a step neither reads nor
+//! puts; `devsCalcoutSoft` puts `OSV` to a target
 //! whose address is `DBF_STRING` (`devsCalcoutSoft.c:127-134`).
 
 use std::collections::HashMap;
@@ -50,7 +52,7 @@ fn idle(sseq: &'static str) -> impl Fn(&PvDatabase) -> bool {
 }
 
 #[epics_macros_rs::epics_test]
-async fn sseq_keeps_the_dbf_code_its_link_targets_address_as() {
+async fn sseq_reports_the_dbr_type_its_links_deliver() {
     let db = ioc("record(ai, \"X\") {}\n\
          record(waveform, \"W\") { field(FTVL, \"LONG\") field(NELM, \"8\") }\n\
          record(lso, \"L\") { field(SIZV, \"80\") }\n\
@@ -65,15 +67,15 @@ async fn sseq_keeps_the_dbf_code_its_link_targets_address_as() {
          }\n")
     .await;
     let code = |f: &str| db.get_pv(format!("SQ.{f}")).unwrap();
-    // DBF_NOACCESS 17, MENU 12, DEVICE 13, INLINK 14, FWDLINK 16, LONG 5,
-    // DOUBLE 10, STRING 0.
+    // C oracleIoc after a `special` on each link: NOACCESS 17, a menu and
+    // `DTYP` ENUM 11, a link field STRING 0, LONG 5, DOUBLE 10.
     let want = [
         ("DT1", 17),
         ("LT1", 17),
-        ("DT2", 12),
-        ("LT2", 13),
-        ("DT3", 14),
-        ("LT3", 16),
+        ("DT2", 11),
+        ("LT2", 11),
+        ("DT3", 0),
+        ("LT3", 0),
         ("DT4", 5),
         ("LT4", 10),
         ("DT5", 0),

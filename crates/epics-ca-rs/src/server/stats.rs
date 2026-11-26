@@ -20,9 +20,9 @@ pub struct ServerStats {
     /// `caServerBytes_in` counter from PR #592's `dbServerStats`.
     pub bytes_in: std::sync::atomic::AtomicU64,
     /// Total bytes sent to clients since startup. Mirrors
-    /// `caServerBytes_out`. Updated when the per-client BufWriter
-    /// reports successful flushes; CA over TLS counts post-decrypt
-    /// plaintext (the rustls handshake bytes are not surfaced).
+    /// `caServerBytes_out`. Updated by each write to a client socket;
+    /// CA over TLS counts post-decrypt plaintext (the rustls handshake
+    /// bytes are not surfaced).
     pub bytes_out: std::sync::atomic::AtomicU64,
     /// Total CREATE_CHAN successes across the server lifetime.
     /// PR #592's `caServerChannelCount` minus the closes (which we

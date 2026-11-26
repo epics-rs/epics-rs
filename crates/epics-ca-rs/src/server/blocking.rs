@@ -1414,7 +1414,7 @@ fn write_frame_locked(send_lock: &Mutex<SendBuf>, frame: &[u8]) -> std::io::Resu
 
 /// Stage every queued frame in arrival order, then send once. Single owner of
 /// "server bytes reach the socket" for the command path — the blocking
-/// analogue of `drain_and_flush` (`tcp.rs:1627`), held under the
+/// analogue of `run_circuit_writer`'s flush, held under the
 /// `client->lock` send-lock (`server.h:83`). The send also carries whatever
 /// the event thread staged before it.
 fn drain_outbox_locked(send_lock: &Mutex<SendBuf>, drain: &mut OutboxDrain) -> std::io::Result<()> {

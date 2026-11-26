@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 // These `tokio::io` traits/wrappers are used only by the async accept/read
-// front-end (`handle_client`, `drain_and_flush`); the shared read helper takes
+// front-end (`handle_client`, `run_circuit_writer`); the shared read helper takes
 // a `tokio::io::AsyncReadExt` bound by full path. Gated to `tokio_backend`,
 // with the rest of the async front-end.
 #[cfg(tokio_backend)]
@@ -53,22 +53,72 @@ fn resolve_inactivity_timeout() -> Option<Duration> {
         .map(|v| crate::estdlib::duration_from_secs(v.max(30.0)))
 }
 
+/// When a circuit last moved a byte either way, which is what
+/// [`inactivity_timeout`] measures idleness from: rsrv keeps the same pair,
+/// `time_at_last_send` and `time_at_last_recv` (`caserverio.c:72`,
+/// `camsgtask.c:113`).
+#[cfg(tokio_backend)]
+struct CircuitActivity {
+    since: std::time::Instant,
+    /// Nanoseconds from `since` to the latest byte read or written.
+    last: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(tokio_backend)]
+impl CircuitActivity {
+    fn new() -> Self {
+        Self {
+            since: std::time::Instant::now(),
+            last: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Bytes moved just now.
+    fn touch(&self) {
+        let at = u64::try_from(self.since.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.last.fetch_max(at, Ordering::Relaxed);
+    }
+
+    /// What is left of `cap` since bytes last moved; `None` once it has run out.
+    fn idle_remaining(&self, cap: Duration) -> Option<Duration> {
+        let idle = self
+            .since
+            .elapsed()
+            .saturating_sub(Duration::from_nanos(self.last.load(Ordering::Relaxed)));
+        cap.checked_sub(idle).filter(|left| !left.is_zero())
+    }
+
+    /// Resolves once `cap` passes with no byte moved.
+    async fn idle_for(&self, cap: Duration) {
+        while let Some(left) = self.idle_remaining(cap) {
+            tokio::time::sleep(left).await;
+        }
+    }
+}
+
 /// Read into `buf` with an optional idle cap. If `cap` is `None`, the read
 /// is unbounded (matches C `recv()` blocking semantics in `camsgtask.c`);
-/// if `cap` is `Some(d)`, returns `Err(d)` after `d` of inactivity.
+/// if `cap` is `Some(d)`, returns `Err(d)` once `d` passes with no byte
+/// moved on the circuit either way.
 #[cfg(tokio_backend)]
 async fn read_with_optional_timeout<R: tokio::io::AsyncReadExt + Unpin>(
     reader: &mut R,
     buf: &mut [u8],
     cap: Option<Duration>,
+    activity: &CircuitActivity,
 ) -> Result<std::io::Result<usize>, Duration> {
-    match cap {
-        None => Ok(reader.read(buf).await),
-        Some(d) => match tokio::time::timeout(d, reader.read(buf)).await {
-            Ok(r) => Ok(r),
-            Err(_) => Err(d),
+    let read = match cap {
+        None => reader.read(buf).await,
+        Some(d) => tokio::select! {
+            biased;
+            read = reader.read(buf) => read,
+            () = activity.idle_for(d) => return Err(d),
         },
+    };
+    if matches!(read, Ok(n) if n > 0) {
+        activity.touch();
     }
+    Ok(read)
 }
 
 /// Parse an opt-in resource cap from an env value. `None` (variable
@@ -256,10 +306,10 @@ pub(crate) use epics_base_rs::server::database::dbr_delivery::prepare_read;
 // host `exec_backend` build with them.
 #[cfg(tokio_backend)]
 use crate::server::recv::{Admit, Gate, RecvAccumulator};
-// `OutboxDrain` is consumed only by the async `drain_and_flush`; same gate.
+// `OutboxDrain` is consumed only by the async `run_circuit_writer`; same gate.
 use crate::server::frame::{FrameBuf, size_dbr_reply};
 #[cfg(tokio_backend)]
-use crate::server::outbox::OutboxDrain;
+use crate::server::outbox::{Drained, OutboxDrain};
 use epics_base_rs::error::CaResult;
 #[cfg(tokio_backend)]
 use epics_base_rs::server::database::channel_io::get_read_snapshot;
@@ -2013,8 +2063,8 @@ async fn accept_loop(
             // `dispatch_message` as "the actual stall guard". It is not one:
             // `dispatch_message` takes `&Outbox` and cannot touch the socket,
             // so no socket stall can make it late. Every server write now
-            // happens in `drain_and_flush` at the bottom of the read loop,
-            // which is not wrapped. **The hosted driver therefore has no stall
+            // happens in `run_circuit_writer`, which is not wrapped. **The
+            // hosted driver therefore has no stall
             // guard**, which happens to match the blocking driver and C — both
             // block in the write for as long as the peer takes. Whether to
             // keep that or restore a bound is an open decision, not an
@@ -2199,34 +2249,177 @@ pub(crate) fn is_peer_disconnect(kind: std::io::ErrorKind) -> bool {
     )
 }
 
-/// Drain every frame currently queued in the connection outbox into the
-/// socket buffer (in arrival order) and flush once. This is the single-owner
-/// drain that replaces every former out-of-band `writer.lock().await` write.
-/// Returns the number of wire bytes written, for `ServerStats::bytes_out`.
+/// The circuit's socket writer: the single drain owner that replaces every
+/// former out-of-band `writer.lock().await` write. It writes each frame into
+/// `sock` as it is queued and flushes where a flush is asked for, so a frame
+/// an out-of-loop producer flushed does not wait for the connection loop's
+/// read batch (see `super::outbox`).
 ///
-/// It is *not* the only place server bytes reach the socket, and the comment
-/// that used to say so was wrong: `handle_client` writes the unsolicited
-/// `CA_PROTO_VERSION` greeting directly before the loop starts, and the
-/// out-of-band monitor arm writes its first frame directly before draining the
-/// rest. What is genuinely single-owner is the *policy* those three share —
-/// `sock`'s innermost writer is a [`crate::server::send::RetryTransientAsync`],
-/// so all three inherit C's transient-failure handling without a branch.
+/// It is *not* the only place server bytes reach the socket: `handle_client`
+/// writes the unsolicited `CA_PROTO_VERSION` greeting directly before starting
+/// it. What is genuinely single-owner is the *policy* the two share — `sock`'s
+/// innermost writer is a [`crate::server::send::RetryTransientAsync`], so both
+/// inherit C's transient-failure handling without a branch.
 ///
-/// Batching is preserved: a whole dispatch burst (or a run of monitor
-/// frames) is written back-to-back before the single `flush`, so N framed
-/// replies still collapse to one TCP write.
+/// Batching is preserved: frames queued between two flushes are written
+/// back-to-back into the `BufWriter`, so N framed replies still collapse to
+/// one TCP write.
+///
+/// `stop` is looked at only between frames, and what was written is flushed
+/// before returning, so a stopped writer leaves the wire on a frame boundary.
 #[cfg(tokio_backend)]
-async fn drain_and_flush<W: AsyncWrite + Unpin>(
-    sock: &mut BufWriter<W>,
-    drain: &mut OutboxDrain,
-) -> std::io::Result<u64> {
-    let mut total = 0u64;
-    while let Some(frame) = drain.try_next() {
-        sock.write_all(&frame).await?;
-        total += frame.len() as u64;
+async fn run_circuit_writer<W: AsyncWrite + Unpin>(
+    mut sock: BufWriter<W>,
+    mut drain: OutboxDrain,
+    mut stop: tokio::sync::oneshot::Receiver<()>,
+) -> std::io::Result<()> {
+    // Frames written since the last flush. Their credit is released only once
+    // they are flushed, so the buffer's capacity is not backlog.
+    let mut held = Vec::new();
+    loop {
+        let next = tokio::select! {
+            biased;
+            _ = &mut stop => break,
+            next = drain.recv() => next,
+        };
+        let Some(next) = next else { break };
+        match next {
+            Drained::Frame(frame) => {
+                sock.write_all(&frame).await?;
+                held.push(frame);
+            }
+            flush @ (Drained::Flush | Drained::FlushAck(_)) => {
+                sock.flush().await?;
+                held.clear();
+                if let Drained::FlushAck(ack) = flush {
+                    let _ = ack.send(());
+                }
+            }
+        }
     }
     sock.flush().await?;
-    Ok(total)
+    Ok(())
+}
+
+/// The circuit's socket write half, counting into `ServerStats::bytes_out`
+/// and the circuit's [`CircuitActivity`] what each write puts on the wire, so
+/// a write cut off by an abort or an error still counts the part that went
+/// out.
+#[cfg(tokio_backend)]
+struct CountedWrites<W> {
+    inner: W,
+    stats: Option<Arc<super::stats::ServerStats>>,
+    activity: Arc<CircuitActivity>,
+}
+
+#[cfg(tokio_backend)]
+impl<W: AsyncWrite + Unpin> AsyncWrite for CountedWrites<W> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let me = self.get_mut();
+        let written = std::pin::Pin::new(&mut me.inner).poll_write(cx, buf);
+        if let std::task::Poll::Ready(Ok(n @ 1..)) = written {
+            me.activity.touch();
+            if let Some(stats) = &me.stats {
+                stats.bytes_out.fetch_add(n as u64, Ordering::Relaxed);
+            }
+        }
+        written
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+/// `handle_client`'s handle on its [`run_circuit_writer`].
+#[cfg(tokio_backend)]
+enum CircuitWriter {
+    Running {
+        task: WriterTask,
+        stop: tokio::sync::oneshot::Sender<()>,
+    },
+    /// The error the writer stopped on, which every later caller sees too.
+    Failed(std::io::Error),
+}
+
+/// Dropping it stops the writer, so an aborted circuit leaves no task holding
+/// its socket.
+#[cfg(tokio_backend)]
+struct WriterTask(epics_base_rs::runtime::task::TaskHandle<std::io::Result<()>>);
+
+#[cfg(tokio_backend)]
+impl Drop for WriterTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+#[cfg(tokio_backend)]
+impl CircuitWriter {
+    /// Wait until every frame queued in `outbox` before this call is on the
+    /// wire.
+    async fn flushed(&mut self, outbox: &Outbox) -> std::io::Result<()> {
+        match outbox.flushed().await {
+            Ok(()) => Ok(()),
+            Err(_) => Err(self.failed().await),
+        }
+    }
+
+    /// The error the writer stopped on; pending while it runs.
+    async fn failed(&mut self) -> std::io::Error {
+        let error = match self {
+            CircuitWriter::Failed(error) => return copy_error(error),
+            CircuitWriter::Running { task, .. } => match (&mut task.0).await {
+                Ok(Err(e)) => e,
+                // Every `Outbox` handle is gone, which the loop's own handle
+                // rules out.
+                Ok(Ok(())) => std::io::Error::other("the circuit writer ended on an open circuit"),
+                Err(join) => std::io::Error::other(join),
+            },
+        };
+        let seen = copy_error(&error);
+        *self = CircuitWriter::Failed(error);
+        seen
+    }
+
+    /// Stop the writer at its next frame boundary and wait until it has let
+    /// go of the socket. A peer that stopped reading gets the send timeout to
+    /// take the frame on the wire, then the writer is cut off mid-frame.
+    async fn stop(self) {
+        if let CircuitWriter::Running { mut task, stop } = self {
+            let _ = stop.send(());
+            if tokio::time::timeout(send_timeout(), &mut task.0)
+                .await
+                .is_err()
+            {
+                task.0.abort();
+                let _ = (&mut task.0).await;
+            }
+        }
+    }
+}
+
+/// `error` again, for a caller after the first: `io::Error` is not `Clone`.
+#[cfg(tokio_backend)]
+fn copy_error(error: &std::io::Error) -> std::io::Error {
+    match error.raw_os_error() {
+        Some(code) => std::io::Error::from_raw_os_error(code),
+        None => std::io::Error::new(error.kind(), error.to_string()),
+    }
 }
 
 /// A postponed request, held by the connection loop until what it waits
@@ -2274,8 +2467,8 @@ async fn handle_client<S>(
     audit: Option<crate::audit::AuditLogger>,
     conn_events: Option<broadcast::Sender<ServerConnectionEvent>>,
     // PR #592 dbServerStats: bytes_in/bytes_out counters. Incremented
-    // post-read (per accepted UDP/TCP buffer) and at each BufWriter
-    // flush (by inspecting `BufWriter::buffer().len()` before flush).
+    // post-read (per accepted UDP/TCP buffer) and per socket write
+    // (`CountedWrites`).
     // `None` skips all counter bookkeeping — used by the unit-test
     // dispatch fixtures that don't spin up a full CaServer.
     stats: Option<Arc<super::stats::ServerStats>>,
@@ -2307,13 +2500,13 @@ where
         None,
     );
     let (reader, write_half) = tokio::io::split(stream);
-    // The connection loop is the SOLE owner of the socket writer — no
+    // The circuit writer is the SOLE owner of the socket writer — no
     // `Arc<Mutex<..>>`, so no other task can write the socket. Bigger
     // BufWriter so a 100-PV batched response burst (~3 KB) fits without
     // auto-flushing mid-batch. The dispatch hot-path no longer writes the
-    // socket at all: handlers push framed bytes into `outbox`, and this
-    // loop drains that outbox into `sock` and flushes once per outer read
-    // iteration — turning N small TCP writes into one. Default 8 KB was hit
+    // socket at all: handlers push framed bytes into `outbox`, the writer
+    // copies them into `sock`, and this loop has it flush once per outer
+    // read iteration — turning N small TCP writes into one. Default 8 KB was hit
     // at ~330 responses; 64 KB covers the common bulk_caget(100) case with
     // headroom for follow-on monitor events queued in the same tick.
     // The write half is wrapped before it is buffered, so `BufWriter`'s spill,
@@ -2321,15 +2514,20 @@ where
     // `ENOBUFS` burst parks this circuit for 15 s and retries, where the bare
     // `write_all` used to return `Err` and `?` used to disconnect the client.
     // See `crate::server::send`.
+    let activity = Arc::new(CircuitActivity::new());
     let mut sock = BufWriter::with_capacity(
         64 * 1024,
-        crate::server::send::RetryTransientAsync::new(write_half),
+        crate::server::send::RetryTransientAsync::new(CountedWrites {
+            inner: write_half,
+            stats: stats.clone(),
+            activity: activity.clone(),
+        }),
     );
     // The single per-connection outbox. `outbox` is the cloneable producer
     // handle every emit site holds (dispatch handlers in this task, plus
-    // the spawned monitor / put-notify tasks); `outbox_drain` is owned only
-    // here. See `super::outbox` for the invariant this establishes.
-    let (outbox, mut outbox_drain) = crate::server::outbox::channel();
+    // the spawned monitor / put-notify tasks); `outbox_drain` goes to the
+    // circuit writer. See `super::outbox` for the invariant this establishes.
+    let (outbox, outbox_drain) = crate::server::outbox::channel();
     let mut state = ClientState::new(acf, tcp_port, db.clone());
     state.stats = stats.clone();
     #[cfg(feature = "cap-tokens")]
@@ -2365,6 +2563,11 @@ where
         sock.write_all(&hdr.to_bytes()).await?;
         sock.flush().await?;
     }
+    let (stop_writer, writer_stop) = tokio::sync::oneshot::channel();
+    let mut writer = CircuitWriter::Running {
+        task: WriterTask(conn_reactor.spawn(run_circuit_writer(sock, outbox_drain, writer_stop))),
+        stop: stop_writer,
+    };
 
     let mut reader = reader;
 
@@ -2428,7 +2631,7 @@ where
                             // the outbox; drain them to the socket now so the
                             // re-evaluation reaches the client promptly (RSRV
                             // flushes these immediately).
-                            if let Err(e) = drain_and_flush(&mut sock, &mut outbox_drain).await {
+                            if let Err(e) = writer.flushed(&outbox).await {
                                 if is_peer_disconnect(e.kind()) {
                                     break 'client_loop Ok(());
                                 }
@@ -2464,7 +2667,7 @@ where
                             .await
                                 > 0
                             {
-                                if let Err(e) = drain_and_flush(&mut sock, &mut outbox_drain).await {
+                                if let Err(e) = writer.flushed(&outbox).await {
                                     if is_peer_disconnect(e.kind()) {
                                         break 'client_loop Ok(());
                                     }
@@ -2484,16 +2687,12 @@ where
                 // client that keeps sending cannot hold its own replies back.
                 settled = state.parked_reads.next_settled() => {
                     if let Err(e) = answer_parked_reads(&mut state, &outbox, settled) {
-                        let _ = drain_and_flush(&mut sock, &mut outbox_drain).await;
+                        let _ = writer.flushed(&outbox).await;
                         print_forcing_disconnect(peer);
                         break 'client_loop Err(e);
                     }
-                    match drain_and_flush(&mut sock, &mut outbox_drain).await {
-                        Ok(out) => {
-                            if let Some(ref s) = stats {
-                                s.bytes_out.fetch_add(out, std::sync::atomic::Ordering::Relaxed);
-                            }
-                        }
+                    match writer.flushed(&outbox).await {
+                        Ok(()) => {}
                         Err(e) if is_peer_disconnect(e.kind()) => break 'client_loop Ok(()),
                         Err(e) => break 'client_loop Err(e.into()),
                     }
@@ -2515,7 +2714,7 @@ where
                     .await;
                     None
                 }
-                read = read_with_optional_timeout(&mut reader, &mut buf[..room], inactivity), if room > 0 => {
+                read = read_with_optional_timeout(&mut reader, &mut buf[..room], inactivity, &activity), if room > 0 => {
                     match read {
                         Ok(Ok(n)) => Some(n),
                         Ok(Err(e)) if is_peer_disconnect(e.kind()) => break 'client_loop Ok(()),
@@ -2534,41 +2733,14 @@ where
                         }
                     }
                 }
-                // Out-of-band frame produced by a spawned monitor / put-notify
-                // task while this loop was idle on the socket read. This arm is
-                // last (biased) so socket reads keep priority; under a steady
-                // read stream these frames still flush via the per-burst drain
-                // at the bottom of the loop, so they are never starved.
-                frame = outbox_drain.recv() => {
-                    match frame {
-                        Some(frame) => {
-                            let first = frame.len() as u64;
-                            if let Err(e) = sock.write_all(&frame).await {
-                                if is_peer_disconnect(e.kind()) {
-                                    break 'client_loop Ok(());
-                                }
-                                break 'client_loop Err(e.into());
-                            }
-                            match drain_and_flush(&mut sock, &mut outbox_drain).await {
-                                Ok(rest) => {
-                                    if let Some(ref s) = stats {
-                                        s.bytes_out.fetch_add(
-                                            first + rest,
-                                            std::sync::atomic::Ordering::Relaxed,
-                                        );
-                                    }
-                                }
-                                Err(e) if is_peer_disconnect(e.kind()) => {
-                                    break 'client_loop Ok(());
-                                }
-                                Err(e) => break 'client_loop Err(e.into()),
-                            }
-                            continue;
-                        }
-                        // Unreachable while this loop still holds `outbox`; a
-                        // `None` would mean every producer handle was dropped.
-                        None => break 'client_loop Ok(()),
+                // The writer stopped on a socket error while this loop was idle
+                // on the read, writing what a spawned monitor / put-notify task
+                // flushed.
+                e = writer.failed() => {
+                    if is_peer_disconnect(e.kind()) {
+                        break 'client_loop Ok(());
                     }
+                    break 'client_loop Err(e.into());
                 }
             };
             if let Some(n) = read {
@@ -2631,7 +2803,7 @@ where
                             // subscription it holds; only this message is lost.
                             parsed_any = true;
                             report_gate_error(&outbox, &state, peer, &err);
-                            let _ = drain_and_flush(&mut sock, &mut outbox_drain).await;
+                            let _ = writer.flushed(&outbox).await;
                             continue;
                         }
                         Gate::TearDown { error, reason } => {
@@ -2639,7 +2811,7 @@ where
                             if let Some(err) = error {
                                 report_gate_error(&outbox, &state, peer, &err);
                             }
-                            let _ = drain_and_flush(&mut sock, &mut outbox_drain).await;
+                            let _ = writer.flushed(&outbox).await;
                             print_forcing_disconnect(peer);
                             break 'client_loop Err(reason);
                         }
@@ -2695,7 +2867,7 @@ where
                         // Regression defence: dispatch_message no longer
                         // flushes per response (batched at the bottom of
                         // this outer loop). On a propagated dispatch
-                        // error, exit-via-`?` would drop the BufWriter
+                        // error, exit-via-`?` would stop the writer
                         // before the outer flush fires, so any responses
                         // queued by earlier successful handlers in this
                         // batch — or by an error-path `send_cmd_error`
@@ -2704,7 +2876,7 @@ where
                         // the client sees them; ignore errors here
                         // because the underlying TCP is most likely
                         // already broken (which is why dispatch failed).
-                        let _ = drain_and_flush(&mut sock, &mut outbox_drain).await;
+                        let _ = writer.flushed(&outbox).await;
                         print_forcing_disconnect(peer);
                         break 'client_loop Err(e);
                     }
@@ -2720,32 +2892,27 @@ where
                 // (server-side throughput floor was ~2.2µs/PV due to
                 // per-message flush; this collapses it to one syscall).
                 //
-                // The drain also picks up any monitor / put-notify frames
-                // pushed by spawned tasks during this dispatch burst, so those
-                // ride out on the same syscall.
+                // The flush also covers any monitor / put-notify frames
+                // pushed by spawned tasks during this dispatch burst and not
+                // yet flushed by them, so those ride out on the same syscall.
                 //
                 // Errors here mean the TCP write stalled / peer closed —
                 // surface as the read loop's normal disconnect path.
                 //
                 // PR #592 dbServerStats: bytes_out mirrors RSRV's
-                // `caServerBytes_out`. `drain_and_flush` returns the exact
-                // wire-byte count that left on this syscall. CA-over-TLS counts
-                // post-decrypt plaintext since the rustls layer wraps the
-                // BufWriter externally — matches what the comment on
-                // ServerStats::bytes_out already documents.
-                match drain_and_flush(&mut sock, &mut outbox_drain).await {
-                    Ok(pending_out) => {
-                        if let Some(ref s) = stats {
-                            s.bytes_out
-                                .fetch_add(pending_out, std::sync::atomic::Ordering::Relaxed);
-                        }
-                    }
+                // `caServerBytes_out`; `CountedWrites` counts it per write.
+                // CA-over-TLS counts post-decrypt plaintext since the rustls
+                // layer wraps the BufWriter externally — matches what the
+                // comment on ServerStats::bytes_out already documents.
+                match writer.flushed(&outbox).await {
+                    Ok(()) => {}
                     Err(e) if is_peer_disconnect(e.kind()) => break 'client_loop Ok(()),
                     Err(e) => break 'client_loop Err(e.into()),
                 }
             }
         }
     };
+    writer.stop().await;
 
     // Cleanup: cancel all subscriptions. PR #592 dbServerStats —
     // emit `SubscriptionClosed` for each so the running close-count
@@ -7688,12 +7855,15 @@ pub(crate) async fn run_circuit_monitors(
     use epics_base_rs::server::event_queue::CircuitEvent;
     // The connection loop aborts this task when the circuit ends.
     let _closed = CloseReplies(&events);
+    let mut owed = false;
     loop {
-        let (context, event) = match std::future::poll_fn(|cx| events.poll_next(cx)).await {
+        let next = std::future::poll_fn(|cx| events.poll_next(cx));
+        let (context, event) = match outbox.flush_before_waiting(&mut owed, next).await {
             CircuitEvent::Event { context, event, .. } => (context, event),
             CircuitEvent::Reply { frame, hold } => {
                 if !frame.is_empty() {
                     outbox.push(frame);
+                    owed = true;
                 }
                 drop(hold);
                 continue;
@@ -7716,6 +7886,7 @@ pub(crate) async fn run_circuit_monitors(
                 deliver_record_field_event(m, event, &outbox, minor.get()).await
             }
         }
+        owed = true;
     }
 }
 
@@ -8604,8 +8775,10 @@ async fn run_write_notify_queue(
     minor: CircuitMinor,
 ) {
     let mut pending: Vec<PendingWriteNotify> = Vec::new();
+    let mut owed = false;
     loop {
-        match next_write_notify_step(&mut pending, &mut control).await {
+        let next = next_write_notify_step(&mut pending, &mut control);
+        match outbox.flush_before_waiting(&mut owed, next).await {
             WriteNotifyStep::Control(None) => break,
             WriteNotifyStep::Control(Some(WriteNotifyQueueMsg::Queue(p))) => pending.push(*p),
             WriteNotifyStep::Control(Some(WriteNotifyQueueMsg::FreeChannel(sid))) => {
@@ -8615,6 +8788,7 @@ async fn run_write_notify_queue(
             WriteNotifyStep::Control(Some(WriteNotifyQueueMsg::Retire(sids, done))) => {
                 for (mut p, ended) in take_owed_writes(&mut pending, |p| sids.contains(&p.sid)) {
                     let _ = p.settle(ended, &outbox, &events, minor.get());
+                    owed = true;
                 }
                 let _ = done.send(());
             }
@@ -8625,6 +8799,7 @@ async fn run_write_notify_queue(
                 // An unshippable reply (16k-array boundary) is dropped, as it
                 // is on the blocking driver's owner; the circuit keeps serving.
                 let _ = p.settle(res, &outbox, &events, minor.get());
+                owed = true;
             }
         }
     }
@@ -9328,8 +9503,8 @@ fn refuse_install(
     ))
 }
 
-/// Push a `CA_PROTO_ERROR` reply into the connection outbox. The connection
-/// loop is the sole owner that drains the outbox to the socket, so this
+/// Push a `CA_PROTO_ERROR` reply into the connection outbox. The circuit's
+/// writer is the sole owner that drains the outbox to the socket, so this
 /// only builds one framed message and enqueues it — see
 /// [`build_ca_error_frame`]. Synchronous: enqueueing is a pure buffer
 /// push with no I/O, so callers do not `.await` it.
@@ -19433,5 +19608,387 @@ mod bind_tcp_set_tests {
     async fn an_empty_set_fails() {
         let r = bind_tcp_set(vec![Ipv4Addr::new(192, 0, 2, 1)], 0).await;
         assert!(r.is_err());
+    }
+}
+
+#[cfg(all(test, tokio_backend))]
+mod circuit_writer_tests {
+    //! What the peer and the operator see when the circuit's socket writer
+    //! fails or stops.
+    use super::*;
+    use crate::audit::{AuditLogger, AuditSink, AuditWriter};
+    use epics_base_rs::error::CaError;
+    use epics_base_rs::server::database::PvDatabase;
+    use epics_base_rs::types::EpicsValue;
+    use fact_budget::FACT_BUDGET;
+    use std::pin::Pin;
+    use std::sync::atomic::AtomicUsize;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncReadExt, DuplexStream, ReadBuf};
+    use tokio::sync::mpsc;
+
+    /// The server end of a circuit whose writes fail once `budget` more bytes
+    /// have been accepted.
+    struct Budgeted {
+        io: DuplexStream,
+        budget: Arc<AtomicUsize>,
+    }
+
+    impl AsyncRead for Budgeted {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.io).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for Budgeted {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let left = self.budget.load(Ordering::SeqCst);
+            if left == 0 {
+                return Poll::Ready(Err(std::io::Error::other("injected write failure")));
+            }
+            let take = buf.len().min(left);
+            let written = Pin::new(&mut self.io).poll_write(cx, &buf[..take]);
+            if let Poll::Ready(Ok(n)) = written {
+                self.budget.fetch_sub(n, Ordering::SeqCst);
+            }
+            written
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.io).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.io).poll_shutdown(cx)
+        }
+    }
+
+    /// The peer's end of a circuit, counting what it reads.
+    struct Peer {
+        io: DuplexStream,
+        received: usize,
+    }
+
+    impl AsyncRead for Peer {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let before = buf.filled().len();
+            let read = Pin::new(&mut self.io).poll_read(cx, buf);
+            self.received += buf.filled().len() - before;
+            read
+        }
+    }
+
+    impl AsyncWrite for Peer {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.io).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.io).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.io).poll_shutdown(cx)
+        }
+    }
+
+    /// Audit lines, in the order the logger wrote them.
+    struct Lines(mpsc::UnboundedSender<String>);
+
+    #[async_trait::async_trait]
+    impl AuditWriter for Lines {
+        async fn write_line(&self, line: &str) {
+            let _ = self.0.send(line.to_string());
+        }
+    }
+
+    struct Circuit {
+        client: Peer,
+        server: tokio::task::JoinHandle<CaResult<()>>,
+        audit: mpsc::UnboundedReceiver<String>,
+        budget: Arc<AtomicUsize>,
+        stats: Arc<super::super::stats::ServerStats>,
+        _acf_reload: broadcast::Sender<()>,
+    }
+
+    fn circuit(db: Arc<PvDatabase>, duplex: usize) -> Circuit {
+        let budget = Arc::new(AtomicUsize::new(usize::MAX));
+        let (lines, audit) = mpsc::unbounded_channel();
+        let logger = AuditLogger::new(
+            &epics_base_rs::runtime::task::Reactor::current().expect("test runtime"),
+            AuditSink::Custom(Box::new(Lines(lines))),
+        );
+        let (acf_reload, acf_reload_rx) = broadcast::channel::<()>(4);
+        let stats = Arc::new(super::super::stats::ServerStats::default());
+        let (client, server_io) = tokio::io::duplex(duplex);
+        let server = tokio::spawn(handle_client(
+            Budgeted {
+                io: server_io,
+                budget: budget.clone(),
+            },
+            "127.0.0.1:55501".parse().unwrap(),
+            db,
+            epics_base_rs::server::access_security::new_acf_cell(None),
+            acf_reload_rx,
+            5064,
+            None,
+            None,
+            Some(logger),
+            None,
+            Some(stats.clone()),
+            #[cfg(feature = "cap-tokens")]
+            None,
+            #[cfg(feature = "cap-tokens")]
+            None,
+        ));
+        Circuit {
+            client: Peer {
+                io: client,
+                received: 0,
+            },
+            server,
+            audit,
+            budget,
+            stats,
+            _acf_reload: acf_reload,
+        }
+    }
+
+    /// The circuit's `disconnect` audit line.
+    async fn disconnect_line(audit: &mut mpsc::UnboundedReceiver<String>) -> String {
+        loop {
+            let line = tokio::time::timeout(FACT_BUDGET, audit.recv())
+                .await
+                .expect("a disconnect audit line")
+                .expect("the audit logger is up");
+            if line.contains("\"ev\":\"disconnect\"") {
+                return line;
+            }
+        }
+    }
+
+    /// One whole frame: its header and its payload.
+    async fn read_frame(client: &mut Peer) -> (CaHeader, Vec<u8>) {
+        let mut head = vec![0u8; CaHeader::SIZE];
+        tokio::time::timeout(FACT_BUDGET, client.read_exact(&mut head))
+            .await
+            .expect("a frame within the budget")
+            .expect("a frame header");
+        if u16::from_be_bytes([head[2], head[3]]) == 0xffff {
+            let mut ext = [0u8; 8];
+            client.read_exact(&mut ext).await.expect("extended header");
+            head.extend_from_slice(&ext);
+        }
+        let (hdr, _) = CaHeader::from_bytes_extended(&head).expect("header parses");
+        let mut payload = vec![0u8; hdr.actual_postsize()];
+        tokio::time::timeout(FACT_BUDGET, client.read_exact(&mut payload))
+            .await
+            .expect("a payload within the budget")
+            .expect("a frame payload");
+        (hdr, payload)
+    }
+
+    /// A circuit that subscribed `pv` as DBR_DOUBLE × `count` and read its
+    /// initial value.
+    async fn monitoring(c: &mut Circuit, pv: &str, count: u32) {
+        let (hdr, _) = read_frame(&mut c.client).await;
+        assert_eq!(hdr.cmmd, CA_PROTO_VERSION, "the greeting comes first");
+        c.client
+            .write_all(&super::non_graceful_disconnect_teardown_tests::version_frame())
+            .await
+            .expect("write VERSION");
+        c.client
+            .write_all(&super::non_graceful_disconnect_teardown_tests::create_chan_frame(1, pv))
+            .await
+            .expect("write CREATE_CHAN");
+        let sid = loop {
+            let (hdr, _) = read_frame(&mut c.client).await;
+            if hdr.cmmd == CA_PROTO_CREATE_CHAN {
+                break hdr.available;
+            }
+        };
+        let mut h = CaHeader::new(CA_PROTO_EVENT_ADD);
+        h.data_type = epics_base_rs::types::DBR_DOUBLE;
+        h.cid = sid;
+        h.available = 7;
+        h.set_payload_size(16, count, CA_MINOR_VERSION)
+            .expect("modern peer accepts the extended header");
+        let mut add = h.to_bytes().to_vec();
+        add.extend_from_slice(&[0; 12]);
+        add.extend_from_slice(&3u16.to_be_bytes());
+        add.extend_from_slice(&[0; 2]);
+        c.client.write_all(&add).await.expect("write EVENT_ADD");
+        loop {
+            let (hdr, _) = read_frame(&mut c.client).await;
+            if hdr.cmmd == CA_PROTO_EVENT_ADD {
+                return;
+            }
+        }
+    }
+
+    /// A circuit that ends while a monitor frame is half on the wire still
+    /// hands its peer the whole frame: a cut frame would leave a partial
+    /// message as the last thing the peer reads.
+    #[tokio::test]
+    async fn a_circuit_ending_mid_frame_finishes_the_frame_first() {
+        const COUNT: usize = 2000;
+        let db = Arc::new(PvDatabase::new());
+        db.add_pv("BIG", EpicsValue::DoubleArray(vec![0.0; COUNT].into()))
+            .await
+            .expect("add pv");
+        // A pipe far smaller than the frame, so the frame is still being
+        // written when the peer hangs up.
+        let mut c = circuit(db.clone(), 1024);
+        monitoring(&mut c, "BIG", COUNT as u32).await;
+
+        db.find_pv("BIG")
+            .expect("pv")
+            .set(EpicsValue::DoubleArray(vec![1.0; COUNT].into()));
+        let mut head = [0u8; CaHeader::SIZE];
+        tokio::time::timeout(FACT_BUDGET, c.client.read_exact(&mut head))
+            .await
+            .expect("the monitor frame starts within the budget")
+            .expect("the monitor frame's header");
+        let (hdr, _) = CaHeader::from_bytes_extended(&head).expect("header parses");
+        assert_eq!(hdr.cmmd, CA_PROTO_EVENT_ADD);
+        let payload = hdr.actual_postsize();
+        assert!(payload > 1024 * 2, "the frame must outsize the pipe");
+        c.client.shutdown().await.expect("hang up");
+
+        let mut rest = Vec::new();
+        tokio::time::timeout(FACT_BUDGET, c.client.read_to_end(&mut rest))
+            .await
+            .expect("the circuit closes within the budget")
+            .expect("read to the close");
+        assert_eq!(
+            rest.len(),
+            payload,
+            "the peer must read the frame's whole {payload}-byte payload before the close"
+        );
+    }
+
+    /// A peer that hangs up and stops reading mid-frame does not hold the
+    /// circuit's teardown: the writer gets the send timeout to finish the
+    /// frame, then is cut off.
+    #[tokio::test]
+    async fn a_circuit_ending_mid_frame_to_a_peer_that_stopped_reading_still_ends() {
+        const COUNT: usize = 2000;
+        let db = Arc::new(PvDatabase::new());
+        db.add_pv("BIG", EpicsValue::DoubleArray(vec![0.0; COUNT].into()))
+            .await
+            .expect("add pv");
+        let mut c = circuit(db.clone(), 1024);
+        monitoring(&mut c, "BIG", COUNT as u32).await;
+
+        db.find_pv("BIG")
+            .expect("pv")
+            .set(EpicsValue::DoubleArray(vec![1.0; COUNT].into()));
+        let mut head = [0u8; CaHeader::SIZE];
+        tokio::time::timeout(FACT_BUDGET, c.client.read_exact(&mut head))
+            .await
+            .expect("the monitor frame starts within the budget")
+            .expect("the monitor frame's header");
+        c.client.shutdown().await.expect("hang up");
+
+        tokio::time::timeout(send_timeout() + FACT_BUDGET, c.server)
+            .await
+            .expect("the circuit ends though its peer reads nothing more")
+            .expect("handle_client does not panic")
+            .expect("a hang-up ends the circuit cleanly");
+        // What the cut-off writer got onto the wire still counts.
+        let mut rest = Vec::new();
+        c.client
+            .read_to_end(&mut rest)
+            .await
+            .expect("read to the close");
+        assert_eq!(
+            c.stats.bytes_out.load(Ordering::Relaxed),
+            c.client.received as u64
+        );
+    }
+
+    /// Bytes a write put on the wire before it failed count in `bytes_out`:
+    /// the counter is what the peers got.
+    #[tokio::test]
+    async fn bytes_out_counts_what_reached_the_peer_before_a_write_failed() {
+        let db = Arc::new(PvDatabase::new());
+        db.add_pv("PV", EpicsValue::Double(0.0))
+            .await
+            .expect("add pv");
+        let mut c = circuit(db, 8192);
+        let (hdr, _) = read_frame(&mut c.client).await;
+        assert_eq!(hdr.cmmd, CA_PROTO_VERSION, "the greeting comes first");
+        // Less than the CREATE_CHAN replies, which then fail part way.
+        c.budget.store(20, Ordering::SeqCst);
+        c.client
+            .write_all(&super::non_graceful_disconnect_teardown_tests::version_frame())
+            .await
+            .expect("write VERSION");
+        c.client
+            .write_all(&super::non_graceful_disconnect_teardown_tests::create_chan_frame(1, "PV"))
+            .await
+            .expect("write CREATE_CHAN");
+
+        let mut rest = Vec::new();
+        tokio::time::timeout(FACT_BUDGET, c.client.read_to_end(&mut rest))
+            .await
+            .expect("the circuit closes within the budget")
+            .expect("read to the close");
+        assert_eq!(rest.len(), 20, "the failing write's part reached the peer");
+        assert_eq!(
+            c.stats.bytes_out.load(Ordering::Relaxed),
+            c.client.received as u64
+        );
+    }
+
+    /// A write failure met while answering a refused message ends the circuit
+    /// as the error it is, not as a peer that hung up.
+    #[tokio::test]
+    async fn a_write_failure_answering_a_refused_message_is_audited_as_an_error() {
+        let mut c = circuit(Arc::new(PvDatabase::new()), 8192);
+        let mut greeting = [0u8; CaHeader::SIZE];
+        tokio::time::timeout(FACT_BUDGET, c.client.read_exact(&mut greeting))
+            .await
+            .expect("the greeting within the budget")
+            .expect("the greeting");
+        c.budget.store(0, Ordering::SeqCst);
+        // Before its VERSION the peer is minor 0, so this ECHO is refused.
+        c.client
+            .write_all(&CaHeader::new(CA_PROTO_ECHO).to_bytes())
+            .await
+            .expect("write the ECHO");
+
+        let ended = tokio::time::timeout(FACT_BUDGET, c.server)
+            .await
+            .expect("the circuit ends within the budget")
+            .expect("handle_client does not panic");
+        match ended {
+            Err(CaError::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::Other, "{e}"),
+            other => panic!("the circuit must end on the write error, got {other:?}"),
+        }
+        let line = disconnect_line(&mut c.audit).await;
+        assert!(line.contains("\"result\":\"error\""), "{line}");
     }
 }

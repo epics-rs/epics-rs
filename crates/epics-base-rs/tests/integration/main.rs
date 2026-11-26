@@ -968,6 +968,7 @@ mod sseq_db_link_put_posts_like_softioc;
 mod sseq_dly_quantization;
 mod sseq_dol_source_typed;
 mod sseq_dol_string;
+mod sseq_filtered_lnk_puts_the_filtered_count;
 mod sseq_internal_put_coerces;
 mod sseq_link_put_leaves_the_other_status;
 mod sseq_link_status_at_put;

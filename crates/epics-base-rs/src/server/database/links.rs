@@ -4205,8 +4205,9 @@ impl PvDatabase {
     ///   a braced `{pva:…}` or `{ca:…}` is a `JSON_LINK`, which C's own type
     ///   switches send to their `default:` arm.
     ///
-    /// `no_elements` is [`RecordCell::no_elements`](crate::server::record::RecordCell::no_elements),
-    /// `dbNameToAddr`'s, with no filter applied.
+    /// [`OutTarget::no_elements`] is [`RecordCell::no_elements`](crate::server::record::RecordCell::no_elements),
+    /// `dbNameToAddr`'s, with no filter applied; [`OutTarget::final_elements`]
+    /// is [`Self::link_nelements`], `dbGetNelements`'s, through the filters.
     pub(crate) fn resolve_out_target(&self, link: &crate::server::record::ParsedLink) -> OutTarget {
         use crate::server::record::LinkType;
         let external = |link: crate::server::record::ExternalRef<'_>, link_type: LinkType| {
@@ -4216,13 +4217,18 @@ impl PvDatabase {
                 // served as (`dbCaGetLinkDBFtype` → the channel's type): a
                 // remote `DBF_MENU` or link field arrives as `DBF_ENUM` or
                 // `DBF_STRING`.
-                Some(m) => OutTarget {
-                    field_type: m.dbf_type.map(|t| link_dbf_to_field_type(t).dbf_code()),
-                    dbr_field_type: m.dbf_type.map(link_dbf_to_field_type),
-                    element_count: m.element_count.unwrap_or(1).max(1),
-                    link_type,
-                    put_admitted,
-                },
+                Some(m) => {
+                    // `dbCaGetNelements` answers both counts.
+                    let n = m.element_count.unwrap_or(1).max(1);
+                    OutTarget {
+                        field_type: m.dbf_type.map(|t| link_dbf_to_field_type(t).dbf_code()),
+                        dbr_field_type: m.dbf_type.map(link_dbf_to_field_type),
+                        no_elements: n,
+                        final_elements: n,
+                        link_type,
+                        put_admitted,
+                    }
+                }
                 None => OutTarget {
                     link_type,
                     put_admitted,
@@ -4244,6 +4250,9 @@ impl PvDatabase {
                     // Non-local ⇒ CA link in C (`dbInitLink` locality).
                     LinkTarget::External => return external(db.external(), LinkType::Ca),
                 };
+                // Taken before the target lock: a cache miss resolves the
+                // address, which reads the target.
+                let final_elements = self.link_nelements(link).map_or(1, |n| n.max(1));
                 let guard = target.read();
                 // `dbNameToAddr` of a `$` address: a string's `DBF_CHAR` view,
                 // or a link's own type, read as `DBR_CHAR`, and its
@@ -4253,7 +4262,8 @@ impl PvDatabase {
                         Some(view) => OutTarget {
                             field_type: Some(view.field_type),
                             dbr_field_type: Some(DbFieldType::Char),
-                            element_count: (view.no_elements as i64).max(1),
+                            no_elements: (view.no_elements as i64).max(1),
+                            final_elements,
                             link_type: LinkType::Db,
                             put_admitted: true,
                         },
@@ -4265,11 +4275,12 @@ impl PvDatabase {
                     &addressed.field,
                     Some(guard.record.as_ref()),
                 );
-                let element_count = target.no_elements(&addressed.field).map_or(1, i64::from);
+                let no_elements = target.no_elements(&addressed.field).map_or(1, i64::from);
                 OutTarget {
                     field_type,
                     dbr_field_type: field_type.and_then(crate::types::DbfCode::served_type),
-                    element_count: element_count.max(1),
+                    no_elements: no_elements.max(1),
+                    final_elements,
                     link_type: LinkType::Db,
                     put_admitted: true,
                 }
@@ -4286,7 +4297,8 @@ impl PvDatabase {
             crate::server::record::ParsedLink::State(_) => OutTarget {
                 field_type: Some(crate::types::DbfCode::Short),
                 dbr_field_type: Some(DbFieldType::Short),
-                element_count: 1,
+                no_elements: 1,
+                final_elements: 1,
                 link_type: LinkType::Json,
                 put_admitted: true,
             },

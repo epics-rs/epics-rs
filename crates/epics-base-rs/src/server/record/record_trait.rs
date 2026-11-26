@@ -994,9 +994,16 @@ pub struct OutTarget {
     /// [`Self::field_type`] is served as, except at a `$` address, which is
     /// `DBR_CHAR` while a link keeps its `DBF_xxLINK` (`dbAccess.c:690-695`).
     pub dbr_field_type: Option<DbFieldType>,
-    /// Target field's element capacity — C `no_elements` / `dbCaGetNelements`.
-    /// `1` when unresolved, matching C's `n_elements = 1` initializer.
-    pub element_count: i64,
+    /// C `dbNameToAddr`'s `no_elements`, no filter applied, or
+    /// `dbCaGetNelements` for an external link: the count device support and
+    /// `sCalcoutRecord.c` `fetch_values` (:898, :903) size by. `1` when
+    /// unresolved, matching C's `n_elements = 1` initializer.
+    pub no_elements: i64,
+    /// C `dbGetNelements` (`dbLink.c:297`): `dbChannelFinalElements`, after the
+    /// link's filters (`dbDbLink.c:157-162`), or `dbCaGetNelements` for an
+    /// external link — the count `sseqRecord.c` sizes `DOLn` and `LNKn` by
+    /// (:683, :760). `1` where C's call fails.
+    pub final_elements: i64,
     /// C `plink->type` once `dbInitLink` has run, the value every
     /// `plink->type == CA_LINK` / `CONSTANT` test in device support reads
     /// (`devsCalcoutSoft.c:78`, `:113`, `sseqRecord.c:717`,
@@ -1019,7 +1026,8 @@ impl OutTarget {
     pub const UNRESOLVED: Self = Self {
         field_type: None,
         dbr_field_type: None,
-        element_count: 1,
+        no_elements: 1,
+        final_elements: 1,
         link_type: LinkType::Constant,
         put_admitted: true,
     };

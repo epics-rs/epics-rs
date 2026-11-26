@@ -1689,7 +1689,7 @@ impl Record for SseqRecord {
             | DbfCode::Fwdlink => Some(LinkReadAs::String),
             DbfCode::Char | DbfCode::UChar => Some(LinkReadAs::CharArrayAsString {
                 // C `if (n_elements>40) n_elements=40` against `char s[40]`.
-                max_elements: source.element_count.clamp(1, SSEQ_STRING_SIZE as i64) as usize,
+                max_elements: source.final_elements.clamp(1, SSEQ_STRING_SIZE as i64) as usize,
             }),
             DbfCode::Short
             | DbfCode::UShort
@@ -1768,10 +1768,10 @@ impl Record for SseqRecord {
             | DbfCode::Outlink
             | DbfCode::Fwdlink => Some(EpicsValue::String(step.str_val.clone())),
             DbfCode::Char | DbfCode::UChar => {
-                if target.element_count > 1 {
+                if target.final_elements > 1 {
                     // C puts `n` bytes straight out of the 40-byte `s`, so the
                     // string is NUL-padded out to the requested count.
-                    let n = target.element_count.min(SSEQ_STRING_SIZE as i64) as usize;
+                    let n = target.final_elements.min(SSEQ_STRING_SIZE as i64) as usize;
                     let mut buf = step.str_val.as_bytes().to_vec();
                     buf.resize(n, 0);
                     Some(EpicsValue::CharArray(buf.into()))

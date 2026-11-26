@@ -2532,7 +2532,7 @@ impl Record for AcalcoutRecord {
         if link_field != "OUT" {
             return staged;
         }
-        if staged.count() > 1 && target.element_count > 1 {
+        if staged.count() > 1 && target.no_elements > 1 {
             return staged;
         }
         let scalar = if self.dopt == 1 { "OVAL" } else { "VAL" };

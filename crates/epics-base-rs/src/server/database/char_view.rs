@@ -413,6 +413,32 @@ impl TextRoute {
     }
 }
 
+/// [`TextRoute`] as a DB link reads it: `dbDbGetValue` reads one element of
+/// an unfiltered field outside `dbGet`, through `dbFastGetConvertRoutine`,
+/// which has no row for a link type (`dbDbLink.c:185-200`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LinkTextRoute {
+    /// `dbGet`'s, for every request.
+    Get(TextRoute),
+    /// A link field with neither `$` nor a filter: `S_db_badDbrtype` for a
+    /// one-element request, [`TextRoute::Link`] for any other.
+    BareLink,
+}
+
+impl LinkTextRoute {
+    /// The route `read_as` is answered through, `None` for `S_db_badDbrtype`.
+    pub(crate) fn of_request(
+        self,
+        read_as: crate::server::record::LinkReadAs,
+    ) -> Option<TextRoute> {
+        match self {
+            LinkTextRoute::Get(route) => Some(route),
+            LinkTextRoute::BareLink if read_as.one_element() => None,
+            LinkTextRoute::BareLink => Some(TextRoute::Link),
+        }
+    }
+}
+
 /// One request type [`TextRoute::read`] accepted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TextRead {

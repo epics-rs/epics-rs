@@ -1574,7 +1574,7 @@ enum CachedAnswer {
         final_no_elements: u32,
         final_field_type: Option<crate::types::DbFieldType>,
         chain: Option<std::sync::Arc<FilterChain>>,
-        text_route: Option<crate::server::database::char_view::TextRoute>,
+        text_route: Option<crate::server::database::char_view::LinkTextRoute>,
     },
     Shadowed {
         pv: std::sync::Arc<crate::server::pv::ProcessVariable>,

@@ -2465,7 +2465,7 @@ struct MultiInputLink<'a> {
     val_field: &'static str,
     parsed: &'a crate::server::record::ParsedLink,
     /// The text route of the target the fetch resolved `parsed` to.
-    text_route: Option<super::char_view::TextRoute>,
+    text_route: Option<super::char_view::LinkTextRoute>,
     /// [`Record::input_link_request`](crate::server::record::Record::input_link_request) for the link — C's `dbrType` argument
     /// to `dbGetLink`.
     request: crate::server::record::InputLinkRequest,
@@ -11293,6 +11293,11 @@ impl PvDatabase {
         render: Option<crate::server::record::record_instance::SourceRender>,
     ) -> bool {
         if !link_fetch_converts(request, fetch) {
+            if let crate::server::recgbl::simm::LinkFetch::Value(value) = &*fetch
+                && self.refuses_native(link, value)
+            {
+                *fetch = crate::server::recgbl::simm::LinkFetch::Failed;
+            }
             return false;
         }
         self.convert_link_value(reader, link_field, link, request, fetch, render)

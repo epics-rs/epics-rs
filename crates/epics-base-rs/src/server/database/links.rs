@@ -138,7 +138,7 @@ pub(crate) enum ReadLink<'a> {
     /// [`ResolvedTarget::text_route`]: crate::server::record::record_instance::ResolvedTarget::text_route
     Resolved(
         &'a crate::server::record::ParsedLink,
-        Option<super::char_view::TextRoute>,
+        Option<super::char_view::LinkTextRoute>,
     ),
     /// Not resolved by the caller: a conversion resolves it.
     Unresolved(&'a crate::server::record::ParsedLink),
@@ -274,16 +274,17 @@ fn char_bytes_as_string(value: &EpicsValue, max_elements: usize) -> Option<PvStr
     Some(PvString::from_bytes(text[..end].to_vec()))
 }
 
-/// C `dbGet` of a `$` address on a link or an attribute: `getLinkValue` /
-/// `getAttrValue` answer `read_as` from the text (`dbAccess.c:944-952`), so
-/// `image`, its `DBR_CHAR` read, is never what the request converts. `None`
-/// is `S_db_badDbrtype`.
+/// C `dbGet` of a link or an attribute: `getLinkValue` / `getAttrValue`
+/// answer `read_as` from the text (`dbAccess.c:944-952`), so `image`, the
+/// text or its `$` `DBR_CHAR` read, is never what the request converts.
+/// `None` is `S_db_badDbrtype`.
 fn text_route_read(
-    route: super::char_view::TextRoute,
+    route: super::char_view::LinkTextRoute,
     read_as: crate::server::record::LinkReadAs,
     image: EpicsValue,
 ) -> Option<EpicsValue> {
     use crate::server::record::LinkReadAs;
+    let route = route.of_request(read_as)?;
     let text = super::char_view::text_of(&image);
     match read_as {
         LinkReadAs::Native => Some(image),
@@ -1215,7 +1216,7 @@ impl PvDatabase {
     pub(crate) fn text_route_of(
         &self,
         link: &crate::server::record::ParsedLink,
-    ) -> Option<super::char_view::TextRoute> {
+    ) -> Option<super::char_view::LinkTextRoute> {
         match link {
             crate::server::record::ParsedLink::Db(db) => self.db_link_addr(db)?.text_route,
             _ => None,
@@ -1315,13 +1316,24 @@ impl PvDatabase {
             .as_ref()
             .map_or(no_elements, |chain| chain.final_element_count(no_elements));
         // `dbGet` takes `getAttrValue` on `SPC_ATTRIBUTE`, which `$` leaves
-        // alone, and `getLinkValue` on a link `$` keeps `DBF_xxLINK`.
+        // alone, and `getLinkValue` on a link field's type unless a filter
+        // replaced its log; one element of a bare link never reaches `dbGet`.
+        use super::char_view::{LinkTextRoute, TextRoute};
         let text_route = if self.attribute_field_type(&rec, field).is_some() {
-            Some(super::char_view::TextRoute::Attribute)
-        } else if put.field().char_view() {
-            super::char_view::source_of(put.field().desc).text_route()
-        } else {
+            Some(LinkTextRoute::Get(TextRoute::Attribute))
+        } else if !put
+            .field()
+            .desc
+            .is_some_and(|d| crate::types::link_class_of(d).is_some())
+        {
             None
+        } else if put.field().char_view() || chain.as_deref().is_some_and(|c| !c.is_empty()) {
+            chain
+                .as_deref()
+                .map_or(Some(TextRoute::Link), |c| TextRoute::Link.after(c))
+                .map(LinkTextRoute::Get)
+        } else {
+            Some(LinkTextRoute::BareLink)
         };
         DbLinkAnswer::Local(crate::server::record::record_instance::ResolvedTarget {
             f64_slot: (db.target_is_val() && chain.is_none())
@@ -1747,9 +1759,31 @@ impl PvDatabase {
         dest: ReadDest<'_>,
     ) -> Converted {
         match read_as {
+            crate::server::record::LinkReadAs::Native if self.refuses_native(link, &value) => {
+                Err(None)
+            }
             crate::server::record::LinkReadAs::Native => Ok(value),
             _ => self.convert_link_read(held, link, read_as, value, render, dest),
         }
+    }
+
+    /// Whether `value`, read natively through `link`, is a bare link field
+    /// `dbDbGetValue` refused: a native read is one element.
+    #[inline(always)]
+    pub(crate) fn refuses_native(&self, link: ReadLink<'_>, value: &EpicsValue) -> bool {
+        let route = match link {
+            ReadLink::Resolved(_, route) => route,
+            // A link field reads as its text, so nothing else can be one.
+            ReadLink::Unresolved(link) if matches!(value, EpicsValue::String(_)) => {
+                self.text_route_of(link)
+            }
+            ReadLink::Unresolved(_) => None,
+        };
+        route.is_some_and(|route| {
+            route
+                .of_request(crate::server::record::LinkReadAs::Native)
+                .is_none()
+        })
     }
 
     /// [`Self::apply_link_read_as`]'s converting arms, out of the native

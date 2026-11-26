@@ -4958,9 +4958,8 @@ pub(crate) struct ResolvedTarget {
     /// it on the link's `dbChannel` for every `dbDbGetValue`.
     pub(crate) chain: Option<Arc<crate::server::database::filters::FilterChain>>,
     /// The text every read of the target is answered from, never converted:
-    /// an attribute's with or without `$`, a link's with `$`
-    /// (`dbAccess.c:944-953`).
-    pub(crate) text_route: Option<crate::server::database::char_view::TextRoute>,
+    /// an attribute's with or without `$`, a link's (`dbAccess.c:944-953`).
+    pub(crate) text_route: Option<crate::server::database::char_view::LinkTextRoute>,
 }
 
 /// Where a DB link's local target comes from — `PvDatabase` in production.

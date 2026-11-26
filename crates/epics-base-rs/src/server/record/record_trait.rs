@@ -1113,6 +1113,16 @@ impl LinkReadAs {
         )
     }
 
+    /// C's `!pnRequest || *pnRequest == 1` (`dbDbLink.c:185`): every request
+    /// but an array one of another length, the native read included.
+    pub(crate) fn one_element(self) -> bool {
+        match self {
+            Self::Array { n_request, .. } => n_request == 1,
+            Self::CharArrayAsString { max_elements } => max_elements == 1,
+            _ => true,
+        }
+    }
+
     /// The scalar `dbrType` this request names; `None` for the native read and
     /// the char-array one, which name none.
     pub(crate) fn dbr_type(self) -> Option<crate::types::DbFieldType> {

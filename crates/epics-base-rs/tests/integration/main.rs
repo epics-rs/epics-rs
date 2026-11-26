@@ -286,6 +286,7 @@ mod autosave_write_it_failure;
 mod bad_link_text_prints_its_refusal;
 mod bad_sub_alarm;
 mod bare_database_is_not_running_until_run;
+mod bare_link_field_reads_like_dbdbgetvalue;
 mod bare_shell_build_runs_c_iocbuild;
 mod bi_monitor_posts_from_its_own_copies;
 mod bi_udf_exact_one;

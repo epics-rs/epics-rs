@@ -262,6 +262,26 @@ impl TimerHandle {
     }
 }
 
+#[cfg(test)]
+impl TimerHandle {
+    /// Make every queued entry due now and wake the timer thread to fire it,
+    /// so a test decides when the timer fires instead of racing a deadline.
+    /// The entries are re-keyed: a key held for one no longer cancels it.
+    pub(crate) fn expire_all(&self) {
+        let now = Instant::now();
+        let mut st = self.inner.state.lock();
+        st.queue = std::mem::take(&mut st.queue)
+            .into_iter()
+            .map(|(key, entry)| {
+                let deadline = key.deadline.min(now);
+                (WakeKey { deadline, ..key }, entry)
+            })
+            .collect();
+        drop(st);
+        self.inner.wake.signal();
+    }
+}
+
 /// The delayed-callback timer: one thread draining a deadline-ordered queue
 /// into the callback executor pool. Port of the `timerQueue` half of
 /// `callback.c`.

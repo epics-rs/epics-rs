@@ -48,3 +48,23 @@ async fn an_attribute_reads_as_its_text_in_chars() {
         Some(EpicsValue::CharArray(b"ai\0".to_vec().into()))
     );
 }
+
+/// Every other request type is `S_db_badDbrtype` (`dbAccess.c:885-886`):
+/// the text is never converted, even where it spells a number. A declared
+/// field of the attribute's name is the field, converted as one.
+#[epics_macros_rs::epics_test]
+async fn an_attribute_refuses_a_numeric_read() {
+    let db = ioc().await;
+    let h = db.async_handle();
+    let get = |name, dbr| h.db_get(name, dbr, 1, None).map(|s| s.value);
+    assert_eq!(get("AI.NUM", DbFieldType::Double), None);
+    assert_eq!(get("AI.NUM", DbFieldType::Long), None);
+    assert_eq!(
+        get("AI.NUM", DbFieldType::String),
+        Some(EpicsValue::String("5".into()))
+    );
+    assert_eq!(
+        get("AI.DESC", DbFieldType::Double),
+        Some(EpicsValue::Double(7.0))
+    );
+}

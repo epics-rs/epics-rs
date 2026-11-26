@@ -14154,11 +14154,10 @@ impl PvDatabase {
         if parts.char_view() {
             self.char_addressed(&cell, &field, None)?;
         }
-        // `getAttrValue` answers chars from the attribute's text with or
-        // without `$` (`dbAccess.c:879-892,950-953`).
-        let attribute_chars = matches!(request.dbr, DbFieldType::Char | DbFieldType::UChar)
-            && self.attribute_field_type(&cell, &field).is_some();
-        let char_view = (parts.char_view() || attribute_chars).then_some(request);
+        // `getAttrValue` reads the attribute's text with or without `$`, and
+        // refuses any request but a string or chars (`dbAccess.c:865-895,950-953`).
+        let attribute = self.attribute_field_type(&cell, &field).is_some();
+        let char_view = (parts.char_view() || attribute).then_some(request);
         let own = own.and_then(|own| Some((self.get_record(own.name())?, own)));
         let own = own.as_ref().map(|(cell, own)| (&**cell, *own));
         if let Some(got) = self.db_get_held(&cell, &field, char_view, own, read) {

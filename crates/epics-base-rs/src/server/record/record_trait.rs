@@ -7241,8 +7241,9 @@ pub trait Record: RecordAny + Send + Sync + 'static {
     /// loop; see [`InputFetchPolicy`]. Default: [`InputFetchPolicy::ReadAll`].
     ///
     /// It governs the [`Self::multi_input_links`] loop ONLY.
-    /// [`Self::string_input_links`] is C's *second*, separately-gated fetch
-    /// loop and never participates in this policy.
+    /// [`Self::string_input_links`] is C's *second* fetch loop: its own
+    /// failures never feed this policy, and it runs only when this one
+    /// reports no failure.
     fn input_fetch_policy(&self) -> InputFetchPolicy {
         InputFetchPolicy::ReadAll
     }
@@ -7273,7 +7274,8 @@ pub trait Record: RecordAny + Send + Sync + 'static {
     ///    makes `fetch_values` non-zero, so it cannot suppress the record body.
     ///    The record's single [`Self::input_fetch_policy`] describes the numeric
     ///    loop (`AbortOnFirstFailure` for scalcout) and cannot also describe this
-    ///    one.
+    ///    one. It is reached only when that loop did not `return(status)`
+    ///    (:886), so after a failed numeric read no string field is touched.
     /// 2. **A failed read still writes the field** — with the diagnostic text
     ///    `"<record>:fetch(<FIELD>) failed"`, not with the previous value.
     /// 3. **A `DBF_CHAR`/`DBF_UCHAR` array source is read as text**, C-escaped

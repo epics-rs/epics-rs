@@ -1654,7 +1654,8 @@ impl Record for ScalcoutRecord {
     }
 
     /// C `sCalcoutRecord.c::fetch_values` (890-941) — INAA..INLL → AA..LL, read
-    /// as DBR_STRING, outside the fetch gate.
+    /// as DBR_STRING once the numeric loop succeeded; its own failures do not
+    /// feed the fetch gate.
     fn string_input_links(&self) -> &'static [(&'static str, &'static str)] {
         SCALCOUT_STRING_INPUT_LINKS
     }

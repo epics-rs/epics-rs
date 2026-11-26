@@ -6647,7 +6647,7 @@ impl PvDatabase {
         // Built only for a type that reads it.
         let resolved_link_fields = pre_input_resolved;
         let mut fold = FetchFold::default();
-        {
+        let fetch_values_failed = {
             // The shape questions — what a failed read means
             // (`input_fetch_policy`), whether a constant delivers at process
             // (`printf` alone), and whether the fetch is C's `dbGetLink` —
@@ -6744,7 +6744,8 @@ impl PvDatabase {
             if fetch_values_failed {
                 inst.skip_subroutine_this_cycle();
             }
-        }
+            fetch_values_failed
+        };
         let resolved = fold.resolved;
         // The two stages below read this record by name through the shared
         // lock, so they run with the guard released.
@@ -6784,13 +6785,16 @@ impl PvDatabase {
         // fetch gate (`return(0)` at :943, so a failing string link never
         // suppresses sCalcPerform), a failed read writes a diagnostic INTO the
         // value field instead of leaving it alone, and a multi-element
-        // DBF_CHAR/DBF_UCHAR source is read as escaped text. See
+        // DBF_CHAR/DBF_UCHAR source is read as escaped text. It is reached
+        // only past the numeric loop's `return(status)` (:886), so a failed
+        // numeric input leaves AA..LL as they were. See
         // `Record::string_input_links`.
-        let string_input_values: Vec<(String, EpicsValue)> = if !plan.string_input {
-            Vec::new()
-        } else {
-            self.fetch_string_inputs(rec, name, visited, &mut link_alarms)
-        };
+        let string_input_values: Vec<(String, EpicsValue)> =
+            if !plan.string_input || fetch_values_failed {
+                Vec::new()
+            } else {
+                self.fetch_string_inputs(rec, name, visited, &mut link_alarms)
+            };
 
         // aSub LFLG=READ: re-read the subroutine name from the SUBL link and,
         // if it changed, re-resolve the function — computed here, before the

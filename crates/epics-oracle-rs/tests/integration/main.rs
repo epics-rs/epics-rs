@@ -2,6 +2,7 @@
 //! built as one binary: test `t` of the former binary `X` is `X::t` here, and
 //! `binary(integration) & test(/^X::/)` selects what `X` ran.
 
+mod calc_fetch_stop_oracle;
 mod oracle;
 mod oracle_ioc_db_load_fails_as_softioc_d;
 mod oracle_ioc_iocinit_line;

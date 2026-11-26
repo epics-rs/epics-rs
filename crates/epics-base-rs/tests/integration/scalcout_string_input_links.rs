@@ -145,6 +145,40 @@ async fn r10_65_failed_numeric_link_still_gates_the_calc() {
     );
 }
 
+/// The numeric loop's `return(status)` (sCalcoutRecord.c:886) comes before the
+/// string loop, so after a failed INPA neither a resolvable INAA nor a failing
+/// INBB touches its field: no fetched text, no diagnostic.
+#[epics_macros_rs::epics_test]
+async fn a_failed_numeric_link_leaves_the_string_fields_unread() {
+    let db = PvDatabase::new();
+    db.add_record("SSRC", Box::new(StringinRecord::new("hello")))
+        .await
+        .unwrap();
+
+    let mut c = scalcout("AA");
+    for (f, v) in [
+        ("INPA", "NOSUCHREC"),
+        ("INAA", "SSRC"),
+        ("INBB", "NOSUCHREC2"),
+        ("AA", "old"),
+        ("BB", "stale"),
+    ] {
+        c.put_field(f, EpicsValue::String(v.into())).unwrap();
+    }
+    db.add_record("SC", Box::new(c)).await.unwrap();
+
+    process(&db, "SC").await;
+
+    assert_eq!(
+        field(&db, "SC", "AA").await,
+        EpicsValue::String("old".into())
+    );
+    assert_eq!(
+        field(&db, "SC", "BB").await,
+        EpicsValue::String("stale".into())
+    );
+}
+
 /// An unset INAA link is neither CA_LINK nor DB_LINK in C, so neither
 /// `dbGetLink` branch runs, status stays 0, and AA keeps what was put to it.
 #[epics_macros_rs::epics_test]

@@ -337,14 +337,14 @@ impl Held {
 
 /// A subscription another's callback owns. Its drop reports the thread the
 /// subscription's drop returned on, and whether `held` had ended by then.
-struct OwnedSubscription {
-    sub: Option<InProcessSubscription>,
+struct OwnedSubscription<S> {
+    sub: Option<S>,
     held: Arc<Held>,
     began: mpsc::Sender<()>,
     returned: mpsc::Sender<(String, bool)>,
 }
 
-impl Drop for OwnedSubscription {
+impl<S> Drop for OwnedSubscription<S> {
     fn drop(&mut self) {
         let _ = self.began.send(());
         drop(self.sub.take());
@@ -1010,4 +1010,125 @@ fn an_in_process_callbacks_drop_returns_while_a_network_callback_runs() {
             "I1's drop of N1 returned with N1's callback held"
         );
     });
+}
+
+/// Where `CAC-event` holds the last owner of X's route when it lets go.
+enum LastOwner {
+    /// The entry it delivered to X's callback, which dropped X.
+    Entry,
+    /// X's queue slot, freed when it drains the entry X's subscription had
+    /// queued when dropped.
+    Slot,
+}
+
+/// `CAC-event`, outside every callback, lets go of X's route, whose
+/// closure owns N, another context's network subscription, while N's
+/// callback runs: N's drop waits for that callback, and meanwhile a
+/// caller's delivery of X's context, outside every callback, gets through.
+fn a_delivery_gets_through_while_cac_event_drops_a_running_subscription(last: LastOwner) {
+    on_a_blocking_thread(move || {
+        let iocs = Iocs::start(&Arc::new(Gate::default()));
+        let (ctx, other) = (iocs.downstream.ca_client(), iocs.downstream.ca_client());
+        let net = connect(&other, "DROPWAIT:AO");
+        let (n_held, z_held) = (Arc::new(Held::default()), Arc::new(Held::default()));
+        let (tx, first) = mpsc::channel();
+        let (h, f) = (n_held.clone(), tx.clone());
+        let n = monitor(&*net, move |v| {
+            let _ = f.send(v);
+            h.on(v, 5.0);
+        });
+        assert_eq!(first.recv_timeout(fact_budget::FACT_BUDGET), Ok(0.0));
+        let (began_tx, began) = mpsc::channel();
+        let (returned_tx, returned) = mpsc::channel();
+        let owned = OwnedSubscription {
+            // `Mutex`: a network subscription is not `Sync`.
+            sub: Some(Mutex::new(n)),
+            held: n_held.clone(),
+            began: began_tx,
+            returned: returned_tx,
+        };
+        let me = Arc::new(Mutex::new(None::<InProcessSubscription>));
+        let (m, f) = (me.clone(), tx.clone());
+        // X's callback owns N, which drops with X's route; on 1.0 it drops
+        // X's subscription, if it holds it.
+        let x = monitor_in_process(&ctx, "B", DBR_DOUBLE, move |v| {
+            let _owns = &owned;
+            if v == 1.0 {
+                let mine = m.lock().unwrap().take();
+                drop(mine);
+            }
+            let _ = f.send(v);
+        });
+        assert_eq!(first.recv_timeout(fact_budget::FACT_BUDGET), Ok(0.0));
+        let h = z_held.clone();
+        let _z = monitor_in_process(&ctx, "D", DBR_DOUBLE, move |v| {
+            let _ = tx.send(v);
+            h.on(v, 5.0);
+        });
+        assert_eq!(first.recv_timeout(fact_budget::FACT_BUDGET), Ok(0.0));
+        let (w_tx, w) = mpsc::channel();
+        let _w = monitor_in_process(&ctx, "E", DBR_DOUBLE, move |v| {
+            let on = thread::current().name().unwrap_or_default().to_string();
+            let _ = w_tx.send((on, v));
+        });
+        let w_first = w.recv_timeout(fact_budget::FACT_BUDGET).map(|(_, v)| v);
+        assert_eq!(w_first, Ok(0.0));
+        let release_n = Release(&n_held.gate);
+        iocs.post_upstream(5.0);
+        n_held.gate.until_held();
+        match last {
+            LastOwner::Entry => {
+                *me.lock().unwrap() = Some(x);
+                iocs.post_downstream("B", 1.0);
+            }
+            LastOwner::Slot => {
+                let release_z = Release(&z_held.gate);
+                // `CAC-event` holds in Z's callback while X's entry queues
+                // behind it.
+                iocs.post_downstream("D", 5.0);
+                z_held.gate.until_held();
+                iocs.post_downstream("B", 1.0);
+                drop(x);
+                drop(release_z);
+            }
+        }
+        began
+            .recv_timeout(fact_budget::FACT_BUDGET)
+            .expect("X's route never let go of N");
+        iocs.post_downstream("E", 3.0);
+        let events = ctx.events().clone();
+        let caller = thread::Builder::new()
+            .name(CALLER.into())
+            .spawn(move || events.deliver())
+            .expect("spawn the caller");
+        let delivered = w.recv_timeout(fact_budget::FACT_BUDGET);
+        let dropping = returned.try_recv().is_err();
+        drop(release_n);
+        assert_eq!(
+            delivered,
+            Ok((CALLER.to_string(), 3.0)),
+            "where W's value was delivered while N's drop waited"
+        );
+        assert!(dropping, "N's drop returned while N's callback was held");
+        assert_eq!(caller.join().unwrap(), Ok(()));
+        assert_eq!(
+            returned.recv_timeout(fact_budget::FACT_BUDGET),
+            Ok(("CAC-event".to_string(), true)),
+            "where N's drop returned, and whether N's callback had ended"
+        );
+    });
+}
+
+/// The entry `CAC-event` delivered is the last owner of X's route.
+#[test]
+#[serial(epics_env)]
+fn a_delivery_gets_through_while_cac_event_drops_the_last_entry_of_a_route() {
+    a_delivery_gets_through_while_cac_event_drops_a_running_subscription(LastOwner::Entry);
+}
+
+/// The queue slot `CAC-event` freed is the last owner of X's route.
+#[test]
+#[serial(epics_env)]
+fn a_delivery_gets_through_while_cac_event_frees_the_last_slot_of_a_route() {
+    a_delivery_gets_through_while_cac_event_drops_a_running_subscription(LastOwner::Slot);
 }

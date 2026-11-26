@@ -530,18 +530,56 @@ impl Events {
         if std::ptr::eq(DELIVERING.get(), self) || IN_RUNS.get() > 0 {
             return;
         }
+        let mut cx = Context::from_waker(waker);
+        let (mut taken, mut last) = (Vec::new(), Vec::new());
+        // The last owner of a route drops the client's closure, which may
+        // wait on another context's callback: never in the turn.
+        while self.deliver_turn(&mut cx, &mut taken, &mut last) {
+            last.clear();
+        }
+    }
+
+    /// Entries to their callbacks in the consumer's turn, until none is
+    /// ready or the turn lets go of the last owner of a context, which goes
+    /// to `last` for the caller to drop after the turn; whether entries may
+    /// remain. `taken` holds each context the turn takes until it lets go.
+    fn deliver_turn(
+        &self,
+        cx: &mut Context<'_>,
+        taken: &mut Vec<DeliveryContext>,
+        last: &mut Vec<Box<dyn Send>>,
+    ) -> bool {
         let _consumer = self.consumer.lock();
         let _delivering = Delivering::enter(self);
-        let mut cx = Context::from_waker(waker);
-        while let Poll::Ready(entry) = self.user.poll_next(&mut cx) {
+        loop {
+            let mut entry = None;
+            let ready = self
+                .user
+                .poll_next_freeing(cx, &mut entry, taken)
+                .is_ready();
             // An ended producer's subscription ends when the client drops it.
-            if let CircuitEvent::Event { context, event, .. } = entry
-                && let Some(route) = context.downcast_ref::<Route>()
-            {
-                self.running.wait(route.record);
-                route.deliver(event);
+            if let Some(CircuitEvent::Event { context, event, .. }) = entry {
+                if let Some(route) = context.downcast_ref::<Route>() {
+                    self.running.wait(route.record);
+                    route.deliver(event);
+                }
+                taken.push(context);
+            }
+            last.extend(taken.drain(..).filter_map(let_go));
+            if !ready || !last.is_empty() {
+                return ready;
             }
         }
+    }
+}
+
+/// A context the delivery turn took, let go of in the turn: `None` when
+/// another owner remains, which then drops it, so nothing of it runs here;
+/// else the whole of it, for after the turn.
+fn let_go(context: DeliveryContext) -> Option<Box<dyn Send>> {
+    match context.downcast::<Route>() {
+        Ok(route) => Arc::into_inner(route).map(|route| Box::new(route) as Box<dyn Send>),
+        Err(context) => Some(Box::new(context)),
     }
 }
 

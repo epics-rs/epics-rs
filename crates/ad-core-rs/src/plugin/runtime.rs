@@ -5991,13 +5991,16 @@ mod tests {
     /// `callParamCallbacks`, all under the port lock (NDPluginDriver.cpp:332,
     /// :539): a blocking consumer still holding the frame reads its STAMP
     /// from the port, and STAMP has not been posted — on list 0, which C's
-    /// `callParamCallbacks()` posts, and on a further list alike.
+    /// `callParamCallbacks()` posts, and on a further list alike. Neither
+    /// another thread's `callParamCallbacks` nor the interrupt edge's sweep
+    /// (asynPortDriver.cpp:923-937) gets the lock before the frame's own.
     fn a_held_frame_reads_its_stamp_unposted(
         port_name: &str,
         blocking_callbacks: i32,
         addr: i32,
         read: ConsumerRead,
     ) {
+        use epics_libcom_rs::runtime::interrupt_accept::{EdgeDone, InterruptGate};
         use epics_libcom_rs::runtime::task::block_on_sync;
         use std::sync::atomic::AtomicBool;
         let (mut downstream, mut downstream_rx) = ndarray_channel(&format!("{port_name}_DOWN"), 10);
@@ -6021,14 +6024,19 @@ mod tests {
             DEFAULT_PLUGIN_THREADS,
         );
         let port = handle.port_runtime().port_handle().clone();
-        let gate = epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened();
-        claim.publish(port.clone(), &gate).unwrap();
-        // The boot sweep runs on its own thread; run late, it would post the
-        // frame's STAMP while the frame is held.
-        block_on_sync(gate.jobs_settled()).unwrap();
-        wait_until("the edge sweep", || {
-            port.interrupts().edge_sweeps().is_clear()
+        let gate = InterruptGate::new();
+        // Runs ahead of the port's own edge callback, the gate open: the
+        // sweep is queued only once the frame is held.
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let edge = release.clone();
+        gate.on_open(move || {
+            edge.wait();
+            EdgeDone::Inline
         });
+        claim.publish(port.clone(), &gate).unwrap();
+        let opening = gate.clone();
+        let opener = std::thread::spawn(move || opening.set(true));
+        wait_until("the gate to open", || gate.is_open());
         enable_callbacks(&handle);
         let stamp = port
             .drv_user_create_blocking(&asyn_rs::port::DrvUserRequest::new("STAMP", 0))
@@ -6070,10 +6078,29 @@ mod tests {
         .unwrap();
         // The actor held the post back before it ran this read.
         read(&port, held.scope, stamp, addr).unwrap();
+        release.wait();
+        opener.join().unwrap();
+        block_on_sync(gate.jobs_settled()).unwrap();
+        // The sweep ranks behind everything queued before it, so a Low read
+        // queued after it runs after it.
+        let (reader, scope) = (port.clone(), held.scope);
+        thread::spawn(move || {
+            let _in = scope.enter();
+            reader.submit_blocking(
+                asyn_rs::request::RequestOp::Int32Read,
+                consumer_read(stamp, addr).with_priority(asyn_rs::port::QueuePriority::Low),
+            )
+        })
+        .join()
+        .unwrap()
+        .unwrap();
         assert!(posts.lock().is_empty(), "posted before the delivery ended");
         drop(held);
         producer.join().unwrap();
         wait_until("the STAMP post", || !posts.lock().is_empty());
+        wait_until("the edge sweep", || {
+            port.interrupts().edge_sweeps().is_clear()
+        });
         assert_eq!(*posts.lock(), [30]);
     }
 

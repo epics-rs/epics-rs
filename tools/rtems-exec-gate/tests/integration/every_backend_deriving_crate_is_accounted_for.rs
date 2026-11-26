@@ -279,6 +279,10 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ),
     (
         "epics-ca-rs",
+        "tests/integration/a_c_repeater_finds_a_live_client_alive.rs",
+    ),
+    (
+        "epics-ca-rs",
         "tests/integration/a_put_to_an_unopened_remote_link_is_refused.rs",
     ),
     (

@@ -148,6 +148,7 @@ mod array_record_nelm1_nord_seed;
 mod array_record_scalar_source_into_val;
 mod array_record_udf;
 mod as_verify_members_are_channels;
+mod as_verify_splits_the_line_at_c_isspace;
 mod asg_bad_inp_is_per_rule;
 mod asg_calc_truth_band;
 mod asg_inp_attach_reevaluates;

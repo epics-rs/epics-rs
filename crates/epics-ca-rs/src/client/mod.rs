@@ -4188,7 +4188,8 @@ async fn run_coordinator(
                     // libca throws from `nciu::connect` and drops the whole
                     // circuit with every channel on it (`tcpiiu.cpp:588`);
                     // only the refused channel is cleared here, and it
-                    // searches again after the search engine's refusal hold.
+                    // searches again on the search engine's disconnect
+                    // governor tick.
                     TransportEvent::ChannelRefused { cid, sid, data_type, server_addr, priority } => {
                         let _ = transport_tx.send(TransportCommand::ClearChannel {
                             cid,

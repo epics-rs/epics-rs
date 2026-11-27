@@ -114,9 +114,9 @@ async fn send_with_fanout(
 /// second instead of letting every channel fire on its own backoff.
 const N_SEARCH_BUCKETS: usize = 30;
 
-/// Decide which bucket to drop a fresh search into based on the
-/// caller's intent. Pure function so the production handler and the
-/// unit tests share the formula and can't drift apart.
+/// Decide where a fresh search waits based on the caller's intent. Pure
+/// function so the production handler and the unit tests share the
+/// formula and can't drift apart.
 ///
 /// - `Initial` / `BeaconAnomaly` (new cid): `current_bucket + 1`. The
 ///   handler ALSO fires an immediate broadcast for `Initial`; the +1
@@ -128,19 +128,20 @@ const N_SEARCH_BUCKETS: usize = 30;
 ///   (client.cpp:213) with `holdoff = 0` — the typical Active→
 ///   disconnect case sits in the current bucket and the next 1 Hz
 ///   tick fires the broadcast. Latency ≤ 1 s.
-/// - `Refused`: `current_bucket`, but its `hold_until` keeps it off the
-///   wire until one normal tick has passed.
+/// - `Refused`: no bucket; the disconnect governor holds it (see
+///   [`Slot::Governed`]).
 ///
 /// Cascade-spread (5000 channels disconnecting simultaneously) is
 /// handled by the natural O(N / nBuckets) per-tick rate-limit and
 /// the runtime-side smoothing in `cascade_smoothed_next` — no
 /// per-channel cid hashing needed for the first attempt.
-fn placement_bucket(current_bucket: usize, reason: SearchReason) -> usize {
+fn placement(current_bucket: usize, reason: SearchReason) -> Slot {
     match reason {
         SearchReason::Initial | SearchReason::BeaconAnomaly => {
-            (current_bucket + 1) % N_SEARCH_BUCKETS
+            Slot::Bucket((current_bucket + 1) % N_SEARCH_BUCKETS)
         }
-        SearchReason::Reconnect | SearchReason::Refused => current_bucket,
+        SearchReason::Reconnect => Slot::Bucket(current_bucket),
+        SearchReason::Refused => Slot::Governed,
     }
 }
 
@@ -342,6 +343,10 @@ const MIN_NORMAL_TICK: Period = Period::from_secs(NonZeroU64::new(2).unwrap());
 /// revolution fits in `N_SEARCH_BUCKETS * FAST_TICK = 6 s`.
 const FAST_TICK: Period = Period::from_millis(NonZeroU64::new(200).unwrap());
 
+/// C `disconnectGovernorPeriod` (`disconnectGovernorTimer.cpp:27`): the
+/// period of the free-running timer that releases governed channels.
+const DISCONNECT_GOVERNOR_PERIOD: Period = Period::from_secs(NonZeroU64::new(10).unwrap());
+
 /// `EPICS_CA_DNS_REFRESH_SECS` when unset, zero or not a number.
 const DEFAULT_DNS_REFRESH: Period = Period::from_secs(NonZeroU64::new(60).unwrap());
 
@@ -355,6 +360,18 @@ const PENALTY_DURATION: Duration = Duration::from_secs(30);
 // Per-channel search state
 // ---------------------------------------------------------------------------
 
+/// Where a pending search waits for its next SEARCH.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Slot {
+    /// In `buckets[i]`: sent when the bucket tick reaches it.
+    Bucket(usize),
+    /// Held by the disconnect governor (C `cs_disconnGov`): in no bucket, so
+    /// neither a bucket tick nor a beacon's fast tick sends it, until the
+    /// governor's next tick releases it as a new search
+    /// ([`release_governed`]).
+    Governed,
+}
+
 struct PendingSearch {
     #[allow(dead_code)]
     cid: u32,
@@ -362,8 +379,8 @@ struct PendingSearch {
     pv_name: PvString,
     /// Pre-built payload: SEARCH header + padded PV name (no VERSION prefix).
     search_payload: Vec<u8>,
-    /// Which bucket this search currently lives in.
-    bucket: usize,
+    /// Where this search waits for its next SEARCH.
+    slot: Slot,
     /// Number of times this search has been broadcast. 0 before the
     /// first transmit; doubles as the pvxs `nSearch` counter that
     /// controls retry-bucket escalation in `cascade_smoothed_next`
@@ -373,9 +390,6 @@ struct PendingSearch {
     attempt: u32,
     #[allow(dead_code)]
     last_attempt: Option<Instant>,
-    /// No SEARCH for this channel goes out before this instant. Set by a
-    /// `Refused` schedule only; a later schedule or poke never shortens it.
-    hold_until: Option<Instant>,
 }
 
 // ---------------------------------------------------------------------------
@@ -469,11 +483,18 @@ impl SearchEngineState {
         }
     }
 
+    /// Take `cid` out of `pending` and out of the bucket that holds it.
+    fn take_pending(&mut self, cid: u32) -> Option<PendingSearch> {
+        let p = self.pending.remove(&cid)?;
+        if let Slot::Bucket(b) = p.slot {
+            self.buckets[b].retain(|x| *x != cid);
+        }
+        Some(p)
+    }
+
     /// Remove a channel entirely (Cancel, channel drop).
     fn remove_channel(&mut self, cid: u32) {
-        if let Some(p) = self.pending.remove(&cid) {
-            self.buckets[p.bucket].retain(|x| *x != cid);
-        }
+        self.take_pending(cid);
         self.attempts.remove(&cid);
         // drop the multiply-defined tracker only on Cancel /
         // channel destruction. A new CREATE_CHAN for the same cid
@@ -518,6 +539,28 @@ impl SearchEngineState {
         }
         self.fast_ticks_remaining = N_SEARCH_BUCKETS as u32;
     }
+}
+
+/// The disconnect governor's tick (C `disconnectGovernorTimer::expire`): every
+/// governed channel searches again as a new one, as
+/// `udpiiu::govExpireNotify` installs it in the first search timer. Returns
+/// the cids to send now.
+fn release_governed(state: &mut SearchEngineState) -> Vec<u32> {
+    let slot = placement(state.current_bucket, SearchReason::Initial);
+    let Slot::Bucket(bucket) = slot else {
+        unreachable!("an Initial search is placed in a bucket");
+    };
+    let mut released = Vec::new();
+    for (cid, p) in &mut state.pending {
+        if p.slot == Slot::Governed {
+            p.slot = slot;
+            p.attempt = 0;
+            p.last_attempt = None;
+            released.push(*cid);
+        }
+    }
+    state.buckets[bucket].extend_from_slice(&released);
+    released
 }
 
 // ---------------------------------------------------------------------------
@@ -1057,6 +1100,11 @@ async fn run_engine(
     let mut dns_refresh = interval(dns_refresh);
     dns_refresh.tick().await; // skip immediate fire
 
+    // Free-running from the engine's start, as C starts `govTmr` with the
+    // `udpiiu`: a governed channel waits for the next tick, not a period.
+    let mut governor = interval(DISCONNECT_GOVERNOR_PERIOD);
+    governor.tick().await; // skip immediate fire
+
     loop {
         tokio::select! {
             req = request_rx.recv() => {
@@ -1122,6 +1170,13 @@ async fn run_engine(
                 process_bucket(&mut state, &mut transport, &nameserver_send_txs).await;
                 if state.fast_ticks_remaining > 0 {
                     state.fast_ticks_remaining -= 1;
+                }
+            }
+
+            _ = governor.tick() => {
+                let released = release_governed(&mut state);
+                if !released.is_empty() {
+                    fire_searches(&mut state, &released, &mut transport, &nameserver_send_txs).await;
                 }
             }
 
@@ -1662,20 +1717,13 @@ fn handle_request(state: &mut SearchEngineState, req: SearchRequest) -> Option<u
 
             let search_payload = build_search_payload(cid, pv_name.as_bytes());
 
-            // The refusal hold: one normal tick of real time, which a
-            // re-schedule of a still-held channel carries over.
-            let carried = state
+            // A governed channel stays governed whatever re-schedules it, as
+            // C puts every disconnect, a governed one's included, back on
+            // the governor (`cac::disconnectChannel`).
+            let governed = state
                 .pending
                 .get(&cid)
-                .and_then(|p| p.hold_until)
-                .filter(|until| *until > Instant::now());
-            let hold_until = if reason == SearchReason::Refused {
-                carried.max(Some(epics_base_rs::runtime::time::deadline_from_now(
-                    normal_tick().get(),
-                )))
-            } else {
-                carried
-            };
+                .is_some_and(|p| p.slot == Slot::Governed);
 
             // Drop any stale entry before re-scheduling.
             state.remove_channel(cid);
@@ -1690,18 +1738,23 @@ fn handle_request(state: &mut SearchEngineState, req: SearchRequest) -> Option<u
             // channel layer's wait-for-Found path made ca-rs
             // reconnect feel slower than pva-rs; the comment at
             // the top of `handle_request` flagged this gap. See
-            // `placement_bucket` for the full rationale.
-            let bucket = placement_bucket(state.current_bucket, reason);
+            // `placement` for the full rationale.
+            let slot = if governed {
+                Slot::Governed
+            } else {
+                placement(state.current_bucket, reason)
+            };
+            if let Slot::Bucket(bucket) = slot {
+                state.buckets[bucket].push(cid);
+            }
             let p = PendingSearch {
                 cid,
                 pv_name,
                 search_payload,
-                bucket,
+                slot,
                 attempt: 0,
                 last_attempt: None,
-                hold_until,
             };
-            state.buckets[bucket].push(cid);
             state.pending.insert(cid, p);
 
             if reason == SearchReason::BeaconAnomaly {
@@ -1718,8 +1771,8 @@ fn handle_request(state: &mut SearchEngineState, req: SearchRequest) -> Option<u
             // avoid. `BeaconAnomaly` for a NEW cid likewise relies on
             // fast-tick mode (`poke()` above) to retransmit within ~6 s
             // instead of firing right away.
-            match (reason, hold_until) {
-                (SearchReason::Initial, None) => Some(cid),
+            match (reason, slot) {
+                (SearchReason::Initial, Slot::Bucket(_)) => Some(cid),
                 _ => None,
             }
         }
@@ -1743,9 +1796,7 @@ fn handle_request(state: &mut SearchEngineState, req: SearchRequest) -> Option<u
                 // `cac.cpp:621-641` runs the duplicate-detect for
                 // the connected-channel lifetime, not just until
                 // first CREATE_CHAN ack.
-                if let Some(p) = state.pending.remove(&cid) {
-                    state.buckets[p.bucket].retain(|x| *x != cid);
-                }
+                state.take_pending(cid);
                 state.attempts.remove(&cid);
                 state.mark_connected(cid);
                 state.penalty.remove(&server_addr);
@@ -1992,10 +2043,8 @@ fn handle_search_response(
                         offset += CaHeader::SIZE + align8(hdr.postsize as usize);
                         continue;
                     }
-                    let bucket = p.bucket;
                     let pv_name = p.pv_name.clone();
-                    state.pending.remove(&cid);
-                    state.buckets[bucket].retain(|x| *x != cid);
+                    state.take_pending(cid);
                     tracing::debug!(
                         pv = %pv_name, cid, server = %server_addr,
                         "PV search resolved"
@@ -2096,12 +2145,6 @@ async fn process_bucket(
             let Some(p) = pending.get_mut(&sid) else {
                 continue;
             };
-            if p.hold_until.is_some_and(|until| until > now) {
-                let next = (current + 1) % N_SEARCH_BUCKETS;
-                p.bucket = next;
-                buckets[next].push(sid);
-                continue;
-            }
             p.last_attempt = Some(now);
             p.attempt = p.attempt.saturating_add(1);
             let attempt = p.attempt;
@@ -2118,7 +2161,7 @@ async fn process_bucket(
             // immutable borrow on `buckets` is gone, so the
             // mutable accesses below compile.
             if let Some(p) = pending.get_mut(&sid) {
-                p.bucket = next;
+                p.slot = Slot::Bucket(next);
             }
             buckets[next].push(sid);
         }
@@ -2469,7 +2512,7 @@ mod tests {
         state.current_bucket = 5;
         schedule_initial(&mut state, 1, "PV:1");
         let p = state.pending.get(&1).unwrap();
-        assert_eq!(p.bucket, 6);
+        assert_eq!(p.slot, Slot::Bucket(6));
         assert_eq!(state.buckets[6], vec![1]);
         assert_eq!(state.buckets[5], Vec::<u32>::new());
     }
@@ -2478,7 +2521,9 @@ mod tests {
     fn cancel_removes_from_bucket() {
         let mut state = SearchEngineState::new();
         schedule_initial(&mut state, 1, "PV:1");
-        let bucket = state.pending.get(&1).unwrap().bucket;
+        let Slot::Bucket(bucket) = state.pending.get(&1).unwrap().slot else {
+            panic!("an Initial search is placed in a bucket");
+        };
         handle_request(&mut state, SearchRequest::Cancel { cid: 1 });
         assert!(state.pending.is_empty());
         assert!(state.buckets[bucket].is_empty());
@@ -2592,7 +2637,9 @@ mod tests {
                 reason: SearchReason::Reconnect,
             },
         );
-        let original_bucket = state.pending.get(&7).unwrap().bucket;
+        let Slot::Bucket(original_bucket) = state.pending.get(&7).unwrap().slot else {
+            panic!("a Reconnect search is placed in a bucket");
+        };
         // Pretend prior attempts happened.
         if let Some(p) = state.pending.get_mut(&7) {
             p.attempt = 4;
@@ -2607,7 +2654,11 @@ mod tests {
             },
         );
         let p = state.pending.get(&7).unwrap();
-        assert_eq!(p.bucket, original_bucket, "poke must not relocate bucket");
+        assert_eq!(
+            p.slot,
+            Slot::Bucket(original_bucket),
+            "poke must not relocate bucket"
+        );
         assert_eq!(p.attempt, 0);
         assert_eq!(state.fast_ticks_remaining, N_SEARCH_BUCKETS as u32);
         // And the bucket vector still has the cid exactly once.
@@ -2755,8 +2806,8 @@ mod tests {
     fn placement_reconnect_uses_current_bucket() {
         for current in 0..N_SEARCH_BUCKETS {
             assert_eq!(
-                placement_bucket(current, SearchReason::Reconnect),
-                current,
+                placement(current, SearchReason::Reconnect),
+                Slot::Bucket(current),
                 "Reconnect must drop in current bucket (got {current})"
             );
         }
@@ -2770,14 +2821,44 @@ mod tests {
     #[test]
     fn placement_initial_and_beacon_anomaly_one_bucket_ahead() {
         for reason in [SearchReason::Initial, SearchReason::BeaconAnomaly] {
-            assert_eq!(placement_bucket(0, reason), 1);
-            assert_eq!(placement_bucket(13, reason), 14);
+            assert_eq!(placement(0, reason), Slot::Bucket(1));
+            assert_eq!(placement(13, reason), Slot::Bucket(14));
             assert_eq!(
-                placement_bucket(N_SEARCH_BUCKETS - 1, reason),
-                0,
+                placement(N_SEARCH_BUCKETS - 1, reason),
+                Slot::Bucket(0),
                 "wrap-around at ring boundary"
             );
         }
+    }
+
+    /// A refused channel sits in no bucket, whatever re-schedules it, until
+    /// the governor's tick sends it as a new search.
+    #[test]
+    fn a_refused_channel_waits_for_the_governor() {
+        let mut state = SearchEngineState::new();
+        for reason in [
+            SearchReason::Refused,
+            SearchReason::Reconnect,
+            SearchReason::BeaconAnomaly,
+            SearchReason::Initial,
+        ] {
+            let fire = handle_request(
+                &mut state,
+                SearchRequest::Schedule {
+                    cid: 3,
+                    pv_name: "PV:3".into(),
+                    reason,
+                },
+            );
+            assert_eq!(fire, None, "{reason:?} sent a governed channel");
+            assert_eq!(state.pending[&3].slot, Slot::Governed, "{reason:?}");
+            assert!(state.buckets.iter().all(Vec::is_empty), "{reason:?}");
+        }
+        state.current_bucket = 4;
+        assert_eq!(release_governed(&mut state), vec![3]);
+        assert_eq!(state.pending[&3].slot, Slot::Bucket(5));
+        assert_eq!(state.buckets[5], vec![3]);
+        assert!(release_governed(&mut state).is_empty());
     }
 
     /// pvxs `tickSearch` line 1193-1196 escalates the retry bucket

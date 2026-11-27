@@ -270,8 +270,8 @@ async fn a_bad_native_type_refuses_its_channel_and_spares_the_circuit() {
 }
 
 /// `caget` on the refused PV prints libca's text with the type once per
-/// refused reply, re-searches only after the refusal hold rather than at
-/// once, and times the PV's connect out.
+/// refused reply, holds the re-search for the disconnect governor rather than
+/// searching at once, and times the PV's connect out.
 #[tokio::test(flavor = "multi_thread")]
 async fn caget_logs_each_refusal_once_and_reports_the_pv_unconnected() {
     let (search_port, retype) = served_behind_retyping_proxy(Retype::default()).await;
@@ -293,9 +293,9 @@ async fn caget_logs_each_refusal_once_and_reports_the_pv_unconnected() {
         logged, refused,
         "one line per refused reply; stderr: {stderr:?}"
     );
-    // The refusal hold is one normal tick, at least 2 s, so 3 s hold at most
-    // one re-search after the first refusal.
-    assert!(refused <= 2, "{refused} refusals in 3 s");
+    // The governor's first tick comes one period after the client starts, so
+    // 3 s hold no re-search after the first refusal.
+    assert_eq!(refused, 1, "{refused} refusals in 3 s");
     assert!(
         stderr.contains(&format!("Channel connect timed out: '{BAD}' not found.")),
         "stderr: {stderr:?}"
@@ -304,9 +304,32 @@ async fn caget_logs_each_refusal_once_and_reports_the_pv_unconnected() {
     assert_eq!(out.status.code(), Some(1), "stderr: {stderr:?}");
 }
 
-/// One normal search tick at `EPICS_CA_MAX_SEARCH_PERIOD=60`: the period over
-/// the 30 search buckets, which is also the tick's 2 s floor.
-const NORMAL_TICK: Duration = Duration::from_secs(2);
+/// C `disconnectGovernorPeriod` (`disconnectGovernorTimer.cpp:27`): a refused
+/// channel searches again on the next tick of a timer with this period.
+const GOVERNOR: Duration = Duration::from_secs(10);
+
+/// What a search, its reply and the create after it may add to a refusal's
+/// time on a loaded host.
+const SLACK: Duration = Duration::from_secs(1);
+
+/// The refusals came on the governor's ticks: none later than one period
+/// after the one before it, and none sooner once the first refusal had put
+/// the channel on the governor's phase.
+fn assert_on_governor_ticks(at: &[Instant]) {
+    for (n, pair) in (2..).zip(at.windows(2)) {
+        let gap = pair[1].duration_since(pair[0]);
+        assert!(
+            gap <= GOVERNOR + SLACK,
+            "refusal {n} came {gap:?} after the one before it, over one governor period"
+        );
+        if n > 2 {
+            assert!(
+                gap + SLACK >= GOVERNOR,
+                "refusal {n} came {gap:?} after the one before it, under one governor period"
+            );
+        }
+    }
+}
 
 /// When the proxy retyped its `n`th reply, once it has.
 async fn nth_refusal(retype: &Retype, n: usize) -> Instant {
@@ -344,11 +367,12 @@ async fn registered_client(repeater: &UdpSocket) -> SocketAddr {
     .expect("no port re-sent REPEATER_REGISTER")
 }
 
-/// When the proxy refused each of the first `n` creates of `BAD`, for a
-/// client that beacons from ever-new servers hold on its fast search tick
-/// from the first refusal on: every beacon wakes its searching channels.
+/// When the proxy refused each of the first `n` creates of `BAD`, at the
+/// shortest normal search tick. With `beacons`, beacons from ever-new servers
+/// hold the client on its fast search tick from the first refusal on: every
+/// beacon wakes its searching channels.
 #[cfg(feature = "client")]
-async fn refusals_under_a_beacon_burst(retype: Retype, n: usize) -> Vec<Instant> {
+async fn refusals(retype: Retype, n: usize, beacons: bool) -> Vec<Instant> {
     let (search_port, retype) = served_behind_retyping_proxy(retype).await;
     let repeater = UdpSocket::bind("0.0.0.0:0").await.expect("bind repeater");
     // SAFETY: `#[serial(epics_env)]` keeps every env-touching test apart, and
@@ -375,21 +399,25 @@ async fn refusals_under_a_beacon_burst(retype: Retype, n: usize) -> Vec<Instant>
 
     let _bad = client.create_channel(BAD);
     let mut at = vec![nth_refusal(&retype, 1).await];
-    let burst = tokio::spawn(async move {
-        for port in 1..=u16::MAX {
-            let mut beacon = CaHeader::new(CA_PROTO_RSRV_IS_UP);
-            beacon.count = port;
-            beacon.cid = 1;
-            beacon.available = u32::from(Ipv4Addr::LOCALHOST);
-            let _ = repeater.send_to(&beacon.to_bytes(), beacon_socket).await;
-            // not-a-wait: pacing between beacons, each a server never seen
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+    let burst = beacons.then(|| {
+        tokio::spawn(async move {
+            for port in 1..=u16::MAX {
+                let mut beacon = CaHeader::new(CA_PROTO_RSRV_IS_UP);
+                beacon.count = port;
+                beacon.cid = 1;
+                beacon.available = u32::from(Ipv4Addr::LOCALHOST);
+                let _ = repeater.send_to(&beacon.to_bytes(), beacon_socket).await;
+                // not-a-wait: pacing between beacons, each a server never seen
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
     });
     for i in 2..=n {
         at.push(nth_refusal(&retype, i).await);
     }
-    burst.abort();
+    if let Some(burst) = burst {
+        burst.abort();
+    }
 
     // SAFETY: `#[serial(epics_env)]`.
     unsafe {
@@ -402,20 +430,22 @@ async fn refusals_under_a_beacon_burst(retype: Retype, n: usize) -> Vec<Instant>
     at
 }
 
-/// A refused channel searches again one normal tick after its refusal at the
-/// earliest; beacons waking it do not bring that forward.
+/// A refused channel searches again on the disconnect governor's next tick,
+/// not on the normal search tick.
+#[cfg(feature = "client")]
+#[tokio::test(flavor = "multi_thread")]
+#[serial(epics_env)]
+async fn a_refused_channel_searches_again_on_the_governors_tick() {
+    assert_on_governor_ticks(&refusals(Retype::default(), 3, false).await);
+}
+
+/// Beacons waking a refused channel do not bring its search before the
+/// governor's tick.
 #[cfg(feature = "client")]
 #[tokio::test(flavor = "multi_thread")]
 #[serial(epics_env)]
 async fn a_beacon_burst_does_not_hasten_a_refused_channels_search() {
-    let at = refusals_under_a_beacon_burst(Retype::default(), 3).await;
-    for (n, pair) in (2..).zip(at.windows(2)) {
-        let gap = pair[1].duration_since(pair[0]);
-        assert!(
-            gap >= NORMAL_TICK,
-            "refusal {n} came {gap:?} after the one before it, under one normal tick"
-        );
-    }
+    assert_on_governor_ticks(&refusals(Retype::default(), 3, true).await);
 }
 
 /// A server that retires the refused cid at once sends
@@ -429,11 +459,5 @@ async fn a_server_disconnect_does_not_hasten_a_refused_channels_search() {
         disconnect: true,
         ..Retype::default()
     };
-    let at = refusals_under_a_beacon_burst(retype, 2).await;
-    let gap = at[1].duration_since(at[0]);
-    assert!(
-        gap >= NORMAL_TICK,
-        "the refusal after a server disconnect came {gap:?} after the first, \
-         under one normal tick"
-    );
+    assert_on_governor_ticks(&refusals(retype, 3, true).await);
 }

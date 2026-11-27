@@ -183,6 +183,9 @@ pub struct RestoreResult {
     /// `disconnected_skipped` can only list the PVs a per-PV marker
     /// named. 0 when the file carried no such line.
     pub not_connected_at_save: usize,
+    /// The restore read a `!` line. C's `reboot_restore` marks the set
+    /// WARN on reading one, whatever count it states (dbrestore.c:1001).
+    pub error_message_line: bool,
     /// Lines of the save file that named no PV at all. Distinct from
     /// `parse_failed`, which is per-PV: these lines never became an
     /// entry, so nothing else in this result can account for them.
@@ -203,6 +206,7 @@ impl RestoreResult {
             not_found: Vec::new(),
             disconnected_skipped: Vec::new(),
             not_connected_at_save: 0,
+            error_message_line: false,
             malformed_lines: Vec::new(),
             aborted: false,
         }
@@ -216,6 +220,7 @@ impl RestoreResult {
         self.not_found.extend(r.not_found);
         self.disconnected_skipped.extend(r.disconnected_skipped);
         self.not_connected_at_save += r.not_connected_at_save;
+        self.error_message_line |= r.error_message_line;
         self.malformed_lines
             .extend(r.malformed_lines.into_iter().map(|m| MalformedLine {
                 line_no: m.line_no + index,
@@ -1698,6 +1703,7 @@ async fn restore_contents(
     // either stops there when the site has cleared
     // `save_restoreIncompleteSetsOk`.
     let incomplete = |result: &mut RestoreResult| {
+        result.error_message_line = true;
         let n = result.not_connected_at_save;
         if boot {
             crate::runtime::log::errlog_vprintf(format_args!(

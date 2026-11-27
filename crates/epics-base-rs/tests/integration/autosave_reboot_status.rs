@@ -172,3 +172,19 @@ async fn an_error_message_line_warns() {
         (2.0, ".sav file contained an error message")
     );
 }
+
+/// The line warns whatever count it states: C sets WARN on reading it.
+#[epics_macros_rs::epics_test]
+async fn an_error_message_line_counting_zero_warns() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("s.sav"),
+        "# h\n! 0 channel(s) not connected or fetch failed\nT:A 2\n<END>\n",
+    )
+    .unwrap();
+    let (code, text, _) = reboot_pvs(dir.path(), &["set_pass0_restoreFile(\"s.sav\")"]).await;
+    assert_eq!(
+        (code, text.as_str()),
+        (2.0, ".sav file contained an error message")
+    );
+}

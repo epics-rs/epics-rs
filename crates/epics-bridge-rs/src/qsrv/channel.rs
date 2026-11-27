@@ -1376,15 +1376,9 @@ mod tests {
 
     /// The errlog lines `f` produced.
     async fn errlog_of(f: impl std::future::Future<Output = ()>) -> Vec<String> {
-        let heard = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-        let sink = heard.clone();
-        let id = epics_base_rs::runtime::log::errlog_add_listener(move |m| {
-            sink.lock().unwrap().push(m.to_string());
-        });
+        let errlog = epics_base_rs::runtime::log::ErrlogCapture::start();
         f.await;
-        epics_base_rs::runtime::log::errlog_flush();
-        epics_base_rs::runtime::log::errlog_remove_listener(id);
-        heard.lock().unwrap().clone()
+        errlog.finish()
     }
 
     const BAD_FILTER_LINE: &str = "dbChannelCreate: Channel filter 'bad' not found";

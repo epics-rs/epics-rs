@@ -4079,8 +4079,6 @@ mod tests {
     /// `handle_search_response` drops the ERROR event and fails this test.
     #[test]
     fn duplicate_pv_different_guid_logs_diagnostic() {
-        use epics_base_rs::runtime::log;
-        use std::sync::{Arc, Mutex};
         use tokio::sync::oneshot;
 
         const G_A: [u8; 12] = [0xA1u8; 12];
@@ -4088,13 +4086,7 @@ mod tests {
         let peer_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 5076);
         let peer_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 5076);
 
-        let heard = Arc::new(Mutex::new(String::new()));
-        let sink = heard.clone();
-        let listener = log::errlog_add_listener(move |m| {
-            if let Some((_time, line)) = m.split_once(' ') {
-                sink.lock().unwrap().push_str(line);
-            }
-        });
+        let errlog = epics_base_rs::runtime::log::ErrlogCapture::start();
         {
             let (tx, _rx) = oneshot::channel::<Vec<SearchHit>>();
             // First reply (GUID A from server A) already accumulated.
@@ -4145,10 +4137,13 @@ mod tests {
                 false,
             );
         }
-        log::errlog_flush();
-        log::errlog_remove_listener(listener);
+        let heard: String = errlog
+            .finish()
+            .iter()
+            .filter_map(|m| m.split_once(' ').map(|(_time, line)| line))
+            .collect();
         assert_eq!(
-            *heard.lock().unwrap(),
+            heard,
             "ERR pvxs.client.dup Duplicate PV name dut from 10.0.0.1:5075 and 10.0.0.2:5075\n"
         );
     }
@@ -6726,19 +6721,14 @@ mod tests {
     #[test]
     #[serial(epics_env)]
     fn invalid_ports_log_once_per_from_env() {
-        use epics_base_rs::runtime::log;
         let logged = |f: &dyn Fn()| {
-            let heard = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-            let sink = heard.clone();
-            let id = log::errlog_add_listener(move |m| {
-                if let Some((_time, line)) = m.split_once(' ') {
-                    sink.lock().unwrap().push_str(line);
-                }
-            });
+            let errlog = epics_base_rs::runtime::log::ErrlogCapture::start();
             f();
-            log::errlog_flush();
-            log::errlog_remove_listener(id);
-            heard.lock().unwrap().clone()
+            errlog
+                .finish()
+                .iter()
+                .filter_map(|m| m.split_once(' ').map(|(_time, line)| line))
+                .collect::<String>()
         };
         let _env = EnvVarGuard::set(&[
             ("EPICS_PVA_BROADCAST_PORT", "0"),
@@ -6772,25 +6762,21 @@ mod tests {
     #[test]
     #[serial(epics_env)]
     fn a_builder_logs_the_client_env_once_in_from_defs_order() {
-        use epics_base_rs::runtime::log;
-        let heard = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-        let sink = heard.clone();
         let _env = EnvVarGuard::set(&[
             ("EPICS_PVA_BROADCAST_PORT", "0x"),
             ("EPICS_PVA_AUTO_ADDR_LIST", "maybe"),
             ("EPICS_PVA_CONN_TMO", "abc"),
         ]);
-        let id = log::errlog_add_listener(move |m| {
-            if let Some((_time, line)) = m.split_once(' ') {
-                sink.lock().unwrap().push_str(line);
-            }
-        });
+        let errlog = epics_base_rs::runtime::log::ErrlogCapture::start();
         let client = crate::client_native::context::PvaClient::builder().build();
-        log::errlog_flush();
-        log::errlog_remove_listener(id);
+        let heard: String = errlog
+            .finish()
+            .iter()
+            .filter_map(|m| m.split_once(' ').map(|(_time, line)| line))
+            .collect();
         assert_eq!(client.config().udp_port, 5076);
         assert_eq!(
-            *heard.lock().unwrap(),
+            heard,
             "WARN pvxs.client.setup\n     EPICS_PVA_BROADCAST_PORT invalid integer : \
              Extraneous characters after integer: \"0x\"\n\
              ERR pvxs.config EPICS_PVA_AUTO_ADDR_LIST invalid bool value (YES/NO) : 'maybe'\n\

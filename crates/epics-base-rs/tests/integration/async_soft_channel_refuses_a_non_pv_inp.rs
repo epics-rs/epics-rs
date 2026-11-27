@@ -8,23 +8,18 @@
 //! `dev*SoftCallback.c` files declare no `dsxt` at all.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
+use epics_base_rs::runtime::log::ErrlogCapture;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 
-fn listen() -> Arc<Mutex<Vec<String>>> {
-    let heard = Arc::new(Mutex::new(Vec::new()));
-    let sink = Arc::clone(&heard);
-    epics_base_rs::runtime::log::errlog_add_listener(move |m| {
-        sink.lock().expect("sink").push(m.to_string());
-    });
-    heard
+fn listen() -> ErrlogCapture {
+    ErrlogCapture::start()
 }
 
-fn heard(sink: &Arc<Mutex<Vec<String>>>) -> String {
-    epics_base_rs::runtime::log::errlog_flush();
-    sink.lock().expect("sink").join("\n")
+fn heard(sink: &mut ErrlogCapture) -> String {
+    sink.lines().join("\n")
 }
 
 async fn ioc(db_text: &str) -> Arc<PvDatabase> {
@@ -41,7 +36,7 @@ async fn ioc(db_text: &str) -> Arc<PvDatabase> {
 /// a JSON constant refuses, a PV name passes, an unset INP refuses.
 #[epics_macros_rs::epics_test]
 async fn only_a_pv_link_passes_add_record() {
-    let sink = listen();
+    let mut sink = listen();
     let db = ioc(
         "record(ai, \"T:CONST\") { field(DTYP,\"Async Soft Channel\") field(INP,{const:9}) }\n\
          record(ai, \"T:PV\")    { field(DTYP,\"Async Soft Channel\") field(INP,\"T:CONST\") }\n\
@@ -49,7 +44,7 @@ async fn only_a_pv_link_passes_add_record() {
     )
     .await;
 
-    let log = heard(&sink);
+    let log = heard(&mut sink);
     for name in ["T:CONST", "T:EMPTY"] {
         assert!(
             log.contains(&format!(
@@ -75,14 +70,14 @@ async fn only_a_pv_link_passes_add_record() {
 /// refused at load (`lnkConst.c:50-53`).
 #[epics_macros_rs::epics_test]
 async fn nothing_else_is_checked() {
-    let sink = listen();
+    let mut sink = listen();
     let _db = ioc(
         "record(ao, \"T:AO\") { field(DTYP,\"Async Soft Channel\") field(OUT,\"1\") }\n\
          record(ai, \"T:PLAIN\") { field(DTYP,\"Soft Channel\") field(INP,{const:9}) }\n",
     )
     .await;
 
-    let log = heard(&sink);
+    let log = heard(&mut sink);
     assert!(
         !log.contains("add_record"),
         "devAoSoftCallback.c declares no dsxt and devAiSoft.c has no add_record, got {log:?}"

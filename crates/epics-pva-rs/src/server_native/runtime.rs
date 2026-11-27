@@ -1113,18 +1113,13 @@ mod tcp_fallback_tests {
 
     /// The pvxs log lines `f` prints, each without its timestamp.
     fn pvxs_logged<T>(f: impl FnOnce() -> T) -> (T, String) {
-        use epics_base_rs::runtime::log;
-        let heard = Arc::new(std::sync::Mutex::new(String::new()));
-        let sink = heard.clone();
-        let id = log::errlog_add_listener(move |m| {
-            if let Some((_time, line)) = m.split_once(' ') {
-                sink.lock().unwrap().push_str(line);
-            }
-        });
+        let errlog = epics_base_rs::runtime::log::ErrlogCapture::start();
         let out = f();
-        log::errlog_flush();
-        log::errlog_remove_listener(id);
-        let logged = heard.lock().unwrap().clone();
+        let logged = errlog
+            .finish()
+            .iter()
+            .filter_map(|m| m.split_once(' ').map(|(_time, line)| line))
+            .collect();
         (out, logged)
     }
 

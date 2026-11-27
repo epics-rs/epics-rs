@@ -18,9 +18,8 @@
 //! each followed by the kept value: Off, zero, Passive, NO, Soft Channel.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 
-use epics_base_rs::runtime::log::{errlog_add_listener, errlog_flush};
+use epics_base_rs::runtime::log::ErrlogCapture;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
 
@@ -40,9 +39,7 @@ record(ai, "A") {}
         .await
         .unwrap()
         .0;
-    let heard = Arc::new(Mutex::new(Vec::<String>::new()));
-    let sink = Arc::clone(&heard);
-    errlog_add_listener(move |m| sink.lock().unwrap().push(m.trim_end().to_string()));
+    let mut errlog = ErrlogCapture::start();
 
     let menu = |pv: &str| {
         format!("recGblDbaddrError: dbFastLinkConv(cvt_st_menu) Illegal choice PV: {pv}")
@@ -80,16 +77,16 @@ record(ai, "A") {}
         ("A.DTYP", "Bogus", device.to_string(), "Soft Channel"),
         ("A.DTYP", "99", device.to_string(), "Soft Channel"),
     ] {
-        errlog_flush();
-        heard.lock().unwrap().clear();
+        errlog.take();
         let (rec, field) = pv.split_once('.').unwrap_or((pv, "VAL"));
         let refused = db
             .put_record_field_from_ca(rec, field, EpicsValue::String(put.into()))
             .await;
         assert!(refused.is_err(), "{pv} {put}: {refused:?}");
-        errlog_flush();
-        let said: Vec<String> = std::mem::take(&mut *heard.lock().unwrap())
-            .into_iter()
+        let said: Vec<String> = errlog
+            .take()
+            .iter()
+            .map(|m| m.trim_end().to_string())
             .filter(|m| m.starts_with("recGbl"))
             .collect();
         assert_eq!(said, [line], "{pv} {put}");

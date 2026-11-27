@@ -18,9 +18,9 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::os::fd::AsRawFd;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use epics_base_rs::runtime::log::{errlog_add_listener, errlog_flush};
+use epics_base_rs::runtime::log::ErrlogCapture;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::iocsh::IocShell;
@@ -42,16 +42,14 @@ async fn a_dtyp_with_no_device_menu_refuses_every_string() {
         .await
         .unwrap()
         .0;
-    let heard = Arc::new(Mutex::new(Vec::<String>::new()));
-    let sink = Arc::clone(&heard);
-    errlog_add_listener(move |m| sink.lock().unwrap().push(m.trim_end().to_string()));
-    let heard = move || {
-        errlog_flush();
-        let said: Vec<String> = std::mem::take(&mut *heard.lock().unwrap())
-            .into_iter()
+    let mut errlog = ErrlogCapture::start();
+    let mut heard = move || {
+        errlog
+            .take()
+            .iter()
+            .map(|m| m.trim_end().to_string())
             .filter(|m| m.starts_with("recGbl"))
-            .collect();
-        said
+            .collect::<Vec<String>>()
     };
     heard();
     for put in ["Bogus", "0"] {

@@ -4,7 +4,7 @@
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32};
 use std::sync::{Arc, OnceLock};
 
-use epics_base_rs::runtime::log::{errlog_add_listener, errlog_flush, errlog_remove_listener};
+use epics_base_rs::runtime::log::ErrlogCapture;
 use epics_base_rs::runtime::task::test_block_on;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::types::EpicsValue;
@@ -279,19 +279,11 @@ pub(super) fn set_mask(prog: &Program<Vars>, index: usize, events: &[u32]) {
 
 /// The errlog lines containing `needle` that `f` logs.
 pub(super) fn logged(needle: &str, f: impl FnOnce()) -> Vec<String> {
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    let id = {
-        let (seen, needle) = (Arc::clone(&seen), needle.to_owned());
-        errlog_add_listener(move |m| {
-            if m.contains(&needle) {
-                seen.lock().push(m.to_owned());
-            }
-        })
-    };
+    let errlog = ErrlogCapture::start();
     f();
-    errlog_flush();
-    errlog_remove_listener(id);
-    std::mem::take(&mut *seen.lock())
+    let mut seen = errlog.finish();
+    seen.retain(|m| m.contains(needle));
+    seen
 }
 
 fn reentrant(ss: usize) -> Arc<Program<Vars>> {

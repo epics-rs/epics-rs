@@ -24,9 +24,8 @@
 use crate::calink_ioc;
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 
-use epics_base_rs::runtime::log::{errlog_add_listener, errlog_flush, errlog_strip_ansi};
+use epics_base_rs::runtime::log::{ErrlogCapture, errlog_strip_ansi};
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::record::ParsedLink;
 
@@ -38,9 +37,14 @@ record(ai, "T") { field(INP, "F.{]") }
 
 #[epics_macros_rs::epics_test]
 async fn both_refusals_print_and_the_link_stays_unconnected() {
-    let heard = Arc::new(Mutex::new(String::new()));
-    let sink = Arc::clone(&heard);
-    errlog_add_listener(move |m| sink.lock().unwrap().push_str(&errlog_strip_ansi(m)));
+    let mut errlog = ErrlogCapture::start();
+    let mut heard = || {
+        errlog
+            .lines()
+            .iter()
+            .map(|m| errlog_strip_ansi(m))
+            .collect::<String>()
+    };
     let (db, _) = IocBuilder::new()
         .db_string(DB, &HashMap::new())
         .unwrap()
@@ -54,12 +58,8 @@ async fn both_refusals_print_and_the_link_stays_unconnected() {
     let once = "dbChannelCreate: Channel filter 'x' not found\n\
                 dbChannelCreate: lexical error: invalid char in json text.\n                                      {]\n                     (right here) ------^\n\n";
     let twice = once.repeat(2);
-    calink_ioc::until("both links opened", || {
-        errlog_flush();
-        heard.lock().unwrap().contains(&twice)
-    })
-    .await;
-    assert_eq!(*heard.lock().unwrap(), twice);
+    calink_ioc::until("both links opened", || heard().contains(&twice)).await;
+    assert_eq!(heard(), twice);
 
     for rec in ["S", "T"] {
         let inp = db

@@ -4,9 +4,9 @@
 //! whose dset has no `get_ioint_info` is refused with C's line and left
 //! Passive, and a later SCAN put reaches `scanAdd` again.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use epics_base_rs::runtime::log::{errlog_add_listener, errlog_flush};
+use epics_base_rs::runtime::log::ErrlogCapture;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::iocsh::IocShell;
 use epics_base_rs::server::record::ScanType;
@@ -14,12 +14,10 @@ use epics_base_rs::types::EpicsValue;
 
 #[test]
 fn a_bare_shell_ioc_init_refuses_an_io_intr_record_without_a_hook() {
-    let heard = Arc::new(Mutex::new(Vec::<String>::new()));
-    let sink = Arc::clone(&heard);
-    errlog_add_listener(move |m| sink.lock().unwrap().push(m.to_string()));
-    let said = || {
-        errlog_flush();
-        std::mem::take(&mut *heard.lock().unwrap())
+    let mut errlog = ErrlogCapture::start();
+    let mut said = || {
+        errlog
+            .take()
             .iter()
             .flat_map(|m| m.lines().map(str::to_string).collect::<Vec<_>>())
             .filter(|l| l.contains("scanAdd"))

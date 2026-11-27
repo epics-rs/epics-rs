@@ -141,15 +141,11 @@ pub(super) async fn on_rs(commands: &'static [Command]) -> (Vec<u8>, SocketAddr,
     let addr = server.tcp_addr();
 
     logger_level_set(TCP_IO, Level::Debug);
-    let heard = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-    let sink = heard.clone();
-    let id = log::errlog_add_listener(move |m| sink.lock().unwrap().push_str(m));
+    let errlog = log::ErrlogCapture::start();
     let (replies, me) = tokio::task::spawn_blocking(move || replies_to_inits(addr, commands))
         .await
         .unwrap();
-    log::errlog_flush();
-    log::errlog_remove_listener(id);
-    let heard = heard.lock().unwrap().clone();
+    let heard = errlog.finish().concat();
     (replies, me, heard)
 }
 

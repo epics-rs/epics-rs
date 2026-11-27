@@ -10,7 +10,7 @@
 //! ```
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use epics_base_rs::server::device_support::DeviceSupport;
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -50,11 +50,7 @@ fn run(shell: &IocShell, line: &str) -> String {
 // `BlockingBridge::capture` for the shell; no CA server is built.
 #[test]
 fn an_out_put_is_refused_silently_as_in_oracle_scaler_ioc() {
-    let heard = Arc::new(Mutex::new(Vec::<String>::new()));
-    let sink = Arc::clone(&heard);
-    epics_base_rs::runtime::log::errlog_add_listener(move |m| {
-        sink.lock().unwrap().push(m.to_string());
-    });
+    let mut errlog = epics_base_rs::runtime::log::ErrlogCapture::start();
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     let (name, factory) = scaler_rs::scaler_record_factory();
@@ -79,17 +75,14 @@ fn an_out_put_is_refused_silently_as_in_oracle_scaler_ioc() {
         (db, epics_base_rs::runtime::task::BlockingBridge::capture())
     });
     let shell = IocShell::new(Arc::clone(&db), bridge);
-    epics_base_rs::runtime::log::errlog_flush();
-    heard.lock().unwrap().clear();
+    errlog.take();
 
     assert_eq!(
         run(&shell, r#"dbpf SC.OUT "@asyn(scalerPort 0 1)""#),
         "DBF_STRING:         \"@asyn(scalerPortC 0 0)\"      \n"
     );
-    epics_base_rs::runtime::log::errlog_flush();
-    let lines: Vec<String> = heard
-        .lock()
-        .unwrap()
+    let lines: Vec<String> = errlog
+        .finish()
         .iter()
         .flat_map(|m| m.lines().map(str::to_string).collect::<Vec<_>>())
         .filter(|l| l.contains("SC"))

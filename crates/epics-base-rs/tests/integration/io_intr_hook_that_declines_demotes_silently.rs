@@ -5,10 +5,9 @@
 //! and a later SCAN put say the same.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 
 use epics_base_rs::error::CaResult;
-use epics_base_rs::runtime::log::{errlog_add_listener, errlog_flush};
+use epics_base_rs::runtime::log::ErrlogCapture;
 use epics_base_rs::server::device_support::DeviceSupport;
 use epics_base_rs::server::device_support::IoIntrCmd;
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -66,9 +65,7 @@ record(ai, "NOLIST") { field(DTYP, "No List") field(INP, "@x") field(SCAN, "I/O 
 
 #[epics_macros_rs::epics_test]
 async fn a_declining_hook_demotes_without_a_line() {
-    let heard = Arc::new(Mutex::new(Vec::<String>::new()));
-    let sink = Arc::clone(&heard);
-    errlog_add_listener(move |m| sink.lock().unwrap().push(m.to_string()));
+    let mut errlog = ErrlogCapture::start();
     let (db, _) = IocBuilder::new()
         .register_device_support("ai", &DECLINES, || Box::new(NoList("Hook Declines")))
         .register_device_support("ai", &NO_HOOK, || Box::new(NoList("No Hook")))
@@ -78,9 +75,9 @@ async fn a_declining_hook_demotes_without_a_line() {
         .build()
         .await
         .unwrap();
-    let said = || {
-        errlog_flush();
-        let said: Vec<String> = std::mem::take(&mut *heard.lock().unwrap())
+    let mut said = || {
+        let said: Vec<String> = errlog
+            .take()
             .iter()
             .flat_map(|m| m.lines().map(str::to_string).collect::<Vec<_>>())
             .filter(|l| l.contains("scanAdd"))

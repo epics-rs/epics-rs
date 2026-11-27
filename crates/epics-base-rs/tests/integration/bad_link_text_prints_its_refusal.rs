@@ -6,9 +6,8 @@
 //! carrying the same text prints the line too.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 
-use epics_base_rs::runtime::log::{errlog_add_listener, errlog_flush};
+use epics_base_rs::runtime::log::ErrlogCapture;
 use epics_base_rs::server::database::PutSplit;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -16,20 +15,15 @@ use epics_base_rs::types::{EpicsValue, PvString};
 
 const ZZ: &str = "dbJLinkInit: Link type 'zz' not found";
 
-fn listen() -> impl Fn() -> Vec<String> {
-    let heard = Arc::new(Mutex::new(Vec::<String>::new()));
-    let sink = Arc::clone(&heard);
-    errlog_add_listener(move |m| sink.lock().unwrap().push(m.to_string()));
+fn listen() -> impl FnMut() -> Vec<String> {
+    let mut errlog = ErrlogCapture::start();
     move || {
-        errlog_flush();
-        let mut heard = heard.lock().unwrap();
-        let said = heard
+        errlog
+            .take()
             .iter()
             .filter(|m| m.contains("Link type 'zz'"))
             .map(|m| m.trim_end().to_string())
-            .collect();
-        heard.clear();
-        said
+            .collect()
     }
 }
 
@@ -53,7 +47,7 @@ async fn a_put_of_an_unknown_json_link_type_prints_the_line_after_the_gate() {
         .await
         .unwrap()
         .0;
-    let heard = listen();
+    let mut heard = listen();
     let kept = sdis(&db);
 
     db.put_record_field_from_ca("X", "SDIS", text(r#"{"zz":1}"#))
@@ -104,7 +98,7 @@ async fn a_put_of_an_unknown_json_link_type_prints_the_line_after_the_gate() {
 
 #[epics_macros_rs::epics_test]
 async fn a_db_load_of_an_unknown_json_link_type_prints_the_line() {
-    let heard = listen();
+    let mut heard = listen();
     let builder = IocBuilder::new()
         .db_string(
             "record(ai, \"J1\") { field(INP, \"{\\\"zz\\\":1}\") }\n",

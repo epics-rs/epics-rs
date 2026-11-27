@@ -894,19 +894,18 @@ mod tests {
     /// every host, and the errno is named where it is knowable.
     #[test]
     fn failed_mcast_join_reaches_the_errlog_with_cs_bytes() {
-        use std::sync::{Arc, Mutex};
-
         let group = "224.0.2.3";
         // SAFETY: nextest runs each test in its own process.
         unsafe { std::env::set_var("EPICS_CAS_BEACON_ADDR_LIST", group) };
 
-        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let sink = Arc::clone(&seen);
-        let listener = epics_base_rs::runtime::log::errlog_add_listener(move |line| {
-            if line.starts_with("caR: ") {
-                sink.lock().expect("errlog sink").push(line.to_string());
-            }
-        });
+        let mut errlog = epics_base_rs::runtime::log::ErrlogCapture::start();
+        let car = |lines: &[String]| -> Vec<String> {
+            lines
+                .iter()
+                .filter(|l| l.starts_with("caR: "))
+                .cloned()
+                .collect()
+        };
 
         let sock = socket2::Socket::new(
             socket2::Domain::IPV4,
@@ -918,19 +917,15 @@ mod tests {
 
         // First join: the membership is taken, and C says nothing.
         join_beacon_multicast_groups(&sock, port, Diag::new(0));
-        epics_base_rs::runtime::log::errlog_flush();
+        let first = car(errlog.lines());
         assert!(
-            seen.lock().expect("errlog sink").is_empty(),
-            "a join that succeeds must be silent; got {:?}",
-            seen.lock().expect("errlog sink")
+            first.is_empty(),
+            "a join that succeeds must be silent; got {first:?}"
         );
 
         // Second join of the same membership: EADDRINUSE.
         join_beacon_multicast_groups(&sock, port, Diag::new(0));
-        epics_base_rs::runtime::log::errlog_flush();
-        epics_base_rs::runtime::log::errlog_remove_listener(listener);
-
-        let lines = seen.lock().expect("errlog sink").clone();
+        let lines = car(&errlog.finish());
         let prefix = format!("caR: Socket mcast join to {group}:{port} failed: ");
         assert_eq!(
             lines.len(),
@@ -957,21 +952,11 @@ mod tests {
     /// the second join failing.
     #[test]
     fn beacon_groups_are_read_as_c_a_to_ip_addr() {
-        use std::sync::{Arc, Mutex};
-
         // 224.0.2.4 with a leading zero, and 224.0.2.7 as a raw number.
         // SAFETY: nextest runs each test in its own process.
         unsafe { std::env::set_var("EPICS_CAS_BEACON_ADDR_LIST", "0224.0.2.4 3758096903") };
 
-        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let sink = Arc::clone(&seen);
-        let listener = epics_base_rs::runtime::log::errlog_add_listener(move |line| {
-            if let Some(rest) = line.strip_prefix("caR: Socket mcast join to ") {
-                sink.lock()
-                    .expect("errlog sink")
-                    .push(rest.split(' ').next().unwrap_or("").to_string());
-            }
-        });
+        let errlog = epics_base_rs::runtime::log::ErrlogCapture::start();
         let sock = socket2::Socket::new(
             socket2::Domain::IPV4,
             socket2::Type::DGRAM,
@@ -980,12 +965,13 @@ mod tests {
         .expect("probe socket");
         join_beacon_multicast_groups(&sock, 5065, Diag::new(0));
         join_beacon_multicast_groups(&sock, 5065, Diag::new(0));
-        epics_base_rs::runtime::log::errlog_flush();
-        epics_base_rs::runtime::log::errlog_remove_listener(listener);
+        let seen: Vec<String> = errlog
+            .finish()
+            .iter()
+            .filter_map(|l| l.strip_prefix("caR: Socket mcast join to "))
+            .map(|rest| rest.split(' ').next().unwrap_or("").to_string())
+            .collect();
 
-        assert_eq!(
-            *seen.lock().expect("errlog sink"),
-            ["224.0.2.4:5065", "224.0.2.7:5065"]
-        );
+        assert_eq!(seen, ["224.0.2.4:5065", "224.0.2.7:5065"]);
     }
 }

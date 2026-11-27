@@ -34,11 +34,7 @@ fn a_site_menuscan_replaces_the_rates_the_ioc_scans_at() {
     // Registered BEFORE the table is frozen: C reports a rate it cannot keep
     // from inside `initPeriodic` itself (`dbScan.c:912`), so the message is
     // emitted at the freeze and there is no second chance to hear it.
-    let heard = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let sink = std::sync::Arc::clone(&heard);
-    epics_base_rs::runtime::log::errlog_add_listener(move |m| {
-        sink.lock().expect("sink").push(m.to_string());
-    });
+    let errlog = epics_base_rs::runtime::log::ErrlogCapture::start();
 
     parse_db(SITE_MENU, &HashMap::new()).expect("the site menu loads");
 
@@ -46,8 +42,7 @@ fn a_site_menuscan_replaces_the_rates_the_ioc_scans_at() {
 
     // 1/60 s is under two clock ticks on a 100 Hz kernel, which is C's own
     // definition of a rate it cannot keep — reported, then used anyway.
-    epics_base_rs::runtime::log::errlog_flush();
-    let heard = heard.lock().expect("sink").join("");
+    let heard = errlog.finish().join("");
     assert!(
         heard.contains("initPeriodic: Scan rate '60 Hz' is not achievable."),
         "the unachievable rate must be reported: {heard:?}"

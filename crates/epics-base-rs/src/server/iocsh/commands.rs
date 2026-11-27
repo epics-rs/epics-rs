@@ -12201,17 +12201,11 @@ record(stringin, "P") { field(INP, "SRC.DESC") }"#,
     /// (8f5015b66) on this database and these commands.
     #[test]
     fn a_refused_subl_put_removes_the_link() {
-        let heard = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-        let sink = std::sync::Arc::clone(&heard);
-        crate::runtime::log::errlog_add_listener(move |m| {
-            sink.lock().expect("sink").push(m.to_string());
-        });
-        let no_mod_lines = || {
-            crate::runtime::log::errlog_flush();
-            heard
-                .lock()
-                .expect("sink")
-                .drain(..)
+        let mut errlog = crate::runtime::log::ErrlogCapture::start();
+        let mut no_mod_lines = || {
+            errlog
+                .take()
+                .into_iter()
                 .filter(|m| m.contains("noMod"))
                 .map(|m| m.trim_end().to_string())
                 .collect::<Vec<_>>()
@@ -13326,11 +13320,7 @@ record(ai, "SIM:C") { field(VAL, "1") }
         )
         .unwrap();
         ctx.block_on(db.ioc_init());
-        let heard = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-        let sink = Arc::clone(&heard);
-        crate::runtime::log::errlog_add_listener(move |m| {
-            sink.lock().unwrap().push(m.trim_end().to_string())
-        });
+        let mut errlog = crate::runtime::log::ErrlogCapture::start();
         for (pv, want, line) in [
             ("S:B.DESC", "1", None),
             (
@@ -13347,10 +13337,8 @@ record(ai, "SIM:C") { field(VAL, "1") }
                 ),
             ),
         ] {
-            crate::runtime::log::errlog_flush();
-            heard.lock().unwrap().clear();
+            errlog.take();
             let out = run_cmd(&ctx, "dbtgf", &[pv]);
-            crate::runtime::log::errlog_flush();
             let got: Vec<&str> = out
                 .lines()
                 .find(|l| l.starts_with("DBF_ENUM:"))
@@ -13358,7 +13346,11 @@ record(ai, "SIM:C") { field(VAL, "1") }
                 .split_whitespace()
                 .collect();
             assert_eq!(got, ["DBF_ENUM:", want], "{pv}:\n{out}");
-            let said = std::mem::take(&mut *heard.lock().unwrap());
+            let said: Vec<String> = errlog
+                .take()
+                .into_iter()
+                .map(|m| m.trim_end().to_string())
+                .collect();
             match line {
                 Some(line) => assert!(said.iter().any(|l| l == line), "{pv}: {said:?}"),
                 None => assert!(said.is_empty(), "{pv}: {said:?}"),

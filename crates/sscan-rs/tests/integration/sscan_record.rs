@@ -596,41 +596,32 @@ record(sscan, "S") {
     assert_eq!(arr(&db, "S.D01DA", 3), [2.5, 2.5, 2.5]);
 }
 
-/// The errlog lines naming `who` from here on.
-fn errlog_lines(who: &'static str) -> Arc<std::sync::Mutex<Vec<String>>> {
-    let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let sink = lines.clone();
-    epics_base_rs::runtime::log::errlog_add_listener(move |m| {
-        if m.contains(who) {
-            sink.lock().unwrap().push(m.to_owned());
-        }
-    });
-    lines
-}
-
-fn logged(lines: &std::sync::Mutex<Vec<String>>, what: &str) -> bool {
-    epics_base_rs::runtime::log::errlog_flush();
-    lines.lock().unwrap().iter().any(|l| l.contains(what))
+/// Whether a `S:special:connect` line in `errlog` says `what`.
+fn logged(errlog: &mut epics_base_rs::runtime::log::ErrlogCapture, what: &str) -> bool {
+    errlog
+        .lines()
+        .iter()
+        .any(|l| l.contains("S:special:connect") && l.contains(what))
 }
 
 #[epics_base_rs::epics_test]
 async fn a_pv_name_written_during_a_connect_that_never_lands_waits_it_out() {
     let db = ioc(r#"record(sscan, "S") {}"#).await;
-    let lines = errlog_lines("S:special:connect");
+    let mut errlog = epics_base_rs::runtime::log::ErrlogCapture::start();
     put(&db, "S.D01PV", EpicsValue::String("NOBODY".into())).await;
     let t0 = std::time::Instant::now();
     put(&db, "S.D01PV", EpicsValue::String("D".into())).await;
     let waited = t0.elapsed();
     assert!(waited >= Duration::from_millis(900), "{waited:?}");
-    assert!(logged(&lines, "Waiting..."));
-    assert!(logged(&lines, "Trying new PV name."));
+    assert!(logged(&mut errlog, "Waiting..."));
+    assert!(logged(&mut errlog, "Trying new PV name."));
     assert_eq!(f64_of(&db, "S.D01NV"), 0.0);
 }
 
 #[epics_base_rs::epics_test]
 async fn a_pv_name_written_during_a_connect_waits_for_it_to_land() {
     let db = ioc(r#"record(sscan, "S") {}"#).await;
-    let lines = errlog_lines("S:special:connect");
+    let mut errlog = epics_base_rs::runtime::log::ErrlogCapture::start();
     put(&db, "S.P1PV", EpicsValue::String("M".into())).await;
     let db2 = db.clone();
     let (done, renamed) = tokio::sync::oneshot::channel();
@@ -647,7 +638,7 @@ async fn a_pv_name_written_during_a_connect_waits_for_it_to_land() {
     // The connect lands before the rename, between C's "Waiting..." and its
     // first check (no sleep: links.rs pins it), or inside the first second.
     assert!(waited < Duration::from_millis(1900), "{waited:?}");
-    assert!(!logged(&lines, "Trying new PV name."));
+    assert!(!logged(&mut errlog, "Trying new PV name."));
     connected(&db, "S", &["P1NV"]).await;
     db.put_pv_and_post("M2", EpicsValue::Double(4.0))
         .await

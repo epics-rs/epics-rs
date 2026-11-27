@@ -199,16 +199,12 @@ async fn rs_ignores_a_process_request_as_pvxs_does() {
     let addr = server.tcp_addr();
 
     logger_level_set(TCP_IO, Level::Debug);
-    let heard = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-    let sink = heard.clone();
-    let id = log::errlog_add_listener(move |m| sink.lock().unwrap().push_str(m));
+    let errlog = log::ErrlogCapture::start();
     let (replies, me) = tokio::task::spawn_blocking(move || replies_to_cmd16(addr))
         .await
         .unwrap();
-    log::errlog_flush();
-    log::errlog_remove_listener(id);
+    let heard = errlog.finish().concat();
     assert_eq!(replies, Vec::<u8>::new());
-    let heard = heard.lock().unwrap();
     for line in ignore_lines(me) {
         assert!(heard.contains(&line), "{line:?} not in:\n{heard}");
     }

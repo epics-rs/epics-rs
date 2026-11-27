@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use asyn_rs::registry::open_owner;
-use epics_base_rs::runtime::log::{errlog_add_listener, errlog_flush};
+use epics_base_rs::runtime::log::ErrlogCapture;
 use epics_base_rs::runtime::task::{BlockingBridge, set_thread_ok_to_block};
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::iocsh::IocShell;
@@ -92,9 +92,7 @@ async fn init_child() {
     let db = Arc::clone(ioc.database());
     assert!(ioc.run().await);
 
-    let log = Arc::new(Mutex::new(String::new()));
-    let l = log.clone();
-    errlog_add_listener(move |m| l.lock().unwrap().push_str(m));
+    let mut errlog = ErrlogCapture::start();
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path().display().to_string().replace('\\', "/");
     let long = "P".repeat(54);
@@ -112,8 +110,8 @@ async fn init_child() {
          Check prefix matches Db\n"
     );
     let bridge = BlockingBridge::capture();
-    let (shell_log, shell_failed) = (log.clone(), failed.clone());
-    let printed = std::thread::spawn(move || {
+    let shell_failed = failed.clone();
+    let (printed, log) = std::thread::spawn(move || {
         set_thread_ok_to_block(true);
         let shell = IocShell::new(db, bridge);
         for c in motor_rs::motor_util::motor_util_commands() {
@@ -130,23 +128,21 @@ async fn init_child() {
             .collect();
         // The task logs from its own thread.
         for _ in 0..500 {
-            errlog_flush();
-            if shell_log.lock().unwrap().contains("Check prefix") {
+            if errlog.lines().concat().contains("Check prefix") {
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(*shell_log.lock().unwrap(), shell_failed);
+        assert_eq!(errlog.lines().concat(), shell_failed);
         shell.execute_line("printChIDlist").unwrap();
         shell.execute_line("listMovingMotors").unwrap();
-        errlog_flush();
-        printed
+        (printed, errlog.finish().concat())
     })
     .join()
     .unwrap();
     assert_eq!(printed, ["", "", ""]);
     assert_eq!(
-        log.lock().unwrap().strip_prefix(&failed).unwrap(),
+        log.strip_prefix(&failed).unwrap(),
         "i = 0,\tname = \tchid_dmov = (nil)\tchid_stop =                (nil)\
          \tin_motion = 0\tindex = 0\n\
          chid_allstop = (nil)\nchid_alldone = (nil)\nchid_moving = (nil)\n\

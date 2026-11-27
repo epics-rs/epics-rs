@@ -187,16 +187,15 @@ record(motor, "V:i{card}") {{ field(DTYP, "TestInitStatus") field(OUT, "#C{card}
 async fn logged(
     boot: impl std::future::Future<Output = Booted>,
 ) -> (Booted, Vec<String>, Duration) {
-    use epics_base_rs::runtime::log::{errlog_add_listener, errlog_flush, errlog_remove_listener};
-    let lines = Arc::new(Mutex::new(Vec::new()));
-    let sink = lines.clone();
-    let id = errlog_add_listener(move |m| sink.lock().unwrap().push(m.trim_end().to_owned()));
+    let errlog = epics_base_rs::runtime::log::ErrlogCapture::start();
     let start = Instant::now();
     let booted = boot.await;
     let took = start.elapsed();
-    errlog_flush();
-    errlog_remove_listener(id);
-    let lines = lines.lock().unwrap().clone();
+    let lines = errlog
+        .finish()
+        .iter()
+        .map(|m| m.trim_end().to_owned())
+        .collect();
     (booted, lines, took)
 }
 

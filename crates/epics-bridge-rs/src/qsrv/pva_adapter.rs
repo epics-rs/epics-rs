@@ -1695,16 +1695,7 @@ mod tests {
         .install_channel_sources(&db, &composite)
         .expect("qsrv sources mount");
 
-        // The group's no-+trigger WARN may still be queued here; a listener added
-        // before the worker drains it hears it, as in C errlog.
-        epics_base_rs::runtime::log::errlog_flush();
-        let heard = Arc::new(std::sync::Mutex::new(String::new()));
-        let sink = heard.clone();
-        let listener = epics_base_rs::runtime::log::errlog_add_listener(move |m| {
-            if let Some((_time, line)) = m.split_once(' ') {
-                sink.lock().unwrap().push_str(line);
-            }
-        });
+        let errlog = epics_base_rs::runtime::log::ErrlogCapture::start();
         let peer: std::net::SocketAddr = "127.0.0.1:5075".parse().unwrap();
         for name in ["CAP:b", "CAP:GRP"] {
             let checked = AccessGate::open()
@@ -1729,10 +1720,13 @@ mod tests {
                 .await;
             assert!(opened.is_none(), "{name}: the cap refuses the monitor");
         }
-        epics_base_rs::runtime::log::errlog_flush();
-        epics_base_rs::runtime::log::errlog_remove_listener(listener);
+        let heard: String = errlog
+            .finish()
+            .iter()
+            .filter_map(|m| m.split_once(' ').map(|(_time, line)| line))
+            .collect();
         assert_eq!(
-            *heard.lock().unwrap(),
+            heard,
             format!(
                 "ERR pvxs.tcp.setup Client {peer} Monitor \"CAP:b\" onSubscribe() error: Failed to create db subscription\n\
                  ERR pvxs.tcp.setup Client {peer} Monitor \"CAP:GRP\" onSubscribe() error: Failed to create db subscription\n"

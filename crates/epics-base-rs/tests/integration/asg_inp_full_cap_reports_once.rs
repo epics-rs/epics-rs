@@ -3,10 +3,10 @@
 //! once per input, so its `ECA_ALLOCMEM` exception arrives once, while the
 //! port retries the attach on every rebuild.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
-use epics_base_rs::runtime::log::{errlog_add_listener, errlog_flush};
+use epics_base_rs::runtime::log::ErrlogCapture;
 use epics_base_rs::runtime::task::sleep;
 use epics_base_rs::server::access_security::{
     new_acf_cell_watching, notify_asg_field_changed, parse_acf,
@@ -31,13 +31,7 @@ async fn a_full_cap_on_an_asg_input_prints_ascas_exception_once() {
         .collect();
     assert!(!held.is_empty());
 
-    let heard = Arc::new(Mutex::new(Vec::<String>::new()));
-    let sink = heard.clone();
-    errlog_add_listener(move |m| {
-        if m.starts_with("dbCa:") {
-            sink.lock().unwrap().push(m.to_string());
-        }
-    });
+    let errlog = ErrlogCapture::start();
     let acf = parse_acf(
         r#"ASG(DEFAULT) { RULE(1, READ) }
            ASG(G) { INPA("CAPR.VAL") RULE(1, WRITE) { CALC("A") } }"#,
@@ -50,9 +44,10 @@ async fn a_full_cap_on_an_asg_input_prints_ascas_exception_once() {
         notify_asg_field_changed();
         sleep(Duration::from_millis(200)).await;
     }
-    errlog_flush();
+    let mut heard = errlog.finish();
+    heard.retain(|m| m.starts_with("dbCa:"));
     assert_eq!(
-        *heard.lock().unwrap(),
+        heard,
         [
             "dbCa:exceptionCallback stat \"Unable to allocate additional dynamic memory\" \
              channel \"CAPR.VAL\" context \"subscription install into record CAPR failed\"\n \

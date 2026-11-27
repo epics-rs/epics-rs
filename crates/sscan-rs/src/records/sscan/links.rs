@@ -655,7 +655,6 @@ impl SscanRecord {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::sync::Arc;
     use std::time::Duration;
 
     use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -681,13 +680,7 @@ mod tests {
             .build()
             .await
             .unwrap();
-        let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sink = lines.clone();
-        epics_base_rs::runtime::log::errlog_add_listener(move |m| {
-            if m.contains("S:special:connect") {
-                sink.lock().unwrap().push(m.to_owned());
-            }
-        });
+        let errlog = epics_base_rs::runtime::log::ErrlogCapture::start();
         let h = db.async_handle();
         let (done, waited) = tokio::sync::oneshot::channel();
         // Off this runtime, which may be the one a network link runs on.
@@ -714,14 +707,13 @@ mod tests {
         let (waited, in_progress) = waited.await.unwrap();
         assert!(!in_progress);
         assert!(waited < Duration::from_millis(900), "{waited:?}");
-        epics_base_rs::runtime::log::errlog_flush();
-        let lines = lines.lock().unwrap();
+        let mut lines = errlog.finish();
+        lines.retain(|m| m.contains("S:special:connect"));
         assert!(lines.iter().any(|l| l.contains("Waiting...")), "{lines:?}");
         assert!(
             !lines.iter().any(|l| l.contains("Trying new PV name.")),
             "{lines:?}"
         );
-        drop(lines);
         assert_eq!(db.get_pv("S.T1NV").unwrap().to_f64(), Some(0.0));
     }
 
@@ -736,13 +728,7 @@ mod tests {
             .build()
             .await
             .unwrap();
-        let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sink = lines.clone();
-        epics_base_rs::runtime::log::errlog_add_listener(move |m| {
-            if m.starts_with("SNAN:posMonCallback") {
-                sink.lock().unwrap().push(m.trim_end().to_owned());
-            }
-        });
+        let errlog = epics_base_rs::runtime::log::ErrlogCapture::start();
         let h = db.async_handle();
         std::thread::spawn(move || {
             with_sscan(&h, "SNAN", |s: &mut SscanRecord, _| {
@@ -754,9 +740,14 @@ mod tests {
         })
         .join()
         .unwrap();
-        epics_base_rs::runtime::log::errlog_flush();
+        let errlog_lines = errlog.finish();
+        let lines: Vec<&str> = errlog_lines
+            .iter()
+            .filter(|m| m.starts_with("SNAN:posMonCallback"))
+            .map(|m| m.trim_end())
+            .collect();
         assert_eq!(
-            *lines.lock().unwrap(),
+            lines,
             [
                 "SNAN:posMonCallback: recDynLinkGet returned -1, pvIndex=0, cv=nan",
                 "SNAN:posMonCallback: recDynLinkGet returned -1, pvIndex=0, cv=-nan",

@@ -177,11 +177,7 @@ async fn a_source_without_put_enum_str_fails() {
 /// ```
 #[epics_macros_rs::epics_test]
 async fn a_refused_read_prints_cvt_st_es_line() {
-    let heard = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-    let sink = Arc::clone(&heard);
-    epics_base_rs::runtime::log::errlog_add_listener(move |m| {
-        sink.lock().unwrap().push(m.trim_end().to_string())
-    });
+    let mut errlog = epics_base_rs::runtime::log::ErrlogCapture::start();
     for (rtype, source, line) in [
         (
             "bi",
@@ -207,13 +203,13 @@ async fn a_refused_read_prints_cvt_st_es_line() {
         ),
     ] {
         let db = ioc(rtype, source).await;
-        epics_base_rs::runtime::log::errlog_flush();
-        heard.lock().unwrap().clear();
+        errlog.take();
         db.process_record("HELD").await.unwrap();
         settle(&db, "HELD").await;
-        epics_base_rs::runtime::log::errlog_flush();
-        let said: Vec<String> = std::mem::take(&mut *heard.lock().unwrap())
-            .into_iter()
+        let said: Vec<String> = errlog
+            .take()
+            .iter()
+            .map(|m| m.trim_end().to_string())
             .filter(|m| m.starts_with("recGbl"))
             .collect();
         assert_eq!(said, [line], "{source}");

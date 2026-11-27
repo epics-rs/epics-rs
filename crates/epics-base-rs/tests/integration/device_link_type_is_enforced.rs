@@ -385,17 +385,9 @@ async fn a_device_link_of_a_type_without_device_support_is_held_to_constant() {
 /// refusal lines go through errlog, so an errlog listener receives each one.
 #[epics_macros_rs::epics_test]
 async fn the_refusals_print_through_errlog_at_ioc_init() {
-    use epics_base_rs::runtime::log::{errlog_add_listener, errlog_flush, errlog_strip_ansi};
-    use std::sync::Mutex;
+    use epics_base_rs::runtime::log::{ErrlogCapture, errlog_strip_ansi};
 
-    let heard = Arc::new(Mutex::new(Vec::<String>::new()));
-    let sink = Arc::clone(&heard);
-    errlog_add_listener(move |m| {
-        let m = errlog_strip_ansi(m);
-        if m.contains(": T:") {
-            sink.lock().unwrap().push(m);
-        }
-    });
+    let errlog = ErrlogCapture::start();
     // `build` ends in `ioc_init`.
     IocBuilder::new()
         .db_string(
@@ -417,7 +409,12 @@ record(ai,"T:A2"){ field(DTYP,"Soft Channel")   field(INP,"5")           }
         .build()
         .await
         .unwrap();
-    errlog_flush();
+    let heard: Vec<String> = errlog
+        .finish()
+        .iter()
+        .map(|m| errlog_strip_ansi(m))
+        .filter(|m| m.contains(": T:"))
+        .collect();
     let want = [
         r#"T:R1.INP: can't initialize link type INST_IO with "5" (type CONSTANT)"#,
         r#"T:R2.INP: can't initialize link type INST_IO with "OTHER.VAL" (type PV_LINK)"#,
@@ -429,7 +426,7 @@ record(ai,"T:A2"){ field(DTYP,"Soft Channel")   field(INP,"5")           }
         r#"T:N3.FLNK: can't initialize link type CONSTANT with "@instio parm" (type INST_IO)"#,
     ]
     .map(|line| format!("ERROR: {line}\n"));
-    assert_eq!(*heard.lock().unwrap(), want);
+    assert_eq!(heard, want);
 }
 
 /// `iocInit` walks the records type-major (`iterateRecords`, `iocInit.c:484`)
@@ -438,17 +435,9 @@ record(ai,"T:A2"){ field(DTYP,"Soft Channel")   field(INP,"5")           }
 /// below prints, after the load's own six CP lines, exactly `want`.
 #[epics_macros_rs::epics_test]
 async fn the_ioc_init_lines_follow_cs_record_type_order() {
-    use epics_base_rs::runtime::log::{errlog_add_listener, errlog_flush, errlog_strip_ansi};
-    use std::sync::Mutex;
+    use epics_base_rs::runtime::log::{ErrlogCapture, errlog_strip_ansi};
 
-    let heard = Arc::new(Mutex::new(Vec::<String>::new()));
-    let sink = Arc::clone(&heard);
-    errlog_add_listener(move |m| {
-        let m = errlog_strip_ansi(m);
-        if m.contains("Discarding") || m.contains("can't initialize") {
-            sink.lock().unwrap().push(m);
-        }
-    });
+    let errlog = ErrlogCapture::start();
     // `build` is the load and then `ioc_init`.
     IocBuilder::new()
         .db_string(
@@ -469,7 +458,12 @@ record(ai, "I2") { field(INP, "@x") }
         .build()
         .await
         .unwrap();
-    errlog_flush();
+    let heard: Vec<String> = errlog
+        .finish()
+        .iter()
+        .map(|m| errlog_strip_ansi(m))
+        .filter(|m| m.contains("Discarding") || m.contains("can't initialize"))
+        .collect();
     let cp = |from: &str, to: &str| {
         format!("WARNING: Discarding CP/CPP modifier in CA output link from {from} to {to}.\n")
     };
@@ -497,8 +491,5 @@ record(ai, "I2") { field(INP, "@x") }
             .to_string()
             + "\n",
     ];
-    assert_eq!(
-        *heard.lock().unwrap(),
-        [load.to_vec(), ioc_init.to_vec()].concat()
-    );
+    assert_eq!(heard, [load.to_vec(), ioc_init.to_vec()].concat());
 }

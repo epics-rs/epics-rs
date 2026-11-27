@@ -2898,15 +2898,8 @@ pub(crate) mod tests {
     /// `handle_X`) is dropped without a line.
     #[test]
     fn unhandled_server_commands_log_as_pvxs_and_keep_the_circuit() {
-        use epics_base_rs::runtime::log;
         let order = ByteOrder::Little;
-        let heard = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sink = heard.clone();
-        let id = log::errlog_add_listener(move |m| {
-            if let Some((_time, line)) = m.split_once(' ') {
-                sink.lock().unwrap().push(line.trim_end().to_string());
-            }
-        });
+        let errlog = epics_base_rs::runtime::log::ErrlogCapture::start();
         crate::pvxs_log::logger_level_set(crate::pvxs_log::TCP_IO, crate::pvxs_log::Level::Debug);
         let (by_ioid, by_cid, by_sid_close, ioid_to_sid, ioid_to_cmd, writer_tx, cancel) =
             fresh_router();
@@ -2954,15 +2947,13 @@ pub(crate) mod tests {
                 &cancel,
             );
         }
-        log::errlog_flush();
-        log::errlog_remove_listener(id);
+        let heard = errlog.finish();
         crate::pvxs_log::logger_level_set(crate::pvxs_log::TCP_IO, crate::pvxs_log::Level::Warn);
         let heard: Vec<String> = heard
-            .lock()
-            .unwrap()
             .iter()
+            .filter_map(|m| m.split_once(' ').map(|(_time, line)| line.trim_end()))
             .filter(|l| l.contains(&format!("Server {ROUTER_PEER} ")))
-            .cloned()
+            .map(str::to_string)
             .collect();
         let line = |cmd: u8| {
             format!("DEBUG pvxs.tcp.io Server {ROUTER_PEER} Ignore unexpected command 0x{cmd:02x}")

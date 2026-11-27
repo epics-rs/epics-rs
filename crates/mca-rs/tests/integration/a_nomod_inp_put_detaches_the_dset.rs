@@ -25,7 +25,7 @@
 //! `MA.LCNT` at 0, as does a `dbpf WF2.PROC 1`.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::iocsh::IocShell;
@@ -100,12 +100,10 @@ fn cells(dbpr: &str, names: &[&str]) -> Vec<String> {
         .collect()
 }
 
-fn heard_lines(heard: &Mutex<Vec<String>>) -> Vec<String> {
-    epics_base_rs::runtime::log::errlog_flush();
-    heard
-        .lock()
-        .unwrap()
-        .drain(..)
+fn heard_lines(errlog: &mut epics_base_rs::runtime::log::ErrlogCapture) -> Vec<String> {
+    errlog
+        .take()
+        .into_iter()
         .flat_map(|m| m.lines().map(str::to_string).collect::<Vec<_>>())
         .filter(|l| l.contains("MA."))
         .collect()
@@ -143,18 +141,14 @@ fn build(
 
 #[test]
 fn a_nomod_inp_put_detaches_the_dset_as_in_c() {
-    let heard = Arc::new(Mutex::new(Vec::<String>::new()));
-    let sink = Arc::clone(&heard);
-    epics_base_rs::runtime::log::errlog_add_listener(move |m| {
-        sink.lock().unwrap().push(m.to_string());
-    });
+    let mut errlog = epics_base_rs::runtime::log::ErrlogCapture::start();
 
     let (rt, _db, shell) = build(DB);
     let rows = ["INP", "DSET", "DPVT", "PACT"];
     let before = cells(&run(&shell, "dbpr MA 4"), &rows);
     assert_eq!(before[0], "INP: DB_LINK WF NPP NMS", "{before:?}");
     assert_eq!(before[3], "PACT: 0", "{before:?}");
-    heard_lines(&heard);
+    heard_lines(&mut errlog);
 
     let refused = ["recGblDbaddrError: dbPut Attempt to modify noMod field PV: MA.INP".to_string()];
     let detached = [
@@ -167,7 +161,7 @@ fn a_nomod_inp_put_detaches_the_dset_as_in_c() {
         run(&shell, "dbpf MA.INP WF2"),
         "DBF_STRING:         \"WF NPP NMS\"        \n"
     );
-    assert_eq!(heard_lines(&heard), refused);
+    assert_eq!(heard_lines(&mut errlog), refused);
     assert_eq!(cells(&run(&shell, "dbpr MA 4"), &rows), detached);
 
     assert_eq!(
@@ -183,7 +177,7 @@ fn a_nomod_inp_put_detaches_the_dset_as_in_c() {
         run(&shell, "dbpf MA.INP WF"),
         "DBF_STRING:         \"WF NPP NMS\"        \n"
     );
-    assert_eq!(heard_lines(&heard), refused);
+    assert_eq!(heard_lines(&mut errlog), refused);
     assert_eq!(cells(&run(&shell, "dbpr MA 4"), &rows), detached);
     drop(shell);
     std::mem::forget(rt);

@@ -4893,14 +4893,9 @@ mod tests {
     /// The errlog messages `f` posted, as a listener (the iocLog client
     /// among them) receives them.
     fn errlog_of(f: impl FnOnce()) -> Vec<String> {
-        use epics_base_rs::runtime::log;
-        let heard = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-        let sink = heard.clone();
-        let id = log::errlog_add_listener(move |m| sink.lock().unwrap().push(m.to_string()));
+        let errlog = epics_base_rs::runtime::log::ErrlogCapture::start();
         f();
-        log::errlog_flush();
-        log::errlog_remove_listener(id);
-        heard.lock().unwrap().clone()
+        errlog.finish()
     }
 
     /// pvxs `pvaOpenLink`'s failure line is errlog's (`pvalink_lset.cpp:47-48`).

@@ -1897,11 +1897,7 @@ mod tests {
     /// line prints only above its C level: `> 5` for the start (`:638`).
     #[test]
     fn mca_record_debug_gates_cs_trace_lines() {
-        use epics_base_rs::runtime::log::{
-            errlog_add_listener, errlog_flush, errlog_remove_listener,
-        };
         use epics_base_rs::server::iocsh::vars::{VarAccess, variable_names};
-        use std::sync::{Arc, Mutex};
 
         let _ = crate::mca_record_factory();
         assert!(variable_names().contains(&"mcaRecordDebug"));
@@ -1909,22 +1905,18 @@ mod tests {
             panic!("mcaRecordDebug is an int");
         };
 
-        let lines = Arc::new(Mutex::new(Vec::new()));
-        let sink = lines.clone();
-        let id = errlog_add_listener(move |m| sink.lock().unwrap().push(m.to_string()));
-        let traced = |level: i64| {
+        let mut errlog = epics_base_rs::runtime::log::ErrlogCapture::start();
+        let mut traced = |level: i64| {
             set(level);
             assert_eq!(get(), level);
             let mut rec = loaded(8, &[0; 8]);
             rec.strt = 1;
             rec.run_device_cycle(&mut Probe::default());
-            errlog_flush();
             set(0);
-            std::mem::take(&mut *lines.lock().unwrap())
+            errlog.take()
         };
         let at5 = traced(5);
         let at6 = traced(6);
-        errlog_remove_listener(id);
 
         let start = "process: start acquisition.\n".to_string();
         assert!(at5.contains(&"process: entry, rdng=0, rdns=0, read=0\n".to_string()));

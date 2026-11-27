@@ -32,8 +32,9 @@
 #![cfg(unix)]
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
+use epics_base_rs::runtime::log::ErrlogCapture;
 use epics_base_rs::server::database::PutSplit;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -43,18 +44,12 @@ use epics_base_rs::types::EpicsValue;
 /// Everything the errlog carried, from before the IOC was built. Installed
 /// first because `init_record`'s half of the report is written during
 /// `build()` and there is no second chance to hear it.
-fn listen() -> Arc<Mutex<Vec<String>>> {
-    let heard = Arc::new(Mutex::new(Vec::new()));
-    let sink = Arc::clone(&heard);
-    epics_base_rs::runtime::log::errlog_add_listener(move |m| {
-        sink.lock().expect("sink").push(m.to_string());
-    });
-    heard
+fn listen() -> ErrlogCapture {
+    ErrlogCapture::start()
 }
 
-fn heard(sink: &Arc<Mutex<Vec<String>>>) -> String {
-    epics_base_rs::runtime::log::errlog_flush();
-    sink.lock().expect("sink").join("\n")
+fn heard(sink: &mut ErrlogCapture) -> String {
+    sink.lines().join("\n")
 }
 
 async fn ioc(db_text: &str) -> Arc<PvDatabase> {
@@ -108,7 +103,7 @@ impl Stdout {
 /// nothing reaches the errlog, or `stdout` when given, until the hold is down.
 fn put_under_hold(
     db: &PvDatabase,
-    sink: &Arc<Mutex<Vec<String>>>,
+    sink: &mut ErrlogCapture,
     stdout: Option<&Stdout>,
     puts: &[(&str, &str, &str)],
 ) {
@@ -144,7 +139,7 @@ fn calc_of(db: &PvDatabase, pv: &str) -> String {
 /// The put path. Both records, the real PV name in both, and the put refused.
 #[epics_macros_rs::epics_test]
 async fn a_refused_calc_put_writes_both_of_cs_errlog_records() {
-    let sink = listen();
+    let mut sink = listen();
     let db = ioc("record(calc, \"P:C\") { field(CALC,\"A+B\") }\n").await;
 
     let refused = db
@@ -155,7 +150,7 @@ async fn a_refused_calc_put_writes_both_of_cs_errlog_records() {
         "C `special()` returns S_db_badField, so the client's write FAILS"
     );
 
-    let log = heard(&sink);
+    let log = heard(&mut sink);
     assert!(
         log.contains("recGblRecordError: calc: Illegal CALC field Illegal field value PV: P:C"),
         "C `recGblRecordError(S_db_badField, ...)`, got {log:?}"
@@ -171,7 +166,7 @@ async fn a_refused_calc_put_writes_both_of_cs_errlog_records() {
 /// the assertion above passes on a hard-coded "P:C" too.
 #[epics_macros_rs::epics_test]
 async fn each_record_is_named_by_its_own_pv_name() {
-    let sink = listen();
+    let mut sink = listen();
     let db = ioc("record(calc, \"A:ONE\") { field(CALC,\"A+B\") }\n\
                   record(calc, \"B:TWO\") { field(CALC,\"A+B\") }\n")
     .await;
@@ -182,7 +177,7 @@ async fn each_record_is_named_by_its_own_pv_name() {
             .expect_err("an uncompilable CALC is refused");
     }
 
-    let log = heard(&sink);
+    let log = heard(&mut sink);
     for pv in ["A:ONE", "B:TWO"] {
         assert!(
             log.contains(&format!("PV: {pv}")),
@@ -205,14 +200,14 @@ async fn each_record_is_named_by_its_own_pv_name() {
 /// unconditional and every test above would still pass.
 #[epics_macros_rs::epics_test]
 async fn a_calc_that_compiles_says_nothing() {
-    let sink = listen();
+    let mut sink = listen();
     let db = ioc("record(calc, \"P:OK\") { field(CALC,\"A+B\") }\n").await;
 
     db.put_record_field_from_ca_no_notify("P:OK", "CALC", EpicsValue::String("A*B".into()))
         .await
         .expect("a CALC that compiles is accepted");
 
-    let log = heard(&sink);
+    let log = heard(&mut sink);
     assert!(
         !log.contains("Illegal CALC field"),
         "a good CALC is silent in C, got {log:?}"
@@ -231,7 +226,7 @@ async fn a_calc_that_compiles_says_nothing() {
 async fn a_bad_calc_from_the_db_file_reports_at_init_without_refusing_the_record() {
     use epics_base_rs::server::iocsh::IocShell;
 
-    let sink = listen();
+    let mut sink = listen();
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("f.db");
     std::fs::write(&path, "record(calc, \"P:F\") { field(CALC,\"(A\") }\n").unwrap();
@@ -245,7 +240,7 @@ async fn a_bad_calc_from_the_db_file_reports_at_init_without_refusing_the_record
         .expect("the shell thread");
     db.ioc_init().await;
 
-    let log = heard(&sink);
+    let log = heard(&mut sink);
     assert!(
         log.contains(
             "recGblRecordError: calc: init_record: Illegal CALC field Illegal field value PV: P:F"
@@ -281,14 +276,14 @@ async fn the_refused_expression_stays_stored() {
 /// nothing to do.
 #[epics_macros_rs::epics_test]
 async fn an_emptied_calc_is_reported_like_any_other_failure() {
-    let sink = listen();
+    let mut sink = listen();
     let db = ioc("record(calc, \"P:C\") { field(CALC,\"A+B\") }\n").await;
 
     db.put_record_field_from_ca_no_notify("P:C", "CALC", EpicsValue::String("".into()))
         .await
         .expect_err("C refuses an empty CALC put with S_db_badField");
 
-    let log = heard(&sink);
+    let log = heard(&mut sink);
     assert!(
         log.contains("P:C.CALC: NULL or empty input argument to postfix() in expression \"\""),
         "got {log:?}"
@@ -303,7 +298,7 @@ async fn an_emptied_calc_is_reported_like_any_other_failure() {
 /// OCLV -1.
 #[epics_macros_rs::epics_test]
 async fn calcout_init_reports_a_bad_calc_and_a_used_bad_ocal() {
-    let sink = listen();
+    let mut sink = listen();
     let db = IocBuilder::new()
         .boot_past_failed_loads()
         .db_string(
@@ -323,7 +318,7 @@ record(calcout, "DEF") {}
         .0;
 
     assert_eq!(
-        heard(&sink),
+        heard(&mut sink),
         [
             "Incomplete expression, operand missing in CALC expression 'A+'\n",
             "Incomplete expression, operand missing in CALC expression 'B+'\n",
@@ -360,7 +355,7 @@ record(calcout, "DEF") {}
 #[epics_macros_rs::epics_test]
 #[serial_test::serial(stdout)]
 async fn scalcout_init_reports_a_bad_calc_and_any_bad_ocal() {
-    let sink = listen();
+    let mut sink = listen();
     let stdout = Stdout::start();
     let db = IocBuilder::new()
         .register_record_type("scalcout", || Box::new(ScalcoutRecord::default()))
@@ -386,7 +381,7 @@ record(scalcout, "SB3") { field(CALC, "(A") }
         "sCalcPostfix returns: 8\n".repeat(3) + "sCalcPostfix returns: 6\n"
     );
     assert_eq!(
-        heard(&sink),
+        heard(&mut sink),
         [
             "recGblRecordError: scalcout: init_record: Illegal CALC field Illegal field value PV: SB0\n",
             "recGblRecordError: scalcout: init_record: Illegal OCAL field Illegal field value PV: SB1\n",
@@ -422,7 +417,7 @@ record(scalcout, "SB3") { field(CALC, "(A") }
 #[epics_macros_rs::epics_test]
 async fn acalcout_reports_a_bad_calc_and_ocal_at_init_and_on_a_put() {
     use epics_base_rs::server::records::acalcout::AcalcoutRecord;
-    let sink = listen();
+    let mut sink = listen();
     let db = IocBuilder::new()
         .register_record_type("acalcout", || Box::new(AcalcoutRecord::default()))
         .db_string(
@@ -441,13 +436,13 @@ record(acalcout, "AC") { field(CALC, "A") field(OCAL, "B") }
         .0;
     put_under_hold(
         &db,
-        &sink,
+        &mut sink,
         None,
         &[("AC", "CALC", "A+"), ("AC", "OCAL", "(B")],
     );
 
     assert_eq!(
-        heard(&sink),
+        heard(&mut sink),
         [
             "recGblRecordError: acalcout: init_record: Illegal CALC field Illegal field value PV: ACB\n",
             "recGblRecordError: acalcout: init_record: Illegal OCAL field Illegal field value PV: AO0\n",
@@ -471,7 +466,7 @@ record(acalcout, "AC") { field(CALC, "A") field(OCAL, "B") }
 #[epics_macros_rs::epics_test]
 #[serial_test::serial(stdout)]
 async fn scalcout_special_reports_a_refused_calc_and_ocal_put() {
-    let sink = listen();
+    let mut sink = listen();
     let db = IocBuilder::new()
         .register_record_type("scalcout", || Box::new(ScalcoutRecord::default()))
         .db_string(
@@ -486,14 +481,14 @@ async fn scalcout_special_reports_a_refused_calc_and_ocal_put() {
     let stdout = Stdout::start();
     put_under_hold(
         &db,
-        &sink,
+        &mut sink,
         Some(&stdout),
         &[("SC", "CALC", "A+"), ("SC", "OCAL", "@@")],
     );
 
     assert_eq!(stdout.finish(), "sCalcPostfix returns: 8\n".repeat(2));
     assert_eq!(
-        heard(&sink),
+        heard(&mut sink),
         [
             "recGblRecordError: scalcout: special(): Illegal CALC field Illegal field value PV: SC\n",
             "recGblRecordError: scalcout: special(): Illegal OCAL field Illegal field value PV: SC\n",
@@ -510,7 +505,7 @@ async fn scalcout_special_reports_a_refused_calc_and_ocal_put() {
 #[epics_macros_rs::epics_test]
 async fn transform_reports_each_refused_clc_at_init_and_on_a_put() {
     use epics_base_rs::server::records::transform::TransformRecord;
-    let sink = listen();
+    let mut sink = listen();
     let db = IocBuilder::new()
         .register_record_type("transform", || Box::new(TransformRecord::default()))
         .db_string(
@@ -528,7 +523,7 @@ record(transform, "TR") { field(CLCA, "A") }
         .0;
     put_under_hold(
         &db,
-        &sink,
+        &mut sink,
         None,
         &[
             ("TR", "CLCA", "Q+"),
@@ -538,7 +533,7 @@ record(transform, "TR") { field(CLCA, "A") }
     );
 
     assert_eq!(
-        heard(&sink),
+        heard(&mut sink),
         [
             "recGblRecordError: transform: init_record: Illegal CALC field Illegal field value PV: TRB\n",
             "recGblRecordError: transform: init_record: Illegal CALC field Illegal field value PV: TRB\n",
@@ -555,7 +550,7 @@ record(transform, "TR") { field(CLCA, "A") }
 /// exactly these four stderr lines.
 #[epics_macros_rs::epics_test]
 async fn calcout_special_reports_a_refused_calc_and_a_used_ocal_put() {
-    let sink = listen();
+    let mut sink = listen();
     let db = ioc(r#"
 record(calcout, "CO0") { field(CALC, "A") field(OCAL, "B") }
 record(calcout, "CO1") { field(CALC, "A") field(OCAL, "B") field(DOPT, "Use OCAL") }
@@ -563,7 +558,7 @@ record(calcout, "CO1") { field(CALC, "A") field(OCAL, "B") field(DOPT, "Use OCAL
     .await;
     put_under_hold(
         &db,
-        &sink,
+        &mut sink,
         None,
         &[
             ("CO0", "CALC", "A+"),
@@ -573,7 +568,7 @@ record(calcout, "CO1") { field(CALC, "A") field(OCAL, "B") field(DOPT, "Use OCAL
     );
 
     assert_eq!(
-        heard(&sink),
+        heard(&mut sink),
         [
             "recGblRecordError: calcout: special(): Illegal CALC field Illegal field value PV: CO0\n",
             "CO0.CALC: Incomplete expression, operand missing in expression \"A+\"\n",
@@ -628,7 +623,7 @@ async fn transform_cav_holds_each_clc_compile_status() {
 #[epics_macros_rs::epics_test]
 async fn transform_over_long_clc_put_compiles_its_first_119_bytes() {
     use epics_base_rs::server::records::transform::TransformRecord;
-    let sink = listen();
+    let mut sink = listen();
     let db = IocBuilder::new()
         .register_record_type("transform", || Box::new(TransformRecord::default()))
         .db_string("record(transform, \"TP\") {}\n", &HashMap::new())
@@ -645,7 +640,7 @@ async fn transform_over_long_clc_put_compiles_its_first_119_bytes() {
 
     assert_eq!(calc_of(&db, "TP.CLCA"), long[..119]);
     assert_eq!(db.get_pv("TP.CAV").unwrap().to_f64(), Some(0.0));
-    assert_eq!(heard(&sink), "");
+    assert_eq!(heard(&mut sink), "");
 }
 
 /// swait `special()` reports a refused CALC put and returns 0
@@ -655,7 +650,7 @@ async fn transform_over_long_clc_put_compiles_its_first_119_bytes() {
 #[serial_test::serial(stdout)]
 async fn swait_special_reports_a_refused_calc_put() {
     use epics_base_rs::server::records::swait::SwaitRecord;
-    let sink = listen();
+    let mut sink = listen();
     let db = IocBuilder::new()
         .register_record_type("swait", || Box::new(SwaitRecord::default()))
         .db_string(
@@ -668,11 +663,11 @@ async fn swait_special_reports_a_refused_calc_put() {
         .unwrap()
         .0;
     let stdout = Stdout::start();
-    put_under_hold(&db, &sink, Some(&stdout), &[("SW", "CALC", "A+")]);
+    put_under_hold(&db, &mut sink, Some(&stdout), &[("SW", "CALC", "A+")]);
 
     assert_eq!(stdout.finish(), "");
     assert_eq!(
-        heard(&sink),
+        heard(&mut sink),
         "recGblRecordError: swaitRecord:special: Illegal CALC field Illegal field value PV: SW\n"
     );
     assert_eq!(db.get_pv("SW.CLCV").unwrap().to_f64(), Some(-1.0));

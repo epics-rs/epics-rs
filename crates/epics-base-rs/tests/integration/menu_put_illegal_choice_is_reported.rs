@@ -5,7 +5,6 @@
 //! `dbpf`/`dbgf` (R7.0.10-146).
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::{EpicsValue, PvString};
@@ -59,11 +58,7 @@ const C_PINS: &[(&str, &str, &str, Option<&str>, u16)] = &[
 
 #[epics_macros_rs::epics_test]
 async fn dbpf_sel_selm_space_mask_prints_recgbldbaddrerror_cvt_st_menu() {
-    let heard = Arc::new(Mutex::new(Vec::<String>::new()));
-    let sink = Arc::clone(&heard);
-    epics_base_rs::runtime::log::errlog_add_listener(move |m| {
-        sink.lock().unwrap().push(m.to_string());
-    });
+    let mut errlog = epics_base_rs::runtime::log::ErrlogCapture::start();
     let db = IocBuilder::new()
         .db_string(DB, &HashMap::new())
         .unwrap()
@@ -72,15 +67,12 @@ async fn dbpf_sel_selm_space_mask_prints_recgbldbaddrerror_cvt_st_menu() {
         .unwrap()
         .0;
     for &(rec, field, text, line, want) in C_PINS {
-        epics_base_rs::runtime::log::errlog_flush();
-        heard.lock().unwrap().clear();
+        errlog.take();
         let put = db
             .put_record_field_from_ca(rec, field, EpicsValue::String(PvString::from(text)))
             .await;
-        epics_base_rs::runtime::log::errlog_flush();
-        let said: Vec<String> = heard
-            .lock()
-            .unwrap()
+        let said: Vec<String> = errlog
+            .take()
             .iter()
             .filter(|m| m.contains("Illegal choice"))
             .map(|m| m.trim_end().to_string())

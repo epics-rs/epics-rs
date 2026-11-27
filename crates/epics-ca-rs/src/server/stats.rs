@@ -27,16 +27,18 @@ pub struct ServerStats {
     /// Total CREATE_CHAN successes across the server lifetime.
     /// PR #592's `caServerChannelCount` minus the closes (which we
     /// track separately so the open-channel count is computable).
+    /// This and the three below count the circuit's channel table on
+    /// both drivers.
     pub channels_opened_total: std::sync::atomic::AtomicU64,
-    /// Total CLEAR_CHANNEL successes. Subtract from
-    /// `channels_opened_total` for the live channel count.
+    /// Total channels closed, by CLEAR_CHANNEL, destruction or
+    /// disconnect. Subtract from `channels_opened_total` for the live
+    /// channel count.
     pub channels_closed_total: std::sync::atomic::AtomicU64,
     /// Total successful EVENT_ADD setups. Mirrors
     /// `caServerSubscriptionCount`.
     pub subscriptions_opened_total: std::sync::atomic::AtomicU64,
-    /// Total successful EVENT_CANCEL / channel-close subscription
-    /// teardowns. Subtract from opened for the live subscription
-    /// count.
+    /// Total subscriptions closed, by EVENT_CANCEL or with their
+    /// channel. Subtract from opened for the live subscription count.
     pub subscriptions_closed_total: std::sync::atomic::AtomicU64,
     /// Cumulative monitor events posted to client subscriptions since
     /// startup — counted once per subscription update the server

@@ -304,8 +304,6 @@ pub enum ServerConnectionEvent {
         cid: u32,
     },
     /// `CA_PROTO_EVENT_ADD` accepted; a new subscription is live.
-    /// Drives `ServerStats::subscriptions_opened_total` (PR #592's
-    /// `caServerSubscriptionCount`).
     ///
     /// `mask` is the validated `DBE_*` event-select mask the client
     /// requested (`1..=255`). The CA gateway consults `mask & DBE_PROPERTY`
@@ -320,9 +318,7 @@ pub enum ServerConnectionEvent {
         mask: u16,
     },
     /// `CA_PROTO_EVENT_CANCEL` or channel teardown closed a
-    /// subscription. Drives `ServerStats::subscriptions_closed_total`.
-    /// Subtract from the opened counter for the live subscription
-    /// count.
+    /// subscription.
     SubscriptionClosed {
         peer: SocketAddr,
         pv_name: Arc<[u8]>,
@@ -833,7 +829,60 @@ impl PutNotifySlot {
     }
 }
 
+type TableCounter = fn(&super::stats::ServerStats) -> &std::sync::atomic::AtomicU64;
+
+/// One channel or monitor in a circuit's table as `ServerStats` counts it:
+/// opened when it enters the table, closed when it is dropped, so every way
+/// out (CLEAR_CHANNEL, EVENT_CANCEL, destruction, disconnect, either driver
+/// dropping its [`ClientState`]) closes it exactly once.
+struct TableCount {
+    /// `None` counts nothing (dispatch fixtures without a server).
+    stats: Option<Arc<super::stats::ServerStats>>,
+    closed: TableCounter,
+}
+
+impl TableCount {
+    fn channel(stats: &Option<Arc<super::stats::ServerStats>>) -> Self {
+        Self::open(
+            stats,
+            |s| &s.channels_opened_total,
+            |s| &s.channels_closed_total,
+        )
+    }
+
+    fn subscription(stats: &Option<Arc<super::stats::ServerStats>>) -> Self {
+        Self::open(
+            stats,
+            |s| &s.subscriptions_opened_total,
+            |s| &s.subscriptions_closed_total,
+        )
+    }
+
+    fn open(
+        stats: &Option<Arc<super::stats::ServerStats>>,
+        opened: TableCounter,
+        closed: TableCounter,
+    ) -> Self {
+        if let Some(s) = stats {
+            opened(s).fetch_add(1, Ordering::Relaxed);
+        }
+        Self {
+            stats: stats.clone(),
+            closed,
+        }
+    }
+}
+
+impl Drop for TableCount {
+    fn drop(&mut self) {
+        if let Some(s) = &self.stats {
+            (self.closed)(s).fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 struct ChannelEntry {
+    _counted: TableCount,
     target: ChannelTarget,
     /// This channel's asLib client; each of its monitors holds a clone.
     rights: Arc<ChannelRights>,
@@ -910,6 +959,8 @@ pub(crate) struct ChannelMonitor {
     /// Its gate and read-access flag.
     pub monitor: Arc<CircuitMonitor>,
     pub id: epics_base_rs::server::event_queue::AttachId,
+    /// Private, so [`ClientState::link_subscription`] is the only way in.
+    _counted: TableCount,
 }
 
 impl ChannelEntry {
@@ -1057,8 +1108,9 @@ pub(crate) struct ClientState {
     /// `subscription_events_posted` / `subscription_events_processed`
     /// counters (PCAS `caServer` parity, feeding the gateway's
     /// `serverPostRate` / `serverEventRate`) advance from the delivery
-    /// layer. `None` in unit tests that drive the TCP path without a
-    /// full `ServerStats` wired up.
+    /// layer, and into each channel's and monitor's [`TableCount`].
+    /// `None` in unit tests that drive the TCP path without a full
+    /// `ServerStats` wired up.
     stats: Option<Arc<super::stats::ServerStats>>,
 }
 
@@ -1352,10 +1404,22 @@ impl ClientState {
     ///
     /// The single owner of the channel→monitor association, so both drivers
     /// register through it and [`destroy_channel`] can cancel a cleared
-    /// channel's monitors without knowing which registry holds them.
-    pub(crate) fn link_subscription(&mut self, sid: u32, monitor: ChannelMonitor) {
+    /// channel's monitors without knowing which registry holds them, and so
+    /// both count their subscriptions here.
+    pub(crate) fn link_subscription(
+        &mut self,
+        sid: u32,
+        sub_id: u32,
+        monitor: Arc<CircuitMonitor>,
+        id: epics_base_rs::server::event_queue::AttachId,
+    ) {
         if let Some(chan) = self.channels.get_mut(&sid) {
-            chan.subscriptions.push(monitor);
+            chan.subscriptions.push(ChannelMonitor {
+                sub_id,
+                monitor,
+                id,
+                _counted: TableCount::subscription(&self.stats),
+            });
         }
     }
 
@@ -1407,6 +1471,7 @@ impl ClientState {
         acf: epics_base_rs::server::access_security::AcfCell,
         tcp_port: u16,
         db: Arc<PvDatabase>,
+        stats: Option<Arc<super::stats::ServerStats>>,
     ) -> Self {
         Self {
             channels: HashMap::new(),
@@ -1430,7 +1495,7 @@ impl ClientState {
             #[cfg(tokio_backend)]
             parked_reads: ParkedReads::default(),
             circuit_monitors: None,
-            stats: None,
+            stats,
         }
     }
 
@@ -2556,8 +2621,7 @@ where
     // the spawned monitor / put-notify tasks); `outbox_drain` goes to the
     // circuit writer. See `super::outbox` for the invariant this establishes.
     let (outbox, outbox_drain) = crate::server::outbox::channel();
-    let mut state = ClientState::new(acf, tcp_port, db.clone());
-    state.stats = stats.clone();
+    let mut state = ClientState::new(acf, tcp_port, db.clone(), stats.clone());
     #[cfg(feature = "cap-tokens")]
     {
         state.cap_token_verifier = cap_token_verifier;
@@ -3601,6 +3665,7 @@ pub(crate) async fn dispatch_message(
             state.channels.insert(
                 sid,
                 ChannelEntry {
+                    _counted: TableCount::channel(&state.stats),
                     target,
                     rights,
                     cid: client_cid,
@@ -3971,11 +4036,9 @@ pub(crate) async fn dispatch_message(
                     // knows its monitors, so CLEAR_CHANNEL can cancel them.
                     state.link_subscription(
                         s.channel_sid,
-                        ChannelMonitor {
-                            sub_id: s.sub_id,
-                            monitor: s.monitor.clone(),
-                            id: s.reader.id(),
-                        },
+                        s.sub_id,
+                        s.monitor.clone(),
+                        s.reader.id(),
                     );
                     state.subscriptions.insert(
                         s.reader.id(),
@@ -15300,6 +15363,7 @@ mod destroyed_channel_teardown_tests {
             epics_base_rs::server::access_security::new_acf_cell(None),
             5064,
             db.clone(),
+            None,
         );
         let (outbox, drain) = crate::server::outbox::channel();
         for frame in [version_frame(), create_chan_frame(1, "AR4:pending")] {
@@ -17266,7 +17330,7 @@ mod destroyed_channel_teardown_tests {
             .await
             .expect("add pv");
         let acf = epics_base_rs::server::access_security::new_acf_cell(None);
-        let mut state = ClientState::new(acf, 5064, db.clone());
+        let mut state = ClientState::new(acf, 5064, db.clone(), None);
         let (outbox, mut drain) = crate::server::outbox::channel();
         let peer: SocketAddr = "127.0.0.1:55308".parse().unwrap();
         let version = CaHeader::from_bytes(&version_frame()).expect("header");
@@ -18654,7 +18718,7 @@ mod access_change_walk_tests {
         let acf = epics_base_rs::server::access_security::new_acf_cell(Some(
             epics_base_rs::server::access_security::parse_acf(ACF).unwrap(),
         ));
-        let mut state = ClientState::new(acf, 5064, db.clone());
+        let mut state = ClientState::new(acf, 5064, db.clone(), None);
         state.update_identity(|id| id.username = "ops".into());
         let (outbox, mut drain) = crate::server::outbox::channel();
         let peer: SocketAddr = "127.0.0.1:55990".parse().unwrap();
@@ -18740,7 +18804,7 @@ mod access_change_walk_tests {
     async fn a_non_utf8_host_name_reaches_the_acf_check_byte_for_byte() {
         use epics_base_rs::server::access_security::{AccessLevel, new_acf_cell, parse_acf};
         let db = Arc::new(PvDatabase::new());
-        let mut state = ClientState::new(new_acf_cell(None), 5064, db.clone());
+        let mut state = ClientState::new(new_acf_cell(None), 5064, db.clone(), None);
         let (outbox, _drain) = crate::server::outbox::channel();
         let payload = b"h\xff\0\0\0\0\0\0".to_vec();
         let mut hdr = CaHeader::new(CA_PROTO_HOST_NAME);
@@ -18781,6 +18845,7 @@ mod access_change_walk_tests {
             epics_base_rs::server::access_security::new_acf_cell(None),
             5064,
             db.clone(),
+            None,
         );
         let (outbox, mut drain) = crate::server::outbox::channel();
         for (name, want) in [
@@ -18822,6 +18887,7 @@ mod access_change_walk_tests {
             new_acf_cell(Some(parse_acf(acf).unwrap())),
             5064,
             db.clone(),
+            None,
         );
         let (outbox, _drain) = crate::server::outbox::channel();
         let payload = b"op\xff\0\0\0\0\0".to_vec();
@@ -18881,6 +18947,7 @@ mod unrouted_command_tests {
             epics_base_rs::server::access_security::new_acf_cell(None),
             5064,
             db.clone(),
+            None,
         );
         state.minor.set(13);
         let (outbox, mut drain) = crate::server::outbox::channel();
@@ -18977,7 +19044,7 @@ mod access_change_tests {
     ) {
         db.add_pv("AR:LIVE", EpicsValue::Double(1.5)).await.unwrap();
         let acf = new_acf_cell(Some(parse_acf(READ_WRITE).unwrap()));
-        let mut state = ClientState::new(acf.clone(), 5064, db.clone());
+        let mut state = ClientState::new(acf.clone(), 5064, db.clone(), None);
         let (outbox, mut drain) = crate::server::outbox::channel();
         let mut version = CaHeader::new(CA_PROTO_VERSION);
         version.count = CA_MINOR_VERSION;
@@ -19481,7 +19548,7 @@ mod clear_channel_revoke_tests {
         let db = Arc::new(PvDatabase::new());
         db.add_pv("CC:VAL", EpicsValue::Double(1.5)).await.unwrap();
         let acf = epics_base_rs::server::access_security::new_acf_cell(None);
-        let mut state = ClientState::new(acf, 5064, db.clone());
+        let mut state = ClientState::new(acf, 5064, db.clone(), None);
         let (outbox, mut drain) = crate::server::outbox::channel();
         let peer: SocketAddr = "127.0.0.1:55991".parse().unwrap();
 

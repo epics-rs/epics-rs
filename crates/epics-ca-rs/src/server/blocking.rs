@@ -1508,14 +1508,7 @@ pub(crate) fn hand_off_subscription(
             monitor: r.monitor.clone(),
         },
     );
-    state.link_subscription(
-        r.channel_sid,
-        crate::server::tcp::ChannelMonitor {
-            sub_id: r.sub_id,
-            monitor: r.monitor,
-            id: r.reader.id(),
-        },
-    );
+    state.link_subscription(r.channel_sid, r.sub_id, r.monitor, r.reader.id());
     let _ = ev_tx.send(EventTaskControl::Add(Box::new(MonitorDelivery {
         reader: r.reader,
         target: r.target,
@@ -1732,11 +1725,11 @@ fn handle_client_blocking(
 
     let stream = Arc::new(stream);
     let mut reader: &TcpStream = &stream;
-    let activity = Arc::new(CircuitActivity::new(Some(stats)));
+    let activity = Arc::new(CircuitActivity::new(Some(stats.clone())));
     let send_lock = Arc::new(Mutex::new(SendBuf::new(stream.clone(), activity.clone())));
 
     let (outbox, drain) = outbox::channel();
-    let mut state = ClientState::new(acf, tcp_port, db.clone());
+    let mut state = ClientState::new(acf, tcp_port, db.clone(), Some(stats));
     state.apply_connection_identity(peer, None, None);
 
     // C `create_tcp_client` (`caservertask.c:1526`) sends an unsolicited
@@ -3067,7 +3060,7 @@ mod tests {
         dbr_type: u16,
     ) -> Vec<u8> {
         let acf = new_acf();
-        let mut state = ClientState::new(acf, 5064, db.clone());
+        let mut state = ClientState::new(acf, 5064, db.clone(), None);
         let peer: SocketAddr = "127.0.0.1:5064".parse().unwrap();
         state.apply_connection_identity(peer, None, None);
         let (outbox, mut drain) = outbox::channel();
@@ -3441,6 +3434,118 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(counts(), (sent, received), "(bytes_in, bytes_out)");
+
+        server.shutdown();
+        accept.join().unwrap();
+    }
+
+    /// `(channels opened, closed, subscriptions opened, closed)`, once it
+    /// reads `want` or the budget runs out: the client sees a reply a moment
+    /// before a teardown on the server's side of it has finished.
+    fn table_counts_settle(
+        stats: &ServerStats,
+        want: (u64, u64, u64, u64),
+    ) -> (u64, u64, u64, u64) {
+        let counts = || {
+            (
+                stats.channels_opened_total.load(Ordering::Relaxed),
+                stats.channels_closed_total.load(Ordering::Relaxed),
+                stats.subscriptions_opened_total.load(Ordering::Relaxed),
+                stats.subscriptions_closed_total.load(Ordering::Relaxed),
+            )
+        };
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
+        while counts() != want && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        counts()
+    }
+
+    fn event_cancel_frame(sid: u32, sub_id: u32) -> Vec<u8> {
+        let mut h = CaHeader::new(CA_PROTO_EVENT_CANCEL);
+        h.data_type = DBR_DOUBLE_MON;
+        h.count = 1;
+        h.cid = sid;
+        h.available = sub_id;
+        h.to_bytes().to_vec()
+    }
+
+    /// The channel and subscription counters count this driver's table as
+    /// they do the async one's: EVENT_CANCEL closes its subscription, and
+    /// CLEAR_CHANNEL closes the channel and the subscription still on it.
+    #[test]
+    fn channel_and_subscription_counters_move_with_create_and_clear() {
+        let db = seed_db(&[("BLK:TALLY", EpicsValue::Double(1.0))]);
+        let server =
+            Arc::new(BlockingCaServer::bind("127.0.0.1:0", db.clone(), new_acf()).unwrap());
+        let stats = server.stats();
+        let addr = server.local_addr().unwrap();
+        let srv = server.clone();
+        let accept = thread::spawn(move || srv.serve());
+
+        let mut c = TcpStream::connect(addr).unwrap();
+        c.set_read_timeout(Some(fact_budget::FACT_BUDGET)).unwrap();
+        let _ = read_until_cmmd(&mut c, CA_PROTO_VERSION);
+        c.write_all(&version_frame()).unwrap();
+        c.write_all(&create_chan_frame(0x51, "BLK:TALLY")).unwrap();
+        let cc = read_until_cmmd(&mut c, CA_PROTO_CREATE_CHAN);
+        let sid = u32::from_be_bytes([cc[12], cc[13], cc[14], cc[15]]);
+        c.write_all(&event_add_double_frame(sid, 1)).unwrap();
+        c.write_all(&event_add_double_frame(sid, 2)).unwrap();
+        let _ = read_until_cmmd(&mut c, CA_PROTO_EVENT_ADD);
+        let _ = read_until_cmmd(&mut c, CA_PROTO_EVENT_ADD);
+        assert_eq!(table_counts_settle(&stats, (1, 0, 2, 0)), (1, 0, 2, 0));
+        // Each initial value is one update posted and one processed.
+        let events = || {
+            (
+                stats.subscription_events_posted.load(Ordering::Relaxed),
+                stats.subscription_events_processed.load(Ordering::Relaxed),
+            )
+        };
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
+        while events() != (2, 2) && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(events(), (2, 2), "(events posted, processed)");
+
+        c.write_all(&event_cancel_frame(sid, 1)).unwrap();
+        assert_eq!(table_counts_settle(&stats, (1, 0, 2, 1)), (1, 0, 2, 1));
+        let mut clear = CaHeader::new(CA_PROTO_CLEAR_CHANNEL);
+        clear.cid = sid;
+        clear.available = 0x51;
+        c.write_all(&clear.to_bytes()).unwrap();
+        let _ = read_until_cmmd(&mut c, CA_PROTO_CLEAR_CHANNEL);
+        assert_eq!(table_counts_settle(&stats, (1, 1, 2, 2)), (1, 1, 2, 2));
+
+        server.shutdown();
+        accept.join().unwrap();
+    }
+
+    /// A client that leaves without clearing anything closes, in the
+    /// counters, the channel and subscription it left open.
+    #[test]
+    fn a_disconnect_closes_the_channel_and_subscription_left_open() {
+        let db = seed_db(&[("BLK:LEFT", EpicsValue::Double(1.0))]);
+        let server =
+            Arc::new(BlockingCaServer::bind("127.0.0.1:0", db.clone(), new_acf()).unwrap());
+        let stats = server.stats();
+        let addr = server.local_addr().unwrap();
+        let srv = server.clone();
+        let accept = thread::spawn(move || srv.serve());
+
+        let mut c = TcpStream::connect(addr).unwrap();
+        c.set_read_timeout(Some(fact_budget::FACT_BUDGET)).unwrap();
+        let _ = read_until_cmmd(&mut c, CA_PROTO_VERSION);
+        c.write_all(&version_frame()).unwrap();
+        c.write_all(&create_chan_frame(0x52, "BLK:LEFT")).unwrap();
+        let cc = read_until_cmmd(&mut c, CA_PROTO_CREATE_CHAN);
+        let sid = u32::from_be_bytes([cc[12], cc[13], cc[14], cc[15]]);
+        c.write_all(&event_add_double_frame(sid, 1)).unwrap();
+        let _ = read_until_cmmd(&mut c, CA_PROTO_EVENT_ADD);
+        assert_eq!(table_counts_settle(&stats, (1, 0, 1, 0)), (1, 0, 1, 0));
+
+        drop(c);
+        assert_eq!(table_counts_settle(&stats, (1, 1, 1, 1)), (1, 1, 1, 1));
 
         server.shutdown();
         accept.join().unwrap();
@@ -4923,7 +5028,7 @@ mod tests {
     fn event_add_with_truncated_mon_info_drops_silently() {
         let db = seed_db(&[("SHORT:MON", EpicsValue::Double(1.0))]);
         let acf = new_acf();
-        let mut state = ClientState::new(acf, 5064, db.clone());
+        let mut state = ClientState::new(acf, 5064, db.clone(), None);
         let peer: SocketAddr = "127.0.0.1:5064".parse().unwrap();
         state.apply_connection_identity(peer, None, None);
         let (outbox, mut drain) = outbox::channel();
@@ -5031,7 +5136,7 @@ mod tests {
         u32,
     ) {
         let acf = new_acf();
-        let mut state = ClientState::new(acf, 5064, db.clone());
+        let mut state = ClientState::new(acf, 5064, db.clone(), None);
         let peer: SocketAddr = "127.0.0.1:5064".parse().unwrap();
         state.apply_connection_identity(peer, None, None);
         let (outbox, mut drain) = outbox::channel();
@@ -5355,7 +5460,7 @@ mod tests {
     fn reference_monitor_frames(seed: f64, update: f64, sub_id: u32) -> (Vec<u8>, Vec<u8>) {
         let db = seed_db(&[("REF:MON", EpicsValue::Double(seed))]);
         let acf = new_acf();
-        let mut state = ClientState::new(acf, 5064, db.clone());
+        let mut state = ClientState::new(acf, 5064, db.clone(), None);
         let peer: SocketAddr = "127.0.0.1:5064".parse().unwrap();
         state.apply_connection_identity(peer, None, None);
         let (outbox, mut drain) = outbox::channel();
@@ -5923,7 +6028,7 @@ mod tests {
     fn reference_write_notify_completion(put_val: f64, ioid: u32) -> Vec<u8> {
         let db = seed_async_db("REF:ASYW");
         let acf = new_acf();
-        let mut state = ClientState::new(acf, 5064, db.clone());
+        let mut state = ClientState::new(acf, 5064, db.clone(), None);
         let peer: SocketAddr = "127.0.0.1:5064".parse().unwrap();
         state.apply_connection_identity(peer, None, None);
         let (outbox, _drain) = outbox::channel();

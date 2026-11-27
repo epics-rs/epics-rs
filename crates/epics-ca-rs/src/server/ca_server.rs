@@ -1125,39 +1125,14 @@ impl CaServer {
             reactor.spawn(async move {
                 while let Ok(evt) = rx.recv().await {
                     use std::sync::atomic::Ordering::Relaxed;
-                    // ServerConnectionEvent is `#[non_exhaustive]`, so
-                    // the `_` arm guards against future variants — even
-                    // though every present variant is matched today,
-                    // we don't want a new event in some future minor
-                    // release to break this crate. Clippy sees today's
-                    // exhaustive cover and warns; allow it explicitly.
-                    #[allow(unreachable_patterns)]
+                    // Channel and subscription counts are the circuit
+                    // table's (`tcp::TableCount`), on both drivers.
                     match evt {
                         crate::server::tcp::ServerConnectionEvent::Connected(_) => {
                             stats_for_task.connects_total.fetch_add(1, Relaxed);
                         }
                         crate::server::tcp::ServerConnectionEvent::Disconnected(_) => {
                             stats_for_task.disconnects_total.fetch_add(1, Relaxed);
-                        }
-                        crate::server::tcp::ServerConnectionEvent::ChannelCreated { .. } => {
-                            stats_for_task.channels_opened_total.fetch_add(1, Relaxed);
-                        }
-                        crate::server::tcp::ServerConnectionEvent::ChannelCleared { .. } => {
-                            stats_for_task.channels_closed_total.fetch_add(1, Relaxed);
-                        }
-                        crate::server::tcp::ServerConnectionEvent::SubscriptionOpened {
-                            ..
-                        } => {
-                            stats_for_task
-                                .subscriptions_opened_total
-                                .fetch_add(1, Relaxed);
-                        }
-                        crate::server::tcp::ServerConnectionEvent::SubscriptionClosed {
-                            ..
-                        } => {
-                            stats_for_task
-                                .subscriptions_closed_total
-                                .fetch_add(1, Relaxed);
                         }
                         _ => {}
                     }

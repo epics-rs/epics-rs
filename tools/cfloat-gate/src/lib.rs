@@ -18,15 +18,15 @@
 //! # Why textual
 //!
 //! clippy cannot see a format argument's type, and a placeholder's type is the
-//! only thing that tells a float apart from a string being truncated
-//! (`{:.12}` of a `&str`). So the argument must *say* what it is: written
-//! `CFloat(x)` it passes, written `x` it fails, and a captured identifier
-//! (`{x:.3}`) fails because nothing at the call site says what `x` holds.
-//! Placeholders whose argument is genuinely not a float are named in the
-//! caller's exemption list with the reason; an exemption that matches nothing
-//! fails the gate, so the list cannot outlive its sites. The crates and the
-//! list are the workspace's own: this crate's `tests/cfloat_gate.rs` holds
-//! epics-rs's, and epics-rs-iocs takes the crate as a git dev-dependency.
+//! only thing that tells a float apart from a string being truncated (`{:.12}`
+//! of a `&str`). So the argument must *say* what it is: written `CFloat(x)` it
+//! passes, written `x` it fails, and a captured identifier (`{x:.3}`) fails
+//! because nothing at the call site says what `x` holds. Placeholders whose
+//! argument is genuinely not a float are named in the caller's exemption list
+//! with the reason; an exemption that matches nothing fails the gate, so the
+//! list cannot outlive its sites. The crates and the list are the workspace's
+//! own: this crate's `tests/integration/cfloat_gate.rs` holds epics-rs's, and
+//! epics-rs-iocs takes the crate as a git dev-dependency.
 //!
 //! Every `name!(...)` invocation is read, not a list of known format macros:
 //! a format string is the first argument that is exactly one string literal.

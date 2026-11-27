@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::{Duration, Instant};
 
-use epics_base_rs::net::{AsyncUdpV4, PortUse};
 use epics_base_rs::runtime::sync::mpsc;
+use tokio::net::UdpSocket;
 
 use crate::protocol::*;
 
@@ -268,23 +268,15 @@ async fn run_beacon_monitor_inner(
         std::sync::Arc<crate::server::signed_beacon::SignedBeaconVerifier>,
     >,
 ) {
-    // C `udpiiu` binds this socket to INADDR_ANY (`udpiiu.cpp:241-249`,
-    // "force a bind to an unconstrained address"), and the registration
-    // retry it drives ALTERNATES its destination between the loopback
-    // address and `osiLocalAddr()` (the first non-loopback NIC,
-    // `udpiiu.cpp:494-519`) for pre-3.13-beta-12 repeater compatibility.
-    // A loopback-ONLY bind cannot reach the `osiLocalAddr()` destination
-    // on Windows (a socket bound to `127.0.0.1` may only send over the
-    // loopback interface), so every odd-numbered registration was silently
-    // dropped there and the compatibility alternation was defeated. Bind
-    // the same-port bundle across every NIC (loopback + non-loopback) —
-    // the AsyncUdpV4 analogue of INADDR_ANY — so BOTH destinations are
-    // reachable and, because all NIC sockets share ONE ephemeral port, the
-    // repeater keys the alternating datagrams to a single client by port
-    // (C `identicalPort`, `repeater.cpp:418`) exactly as C's single
-    // INADDR_ANY socket does. `Exclusive`, as that socket sets no reuse
-    // option (`udpiiu.cpp:174-252`).
-    let socket = match AsyncUdpV4::bind_ephemeral_same_port(PortUse::Exclusive, false) {
+    // C `udpiiu` binds this socket to INADDR_ANY with no reuse option
+    // (`udpiiu.cpp:174-252`), and C caRepeater's liveness probe binds
+    // INADDR_ANY at the client's port (`repeater.cpp:285-311`). Only a
+    // wildcard socket is sure to make that probe fail: Linux past ten
+    // sockets on a port, and Windows always, let it bind beside per-address
+    // sockets, and the repeater then reaps the client and stops forwarding
+    // it beacons. A wildcard socket also reaches both of the alternating
+    // registration destinations (`udpiiu.cpp:494-519`) from one port.
+    let socket = match UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).await {
         Ok(s) => s,
         Err(_) => return,
     };
@@ -293,7 +285,7 @@ async fn run_beacon_monitor_inner(
     // (slow main loop, undersized SO_RCVBUF, mass-restart storm)
     // surfaces as a debug log instead of silent loss. No-op on
     // non-Linux. Diagnostic-only failure is logged at trace.
-    if let Err(e) = socket.enable_so_rxq_ovfl() {
+    if let Err(e) = epics_base_rs::net::enable_so_rxq_ovfl_for_socket(&socket) {
         tracing::trace!(
             target: "epics_ca_rs::client::beacon_monitor",
             error = %e,
@@ -361,9 +353,9 @@ async fn run_beacon_monitor_inner(
         // its stale steady-state estimate.
         let recv_fut = tokio::time::timeout(
             REREGISTER_INTERVAL,
-            socket.recv_with_meta_with_drops(&mut buf),
+            epics_base_rs::net::recv_from_with_drop_count_socket(&socket, &mut buf),
         );
-        let (meta, drops) = tokio::select! {
+        let (datagram, drops) = tokio::select! {
             // C `repeaterSubscribeTimer::expire` (`repeaterSubscribeTimer.cpp:66-91`):
             // send a registration on every expiry and reschedule at 1 s for as
             // long as the repeater has not confirmed. Disabled once it has,
@@ -401,7 +393,7 @@ async fn run_beacon_monitor_inner(
             }
             recv = recv_fut => {
                 match recv {
-                    Ok(Ok(v)) => v,
+                    Ok(Ok((n, from, drops))) => ((n, from), drops),
                     Ok(Err(_)) => continue,
                     Err(_) => {
                         // No beacons for 5 minutes — the repeater may have
@@ -425,7 +417,9 @@ async fn run_beacon_monitor_inner(
             );
         }
         prev_drops_beacon = drops;
-        let len = meta.n;
+        let len = datagram.0;
+        #[cfg(feature = "cap-tokens")]
+        let src = datagram.1;
         if len < CaHeader::SIZE {
             continue;
         }
@@ -476,8 +470,7 @@ async fn run_beacon_monitor_inner(
                     // rewrites the L3 source to the repeater's local
                     // socket address (typically 127.0.0.1). Under the
                     // standard production topology the client beacon
-                    // socket is bound to LOCALHOST (line 160) and ONLY
-                    // receives via the repeater, so `meta.src` is
+                    // socket ONLY receives via the repeater, so `src` is
                     // always loopback and a strict G3 binding would
                     // reject every legitimate companion.
                     //
@@ -490,7 +483,7 @@ async fn run_beacon_monitor_inner(
                     // when a non-loopback path is observed (e.g. a
                     // future direct-LAN deployment without a
                     // repeater).
-                    let src_ip = match meta.src.ip() {
+                    let src_ip = match src.ip() {
                         std::net::IpAddr::V4(v) => v,
                         std::net::IpAddr::V6(_) => {
                             metrics::counter!("ca_client_signed_beacon_failures_total")
@@ -590,10 +583,10 @@ async fn run_beacon_monitor_inner(
                 // line up regardless of whether the matching beacon
                 // arrives directly or via a repeater.
                 //
-                // The earlier `meta.src.ip()` keying was correct in
+                // The earlier `src.ip()` keying was correct in
                 // synthetic direct-LAN tests but broke production: a
                 // loopback-bound monitor socket only ever sees
-                // `meta.src = 127.0.0.1:<repeater_port>` from the
+                // `src = 127.0.0.1:<repeater_port>` from the
                 // repeater, so the lookup key was always
                 // `(127.0.0.1, port, beacon_id)` while the insert key
                 // was `(real_server_ip, port, beacon_id)` — every
@@ -602,14 +595,14 @@ async fn run_beacon_monitor_inner(
                 // `verified_tuple_key_matches_via_repeater` for the
                 // regression case.
                 //
-                // Fall back to `meta.src.ip()` when `hdr.available` is
+                // Fall back to `src.ip()` when `hdr.available` is
                 // zero (e.g. a malformed or non-rewritten beacon).
                 // That key won't hit under the loopback topology, but
                 // it lets the direct-LAN path keep working.
                 let lookup_ip_u32 = if hdr.available != 0 {
                     hdr.available
                 } else {
-                    match meta.src.ip() {
+                    match src.ip() {
                         std::net::IpAddr::V4(v) => u32::from_be_bytes(v.octets()),
                         std::net::IpAddr::V6(_) => 0,
                     }
@@ -963,7 +956,7 @@ fn handle_beacon(
 /// `envGetInetPortConfigParam` — C's `udpiiu::repeaterPort` member, not a
 /// fresh env read per attempt.
 async fn send_repeater_registration(
-    socket: &AsyncUdpV4,
+    socket: &UdpSocket,
     attempt: u32,
     repeater_port: u16,
 ) -> Result<(), ()> {
@@ -1003,7 +996,7 @@ mod repeater_registration_tests {
         let mut buf = [0u8; 64];
         let mut registers = 0usize;
         let mut client = None;
-        let deadline = tokio::time::Instant::now() + window;
+        let deadline = epics_libcom_rs::runtime::task::deadline_from_now(window);
         loop {
             match tokio::time::timeout_at(deadline, repeater.recv_from(&mut buf)).await {
                 Ok(Ok((n, src))) if n >= CaHeader::SIZE => {
@@ -1091,7 +1084,7 @@ mod repeater_registration_tests {
             |(src, _): &(SocketAddr, usize)| src.port() == client.port() && pacer_ticks.get() >= 2,
             |(src, _): &(SocketAddr, usize)| src.port() != client.port() && pacer_ticks.get() >= 4,
             async |remaining| {
-                let deadline = tokio::time::Instant::now() + remaining;
+                let deadline = epics_libcom_rs::runtime::task::deadline_from_now(remaining);
                 let mut buf = [0u8; 64];
                 loop {
                     let (n, src) = tokio::time::timeout_at(deadline, repeater.recv_from(&mut buf))
@@ -1164,7 +1157,8 @@ mod repeater_registration_tests {
         // Attempts 0..=3 at ~1 s apart (the repeater never CONFIRMs).
         let mut announced: Vec<Ipv4Addr> = Vec::new();
         let mut buf = [0u8; 64];
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(3600);
+        let deadline =
+            epics_libcom_rs::runtime::task::deadline_from_now(Duration::from_millis(3600));
         while announced.len() < 4 {
             match tokio::time::timeout_at(deadline, repeater.recv_from(&mut buf)).await {
                 Ok(Ok((n, _src))) if n >= CaHeader::SIZE => {
@@ -1829,7 +1823,7 @@ mod tests {
         // `last_seen` values below subtract without underflowing Instant on
         // Windows (QPC-since-boot, where uptime may be shorter than the span).
         let base = Instant::now();
-        let now = base + Duration::from_secs(300);
+        let now = epics_libcom_rs::runtime::time::deadline_after(base, Duration::from_secs(300));
         let mut servers: HashMap<SocketAddr, BeaconState> = HashMap::new();
         let fresh: SocketAddr = "127.0.0.1:5064".parse().unwrap();
         let stale: SocketAddr = "127.0.0.1:5065".parse().unwrap();

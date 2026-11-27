@@ -2494,6 +2494,8 @@ pub struct RecordCell {
     /// Set with no borrow of the record, on the line of `name`, which the
     /// cycle reads.
     chain_pact: AtomicBool,
+    /// A `scanOnce` of this record waits on the ring ([`Self::queue_once`]).
+    once_queued: AtomicBool,
     /// How many dset calls hold this record lent, its device out
     /// ([`Self::lend_to_dset`]). Touched only by the set's holder, as
     /// `borrow` is.
@@ -2819,16 +2821,6 @@ impl FieldAddr {
     #[inline(always)]
     pub(crate) fn char_view(&self) -> bool {
         self.char_view
-    }
-
-    /// The text `dbGet` answers every request of this `$` address from: a
-    /// link keeps its `DBF_xxLINK` and an attribute its `SPC_ATTRIBUTE`, so
-    /// the `DBR_CHAR` image is not what a conversion starts from.
-    pub(crate) fn text_route(&self) -> Option<crate::server::database::char_view::TextRoute> {
-        if !self.char_view {
-            return None;
-        }
-        crate::server::database::char_view::source_of(self.desc).text_route()
     }
 }
 
@@ -3614,6 +3606,19 @@ impl Drop for ChainPactHold<'_> {
     }
 }
 
+/// A record's place on the `scanOnce` ring, from [`RecordCell::queue_once`]:
+/// given up when the process it was queued for starts, or when the ring
+/// refuses or discards it.
+pub(crate) struct OnceTicket(Arc<RecordCell>);
+
+impl Drop for OnceTicket {
+    fn drop(&mut self) {
+        // A read-modify-write, so the process that starts after this sees
+        // what each request merged into it wrote before asking.
+        self.0.once_queued.swap(false, Ordering::AcqRel);
+    }
+}
+
 impl RecordCell {
     /// Hold this record's PACT as a target's source while the guard lives.
     /// Under the chain's lock set, so a reader that takes it sees C's value.
@@ -3633,6 +3638,13 @@ impl RecordCell {
 
     pub(crate) fn restore_chain_pact(&self, was: bool) {
         self.chain_pact.store(was, Ordering::Relaxed);
+    }
+
+    /// Claim this record's place on the `scanOnce` ring, or `None` while a
+    /// process queued for it has yet to start: that one starts after this
+    /// request and serves it.
+    pub(crate) fn queue_once(self: &Arc<Self>) -> Option<OnceTicket> {
+        (!self.once_queued.swap(true, Ordering::AcqRel)).then(|| OnceTicket(self.clone()))
     }
 
     /// Whether this thread is inside the record: it holds the record's set
@@ -3744,6 +3756,7 @@ impl RecordCell {
             init_owed: std::sync::atomic::AtomicBool::new(init_owed),
             link_opens_owed: std::sync::atomic::AtomicBool::new(true),
             chain_pact: AtomicBool::new(false),
+            once_queued: AtomicBool::new(false),
             lent: std::sync::atomic::AtomicU32::new(0),
             string_typed: std::sync::atomic::AtomicU64::new(string_typed_mask(&instance)),
             cvt_pending_more: (0..dbaddr_counts.len().saturating_sub(1) / 64)
@@ -4678,7 +4691,10 @@ impl NativeRead {
         if Arc::ptr_eq(&target.rec, reader)
             || db.policy == LinkProcessPolicy::ProcessPassive
             || channel.json_suffix.is_some()
-            || target.put.field().text_route().is_some()
+            || target
+                .route
+                .and_then(crate::server::database::char_view::LinkRoute::text)
+                .is_some()
         {
             return None;
         }
@@ -4937,6 +4953,17 @@ pub(crate) struct ResolvedTarget {
     /// field's `addr.no_elements` through the link's filter chain, settled
     /// with the address as `dbChannelCreate` settles it at link init.
     pub(crate) final_no_elements: u32,
+    /// `dbGetLinkDBFtype` of the link: its channel's `final_type`, served as
+    /// a DBR type, settled with [`Self::final_no_elements`]; `None` for one
+    /// no DBR type serves (`DBF_NOACCESS`).
+    pub(crate) final_field_type: Option<DbFieldType>,
+    /// The link's filter chain, parsed once as the channel opens: C keeps
+    /// it on the link's `dbChannel` for every `dbDbGetValue`.
+    pub(crate) chain: Option<Arc<crate::server::database::filters::FilterChain>>,
+    /// How `dbGet` answers a read of the target past the plain convert:
+    /// from the text of an attribute or a link (`dbAccess.c:944-953`), or a
+    /// `$` string's char log at the reader's request.
+    pub(crate) route: Option<crate::server::database::char_view::LinkRoute>,
 }
 
 /// Where a DB link's local target comes from — `PvDatabase` in production.
@@ -5397,9 +5424,11 @@ pub struct RecordInstance {
     link_rows: (Option<LinkRow>, Option<LinkRow>),
     // Device support
     pub device: Option<Box<dyn super::super::device_support::DeviceSupport>>,
-    /// The record's device-write completion, which carries the lock-free copy
-    /// of `PRIO`: [`Self::set_prio`] is the one store of both.
+    /// The record's device-write completion.
     pub(crate) device_done: crate::server::database::DeviceDone,
+    /// The lock-free copy of `PRIO`: [`Self::set_prio`] is the one store of
+    /// both.
+    pub(crate) band: crate::server::database::RecordBand,
     /// C `prec->dpvt` for the soft dsets; see [`Dpvt`](crate::server::device_support::Dpvt).
     pub dpvt: crate::server::device_support::Dpvt,
     // Subroutine (for sub records)
@@ -5591,9 +5620,9 @@ pub(crate) struct RecordCold {
     /// The database a [`Subroutine::Context`] routine reaches; set at
     /// creation beside `device_done`.
     db: crate::server::database::RecordDb,
-    /// The task delivering the bound device's I/O Intr wakes, wired only by
+    /// The pump delivering the bound device's I/O Intr wakes, wired only by
     /// [`RecordInstance::wire_io_intr_pump`].
-    io_intr_pump: Option<crate::runtime::background::AbortHandle>,
+    io_intr_pump: Option<crate::server::ioc_app::IoIntrPump>,
     /// What a [`Subroutine::Context`] routine stored as C `prec->dpvt`. Not
     /// a [`Dpvt`](crate::server::device_support::Dpvt) variant: a boxed `dyn`
     /// there makes every soft-input read's `Dpvt` overwrite an outlined drop.
@@ -8728,13 +8757,13 @@ impl RecordInstance {
         }
     }
 
-    /// Store `PRIO` and the copy the record's [`DeviceDone`] reads without
-    /// the record lock.
+    /// Store `PRIO` and the [`RecordBand`] every callback request for the
+    /// record reads without the record lock.
     ///
-    /// [`DeviceDone`]: crate::server::database::DeviceDone
+    /// [`RecordBand`]: crate::server::database::RecordBand
     pub fn set_prio(&mut self, prio: i16) {
         self.common.prio = prio;
-        self.device_done.set_prio(prio);
+        self.band.set(prio);
     }
 
     pub fn new_boxed(
@@ -8821,10 +8850,13 @@ impl RecordInstance {
             out_row.and_then(|fields| link_slots.row(fields)),
             dol_row.and_then(|fields| link_slots.row(fields)),
         );
+        let band = crate::server::database::RecordBand::new(common.prio);
+        record.set_record_band(band.clone());
 
         Self {
             destroyed: false,
-            device_done: crate::server::database::DeviceDone::detached(common.prio),
+            device_done: crate::server::database::DeviceDone::detached(band.clone()),
+            band,
             name: name.into(),
             record,
             common,
@@ -9031,8 +9063,7 @@ impl RecordInstance {
     /// record and hands it to the `iocInit` drain, and the loader's merge into
     /// a live record. Both run the three halves as C's three whole-database
     /// walks: this one, then [`Self::run_add_record`], then
-    /// [`Self::run_init_pass1`] against what
-    /// [`crate::server::database::PvDatabase::read_init_links`] read.
+    /// [`crate::server::database::PvDatabase::run_init_pass1`].
     ///
     /// C `doInitRecord0`: the prologue and `init_record(prec, 0)`. Returns
     /// whether the record's `init_record` gets past its dset test, i.e.
@@ -9110,28 +9141,51 @@ impl RecordInstance {
         }
     }
 
-    /// C `doInitRecord1`: `init_record(prec, 1)` and the init tail, for a
-    /// record pass 0 reached. A device that lends held leaves its dset init,
-    /// and the tail after it, for
-    /// [`crate::server::database::PvDatabase::pay_device_init`].
-    #[must_use]
-    pub(crate) fn run_init_pass1(
+    /// One step of C `doInitRecord1`'s `init_record(prec, 1)`, for a record
+    /// pass 0 reached: [`crate::server::record::Record::init_record_step`].
+    /// Returns the link the record reads next, which
+    /// [`crate::server::database::PvDatabase::run_init_pass1`] reads.
+    pub(crate) fn init_pass1_step(
         &mut self,
         name: &str,
-        reads: &mut crate::server::record::InitLinkReads,
+        answer: Option<crate::server::recgbl::simm::LinkFetch>,
+    ) -> Option<(&'static str, crate::server::record::LinkReadAs)> {
+        let _init = crate::server::database::InitPass::enter();
+        let step = if self.has_hook(crate::server::record::CycleHooks::OWN_FRAME) {
+            let (record, own) = self.split_own();
+            record.init_record_own(answer, own)
+        } else {
+            self.record.init_record_step(answer)
+        };
+        step.unwrap_or_else(|e| {
+            crate::stderr_println!("init_record(1) failed for {name}: {e}");
+            None
+        })
+    }
+
+    /// The link `field` names, as a read of it at init resolves it: the link
+    /// the record holds, else the field's text parsed.
+    pub(crate) fn init_read_link(&self, field: &str) -> Arc<ParsedLink> {
+        match self.stored_link_shared(field) {
+            Some(link) => Arc::clone(link),
+            None => Arc::new(parse_link_v2(
+                self.link_text(field)
+                    .as_ref()
+                    .map_or(&b""[..], |t| t.as_bytes()),
+            )),
+        }
+    }
+
+    /// The rest of C `doInitRecord1` once `init_record(prec, 1)`'s steps are
+    /// done. A device that lends held leaves its dset init, and the tail after
+    /// it, for [`crate::server::database::PvDatabase::pay_device_init`].
+    #[must_use]
+    pub(crate) fn init_pass1_tail(
+        &mut self,
+        name: &str,
         err: &dyn Fn(&str),
     ) -> Option<crate::server::device_support::OwedDeviceInit> {
         let _init = crate::server::database::InitPass::enter();
-        let init = if self.has_hook(crate::server::record::CycleHooks::OWN_FRAME) {
-            let (record, own) = self.split_own();
-            record.init_record_own(reads, own)
-        } else {
-            self.record.init_record_with_links(reads)
-        };
-        if let Err(e) = init {
-            crate::stderr_println!("init_record(1) failed for {name}: {e}");
-        }
-        reads.apply(&mut self.common);
         // C `pdset->common.init_record(prec)` — the driver's own init, which
         // every record type calls from INSIDE `init_record` once the dset test
         // above has passed (`aiRecord.c:115-124`, `aoRecord.c:121-133`). It
@@ -9156,7 +9210,7 @@ impl RecordInstance {
         None
     }
 
-    /// [`Self::run_init_pass1`] after the dset init.
+    /// [`Self::init_pass1_tail`] after the dset init.
     pub(crate) fn finish_init_pass1(&mut self, name: &str, err: &dyn Fn(&str)) {
         // C `subRecord.c:107-129` / `aSubRecord.c:139-160` — the INAM call and
         // the SNAM lookup, also inside pass 1. `false` is C's early return
@@ -10839,14 +10893,14 @@ impl RecordInstance {
         Ok(())
     }
 
-    /// Start the task that turns the bound device's wakes into processing,
+    /// Start the pump that turns the bound device's wakes into processing,
     /// the one place that starts it. A device hands its receiver out once
     /// per object, so a fresh one is a newly bound dset and replaces the old
     /// pump; leaving the list stops nothing, because the pump only processes
     /// a record that is on it (C `scanIoRequest` walks the list's members).
     /// Whether the record now has a live pump.
     pub(crate) fn wire_io_intr_pump(&mut self) -> bool {
-        let pumped = |p: &Option<crate::runtime::background::AbortHandle>| {
+        let pumped = |p: &Option<crate::server::ioc_app::IoIntrPump>| {
             p.as_ref().is_some_and(|p| !p.is_finished())
         };
         let Some(dev) = self.device.as_mut() else {
@@ -10858,18 +10912,16 @@ impl RecordInstance {
         let (Some(db), Some(cell)) = (self.cold.db.upgrade(), self.cold.cell.upgrade()) else {
             return false;
         };
-        let pump = crate::server::ioc_app::spawn_io_intr_pump(
-            db,
+        let pump = crate::server::ioc_app::IoIntrPump::start(
+            &db,
             self.name.clone(),
-            cell,
+            &cell,
+            self.band.clone(),
             rx,
-            self.common.callback_priority(),
             dev.io_intr_processes_directly(),
             dev.io_intr_scan_independent(),
         );
-        if let Some(old) = self.cold.io_intr_pump.replace(pump.abort_handle()) {
-            old.abort();
-        }
+        self.cold.io_intr_pump = Some(pump);
         true
     }
 
@@ -14513,6 +14565,7 @@ mod record_cell_layout_tests {
             link_rows,
             device,
             device_done,
+            band,
             dpvt,
             subroutine,
             reprocess_generation,
@@ -14561,6 +14614,7 @@ mod record_cell_layout_tests {
             init_owed,
             link_opens_owed,
             chain_pact,
+            once_queued,
             lent,
             index,
             rdes,

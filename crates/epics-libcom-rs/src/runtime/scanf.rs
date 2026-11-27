@@ -912,167 +912,172 @@ mod tests {
         assert_eq!(&*t.borrow(), b"cd\0x");
     }
 
-    /// What `sscanf(input, fmt, p)` returns and writes at `p`, as the glibc
-    /// probe prints it: a byte is written iff it comes out the same over a
-    /// 0xaa and a 0x55 fill, and an unwritten one before the last written
-    /// prints as `..`.
-    fn stores(input: &[u8], fmt: &[u8]) -> (c_int, String) {
-        let run = |fill| {
-            let p = RefCell::new([fill; 24]);
-            (sscanf(input, fmt, &[&p]), p.into_inner())
-        };
-        let ((n, a), (m, b)) = (run(0xaa), run(0x55));
-        assert_eq!(n, m, "{}", fmt.escape_ascii());
-        let end = (0..a.len())
-            .rev()
-            .find(|&i| a[i] == b[i])
-            .map_or(0, |i| i + 1);
-        let bytes = (0..end)
-            .map(|i| match a[i] == b[i] {
-                true => format!("{:02x}", a[i]),
-                false => "..".into(),
-            })
-            .collect();
-        (n, bytes)
-    }
+    /// The bytes a conversion stores, as glibc 2.43 on x86_64 Linux stores
+    /// them.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    mod glibc_stores {
+        use super::*;
 
-    fn check_stores(rows: &[(&[u8], &[u8], c_int, &str)]) {
-        let failed: Vec<String> = rows
-            .iter()
-            .filter_map(|&(fmt, input, n, bytes)| {
-                let got = stores(input, fmt);
-                (got != (n, bytes.into())).then(|| {
-                    format!(
-                        "{} \"{}\": C {n} {bytes}, rs {got:?}",
-                        fmt.escape_ascii(),
-                        input.escape_ascii()
-                    )
+        /// What `sscanf(input, fmt, p)` returns and writes at `p`, as the glibc
+        /// probe prints it: a byte is written iff it comes out the same over a
+        /// 0xaa and a 0x55 fill, and an unwritten one before the last written
+        /// prints as `..`.
+        fn stores(input: &[u8], fmt: &[u8]) -> (c_int, String) {
+            let run = |fill| {
+                let p = RefCell::new([fill; 24]);
+                (sscanf(input, fmt, &[&p]), p.into_inner())
+            };
+            let ((n, a), (m, b)) = (run(0xaa), run(0x55));
+            assert_eq!(n, m, "{}", fmt.escape_ascii());
+            let end = (0..a.len())
+                .rev()
+                .find(|&i| a[i] == b[i])
+                .map_or(0, |i| i + 1);
+            let bytes = (0..end)
+                .map(|i| match a[i] == b[i] {
+                    true => format!("{:02x}", a[i]),
+                    false => "..".into(),
                 })
-            })
-            .collect();
-        assert!(failed.is_empty(), "{}", failed.join("\n"));
-    }
+                .collect();
+            (n, bytes)
+        }
 
-    /// A conversion stores the type its length modifier names, whatever the
-    /// object: (format, input, return, bytes), measured with glibc 2.43 on
-    /// x86_64.
-    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    #[test]
-    fn a_conversion_stores_its_own_width() {
-        check_stores(&[
-            (b"%hhd", b"200", 1, "c8"),
-            (b"%hhd", b"128", 1, "80"),
-            (b"%hhd", b"-1", 1, "ff"),
-            (b"%hhd", b"300", 1, "2c"),
-            (b"%hhd", b"-129", 1, "7f"),
-            (b"%hhi", b"0x80", 1, "80"),
-            (b"%hhi", b"0b11111111", 1, "ff"),
-            (b"%hhu", b"255", 1, "ff"),
-            (b"%hhu", b"256", 1, "00"),
-            (b"%hhu", b"-1", 1, "ff"),
-            (b"%hhx", b"1ff", 1, "ff"),
-            (b"%hho", b"777", 1, "ff"),
-            (b"%hhb", b"111111111", 1, "ff"),
-            (b"%hd", b"70000", 1, "7011"),
-            (b"%hu", b"-1", 1, "ffff"),
-            (b"%d", b"99999999999", 1, "ffe77648"),
-            (b"%u", b"-1", 1, "ffffffff"),
-            (b"%ld", b"-2", 1, "feffffffffffffff"),
-            (b"%lld", b"-2", 1, "feffffffffffffff"),
-            (b"%jd", b"-2", 1, "feffffffffffffff"),
-            (b"%zd", b"-2", 1, "feffffffffffffff"),
-            (b"%td", b"-2", 1, "feffffffffffffff"),
-            (b"%qd", b"-2", 1, "feffffffffffffff"),
-            (b"%Ld", b"-2", 1, "feffffffffffffff"),
-            (b"abc%hhn", b"abc", 0, "03"),
-            (b"abc%hn", b"abc", 0, "0300"),
-            (b"abc%n", b"abc", 0, "03000000"),
-            (b"abc%ln", b"abc", 0, "0300000000000000"),
-            (b"abc%lln", b"abc", 0, "0300000000000000"),
-            (b"abc%jn", b"abc", 0, "0300000000000000"),
-            (b"abc%zn", b"abc", 0, "0300000000000000"),
-            (b"%p", b"0x10", 1, "1000000000000000"),
-            (b"%p", b"(nil)", 1, "0000000000000000"),
-            (b"%f", b"1.5", 1, "0000c03f"),
-            (b"%hf", b"1.5", 1, "0000c03f"),
-            (b"%hhf", b"1.5", 1, "0000c03f"),
-            (b"%lf", b"1.5", 1, "000000000000f83f"),
-            (b"%jf", b"1.5", 1, "000000000000f83f"),
-            (b"%zf", b"1.5", 1, "000000000000f83f"),
-            (b"%tf", b"1.5", 1, "000000000000f83f"),
-            (b"%f", b"-nan(5)", 1, "0500c0ff"),
-            (b"%lf", b"-nan(5)", 1, "050000000000f8ff"),
-            (b"%c", b"abc", 1, "61"),
-            (b"%3c", b"abc", 1, "616263"),
-            (b"%3c", b"ab", -1, "6162"),
-            (b"%s", b"abc", 1, "61626300"),
-            (b"%3s", b"abcdef", 1, "61626300"),
-            (b"%[a-z]", b"abc1", 1, "61626300"),
-            (b"%*s", b"abc", 0, ""),
-            (b"%hlc", b"a", 0, ""),
-            (b"%s", b"a\xe9b", 1, "61e96200"),
-            (b"%c", b"\xe9", 1, "e9"),
-            (b"%[^,]", b"a\xe9b,", 1, "61e96200"),
-        ]);
-    }
+        fn check_stores(rows: &[(&[u8], &[u8], c_int, &str)]) {
+            let failed: Vec<String> = rows
+                .iter()
+                .filter_map(|&(fmt, input, n, bytes)| {
+                    let got = stores(input, fmt);
+                    (got != (n, bytes.into())).then(|| {
+                        format!(
+                            "{} \"{}\": C {n} {bytes}, rs {got:?}",
+                            fmt.escape_ascii(),
+                            input.escape_ascii()
+                        )
+                    })
+                })
+                .collect();
+            assert!(failed.is_empty(), "{}", failed.join("\n"));
+        }
 
-    /// `%lc`, `%ls` and `%l[` store 4-byte `wchar_t`s in the C locale, where
-    /// a byte past ASCII fails `%lc` and `%ls` after what they read and is a
-    /// slot `%l[` steps over: (format, input, return, bytes), measured with
-    /// glibc 2.43 on x86_64.
-    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    #[test]
-    fn a_wide_conversion_stores_wchar_t() {
-        check_stores(&[
-            (b"%lc", b"abc", 1, "61000000"),
-            (b"%3lc", b"abc", 1, "610000006200000063000000"),
-            (b"%2lc", b"a", -1, "61000000"),
-            (b"%5lc", b"ab", -1, "6100000062000000"),
-            (b"%lc", b"", -1, ""),
-            (b"%lc", b" a", 1, "20000000"),
-            (b"%C", b"ab", 1, "61000000"),
-            (b"%C", b" a", 1, "20000000"),
-            (b"%2C", b"ab", 1, "6100000062000000"),
-            (b"%llc", b"a", 1, "61000000"),
-            (b"%jc", b"ab", 1, "61000000"),
-            (b"%hc", b"ab", 1, "61"),
-            (b"%ls", b"abc", 1, "61000000620000006300000000000000"),
-            (b"%ls", b" ab cd", 1, "610000006200000000000000"),
-            (b"%3ls", b"abcdef", 1, "61000000620000006300000000000000"),
-            (b"%S", b"ab", 1, "610000006200000000000000"),
-            (b"%S", b" ab", 1, "610000006200000000000000"),
-            (b"%3S", b"abcd", 1, "61000000620000006300000000000000"),
-            (b"%lls", b"ab", 1, "610000006200000000000000"),
-            (b"%zs", b"ab", 1, "610000006200000000000000"),
-            (b"%hhs", b"ab", 1, "616200"),
-            (b"%ls", b"", -1, ""),
-            (b"%*ls", b"abc", 0, ""),
-            (b"%l[a-z]", b"abc1", 1, "61000000620000006300000000000000"),
-            (b"%l[a-z]", b"1", 0, ""),
-            (b"%2l[a-z]", b"abc", 1, "610000006200000000000000"),
-            (b"%ll[a-z]", b"ab", 1, "610000006200000000000000"),
-            (b"%tl[a-z]", b"ab", 0, ""),
-            (b"%lc", b"\xe9", 0, ""),
-            (b"%2lc", b"a\xe9", 0, "61000000"),
-            (b"%lc", b"\x80", 0, ""),
-            (b"%lc", b"\x7f", 1, "7f000000"),
-            (b"%lc%n", b"\xe9", 0, ""),
-            (b"%ls", b"\xe9", 0, ""),
-            (b"%ls", b" \xe9", 0, ""),
-            (b"%ls", b"a\xe9b", 0, "61000000"),
-            (b"%ls", b"ab\x80", 0, "6100000062000000"),
-            (b"%l[^,]", b"a\xe9b,", 1, "61000000........6200000000000000"),
-            (b"%l[a-z]", b"a\xe9", 1, "6100000000000000"),
-            (b"%l[^\xe9]", b"ab\xe9", 1, "610000006200000000000000"),
-            (b"%l[\x80-\xff]", b"\xe9a", 1, "........00000000"),
-            (b"%l[^,]", b"\xe9", 1, "........00000000"),
-            (b"%2l[^,]", b"\xe9ab", 1, "........6100000000000000"),
-            (
-                b"%l[a\xe9]",
-                b"aa\xe9a",
-                1,
-                "6100000061000000........6100000000000000",
-            ),
-        ]);
+        /// A conversion stores the type its length modifier names, whatever the
+        /// object: (format, input, return, bytes), measured with glibc 2.43 on
+        /// x86_64.
+        #[test]
+        fn a_conversion_stores_its_own_width() {
+            check_stores(&[
+                (b"%hhd", b"200", 1, "c8"),
+                (b"%hhd", b"128", 1, "80"),
+                (b"%hhd", b"-1", 1, "ff"),
+                (b"%hhd", b"300", 1, "2c"),
+                (b"%hhd", b"-129", 1, "7f"),
+                (b"%hhi", b"0x80", 1, "80"),
+                (b"%hhi", b"0b11111111", 1, "ff"),
+                (b"%hhu", b"255", 1, "ff"),
+                (b"%hhu", b"256", 1, "00"),
+                (b"%hhu", b"-1", 1, "ff"),
+                (b"%hhx", b"1ff", 1, "ff"),
+                (b"%hho", b"777", 1, "ff"),
+                (b"%hhb", b"111111111", 1, "ff"),
+                (b"%hd", b"70000", 1, "7011"),
+                (b"%hu", b"-1", 1, "ffff"),
+                (b"%d", b"99999999999", 1, "ffe77648"),
+                (b"%u", b"-1", 1, "ffffffff"),
+                (b"%ld", b"-2", 1, "feffffffffffffff"),
+                (b"%lld", b"-2", 1, "feffffffffffffff"),
+                (b"%jd", b"-2", 1, "feffffffffffffff"),
+                (b"%zd", b"-2", 1, "feffffffffffffff"),
+                (b"%td", b"-2", 1, "feffffffffffffff"),
+                (b"%qd", b"-2", 1, "feffffffffffffff"),
+                (b"%Ld", b"-2", 1, "feffffffffffffff"),
+                (b"abc%hhn", b"abc", 0, "03"),
+                (b"abc%hn", b"abc", 0, "0300"),
+                (b"abc%n", b"abc", 0, "03000000"),
+                (b"abc%ln", b"abc", 0, "0300000000000000"),
+                (b"abc%lln", b"abc", 0, "0300000000000000"),
+                (b"abc%jn", b"abc", 0, "0300000000000000"),
+                (b"abc%zn", b"abc", 0, "0300000000000000"),
+                (b"%p", b"0x10", 1, "1000000000000000"),
+                (b"%p", b"(nil)", 1, "0000000000000000"),
+                (b"%f", b"1.5", 1, "0000c03f"),
+                (b"%hf", b"1.5", 1, "0000c03f"),
+                (b"%hhf", b"1.5", 1, "0000c03f"),
+                (b"%lf", b"1.5", 1, "000000000000f83f"),
+                (b"%jf", b"1.5", 1, "000000000000f83f"),
+                (b"%zf", b"1.5", 1, "000000000000f83f"),
+                (b"%tf", b"1.5", 1, "000000000000f83f"),
+                (b"%f", b"-nan(5)", 1, "0500c0ff"),
+                (b"%lf", b"-nan(5)", 1, "050000000000f8ff"),
+                (b"%c", b"abc", 1, "61"),
+                (b"%3c", b"abc", 1, "616263"),
+                (b"%3c", b"ab", -1, "6162"),
+                (b"%s", b"abc", 1, "61626300"),
+                (b"%3s", b"abcdef", 1, "61626300"),
+                (b"%[a-z]", b"abc1", 1, "61626300"),
+                (b"%*s", b"abc", 0, ""),
+                (b"%hlc", b"a", 0, ""),
+                (b"%s", b"a\xe9b", 1, "61e96200"),
+                (b"%c", b"\xe9", 1, "e9"),
+                (b"%[^,]", b"a\xe9b,", 1, "61e96200"),
+            ]);
+        }
+
+        /// `%lc`, `%ls` and `%l[` store 4-byte `wchar_t`s in the C locale, where
+        /// a byte past ASCII fails `%lc` and `%ls` after what they read and is a
+        /// slot `%l[` steps over: (format, input, return, bytes), measured with
+        /// glibc 2.43 on x86_64.
+        #[test]
+        fn a_wide_conversion_stores_wchar_t() {
+            check_stores(&[
+                (b"%lc", b"abc", 1, "61000000"),
+                (b"%3lc", b"abc", 1, "610000006200000063000000"),
+                (b"%2lc", b"a", -1, "61000000"),
+                (b"%5lc", b"ab", -1, "6100000062000000"),
+                (b"%lc", b"", -1, ""),
+                (b"%lc", b" a", 1, "20000000"),
+                (b"%C", b"ab", 1, "61000000"),
+                (b"%C", b" a", 1, "20000000"),
+                (b"%2C", b"ab", 1, "6100000062000000"),
+                (b"%llc", b"a", 1, "61000000"),
+                (b"%jc", b"ab", 1, "61000000"),
+                (b"%hc", b"ab", 1, "61"),
+                (b"%ls", b"abc", 1, "61000000620000006300000000000000"),
+                (b"%ls", b" ab cd", 1, "610000006200000000000000"),
+                (b"%3ls", b"abcdef", 1, "61000000620000006300000000000000"),
+                (b"%S", b"ab", 1, "610000006200000000000000"),
+                (b"%S", b" ab", 1, "610000006200000000000000"),
+                (b"%3S", b"abcd", 1, "61000000620000006300000000000000"),
+                (b"%lls", b"ab", 1, "610000006200000000000000"),
+                (b"%zs", b"ab", 1, "610000006200000000000000"),
+                (b"%hhs", b"ab", 1, "616200"),
+                (b"%ls", b"", -1, ""),
+                (b"%*ls", b"abc", 0, ""),
+                (b"%l[a-z]", b"abc1", 1, "61000000620000006300000000000000"),
+                (b"%l[a-z]", b"1", 0, ""),
+                (b"%2l[a-z]", b"abc", 1, "610000006200000000000000"),
+                (b"%ll[a-z]", b"ab", 1, "610000006200000000000000"),
+                (b"%tl[a-z]", b"ab", 0, ""),
+                (b"%lc", b"\xe9", 0, ""),
+                (b"%2lc", b"a\xe9", 0, "61000000"),
+                (b"%lc", b"\x80", 0, ""),
+                (b"%lc", b"\x7f", 1, "7f000000"),
+                (b"%lc%n", b"\xe9", 0, ""),
+                (b"%ls", b"\xe9", 0, ""),
+                (b"%ls", b" \xe9", 0, ""),
+                (b"%ls", b"a\xe9b", 0, "61000000"),
+                (b"%ls", b"ab\x80", 0, "6100000062000000"),
+                (b"%l[^,]", b"a\xe9b,", 1, "61000000........6200000000000000"),
+                (b"%l[a-z]", b"a\xe9", 1, "6100000000000000"),
+                (b"%l[^\xe9]", b"ab\xe9", 1, "610000006200000000000000"),
+                (b"%l[\x80-\xff]", b"\xe9a", 1, "........00000000"),
+                (b"%l[^,]", b"\xe9", 1, "........00000000"),
+                (b"%2l[^,]", b"\xe9ab", 1, "........6100000000000000"),
+                (
+                    b"%l[a\xe9]",
+                    b"aa\xe9a",
+                    1,
+                    "6100000061000000........6100000000000000",
+                ),
+            ]);
+        }
     }
 }

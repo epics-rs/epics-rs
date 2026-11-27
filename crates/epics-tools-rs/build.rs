@@ -92,6 +92,9 @@ fn procserv_host_platform(unix: bool, os: &str) -> bool {
 }
 
 fn main() {
+    // It reads only what Cargo sets; with no `rerun-if` line Cargo would
+    // re-run it on any change in the package.
+    println!("cargo::rerun-if-changed=build.rs");
     println!("cargo::rustc-check-cfg=cfg(procserv_host_platform)");
 
     let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();

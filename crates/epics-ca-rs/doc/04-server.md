@@ -169,7 +169,7 @@ legal large waveform — the cap is strictly above the largest frame the
 protocol can carry.
 
 `inactivity_timeout()` reads `EPICS_CAS_INACTIVITY_TMO` (default
-600 s, minimum 30 s).
+600 s, minimum 30 s). 0 disables it.
 
 ### Cleanup on exit
 
@@ -386,7 +386,7 @@ Both `ProcessVariable` and `RecordInstance` have matching
 
 | Guard | Default | Variable |
 |-------|---------|----------|
-| Inactivity timeout | 600 s | `EPICS_CAS_INACTIVITY_TMO` |
+| Inactivity timeout | 600 s (0 disables) | `EPICS_CAS_INACTIVITY_TMO` |
 | Accumulated buffer cap | `max_payload_size()` + 64 KiB | `EPICS_CA_MAX_ARRAY_BYTES` |
 | Max channels per client | unbounded (opt-in) | `EPICS_CAS_MAX_CHANNELS` |
 | Max subscriptions per channel | unbounded (opt-in) | `EPICS_CAS_MAX_SUBS_PER_CHAN` |

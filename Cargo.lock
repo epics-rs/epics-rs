@@ -6,11 +6,13 @@ version = 4
 name = "ad-core-rs"
 version = "0.34.2"
 dependencies = [
+ "alloc-count",
  "asyn-rs",
  "bytemuck",
  "epics-base-rs",
  "epics-ca-rs",
  "epics-libcom-rs",
+ "fact-budget",
  "fearless_simd 1.0.0",
  "fearless_simd_macros",
  "parking_lot",
@@ -26,12 +28,14 @@ name = "ad-plugins-rs"
 version = "0.34.2"
 dependencies = [
  "ad-core-rs",
+ "alloc-count",
  "asyn-rs",
  "epics-base-rs",
  "epics-bridge-rs",
  "epics-ca-rs",
  "epics-libcom-rs",
  "epics-pva-rs",
+ "fact-budget",
  "fearless_simd 1.0.0",
  "fearless_simd_macros",
  "flate2",
@@ -90,6 +94,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ddd31a130427c27518df266943a5308ed92d4b226cc639f5a8f1002816174301"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "alloc-count"
+version = "0.34.2"
+dependencies = [
+ "epics-libcom-rs",
+ "fact-budget",
 ]
 
 [[package]]
@@ -224,6 +236,7 @@ dependencies = [
 name = "asyn-rs"
 version = "0.34.2"
 dependencies = [
+ "alloc-count",
  "asyn-rs",
  "bitflags",
  "chrono",
@@ -233,6 +246,7 @@ dependencies = [
  "epics-libcom-rs",
  "epics-macros-rs",
  "epics-seq-rs",
+ "fact-budget",
  "libc",
  "named-port",
  "parking_lot",
@@ -1023,6 +1037,7 @@ version = "0.0.0"
 name = "epics-base-rs"
 version = "0.34.2"
 dependencies = [
+ "alloc-count",
  "arc-swap",
  "async-trait",
  "bytes",
@@ -1057,6 +1072,7 @@ dependencies = [
 name = "epics-bridge-rs"
 version = "0.34.2"
 dependencies = [
+ "alloc-count",
  "arc-swap",
  "async-trait",
  "bytes",
@@ -1067,6 +1083,7 @@ dependencies = [
  "epics-oracle-rs",
  "epics-pva-rs",
  "epics-rtems-boot",
+ "fact-budget",
  "libc",
  "named-port",
  "parking_lot",
@@ -1088,6 +1105,7 @@ dependencies = [
 name = "epics-ca-rs"
 version = "0.34.2"
 dependencies = [
+ "alloc-count",
  "arc-swap",
  "async-trait",
  "base64",
@@ -1143,8 +1161,10 @@ dependencies = [
 name = "epics-libcom-rs"
 version = "0.34.2"
 dependencies = [
+ "alloc-count",
  "chrono",
  "epics-macros-rs",
+ "fact-budget",
  "hostname",
  "libc",
  "parking_lot",
@@ -1303,6 +1323,7 @@ dependencies = [
  "chrono",
  "epics-base-rs",
  "epics-libcom-rs",
+ "fact-budget",
  "libc",
  "parking_lot",
  "stream-pcre-sys",
@@ -1424,6 +1445,14 @@ name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
+
+[[package]]
+name = "fixed-wait-gate"
+version = "0.0.0"
+dependencies = [
+ "source-guard",
+ "tempfile",
+]
 
 [[package]]
 name = "fixedbitset"
@@ -2407,6 +2436,7 @@ dependencies = [
  "epics-base-rs",
  "epics-ca-rs",
  "epics-libcom-rs",
+ "fact-budget",
  "libc",
  "parking_lot",
  "tempfile",
@@ -2467,6 +2497,7 @@ name = "named-port"
 version = "0.34.2"
 dependencies = [
  "epics-libcom-rs",
+ "fact-budget",
  "libc",
  "socket2 0.5.10",
  "windows-sys 0.59.0",
@@ -3062,6 +3093,7 @@ dependencies = [
  "epics-base-rs",
  "epics-bridge-rs",
  "epics-ca-rs",
+ "epics-libcom-rs",
  "epics-pva-rs",
  "named-port",
  "tempfile",
@@ -3399,9 +3431,9 @@ dependencies = [
 
 [[package]]
 name = "rust-hdf5"
-version = "0.7.13"
+version = "0.7.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ca38ae195212034cbe82f2ec702f3a348346d0e27626fbd8e7d6aa6cf3d8f66"
+checksum = "bf2c37ca635ade111281dabd624ae8f5cacebd9364e89eb9e7d70be612d3dbb1"
 dependencies = [
  "bzip2",
  "fearless_simd 1.0.0",
@@ -3908,6 +3940,7 @@ dependencies = [
  "epics-ca-rs",
  "epics-libcom-rs",
  "epics-seq-rs",
+ "fact-budget",
  "futures-util",
  "libc",
  "parking_lot",

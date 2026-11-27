@@ -150,11 +150,23 @@ pub fn time_of_day_device_factory() -> StdDeviceSupport {
     )
 }
 
+/// The "Fast Epid" (`epid`) device support from `devEpidFast.c`, which
+/// connects its asyn input and output ports from `INP` and `DESC` at init.
+pub fn fast_epid_device_factory() -> StdDeviceSupport {
+    register_std_dbd();
+    (
+        "epid",
+        &records::dbd_generated::DEVICES_EPID[2],
+        Box::new(|| Box::new(device_support::epid_fast::EpidFastDeviceSupport::new())),
+    )
+}
+
 /// Return all std-module device supports for bulk registration.
 ///
 /// These are the `devTimeOfDay.c` DTYPs ("Sec Past Epoch" ai, "Time of Day"
-/// stringin). They need only the framework's `ProcessContext` (PHAS/TSE), no
-/// INP, so a static [`DeviceSupportFactory`](epics_base_rs::server::DeviceSupportFactory)
+/// stringin) and `devEpidFast.c`'s "Fast Epid" epid. Each reads what it needs
+/// from its record at init, so a static
+/// [`DeviceSupportFactory`](epics_base_rs::server::DeviceSupportFactory)
 /// suffices. Register each onto an `IocBuilder` / `IocApplication` /
 /// `CaServerBuilder` via its `register_device_support(record_type, devsup,
 /// factory)`, which also adds the row to the record type's DTYP menu.
@@ -162,5 +174,6 @@ pub fn std_device_supports() -> Vec<StdDeviceSupport> {
     vec![
         sec_past_epoch_device_factory(),
         time_of_day_device_factory(),
+        fast_epid_device_factory(),
     ]
 }

@@ -641,7 +641,8 @@ enum Wake {
 /// An exhausted budget still polls, with a zero interval: that is C's own
 /// `writeTimeout == 0` behaviour — one non-blocking attempt, then bail — and
 /// keeping it here is why a `timeout == 0` write of a writable port still
-/// sends.
+/// sends. Only the clock ends the wait, as C's timer does: an empty poll loops
+/// back as `EINTR` does, since its interval is capped at `i32::MAX` ms.
 ///
 /// `None` is the other end of the same rule: C starts no timer at all for a
 /// negative `pasynUser->timeout` (`if (tty->writeTimeout > 0)`,
@@ -661,13 +662,12 @@ fn wait_until(
         };
         match fd.poll_ready(events, ms) {
             Ok(Some(revents)) => return Ok(Wake::Ready(revents)),
-            Ok(None) => return Ok(Wake::Expired),
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
-                if deadline.is_some_and(|d| Instant::now() >= d) {
-                    return Ok(Wake::Expired);
-                }
-            }
+            Ok(None) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) => return Err(AsynError::Io(e)),
+        }
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return Ok(Wake::Expired);
         }
     }
 }
@@ -3404,9 +3404,9 @@ mod tests {
     /// A scripted [`SerialFd`] for the loop tests: no real descriptor can be
     /// made to hold `POLLERR` while `read`/`write` keep returning `EAGAIN`.
     ///
-    /// `budget` caps how many wakes the fake will report before it claims
-    /// expiry, so a loop that fails to terminate fails the assertion instead of
-    /// hanging the suite.
+    /// `budget` caps how many wakes the fake will report before its polls come
+    /// back empty, so a loop that fails to terminate runs out at its deadline
+    /// and fails the assertion instead of hanging the suite.
     struct FakeFd {
         revents: libc::c_short,
         budget: std::cell::Cell<u32>,
@@ -3464,7 +3464,9 @@ mod tests {
         let err = read_until(
             &fd,
             &mut buf,
-            Some(Instant::now() + Duration::from_secs(30)),
+            Some(epics_libcom_rs::runtime::time::deadline_from_now(
+                Duration::from_secs(30),
+            )),
         )
         .expect_err("a latched POLLERR with EAGAIN must not read successfully");
         assert_eq!(err.status(), AsynStatus::Disconnected, "got {err:?}");
@@ -3486,7 +3488,9 @@ mod tests {
         let err = write_until(
             &fd,
             b"hello",
-            Some(Instant::now() + Duration::from_secs(30)),
+            Some(epics_libcom_rs::runtime::time::deadline_from_now(
+                Duration::from_secs(30),
+            )),
             &mut sent,
         )
         .expect_err("a latched POLLERR with EAGAIN must not write successfully");
@@ -3547,8 +3551,15 @@ mod tests {
         let fd = FakeFd::new(libc::POLLIN, u32::MAX);
         let mut buf = [0u8; 8];
         let start = Instant::now();
-        let err = read_until(&fd, &mut buf, Some(start + Duration::from_millis(50)))
-            .expect_err("a descriptor that never delivers must time out");
+        let err = read_until(
+            &fd,
+            &mut buf,
+            Some(epics_libcom_rs::runtime::time::deadline_after(
+                start,
+                Duration::from_millis(50),
+            )),
+        )
+        .expect_err("a descriptor that never delivers must time out");
         assert_eq!(err.status(), AsynStatus::Timeout, "got {err:?}");
         assert!(
             start.elapsed() < Duration::from_secs(5),
@@ -3640,6 +3651,71 @@ mod tests {
         );
 
         drv.disconnect(&AsynUser::default()).ok();
+    }
+
+    /// A read times out at its `TMOT`, not at the last whole millisecond before
+    /// it: C's timer (drvAsynSerialPort.c:941) fires at the timeout itself.
+    #[test]
+    fn pty_a_fractional_millisecond_read_timeout_is_waited_out() {
+        let (master, slave, slave_name) = create_pty_pair();
+        let _guard = PtyGuard { master, slave };
+
+        let mut drv = DrvAsynSerialPort::new("pty_frac", &slave_name).unwrap();
+        drv.connect(&AsynUser::default()).unwrap();
+
+        let timeout = Duration::from_micros(1900);
+        let user = AsynUser::new(0).with_timeout(timeout);
+        let mut buf = [0u8; 8];
+        for _ in 0..20 {
+            let start = Instant::now();
+            let res = drv.io_read_octet(&user, &mut buf).into_count();
+            let elapsed = start.elapsed();
+            let err = res.expect_err("the pty is silent");
+            assert_eq!(err.status(), AsynStatus::Timeout, "got {err:?}");
+            assert!(
+                elapsed >= timeout,
+                "a 1.9 ms TMOT timed out after {elapsed:?}"
+            );
+        }
+
+        drv.disconnect(&AsynUser::default()).ok();
+    }
+
+    /// An empty poll is not the deadline: `poll`'s interval is capped at
+    /// `i32::MAX` ms, 24.8 days, and a longer timeout outlasts it.
+    #[test]
+    fn an_empty_poll_before_the_deadline_keeps_the_transfer_waiting() {
+        /// Reports nothing ready on its first poll, then ready.
+        struct EmptyThenReady(std::cell::Cell<u32>);
+        impl SerialFd for EmptyThenReady {
+            fn poll_ready(
+                &self,
+                events: libc::c_short,
+                _timeout_ms: i32,
+            ) -> std::io::Result<Option<libc::c_short>> {
+                self.0.set(self.0.get() + 1);
+                Ok((self.0.get() > 1).then_some(events))
+            }
+            fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+                buf[0] = b'x';
+                Ok(1)
+            }
+            fn write(&self, data: &[u8]) -> std::io::Result<usize> {
+                Ok(data.len())
+            }
+        }
+
+        let far = Some(deadline_from_now(Duration::MAX));
+        let fd = EmptyThenReady(std::cell::Cell::new(0));
+        let mut buf = [0u8; 8];
+        let n = read_until(&fd, &mut buf, far).expect("the byte arrives before the deadline");
+        assert_eq!(&buf[..n], b"x");
+
+        let fd = EmptyThenReady(std::cell::Cell::new(0));
+        let mut sent = 0usize;
+        write_until(&fd, b"hi", far, &mut sent)
+            .expect("the port takes the bytes before the deadline");
+        assert_eq!(sent, 2);
     }
 
     /// A driver may fill `AsynUser::timeout` with `Duration::MAX`: the read and

@@ -3,8 +3,11 @@
 //! std sockets so every driver — tokio, blocking, reactor — binds the same set.
 
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, ToSocketAddrs};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
+use std::time::Duration;
 
+use epics_libcom_rs::runtime::socket::AcceptWaker;
 use tracing::{error, warn};
 
 use super::config::PvaServerConfig;
@@ -202,11 +205,93 @@ fn bind_serv_iface(addr: SocketAddr, mut fallback: bool) -> PvaResult<(TcpListen
     }
 }
 
+/// [`ServeGate`]'s states: not started, serving, and stopped for good.
+const IDLE: u8 = 0;
+const SERVING: u8 = 1;
+const STOPPED: u8 = 2;
+
+/// Whether a server's listeners, search answers and beacons are open: the one
+/// state its start and its stop both move, so whichever comes first decides
+/// and a stopped server opens nothing. pvxs instead ignores a stop that finds
+/// the server not yet `Running` (`server.cpp:619`).
+pub(crate) struct ServeGate {
+    state: Mutex<u8>,
+    changed: Condvar,
+}
+
+impl ServeGate {
+    fn state(&self) -> MutexGuard<'_, u8> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn set(&self, mut state: MutexGuard<'_, u8>, to: u8) {
+        *state = to;
+        self.changed.notify_all();
+    }
+
+    /// Serve, unless a stop came first; whether the server serves.
+    pub(crate) fn open(&self) -> bool {
+        let state = self.state();
+        if *state == IDLE {
+            self.set(state, SERVING);
+            return true;
+        }
+        *state == SERVING
+    }
+
+    /// A start that cannot finish: stopped for good, unless it opened. Never
+    /// needs a wake, as no accept runs before [`Self::open`].
+    pub(crate) fn fail(&self) {
+        let state = self.state();
+        if *state == IDLE {
+            self.set(state, STOPPED);
+        }
+    }
+
+    /// Stopped for good; whether the server served until now. Only
+    /// [`ServListeners::stop`] calls it, which wakes the accepts it served.
+    fn close(&self) -> bool {
+        let state = self.state();
+        let served = *state == SERVING;
+        self.set(state, STOPPED);
+        served
+    }
+
+    /// Until the start or a stop decides; whether the server serves.
+    pub(crate) fn wait(&self) -> bool {
+        let state = self.changed.wait_while(self.state(), |s| *s == IDLE);
+        *state.unwrap_or_else(|e| e.into_inner()) == SERVING
+    }
+
+    /// Sleep `period` or until stopped; `true` once stopped.
+    pub(crate) fn sleep(&self, period: Duration) -> bool {
+        let state = self
+            .changed
+            .wait_timeout_while(self.state(), period, |s| *s != STOPPED);
+        *state.unwrap_or_else(|e| e.into_inner()).0 == STOPPED
+    }
+
+    pub(crate) fn serving(&self) -> bool {
+        *self.state() == SERVING
+    }
+
+    fn stopped(&self) -> bool {
+        *self.state() == STOPPED
+    }
+}
+
 /// A driver's bound listeners, one accept loop each, as rsrv runs one
 /// `CAS-TCP` per interface.
 pub(crate) struct ServListeners {
     listeners: Vec<TcpListener>,
+    /// One per listener, opened with it, so [`Self::stop`] needs no
+    /// descriptor to wake a parked accept.
+    wakers: Vec<AcceptWaker>,
     port: u16,
+    gate: Arc<ServeGate>,
+    /// [`Self::serve`] is refused the further accept thread at this index.
+    #[cfg(test)]
+    pub(crate) refuse_thread: Option<usize>,
 }
 
 impl ServListeners {
@@ -228,12 +313,32 @@ impl ServListeners {
             PvaError::Io(e) => e,
             e => io::Error::other(e),
         })?;
-        Ok(Self { listeners, port })
+        let wakers = listeners
+            .iter()
+            .map(|l| AcceptWaker::new(l.local_addr()?))
+            .collect::<io::Result<_>>()?;
+        Ok(Self {
+            listeners,
+            wakers,
+            port,
+            gate: Arc::new(ServeGate {
+                state: Mutex::new(IDLE),
+                changed: Condvar::new(),
+            }),
+            #[cfg(test)]
+            refuse_thread: None,
+        })
     }
 
     /// The port every listener without an explicit one bound.
     pub(crate) fn port(&self) -> u16 {
         self.port
+    }
+
+    /// The state that opens and stops these listeners, the server's search
+    /// answers and its beacons.
+    pub(crate) fn gate(&self) -> &Arc<ServeGate> {
+        &self.gate
     }
 
     /// The first listener's address.
@@ -242,35 +347,80 @@ impl ServListeners {
     }
 
     /// Run `accept` on every listener until each returns: the first on the
-    /// calling thread, each further one on a thread of its own.
-    pub(crate) fn serve(&self, accept: impl Fn(&TcpListener) + Sync) {
+    /// calling thread, each further one on a thread of its own. `started`
+    /// runs once every thread exists, and the listeners accept only if it
+    /// returns `true` and [`ServeGate::open`] then finds no stop. A thread
+    /// that cannot be created is the `Err`, and then no listener has
+    /// accepted: pvxs's `Server` throws on a listener it cannot set up
+    /// (`serverconn.cpp:426-449`). `accept` returns once [`Self::stopped`].
+    pub(crate) fn serve(
+        &self,
+        accept: impl Fn(&TcpListener) + Sync,
+        started: impl FnOnce() -> bool,
+    ) -> io::Result<()> {
         use epics_base_rs::runtime::task::{StackSizeClass, spawn_dedicated_thread_scoped};
         let (first, rest) = self.listeners.split_first().expect("bind leaves one");
+        let all_created = OnceLock::new();
         std::thread::scope(|scope| {
-            for listener in rest {
-                let accept = &accept;
-                let spawned = spawn_dedicated_thread_scoped(
-                    scope,
-                    "PVAS-TCP".to_string(),
-                    super::blocking::PVA_SERVER_PRIORITY,
-                    StackSizeClass::Medium,
-                    move || accept(listener),
-                );
+            for (thread, listener) in rest.iter().enumerate() {
+                let (accept, all_created) = (&accept, &all_created);
+                let spawned = match self.refusal(thread) {
+                    Some(refused) => Err(refused),
+                    None => spawn_dedicated_thread_scoped(
+                        scope,
+                        "PVAS-TCP".to_string(),
+                        super::blocking::PVA_SERVER_PRIORITY,
+                        StackSizeClass::Medium,
+                        move || {
+                            if *all_created.wait() {
+                                accept(listener);
+                            }
+                        },
+                    )
+                    .map(drop),
+                };
                 if let Err(e) = spawned {
                     error!(addr = ?listener.local_addr(), "PVA accept thread not started: {e}");
+                    let _ = all_created.set(false);
+                    return Err(e);
                 }
             }
-            accept(first);
-        });
+            let run = started() && self.gate.open();
+            let _ = all_created.set(run);
+            if run {
+                accept(first);
+            }
+            Ok(())
+        })
     }
 
-    /// Wake every accept parked in [`Self::serve`] by dialling it.
-    pub(crate) fn wake(&self) {
-        for listener in &self.listeners {
-            if let Ok(addr) = listener.local_addr() {
-                let _ = TcpStream::connect(addr);
+    #[cfg(not(test))]
+    fn refusal(&self, _thread: usize) -> Option<io::Error> {
+        None
+    }
+
+    /// A test's stand-in for a target out of threads.
+    #[cfg(test)]
+    fn refusal(&self, thread: usize) -> Option<io::Error> {
+        (self.refuse_thread == Some(thread)).then(|| io::ErrorKind::WouldBlock.into())
+    }
+
+    /// End accepting, search answers and beacons for good, waking any
+    /// accept parked in [`Self::serve`] with its listener's waker. Only an
+    /// opened gate's listeners are dialled, and the dial never waits: one
+    /// that meets a full backlog finds that listener's accept loop not
+    /// parked, and it sees [`Self::stopped`] at its next accept.
+    pub(crate) fn stop(&self) {
+        if self.gate.close() {
+            for waker in &self.wakers {
+                let _ = waker.wake();
             }
         }
+    }
+
+    /// Whether [`Self::stop`] has run: an accept loop's exit condition.
+    pub(crate) fn stopped(&self) -> bool {
+        self.gate.stopped()
     }
 }
 
@@ -368,6 +518,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn the_default_listener_takes_v4_and_v6_peers() {
+        use std::net::TcpStream;
+
         if !can_ipv6() {
             return;
         }

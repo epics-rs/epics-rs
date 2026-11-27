@@ -2446,7 +2446,7 @@ mod tests {
     #[test]
     fn a_request_behind_the_holder_of_an_idle_port_runs_at_its_release() {
         let handle = make_handle(TestDriver::new());
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(5));
         while handle.lend.state() != "idle" {
             assert!(Instant::now() < deadline, "the actor never went idle");
             std::thread::yield_now();
@@ -3913,6 +3913,59 @@ mod tests {
             drop(hold);
             write.wait_blocking(Duration::from_secs(5)).unwrap();
             assert_eq!(seen, 0, "round {round}: the write did not get in");
+        }
+    }
+
+    /// The request the port takes at the release is the first one C's scan
+    /// would run: a disabled device's request queued ahead of it stays queued
+    /// (asynManager.c:877), and the request behind it still gets in.
+    #[test]
+    fn a_disabled_devices_request_does_not_take_the_release_from_one_behind_it() {
+        let mut base = PortDriverBase::new(
+            "release_scan",
+            2,
+            PortFlags {
+                multi_device: true,
+                can_block: true,
+                ..PortFlags::default()
+            },
+            InterfaceMask::INT32,
+            InterfaceMask::NONE,
+        );
+        base.create_param("VAL", ParamType::Int32).unwrap();
+        base.params.set_int32(0, 1, 7).unwrap();
+        let mut handle = make_handle(TestDriver { base });
+        handle.set_can_block(true);
+        handle.set_capabilities(true, 2, crate::port::port_get_address);
+        let dev = |addr| AsynUser::new(0).with_addr(addr);
+        // A device connect is the port thread's, never the release's.
+        handle
+            .submit_blocking(RequestOp::ConnectAddr, dev(0))
+            .unwrap();
+        handle
+            .submit_blocking(RequestOp::SetEnable { yes: false }, dev(1))
+            .unwrap();
+        let mut skipped = Vec::new();
+        for round in 0..20 {
+            let mut hold = handle.hold_driver_blocking::<TestDriver>().unwrap();
+            hold.run(|d| d.base.set_int32_param(0, 0, 1).unwrap())
+                .unwrap();
+            skipped.push(handle.try_submit(RequestOp::Int32Read, dev(1)).unwrap());
+            let write = handle
+                .try_submit(RequestOp::Int32Write { value: 0 }, dev(0))
+                .unwrap();
+            hold.unlocked(|| ());
+            let seen = hold.run(|d| d.base.get_int32_param(0, 0).unwrap()).unwrap();
+            drop(hold);
+            write.wait_blocking(fact_budget::FACT_BUDGET).unwrap();
+            assert_eq!(seen, 0, "round {round}: the write did not get in");
+        }
+        handle
+            .submit_blocking(RequestOp::SetEnable { yes: true }, dev(1))
+            .unwrap();
+        for read in skipped {
+            let r = read.wait_blocking(fact_budget::FACT_BUDGET).unwrap();
+            assert_eq!(r.int_val, Some(7), "the skipped read stayed queued");
         }
     }
 

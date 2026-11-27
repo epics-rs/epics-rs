@@ -28,17 +28,17 @@
 
 use std::cell::{Cell, RefCell};
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicI16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak, mpsc};
 use std::thread::ThreadId;
 use std::time::Duration;
 
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::runtime::background::{CallbackBody, CallbackCell};
-use epics_base_rs::runtime::task::{CallbackPriority, request_cell, spawn_background_after};
+use epics_base_rs::runtime::task::spawn_background_after;
 use epics_base_rs::server::database::{
     AsyncDbHandle, DbAddr, DeviceDone, DeviceDoneSource, FieldPut, HeldInstance, InitHold,
-    ProcessCallback, UnheldLinkPut,
+    ProcessCallback, RecordBand, UnheldLinkPut,
 };
 use epics_base_rs::server::device_support::{
     DeviceInitOutcome, DevicePost, DeviceReadOutcome, DeviceSupport, IoIntrCmd, ReadStart,
@@ -61,7 +61,7 @@ use epics_libcom_rs::cfmt::CFloat;
 use parking_lot::{Condvar, Mutex};
 
 use crate::StreamBuffer;
-use crate::bus::{OwnedReadInput, StreamIoStatus};
+use crate::bus::{BusInterface, OwnedReadInput, StreamIoStatus};
 use crate::core::{
     ABORTED, ACCEPT_INPUT, Dispatch, Entry, INIT_RUN, Parsed, ProtocolResult, RunId, SCAN_TRIED,
     StartMode, StreamCore, StreamCoreHooks, StreamCoreLock, ValueMatch,
@@ -532,7 +532,7 @@ struct Shared {
     /// every entry goes to it.
     init_waiter: Mutex<Option<mpsc::Sender<Job>>>,
     /// `record->prio`, which the bus reads from its own thread.
-    prio: AtomicI16,
+    band: RecordBand,
     /// The core, for the callbacks that enter it.
     lock: OnceLock<Weak<StreamCoreLock<StreamHooks>>>,
     /// The record type's entries: an output's completing pass calls its I/O
@@ -628,11 +628,11 @@ impl Shared {
     }
 
     fn issue_process(&self, request: u64) {
-        let prio = CallbackPriority::from_record_prio(self.prio.load(Ordering::Relaxed));
-        let queued = self
-            .process_callback
-            .get()
-            .is_some_and(|cell| request_cell(prio, cell).is_ok());
+        let prio = self.band.priority();
+        let queued = match (self.db.get(), self.process_callback.get()) {
+            (Some(db), Some(cell)) => db.request_callback(prio, cell),
+            _ => false,
+        };
         if !queued {
             // refused: no run will come for it
             self.served(request);
@@ -1524,7 +1524,7 @@ impl StreamCoreHooks for StreamHooks {
             return;
         };
         let shared = Arc::downgrade(&self.shared);
-        let prio = CallbackPriority::from_record_prio(self.shared.prio.load(Ordering::Relaxed));
+        let prio = self.shared.band.priority();
         let delay = Duration::from_millis(timeout_ms);
         drop(spawn_background_after(prio, delay, async move {
             let current = shared
@@ -1667,7 +1667,7 @@ impl StreamCoreHooks for StreamHooks {
     }
 
     fn priority(&self, _core: &StreamCore<Self>) -> i64 {
-        self.shared.prio.load(Ordering::Relaxed) as i64
+        i64::from(self.shared.band.prio())
     }
 
     fn interrupt_accept(&self, _core: &StreamCore<Self>) -> bool {
@@ -1981,6 +1981,16 @@ pub struct Stream {
     shared: Arc<Shared>,
 }
 
+/// One `streamInitRecord` at a time, keeping the bus its `attachBus` may
+/// replace until the pass ends, past its holds: the bus's drop waits for its
+/// running callback (cancelRequest, asynManager.c:1647-1655), which may be
+/// waiting for the record. C's streamReload holds no record lock
+/// (StreamEpics.cc:193) and deletes it inside attachBus.
+struct InitPass<'a> {
+    _replaced: Option<Arc<BusInterface>>,
+    _pass: parking_lot::MutexGuard<'a, ()>,
+}
+
 /// Every stream, in creation order: C's `first` / `next`.
 fn streams() -> &'static Mutex<Vec<Weak<StreamCoreLock<StreamHooks>>>> {
     static STREAMS: OnceLock<Mutex<Vec<Weak<StreamCoreLock<StreamHooks>>>>> = OnceLock::new();
@@ -1991,7 +2001,7 @@ impl Stream {
     /// `new Stream(record, ...)`
     fn new(
         name: &str,
-        prio: i16,
+        band: RecordBand,
         db: Option<AsyncDbHandle>,
         record_type: Arc<dyn StreamRecordType>,
     ) -> Self {
@@ -2000,7 +2010,7 @@ impl Stream {
             slot: RecordSlot::default(),
             db: OnceLock::new(),
             init_waiter: Mutex::new(None),
-            prio: AtomicI16::new(prio),
+            band,
             lock: OnceLock::new(),
             record_type: OnceLock::from(record_type),
             device_done: Mutex::new(None),
@@ -2305,6 +2315,15 @@ impl Stream {
         self.lock.lock().hooks.run.get() == Run::Active
     }
 
+    /// A whole `streamInitRecord`, taken outside its holds.
+    fn init_pass(&self) -> InitPass<'_> {
+        let pass = self.shared.init_pass.lock();
+        InitPass {
+            _replaced: self.lock.lock().bus(),
+            _pass: pass,
+        }
+    }
+
     /// `streamInitRecord`'s start for a record that has its stream.
     fn stop_running_protocol(&self, held: &HeldInstance<'_>) {
         // stop any running protocol
@@ -2330,7 +2349,7 @@ impl Stream {
     fn reinit_record(&self, db: &AsyncDbHandle) -> Option<i64> {
         let name = self.name();
         let record_type = self.shared.record_type.get()?;
-        let _pass = self.shared.init_pass.lock();
+        let _pass = self.init_pass();
         let status = db.with_init_hold(name, |hold| {
             let (args, staged) = hold.held(|held| {
                 let args = held.with(|record, common| {
@@ -2516,6 +2535,7 @@ pub struct StreamDevice {
     record_type: Arc<dyn StreamRecordType>,
     stream: Option<Stream>,
     db: Option<AsyncDbHandle>,
+    band: RecordBand,
     name: String,
     /// What the pass's I/O entry returned, for the read that follows it.
     status: i64,
@@ -2530,6 +2550,7 @@ impl StreamDevice {
             record_type: Arc::new(record_type),
             stream: None,
             db: None,
+            band: RecordBand::default(),
             name: String::new(),
             status: ERROR,
             ioscanpvt: None,
@@ -2586,6 +2607,10 @@ impl DeviceSupport for StreamDevice {
         self.db = Some(db);
     }
 
+    fn set_record_band(&mut self, band: RecordBand) {
+        self.band = band;
+    }
+
     fn set_record_info(&mut self, name: &str, _scan: ScanType) {
         self.name = name.to_string();
     }
@@ -2603,25 +2628,29 @@ impl DeviceSupport for StreamDevice {
         // its init_pass
         let created = self.stream.is_none();
         let stream = self.stream.get_or_insert_with(|| {
-            Stream::new(&name, 0, self.db.clone(), self.record_type.clone())
+            Stream::new(
+                &name,
+                self.band.clone(),
+                self.db.clone(),
+                self.record_type.clone(),
+            )
         });
-        let _pass = stream.shared.init_pass.lock();
+        let _pass = stream.init_pass();
         let record_type = &self.record_type;
         let (args, staged) = hold.held(|held| {
-            let (args, prio) = held.with(|record, common| {
+            let args = held.with(|record, common| {
                 let args = record_type.init_record(record, common);
                 debug!(format!(
                     "streamInitRecord({name}): SEVR={}\n",
                     common.sevr as i32
                 ));
-                (args, common.prio)
+                args
             });
             if created {
                 // initialize the first time
                 debug!(format!(
                     "streamInitRecord({name}): create new Stream object\n"
                 ));
-                stream.shared.prio.store(prio, Ordering::Relaxed);
             } else {
                 stream.stop_running_protocol(held);
             }
@@ -2796,7 +2825,12 @@ mod tests {
     /// owes its request to the outer one, issued once that lets go.
     #[test]
     fn a_nested_holds_process_request_goes_to_the_outer_hold() {
-        let stream = Stream::new("nested", 0, None, Arc::new(NoRecordType));
+        let stream = Stream::new(
+            "nested",
+            RecordBand::default(),
+            None,
+            Arc::new(NoRecordType),
+        );
         let outer = OwedScope::open(&stream.shared);
         let inner = OwedScope::open(&stream.shared);
         stream.shared.request_process();

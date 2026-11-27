@@ -249,28 +249,55 @@ pub trait Pollable: std::os::windows::io::AsSocket {}
 #[cfg(windows)]
 impl<T: std::os::windows::io::AsSocket> Pollable for T {}
 
-/// [`poll_ready`]'s `timeout` as `poll`'s millisecond interval.
-fn poll_interval(timeout: Option<Duration>) -> i32 {
-    match timeout {
+/// What is left of [`poll_ready`]'s timeout as `poll`'s millisecond interval,
+/// rounded up so the poll never ends short of the deadline; `None` is `poll`'s
+/// wait-forever.
+fn poll_interval(remaining: Option<Duration>) -> i32 {
+    match remaining {
         None => -1,
-        Some(t) if t.is_zero() => 0,
-        Some(t) => t.as_millis().clamp(1, i32::MAX as u128) as i32,
+        Some(t) => t.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as i32,
     }
 }
 
-/// One C `poll` of `socket` for `want` under `USE_POLL`, which is `WSAPoll` on
-/// WIN32 (drvAsynIPPort.c:77-79): `Ok(true)` ready, `Ok(false)` `timeout`
-/// expired, `None` waits without bound. A positive `timeout` truncates to whole
-/// milliseconds as C's `(int)(timeout * 1000.0)` but polls at least 1 ms, C's
-/// `if (pollmsec == 0) pollmsec = 1` (drvAsynIPPort.c:792-793): truncated to
-/// 0, a sub-millisecond wait would not wait at all. An `EINTR` is returned, not
-/// retried — whether a signal ends the wait is the caller's rule.
-#[cfg(unix)]
+/// Wait up to `timeout` for `want` on `socket` with C's `poll` under
+/// `USE_POLL`, which is `WSAPoll` on WIN32 (drvAsynIPPort.c:77-79): `Ok(true)`
+/// ready, `Ok(false)` `timeout` passed, `None` waits without bound. A zero
+/// `timeout` is one non-blocking probe. Only the clock ends the wait: C takes
+/// `poll`'s 0 as the timeout after truncating it to whole milliseconds
+/// (:662-664, :697), so its wait ends up to 1 ms early, and here the interval
+/// is also capped at `i32::MAX` ms. Nor does a signal end it: an `EINTR` polls
+/// again for the time left, where C re-polls its whole interval
+/// (drvAsynIPPort.c:686-695, :812-824) and its connect fails (:555).
 pub fn poll_ready(
     socket: &impl Pollable,
     want: Readiness,
     timeout: Option<Duration>,
 ) -> io::Result<bool> {
+    poll_within(timeout, |ms| poll_once(socket, want, ms))
+}
+
+/// [`poll_ready`]'s loop over one platform `poll` of `ms` milliseconds.
+fn poll_within(
+    timeout: Option<Duration>,
+    mut poll: impl FnMut(i32) -> io::Result<bool>,
+) -> io::Result<bool> {
+    let deadline = timeout.map(super::time::deadline_from_now);
+    loop {
+        let remaining = deadline.map(|d| d.saturating_duration_since(std::time::Instant::now()));
+        match poll(poll_interval(remaining)) {
+            Ok(true) => return Ok(true),
+            Ok(false) => {}
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            return Ok(false);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn poll_once(socket: &impl Pollable, want: Readiness, ms: i32) -> io::Result<bool> {
     use std::os::fd::AsRawFd;
 
     let mut pfd = libc::pollfd {
@@ -283,20 +310,15 @@ pub fn poll_ready(
     };
     // SAFETY: a one-element `pollfd` array, matching the count passed; the fd
     // is borrowed from `socket` for the call.
-    match unsafe { libc::poll(&mut pfd, 1, poll_interval(timeout)) } {
+    match unsafe { libc::poll(&mut pfd, 1, ms) } {
         0 => Ok(false),
         n if n > 0 => Ok(true),
         _ => Err(io::Error::last_os_error()),
     }
 }
 
-/// See the unix [`poll_ready`].
 #[cfg(windows)]
-pub fn poll_ready(
-    socket: &impl Pollable,
-    want: Readiness,
-    timeout: Option<Duration>,
-) -> io::Result<bool> {
+fn poll_once(socket: &impl Pollable, want: Readiness, ms: i32) -> io::Result<bool> {
     use std::os::windows::io::AsRawSocket;
     use windows_sys::Win32::Networking::WinSock::{POLLIN, POLLOUT, WSAPOLLFD, WSAPoll};
 
@@ -310,7 +332,7 @@ pub fn poll_ready(
     };
     // SAFETY: a one-element `WSAPOLLFD` array, matching the count passed; the
     // socket is borrowed for the call.
-    match unsafe { WSAPoll(&mut pfd, 1, poll_interval(timeout)) } {
+    match unsafe { WSAPoll(&mut pfd, 1, ms) } {
         0 => Ok(false),
         n if n > 0 => Ok(true),
         // `WSAGetLastError` is the `GetLastError` `last_os_error` reads.
@@ -335,6 +357,37 @@ pub fn tcp_connect(
     timeout: Duration,
 ) -> Result<TcpStream, TcpConnectError> {
     sys::tcp_connect(remote, local, opts, timeout)
+}
+
+/// A dial held ready to wake an `accept()` blocked on one listener, the
+/// self-connect a server's stop wakes its accept loop with.
+///
+/// The socket is opened and bound by [`new`](Self::new), when the listener
+/// starts serving, so [`wake`](Self::wake) opens nothing — a process out of
+/// descriptors still wakes its accept — and, non-blocking, never waits on
+/// a backlog nobody drains. Hold it until the woken accept has returned:
+/// closing it first may withdraw the dial.
+pub struct AcceptWaker(sys::AcceptWaker);
+
+impl AcceptWaker {
+    /// A waker for the listener bound at `listener`, its `local_addr`. A
+    /// wildcard address, which not every stack can dial, is dialled at the
+    /// loopback of its family.
+    pub fn new(listener: SocketAddr) -> io::Result<Self> {
+        let mut target = listener;
+        if target.ip().is_unspecified() {
+            target.set_ip(match target {
+                SocketAddr::V4(_) => Ipv4Addr::LOCALHOST.into(),
+                SocketAddr::V6(_) => std::net::Ipv6Addr::LOCALHOST.into(),
+            });
+        }
+        sys::AcceptWaker::new(target).map(Self)
+    }
+
+    /// Dial the listener once, without waiting for the handshake.
+    pub fn wake(&self) -> io::Result<()> {
+        self.0.wake()
+    }
 }
 
 /// Enable `SO_KEEPALIVE` on an already-accepted TCP connection.
@@ -688,11 +741,9 @@ mod sys {
 
     /// The poll half of [`connect_within`]: `Ok` once `SO_ERROR` is clear.
     fn await_connect(socket: &socket2::Socket, timeout: Duration) -> io::Result<()> {
-        // One poll, no EINTR retry: C fails the connect on any return but 1
-        // (drvAsynIPPort.c:555), a signal included. A sub-millisecond timeout
-        // polls 1 ms, the floor C's readIt and writeIt give their polls
-        // (:662-664, :792-794); C's connect `(int)(1000 * connectTimeout)`
-        // (:547) has none and polls 0.
+        // The wait lasts the whole timeout, a signal or not, where C's
+        // `(int)(1000 * connectTimeout)` (:547) truncates it and polls 0 for a
+        // sub-millisecond one.
         if !super::poll_ready(socket, super::Readiness::Writable, Some(timeout))? {
             return Err(io::ErrorKind::TimedOut.into());
         }
@@ -705,6 +756,41 @@ mod sys {
     pub(super) fn enable_keepalive(sock: &TcpStream) -> io::Result<()> {
         socket2::SockRef::from(sock).set_keepalive(true)
     }
+
+    pub(super) struct AcceptWaker {
+        socket: socket2::Socket,
+        target: SocketAddr,
+    }
+
+    impl AcceptWaker {
+        pub(super) fn new(target: SocketAddr) -> io::Result<Self> {
+            let socket = new_socket(
+                target.is_ipv6(),
+                socket2::Type::STREAM,
+                socket2::Protocol::TCP,
+                SocketOptions::default(),
+            )?;
+            socket.set_nonblocking(true)?;
+            // Closed after the accept loop has closed its end, a reset spares
+            // the listener's port the TIME_WAIT a FIN would leave on it.
+            socket.set_linger(Some(Duration::ZERO))?;
+            // Bound now, so the dial needs no ephemeral port later.
+            bind(&socket, SocketAddr::new(target.ip(), 0))?;
+            Ok(Self { socket, target })
+        }
+
+        pub(super) fn wake(&self) -> io::Result<()> {
+            match self.socket.connect(&self.target.into()) {
+                Err(e)
+                    if e.kind() != io::ErrorKind::WouldBlock
+                        && e.raw_os_error() != Some(EINPROGRESS) =>
+                {
+                    Err(e)
+                }
+                _ => Ok(()),
+            }
+        }
+    }
 }
 
 #[cfg(epics_embedded_target)]
@@ -715,7 +801,7 @@ mod sys {
 
     use super::{SetupError, SetupStep, SocketOptions, TcpConnectError};
     use std::io;
-    use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV6, TcpListener, TcpStream, UdpSocket};
     use std::os::fd::{FromRawFd, RawFd};
     use std::time::Duration;
 
@@ -956,6 +1042,113 @@ mod sys {
         }
         Ok(())
     }
+
+    /// Marshal an IPv6 `SocketAddr` into a `sockaddr_in6`, `sin6_len` left
+    /// zero as [`sockaddr_in`] leaves `sin_len`.
+    fn sockaddr_in6(v6: SocketAddrV6) -> libc::sockaddr_in6 {
+        // SAFETY: `sockaddr_in6` is a plain-old-data C struct for which
+        // all-zero is a valid initial value.
+        let mut sin6: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+        sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+        sin6.sin6_port = v6.port().to_be();
+        sin6.sin6_flowinfo = v6.flowinfo();
+        sin6.sin6_addr = libc::in6_addr {
+            s6_addr: v6.ip().octets(),
+        };
+        sin6.sin6_scope_id = v6.scope_id();
+        sin6
+    }
+
+    /// `call` with `addr` as the `sockaddr` of its family and its length.
+    fn with_sockaddr(
+        addr: SocketAddr,
+        call: impl FnOnce(*const libc::sockaddr, libc::socklen_t) -> libc::c_int,
+    ) -> io::Result<()> {
+        let rc = match addr {
+            SocketAddr::V4(_) => {
+                let sin = sockaddr_in(addr)?;
+                call(
+                    &sin as *const libc::sockaddr_in as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                )
+            }
+            SocketAddr::V6(v6) => {
+                let sin6 = sockaddr_in6(v6);
+                call(
+                    &sin6 as *const libc::sockaddr_in6 as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                )
+            }
+        };
+        if rc != 0 {
+            return Err(last_error());
+        }
+        Ok(())
+    }
+
+    /// The hosted waker's socket, in raw `libc`.
+    pub(super) struct AcceptWaker {
+        fd: OwnedFd,
+        target: SocketAddr,
+    }
+
+    impl AcceptWaker {
+        pub(super) fn new(target: SocketAddr) -> io::Result<Self> {
+            let family = match target {
+                SocketAddr::V4(_) => libc::AF_INET,
+                SocketAddr::V6(_) => libc::AF_INET6,
+            };
+            // SAFETY: `socket()` returns a fresh owned descriptor or -1.
+            let fd = unsafe { libc::socket(family, libc::SOCK_STREAM, libc::IPPROTO_TCP) };
+            if fd < 0 {
+                return Err(last_error());
+            }
+            let fd = OwnedFd(fd);
+            // SAFETY: `fd.0` is a valid open socket.
+            let flags = unsafe { libc::fcntl(fd.0, libc::F_GETFL) };
+            // SAFETY: as above.
+            if flags < 0
+                || unsafe { libc::fcntl(fd.0, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+            {
+                return Err(last_error());
+            }
+            let linger = libc::linger {
+                l_onoff: 1,
+                l_linger: 0,
+            };
+            // SAFETY: `fd.0` is a valid open socket; `linger` outlives the
+            // call and its size is the one passed.
+            let rc = unsafe {
+                libc::setsockopt(
+                    fd.0,
+                    libc::SOL_SOCKET,
+                    libc::SO_LINGER,
+                    &linger as *const libc::linger as *const libc::c_void,
+                    std::mem::size_of::<libc::linger>() as libc::socklen_t,
+                )
+            };
+            if rc != 0 {
+                return Err(last_error());
+            }
+            // SAFETY: `with_sockaddr` passes an initialised address of the
+            // length it gives.
+            with_sockaddr(SocketAddr::new(target.ip(), 0), |sa, len| unsafe {
+                libc::bind(fd.0, sa, len)
+            })?;
+            Ok(Self { fd, target })
+        }
+
+        pub(super) fn wake(&self) -> io::Result<()> {
+            // SAFETY: as the bind in `new`.
+            let dialled = with_sockaddr(self.target, |sa, len| unsafe {
+                libc::connect(self.fd.0, sa, len)
+            });
+            match dialled {
+                Err(e) if e.raw_os_error() != Some(libc::EINPROGRESS) => Err(e),
+                _ => Ok(()),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -972,17 +1165,92 @@ mod tests {
     const DEAD_PORT: u16 = 1;
 
     /// Zero stays a probe and `None` is `poll`'s wait-forever; a positive wait
-    /// truncates to whole milliseconds but never below 1.
+    /// rounds up to whole milliseconds.
     #[test]
-    fn poll_interval_rounds_a_sub_millisecond_wait_up_to_one() {
+    fn poll_interval_rounds_a_fractional_millisecond_up() {
         assert_eq!(poll_interval(None), -1);
         assert_eq!(poll_interval(Some(Duration::ZERO)), 0);
         assert_eq!(poll_interval(Some(Duration::from_nanos(1))), 1);
         assert_eq!(poll_interval(Some(Duration::from_micros(500))), 1);
         assert_eq!(poll_interval(Some(Duration::from_millis(1))), 1);
-        assert_eq!(poll_interval(Some(Duration::from_micros(1500))), 1);
+        assert_eq!(poll_interval(Some(Duration::from_micros(1500))), 2);
         assert_eq!(poll_interval(Some(Duration::from_millis(250))), 250);
         assert_eq!(poll_interval(Some(Duration::MAX)), i32::MAX);
+    }
+
+    /// A wait ends at its timeout, not at the last whole millisecond before it.
+    #[test]
+    fn poll_ready_waits_out_a_fractional_millisecond() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let _accepted = listener.accept().unwrap();
+
+        let timeout = Duration::from_micros(1900);
+        for _ in 0..20 {
+            let start = std::time::Instant::now();
+            let ready = poll_ready(&client, Readiness::Readable, Some(timeout)).unwrap();
+            let elapsed = start.elapsed();
+            assert!(!ready, "the peer sent nothing");
+            assert!(elapsed >= timeout, "a 1.9 ms wait ended after {elapsed:?}");
+        }
+    }
+
+    /// Run `wait` on this thread while another sends it `SIGUSR2` every 20 ms
+    /// through a handler without `SA_RESTART`, so each signal reaches the wait
+    /// as `EINTR`. Returns `wait`'s result and how many signals the handler
+    /// took while it ran.
+    #[cfg(unix)]
+    fn interrupted<R>(wait: impl FnOnce() -> R) -> (R, u32) {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+        static TAKEN: AtomicU32 = AtomicU32::new(0);
+        extern "C" fn take(_: libc::c_int) {
+            TAKEN.fetch_add(1, Ordering::SeqCst);
+        }
+        // SAFETY: a zeroed `sigaction` with a counting handler, no SA_RESTART.
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = take as extern "C" fn(libc::c_int) as usize;
+            assert_eq!(libc::sigaction(libc::SIGUSR2, &sa, std::ptr::null_mut()), 0);
+        }
+        // SAFETY: `pthread_self` has no preconditions.
+        let me = unsafe { libc::pthread_self() };
+        let done = Arc::new(AtomicBool::new(false));
+        let kicker = {
+            let done = Arc::clone(&done);
+            std::thread::spawn(move || {
+                while !done.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(20));
+                    // SAFETY: `me` is the test thread, alive until the join below.
+                    unsafe { libc::pthread_kill(me, libc::SIGUSR2) };
+                }
+            })
+        };
+        let before = TAKEN.load(Ordering::SeqCst);
+        let out = wait();
+        let during = TAKEN.load(Ordering::SeqCst) - before;
+        done.store(true, Ordering::SeqCst);
+        kicker.join().unwrap();
+        (out, during)
+    }
+
+    /// A signal does not end a wait: it lasts the whole timeout.
+    #[cfg(unix)]
+    #[test]
+    fn a_signal_during_poll_ready_does_not_end_the_wait() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let _accepted = listener.accept().unwrap();
+
+        let timeout = Duration::from_millis(300);
+        let start = std::time::Instant::now();
+        let (ready, signals) =
+            interrupted(|| poll_ready(&client, Readiness::Readable, Some(timeout)));
+        let elapsed = start.elapsed();
+        assert!(matches!(ready, Ok(false)), "got {ready:?}");
+        assert!(elapsed >= timeout, "a 300 ms wait ended after {elapsed:?}");
+        assert!(signals >= 1, "no signal reached the wait");
     }
 
     /// Unix only: `WSAPoll` may end a 1 ms wait at the next clock tick (386 us
@@ -1212,23 +1480,12 @@ mod tests {
         assert_eq!(err.sockerr().raw_os_error(), Some(libc::EINPROGRESS));
     }
 
-    /// A signal that interrupts the connect poll fails the connect with
-    /// connect()'s own errno, as C's single `poll` does (drvAsynIPPort.c:555,
-    /// :568-571); it is not retried to the deadline.
+    /// A signal does not end the connect poll: the connect waits out its
+    /// timeout, where C's single `poll` fails it on `EINTR`
+    /// (drvAsynIPPort.c:555).
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_signal_during_the_connect_poll_fails_the_connect() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        extern "C" fn ignore(_: libc::c_int) {}
-        // SAFETY: a zeroed `sigaction` with a no-op handler, no SA_RESTART.
-        unsafe {
-            let mut sa: libc::sigaction = std::mem::zeroed();
-            sa.sa_sigaction = ignore as extern "C" fn(libc::c_int) as usize;
-            assert_eq!(libc::sigaction(libc::SIGUSR2, &sa, std::ptr::null_mut()), 0);
-        }
-
+    fn a_signal_during_the_connect_poll_does_not_end_it() {
         // A full accept queue drops further SYNs, so the next connect pends.
         let listener = tcp_listener(localhost(0), SocketOptions::default(), 0).unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1250,33 +1507,21 @@ mod tests {
             }
         }
 
-        // SAFETY: `pthread_self` has no preconditions.
-        let me = unsafe { libc::pthread_self() };
-        let done = Arc::new(AtomicBool::new(false));
-        let kicker = {
-            let done = Arc::clone(&done);
-            std::thread::spawn(move || {
-                while !done.load(Ordering::SeqCst) {
-                    std::thread::sleep(Duration::from_millis(100));
-                    // SAFETY: `me` is the test thread, alive until the join below.
-                    unsafe { libc::pthread_kill(me, libc::SIGUSR2) };
-                }
-            })
-        };
+        let timeout = Duration::from_secs(1);
         let start = std::time::Instant::now();
-        let err =
-            tcp_connect(addr, None, SocketOptions::default(), Duration::from_secs(5)).unwrap_err();
-        done.store(true, Ordering::SeqCst);
-        kicker.join().unwrap();
+        let (err, signals) =
+            interrupted(|| tcp_connect(addr, None, SocketOptions::default(), timeout).unwrap_err());
+        let elapsed = start.elapsed();
 
         match &err {
             TcpConnectError::Deferred { in_progress, cause } => {
                 assert_eq!(in_progress.raw_os_error(), Some(libc::EINPROGRESS));
-                assert_eq!(cause.raw_os_error(), Some(libc::EINTR));
+                assert_eq!(cause.kind(), io::ErrorKind::TimedOut, "got {cause:?}");
             }
             other => panic!("expected Deferred, got {other:?}"),
         }
-        assert!(start.elapsed() < Duration::from_secs(4));
+        assert!(elapsed >= timeout, "a 1 s connect ended after {elapsed:?}");
+        assert!(signals >= 1, "no signal reached the connect");
     }
 
     /// connect() failing outright is C's `sockerrmsg` with no poll behind it
@@ -1337,6 +1582,75 @@ mod tests {
         assert_eq!(
             accepted.peer_addr().unwrap().port(),
             client.local_addr().unwrap().port()
+        );
+    }
+
+    /// The peer `listener`'s accept returns, the accept parked on its own
+    /// thread before `wake` runs.
+    fn woken_accept(listener: TcpListener, wake: impl FnOnce()) -> SocketAddr {
+        use fact_budget::FACT_BUDGET;
+        let (peer_tx, peer) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = peer_tx.send(listener.accept().map(|(_, from)| from));
+        });
+        wake();
+        peer.recv_timeout(FACT_BUDGET)
+            .expect("the accept never woke")
+            .expect("accept")
+    }
+
+    /// Windows cannot dial `0.0.0.0`; a wildcard listener is reached at the
+    /// loopback of its family.
+    #[test]
+    fn an_accept_waker_wakes_a_wildcard_listener_from_its_loopback() {
+        use std::net::{IpAddr, Ipv6Addr};
+        let mut wildcards = vec![IpAddr::from(Ipv4Addr::UNSPECIFIED)];
+        if TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).is_ok() {
+            wildcards.push(Ipv6Addr::UNSPECIFIED.into());
+        }
+        for wildcard in wildcards {
+            let listener = TcpListener::bind((wildcard, 0)).unwrap();
+            let waker = AcceptWaker::new(listener.local_addr().unwrap()).unwrap();
+            let peer = woken_accept(listener, || waker.wake().expect("wake"));
+            assert!(peer.ip().is_loopback(), "{wildcard}: woken from {peer}");
+        }
+    }
+
+    /// A process out of descriptors cannot open the socket a stop would
+    /// wake its accept with; a waker opened while it could still wakes it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_accept_waker_wakes_an_accept_with_no_descriptor_left() {
+        super::super::fresh_process::with_a_process_of_its_own(
+            "runtime::socket::tests::an_accept_waker_wakes_an_accept_with_no_descriptor_left",
+            || {
+                let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+                let addr = listener.local_addr().unwrap();
+                let waker = AcceptWaker::new(addr).unwrap();
+
+                let limit = libc::rlimit {
+                    rlim_cur: 64,
+                    rlim_max: 64,
+                };
+                // SAFETY: a valid `rlimit` for the call; this process is the
+                // test's own, so the limit binds nothing else.
+                assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+                let mut hogs = Vec::new();
+                let full = loop {
+                    match std::fs::File::open("/dev/null") {
+                        Ok(f) => hogs.push(f),
+                        Err(e) => break e,
+                    }
+                };
+                assert_eq!(full.raw_os_error(), Some(libc::EMFILE));
+                let dial = TcpStream::connect(addr).map(drop);
+                assert_eq!(dial.map_err(|e| e.raw_os_error()), Err(Some(libc::EMFILE)));
+                waker.wake().expect("wake with no descriptor left");
+                drop(hogs);
+
+                let peer = woken_accept(listener, || {});
+                assert_eq!(peer.ip(), Ipv4Addr::LOCALHOST);
+            },
         );
     }
 }

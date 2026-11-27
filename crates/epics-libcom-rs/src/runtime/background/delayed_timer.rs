@@ -262,6 +262,26 @@ impl TimerHandle {
     }
 }
 
+#[cfg(test)]
+impl TimerHandle {
+    /// Make every queued entry due now and wake the timer thread to fire it,
+    /// so a test decides when the timer fires instead of racing a deadline.
+    /// The entries are re-keyed: a key held for one no longer cancels it.
+    pub(crate) fn expire_all(&self) {
+        let now = Instant::now();
+        let mut st = self.inner.state.lock();
+        st.queue = std::mem::take(&mut st.queue)
+            .into_iter()
+            .map(|(key, entry)| {
+                let deadline = key.deadline.min(now);
+                (WakeKey { deadline, ..key }, entry)
+            })
+            .collect();
+        drop(st);
+        self.inner.wake.signal();
+    }
+}
+
 /// The delayed-callback timer: one thread draining a deadline-ordered queue
 /// into the callback executor pool. Port of the `timerQueue` half of
 /// `callback.c`.
@@ -363,9 +383,8 @@ mod tests {
 
     /// `callbackRequestDelayed` with a delay past `Duration`'s range must
     /// file a deadline that never arrives, not unwind the caller.
-    /// `duration_from_secs` maps `+inf`, `NaN` and `1e300` to
-    /// `Duration::MAX` because a record delay field is network-settable,
-    /// and `Instant + Duration::MAX` panics.
+    /// A caller may pass `Duration::MAX` as its own "no bound", and
+    /// `Instant + Duration::MAX` panics.
     #[test]
     fn an_unrepresentable_delay_schedules_instead_of_panicking() {
         let pool = CallbackPool::new();

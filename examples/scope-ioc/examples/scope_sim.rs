@@ -11,6 +11,7 @@ use asyn_rs::runtime::sync::Notify;
 
 use asyn_rs::runtime::config::RuntimeConfig;
 use asyn_rs::runtime::port::create_port_runtime;
+use epics_libcom_rs::cfmt::CFloat;
 use scope_ioc::driver::*;
 
 #[epics_base_rs::epics_main]
@@ -94,7 +95,10 @@ async fn main() {
                     let wf_len = wf.len();
                     println!(
                         "  Update {update_count}: waveform={wf_len} pts, \
-                         min={min_v:.3}, max={max_v:.3}, mean={mean_v:.3}"
+                         min={:.3}, max={:.3}, mean={:.3}",
+                        CFloat(min_v),
+                        CFloat(max_v),
+                        CFloat(mean_v)
                     );
                 }
             }
@@ -133,7 +137,10 @@ async fn main() {
                         .await
                         .unwrap_or(0.0);
                     println!(
-                        "  Update (x10 gain): min={min_v:.3}, max={max_v:.3}, mean={mean_v:.3}"
+                        "  Update (x10 gain): min={:.3}, max={:.3}, mean={:.3}",
+                        CFloat(min_v),
+                        CFloat(max_v),
+                        CFloat(mean_v)
                     );
                 }
             }

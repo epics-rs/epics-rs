@@ -898,12 +898,12 @@ mod ioc {
         // shut the broadcast path off so a resolution can only have come over
         // TCP.
         //
-        // Defaults, not overrides: a variable that is already set stays as
-        // set. That now means the same thing on the target as on a host —
-        // step (0-env) above has already applied the boot command line, so an
+        // Defaults, not overrides: a variable that is already set stays as set.
+        // That now means the same thing on the target as on a host — step
+        // (0-env) above has already applied the boot command line, so an
         // `EPICS_CA_NAME_SERVERS=...` boot argument wins over the value
-        // compiled in here, and `tests/realtime_ca_ioc_boots.rs` points the
-        // dial at its own closed port the same way.
+        // compiled in here, and `tests/integration/realtime_ca_ioc_boots.rs`
+        // points the dial at its own closed port the same way.
         //
         // Set before `install_calink_resolver`, because the client the
         // resolver lazily builds reads them once at construction.
@@ -1093,7 +1093,7 @@ mod ioc {
         // 4 and 1 while this reads 4.
         let declared = block_on_sync(db_for_names.external_link_pv_names())
             .expect("the RTEMS entry point runs on a plain thread with no runtime entered");
-        let deadline = std::time::Instant::now() + LINK_SETTLE_TIMEOUT;
+        let deadline = epics_base_rs::runtime::time::deadline_from_now(LINK_SETTLE_TIMEOUT);
         while resolver.link_count() < declared.len() && std::time::Instant::now() < deadline {
             std::thread::sleep(LINK_SETTLE_POLL);
         }

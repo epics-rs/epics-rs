@@ -133,14 +133,15 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, SocketAddrV4, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::runtime::accept::AcceptBackoff;
 use epics_base_rs::runtime::blocking_io;
+use epics_base_rs::runtime::socket::AcceptWaker;
 use epics_base_rs::runtime::task::{
     StackSizeClass, ThreadPriority, block_on_sync, enter_ioc_thread,
 };
@@ -159,12 +160,12 @@ use crate::server::outbox::{self, OutboxDrain};
 use crate::server::recv::{Admit, Gate, RecvAccumulator};
 use crate::server::stats::ServerStats;
 use crate::server::tcp::{
-    AdmittedPut, Blocked, CancelInfo, ChannelTarget, ClientDestroys, ClientState, Dispatched,
-    EventTaskControl, LockedClient, MonitorDelivery, RegisteredSubscription, SubscriptionDelivery,
-    SubscriptionOutcome, WriteHeadOutcome, cancel_subscription_reply, dispatch_message,
-    is_peer_disconnect, log_circuit, print_forcing_disconnect, refuse_bad_tcp_command,
-    register_subscription, report_gate_error, resume_dispatch, resume_write, run_event_task,
-    serve_write_head,
+    AdmittedPut, Blocked, CancelInfo, ChannelTarget, CircuitActivity, ClientState, ClientTable,
+    Dispatched, EventTaskControl, LockedClient, MonitorDelivery, RegisteredSubscription,
+    SubscriptionDelivery, SubscriptionOutcome, WriteHeadOutcome, cancel_subscription_reply,
+    dispatch_message, is_peer_disconnect, log_circuit, print_forcing_disconnect,
+    refuse_bad_tcp_command, register_subscription, report_gate_error, resume_dispatch,
+    resume_write, run_event_task, serve_write_head,
 };
 use crate::server::udp::{self, SearchReplyBatch};
 
@@ -209,58 +210,77 @@ const CAS_BEACON_PRIORITY: ThreadPriority =
     ThreadPriority::Custom(ThreadPriority::CaServerLow.value() - 3);
 
 /// C `rsrv_online_notify_task` on the calling thread, beaconing `tcp_port`
-/// to `beacon_addrs` until `sleep` reports serving ended.
+/// to `beacon_addrs` from when `run` runs until it stops.
 pub(crate) fn serve_beacons(
     socket: std::net::UdpSocket,
     tcp_port: u16,
     beacon_addrs: &[SocketAddr],
     max_period: Duration,
-    sleep: impl FnMut(Duration) -> bool,
+    run: &RunControl,
 ) {
     let _ = enter_ioc_thread(CAS_BEACON_PRIORITY);
+    // Held with the rest of the start; C beacons from `rsrv_init` on, as
+    // `beacon_ctl` starts at `ctlInit` (`online_notify.c:127`).
+    if !run.wait_for_run() {
+        return;
+    }
     crate::server::beacon::run_blocking_beacon_emitter(
         &socket,
         tcp_port,
         beacon_addrs,
         max_period,
-        sleep,
+        |d| run.sleep(d),
     )
 }
+
+/// Descriptors the target gives the process: `CONFIGURE_MAXIMUM_FILE_DESCRIPTORS`
+/// (`crates/epics-rtems-boot/csrc/rtems_config.c` §F).
+const TARGET_DESCRIPTORS: usize = 150;
+
+/// What the IOC held at idle on the target, serving one listener, before
+/// [`RunControl`] held a wake socket: `FD_FREE = 142` of `FD_MAX = 150` at
+/// zero connections.
+const IOC_IDLE_DESCRIPTORS: usize = 8;
+
+/// The [`AcceptWaker`] [`RunControl`] holds for each listener it serves, for
+/// as long as the server lives; the measured IOC serves one.
+const ACCEPT_WAKER_DESCRIPTORS: usize = 1;
+
+/// The descriptor a full server accepts the next client on to refuse it.
+const REFUSAL_DESCRIPTORS: usize = 1;
 
 /// The most CA clients this **process** can serve at once, and therefore the
 /// most two-thread sets [`CAS_CLIENT_POOL`] may ever create.
 ///
-/// **One below the target's fd wall, and the "one below" is the whole point.**
-/// Every term is read out of a source file or out of a measurement: the fd
-/// wall, and this driver's own ramp to it (142 established and held 140 s at
-/// the wall, the 143rd's `accept` failing with nothing said to the peer —
-/// which is what forced the "one below").
+/// **Every descriptor the process has, less each part held without a client,
+/// less one to refuse on.** A part that comes to hold a descriptor for the
+/// life of the server adds its term to this sum, and the capacity moves with
+/// it. Every term is read out of a source file or out of a measurement: this
+/// driver's own ramp to the wall before the wake socket (142 established and
+/// held 140 s, the 143rd's `accept` failing with nothing said to the peer —
+/// which is what forced the refusal term).
 ///
-/// * **fd wall = 142.** `CONFIGURE_MAXIMUM_FILE_DESCRIPTORS` is 150
-///   (`crates/epics-rtems-boot/csrc/rtems_config.c` §F) and the IOC holds 8
-///   descriptors at idle, so 142 client sockets fit. Measured on this driver:
-///   `FD_CNT = FD_MAX = 150`, `CA_CONN_CNT = 142`, zero descriptors free.
-/// * **memory wall ≈ 145.** A set is `Big` + `Medium` = 1,048,576 + 524,288 =
-///   1,572,864 B of stack on `armv7-rtems-eabihf` (`StackSizeClass::bytes` is
-///   `f × 0x10000 × size_of::<usize>()`, and `usize` is 4 there); the measured
-///   cost of a whole client set at the wall is **1,591,854 B**, and this image
-///   has **231,289,888 B** free at idle, so 231,289,888 / 1,591,854 ≈ 145.
-/// * **capacity = fd wall − 1 = 141**, *not* `min(142, 145) = 142`.
+/// The descriptor wall binds, not memory. A set is `Big` + `Medium` =
+/// 1,048,576 + 524,288 = 1,572,864 B of stack on `armv7-rtems-eabihf`
+/// (`StackSizeClass::bytes` is `f × 0x10000 × size_of::<usize>()`, and `usize`
+/// is 4 there); the measured cost of a whole client set at the wall is
+/// **1,591,854 B**, and this image has **231,289,888 B** free at idle, so
+/// memory runs out at 231,289,888 / 1,591,854 ≈ 145 sets.
 ///
 /// # Why one below, and not the wall itself
 ///
-/// At capacity 142 the pool's refusal is **unreachable**, and this is measured
-/// rather than argued: at the wall `REFUSED` stayed **0** for the whole run
-/// while `SETS = CAP = 142`. Set #143 would have been refused with `WouldBlock`
-/// — but client #143's `accept` fails `ENFILE` first, because 142 clients hold
-/// every descriptor the process has. The peer receives *nothing*: the guest
-/// accepted nothing and sent nothing, so a client at the wall sees the socket
-/// close with zero bytes on it.
+/// At capacity 142, the wall before the wake socket, the pool's refusal is
+/// **unreachable**, and this is measured rather than argued: at the wall
+/// `REFUSED` stayed **0** for the whole run while `SETS = CAP = 142`. Set #143
+/// would have been refused with `WouldBlock` — but client #143's `accept`
+/// fails `ENFILE` first, because 142 clients hold every descriptor the process
+/// has. The peer receives *nothing*: the guest accepted nothing and sent
+/// nothing, so a client at the wall sees the socket close with zero bytes on it.
 ///
 /// That is the silent close [`refuse_client`] exists to remove. **A refusal
 /// after `accept` needs a descriptor to refuse on**, so the server must keep
-/// one in hand: at 141 clients the process holds 149 of 150 descriptors, client
-/// #142's `accept` succeeds on the last one, `acquire` refuses it with
+/// one in hand: at capacity the process holds all but one descriptor, the next
+/// client's `accept` succeeds on the last one, `acquire` refuses it with
 /// `WouldBlock`, [`refuse_client`] tells it why with `ECA_ALLOCMEM` and closes
 /// — returning the descriptor for the next one. The accept loop is single
 /// threaded, so a burst of refusals is served one at a time through that one
@@ -271,14 +291,15 @@ pub(crate) fn serve_beacons(
 ///
 /// # What this is still not
 ///
-/// Not a connection-count limit of the kind C `rsrv` lacks. 141 is derived from
-/// the descriptor budget, not chosen as a policy on clients, and it moves with
-/// the fd cap; §9's rejected option 2 was a limit *independent* of the
-/// resource. The client that would have been #142 is not turned away — it is
+/// Not a connection-count limit of the kind C `rsrv` lacks. The capacity is
+/// derived from the descriptor budget, not chosen as a policy on clients, and
+/// it moves with the fd cap; §9's rejected option 2 was a limit *independent*
+/// of the resource. The client past capacity is not turned away — it is
 /// accepted and answered, which is strictly more than it got before. And a
 /// capacity *above* the wall (§9's rejected 256) remains unreachable for the
 /// same reason, now with a measurement behind it.
-const CAS_CLIENT_POOL_CAPACITY: usize = 141;
+const CAS_CLIENT_POOL_CAPACITY: usize =
+    TARGET_DESCRIPTORS - (IOC_IDLE_DESCRIPTORS + ACCEPT_WAKER_DESCRIPTORS + REFUSAL_DESCRIPTORS);
 
 /// The two roles one CA client borrows together, in the order
 /// [`CAS_CLIENT_POOL`] hands them out: `[client, event]`.
@@ -361,7 +382,8 @@ fn client_roster() -> [WorkerRole; 2] {
 /// there is no such ordering to state.
 ///
 /// `CAS`: RTEMS truncates thread names at 16 bytes and the pool appends
-/// `-{suffix} {index}`, so the longest name here is `CAS-client 141` — 14.
+/// `-{suffix} {index}`, so the longest name here, `CAS-client` and a
+/// three-digit index, is 14.
 static CAS_CLIENT_POOL: LazyLock<WorkerPool<2>> =
     LazyLock::new(|| WorkerPool::new("CAS", client_roster(), CAS_CLIENT_POOL_CAPACITY));
 
@@ -375,7 +397,10 @@ pub struct BlockingCaServer {
     db: Arc<PvDatabase>,
     acf: SharedAcf,
     tcp_port: u16,
-    shutdown: AtomicBool,
+    /// Whether [`serve`](Self::serve) accepts and the search responders
+    /// answer; one for every listener of a
+    /// [`BlockingCaServing`](super::blocking_serving::BlockingCaServing).
+    run: Arc<RunControl>,
     /// The counters `casr` reads, shared by every listener of one
     /// [`BlockingCaServing`](super::blocking_serving::BlockingCaServing);
     /// the served-client count is their connect/disconnect delta (see
@@ -383,6 +408,107 @@ pub struct BlockingCaServer {
     ///
     /// [`active_connections`]: Self::active_connections
     stats: Arc<ServerStats>,
+}
+
+/// What a serving shows its clients, which is nothing until its start runs.
+/// One value for accept, search reply and beacon, where C keeps three
+/// (`castcp_ctl`, `casudp_ctl`, `beacon_ctl`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Run {
+    /// Started, showing nothing: no accept, no search reply, no beacon.
+    Held,
+    Running,
+    /// Final: a stop before the run wins over it.
+    Stopped,
+}
+
+impl Run {
+    fn is_stopped(self) -> bool {
+        self == Run::Stopped
+    }
+}
+
+/// The one [`Run`] a serving's threads read, and the wake for those that
+/// wait on it.
+pub(crate) struct RunControl {
+    state: Mutex<Run>,
+    changed: Condvar,
+    /// One per listener served under this run, opened with it, so the stop
+    /// that ends the run opens nothing to wake its `accept`.
+    wakers: Mutex<Vec<AcceptWaker>>,
+}
+
+impl RunControl {
+    /// A serving that shows nothing until [`run`](Self::run).
+    pub(crate) fn held() -> Self {
+        Self::new(Run::Held)
+    }
+
+    fn running() -> Self {
+        Self::new(Run::Running)
+    }
+
+    fn new(state: Run) -> Self {
+        Self {
+            state: Mutex::new(state),
+            changed: Condvar::new(),
+            wakers: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Run> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn state(&self) -> Run {
+        *self.lock()
+    }
+
+    /// C `rsrv_run`.
+    pub(crate) fn run(&self) {
+        let mut state = self.lock();
+        if *state == Run::Held {
+            *state = Run::Running;
+        }
+        self.changed.notify_all();
+    }
+
+    /// Stop for good. Only the stop that ends a run dials its listeners,
+    /// waking any `accept` parked in [`BlockingCaServer::serve`]: before the
+    /// run nothing accepts. The dial neither opens a descriptor nor waits.
+    pub(crate) fn stop(&self) {
+        let ran = {
+            let mut state = self.lock();
+            let ran = *state == Run::Running;
+            *state = Run::Stopped;
+            self.changed.notify_all();
+            ran
+        };
+        if ran {
+            let wakers = self.wakers.lock().unwrap_or_else(|e| e.into_inner());
+            for waker in wakers.iter() {
+                let _ = waker.wake();
+            }
+        }
+    }
+
+    /// Wait out [`Run::Held`]; `true` once running, `false` once stopped.
+    fn wait_for_run(&self) -> bool {
+        let state = self
+            .changed
+            .wait_while(self.lock(), |s| *s == Run::Held)
+            .unwrap_or_else(|e| e.into_inner());
+        *state == Run::Running
+    }
+
+    /// Sleep `period` or until stopped; `true` once stopped.
+    fn sleep(&self, period: Duration) -> bool {
+        let (state, _) = self
+            .changed
+            .wait_timeout_while(self.lock(), period, |s| !s.is_stopped())
+            .unwrap_or_else(|e| e.into_inner());
+        state.is_stopped()
+    }
 }
 
 /// One served client's place in [`BlockingCaServer::active_connections`],
@@ -442,27 +568,47 @@ impl BlockingCaServer {
         acf: SharedAcf,
         stats: Arc<ServerStats>,
     ) -> std::io::Result<Self> {
+        Self::with_run(listener, db, acf, stats, Arc::new(RunControl::running()))
+    }
+
+    /// [`from_listener`](Self::from_listener), accepting and answering
+    /// searches only while `run` runs.
+    pub(crate) fn with_run(
+        listener: TcpListener,
+        db: Arc<PvDatabase>,
+        acf: SharedAcf,
+        stats: Arc<ServerStats>,
+        run: Arc<RunControl>,
+    ) -> std::io::Result<Self> {
         // Two fallible calls, two different diagnoses — so they must not
         // collapse into one `io::Error` the caller then labels "cannot bind".
         // On RTEMS this is the difference that matters: `bind` succeeds while
         // `local_addr` returns InvalidInput, because the target's libc omits
         // the BSD `sin_len` byte. Reporting that as a bind failure sends the
         // reader after the wrong syscall.
-        let tcp_port = listener
-            .local_addr()
-            .map_err(|e| {
-                std::io::Error::new(
-                    e.kind(),
-                    format!("bind() succeeded; local_addr() on the listener failed: {e}"),
-                )
-            })?
-            .port();
+        let addr = listener.local_addr().map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("bind() succeeded; local_addr() on the listener failed: {e}"),
+            )
+        })?;
+        let waker = AcceptWaker::new(addr).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("cannot open the socket that wakes accept() on {addr}: {e}"),
+            )
+        })?;
+        run.wakers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(waker);
+        let tcp_port = addr.port();
         Ok(Self {
             listener,
             db,
             acf,
             tcp_port,
-            shutdown: AtomicBool::new(false),
+            run,
             stats,
         })
     }
@@ -480,8 +626,9 @@ impl BlockingCaServer {
     /// so the number can be *reported*. It is the number the bring-up box
     /// measured the ceiling in: 142 concurrent, connection 143 refused by the
     /// libbsd socket zone with `ENFILE` and told nothing at all. This driver
-    /// now stops one short of that, at `CAS_CLIENT_POOL_CAPACITY` = 141, so
-    /// the descriptor client #142 needs to *hear why* is still there. Watching
+    /// now stops at `CAS_CLIENT_POOL_CAPACITY`, one descriptor short of the
+    /// wall, so the descriptor the next client needs to *hear why* is still
+    /// there. Watching
     /// this climb is how an operator sees the wall coming.
     pub fn active_connections(&self) -> usize {
         self.stats.active_clients() as usize
@@ -493,7 +640,9 @@ impl BlockingCaServer {
     }
 
     /// Run the accept loop until [`shutdown`](Self::shutdown) is requested.
-    /// Blocks the calling thread; run it on its own `std::thread`.
+    /// Blocks the calling thread; run it on its own `std::thread`. A held
+    /// server accepts nothing before it runs; one shut down first returns
+    /// without accepting.
     ///
     /// Each accepted connection **borrows** its two threads — the C `camsgtask`
     /// receiver (`caservertask.c:109`) and its event sender — as one set from
@@ -525,14 +674,23 @@ impl BlockingCaServer {
             epics_base_rs::runtime::taskwd::CheckIn::Unbounded,
             None,
         );
+        if !self.run.wait_for_run() {
+            return;
+        }
         let mut backoff = AcceptBackoff::new();
-        for stream in self.listener.incoming() {
-            match stream {
-                Ok(mut stream) => {
+        // Read before every `accept` as well as after: a stop that lands while
+        // the loop is away (serving, refusing, backing off) is seen here even if
+        // its wake dial never reaches the queue — it can time out behind a full
+        // backlog, and BSD stacks drop queued clients that reset. A stop between
+        // this read and the `accept` itself still relies on the dial.
+        while !self.run.state().is_stopped() {
+            match self.listener.accept() {
+                Ok((stream, _)) => {
                     backoff.accepted();
                     // A `shutdown()` wakes the blocking accept by dialing our
-                    // own socket; the throwaway connection is dropped here.
-                    if self.shutdown.load(Ordering::Acquire) {
+                    // own socket; the throwaway connection, or the queued
+                    // client a full backlog hands over first, is dropped here.
+                    if self.run.state().is_stopped() {
                         break;
                     }
                     let peer = match stream.peer_addr() {
@@ -571,10 +729,7 @@ impl BlockingCaServer {
                         Ok(set) => set,
                         Err(e) => {
                             refuse_client(peer, &e, |frame| {
-                                use std::io::Write;
-                                let _ = stream.write_all(frame);
-                                let _ = stream.flush();
-                                let _ = stream.shutdown(std::net::Shutdown::Both);
+                                send_refusal(&stream, stats.clone(), frame)
                             });
                             continue;
                         }
@@ -595,10 +750,16 @@ impl BlockingCaServer {
                         let _lease = lease;
                         // Held for the whole client: its `Drop` returns the
                         // slot however this job ends, panic included.
-                        let _slot = ClientSlot::take(stats);
-                        if let Err(e) =
-                            handle_client_blocking(event_worker, stream, peer, db, acf, tcp_port)
-                        {
+                        let _slot = ClientSlot::take(stats.clone());
+                        if let Err(e) = handle_client_blocking(
+                            event_worker,
+                            stream,
+                            peer,
+                            db,
+                            acf,
+                            tcp_port,
+                            stats,
+                        ) {
                             tracing::debug!(
                                 target: "epics_ca_rs::server::blocking",
                                 %peer, error = %e,
@@ -608,7 +769,7 @@ impl BlockingCaServer {
                     });
                 }
                 Err(e) => {
-                    if self.shutdown.load(Ordering::Acquire) {
+                    if self.run.state().is_stopped() {
                         break;
                     }
                     tracing::warn!(
@@ -622,11 +783,6 @@ impl BlockingCaServer {
                     // C `rsrv` never leaves this loop, and an IOC that stops
                     // accepting for good is worse than one that keeps trying.
                     thread::sleep(backoff.failed());
-                    // `shutdown()` may have been asked for while we slept, and
-                    // its self-dial cannot wake an `accept()` that is failing.
-                    if self.shutdown.load(Ordering::Acquire) {
-                        break;
-                    }
                 }
             }
         }
@@ -634,14 +790,10 @@ impl BlockingCaServer {
 
     /// Ask the accept loop to stop and unblock it. Idempotent. Also stops the
     /// UDP name-search responder ([`serve_udp_search`](Self::serve_udp_search)),
-    /// which polls the same flag between its short-capped `recv_from` calls.
+    /// which reads the same run state between its short-capped `recv_from`
+    /// calls.
     pub fn shutdown(&self) {
-        self.shutdown.store(true, Ordering::Release);
-        // Wake the blocking `accept()` by connecting to ourselves; the loop
-        // then observes the flag and returns.
-        if let Ok(addr) = self.listener.local_addr() {
-            let _ = TcpStream::connect(addr);
-        }
+        self.run.stop();
     }
 
     /// The advertised CA TCP port — the value SEARCH replies carry so a
@@ -691,7 +843,7 @@ impl BlockingCaServer {
             &cfg.ignore_addrs,
             self.db.clone(),
             self.tcp_port,
-            &self.shutdown,
+            &self.run,
         )
     }
 }
@@ -865,6 +1017,20 @@ fn refuse_client(peer: SocketAddr, cause: &AcquireError, send: impl FnOnce(&[u8]
     );
 }
 
+/// The refusal's wire leg. The socket never becomes a circuit, but its frame
+/// is server output all the same, so it goes through the `bytes_out` owner.
+fn send_refusal(stream: &TcpStream, stats: Arc<ServerStats>, frame: &[u8]) {
+    use std::io::Write;
+    let activity = CircuitActivity::new(Some(stats));
+    let mut wire = MarkingWrites {
+        sock: stream,
+        activity: &activity,
+    };
+    let _ = wire.write_all(frame);
+    let _ = wire.flush();
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+}
+
 /// Bind a blocking UDP name-search responder socket. Raw `libc` throughout
 /// (no `socket2`), so the socket-option path builds for RTEMS. SO_REUSEADDR +
 /// SO_REUSEPORT go on a configured port, as C
@@ -984,9 +1150,9 @@ fn flush_held_batch(
     }
 }
 
-/// Serve CA UDP name searches received on `socket`, replying on `reply`,
-/// and dropping any from a source in `ignore` (`casIgnoreAddrs`), until
-/// `shutdown` is set. C
+/// Serve CA UDP name searches received on `socket`, replying on `reply`
+/// while `run` runs, and dropping any from a source in `ignore`
+/// (`casIgnoreAddrs`), until it stops. C
 /// `cast_server` (`cast_server.c:113`): `recvfrom`, decode VERSION + SEARCH,
 /// `sendto` the reply. The decode/respond core is the shared
 /// [`udp::parse_search_datagram`]; only the socket I/O is blocking-specific,
@@ -1005,7 +1171,7 @@ fn handle_udp_search_blocking(
     ignore: &[std::net::Ipv4Addr],
     db: Arc<PvDatabase>,
     tcp_port: u16,
-    shutdown: &AtomicBool,
+    run: &RunControl,
 ) -> CaResult<()> {
     // C `cast_server` reaches the watchdog through `casAttachThreadToClient`
     // (`cast_server.c:151`), the same call its TCP siblings make — the UDP
@@ -1020,7 +1186,7 @@ fn handle_udp_search_blocking(
         epics_base_rs::runtime::taskwd::CheckIn::Unbounded,
         None,
     );
-    // Cap each blocking `recv_from` so the loop can observe `shutdown` between
+    // Cap each blocking `recv_from` so the loop can observe a stop between
     // datagrams. C `cast_server` blocks in `recvfrom` forever; this timeout is
     // only a clean-stop seam and is otherwise transparent to the protocol.
     socket
@@ -1037,11 +1203,11 @@ fn handle_udp_search_blocking(
     let mut batch = SearchReplyBatch::default();
     let mut batch_addr: Option<SocketAddr> = None;
 
-    while !shutdown.load(Ordering::Acquire) {
+    while !run.state().is_stopped() {
         let (len, src) = match socket.recv_from(&mut buf) {
             Ok(v) => v,
             // Idle cap fired: the recv queue is drained, so flush any held
-            // batch (C flushes on FIONREAD == 0) and re-check `shutdown`.
+            // batch (C flushes on FIONREAD == 0) and re-check `run`.
             Err(ref e) if is_read_timeout(e.kind()) => {
                 flush_held_batch(reply, &mut batch, &mut batch_addr);
                 continue;
@@ -1055,10 +1221,11 @@ fn handle_udp_search_blocking(
                 continue;
             }
         };
-        // C `cast_server.c:182-189`: a source on `casIgnoreAddrs` is dropped
-        // before `camessage`, yet still reaches the FIONREAD flush below.
+        // A start shows clients nothing until it runs, so a search before
+        // then is dropped, as is one from a `casIgnoreAddrs` source
+        // (`cast_server.c:182-189`); both still reach the FIONREAD flush.
         let ignored = matches!(src, SocketAddr::V4(v4) if ignore.contains(v4.ip()));
-        if !ignored {
+        if !ignored && run.state() == Run::Running {
             // Peer-change flush (C `cast_server.c:205-214`): a held batch belongs
             // to its source; if this datagram is from a different peer, flush the
             // held batch to the old peer before adopting the new one.
@@ -1106,7 +1273,7 @@ fn handle_udp_search_blocking(
             Ok(_) => { /* more datagrams pending: hold to coalesce */ }
         }
     }
-    // Shutdown requested: flush any held batch so a buffered reply is not lost.
+    // Stopped: flush any held batch so a buffered reply is not lost.
     flush_held_batch(reply, &mut batch, &mut batch_addr);
     Ok(())
 }
@@ -1143,9 +1310,7 @@ fn command_drives_without_spawn(cmmd: u16) -> bool {
 }
 
 /// `WouldBlock` / `TimedOut` from a blocking read mean the read timeout fired
-/// (`SO_RCVTIMEO`, set portably via `std`'s `set_read_timeout`; only when a cap
-/// is configured). Treated as an idle close, matching `handle_client`'s
-/// inactivity branch.
+/// (`SO_RCVTIMEO`, set portably via `std`'s `set_read_timeout`).
 fn is_read_timeout(kind: std::io::ErrorKind) -> bool {
     matches!(
         kind,
@@ -1159,18 +1324,46 @@ fn is_read_timeout(kind: std::io::ErrorKind) -> bool {
 /// at `MAX_TCP`, like C's `casExpandSendBuffer`-less default.
 pub(crate) struct SendBuf<W = TcpStream> {
     sock: Arc<W>,
+    activity: Arc<CircuitActivity>,
     buf: Vec<u8>,
+}
+
+/// A circuit write that reports what went out to the circuit's
+/// [`CircuitActivity`].
+struct MarkingWrites<'a, W> {
+    sock: W,
+    activity: &'a CircuitActivity,
+}
+
+impl<W: Write> Write for MarkingWrites<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.sock.write(buf)?;
+        self.activity.sent(n);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.sock.flush()
+    }
 }
 
 impl<W> SendBuf<W>
 where
     for<'a> &'a W: Write,
 {
-    fn new(sock: Arc<W>) -> Self {
+    fn new(sock: Arc<W>, activity: Arc<CircuitActivity>) -> Self {
         Self {
             sock,
+            activity,
             buf: Vec::with_capacity(crate::protocol::MAX_TCP),
         }
+    }
+
+    fn wire(&self) -> crate::server::send::RetryTransient<MarkingWrites<'_, &W>> {
+        crate::server::send::RetryTransient(MarkingWrites {
+            sock: &*self.sock,
+            activity: &self.activity,
+        })
     }
 
     /// C `cas_copy_in_header` (its flush, `caserverio.c:280-286`) +
@@ -1182,7 +1375,7 @@ where
             self.send()?;
         }
         if frame.len() > crate::protocol::MAX_TCP {
-            return crate::server::send::RetryTransient(&*self.sock).write_all(frame);
+            return self.wire().write_all(frame);
         }
         self.buf.extend_from_slice(frame);
         Ok(())
@@ -1222,7 +1415,7 @@ where
         if self.buf.is_empty() {
             return Ok(());
         }
-        let sent = crate::server::send::RetryTransient(&*self.sock).write_all(&self.buf);
+        let sent = self.wire().write_all(&self.buf);
         self.buf.clear();
         sent
     }
@@ -1264,7 +1457,7 @@ fn write_frame_locked(send_lock: &Mutex<SendBuf>, frame: &[u8]) -> std::io::Resu
 
 /// Stage every queued frame in arrival order, then send once. Single owner of
 /// "server bytes reach the socket" for the command path — the blocking
-/// analogue of `drain_and_flush` (`tcp.rs:1627`), held under the
+/// analogue of `run_circuit_writer`'s flush, held under the
 /// `client->lock` send-lock (`server.h:83`). The send also carries whatever
 /// the event thread staged before it.
 fn drain_outbox_locked(send_lock: &Mutex<SendBuf>, drain: &mut OutboxDrain) -> std::io::Result<()> {
@@ -1315,14 +1508,7 @@ pub(crate) fn hand_off_subscription(
             monitor: r.monitor.clone(),
         },
     );
-    state.link_subscription(
-        r.channel_sid,
-        crate::server::tcp::ChannelMonitor {
-            sub_id: r.sub_id,
-            monitor: r.monitor,
-            id: r.reader.id(),
-        },
-    );
+    state.link_subscription(r.channel_sid, r.sub_id, r.monitor, r.reader.id());
     let _ = ev_tx.send(EventTaskControl::Add(Box::new(MonitorDelivery {
         reader: r.reader,
         target: r.target,
@@ -1411,8 +1597,12 @@ impl LockedClient for BlockingClient {
         &mut self.state
     }
 
+    fn send_queued(&mut self) -> bool {
+        drain_outbox_locked(&self.send_lock, &mut self.drain).is_ok()
+    }
+
     fn channels_retired(&mut self) -> bool {
-        if drain_outbox_locked(&self.send_lock, &mut self.drain).is_err() {
+        if !self.send_queued() {
             return false;
         }
         // The destroy ended their readers on the event thread.
@@ -1435,6 +1625,7 @@ fn handle_client_blocking(
     db: Arc<PvDatabase>,
     acf: SharedAcf,
     tcp_port: u16,
+    stats: Arc<ServerStats>,
 ) -> CaResult<()> {
     // C `create_client` sets both of these and refuses the client —
     // `destroy_client`, `return NULL` — when either `setsockopt` fails
@@ -1470,17 +1661,16 @@ fn handle_client_blocking(
     // `write` under the send lock until the peer reads or resets. C parks in
     // `send` under `SEND_LOCK` for exactly as long, so the BEHAVIOUR here is
     // C-faithful and is deliberately left alone; only the rationale was wrong.
-    // The bound, when one is wanted, is `EPICS_CAS_INACTIVITY_TMO` below —
-    // off by default, as in C. (Measured on rtems-libbsd.)
+    // The bound is `EPICS_CAS_INACTIVITY_TMO` below, which C does not have.
+    // (Measured on rtems-libbsd.)
     stream.set_nodelay(true).map_err(CaError::Io)?;
     epics_base_rs::runtime::socket::enable_keepalive(&stream).map_err(CaError::Io)?;
-    // `None` (no configured cap) leaves the socket in pure blocking mode — C
-    // `rsrv`'s default (`camsgtask` blocks in `recv` with no idle cap).
+    // `None` (the cap turned off) leaves the socket in pure blocking mode, as C
+    // `camsgtask` blocks in `recv` with no idle cap.
     // `set_read_timeout` sets SO_RCVTIMEO on Unix (incl. RTEMS) and is portable
     // to Windows, unlike the former raw-libc helper.
-    stream
-        .set_read_timeout(crate::server::tcp::inactivity_timeout())
-        .map_err(CaError::Io)?;
+    let cap = crate::server::tcp::inactivity_timeout();
+    stream.set_read_timeout(cap).map_err(CaError::Io)?;
 
     // One socket, two roles: a blocking read handle owned by this thread, and
     // a write handle behind the SEND_LOCK, so the monitor thread (S1c) can
@@ -1535,10 +1725,11 @@ fn handle_client_blocking(
 
     let stream = Arc::new(stream);
     let mut reader: &TcpStream = &stream;
-    let send_lock = Arc::new(Mutex::new(SendBuf::new(stream.clone())));
+    let activity = Arc::new(CircuitActivity::new(Some(stats.clone())));
+    let send_lock = Arc::new(Mutex::new(SendBuf::new(stream.clone(), activity.clone())));
 
     let (outbox, drain) = outbox::channel();
-    let mut state = ClientState::new(acf, tcp_port, db.clone());
+    let mut state = ClientState::new(acf, tcp_port, db.clone(), Some(stats));
     state.apply_connection_identity(peer, None, None);
 
     // C `create_tcp_client` (`caservertask.c:1526`) sends an unsolicited
@@ -1578,10 +1769,13 @@ fn handle_client_blocking(
         drain,
         send_lock: send_lock.clone(),
     }));
-    // Subscribed before any channel exists, so no destroy goes unseen.
-    let destroys = ClientDestroys {
+    // Subscribed before any channel exists, so no destroy and no access
+    // change goes unseen.
+    let table = ClientTable {
         client: client.clone(),
-        wake: db.pv_destroyed_events(),
+        destroyed: db.pv_destroyed_events(),
+        access: epics_base_rs::server::access_security::subscribe_asg_changes(),
+        outbox: outbox.clone(),
         peer,
     };
     let event_job = event_worker.run(move || {
@@ -1594,15 +1788,7 @@ fn handle_client_blocking(
             None,
         );
         let sink = EventSendBuf(event_send_lock);
-        if block_on_sync(run_event_task(
-            event_user,
-            ev_rx,
-            destroys,
-            sink,
-            event_minor,
-        ))
-        .is_err()
-        {
+        if block_on_sync(run_event_task(event_user, ev_rx, table, sink, event_minor)).is_err() {
             tracing::error!(
                 target: "epics_ca_rs::server::blocking",
                 %peer,
@@ -1642,12 +1828,21 @@ fn handle_client_blocking(
 
             let n = match reader.read(&mut buf) {
                 Ok(0) => break, // graceful EOF
-                Ok(n) => n,
+                Ok(n) => {
+                    activity.received(n);
+                    n
+                }
                 // Peer vanished mid-session (RST / broken pipe / truncated) is a
                 // clean disconnect, not a server error — same rule as
                 // `handle_client` (`is_peer_disconnect`).
                 Err(ref e) if is_peer_disconnect(e.kind()) => break,
                 Err(ref e) if is_read_timeout(e.kind()) => {
+                    // SO_RCVTIMEO only wakes the read: bytes written since it
+                    // was armed leave the rest of the cap to run.
+                    if let Some(left) = cap.and_then(|cap| activity.idle_remaining(cap)) {
+                        reader.set_read_timeout(Some(left)).map_err(CaError::Io)?;
+                        continue;
+                    }
                     tracing::warn!(
                         target: "epics_ca_rs::server::blocking",
                         %peer, "CA client idle (SO_RCVTIMEO), closing"
@@ -2075,6 +2270,34 @@ mod tests {
             text.contains("no resources for a new client"),
             "the diagnostic string must reach the client: {text:?}"
         );
+    }
+
+    /// The refusal frame is counted in `bytes_out` like any circuit's bytes.
+    #[test]
+    fn a_refusal_counts_its_frame_in_bytes_out() {
+        use std::io::Read;
+        use std::net::{Ipv4Addr, TcpListener as StdTcpListener};
+
+        let listener = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind loopback");
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).expect("connect");
+        client
+            .set_read_timeout(Some(fact_budget::FACT_BUDGET))
+            .expect("client read timeout");
+        let (server, peer) = listener.accept().expect("accept");
+        let stats = Arc::new(ServerStats::default());
+
+        refuse_client(
+            peer,
+            &AcquireError::AtCapacity {
+                capacity: CAS_CLIENT_POOL_CAPACITY,
+            },
+            |frame| send_refusal(&server, stats.clone(), frame),
+        );
+
+        let mut got = Vec::new();
+        client.read_to_end(&mut got).expect("read the refusal");
+        assert!(!got.is_empty(), "the refusal frame reached the client");
+        assert_eq!(stats.bytes_out.load(Ordering::Relaxed), got.len() as u64);
     }
 
     /// The diagnostic string of a refusal frame, as a client reads it.
@@ -2623,8 +2846,15 @@ mod tests {
             let db = db.clone();
             let job = client_worker.run(move || {
                 let _lease = lease;
-                let _ =
-                    handle_client_blocking(event_worker, server_sock, peer, db, new_acf(), 5064);
+                let _ = handle_client_blocking(
+                    event_worker,
+                    server_sock,
+                    peer,
+                    db,
+                    new_acf(),
+                    5064,
+                    Arc::new(ServerStats::default()),
+                );
             });
             // EOF ends the client body, which drops the control sender and
             // joins the event job.
@@ -2634,7 +2864,8 @@ mod tests {
             // The set re-idles a moment after the job's result is handed to the
             // joiner (the worker loop's return step runs next), so wait for the
             // accounting rather than racing it.
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let deadline =
+                epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(5));
             while pool.set_usage().0 != 0 && std::time::Instant::now() < deadline {
                 thread::sleep(Duration::from_millis(5));
             }
@@ -2654,52 +2885,34 @@ mod tests {
 
     /// The pool's capacity leaves exactly one descriptor for the refusal.
     ///
-    /// The number is a decision, so it is pinned here with its derivation rather
-    /// than left as a literal somebody rounds later:
+    /// Memory is measured at ≈145 sets (1,591,854 B per client set, 231,289,888 B
+    /// free at idle) — not the 151 the first derivation used, which came from a
+    /// different image's idle heap — so the descriptor wall binds first.
     ///
-    /// * 150 descriptors configured minus the 8 the IOC holds at idle = **142**
-    ///   client sockets; measured on this driver as `FD_CNT = FD_MAX = 150`
-    ///   with `CA_CONN_CNT = 142` and zero free.
-    /// * memory: a client set costs a measured 1,591,854 B and the image has
-    ///   231,289,888 B free at idle, so **≈145** sets — not the 151 the first
-    ///   derivation used, which came from a different image's idle heap.
-    /// * capacity = **fd wall − 1 = 141**, so the client that cannot be served
-    ///   can still be *accepted* and told why.
-    ///
-    /// The last line is the one the target forced. At capacity = the wall the
-    /// pool's refusal is unreachable — `REFUSED` stayed 0 through a full ramp
-    /// while `SETS = CAP = 142`, because client #143's `accept` fails `ENFILE`
-    /// before `acquire` is ever called, and the peer is sent nothing at all.
-    /// Refusing after `accept` needs a descriptor to refuse on; this keeps one.
+    /// At capacity = the wall the pool's refusal is unreachable — `REFUSED`
+    /// stayed 0 through a full ramp while `SETS = CAP = 142`, because client
+    /// #143's `accept` fails `ENFILE` before `acquire` is ever called, and the
+    /// peer is sent nothing at all. Refusing after `accept` needs a descriptor
+    /// to refuse on; this keeps one.
     #[test]
     fn the_client_pool_capacity_leaves_one_descriptor_for_the_refusal() {
-        const CONFIGURED_DESCRIPTORS: usize = 150;
-        const IOC_HELD_AT_IDLE: usize = 8;
         /// 231,289,888 B free at idle / 1,591,854 B measured per client set.
         const MEMORY_WALL_CONNECTIONS: usize = 145;
 
-        let fd_wall = CONFIGURED_DESCRIPTORS - IOC_HELD_AT_IDLE;
-        assert_eq!(fd_wall, 142, "the fd wall is the cap minus the idle hold");
+        let held_without_clients = IOC_IDLE_DESCRIPTORS + ACCEPT_WAKER_DESCRIPTORS;
+        let fd_wall = TARGET_DESCRIPTORS - held_without_clients;
         assert!(
             fd_wall <= MEMORY_WALL_CONNECTIONS,
             "the fd wall is the binding one; if memory ever binds first, the \
              spare descriptor this capacity reserves no longer buys a refusal"
         );
         assert_eq!(
-            CAS_CLIENT_POOL_CAPACITY,
-            fd_wall - 1,
-            "capacity must sit one below the fd wall: at the wall itself the \
-             pool's WouldBlock arm is unreachable (measured REFUSED=0 with \
-             SETS=CAP) because accept fails ENFILE first, and the peer is told \
-             nothing"
-        );
-        // The property that spare descriptor exists for: at capacity, one more
-        // client can still be accepted, which is what `refuse_client` needs.
-        assert_eq!(
-            CONFIGURED_DESCRIPTORS - (IOC_HELD_AT_IDLE + CAS_CLIENT_POOL_CAPACITY),
+            TARGET_DESCRIPTORS - (held_without_clients + CAS_CLIENT_POOL_CAPACITY),
             1,
             "a full server must still be able to accept the client it is about \
-             to refuse"
+             to refuse: at the wall itself the pool's WouldBlock arm is \
+             unreachable (measured REFUSED=0 with SETS=CAP) because accept \
+             fails ENFILE first, and the peer is told nothing"
         );
     }
 
@@ -2848,7 +3061,7 @@ mod tests {
         dbr_type: u16,
     ) -> Vec<u8> {
         let acf = new_acf();
-        let mut state = ClientState::new(acf, 5064, db.clone());
+        let mut state = ClientState::new(acf, 5064, db.clone(), None);
         let peer: SocketAddr = "127.0.0.1:5064".parse().unwrap();
         state.apply_connection_identity(peer, None, None);
         let (outbox, mut drain) = outbox::channel();
@@ -2890,7 +3103,7 @@ mod tests {
     /// This is the number the bring-up box measured the ceiling in (142
     /// concurrent, the 143rd's `accept` failing `ENFILE` with nothing said to
     /// the peer), so it is the one an operator watches climb — now to
-    /// [`CAS_CLIENT_POOL_CAPACITY`] = 141, one below that wall. It is a count
+    /// [`CAS_CLIENT_POOL_CAPACITY`], one descriptor short of the wall. It is a count
     /// and never a limit — nothing in this file reads it to decide anything.
     #[test]
     fn a_served_client_is_counted_and_gives_the_slot_back() {
@@ -2919,7 +3132,7 @@ mod tests {
         );
 
         drop(c);
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(5));
         while server.active_connections() != 0 && std::time::Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
         }
@@ -2931,6 +3144,139 @@ mod tests {
 
         server.shutdown();
         let _ = accept.join();
+    }
+
+    /// A stop that lands while a running server's accept loop is away from
+    /// `accept()`, busy, and clients fill its backlog, returns; the loop,
+    /// back at its accept, leaves.
+    #[test]
+    fn a_stop_behind_a_full_backlog_returns_while_the_loop_is_busy() {
+        use fact_budget::FACT_BUDGET;
+
+        let server =
+            Arc::new(BlockingCaServer::bind("127.0.0.1:0", seed_db(&[]), new_acf()).unwrap());
+        let addr = server.local_addr().unwrap();
+        // Up to the first connect the full backlog leaves unanswered.
+        let waiting: Vec<TcpStream> = std::iter::from_fn(|| {
+            // absence-window: a full backlog drops the SYN, so no reply can
+            // mark it full.
+            TcpStream::connect_timeout(&addr, Duration::from_millis(200)).ok()
+        })
+        .take(4096)
+        .collect();
+        assert!(waiting.len() < 4096, "the backlog never filled");
+
+        let (done, ended) = std::sync::mpsc::channel();
+        let srv = server.clone();
+        thread::spawn(move || {
+            srv.shutdown();
+            let _ = done.send(());
+        });
+        assert!(
+            ended.recv_timeout(FACT_BUDGET).is_ok(),
+            "the stop did not return within {FACT_BUDGET:?} ({} clients waiting)",
+            waiting.len()
+        );
+
+        let (done, ended) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            server.serve();
+            let _ = done.send(());
+        });
+        assert!(
+            ended.recv_timeout(FACT_BUDGET).is_ok(),
+            "the accept loop did not leave"
+        );
+    }
+
+    /// A stop in a process out of descriptors still wakes the parked accept,
+    /// and the port is free to bind again once the server goes. The limit is
+    /// lowered in a child process, so no other test runs under it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stop_with_no_descriptor_left_frees_the_port() {
+        use fact_budget::FACT_BUDGET;
+
+        crate::fresh_process::with_a_process_of_its_own(
+            "server::blocking::tests::a_stop_with_no_descriptor_left_frees_the_port",
+            || {
+                let server = Arc::new(
+                    BlockingCaServer::bind("127.0.0.1:0", seed_db(&[]), new_acf()).unwrap(),
+                );
+                let addr = server.local_addr().unwrap();
+                let (done, ended) = std::sync::mpsc::channel();
+                let srv = server.clone();
+                thread::spawn(move || {
+                    srv.serve();
+                    drop(srv);
+                    let _ = done.send(());
+                });
+                // Greeted, so the loop has been through `accept` and parks in the next.
+                let mut c = TcpStream::connect(addr).unwrap();
+                c.set_read_timeout(Some(FACT_BUDGET)).unwrap();
+                let _ = read_until_cmmd(&mut c, CA_PROTO_VERSION);
+
+                let limit = libc::rlimit {
+                    rlim_cur: 64,
+                    rlim_max: 64,
+                };
+                // SAFETY: a valid `rlimit`; this process runs this test alone.
+                assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+                let mut hogs = Vec::new();
+                let full = loop {
+                    match std::fs::File::open("/dev/null") {
+                        Ok(f) => hogs.push(f),
+                        Err(e) => break e,
+                    }
+                };
+                assert_eq!(full.raw_os_error(), Some(libc::EMFILE));
+                server.shutdown();
+                drop(hogs);
+
+                assert!(
+                    ended.recv_timeout(FACT_BUDGET).is_ok(),
+                    "the accept loop stayed parked after the stop"
+                );
+                drop(server);
+                TcpListener::bind(addr).expect("the stopped server's port is free to bind");
+            },
+        );
+    }
+
+    /// MUST: the accept loop reads the run state right before every `accept`,
+    /// not only after one returns. A stop landing while the loop is away
+    /// serving or refusing a client otherwise reaches it only through the
+    /// wake dial, which can be lost: it times out behind a full backlog, and
+    /// BSD stacks drop queued clients that reset, leaving nothing to take.
+    ///
+    /// Source inspection: the window is the few microseconds the loop spends
+    /// away, and no Linux client can make a queued dial vanish.
+    #[test]
+    fn the_accept_loop_reads_the_run_state_before_every_accept() {
+        let prod = production(include_str!("blocking.rs"), Comments::Strip);
+        let serve = {
+            let at = prod
+                .find("pub fn serve(&self) {")
+                .expect("serve moved; update this guard");
+            let tail = &prod[at..];
+            &tail[..tail.find("\n    }\n").expect("serve body")]
+        };
+        assert!(
+            !serve.contains(".incoming()"),
+            "`incoming()` accepts before the loop body can read the run state"
+        );
+        let accepts: Vec<usize> = serve.match_indices("accept(").map(|(at, _)| at).collect();
+        assert!(!accepts.is_empty(), "the accept moved; update this guard");
+        for at in accepts {
+            let check = serve[..at]
+                .rfind("is_stopped()")
+                .expect("an accept with no run-state read before it");
+            assert_eq!(
+                serve[check..at].split_whitespace().collect::<Vec<_>>(),
+                ["is_stopped()", "{", "match", "self.listener."],
+                "nothing may run between the run-state read and the accept"
+            );
+        }
     }
 
     /// The placement that makes the count survivable: the slot is a guard, so
@@ -3032,6 +3378,175 @@ mod tests {
             reply, reference,
             "blocking driver must ship the shared dispatch handler's exact bytes"
         );
+
+        server.shutdown();
+        accept.join().unwrap();
+    }
+
+    /// `bytes_in` / `bytes_out` count this driver's circuit, as they do the
+    /// async one's: once a READ_NOTIFY is answered, `bytes_in` is every byte
+    /// the client sent and `bytes_out` every byte it has read.
+    #[test]
+    fn byte_counters_move_with_a_request_and_its_reply() {
+        let db = seed_db(&[("BLK:BYTES", EpicsValue::Double(1.0))]);
+        let server =
+            Arc::new(BlockingCaServer::bind("127.0.0.1:0", db.clone(), new_acf()).unwrap());
+        let stats = server.stats();
+        let addr = server.local_addr().unwrap();
+        let srv = server.clone();
+        let accept = thread::spawn(move || srv.serve());
+
+        let mut c = TcpStream::connect(addr).unwrap();
+        c.set_read_timeout(Some(fact_budget::FACT_BUDGET)).unwrap();
+        let mut received = read_until_cmmd(&mut c, CA_PROTO_VERSION).len();
+        let mut sent = 0;
+        let mut send = |c: &mut TcpStream, frame: Vec<u8>| {
+            c.write_all(&frame).unwrap();
+            sent += frame.len();
+        };
+        send(&mut c, version_frame());
+        send(&mut c, create_chan_frame(1, "BLK:BYTES"));
+        let cc = loop {
+            let frame = read_one_frame(&mut c);
+            received += frame.len();
+            if u16::from_be_bytes([frame[0], frame[1]]) == CA_PROTO_CREATE_CHAN {
+                break frame;
+            }
+        };
+        let sid = u32::from_be_bytes([cc[12], cc[13], cc[14], cc[15]]);
+        send(&mut c, read_notify_frame(sid, 7, 6));
+        let reply = read_one_frame(&mut c);
+        assert_eq!(
+            u16::from_be_bytes([reply[0], reply[1]]),
+            CA_PROTO_READ_NOTIFY
+        );
+        received += reply.len();
+
+        // The server counts after each read or write returns, so the client
+        // can see the reply a moment before the count does.
+        let counts = || {
+            (
+                stats.bytes_in.load(Ordering::Relaxed) as usize,
+                stats.bytes_out.load(Ordering::Relaxed) as usize,
+            )
+        };
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
+        while counts() != (sent, received) && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(counts(), (sent, received), "(bytes_in, bytes_out)");
+
+        server.shutdown();
+        accept.join().unwrap();
+    }
+
+    /// `(channels opened, closed, subscriptions opened, closed)`, once it
+    /// reads `want` or the budget runs out: the client sees a reply a moment
+    /// before a teardown on the server's side of it has finished.
+    fn table_counts_settle(
+        stats: &ServerStats,
+        want: (u64, u64, u64, u64),
+    ) -> (u64, u64, u64, u64) {
+        let counts = || {
+            (
+                stats.channels_opened_total.load(Ordering::Relaxed),
+                stats.channels_closed_total.load(Ordering::Relaxed),
+                stats.subscriptions_opened_total.load(Ordering::Relaxed),
+                stats.subscriptions_closed_total.load(Ordering::Relaxed),
+            )
+        };
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
+        while counts() != want && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        counts()
+    }
+
+    fn event_cancel_frame(sid: u32, sub_id: u32) -> Vec<u8> {
+        let mut h = CaHeader::new(CA_PROTO_EVENT_CANCEL);
+        h.data_type = DBR_DOUBLE_MON;
+        h.count = 1;
+        h.cid = sid;
+        h.available = sub_id;
+        h.to_bytes().to_vec()
+    }
+
+    /// The channel and subscription counters count this driver's table as
+    /// they do the async one's: EVENT_CANCEL closes its subscription, and
+    /// CLEAR_CHANNEL closes the channel and the subscription still on it.
+    #[test]
+    fn channel_and_subscription_counters_move_with_create_and_clear() {
+        let db = seed_db(&[("BLK:TALLY", EpicsValue::Double(1.0))]);
+        let server =
+            Arc::new(BlockingCaServer::bind("127.0.0.1:0", db.clone(), new_acf()).unwrap());
+        let stats = server.stats();
+        let addr = server.local_addr().unwrap();
+        let srv = server.clone();
+        let accept = thread::spawn(move || srv.serve());
+
+        let mut c = TcpStream::connect(addr).unwrap();
+        c.set_read_timeout(Some(fact_budget::FACT_BUDGET)).unwrap();
+        let _ = read_until_cmmd(&mut c, CA_PROTO_VERSION);
+        c.write_all(&version_frame()).unwrap();
+        c.write_all(&create_chan_frame(0x51, "BLK:TALLY")).unwrap();
+        let cc = read_until_cmmd(&mut c, CA_PROTO_CREATE_CHAN);
+        let sid = u32::from_be_bytes([cc[12], cc[13], cc[14], cc[15]]);
+        c.write_all(&event_add_double_frame(sid, 1)).unwrap();
+        c.write_all(&event_add_double_frame(sid, 2)).unwrap();
+        let _ = read_until_cmmd(&mut c, CA_PROTO_EVENT_ADD);
+        let _ = read_until_cmmd(&mut c, CA_PROTO_EVENT_ADD);
+        assert_eq!(table_counts_settle(&stats, (1, 0, 2, 0)), (1, 0, 2, 0));
+        // Each initial value is one update posted and one processed.
+        let events = || {
+            (
+                stats.subscription_events_posted.load(Ordering::Relaxed),
+                stats.subscription_events_processed.load(Ordering::Relaxed),
+            )
+        };
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
+        while events() != (2, 2) && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(events(), (2, 2), "(events posted, processed)");
+
+        c.write_all(&event_cancel_frame(sid, 1)).unwrap();
+        assert_eq!(table_counts_settle(&stats, (1, 0, 2, 1)), (1, 0, 2, 1));
+        let mut clear = CaHeader::new(CA_PROTO_CLEAR_CHANNEL);
+        clear.cid = sid;
+        clear.available = 0x51;
+        c.write_all(&clear.to_bytes()).unwrap();
+        let _ = read_until_cmmd(&mut c, CA_PROTO_CLEAR_CHANNEL);
+        assert_eq!(table_counts_settle(&stats, (1, 1, 2, 2)), (1, 1, 2, 2));
+
+        server.shutdown();
+        accept.join().unwrap();
+    }
+
+    /// A client that leaves without clearing anything closes, in the
+    /// counters, the channel and subscription it left open.
+    #[test]
+    fn a_disconnect_closes_the_channel_and_subscription_left_open() {
+        let db = seed_db(&[("BLK:LEFT", EpicsValue::Double(1.0))]);
+        let server =
+            Arc::new(BlockingCaServer::bind("127.0.0.1:0", db.clone(), new_acf()).unwrap());
+        let stats = server.stats();
+        let addr = server.local_addr().unwrap();
+        let srv = server.clone();
+        let accept = thread::spawn(move || srv.serve());
+
+        let mut c = TcpStream::connect(addr).unwrap();
+        c.set_read_timeout(Some(fact_budget::FACT_BUDGET)).unwrap();
+        let _ = read_until_cmmd(&mut c, CA_PROTO_VERSION);
+        c.write_all(&version_frame()).unwrap();
+        c.write_all(&create_chan_frame(0x52, "BLK:LEFT")).unwrap();
+        let cc = read_until_cmmd(&mut c, CA_PROTO_CREATE_CHAN);
+        let sid = u32::from_be_bytes([cc[12], cc[13], cc[14], cc[15]]);
+        c.write_all(&event_add_double_frame(sid, 1)).unwrap();
+        let _ = read_until_cmmd(&mut c, CA_PROTO_EVENT_ADD);
+        assert_eq!(table_counts_settle(&stats, (1, 0, 1, 0)), (1, 0, 1, 0));
+
+        drop(c);
+        assert_eq!(table_counts_settle(&stats, (1, 1, 1, 1)), (1, 1, 1, 1));
 
         server.shutdown();
         accept.join().unwrap();
@@ -3448,7 +3963,7 @@ mod tests {
             // One accept loop per file today. Counting rather than merely
             // checking presence is what makes this catch a *newly added*
             // loop that forgot the backoff.
-            let loops = src.matches(concat!("self.listener.inco", "ming()")).count()
+            let loops = src.matches(concat!("self.listener.acc", "ept()")).count()
                 + src
                     .matches(concat!("res = listener.acc", "ept() => match res {"))
                     .count();
@@ -3756,14 +4271,14 @@ mod tests {
             errlog: Arc::new(AtomicUsize::new(0)),
             elsewhere: errors.clone(),
         };
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let stop = shutdown.clone();
+        let run = Arc::new(RunControl::running());
+        let ctl = run.clone();
         let udp_thread = thread::spawn(move || {
             tracing::subscriber::with_default(recorder, || {
-                handle_udp_search_blocking(&resp, &reply, "CAS-UDP", &[], db, 5064, &stop)
+                handle_udp_search_blocking(&resp, &reply, "CAS-UDP", &[], db, 5064, &ctl)
             })
         });
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(5));
         while errors.load(Ordering::Relaxed) == 0 {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -3789,7 +4304,7 @@ mod tests {
             .expect("the responder still answers");
         assert_eq!(search_reply_cids(&rbuf[..n]), vec![7]);
 
-        shutdown.store(true, Ordering::Release);
+        run.stop();
         udp_thread.join().unwrap().unwrap();
     }
 
@@ -3800,8 +4315,8 @@ mod tests {
         let db = seed_db(&[("BLK:IGN", EpicsValue::Double(1.0))]);
         let resp = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
         let resp_addr = resp.local_addr().unwrap();
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let stop = shutdown.clone();
+        let run = Arc::new(RunControl::running());
+        let ctl = run.clone();
         let udp_thread = thread::spawn(move || {
             handle_udp_search_blocking(
                 &resp,
@@ -3810,7 +4325,7 @@ mod tests {
                 &[Ipv4Addr::LOCALHOST],
                 db,
                 5064,
-                &stop,
+                &ctl,
             )
         });
 
@@ -3845,7 +4360,7 @@ mod tests {
             "the ignored source drew a reply"
         );
 
-        shutdown.store(true, Ordering::Release);
+        run.stop();
         udp_thread.join().unwrap().unwrap();
     }
 
@@ -4514,7 +5029,7 @@ mod tests {
     fn event_add_with_truncated_mon_info_drops_silently() {
         let db = seed_db(&[("SHORT:MON", EpicsValue::Double(1.0))]);
         let acf = new_acf();
-        let mut state = ClientState::new(acf, 5064, db.clone());
+        let mut state = ClientState::new(acf, 5064, db.clone(), None);
         let peer: SocketAddr = "127.0.0.1:5064".parse().unwrap();
         state.apply_connection_identity(peer, None, None);
         let (outbox, mut drain) = outbox::channel();
@@ -4622,7 +5137,7 @@ mod tests {
         u32,
     ) {
         let acf = new_acf();
-        let mut state = ClientState::new(acf, 5064, db.clone());
+        let mut state = ClientState::new(acf, 5064, db.clone(), None);
         let peer: SocketAddr = "127.0.0.1:5064".parse().unwrap();
         state.apply_connection_identity(peer, None, None);
         let (outbox, mut drain) = outbox::channel();
@@ -4946,7 +5461,7 @@ mod tests {
     fn reference_monitor_frames(seed: f64, update: f64, sub_id: u32) -> (Vec<u8>, Vec<u8>) {
         let db = seed_db(&[("REF:MON", EpicsValue::Double(seed))]);
         let acf = new_acf();
-        let mut state = ClientState::new(acf, 5064, db.clone());
+        let mut state = ClientState::new(acf, 5064, db.clone(), None);
         let peer: SocketAddr = "127.0.0.1:5064".parse().unwrap();
         state.apply_connection_identity(peer, None, None);
         let (outbox, mut drain) = outbox::channel();
@@ -5150,6 +5665,51 @@ mod tests {
         accept.join().unwrap();
     }
 
+    /// An ACF reload under a live channel moves both what the server enforces
+    /// and the `CA_PROTO_ACCESS_RIGHTS` its client holds: rsrv's
+    /// `casAccessRightsCB` and the event task's `rsrv_extra_labor`
+    /// (`camessage.c:1070-1138`, `:1502-1508`).
+    #[test]
+    fn an_acf_reload_moves_a_live_channels_rights() {
+        use crate::protocol::{CA_PROTO_ACCESS_RIGHTS, ECA_NORMAL, ECA_NOWTACCESS};
+        use epics_base_rs::server::access_security::{new_acf_cell, parse_acf};
+        const READ_WRITE: &str = "ASG(DEFAULT) {\n RULE(1, READ)\n RULE(1, WRITE)\n}\n";
+        const READ_ONLY: &str = "ASG(DEFAULT) {\n RULE(1, READ)\n}\n";
+        let word = |f: &[u8], at: usize| u32::from_be_bytes(f[at..at + 4].try_into().unwrap());
+
+        let db = seed_db(&[("BLK:AR", EpicsValue::Double(0.0))]);
+        let acf = new_acf_cell(Some(parse_acf(READ_WRITE).unwrap()));
+        let server = Arc::new(BlockingCaServer::bind("127.0.0.1:0", db, acf.clone()).unwrap());
+        let addr = server.local_addr().unwrap();
+        let srv = server.clone();
+        let accept = thread::spawn(move || srv.serve());
+
+        let mut c = TcpStream::connect(addr).unwrap();
+        c.set_read_timeout(Some(fact_budget::FACT_BUDGET)).unwrap();
+        let _ = read_until_cmmd(&mut c, CA_PROTO_VERSION);
+        c.write_all(&version_frame()).unwrap();
+        c.write_all(&create_chan_frame(0x1234, "BLK:AR")).unwrap();
+        let granted = read_until_cmmd(&mut c, CA_PROTO_ACCESS_RIGHTS);
+        assert_eq!((word(&granted, 8), word(&granted, 12)), (0x1234, 3));
+        let sid = word(&read_until_cmmd(&mut c, CA_PROTO_CREATE_CHAN), 12);
+        let put = |c: &mut TcpStream, ioid: u32| {
+            c.write_all(&write_notify_frame(sid, ioid, DBR_DOUBLE_MON, 1.0))
+                .unwrap();
+            word(&read_until_cmmd(c, CA_PROTO_WRITE_NOTIFY), 8)
+        };
+        assert_eq!(put(&mut c, 1), ECA_NORMAL);
+
+        // iocsh `asInit`.
+        acf.install(parse_acf(READ_ONLY).unwrap());
+
+        let revoked = read_until_cmmd(&mut c, CA_PROTO_ACCESS_RIGHTS);
+        assert_eq!((word(&revoked, 8), word(&revoked, 12)), (0x1234, 1));
+        assert_eq!(put(&mut c, 2), ECA_NOWTACCESS);
+
+        server.shutdown();
+        accept.join().unwrap();
+    }
+
     /// (S1c-a-ii) EVENTS_OFF gates monitor delivery; EVENTS_ON releases the
     /// held update. The event thread's readers consult the shared `EventUser`
     /// flow-control flag the dispatch thread flips — same as the async server.
@@ -5305,7 +5865,7 @@ mod tests {
     /// it processes the record; the put writes VAL, the process returns
     /// `AsyncPending`, and the completion fires later on `complete_async_record`
     /// (C `dbNotifyCompletion`). Mirrors `AsyncOnceRecord` in
-    /// `epics-base-rs/tests/put_notify_defers_on_pact.rs`.
+    /// `epics-base-rs/tests/integration/put_notify_defers_on_pact.rs`.
     struct AsyncOnceRecord {
         val: f64,
         pending: bool,
@@ -5469,7 +6029,7 @@ mod tests {
     fn reference_write_notify_completion(put_val: f64, ioid: u32) -> Vec<u8> {
         let db = seed_async_db("REF:ASYW");
         let acf = new_acf();
-        let mut state = ClientState::new(acf, 5064, db.clone());
+        let mut state = ClientState::new(acf, 5064, db.clone(), None);
         let peer: SocketAddr = "127.0.0.1:5064".parse().unwrap();
         state.apply_connection_identity(peer, None, None);
         let (outbox, _drain) = outbox::channel();

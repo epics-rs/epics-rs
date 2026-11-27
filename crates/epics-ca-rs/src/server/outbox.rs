@@ -14,11 +14,11 @@
 //!
 //! The structural fix (this module) removes the second owner *by
 //! construction*: the raw socket writer becomes private to ONE owner, the
-//! connection loop. Every emit site — request→reply handlers, the monitor
+//! circuit's writer. Every emit site — request→reply handlers, the monitor
 //! producers, put-notify completion — instead PUSHES one fully-framed
-//! message into the `Outbox`. The connection loop is the sole draining
-//! owner: it pulls framed bytes in arrival order and is the only code that
-//! ever touches the socket.
+//! message into the `Outbox`. The writer is the sole draining owner: it
+//! pulls framed bytes in arrival order and is the only code that ever
+//! touches the socket.
 //!
 //! This mirrors what the PVA server already does
 //! (`crates/epics-pva-rs/src/server_native/tcp.rs`: emit sites push framed
@@ -26,8 +26,8 @@
 //!
 //! # Invariant
 //!
-//! - MUST: the socket writer is owned by exactly one task (the connection
-//!   loop) and no other code writes the socket directly.
+//! - MUST: the socket writer is owned by exactly one task (the circuit's
+//!   writer) and no other code writes the socket directly.
 //! - Every producer holds only an `Outbox` handle and can do nothing but
 //!   `push` a complete frame; it cannot observe or mutate the socket.
 //!
@@ -47,11 +47,13 @@
 //!
 //! - MUST: a producer that is not the connection loop MUST hold a `Credit`
 //!   for every frame it enqueues, and only the drain owner may release one —
-//!   by dropping the queued frame after its bytes are in the socket writer.
+//!   once the frame's bytes are flushed to the socket, not merely copied into
+//!   its buffer, whose capacity would otherwise be backlog no ring coalesces.
 //!
 //! Request→reply handlers are exempt and pass `Credit::none()`: they run *in*
-//! the connection loop, so a parked drain stops dispatch and no further reply
-//! can be produced. They are self-limiting.
+//! the connection loop, which waits for the writer's flush after every read
+//! batch, so a parked drain stops dispatch and no further reply can be
+//! produced. They are self-limiting.
 //!
 //! Monitor producers are not. They pull from their own `EvQue` on their own
 //! task, so with an unbounded queue a client that stops reading grows the
@@ -68,6 +70,19 @@
 //! waiting for its next event must hold nothing, or a connection with more
 //! subscriptions than `MONITOR_CREDIT` would exhaust the pool with an empty
 //! queue and nothing left to drain to release it.
+//!
+//! # Invariant: a producer outside the connection loop flushes before it waits
+//!
+//! - MUST: a producer that is not the connection loop calls
+//!   `Outbox::flush` before it waits for more work, and the drain owner puts
+//!   every frame queued ahead of a flush request on the wire.
+//!
+//! The connection loop flushes once per read batch, so a frame left for it
+//! would wait behind every request still in the batch, however long one of
+//! them processes. C's event task flushes the client's send buffer itself
+//! once it runs out of labor (`rsrv_extra_labor` and `read_reply`'s
+//! `eventsRemaining`, `camessage.c:525-594,1502-1508`), so a completed
+//! put-callback goes out while the receive task is still busy.
 
 use crate::protocol::CaHeader;
 use crate::server::frame::{FrameBuf, FramePool, PooledFrame};
@@ -113,11 +128,8 @@ impl Credit {
 /// update still queued for it is discarded rather than delivered — the
 /// `user_sub` test runs under LOCKEVQUE on each drained log.
 ///
-/// The port cannot reproduce the *waiting* half: the connection loop is the
-/// sole [`OutboxDrain`] owner, so blocking it until an in-flight monitor task
-/// finishes would deadlock against [`Outbox::reserve`] — the producer is
-/// waiting for credit only that loop releases. This gate keeps the half a
-/// client can observe. Revocation and the delivery decision share one
+/// The port does not reproduce the *waiting* half. This gate keeps the half
+/// a client can observe. Revocation and the delivery decision share one
 /// critical section, so a producer that has not yet enqueued its frame when
 /// the confirmation is queued drops it instead of emitting it late.
 ///
@@ -175,7 +187,7 @@ impl MonitorGate {
 /// the connection's send buffer to build that frame in.
 #[derive(Clone)]
 pub(crate) struct Outbox {
-    tx: mpsc::UnboundedSender<QueuedFrame>,
+    tx: mpsc::UnboundedSender<Drained>,
     pool: Arc<FramePool>,
     credit: Arc<Semaphore>,
 }
@@ -198,19 +210,30 @@ impl std::ops::Deref for QueuedFrame {
     }
 }
 
-/// The draining end, owned solely by the connection loop alongside the
+/// What the drain owner takes from the queue, in push order.
+pub(crate) enum Drained {
+    Frame(QueuedFrame),
+    /// Put every frame before this on the wire. In the queue rather than
+    /// beside it, so the frames a flush covers are exactly the ones pushed
+    /// before it.
+    Flush,
+    /// [`Flush`](Drained::Flush), then answer.
+    #[cfg(tokio_backend)]
+    FlushAck(tokio::sync::oneshot::Sender<()>),
+}
+
+/// The draining end, owned solely by the circuit's writer alongside the
 /// socket `BufWriter`. Not `Clone`: there is exactly one drain owner.
 pub(crate) struct OutboxDrain {
-    rx: mpsc::UnboundedReceiver<QueuedFrame>,
+    rx: mpsc::UnboundedReceiver<Drained>,
 }
 
 /// Create a linked [`Outbox`] / [`OutboxDrain`] pair for one connection.
 ///
-/// The channel itself is unbounded: the sole draining owner pulls it empty
-/// after every dispatch burst and whenever it is otherwise idle, and the
-/// in-loop producers that feed it stop as soon as it does not. What bounds
-/// the queue is [`Credit`], which the out-of-loop producers must hold — see
-/// the module invariant. Bounding the channel instead would deadlock the
+/// The channel itself is unbounded: the sole draining owner pulls frames as
+/// they arrive, and once it stalls the in-loop producers that feed it stop at
+/// the loop's next flush. What bounds the queue is [`Credit`], which the
+/// out-of-loop producers must hold — see the module invariant. Bounding the channel instead would deadlock the
 /// connection loop, which is both a producer and the only consumer.
 pub(crate) fn channel() -> (Outbox, OutboxDrain) {
     let (tx, rx) = mpsc::unbounded_channel();
@@ -254,10 +277,44 @@ impl Outbox {
     /// between sealing it and enqueuing it, so a producer aborted mid-flight
     /// can only be cut at a frame boundary.
     pub(crate) fn push_with(&self, frame: impl Into<PooledFrame>, credit: Credit) {
-        let _ = self.tx.send(QueuedFrame {
+        let _ = self.tx.send(Drained::Frame(QueuedFrame {
             frame: frame.into(),
             _credit: credit,
-        });
+        }));
+    }
+
+    /// Ask the drain owner to put every frame pushed so far on the wire,
+    /// without waiting for it. See the module invariant for who must.
+    pub(crate) fn flush(&self) {
+        let _ = self.tx.send(Drained::Flush);
+    }
+
+    /// [`flush`](Outbox::flush), resolving once the frames are on the wire.
+    /// An error means the drain owner is gone.
+    #[cfg(tokio_backend)]
+    pub(crate) fn flushed(&self) -> tokio::sync::oneshot::Receiver<()> {
+        let (ack, acked) = tokio::sync::oneshot::channel();
+        let _ = self.tx.send(Drained::FlushAck(ack));
+        acked
+    }
+
+    /// Await `next`, first asking for a flush if `next` has to wait and
+    /// `owed` says frames were pushed since the last one. `owed` is cleared
+    /// once the flush is asked for.
+    pub(crate) async fn flush_before_waiting<F: std::future::Future>(
+        &self,
+        owed: &mut bool,
+        next: F,
+    ) -> F::Output {
+        let mut next = std::pin::pin!(next);
+        std::future::poll_fn(|cx| {
+            let polled = std::future::Future::poll(next.as_mut(), cx);
+            if polled.is_pending() && std::mem::take(owed) {
+                self.flush();
+            }
+            polled
+        })
+        .await
     }
 
     /// Wait for room in this connection's outbox, for a producer that runs
@@ -266,9 +323,17 @@ impl Outbox {
     /// Call this only once the event is already out of the producer's ring —
     /// see the module invariant for why holding credit while idle deadlocks.
     /// The semaphore is never closed, so this resolves to a real credit or
-    /// stays pending until the drain owner releases one.
+    /// stays pending until the drain owner releases one. Before it waits it
+    /// asks for a flush, which is what releases credit.
     pub(crate) async fn reserve(&self) -> Credit {
-        match Arc::clone(&self.credit).acquire_owned().await {
+        let permit = match Arc::clone(&self.credit).try_acquire_owned() {
+            Ok(permit) => Ok(permit),
+            Err(_) => {
+                self.flush();
+                Arc::clone(&self.credit).acquire_owned().await
+            }
+        };
+        match permit {
             Ok(permit) => Credit {
                 _permit: Some(permit),
             },
@@ -325,23 +390,27 @@ impl FrameSink for Outbox {
 
 impl OutboxDrain {
     /// Pull the next already-queued frame without waiting. Returns `None`
-    /// when the queue is momentarily empty. The connection loop calls this
-    /// in a tight loop to drain a whole burst before a single flush.
+    /// when the queue is momentarily empty. For a drain owner that flushes
+    /// whatever it drains, so a flush request on the way is dropped: the
+    /// blocking driver calls this in a tight loop to drain a whole burst
+    /// before a single send.
     pub(crate) fn try_next(&mut self) -> Option<QueuedFrame> {
-        self.rx.try_recv().ok()
+        loop {
+            match self.rx.try_recv().ok()? {
+                Drained::Frame(frame) => return Some(frame),
+                _ => continue,
+            }
+        }
     }
 
-    /// Await the next frame. Used by the connection loop's idle `select!`
-    /// arm so a monitor / put-notify frame produced while the loop is
-    /// blocked on the socket read is written promptly. Resolves to `None`
-    /// only if every [`Outbox`] handle has been dropped, which cannot
-    /// happen while the loop still holds its own handle.
+    /// Await the next frame or flush request. Resolves to `None` only if
+    /// every [`Outbox`] handle has been dropped.
     ///
-    /// Used only by the async connection loop (`tcp::handle_client`); the
-    /// blocking driver drains synchronously via [`OutboxDrain::try_next`].
-    /// Reactor-only (`tokio_backend`).
+    /// Used only by the async driver's writer (`tcp::run_circuit_writer`);
+    /// the blocking driver drains synchronously via
+    /// [`OutboxDrain::try_next`]. Reactor-only (`tokio_backend`).
     #[cfg(tokio_backend)]
-    pub(crate) async fn recv(&mut self) -> Option<QueuedFrame> {
+    pub(crate) async fn recv(&mut self) -> Option<Drained> {
         self.rx.recv().await
     }
 }

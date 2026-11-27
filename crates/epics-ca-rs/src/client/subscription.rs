@@ -363,44 +363,8 @@ fn call(
 pub(crate) struct SubscriptionRecord {
     pub subid: u32,
     pub cid: u32,
-    pub data_type: Option<u16>,
-    /// The resolved wire element count for the current connection: a
-    /// positive clamped `-#` cap, or `0` for autosize (no cap). See
-    /// [`resolve_subscription_count`].
-    pub count: Option<u32>,
-    /// The caller's requested element-count cap (`camonitor -#`), or
-    /// `None` for autosize (wire count `0`, the standard CA-tool default).
-    /// Unlike the resolved [`Self::count`] (which caches the wire count for
-    /// the current connection), this is a persistent *preference* — carried
-    /// across reconnects and re-resolved against the fresh native element
-    /// count on each connect via [`resolve_subscription_count`] (a positive
-    /// cap re-clamps per C `camonitor.c:169`; `None` stays autosize).
-    /// Orthogonal to [`Self::type_user_supplied`]: the cap survives a
-    /// `NativeTypeChanged` reset because it is the user's intent, not an
-    /// auto-derived value.
-    pub req_count: Option<u32>,
-    /// `true` when `data_type`/`count` were chosen explicitly by the
-    /// caller, `false` when they were auto-derived from the channel's
-    /// native type at subscribe time. Auto-derived values must be
-    /// re-derived when the IOC redefines the record (the channel
-    /// reports `NativeTypeChanged` on reconnect); user-supplied values
-    /// are preserved across reconnects. See `restore_for_channel`.
-    pub type_user_supplied: bool,
-    /// ENUM readback mode for this subscription: `Native` (keep
-    /// `DBR_TIME_ENUM`), `Label` (the `camonitor` default `DBR_TIME_STRING`,
-    /// C `camonitor.c:156-160`), or `Numeric` (`camonitor -n`
-    /// `DBR_TIME_INT`, C `camonitor.c:158`). See
-    /// [`super::EnumReadback`]. Carried here so the reconnect re-derivation
-    /// in `restore_for_channel` re-applies the same ENUM substitution against
-    /// the (possibly new) native type.
-    pub enum_readback: super::EnumReadback,
-    /// `camonitor -s` float-as-string preference. When `true`, a
-    /// FLOAT/DOUBLE field's auto-derived monitor type is the
-    /// `DBR_TIME_STRING` form so the server renders the value to a string
-    /// at record precision (C `camonitor.c:162-166`). Carried here for the
-    /// same reconnect re-derivation reason as `enum_as_string`; the ENUM
-    /// substitution takes precedence (C `if (ENUM) … else if (float …)`).
-    pub float_as_string: bool,
+    /// How the DBR type and count are chosen, and the pair chosen so far.
+    pub kind: SubscribeType,
     pub mask: u16,
     pub server_addr: SocketAddr,
     /// the CA priority of the channel this subscription rides.
@@ -459,6 +423,89 @@ pub(crate) fn resolve_subscription_count(req_count: Option<u32>, element_count: 
     match req_count {
         Some(n) if n > 0 => n.min(element_count),
         _ => 0,
+    }
+}
+
+/// How a subscription chooses its DBR type and element count, kept on its
+/// record across reconnects.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum SubscribeType {
+    /// Derived from the channel's native type through
+    /// [`super::subscription_readback_dbr`], for the `req_count` cap through
+    /// [`resolve_subscription_count`]. `chosen` is the pair from the first
+    /// connect, kept until a reconnect reports another native type.
+    Derived {
+        enum_readback: super::EnumReadback,
+        float_as_string: bool,
+        req_count: Option<u32>,
+        chosen: Option<(u16, u32)>,
+    },
+    /// The caller's `ca_create_subscription(type, count, ...)`, kept across
+    /// reconnects as libca's `netSubscription` keeps it.
+    Fixed {
+        dbr_type: super::DbrType,
+        count: u32,
+    },
+}
+
+impl SubscribeType {
+    /// A subscription derived from the native type, none chosen yet.
+    pub(crate) fn derived(
+        enum_readback: super::EnumReadback,
+        float_as_string: bool,
+        req_count: Option<u32>,
+    ) -> Self {
+        Self::Derived {
+            enum_readback,
+            float_as_string,
+            req_count,
+            chosen: None,
+        }
+    }
+
+    /// The type and count `ca_create_subscription` is given (C
+    /// `netSubscription` `type` and `count`), `None` while a derived pair
+    /// waits for a connect. The wire count is resolved from it per request
+    /// (`netIO.h:241-251`).
+    pub(crate) fn request(&self) -> Option<(u16, u32)> {
+        match *self {
+            Self::Derived { chosen, .. } => chosen,
+            Self::Fixed { dbr_type, count } => Some((dbr_type.code(), count)),
+        }
+    }
+
+    /// The request on a connect to a channel of `native_type` and
+    /// `element_count`. A derived pair is chosen on the first connect and
+    /// again when `native_changed`.
+    pub(crate) fn connect(
+        &mut self,
+        native_type: DbFieldType,
+        element_count: u32,
+        native_changed: bool,
+    ) -> (u16, u32) {
+        match self {
+            Self::Derived {
+                enum_readback,
+                float_as_string,
+                req_count,
+                chosen,
+            } => {
+                if native_changed {
+                    *chosen = None;
+                }
+                *chosen.get_or_insert_with(|| {
+                    (
+                        super::subscription_readback_dbr(
+                            native_type,
+                            *enum_readback,
+                            *float_as_string,
+                        ),
+                        resolve_subscription_count(*req_count, element_count),
+                    )
+                })
+            }
+            Self::Fixed { dbr_type, count } => (dbr_type.code(), *count),
+        }
     }
 }
 
@@ -596,15 +643,14 @@ impl SubscriptionRegistry {
     /// `native_changed` is `true` when this (re)connection reports a
     /// native DBR type different from the one observed before (the IOC
     /// redefined the record, or the channel reconnected to a different
-    /// IOC). When set, auto-derived `data_type`/`count` are reset to
-    /// `None` so they re-derive from the fresh `native_type`; subscriptions
-    /// created with an explicit user-chosen type keep their type.
+    /// IOC). When set, a derived pair is chosen again from the fresh
+    /// `native_type`; a fixed one is kept.
     #[allow(clippy::too_many_arguments)]
     pub fn restore_for_channel(
         &mut self,
         cid: u32,
         new_sid: u32,
-        native_type: u16,
+        native_type: DbFieldType,
         element_count: u32,
         native_changed: bool,
         server_addr: std::net::SocketAddr,
@@ -633,48 +679,13 @@ impl SubscriptionRegistry {
             if rec.cid == cid && rec.needs_restore {
                 rec.needs_restore = false;
                 rec.server_addr = server_addr;
-                // The IOC redefined the record: a previously auto-derived
-                // type/count is now stale and would decode monitor frames
-                // against the wrong DBR type. Drop both so they re-derive
-                // from the fresh native type/count below — the count
-                // re-derivation re-clamps the `-#` cap to the new native
-                // element count. User-supplied type/count are kept. Without
-                // a native-type change, auto-derived type AND count stay
-                // locked to their first-connect values (established
-                // reconnect behaviour).
-                if native_changed && !rec.type_user_supplied {
-                    rec.data_type = None;
-                    rec.count = None;
-                }
-                // Re-derive the DBR type from the fresh native type via the
-                // shared subscribe-time owner, so the reconnect re-derivation
-                // applies the identical substitution chain as the initial
-                // subscribe: ENUM honours -n, else FLOAT/DOUBLE under -s
-                // becomes DBR_TIME_STRING, else native TIME type
-                // (C camonitor.c:155-166). native_type is the server-reported
-                // CA wire type (0..6), so the `+ 14` fallback (only reached if
-                // from_u16 fails) lands in the DBR_TIME range; Int64 (7)
-                // cannot reach here.
-                let derived = DbFieldType::from_u16(native_type)
-                    .ok()
-                    .map(|t| {
-                        super::subscription_readback_dbr(t, rec.enum_readback, rec.float_as_string)
-                    })
-                    .unwrap_or(native_type + 14);
-                let data_type = *rec.data_type.get_or_insert(derived);
-                // Single owner of the auto-derived count seed: a `-#` cap is
-                // clamped to the native element count, no cap resolves to
-                // wire 0 (autosize) (`resolve_subscription_count`, C
-                // `camonitor.c:168-169` / `caget.c:200`). Cached like
-                // `data_type` via `get_or_insert`, so it is computed at first
-                // connect and re-derived only when a native-type change
-                // cleared it above — keeping count and type re-derivation
-                // uniform. User-supplied counts (already `Some`) are kept.
-                let count = *rec
-                    .count
-                    .get_or_insert(resolve_subscription_count(rec.req_count, element_count));
-                // The cached `rec.count` is C's `netSubscription::count` (the
-                // user's cap); the wire count is derived from it per request
+                // A redefined record re-derives a derived pair, the `-#`
+                // cap re-clamped to the new native count; without a native
+                // type change it stays locked to its first-connect value.
+                let (data_type, count) =
+                    rec.kind.connect(native_type, element_count, native_changed);
+                // `count` is C's `netSubscription::count`; the wire count is
+                // derived from it per request
                 // via `getCount(allow_zero = CA_V413(minor))`
                 // (`netIO.h:241-251`) and then bounded against what the
                 // circuit can carry (`tcpiiu.cpp:1574-1585`).
@@ -769,18 +780,13 @@ mod tests {
     fn record(
         subid: u32,
         cid: u32,
-        type_user_supplied: bool,
+        kind: SubscribeType,
     ) -> (SubscriptionRecord, mpsc::Receiver<CaResult<Snapshot>>) {
         let (callback_tx, rx) = mpsc::channel(8);
         let rec = SubscriptionRecord {
             subid,
             cid,
-            data_type: None,
-            count: None,
-            req_count: None,
-            type_user_supplied,
-            enum_readback: crate::client::EnumReadback::Native,
-            float_as_string: false,
+            kind,
             mask: 1,
             server_addr: addr(),
             priority: 0,
@@ -794,6 +800,19 @@ mod tests {
             nreplace: 0,
         };
         (rec, rx)
+    }
+
+    /// A derived subscription with native readback and the `-#` cap `cap`.
+    fn derived(cap: Option<u32>) -> SubscribeType {
+        SubscribeType::derived(crate::client::EnumReadback::Native, false, cap)
+    }
+
+    /// The caller's own `(dbr_type, count)`.
+    fn fixed(dbr_type: u16, count: u32) -> SubscribeType {
+        SubscribeType::Fixed {
+            dbr_type: crate::client::DbrType::new(dbr_type).unwrap(),
+            count,
+        }
     }
 
     /// Drains a `TransportCommand::Subscribe` and returns its
@@ -814,7 +833,7 @@ mod tests {
     #[test]
     fn alloc_subid_skips_live_subscription_on_wrap() {
         let mut reg = SubscriptionRegistry::new();
-        let (rec, _cb_rx) = record(1, 100, /* type_user_supplied */ false);
+        let (rec, _cb_rx) = record(1, 100, derived(None));
         reg.add(rec);
         // Force the counter back onto the live subid.
         reg.seed_next_subid(1);
@@ -843,7 +862,7 @@ mod tests {
     #[test]
     fn auto_derived_type_resets_on_native_change() {
         let mut reg = SubscriptionRegistry::new();
-        let (rec, _cb_rx) = record(1, 100, /* type_user_supplied */ false);
+        let (rec, _cb_rx) = record(1, 100, derived(None));
         reg.add(rec);
         let (tx, mut rx) = mpsc::unbounded_channel();
 
@@ -853,7 +872,7 @@ mod tests {
         let (restored, failed) = reg.restore_for_channel(
             100,
             7,
-            1,
+            DbFieldType::Short,
             1,
             false,
             addr(),
@@ -869,7 +888,7 @@ mod tests {
         let (restored, failed) = reg.restore_for_channel(
             100,
             8,
-            6,
+            DbFieldType::Double,
             3,
             true,
             addr(),
@@ -892,16 +911,18 @@ mod tests {
     /// The port does that re-derivation here, in the ONE subscribe-time
     /// owner: `ChannelCreated` computes `native_changed`
     /// (`client/mod.rs:3721-3725`), passes it to `restore_for_channel`
-    /// (`:3832-3844`), which clears the auto-derived `data_type` and
-    /// re-derives via `subscription_readback_dbr` with the record's stored
-    /// `enum_readback`. The camonitor front-end therefore needs no
+    /// (`:3832-3844`), which derives the pair again via
+    /// `subscription_readback_dbr` with the record's stored `enum_readback`. The camonitor front-end therefore needs no
     /// clear/re-subscribe of its own.
     #[test]
     fn label_readback_re_derives_to_dbr_time_string_when_the_pv_returns_as_enum() {
         let mut reg = SubscriptionRegistry::new();
-        let (mut rec, _cb_rx) = record(1, 100, /* type_user_supplied */ false);
         // `camonitor` without `-n`: ENUM fields are monitored as labels.
-        rec.enum_readback = crate::client::EnumReadback::Label;
+        let (rec, _cb_rx) = record(
+            1,
+            100,
+            SubscribeType::derived(crate::client::EnumReadback::Label, false, None),
+        );
         reg.add(rec);
         let (tx, mut rx) = mpsc::unbounded_channel();
 
@@ -909,7 +930,7 @@ mod tests {
         let (restored, failed) = reg.restore_for_channel(
             100,
             7,
-            6,
+            DbFieldType::Double,
             1,
             false,
             addr(),
@@ -924,7 +945,7 @@ mod tests {
         let (restored, failed) = reg.restore_for_channel(
             100,
             8,
-            3,
+            DbFieldType::Enum,
             1,
             true,
             addr(),
@@ -942,7 +963,7 @@ mod tests {
         );
     }
 
-    /// The cached `rec.count` is C's `netSubscription::count` (the user's
+    /// The record's count is C's `netSubscription::count` (the user's
     /// cap); the WIRE count is re-resolved per request from the circuit's
     /// minor version (`subscr.getCount(guard, CA_V413(minor))`,
     /// `tcpiiu.cpp:1573`). So the same registry, restored onto a pre-V413
@@ -951,21 +972,23 @@ mod tests {
     #[test]
     fn restore_resolves_the_wire_count_from_the_peer_version() {
         let mut reg = SubscriptionRegistry::new();
-        let (rec, _cb_rx) = record(1, 100, /* type_user_supplied */ false);
+        let (rec, _cb_rx) = record(1, 100, derived(None));
         reg.add(rec); // no `-#` cap ⇒ cached count resolves to 0 (autosize)
         let (tx, mut rx) = mpsc::unbounded_channel();
 
         // Pre-V413 peer: the autosize 0 has no meaning there, so the
         // channel's native count (4) goes on the wire instead.
-        let (restored, _) = reg.restore_for_channel(100, 7, 1, 4, false, addr(), 12, &tx);
+        let (restored, _) =
+            reg.restore_for_channel(100, 7, DbFieldType::Short, 4, false, addr(), 12, &tx);
         assert_eq!(restored, 1);
         assert_eq!(drained_type(&mut rx).1, 4);
         // The cached cap itself is untouched — only the wire count changed.
-        assert_eq!(reg.get(1).unwrap().count, Some(0));
+        assert_eq!(reg.get(1).unwrap().kind.request(), Some((15, 0)));
 
         // Same registry, reconnect onto a V413 peer: the 0 travels verbatim.
         reg.subscriptions.get_mut(&1).unwrap().needs_restore = true;
-        let (restored, _) = reg.restore_for_channel(100, 8, 1, 4, false, addr(), 13, &tx);
+        let (restored, _) =
+            reg.restore_for_channel(100, 8, DbFieldType::Short, 4, false, addr(), 13, &tx);
         assert_eq!(restored, 1);
         assert_eq!(drained_type(&mut rx).1, 0);
     }
@@ -976,16 +999,16 @@ mod tests {
     #[test]
     fn restore_clamps_an_over_large_cap_to_native_on_the_wire() {
         let mut reg = SubscriptionRegistry::new();
-        let (mut rec, _cb_rx) = record(1, 100, /* type_user_supplied */ true);
-        rec.data_type = Some(19);
-        rec.count = Some(99); // user asked for more elements than the record has
+        // The user asked for more elements than the record has.
+        let (rec, _cb_rx) = record(1, 100, fixed(19, 99));
         reg.add(rec);
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        let (restored, _) = reg.restore_for_channel(100, 7, 1, 4, false, addr(), 13, &tx);
+        let (restored, _) =
+            reg.restore_for_channel(100, 7, DbFieldType::Short, 4, false, addr(), 13, &tx);
         assert_eq!(restored, 1);
         assert_eq!(drained_type(&mut rx), (19, 4));
-        assert_eq!(reg.get(1).unwrap().count, Some(99));
+        assert_eq!(reg.get(1).unwrap().kind.request(), Some((19, 99)));
     }
 
     /// A subscription created with an explicit user-chosen type keeps
@@ -994,16 +1017,14 @@ mod tests {
     #[test]
     fn user_supplied_type_preserved_on_native_change() {
         let mut reg = SubscriptionRegistry::new();
-        let (mut rec, _cb_rx) = record(1, 100, /* type_user_supplied */ true);
-        rec.data_type = Some(19); // explicit DBR_TIME_SHORT
-        rec.count = Some(2);
+        let (rec, _cb_rx) = record(1, 100, fixed(19, 2)); // explicit DBR_TIME_LONG
         reg.add(rec);
         let (tx, mut rx) = mpsc::unbounded_channel();
 
         let (restored, _) = reg.restore_for_channel(
             100,
             8,
-            6,
+            DbFieldType::Double,
             5,
             true,
             addr(),
@@ -1024,14 +1045,13 @@ mod tests {
     fn auto_derived_count_clamps_req_count_to_native() {
         // cap (2) < native (5) ⇒ request the cap.
         let mut reg = SubscriptionRegistry::new();
-        let (mut rec, _cb_rx) = record(1, 100, /* type_user_supplied */ false);
-        rec.req_count = Some(2);
+        let (rec, _cb_rx) = record(1, 100, derived(Some(2)));
         reg.add(rec);
         let (tx, mut rx) = mpsc::unbounded_channel();
         let (restored, _) = reg.restore_for_channel(
             100,
             7,
-            6,
+            DbFieldType::Double,
             5,
             false,
             addr(),
@@ -1043,14 +1063,13 @@ mod tests {
 
         // Separate record: cap (4) > native (1) ⇒ clamp DOWN to native.
         let mut reg2 = SubscriptionRegistry::new();
-        let (mut rec2, _cb_rx2) = record(2, 200, /* type_user_supplied */ false);
-        rec2.req_count = Some(4);
+        let (rec2, _cb_rx2) = record(2, 200, derived(Some(4)));
         reg2.add(rec2);
         let (tx2, mut rx2) = mpsc::unbounded_channel();
         let (restored, _) = reg2.restore_for_channel(
             200,
             9,
-            6,
+            DbFieldType::Double,
             1,
             false,
             addr(),
@@ -1068,15 +1087,14 @@ mod tests {
     #[test]
     fn auto_derived_count_reclamps_on_native_change() {
         let mut reg = SubscriptionRegistry::new();
-        let (mut rec, _cb_rx) = record(1, 100, /* type_user_supplied */ false);
-        rec.req_count = Some(4);
+        let (rec, _cb_rx) = record(1, 100, derived(Some(4)));
         reg.add(rec);
         let (tx, mut rx) = mpsc::unbounded_channel();
         // First connect: native count 5, cap 4 ⇒ request 4.
         let (restored, _) = reg.restore_for_channel(
             100,
             7,
-            1,
+            DbFieldType::Short,
             5,
             false,
             addr(),
@@ -1090,7 +1108,7 @@ mod tests {
         let (restored, _) = reg.restore_for_channel(
             100,
             8,
-            6,
+            DbFieldType::Double,
             2,
             true,
             addr(),
@@ -1133,14 +1151,13 @@ mod tests {
     #[test]
     fn auto_derived_count_without_cap_requests_autosize_zero() {
         let mut reg = SubscriptionRegistry::new();
-        let (rec, _cb_rx) = record(1, 100, /* type_user_supplied */ false);
-        assert_eq!(rec.req_count, None);
+        let (rec, _cb_rx) = record(1, 100, derived(None));
         reg.add(rec);
         let (tx, mut rx) = mpsc::unbounded_channel();
         let (restored, _) = reg.restore_for_channel(
             100,
             7,
-            6,
+            DbFieldType::Double,
             4,
             false,
             addr(),
@@ -1176,12 +1193,7 @@ mod tests {
         SubscriptionRecord {
             subid,
             cid: 100,
-            data_type: Some(DBR_TIME_LONG),
-            count: Some(1),
-            req_count: None,
-            type_user_supplied: true,
-            enum_readback: crate::client::EnumReadback::Native,
-            float_as_string: false,
+            kind: fixed(DBR_TIME_LONG, 1),
             mask: 1,
             server_addr: addr(),
             priority: 0,
@@ -1684,14 +1696,14 @@ mod tests {
     #[test]
     fn auto_derived_type_stable_without_native_change() {
         let mut reg = SubscriptionRegistry::new();
-        let (rec, _cb_rx) = record(1, 100, false);
+        let (rec, _cb_rx) = record(1, 100, derived(None));
         reg.add(rec);
         let (tx, mut rx) = mpsc::unbounded_channel();
 
         let (restored, _) = reg.restore_for_channel(
             100,
             7,
-            1,
+            DbFieldType::Short,
             1,
             false,
             addr(),
@@ -1706,7 +1718,7 @@ mod tests {
         let (restored, _) = reg.restore_for_channel(
             100,
             8,
-            6,
+            DbFieldType::Double,
             3,
             false,
             addr(),

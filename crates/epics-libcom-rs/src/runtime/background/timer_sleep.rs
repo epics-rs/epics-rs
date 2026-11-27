@@ -176,9 +176,15 @@ impl Future for Sleep {
             this.entry = this.timer.schedule_wake(
                 delay,
                 Box::new(move || {
-                    let mut st = cb_state.lock().unwrap();
-                    st.fired = true;
-                    if let Some(w) = st.waker.take() {
+                    // Woken outside the lock: a wake queues the sleeper's
+                    // task, and a band thread polling or dropping this sleep
+                    // must not wait on the timer thread doing that.
+                    let waker = {
+                        let mut st = cb_state.lock().unwrap();
+                        st.fired = true;
+                        st.waker.take()
+                    };
+                    if let Some(w) = waker {
                         w.wake();
                     }
                 }),
@@ -281,9 +287,8 @@ mod tests {
     }
 
     /// A delay past `Duration`'s representable range must never fire
-    /// rather than unwind the task. `duration_from_secs` maps `+inf`,
-    /// `NaN` and `1e300` to `Duration::MAX` — a record `HIGH` field is
-    /// network-settable — and `Instant + Duration::MAX` panics, where
+    /// rather than unwind the task. A caller may pass `Duration::MAX` as
+    /// its own "no bound", and `Instant + Duration::MAX` panics, where
     /// `tokio::time::sleep` saturates to `far_future()`. The two
     /// backends disagreeing is the defect, so this pins the exec side to
     /// tokio's answer.
@@ -363,6 +368,67 @@ mod tests {
             count.load(Ordering::SeqCst),
             0,
             "a dropped sleep must not wake a stale waker"
+        );
+    }
+
+    /// A wake that takes a while, as one that grows a band's run queue does:
+    /// it reports that it has started, then holds until let go.
+    struct HeldWake {
+        started: mpsc::Sender<()>,
+        let_go: Mutex<mpsc::Receiver<()>>,
+    }
+    impl Wake for HeldWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            let _ = self.started.send(());
+            let _ = self
+                .let_go
+                .lock()
+                .unwrap()
+                .recv_timeout(fact_budget::FACT_BUDGET);
+        }
+    }
+
+    /// A band thread dropping a sleep — a `timeout` whose other branch won —
+    /// goes on while the timer thread is still inside that sleep's wake. The
+    /// deadline never comes; the test fires the wake by hand.
+    #[test]
+    fn dropping_a_sleep_does_not_wait_for_its_wake_in_progress() {
+        let pool = CallbackPool::new();
+        let timer = DelayedTimer::new(pool.handle());
+        let h = timer.handle();
+        let (started, wake_started) = mpsc::channel();
+        let (let_go, held) = mpsc::channel();
+        let waker = Waker::from(Arc::new(HeldWake {
+            started,
+            let_go: Mutex::new(held),
+        }));
+
+        // not-a-wait: a deadline that never comes; `expire_all` fires it.
+        let mut s = Box::pin(sleep(&h, Duration::MAX));
+        assert!(
+            s.as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        h.expire_all();
+        wake_started
+            .recv_timeout(fact_budget::FACT_BUDGET)
+            .expect("the fired wake never reached the waker");
+
+        let (dropped, was_dropped) = mpsc::channel();
+        let dropper = std::thread::spawn(move || {
+            drop(s);
+            let _ = dropped.send(());
+        });
+        let meanwhile = was_dropped.recv_timeout(fact_budget::FACT_BUDGET);
+        let _ = let_go.send(());
+        dropper.join().unwrap();
+        assert!(
+            meanwhile.is_ok(),
+            "dropping the sleep waited for its wake in progress"
         );
     }
 

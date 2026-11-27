@@ -45,8 +45,8 @@ pub struct MalformedLine {
 pub struct SaveFileContents {
     pub entries: Vec<SaveEntry>,
     pub malformed: Vec<MalformedLine>,
-    /// How many PVs the file itself declares it could not save, from its
-    /// `!` line; 0 when it has none.
+    /// The file's own statement of how many PVs it could not save, from
+    /// its first `!` line.
     ///
     /// C writes `! <n> channel(s) not connected - or not all gets were
     /// successful` under the header whenever a set saved with unreachable
@@ -55,10 +55,35 @@ pub struct SaveFileContents {
     /// to WARN, and with `save_restoreIncompleteSetsOk` cleared refuses
     /// the restore outright. A file that omits the line tells a C IOC the
     /// save set was complete, so this is not decoration.
-    pub not_connected: usize,
-    /// How many entries precede the `!` line, where C's restore reads it
-    /// and with `save_restoreIncompleteSetsOk` cleared stops.
-    pub incomplete_at: Option<usize>,
+    pub error_message: Option<ErrorMessageLine>,
+}
+
+/// A `.sav` file's `!` line, kept as written: C's two restores read its
+/// count each with its own conversion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ErrorMessageLine {
+    /// How many entries precede it, where C's restore reads it and with
+    /// `save_restoreIncompleteSetsOk` cleared stops.
+    pub at: usize,
+    /// The line from its first character, as C's line buffer holds it.
+    pub text: String,
+}
+
+impl ErrorMessageLine {
+    /// `reboot_restore`'s `(int)atol(&bp[1])` (dbrestore.c:999), read from
+    /// the line's second character, so an indented line counts 0.
+    pub fn boot_count(&self) -> i32 {
+        crate::types::c_parse::atoi(&self.text.as_bytes()[1..])
+    }
+
+    /// `do_manual_restore`'s `atoi(value_string)` (save_restore.c:3427):
+    /// the text after the line's first word, as `%s%c%[^\n]` splits it
+    /// (:3322), so `!7` counts 0.
+    pub fn manual_count(&self) -> i32 {
+        use crate::runtime::stdlib::c_isspace;
+        let word = self.text.trim_start_matches(c_isspace);
+        crate::types::c_parse::atoi(word.trim_start_matches(|c| !c_isspace(c)))
+    }
 }
 
 /// Write a .sav file atomically (tmp -> fsync -> rename).
@@ -596,18 +621,14 @@ pub(super) fn parse_save_content(content: &str) -> SaveFileContents {
         };
 
         // The file's own count of what it could not save. C emits it as
-        // `! <n> channel(s) not connected - ...` and reads the number
-        // back with `atol` on the text after the `!`, so a leading `!`
-        // never names a PV — parsing it as one produced an entry called
-        // `!` that the restore then looked for in the database.
-        if let Some(rest) = framing.strip_prefix('!') {
-            let digits: String = rest
-                .trim_start()
-                .chars()
-                .take_while(char::is_ascii_digit)
-                .collect();
-            out.not_connected = digits.parse().unwrap_or(0);
-            out.incomplete_at.get_or_insert(out.entries.len());
+        // `! <n> channel(s) not connected - ...`, so a leading `!` never
+        // names a PV — parsing it as one produced an entry called `!`
+        // that the restore then looked for in the database.
+        if framing.starts_with('!') {
+            out.error_message.get_or_insert(ErrorMessageLine {
+                at: out.entries.len(),
+                text: raw.to_string(),
+            });
             continue;
         }
 

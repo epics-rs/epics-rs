@@ -24,8 +24,8 @@
 //! backend cfg has the same hole — `epics-pva-rs` had it, and the exec-backend
 //! suite there reddened exactly as predicted — and the answer to "the same
 //! rule in three crates" is not three copies of a 300-line audit. Each crate
-//! now keeps a ten-line `tests/rtems_exec_model_gate.rs` that calls
-//! [`assert_crate_is_accounted_for`]; the rule, its message and its own
+//! now keeps a ten-line `tests/integration/rtems_exec_model_gate.rs` that
+//! calls [`assert_crate_is_accounted_for`]; the rule, its message and its own
 //! boundary tests live here, once.
 //!
 //! Dev-only and `publish = false`: it reads source text and is never linked
@@ -1010,12 +1010,13 @@ fn crate_rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
 /// Residual, stated rather than papered over: a `tests/` directory that is
 /// DELETED outright contributes zero legitimately — a crate need not have
 /// integration tests — and only `min_files` stands behind that. The census
-/// added by `tests/every_backend_deriving_crate_is_accounted_for.rs` is what keeps a
-/// crate from dropping out of the scan entirely.
+/// added by
+/// `tests/integration/every_backend_deriving_crate_is_accounted_for.rs` is what
+/// keeps a crate from dropping out of the scan entirely.
 ///
-/// Call it from a `tests/rtems_exec_model_gate.rs` that is itself gated to
-/// `#![cfg(exec_backend)]`, so the census is checked in exactly
-/// the configuration it describes.
+/// Call it from a `tests/integration/rtems_exec_model_gate.rs` that is itself
+/// gated to `#![cfg(exec_backend)]`, so the census is checked in exactly the
+/// configuration it describes.
 /// One crate's census, as measured — the whole-crate totals behind
 /// [`assert_crate_is_accounted_for`].
 ///
@@ -1316,7 +1317,7 @@ fn repo_path(root: &Path, path: &Path) -> String {
 
 /// The path, from a workspace root, of the file holding the `SCOPE_GATED` pin.
 pub const PIN_FILE: &str =
-    "tools/rtems-exec-gate/tests/every_backend_deriving_crate_is_accounted_for.rs";
+    "tools/rtems-exec-gate/tests/integration/every_backend_deriving_crate_is_accounted_for.rs";
 
 /// Every workspace member directory, from the root manifest's own `members`
 /// globs rather than from a list repeated here.

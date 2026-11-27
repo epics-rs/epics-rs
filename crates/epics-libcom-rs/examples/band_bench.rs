@@ -29,6 +29,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::Instant;
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_libcom_rs::runtime::background::CallbackPriority;
 use epics_libcom_rs::runtime::background::callback_executor::CallbackPool;
 
@@ -91,9 +92,9 @@ fn stat(label: &str, mut v: Vec<f64>) {
     v.sort_by(f64::total_cmp);
     println!(
         "  {label:5} min={:8.1} med={:8.1} max={:8.1} ns/callback",
-        v[0],
-        v[v.len() / 2],
-        v[v.len() - 1]
+        CFloat(v[0]),
+        CFloat(v[v.len() / 2]),
+        CFloat(v[v.len() - 1])
     );
 }
 

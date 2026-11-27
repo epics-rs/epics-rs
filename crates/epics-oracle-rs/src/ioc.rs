@@ -776,7 +776,7 @@ fn watch_boot(
     spawn_watcher(stdout, tx.clone(), tail.clone());
     spawn_watcher(stderr, tx, tail.clone());
 
-    let deadline = Instant::now() + timeout;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(timeout);
     let mut ready = false;
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
@@ -1910,7 +1910,7 @@ mod tests {
             tx,
             tail.clone(),
         );
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(5));
         while Instant::now() < deadline && !tail.text().contains("unaligned fastbin") {
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -2757,7 +2757,7 @@ time.sleep(60)
             .spawn()
             .expect("spawn sleep");
         let comm = format!("/proc/{}/comm", child.id());
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(10));
         while std::fs::read_to_string(&comm).unwrap() != "sleep\n" {
             assert!(Instant::now() < deadline, "sleep never exec'd");
             std::thread::sleep(Duration::from_millis(1));

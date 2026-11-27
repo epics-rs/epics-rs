@@ -106,9 +106,9 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage
 source-guard = { path = "../source-guard" }
 # Dev-only, path-only (no `version`, so `cargo publish` strips the entry
 # entirely): the shared exec-backend test-gating census, called by
-# `tests/rtems_exec_model_gate.rs`. Shared rather than copied because every
-# crate that derives the backend has the same hole, and a 300-line audit
-# copied once per crate is how copies of a rule come to disagree.
+# `tests/integration/rtems_exec_model_gate.rs`. Shared rather than copied
+# because every crate that derives the backend has the same hole, and a 300-line
+# audit copied once per crate is how copies of a rule come to disagree.
 rtems-exec-gate = { path = "../../tools/rtems-exec-gate" }
 record-seam-gate = { path = "../../tools/record-seam-gate" }
 epics-ca-rs = { path = "../epics-ca-rs" }
@@ -116,9 +116,12 @@ fact-budget = { path = "../fact-budget" }
 tempfile = "3"
 serial_test = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
-# Test-only: captures the `errlog` `tracing` sink so `tests/stdio_device.rs`
-# can assert the `stdio` "errlog" stream actually printed the record's VAL.
+# Test-only: captures the `errlog` `tracing` sink so
+# `tests/integration/stdio_device.rs` can assert the `stdio` "errlog" stream
+# actually printed the record's VAL.
 tracing-subscriber = "0.3"
+# Dev-only and path-only: the counting allocator of the `alloc` binary.
+alloc-count = { path = "../alloc-count" }
 
 [features]
 # Test-only: enables the `client_server` integration test, whose

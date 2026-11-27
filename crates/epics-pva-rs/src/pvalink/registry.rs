@@ -752,7 +752,7 @@ mod tests {
         // The peer count only means something once both monitors have
         // actually reached the server; each proves liveness by delivering
         // its first event.
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(10));
         while std::time::Instant::now() < deadline
             && !(link_q1.is_connected() && link_q8.is_connected())
         {

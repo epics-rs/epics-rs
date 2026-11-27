@@ -505,7 +505,7 @@ impl CaTools {
         // (2) Sync point: one initial update per PV proves every subscription
         // is live before any operation is driven.
         let mut initial = Vec::new();
-        let deadline = std::time::Instant::now() + connect_timeout;
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(connect_timeout);
         while initial.len() < pvs.len() {
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             if left.is_zero() {
@@ -845,7 +845,7 @@ pub(crate) fn wait_bounded(
             .map(|s| Box::new(s) as Box<dyn Read + Send>),
     );
 
-    let deadline = std::time::Instant::now() + timeout;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(timeout);
     let status = loop {
         match child.try_wait() {
             Ok(Some(s)) => break s,

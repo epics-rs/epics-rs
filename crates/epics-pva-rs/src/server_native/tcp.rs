@@ -13924,10 +13924,8 @@ mod tests {
     ///
     /// The complementary case — an ACL that flips to DENY *mid-window*,
     /// forcing the per-event `revalidate_read` recheck to emit MONITOR
-    /// FINISH — is exercised end-to-end (over the wire, through
-    /// `run_pva_server`) by
-    /// `tests/parity/test_monitor_reload_deny_composite.rs`; this change
-    /// preserved that per-event recheck arm unchanged, so that test
+    /// FINISH — is `pvx61_raw_seed_rechecks_acl_on_reload` above; this
+    /// change preserved that per-event recheck arm unchanged, so that test
     /// remains its coverage.
     #[epics_macros_rs::epics_test]
     async fn pvx61_acl_deny_surfaces_at_init() {
@@ -23658,7 +23656,11 @@ mod hosted_subscriber_tests {
             "test-PVAS-accept".into(),
             super::super::blocking::PVA_SERVER_PRIORITY,
             StackSizeClass::Medium,
-            move || serving.serve(&harness_reactor()),
+            move || {
+                serving
+                    .serve(&harness_reactor(), || true)
+                    .expect("accept threads")
+            },
         )
         .expect("accept thread");
         let stream = TcpStream::connect(server.local_addr().expect("addr")).expect("connect");

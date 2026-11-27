@@ -47,6 +47,38 @@ impl fmt::Display for ChannelState {
     }
 }
 
+/// Where a channel is in its lifecycle, as the coordinator holds it. A
+/// channel installed in its server carries the native type the server
+/// announced, so no installed channel is without one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Link {
+    Searching,
+    Connecting,
+    Connected(DbFieldType),
+    Unresponsive(DbFieldType),
+    Disconnected,
+}
+
+impl Link {
+    pub fn state(self) -> ChannelState {
+        match self {
+            Self::Searching => ChannelState::Searching,
+            Self::Connecting => ChannelState::Connecting,
+            Self::Connected(_) => ChannelState::Connected,
+            Self::Unresponsive(_) => ChannelState::Unresponsive,
+            Self::Disconnected => ChannelState::Disconnected,
+        }
+    }
+
+    /// The native type of a channel installed in its server.
+    pub fn installed(self) -> Option<DbFieldType> {
+        match self {
+            Self::Connected(native) | Self::Unresponsive(native) => Some(native),
+            Self::Searching | Self::Connecting | Self::Disconnected => None,
+        }
+    }
+}
+
 /// Shared inner state of a channel, owned by coordinator
 pub(crate) struct ChannelInner {
     pub cid: u32,
@@ -57,11 +89,12 @@ pub(crate) struct ChannelInner {
     /// every `TransportCommand` the coordinator builds for this channel
     /// targets `(server_addr, priority)`.
     pub priority: u8,
-    pub state: ChannelState,
+    pub link: Link,
     /// Server-assigned SID (valid only when Connected)
     pub sid: u32,
-    /// Native DBR type (valid only when Connected)
-    pub native_type: Option<DbFieldType>,
+    /// The native type of the last accepted connect, kept across a
+    /// disconnect so the next connect can tell whether it changed.
+    pub last_native: Option<DbFieldType>,
     /// Element count (valid only when Connected)
     pub element_count: u32,
     /// Server address (known after search)
@@ -77,13 +110,17 @@ pub(crate) struct ChannelInner {
 }
 
 impl ChannelInner {
+    pub fn state(&self) -> ChannelState {
+        self.link.state()
+    }
+
     /// The only way a connection event leaves the coordinator. The snapshot
     /// `CaChannel` reads takes this channel's state and rights first, so a
     /// receiver woken by `evt`, on any thread, reads what it announces.
     pub fn announce(&mut self, snapshots: &ChannelSnapshots, evt: ConnectionEvent) {
-        if self.state.is_operational() {
+        if self.state().is_operational() {
             if let Some(mut snap) = snapshots.get_mut(&self.cid) {
-                snap.state = self.state;
+                snap.state = self.state();
                 snap.access_rights = self.access_rights;
             }
         } else {
@@ -327,14 +364,14 @@ mod announce_tests {
         write: true,
     };
 
-    fn channel(state: ChannelState, access_rights: AccessRights) -> ChannelInner {
+    fn channel(link: Link, access_rights: AccessRights) -> ChannelInner {
         ChannelInner {
             cid: 1,
             pv_name: "TEST:PV".into(),
             priority: 0,
-            state,
+            link,
             sid: 7,
-            native_type: Some(DbFieldType::Double),
+            last_native: Some(DbFieldType::Double),
             element_count: 1,
             server_addr: Some("127.0.0.1:5064".parse().unwrap()),
             access_rights,
@@ -382,7 +419,8 @@ mod announce_tests {
             let snapshots = snapshots.clone();
             move || announce(&mut ch, &snapshots)
         });
-        let deadline = Instant::now() + Duration::from_millis(200);
+        let deadline =
+            epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_millis(200));
         let (mut event, mut waiter_woke) = (None, false);
         while event.is_none() && !waiter_woke && Instant::now() < deadline {
             event = rx.try_recv().ok();
@@ -410,7 +448,7 @@ mod announce_tests {
             write: false,
         };
         let seen = announce_under_a_held_snapshot(
-            channel(ChannelState::Connected, revoked),
+            channel(Link::Connected(DbFieldType::Double), revoked),
             ChannelState::Connected,
             |ch, snapshots| {
                 ch.announce(
@@ -433,7 +471,7 @@ mod announce_tests {
     #[test]
     fn an_unresponsive_edge_is_published_before_it_is_announced() {
         let seen = announce_under_a_held_snapshot(
-            channel(ChannelState::Unresponsive, GRANTED),
+            channel(Link::Unresponsive(DbFieldType::Double), GRANTED),
             ChannelState::Connected,
             |ch, snapshots| ch.announce(snapshots, ConnectionEvent::Disconnected),
         );
@@ -452,7 +490,7 @@ mod announce_tests {
             write: false,
         };
         let seen = announce_under_a_held_snapshot(
-            channel(ChannelState::Disconnected, none),
+            channel(Link::Disconnected, none),
             ChannelState::Connected,
             |ch, snapshots| ch.announce(snapshots, ConnectionEvent::Disconnected),
         );
@@ -469,7 +507,7 @@ mod announce_tests {
     #[test]
     fn recovery_is_published_before_a_waiter_wakes() {
         let seen = announce_under_a_held_snapshot(
-            channel(ChannelState::Connected, GRANTED),
+            channel(Link::Connected(DbFieldType::Double), GRANTED),
             ChannelState::Unresponsive,
             |ch, snapshots| ch.announce_connected(snapshots),
         );

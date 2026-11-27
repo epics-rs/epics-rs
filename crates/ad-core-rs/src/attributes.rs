@@ -84,20 +84,21 @@ impl NDAttrSource {
     }
 }
 
-/// Data type tags for NDAttribute values.
+/// Data type tags for NDAttribute values, numbered as C's
+/// `NDAttrDataType_t` (NDAttribute.h:44-58).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NDAttrDataType {
-    Int8,
-    UInt8,
-    Int16,
-    UInt16,
-    Int32,
-    UInt32,
-    Int64,
-    UInt64,
-    Float32,
-    Float64,
-    String,
+    Int8 = 0,
+    UInt8 = 1,
+    Int16 = 2,
+    UInt16 = 3,
+    Int32 = 4,
+    UInt32 = 5,
+    Int64 = 6,
+    UInt64 = 7,
+    Float32 = 8,
+    Float64 = 9,
+    String = 10,
 }
 
 /// Typed value stored in an NDAttribute.
@@ -453,21 +454,23 @@ impl NDAttributeSource for FunctionAttributeSource {
 /// `dbrType` member, taken from the XML `dbrtype` attribute.
 ///
 /// The variants are named for the `NDAttrDataType` C publishes for each
-/// `DBR_XXX` (PVAttribute.cpp:257-282), not for the CA wire type, because
-/// several DBR types collapse: `DBR_SHORT`, `DBR_INT` and `DBR_ENUM` all
-/// publish `NDAttrInt16`.
+/// `DBR_XXX` (PVAttribute.cpp:257-282); `Enum` publishes `NDAttrInt16` like
+/// `Int16` but is requested as `DBR_ENUM`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PvAttrDbrType {
-    /// C `DBR_NATIVE` — the default when `dbrtype` is omitted. The published
-    /// type follows the PV's own field type (PVAttribute.cpp:224-249).
+    /// C `DBR_NATIVE` — the default when `dbrtype` is omitted. The requested
+    /// type follows the PV's own field type (PVAttribute.cpp:224-249), except
+    /// that a CHAR field is read as `DBR_SHORT`.
     #[default]
     Native,
     /// `DBR_STRING` → `NDAttrString`.
     String,
     /// `DBR_CHAR` → `NDAttrInt8`.
     Int8,
-    /// `DBR_SHORT` / `DBR_INT` / `DBR_ENUM` → `NDAttrInt16`.
+    /// `DBR_SHORT` / `DBR_INT` → `NDAttrInt16`.
     Int16,
+    /// `DBR_ENUM` → `NDAttrInt16`.
+    Enum,
     /// `DBR_LONG` → `NDAttrInt32`.
     Int32,
     /// `DBR_FLOAT` → `NDAttrFloat32`.
@@ -487,7 +490,8 @@ impl PvAttrDbrType {
     pub fn from_xml(dbrtype: &str) -> Option<Self> {
         match dbrtype {
             "DBR_CHAR" => Some(Self::Int8),
-            "DBR_SHORT" | "DBR_INT" | "DBR_ENUM" => Some(Self::Int16),
+            "DBR_SHORT" | "DBR_INT" => Some(Self::Int16),
+            "DBR_ENUM" => Some(Self::Enum),
             "DBR_LONG" => Some(Self::Int32),
             "DBR_FLOAT" => Some(Self::Float32),
             "DBR_DOUBLE" => Some(Self::Float64),
@@ -497,39 +501,63 @@ impl PvAttrDbrType {
         }
     }
 
-    /// Publish a monitored value as the type this `dbrtype` asked for.
-    ///
-    /// C requests the type on the wire (`ca_add_masked_array_event(dbrType, …)`,
-    /// PVAttribute.cpp:294) and stores whatever arrives into the matching union
-    /// member, so the attribute's `NDAttrDataType` is the REQUESTED type, not
-    /// the PV's. `CaClient::camonitor` subscribes with the channel's native
-    /// type and takes no type argument, so the port converts on arrival
-    /// instead; the published type is the same either way. A value that will
-    /// not convert — a non-numeric string asked for as `DBR_DOUBLE` — stays
-    /// `Undefined`, C's un-set union member.
-    pub fn publish(self, value: NDAttrValue) -> NDAttrValue {
-        if matches!(value, NDAttrValue::Undefined) {
-            return value;
-        }
+    /// The subscription C's `connectCallback` makes on the first connect to a
+    /// PV of CA field type `field` (PVAttribute.cpp:217-294): the DBR type and
+    /// count on the wire, and the attribute's data type. A CHAR field asked
+    /// for as `DBR_STRING` is read as its whole `DBR_CHAR` array. `None` is
+    /// C's unknown-DBF arm, which never subscribes.
+    /// C's `chtype` for this `dbrtype`, `DBR_NATIVE` being -1
+    /// (PVAttribute.h:21), as `connectCallback` traces it.
+    #[cfg(feature = "ioc")]
+    fn chtype(self) -> i32 {
         match self {
-            Self::Native => value,
-            Self::String => NDAttrValue::String(value.as_string()),
-            Self::Int8 => value
-                .as_i64()
-                .map_or(NDAttrValue::Undefined, |v| NDAttrValue::Int8(v as i8)),
-            Self::Int16 => value
-                .as_i64()
-                .map_or(NDAttrValue::Undefined, |v| NDAttrValue::Int16(v as i16)),
-            Self::Int32 => value
-                .as_i64()
-                .map_or(NDAttrValue::Undefined, |v| NDAttrValue::Int32(v as i32)),
-            Self::Float32 => value
-                .as_f64()
-                .map_or(NDAttrValue::Undefined, |v| NDAttrValue::Float32(v as f32)),
-            Self::Float64 => value
-                .as_f64()
-                .map_or(NDAttrValue::Undefined, NDAttrValue::Float64),
+            Self::Native => -1,
+            Self::String => 0,
+            Self::Int16 => 1,
+            Self::Float32 => 2,
+            Self::Enum => 3,
+            Self::Int8 => 4,
+            Self::Int32 => 5,
+            Self::Float64 => 6,
         }
+    }
+
+    #[cfg(feature = "ioc")]
+    fn request(
+        self,
+        field: epics_base_rs::types::DbFieldType,
+        element_count: u32,
+    ) -> Option<(u16, u32, NDAttrDataType)> {
+        use NDAttrDataType as D;
+        use epics_base_rs::types::{
+            DBR_CHAR, DBR_DOUBLE, DBR_ENUM, DBR_FLOAT, DBR_LONG, DBR_SHORT, DBR_STRING,
+            DbFieldType as F,
+        };
+        let native = match field {
+            F::String => (DBR_STRING, D::String),
+            F::Short | F::Enum => (DBR_SHORT, D::Int16),
+            F::Float => (DBR_FLOAT, D::Float32),
+            // C asks for `DBR_CHAR` into an `NDAttrInt8`, which reads a UCHAR
+            // field's 200 as -56; as a short the IOC keeps the field's sign.
+            F::Char => (DBR_SHORT, D::Int16),
+            F::Long => (DBR_LONG, D::Int32),
+            F::Double => (DBR_DOUBLE, D::Float64),
+            _ => return None,
+        };
+        if self == Self::String && field == F::Char {
+            return Some((DBR_CHAR, element_count, D::String));
+        }
+        let (dbr_type, data_type) = match self {
+            Self::Native => native,
+            Self::String => (DBR_STRING, D::String),
+            Self::Int8 => (DBR_CHAR, D::Int8),
+            Self::Int16 => (DBR_SHORT, D::Int16),
+            Self::Enum => (DBR_ENUM, D::Int16),
+            Self::Int32 => (DBR_LONG, D::Int32),
+            Self::Float32 => (DBR_FLOAT, D::Float32),
+            Self::Float64 => (DBR_DOUBLE, D::Float64),
+        };
+        Some((dbr_type, 1, data_type))
     }
 }
 
@@ -546,7 +574,7 @@ impl PvAttrDbrType {
 pub struct EpicsPvAttributeSource {
     /// The PV name this attribute monitors (the XML `source`).
     pub pv_name: String,
-    /// The type the monitored value is published as (the XML `dbrtype`).
+    /// The type the PV is requested as (the XML `dbrtype`).
     pub dbr_type: PvAttrDbrType,
     cell: std::sync::Arc<LiveValueCell>,
 }
@@ -576,14 +604,15 @@ impl NDAttributeSource for EpicsPvAttributeSource {
 }
 
 /// CA-monitor feeder for `EPICS_PV`-type attributes (C++ `PVAttribute`'s
-/// channel-access monitor callback).
+/// connection and monitor callbacks).
 ///
 /// Requires the `ioc` feature (the `epics-ca-rs` CA client). Spawns a tokio
-/// task that subscribes to the attribute's PV via [`epics_ca_rs::client::CaClient::camonitor`]
-/// and writes every monitored value into the source's [`LiveValueCell`], so
-/// `evaluate()` returns the latest value. The task exits when the monitor
-/// stream ends; the returned [`tokio::task::JoinHandle`] lets the caller abort
-/// it on shutdown.
+/// task that waits for the PV's first connect, subscribes once in the DBR type
+/// and count C picks for its field type, and writes every monitored value into
+/// the source's [`LiveValueCell`], so `evaluate()` returns the latest value.
+/// The request stays as the first connect fixed it across reconnects, as C's
+/// does. The task exits when the client shuts down; the returned
+/// [`tokio::task::JoinHandle`] lets the caller abort it on shutdown.
 ///
 /// `runtime` is named rather than taken from the ambient context because the
 /// caller is `NDArrayDriverBase::read_nd_attributes_file`, reached from an
@@ -598,27 +627,168 @@ pub fn spawn_ca_monitor(
     let pv_name = source.pv_name.clone();
     let dbr_type = source.dbr_type;
     let cell = source.cell().clone();
-    // C subscribes as `dbrtype` (PVAttribute.cpp:294); a DBR_STRING request
-    // has the IOC render a float at its PREC and an enum as its label.
-    let as_text = dbr_type == PvAttrDbrType::String;
     runtime.spawn(async move {
-        use epics_ca_rs::protocol::{DBE_ALARM, DBE_LOG, DBE_VALUE};
+        use asyn_rs::trace::TraceMask;
+        use epics_ca_rs::CaError;
+        use epics_ca_rs::client::ConnectionEvent;
+        use epics_ca_rs::protocol::{DBE_VALUE, ECA_DISCONN};
+        use tokio::sync::broadcast::error::RecvError;
+        // C prints through an asynUser on no port, which reads the global
+        // trace mask (PVAttribute.cpp:23-27).
+        let trace = asyn_rs::services::PortServices::global().trace().clone();
         let channel = client.create_channel(&pv_name);
+        // The snapshot `info` reads is published before `Connected` is sent,
+        // so taking the events first cannot miss the connect.
+        let mut events = channel.connection_events();
+        let info = loop {
+            if let Ok(info) = channel.info().await {
+                break info;
+            }
+            if let Err(RecvError::Closed) = events.recv().await {
+                return;
+            }
+        };
+        let dbf_type = info.native_type as u16;
+        trace.print(
+            None,
+            None,
+            0,
+            TraceMask::FLOW,
+            format_args!(
+                "PVAttribute:connectCallback: Connect event, PV={pv_name}, chanId={:p}, dbfType={dbf_type}, elementCount={}, dbrType={}\n",
+                &channel,
+                info.element_count,
+                dbr_type.chtype()
+            ),
+        );
+        let Some((wire_type, count, data_type)) =
+            dbr_type.request(info.native_type, info.element_count)
+        else {
+            trace.print(
+                None,
+                None,
+                0,
+                TraceMask::ERROR,
+                format_args!("PVAttribute:connectCallback: unknown DBF type = {dbf_type}\n"),
+            );
+            return;
+        };
+        trace.print(
+            None,
+            None,
+            0,
+            TraceMask::FLOW,
+            format_args!(
+                "PVAttribute:connectCallback: Connect event, PV={pv_name}, chanId={:p}, type={}\n",
+                &channel, data_type as i32
+            ),
+        );
+        let Ok(wire_type) = epics_ca_rs::client::DbrType::new(wire_type) else {
+            return;
+        };
         let Ok(mut monitor) = channel
-            .subscribe_with_mask_readback(0.0, DBE_VALUE | DBE_LOG | DBE_ALARM, as_text, as_text)
+            .subscribe_with_mask_dbr_type(DBE_VALUE, wire_type, count)
             .await
         else {
             return;
         };
-        while let Some(Ok(snapshot)) = monitor.recv().await {
-            cell.set(dbr_type.publish(epics_value_to_nd_attr(&snapshot.value)));
+        let mut events_open = true;
+        loop {
+            tokio::select! {
+                update = monitor.recv() => match update {
+                    None => return,
+                    // C keeps the value from before the outage; no IOC vouches
+                    // for it until the first value after the reconnect. libca
+                    // never hands a disconnect to the monitor callback
+                    // (oldSubscription.cpp:80), so neither is it traced here.
+                    Some(Err(CaError::ServerError(ECA_DISCONN))) => {
+                        cell.set(NDAttrValue::Undefined)
+                    }
+                    Some(update) => {
+                        trace.print(
+                            None,
+                            None,
+                            0,
+                            TraceMask::FLOW,
+                            format_args!("PVAttribute:monitorCallback: PV={pv_name}\n"),
+                        );
+                        match update {
+                            Ok(snapshot) => cell.set(decode_pv_value(data_type, &snapshot.value)),
+                            // C skips an event whose status is not ECA_NORMAL
+                            // and keeps the subscription (PVAttribute.cpp:125-130).
+                            Err(CaError::ServerError(status)) => trace.print(
+                                None,
+                                None,
+                                0,
+                                TraceMask::ERROR,
+                                format_args!(
+                                    "PVAttribute:monitorCallback: CA returns eha.status={status}\n"
+                                ),
+                            ),
+                            // An error the client raised itself carries no ECA
+                            // status; its text stands in for the number.
+                            Err(e) => trace.print(
+                                None,
+                                None,
+                                0,
+                                TraceMask::ERROR,
+                                format_args!("PVAttribute:monitorCallback: CA returns {e}\n"),
+                            ),
+                        }
+                    }
+                },
+                event = events.recv(), if events_open => match event {
+                    Ok(ConnectionEvent::Disconnected) => trace.print(
+                        None,
+                        None,
+                        0,
+                        TraceMask::FLOW,
+                        format_args!(
+                            "PVAttribute:connectCallback: Disconnect event, PV={pv_name}, chanId={:p}\n",
+                            &channel
+                        ),
+                    ),
+                    Err(RecvError::Closed) => events_open = false,
+                    _ => {}
+                },
+            }
         }
     })
 }
 
+/// A monitored value as the data type fixed at connect (PVAttribute.cpp:131-
+/// 162): a string is the bytes up to the first NUL (`epicsStrDup`), a number
+/// the first element of the requested DBR type read as C's union member.
+#[cfg(feature = "ioc")]
+fn decode_pv_value(data_type: NDAttrDataType, value: &epics_ca_rs::EpicsValue) -> NDAttrValue {
+    use NDAttrDataType as D;
+    use NDAttrValue as V;
+    use epics_ca_rs::EpicsValue as E;
+    if data_type == D::String {
+        let bytes: &[u8] = match value {
+            E::String(s) => return V::String(s.as_str_lossy().into_owned()),
+            E::Char(b) | E::UChar(b) => std::slice::from_ref(b),
+            E::CharArray(a) | E::UCharArray(a) => a,
+            _ => return V::Undefined,
+        };
+        let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+        return V::String(String::from_utf8_lossy(&bytes[..end]).into_owned());
+    }
+    match (data_type, epics_value_to_nd_attr(value)) {
+        (D::Int8, V::UInt8(v)) => V::Int8(v as i8),
+        (D::Int16, V::UInt16(v)) => V::Int16(v as i16),
+        (D::Int16, v @ V::Int16(_))
+        | (D::Int32, v @ V::Int32(_))
+        | (D::Float32, v @ V::Float32(_))
+        | (D::Float64, v @ V::Float64(_)) => v,
+        _ => V::Undefined,
+    }
+}
+
 /// Convert an `epics-ca-rs` [`epics_ca_rs::EpicsValue`] scalar to an
 /// [`NDAttrValue`]. Array values collapse to their first element (an NDArray
-/// attribute is scalar); empty arrays yield `Undefined`.
+/// attribute is scalar); empty arrays yield `Undefined`. The variant only
+/// carries the value: [`decode_pv_value`] picks the attribute's type.
 #[cfg(feature = "ioc")]
 fn epics_value_to_nd_attr(value: &epics_ca_rs::EpicsValue) -> NDAttrValue {
     use epics_ca_rs::EpicsValue as E;
@@ -1162,35 +1332,6 @@ mod tests {
         assert_eq!(src.evaluate(), NDAttrValue::Undefined);
         src.cell().set(NDAttrValue::Float64(22.4));
         assert_eq!(src.evaluate(), NDAttrValue::Float64(22.4));
-    }
-
-    #[test]
-    fn test_pv_attr_dbr_type_publish() {
-        // C publishes the REQUESTED dbrType, not the PV's native one
-        // (PVAttribute.cpp:257-282), so a DBR_LONG on a DBF_DOUBLE PV is an
-        // Int32 attribute.
-        assert_eq!(
-            PvAttrDbrType::Int32.publish(NDAttrValue::Float64(22.9)),
-            NDAttrValue::Int32(22)
-        );
-        assert_eq!(
-            PvAttrDbrType::String.publish(NDAttrValue::Int16(7)),
-            NDAttrValue::String("7".into())
-        );
-        assert_eq!(
-            PvAttrDbrType::Native.publish(NDAttrValue::Float64(22.9)),
-            NDAttrValue::Float64(22.9)
-        );
-        // Un-convertible and un-set both stay Undefined rather than becoming a
-        // plausible zero.
-        assert_eq!(
-            PvAttrDbrType::Float64.publish(NDAttrValue::String("warm".into())),
-            NDAttrValue::Undefined
-        );
-        assert_eq!(
-            PvAttrDbrType::String.publish(NDAttrValue::Undefined),
-            NDAttrValue::Undefined
-        );
     }
 
     #[test]

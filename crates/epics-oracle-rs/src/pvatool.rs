@@ -520,7 +520,7 @@ impl PvaTools {
 
             let mut lines = Vec::new();
             let mut seeded = vec![false; pvs.len()];
-            let deadline = std::time::Instant::now() + connect_timeout;
+            let deadline = epics_libcom_rs::runtime::time::deadline_from_now(connect_timeout);
             let mut why = String::new();
             while seeded.iter().any(|s| !s) {
                 let left = deadline.saturating_duration_since(std::time::Instant::now());

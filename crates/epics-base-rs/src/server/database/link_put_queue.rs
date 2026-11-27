@@ -230,7 +230,7 @@ impl PutCompletion {
                     } else {
                         band
                     };
-                    let _ = done.complete(band);
+                    done.complete(band);
                 }
             }
         }

@@ -1,0 +1,108 @@
+//! sseq, throttle and transform request `checkLinksCallback` on the record's
+//! PRIO (`sseqRecord.c:182`, `throttleRecord.c:214`, `transformRecord.c:494`),
+//! so a busy low band does not hold back a PRIO HIGH record's link check.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
+
+use epics_base_rs::runtime::background::callback_executor::{set_parallel_threads, set_queue_size};
+use epics_base_rs::runtime::task::{
+    CallbackPriority, background_callback_stats, sleep, spawn_blocking_background,
+};
+use epics_base_rs::server::ioc_builder::IocBuilder;
+use epics_base_rs::server::records::sseq::SseqRecord;
+use epics_base_rs::types::EpicsValue;
+
+/// Holds the low band's worker until dropped.
+#[derive(Clone, Default)]
+struct Gate(Arc<(Mutex<bool>, Condvar)>);
+
+impl Gate {
+    fn wait(&self) {
+        let (open, wake) = &*self.0;
+        let mut open = open.lock().unwrap();
+        while !*open {
+            open = wake.wait(open).unwrap();
+        }
+    }
+}
+
+struct FullBand(Gate);
+
+impl Drop for FullBand {
+    fn drop(&mut self) {
+        let (open, wake) = &*(self.0).0;
+        *open.lock().unwrap() = true;
+        wake.notify_all();
+    }
+}
+
+fn low_overflows() -> u64 {
+    background_callback_stats(false).unwrap()[CallbackPriority::Low.index()].num_overflow
+}
+
+/// Hold the low band's one worker, then take its one ring slot with ad-hoc
+/// requests until one is refused.
+fn fill_low_band() -> FullBand {
+    let gate = Gate::default();
+    let (running_tx, running_rx) = std::sync::mpsc::channel();
+    let holder = gate.clone();
+    drop(spawn_blocking_background(
+        CallbackPriority::Low,
+        move |_| {
+            running_tx.send(()).unwrap();
+            holder.wait();
+        },
+    ));
+    running_rx.recv_timeout(fact_budget::FACT_BUDGET).unwrap();
+    let refused = low_overflows() + 1;
+    for _ in 0..64 {
+        let filler = gate.clone();
+        drop(spawn_blocking_background(
+            CallbackPriority::Low,
+            move |_| filler.wait(),
+        ));
+        if low_overflows() == refused {
+            return FullBand(gate);
+        }
+    }
+    panic!("the low band never filled");
+}
+
+/// A WAIT1 put arms `checkLinksCallback` (`sseqRecord.c:1088-1094`), whose
+/// pass raises WERR1 for a wait on a local DB link (`sseqRecord.c:915-920`).
+#[epics_base_rs::epics_test]
+async fn a_prio_high_sseq_link_check_runs_while_the_low_band_is_full() {
+    // `callbackSetQueueSize` and `callbackParallelThreads` before `callbackInit`.
+    set_queue_size(1);
+    set_parallel_threads(1, Some(CallbackPriority::Low));
+    let (db, _) = IocBuilder::new()
+        .register_record_type("sseq", || Box::new(SseqRecord::default()))
+        .db_string(
+            r#"
+record(ao, "T") {}
+record(sseq, "S") { field(PRIO, "HIGH") field(LNK1, "T") }
+"#,
+            &HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let werr1 = || db.get_pv("S.WERR1").ok().and_then(|v| v.to_f64());
+    assert_eq!(werr1(), Some(0.0));
+
+    let _full = fill_low_band();
+    db.put_record_field_from_ca("S", "WAIT1", EpicsValue::Short(1))
+        .await
+        .unwrap();
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
+    while werr1() != Some(1.0) {
+        assert!(
+            Instant::now() < deadline,
+            "S's link check waited on the full low band"
+        );
+        sleep(Duration::from_millis(5)).await;
+    }
+}

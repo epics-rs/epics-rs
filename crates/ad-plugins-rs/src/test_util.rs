@@ -97,7 +97,7 @@ pub(crate) fn auto_save_to(
 /// ended.
 pub(crate) fn wait_saved(handle: &ad_core_rs::plugin::runtime::PluginRuntimeHandle, n: i32) {
     let port = handle.port_runtime().port_handle();
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(10));
     while port
         .read_int32_blocking(handle.ndarray_params.array_counter, 0)
         .unwrap()
@@ -242,7 +242,7 @@ pub(crate) fn begin_params<P: ad_core_rs::plugin::runtime::NDPluginProcess>(
     publish(&handle, input);
     // One batch carries ArrayCounter and the rest.
     let p = &handle.ndarray_params;
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(10));
     while port.read_int32_blocking(p.array_counter, 0).ok() != Some(1) {
         assert!(std::time::Instant::now() < deadline, "frame not posted");
         std::thread::yield_now();
@@ -279,7 +279,7 @@ pub(crate) fn array_sizes<P: ad_core_rs::plugin::runtime::NDPluginProcess>(
     let mut sizes = Vec::new();
     for (n, input) in (1..).zip(inputs) {
         publish(&handle, input);
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(10));
         while port.read_int32_blocking(p.array_counter, 0).ok() != Some(n) {
             assert!(std::time::Instant::now() < deadline, "frame {n} not posted");
             std::thread::yield_now();

@@ -22,6 +22,10 @@ const SOURCES: &[&str] = &[
     "pcre_xclass.c",
 ];
 
+/// What the sources include under these defines: not `config.h`
+/// (HAVE_CONFIG_H), `pcre_printint.c` (PCRE_DEBUG) or `sljit/` (SUPPORT_JIT).
+const HEADERS: &[&str] = &["pcre.h", "pcre_internal.h", "ucp.h"];
+
 fn main() {
     let mut build = cc::Build::new();
     // The options are PSI's EPICS Makefile for PCRE, which StreamDevice's
@@ -53,6 +57,8 @@ fn main() {
         build.file(format!("pcre/{src}"));
     }
     build.compile("pcre");
-    println!("cargo:rerun-if-changed=pcre");
+    for file in SOURCES.iter().chain(HEADERS) {
+        println!("cargo:rerun-if-changed=pcre/{file}");
+    }
     println!("cargo:include={}/pcre", env!("CARGO_MANIFEST_DIR"));
 }

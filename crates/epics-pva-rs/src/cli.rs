@@ -161,11 +161,12 @@ pub fn timeout_duration(secs: f64) -> Duration {
 /// that range — `pvget -w 1e300` passed every guard and then aborted the
 /// tool. pvxs's tools hand `-w` to `epicsEvent::wait(double)`, which simply
 /// blocks for a duration no run will outlive, so an out-of-range `-w`
-/// saturates to [`TimeoutPolicy::FOREVER_SENTINEL`] (~10 years) here rather
-/// than panicking. Values the callers have already rejected (NaN, negative)
+/// saturates to the runtime's one "never",
+/// [`epics_libcom_rs::runtime::time::FAR_FUTURE`] (~30 years), rather than
+/// panicking. Values the callers have already rejected (NaN, negative)
 /// never reach this function.
 fn secs_to_duration(secs: f64) -> Duration {
-    Duration::try_from_secs_f64(secs).unwrap_or(TimeoutPolicy::FOREVER_SENTINEL)
+    epics_libcom_rs::runtime::time::duration_from_secs(secs)
 }
 
 /// CLI `-w` timeout policy for tools whose pvxs semantics treat a
@@ -190,16 +191,6 @@ pub enum TimeoutPolicy {
 }
 
 impl TimeoutPolicy {
-    /// `-w 0` ("no timeout") cannot be expressed as a truly unbounded
-    /// wait on the Duration-based client builder
-    /// (`client::PvaClient`'s `timeout` takes a `Duration`, fed
-    /// to `tokio::time::timeout`), so [`TimeoutPolicy::Forever`] is
-    /// encoded as a ~10-year sentinel the operation timeout cannot
-    /// realistically reach — operationally a no-deadline wait for an
-    /// interactive CLI, and far below any `Instant` overflow. Matches
-    /// pvxs `pvxlist`'s `done.wait()` (`tools/list.cpp:154-203`).
-    const FOREVER_SENTINEL: Duration = Duration::from_secs(10 * 365 * 24 * 3600);
-
     /// `pvxlist`'s `-w` rule: a finite, strictly-positive value is a
     /// bounded deadline; `0`, a negative, or a non-finite value
     /// (NaN/±Inf) is "no timeout" (`tools/list.cpp:55-58,154-203`). This
@@ -225,11 +216,15 @@ impl TimeoutPolicy {
     }
 
     /// The operation timeout to hand the Duration-based client builder.
-    /// `Forever` maps to `Self::FOREVER_SENTINEL`.
+    /// `-w 0` ("no timeout") cannot be a truly unbounded wait there
+    /// (`client::PvaClient`'s `timeout` takes a `Duration`, fed to
+    /// `tokio::time::timeout`), so `Forever` maps to the runtime's one
+    /// "never", [`epics_libcom_rs::runtime::time::FAR_FUTURE`]. Matches
+    /// pvxs `pvxlist`'s `done.wait()` (`tools/list.cpp:154-203`).
     pub fn op_timeout(self) -> Duration {
         match self {
             TimeoutPolicy::Finite(d) => d,
-            TimeoutPolicy::Forever => Self::FOREVER_SENTINEL,
+            TimeoutPolicy::Forever => epics_libcom_rs::runtime::time::FAR_FUTURE,
         }
     }
 }
@@ -596,18 +591,19 @@ mod tests {
     /// `-w` passed every helper's `is_finite() && > 0.0` guard and then
     /// panicked in `Duration::from_secs_f64` ("cannot convert float seconds
     /// to Duration"), aborting the tool. pvxs's `epicsEvent::wait(1e300)`
-    /// just blocks; the port now saturates to the forever sentinel.
+    /// just blocks; the port now saturates to the runtime's "never".
     #[test]
     fn out_of_range_w_saturates_instead_of_panicking() {
-        let huge = 1e300;
-        assert_eq!(timeout_duration(huge), TimeoutPolicy::FOREVER_SENTINEL);
-        assert_eq!(wait_timeout_duration(huge), TimeoutPolicy::FOREVER_SENTINEL);
-        assert_eq!(
-            TimeoutPolicy::wait_or_forever(huge),
-            TimeoutPolicy::Finite(TimeoutPolicy::FOREVER_SENTINEL)
-        );
-        // Just below the u64::MAX-seconds panic edge, the real value stands.
-        assert_eq!(timeout_duration(1e18), Duration::from_secs_f64(1e18));
+        use epics_libcom_rs::runtime::time::FAR_FUTURE;
+        for huge in [1e300, 1e19] {
+            assert_eq!(timeout_duration(huge), FAR_FUTURE, "-w {huge}");
+            assert_eq!(wait_timeout_duration(huge), FAR_FUTURE, "-w {huge}");
+            assert_eq!(
+                TimeoutPolicy::wait_or_forever(huge),
+                TimeoutPolicy::Finite(FAR_FUTURE),
+                "-w {huge}"
+            );
+        }
     }
 
     /// The shared `-v` verbose path emits the pvxs `Effective config`

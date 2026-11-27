@@ -24,12 +24,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # No debuginfo, not even line tables. The all-features test build on
-  # 12059ffc07 (1,674 test binaries) takes 109,470 MB with `line-tables-only`
-  # and 48,809 MB with 0; 17a131b3b's 69,114 MB was the last that fit. A full
-  # disk kills the runner's own diagnostic log, so the job log goes with it.
-  # Panics keep their file:line; backtrace frames do not.
-  CARGO_PROFILE_DEV_DEBUG: 0
   # R7.0.9 is the floor, not a preference: before base 3d70e7064
   # `dbAllocRecord()` reaches every field through `&ppvt->common`, so
   # `__builtin_object_size()` bounds the write to `sizeof(dbCommon)` and
@@ -66,14 +60,14 @@ jobs:
             - 'crates/epics-ca-rs/src/server/**'
             - 'crates/epics-ca-rs/tests/wire_golden*.rs'
             - 'crates/epics-ca-rs/tests/interop_*.rs'
-            - 'crates/epics-ca-rs/tests/cases/**'
+            - 'crates/epics-ca-rs/tests/integration/cases/**'
             - 'crates/epics-pva-rs/src/codec.rs'
             - 'crates/epics-pva-rs/src/proto/**'
             - 'crates/epics-pva-rs/src/pvdata/**'
             - 'crates/epics-pva-rs/src/server_native/**'
             - 'crates/epics-pva-rs/tests/wire_golden*.rs'
             - 'crates/epics-pva-rs/tests/interop_*.rs'
-            - 'crates/epics-pva-rs/tests/pva_cases/**'
+            - 'crates/epics-pva-rs/tests/integration/pva_cases/**'
             - '.config/nextest.toml'
             - '.github/workflows/interop.yml'
 

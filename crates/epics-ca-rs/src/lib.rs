@@ -145,6 +145,8 @@ pub mod copt;
 #[cfg(not(epics_embedded_target))]
 pub mod discovery;
 pub mod estdlib;
+#[cfg(all(test, target_os = "linux"))]
+mod fresh_process;
 // Reverse-DNS (`getnameinfo` via `socket2::SockAddr`) for the CA client's
 // peer-name cache. Its only consumer is the client's `peer_display_name` /
 // `peer_resolved_name`, so it follows the `client` feature as well as the

@@ -26,15 +26,14 @@
 //!
 //! # Why a derivation and not a list
 //!
-//! `crates/asyn-rs/tests/epics_only_tests_declare_their_feature.rs` enforced
-//! exactly this rule from a hand-written list of three needles, for one crate
-//! and one feature. It is superseded by this crate because the list is the
-//! part that rots: the workspace has 131 gated module paths and 98 optional
-//! dependency declarations, and a needle list covers the ones somebody
-//! thought of. Both halves here are read out of the sources -- the module
-//! tree under `src/lib.rs` for the requirement, the target's own attributes
-//! and manifest block for the declaration -- so a module gated tomorrow is
-//! covered tomorrow.
+//! An asyn-rs test once enforced exactly this rule from a hand-written list of
+//! three needles, for one crate and one feature. It is superseded by this
+//! crate because the list is the part that rots: the workspace has 131 gated
+//! module paths and 98 optional dependency declarations, and a needle list
+//! covers the ones somebody thought of. Both halves here are read out of the
+//! sources -- the module tree under `src/lib.rs` for the requirement, the
+//! target's own attributes and manifest block for the declaration -- so a
+//! module gated tomorrow is covered tomorrow.
 //!
 //! # The axes it reasons over
 //!
@@ -1170,7 +1169,17 @@ fn read_crate(dir: &Path) -> Option<CrateInfo> {
             .find(|(k, _)| k == "required-features")
             .map(|(_, v)| v)
             .unwrap_or_default();
-        let rel_path = PathBuf::from(tpath.unwrap_or_else(|| format!("{dir_name}/{tname}.rs")));
+        // Cargo's own inference for a block without `path`: the file, else
+        // the directory target.
+        let rel_path = PathBuf::from(tpath.unwrap_or_else(|| {
+            let file = format!("{dir_name}/{tname}.rs");
+            let main = format!("{dir_name}/{tname}/main.rs");
+            if !dir.join(&file).is_file() && dir.join(&main).is_file() {
+                main
+            } else {
+                file
+            }
+        }));
         claimed.insert(rel_path.clone());
         targets.push(TargetDecl {
             kind,
@@ -1186,20 +1195,34 @@ fn read_crate(dir: &Path) -> Option<CrateInfo> {
         let Ok(entries) = std::fs::read_dir(dir.join(dir_name)) else {
             continue;
         };
-        let mut found: Vec<PathBuf> = entries
+        // `<dir>/x.rs` is target `x`, and so is `<dir>/x/main.rs`: a merged
+        // test binary is the second shape, and missing it drops every file
+        // it pulls in from the audit.
+        let mut found: Vec<(String, PathBuf)> = entries
             .flatten()
             .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|e| e == "rs"))
+            .filter_map(|p| {
+                let file = p.file_name()?.to_str()?;
+                if let Some(stem) = file.strip_suffix(".rs").filter(|_| p.is_file()) {
+                    Some((stem.to_string(), PathBuf::from(dir_name).join(file)))
+                } else if p.join("main.rs").is_file() {
+                    Some((
+                        file.to_string(),
+                        PathBuf::from(dir_name).join(file).join("main.rs"),
+                    ))
+                } else {
+                    None
+                }
+            })
             .collect();
         found.sort();
-        for path in found {
-            let rel = PathBuf::from(dir_name).join(path.file_name().unwrap());
+        for (tname, rel) in found {
             if claimed.contains(&rel) {
                 continue;
             }
             targets.push(TargetDecl {
                 kind,
-                name: path.file_stem().unwrap().to_string_lossy().into_owned(),
+                name: tname,
                 rel_path: rel,
                 required_features: Vec::new(),
                 main_defining: kind == "bin" || kind == "example",
@@ -1764,6 +1787,47 @@ mod tests {
             r#"feature = "client-core""#
         );
         assert_eq!(project(&need, Axis::Full).render(), need.render());
+    }
+
+    #[test]
+    fn a_directory_target_is_found_by_its_main_rs() {
+        let dir = std::env::temp_dir().join(format!("target-cfg-gate-{}", std::process::id()));
+        for sub in ["tests/merged", "tests/named"] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+            std::fs::write(dir.join(sub).join("main.rs"), "").unwrap();
+        }
+        std::fs::write(dir.join("tests/single.rs"), "").unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"x\"\n\n[[test]]\nname = \"named\"\nrequired-features = [\"f\"]\n",
+        )
+        .unwrap();
+        let info = read_crate(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+        let got: Vec<_> = info
+            .unwrap()
+            .targets
+            .iter()
+            .map(|t| {
+                (
+                    t.name.clone(),
+                    t.rel_path.clone(),
+                    t.required_features.clone(),
+                )
+            })
+            .collect();
+        let t = |n: &str, p: &str, f: &[&str]| {
+            let f = f.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+            (n.to_string(), PathBuf::from(p), f)
+        };
+        assert_eq!(
+            got,
+            [
+                t("named", "tests/named/main.rs", &["f"]),
+                t("merged", "tests/merged/main.rs", &[]),
+                t("single", "tests/single.rs", &[]),
+            ]
+        );
     }
 
     #[test]

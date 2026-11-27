@@ -10,7 +10,7 @@ drops from the uploaded manifest.
 
 ## Usage
 
-From `epics-ca-rs/tests/interop_rust_client_c_ioc.rs`:
+From `epics-ca-rs/tests/integration/interop_rust_client_c_ioc.rs`:
 
 ```rust
 use c_ca_tools::{require_tool, spawn_softioc};

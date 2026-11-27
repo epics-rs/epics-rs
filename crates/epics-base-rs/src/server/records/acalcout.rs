@@ -106,8 +106,8 @@ use crate::calc::{ArrayInputs, Rpcl, acalc_eval};
 // `LINK_CON` (= 3, the `Constant` link-status index) is the value C
 // `init_record` writes for an unconfigured link; shared with `calcout`.
 use super::link_status::{
-    LINK_CON, LINK_EXT_OK, LINK_LOC, LinkCheck, LinkCheckSpec, LinkCheckState, LinkRole, LinkRule,
-    LinkStatusGen, LinkStatusPosts, post_link_status,
+    CheckBand, LINK_CON, LINK_EXT_OK, LINK_LOC, LinkCheck, LinkCheckSpec, LinkCheckState, LinkRole,
+    LinkRule, LinkStatusGen, LinkStatusPosts, post_link_status,
 };
 use crate::server::database::AsyncDbHandle;
 use crate::server::recgbl::PutReport;
@@ -228,6 +228,7 @@ static ACALCOUT_LINK_CHECK: LinkCheckSpec = LinkCheckSpec {
     mask: crate::server::recgbl::EventMask::VALUE,
     repost_local: false,
     in_cycle: true,
+    band: CheckBand::Low,
 };
 const PA_NAMES: [&str; 12] = [
     "PA", "PB", "PC", "PD", "PE", "PF", "PG", "PH", "PI", "PJ", "PK", "PL",
@@ -2531,7 +2532,7 @@ impl Record for AcalcoutRecord {
         if link_field != "OUT" {
             return staged;
         }
-        if staged.count() > 1 && target.element_count > 1 {
+        if staged.count() > 1 && target.no_elements > 1 {
             return staged;
         }
         let scalar = if self.dopt == 1 { "OVAL" } else { "VAL" };

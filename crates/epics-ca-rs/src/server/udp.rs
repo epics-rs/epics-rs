@@ -1877,7 +1877,8 @@ mod responder_bind_tests {
             async move { run_udp_search_responder(&reactor, db, bound, 5064, Vec::new()).await }
         });
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline =
+            epics_libcom_rs::runtime::time::deadline_from_now(std::time::Duration::from_secs(10));
         while !table().contains("CAS-UDP") {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -1888,7 +1889,8 @@ mod responder_bind_tests {
         }
 
         task.abort();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline =
+            epics_libcom_rs::runtime::time::deadline_from_now(std::time::Duration::from_secs(10));
         while table().contains("CAS-UDP") {
             assert!(
                 std::time::Instant::now() < deadline,

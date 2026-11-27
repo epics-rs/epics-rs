@@ -19,19 +19,11 @@ use contract::*;
 
 fn main() {
     println!("cargo::rustc-check-cfg=cfg(rtems_boot_linked)");
-    println!("cargo::rerun-if-changed=csrc/boot_args.c");
-    println!("cargo::rerun-if-changed=csrc/boot_args.h");
-    println!("cargo::rerun-if-changed=csrc/rtems_config.c");
-    println!("cargo::rerun-if-changed=csrc/rtems_init.c");
-    println!("cargo::rerun-if-changed=csrc/rtems_shell_cmds.c");
-    println!("cargo::rerun-if-changed=csrc/rtems_stats.c");
-    println!("cargo::rerun-if-changed=src/contract.rs");
-    println!("cargo::rerun-if-env-changed={BSP_PREFIX_ENV}");
-    println!("cargo::rerun-if-env-changed={BSP_ENV}");
-    println!("cargo::rerun-if-env-changed={CMDLINE_ENV}");
-    println!("cargo::rerun-if-env-changed={KQUEUE_ENV}");
 
+    // Each `rerun-if` line sits at the read it declares. With none, Cargo
+    // would re-run the script on any change in the package.
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("rtems") {
+        println!("cargo::rerun-if-changed=build.rs");
         return;
     }
 
@@ -48,6 +40,8 @@ fn main() {
     // Unset prefix ⟹ the portability-check configuration: type-check only, no
     // toolchain required, and `lib.rs` leaves a self-naming undefined symbol so
     // the resulting objects cannot silently become a shimless image.
+    println!("cargo::rerun-if-env-changed={BSP_PREFIX_ENV}");
+    println!("cargo::rerun-if-env-changed={BSP_ENV}");
     let Some(prefix) = resolve_prefix() else {
         return;
     };
@@ -55,6 +49,12 @@ fn main() {
     let lib_dir = bsp_lib_dir(&prefix);
     let include_dir = bsp_include_dir(&prefix);
 
+    println!("cargo::rerun-if-changed=csrc/boot_args.c");
+    println!("cargo::rerun-if-changed=csrc/boot_args.h");
+    println!("cargo::rerun-if-changed=csrc/rtems_config.c");
+    println!("cargo::rerun-if-changed=csrc/rtems_init.c");
+    println!("cargo::rerun-if-changed=csrc/rtems_shell_cmds.c");
+    println!("cargo::rerun-if-changed=csrc/rtems_stats.c");
     let mut build = cc::Build::new();
     build
         // Compiled here as well as by `scripts/csrc-check.sh`: the gate proves
@@ -84,7 +84,10 @@ fn main() {
 
     // `cc` cannot guess a cross compiler for a tier-3 triple. An explicit
     // CC_armv7_rtems_eabihf wins if the operator set one; otherwise take the
-    // driver from the same prefix everything else is derived from.
+    // driver from the same prefix everything else is derived from. `cc` reads
+    // and declares neither variable once a compiler is set, so this does.
+    println!("cargo::rerun-if-env-changed=CC_armv7_rtems_eabihf");
+    println!("cargo::rerun-if-env-changed=CC_armv7-rtems-eabihf");
     if std::env::var_os("CC_armv7_rtems_eabihf").is_none()
         && std::env::var_os("CC_armv7-rtems-eabihf").is_none()
     {
@@ -146,6 +149,8 @@ const BOOT_CMDLINE_CAPACITY: usize = 1024;
 /// name inside `EPICS_RTEMS_CMDLINE` comes later and wins: `boot_args` applies
 /// assignments in the order they appear.
 fn boot_cmdline() -> Option<String> {
+    println!("cargo::rerun-if-env-changed={KQUEUE_ENV}");
+    println!("cargo::rerun-if-env-changed={CMDLINE_ENV}");
     let mut line = String::new();
     if let Ok(kqueue) = std::env::var(KQUEUE_ENV) {
         let kqueue = kqueue.trim();

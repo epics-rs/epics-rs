@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::runtime::time::deadline_after;
 use crate::server::database::PvDatabase;
 use crate::types::{DbFieldType, EpicsValue};
 use epics_libcom_rs::cfmt::CFloat;
@@ -1712,12 +1713,12 @@ impl ListState {
         }
 
         if self.save_state & SaveStrategy::PERIODIC != 0 {
-            self.periodic_due = Some(now + self.set.period());
+            self.periodic_due = Some(deadline_after(now, self.set.period()));
             self.callback_time = now;
         }
         self.save_state &= !SINGLE_EVENTS;
         if self.save_state & SaveStrategy::MONITORED == SaveStrategy::MONITORED {
-            self.monitor_due = Some(now + self.set.monitor_period());
+            self.monitor_due = Some(deadline_after(now, self.set.monitor_period()));
             self.save_state &= !SaveStrategy::MONITORED;
             self.callback_time = now;
         }
@@ -1828,7 +1829,7 @@ impl ListState {
         }
         self.set.set_status_text("Enabling list...");
         if method & SaveStrategy::PERIODIC != 0 && self.enabled & SaveStrategy::PERIODIC == 0 {
-            self.periodic_due = Some(now + self.set.period());
+            self.periodic_due = Some(deadline_after(now, self.set.period()));
             self.enabled |= SaveStrategy::PERIODIC;
             self.callback_time = now;
         }
@@ -1900,7 +1901,7 @@ impl ListState {
                     "save_restore:enable_list: done calling ca_add_event for list channels"
                 );
             }
-            self.monitor_due = Some(now + self.set.monitor_period());
+            self.monitor_due = Some(deadline_after(now, self.set.monitor_period()));
             self.enabled |= SaveStrategy::MONITORED;
             self.callback_time = now;
         }
@@ -1965,7 +1966,10 @@ mod tests {
         let checks: Vec<bool> = [4, 6, 7, 10, 12]
             .into_iter()
             .map(|s| {
-                clock.check_seq(start + Duration::from_secs(s), period);
+                clock.check_seq(
+                    crate::runtime::time::deadline_after(start, Duration::from_secs(s)),
+                    period,
+                );
                 clock.seq_check
             })
             .collect();
@@ -1979,9 +1983,15 @@ mod tests {
         let start = Instant::now();
         let mut clock = TaskClock::new(start);
         let nfs = super::super::nfs::NfsHost::default();
-        let ok = clock.nfs_status(&nfs, start + Duration::from_secs(1));
+        let ok = clock.nfs_status(
+            &nfs,
+            crate::runtime::time::deadline_after(start, Duration::from_secs(1)),
+        );
         assert_eq!((ok.code, ok.text.as_str()), (SrStatus::Ok, "NFS remounted"));
-        let failed = clock.nfs_status(&nfs, start + Duration::from_secs(61));
+        let failed = clock.nfs_status(
+            &nfs,
+            crate::runtime::time::deadline_after(start, Duration::from_secs(61)),
+        );
         assert_eq!(
             (failed.code, failed.text.as_str()),
             (SrStatus::Fail, "NFS failed!")
@@ -2030,7 +2040,7 @@ mod tests {
         let mut out = Vec::new();
         for secs in [61, 122] {
             for list in &mut lists {
-                let now = start + Duration::from_secs(secs);
+                let now = crate::runtime::time::deadline_after(start, Duration::from_secs(secs));
                 assert!(list.pass(&db, now, &stop, &mgr, &mut clock).await);
             }
             let dated = |name: &str| {
@@ -2086,7 +2096,7 @@ mod tests {
         let start = Instant::now();
         let mut clock = TaskClock::new(start);
         let (_tx, stop) = watch::channel(false);
-        let now = start + Duration::from_secs(100);
+        let now = crate::runtime::time::deadline_after(start, Duration::from_secs(100));
         clock.check_seq(now, settings.seq_period());
         for (set, lock) in mgr.sets() {
             set.save_once(&db).await.unwrap();
@@ -2154,7 +2164,7 @@ mod tests {
             assert!(
                 list.pass(
                     &db,
-                    start + Duration::from_secs(*secs),
+                    crate::runtime::time::deadline_after(start, Duration::from_secs(*secs)),
                     &stop,
                     &mgr,
                     &mut clock,

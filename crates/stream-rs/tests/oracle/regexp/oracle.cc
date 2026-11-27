@@ -1,5 +1,5 @@
 // RegexpConverter.cc called the way StreamCore calls it, for
-// tests/regexp_converter.rs (see run-c.sh).
+// tests/integration/regexp_converter.rs (see run-c.sh).
 //
 // Each stdin line is mode<TAB>format<TAB>arg[<TAB>n]. The format starts at
 // its '%'; a \xNN in it is that byte. Mode p parses it as an output format

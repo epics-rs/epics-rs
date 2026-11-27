@@ -286,8 +286,10 @@ pub fn spawn_softioc_with_acf(db_content: &str, acf_content: &str) -> ManagedIoc
 ///
 /// For the one caller whose subject is the number itself — an IOC restarting
 /// where the first one was — so a fresh candidate would be a different test.
-/// A steal is a failure here rather than a retry, and it fails saying so
-/// instead of leaving a client to time out against a stranger's socket.
+/// The caller holds the number ([`named_port::HeldPort::tcp_and_udp`]), which
+/// is otherwise any socket's while no IOC has it. A steal is a failure here
+/// rather than a retry, and it fails saying so instead of leaving a client to
+/// time out against a stranger's socket.
 pub fn spawn_softioc_on(db_content: &str, port: u16) -> ManagedIoc {
     let db_path = db_file(db_content);
     softioc_on(&db_path, None, port).unwrap_or_else(|| {

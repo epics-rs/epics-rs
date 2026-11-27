@@ -5,7 +5,7 @@
 use std::path::Path;
 
 use crate::calc::engine::string::{escaped_from_raw, raw_from_escaped};
-use crate::runtime::stdlib::strtod;
+use crate::runtime::stdlib::{c_isspace, strtod};
 use crate::server::database::{ClientChannel, Connection, PvDatabase};
 use crate::server::record::record_instance::value_as_dbr_string;
 use crate::types::c_parse::atoi;
@@ -323,14 +323,12 @@ pub async fn do_as_verify(
             continue;
         }
         // sscanf(bp, "%80s%c%[^\n\r]", PVname, &c, value_string)
-        let start = bp
-            .iter()
-            .position(|c| !c.is_ascii_whitespace())
-            .unwrap_or(bp.len());
+        let space = |c: &u8| c_isspace(char::from(*c));
+        let start = bp.iter().position(|c| !space(c)).unwrap_or(bp.len());
         let name_len = bp[start..]
             .iter()
             .take(80)
-            .take_while(|c| !c.is_ascii_whitespace())
+            .take_while(|c| !space(c))
             .count();
         if name_len == 0 {
             // C's sscanf assigns nothing, so it checks the previous line's PV

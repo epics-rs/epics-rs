@@ -2,7 +2,8 @@
 //!
 //! `cargo run -p ioc-spawn-gate --bin ioc-spawn-census`. This is what the
 //! filters in `.config/nextest.toml` have to cover between them; the gate in
-//! `tests/ioc_spawn_gate.rs` is the same scan with the coverage check applied.
+//! `tests/integration/ioc_spawn_gate.rs` is the same scan with the coverage
+//! check applied.
 
 fn main() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

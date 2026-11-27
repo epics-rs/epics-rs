@@ -265,7 +265,8 @@ fn probe_bind(ty: Type, port: u16) -> std::io::Result<()> {
 /// `bind(0)` or by `connect()`; what else may bind beside it is the
 /// constructor's choice.
 pub struct HeldPort {
-    /// The hold, then any socket that keeps it in place (its peer).
+    /// The holds on the number, and any socket that keeps one in place (its
+    /// peer).
     holds: Vec<Socket>,
     pub port: u16,
 }
@@ -286,16 +287,43 @@ impl HeldPort {
     /// Darwin and the BSDs would drop its SYN, so there the hold is
     /// connected to a loopback peer it keeps (`BSD_PCB_LOOKUP`).
     pub fn tcp() -> Self {
-        let hold = Socket::new(Domain::IPV4, Type::STREAM, None).expect("open a TCP hold");
+        Self::tcp_on(0).expect("bind the TCP hold")
+    }
+
+    /// [`HeldPort::tcp`] on `port` (0: the kernel's pick).
+    fn tcp_on(port: u16) -> std::io::Result<Self> {
+        let hold = Socket::new(Domain::IPV4, Type::STREAM, None)?;
         #[cfg(unix)]
-        hold.set_reuse_address(true)
-            .expect("SO_REUSEADDR on the hold");
-        let held = Self::bind(hold);
-        if BSD_PCB_LOOKUP {
+        hold.set_reuse_address(true)?;
+        hold.bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)).into())?;
+        let held = Self::of(vec![hold]);
+        Ok(if BSD_PCB_LOOKUP {
             held.connected()
         } else {
             held
+        })
+    }
+
+    /// A number for C's CA server, which binds it on TCP and UDP and
+    /// restarts on it: [`HeldPort::tcp`] and [`HeldPort::udp`] on one
+    /// number. rsrv binds its listener beside them with `SO_REUSEADDR`
+    /// (`rsrv_grab_tcp`) and its UDP socket with the datagram fanout options
+    /// (`epicsSocketEnableAddressUseForDatagramFanout`), both on its
+    /// interface address, which a search sent there matches before the
+    /// wildcard hold.
+    pub fn tcp_and_udp() -> Self {
+        for _ in 0..ATTEMPTS {
+            let mut udp = Self::udp();
+            match Self::tcp_on(udp.port) {
+                Ok(mut held) => {
+                    held.holds.append(&mut udp.holds);
+                    return held;
+                }
+                Err(e) if port_held(&e) => {}
+                Err(e) => panic!("bind the TCP hold on {}: {e}", udp.port),
+            }
         }
+        panic!("the number of each of {ATTEMPTS} UDP holds was taken on TCP");
     }
 
     /// A UDP number for a socket under test that sets the datagram fanout
@@ -303,21 +331,23 @@ impl HeldPort {
     /// so a plain bind on any address is refused, which would otherwise fail
     /// the subject's wildcard bind. Linux: `SO_REUSEADDR` alone, outside the
     /// subject's `SO_REUSEPORT` group, so unicast goes to the later-bound
-    /// subject and none is hashed to the hold. Darwin and the BSDs share a
-    /// UDP address only when both sides set `SO_REUSEPORT`, and the hold is
-    /// connected (`BSD_PCB_LOOKUP`); a plain bind on another address then
-    /// binds there, and cannot fail the subject's: their `SO_REUSEADDR`
-    /// bind looks only at unconnected sockets on its own address. Windows
-    /// hands unicast to the older of two `SO_REUSEADDR` wildcard binds, and
-    /// to a connected hold as the better match for its local address, so
-    /// there the hold is only for a subject that is sent nothing.
+    /// subject and none is hashed to the hold; on a number outside
+    /// `ip_local_port_range`, which no `bind(0)` is handed. Darwin and the
+    /// BSDs share a UDP address only when both sides set `SO_REUSEPORT`, and
+    /// the hold is connected (`BSD_PCB_LOOKUP`); a plain bind on another
+    /// address then binds there, and cannot fail the subject's: their
+    /// `SO_REUSEADDR` bind looks only at unconnected sockets on its own
+    /// address. Windows hands unicast to the older of two `SO_REUSEADDR`
+    /// wildcard binds, and to a connected hold as the better match for its
+    /// local address, so there the hold is only for a subject that is sent
+    /// nothing.
     pub fn udp() -> Self {
-        let hold = Socket::new(Domain::IPV4, Type::DGRAM, None).expect("open a UDP hold");
-        hold.set_reuse_address(true)
-            .expect("SO_REUSEADDR on the hold");
-        #[cfg(all(unix, not(target_os = "linux")))]
-        hold.set_reuse_port(true).expect("SO_REUSEPORT on the hold");
-        let held = Self::bind(hold);
+        let held = Self::fanout_udp(|hold| {
+            hold.set_reuse_address(true)?;
+            #[cfg(all(unix, not(target_os = "linux")))]
+            hold.set_reuse_port(true)?;
+            Ok(())
+        });
         if BSD_PCB_LOOKUP {
             // The discard port: a peer nothing sends from.
             let discard = SocketAddr::from((Ipv4Addr::LOCALHOST, 9));
@@ -332,15 +362,39 @@ impl HeldPort {
     /// before its bind (`SO_REUSEADDR` where the platform has no
     /// `SO_REUSEPORT`), so the hold has to be a member of that group. It is
     /// unconnected and so takes a share of the group's unicast: only for a
-    /// test that binds the number and sends nothing to it.
+    /// test that binds the number and sends nothing to it. On Linux, on a
+    /// number outside `ip_local_port_range`, which no `bind(0)` is handed.
     pub fn reuse_port_udp() -> Self {
+        Self::fanout_udp(|hold| {
+            #[cfg(unix)]
+            hold.set_reuse_port(true)?;
+            #[cfg(not(unix))]
+            hold.set_reuse_address(true)?;
+            Ok(())
+        })
+    }
+
+    /// A UDP hold on the wildcard with the reuse options `share` sets.
+    ///
+    /// Linux hands a `bind(0)` that sets reuse options first a number held
+    /// only by sockets that share with it (`udp_lib_lport_inuse`), and binds
+    /// it into a same-user `SO_REUSEPORT` group there, which then takes a
+    /// hashed share of the subject's unicast — whichever of the hold and the
+    /// stranger bound first, and options set after a `bind(0)` still read as
+    /// shared. So there the hold binds plain, by name, on a number outside
+    /// `ip_local_port_range`, which no `bind(0)` on the host is handed, and
+    /// only then takes the options: a plain bind first is refused by another
+    /// hold on the number.
+    fn fanout_udp(share: impl Fn(&Socket) -> std::io::Result<()>) -> Self {
         let hold = Socket::new(Domain::IPV4, Type::DGRAM, None).expect("open a UDP hold");
-        #[cfg(unix)]
-        hold.set_reuse_port(true).expect("SO_REUSEPORT on the hold");
-        #[cfg(not(unix))]
-        hold.set_reuse_address(true)
-            .expect("SO_REUSEADDR on the hold");
-        Self::bind(hold)
+        if cfg!(target_os = "linux") {
+            bind_outside_autobind_range(&hold);
+            share(&hold).expect("the reuse options on the hold");
+            Self::of(vec![hold])
+        } else {
+            share(&hold).expect("the reuse options on the hold");
+            Self::bind(hold)
+        }
     }
 
     /// A TCP number nothing answers on: a connect is refused, and no plain
@@ -481,6 +535,38 @@ fn unanswered_on(lo: IpAddr, port: u16) -> std::io::Result<Vec<Socket>> {
     )?;
     assert!(queued, "the filler never reached the accept queue");
     Ok(vec![hold, filler])
+}
+
+/// Bind `hold` plain on the IPv4 wildcard, on a number in the IANA dynamic
+/// range outside Linux's `ip_local_port_range`; a number another socket
+/// holds is drawn again.
+fn bind_outside_autobind_range(hold: &Socket) {
+    use std::hash::BuildHasher;
+    const RANGE: &str = "/proc/sys/net/ipv4/ip_local_port_range";
+    let text = std::fs::read_to_string(RANGE).unwrap_or_else(|e| panic!("read {RANGE}: {e}"));
+    let [lo, hi]: [u16; 2] = text
+        .split_whitespace()
+        .map(|n| n.parse().unwrap_or_else(|e| panic!("{RANGE}: {n:?}: {e}")))
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap_or_else(|v| panic!("{RANGE}: {v:?}"));
+    let outside: Vec<u16> = (49152..=u16::MAX)
+        .filter(|p| !(lo..=hi).contains(p))
+        .collect();
+    assert!(
+        !outside.is_empty(),
+        "{RANGE} is {lo}-{hi}: a bind(0) can be handed every number in 49152-65535"
+    );
+    for _ in 0..64 {
+        let draw = std::collections::hash_map::RandomState::new().hash_one(());
+        let port = outside[(draw % outside.len() as u64) as usize];
+        match hold.bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)).into()) {
+            Ok(()) => return,
+            Err(e) if port_held(&e) => {}
+            Err(e) => panic!("bind the hold on {port}: {e}"),
+        }
+    }
+    panic!("64 numbers drawn outside {RANGE} {lo}-{hi} were all held");
 }
 
 #[cfg(windows)]
@@ -625,9 +711,14 @@ mod tests {
             .bind(&SocketAddr::from(([0, 0, 0, 0], held.port)).into())
             .unwrap();
         let subject = UdpSocket::from(subject);
-        subject
-            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
-            .unwrap();
+        let wait = if cfg!(windows) {
+            // absence-window: Windows hands the datagram to the hold, and the
+            // subject's read proves it got none.
+            std::time::Duration::from_secs(2)
+        } else {
+            fact_budget::FACT_BUDGET
+        };
+        subject.set_read_timeout(Some(wait)).unwrap();
         for _ in 0..if cfg!(windows) { 1 } else { 64 } {
             UdpSocket::bind("127.0.0.1:0")
                 .unwrap()
@@ -635,6 +726,43 @@ mod tests {
                 .unwrap();
             let got = subject.recv(&mut [0; 1]);
             assert_eq!(got.is_ok(), !cfg!(windows), "{got:?}");
+        }
+    }
+
+    /// A fanout `bind(0)` elsewhere on the host is never handed a UDP hold's
+    /// number, where it would join the subject's `SO_REUSEPORT` group and
+    /// take a hashed share of its unicast. `IP_LOCAL_PORT_RANGE` (Linux 6.3)
+    /// steers the stranger's draw at the number.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_fanout_bind_0_is_never_handed_a_udp_holds_number() {
+        use std::os::fd::AsRawFd;
+        /// `include/uapi/linux/in.h`; the libc crate lacks it.
+        const IP_LOCAL_PORT_RANGE: libc::c_int = 51;
+        for held in [HeldPort::udp(), HeldPort::reuse_port_udp()] {
+            let stranger = Socket::new(Domain::IPV4, Type::DGRAM, None).unwrap();
+            stranger.set_reuse_address(true).unwrap();
+            stranger.set_reuse_port(true).unwrap();
+            let only_the_held = u32::from(held.port) * 0x1_0001;
+            // SAFETY: a live socket, and the value outlives the call.
+            let rc = unsafe {
+                libc::setsockopt(
+                    stranger.as_raw_fd(),
+                    libc::IPPROTO_IP,
+                    IP_LOCAL_PORT_RANGE,
+                    (&only_the_held as *const u32).cast(),
+                    size_of::<u32>() as libc::socklen_t,
+                )
+            };
+            assert_eq!(rc, 0, "{}", std::io::Error::last_os_error());
+            stranger
+                .bind(&SocketAddr::from(([0, 0, 0, 0], 0)).into())
+                .unwrap();
+            let got = stranger.local_addr().unwrap().as_socket().unwrap().port();
+            assert_ne!(
+                got, held.port,
+                "a stranger's bind(0) took the hold's number"
+            );
         }
     }
 
@@ -652,6 +780,42 @@ mod tests {
             .bind(&SocketAddr::from(([127, 0, 0, 1], held.port)).into())
             .unwrap();
         assert!(plain_bind(Type::DGRAM, [0, 0, 0, 0], held.port).is_err());
+    }
+
+    /// A CA server binds both its sockets beside the hold each time it
+    /// starts on the number and is reached there, and while none runs a
+    /// plain bind takes the number on neither protocol.
+    #[test]
+    fn a_tcp_and_udp_hold_keeps_the_number_across_a_ca_server_restart() {
+        let held = HeldPort::tcp_and_udp();
+        let at = SocketAddr::from(([127, 0, 0, 1], held.port));
+        for _ in 0..2 {
+            for ty in [Type::STREAM, Type::DGRAM] {
+                assert!(plain_bind(ty, [0, 0, 0, 0], held.port).is_err(), "{ty:?}");
+            }
+            // As caservertask.c binds them on EPICS_CAS_INTF_ADDR_LIST.
+            let listener = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+            #[cfg(unix)]
+            listener.set_reuse_address(true).unwrap();
+            listener.bind(&at.into()).unwrap();
+            listener.listen(20).unwrap();
+            let search = Socket::new(Domain::IPV4, Type::DGRAM, None).unwrap();
+            #[cfg(unix)]
+            search.set_reuse_port(true).unwrap();
+            search.set_reuse_address(true).unwrap();
+            search.bind(&at.into()).unwrap();
+
+            std::net::TcpStream::connect(at).unwrap();
+            let search = UdpSocket::from(search);
+            search
+                .set_read_timeout(Some(fact_budget::FACT_BUDGET))
+                .unwrap();
+            UdpSocket::bind("127.0.0.1:0")
+                .unwrap()
+                .send_to(b"x", at)
+                .unwrap();
+            search.recv(&mut [0; 1]).unwrap();
+        }
     }
 
     /// A closed hold refuses a connect and every plain bind; a listener's

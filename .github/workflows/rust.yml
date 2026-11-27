@@ -8,12 +8,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # No debuginfo, not even line tables. The all-features test build on
-  # 12059ffc07 (1,674 test binaries) takes 109,470 MB with `line-tables-only`
-  # and 48,809 MB with 0; 17a131b3b's 69,114 MB was the last that fit. A full
-  # disk kills the runner's own diagnostic log, so the job log goes with it.
-  # Panics keep their file:line; backtrace frames do not.
-  CARGO_PROFILE_DEV_DEBUG: 0
 
 jobs:
   checks:
@@ -96,7 +90,7 @@ jobs:
   # through. A hand-kept list had omitted `epics-modbus-rs` (167 tests) and
   # `mqtt-rs` (111), and a hand-kept *feature* half enrolled a crate only if
   # the feature happened to be spelled `ioc` or `epics` — which missed
-  # `epics-base-rs/tests/client_server.rs` (`#![cfg(feature =
+  # `epics-base-rs/tests/integration/client_server.rs` (`#![cfg(feature =
   # "ca-server-tls-test")]`) entirely, letting an `E0308` in it survive from
   # before 70b4a74b until 0909e7cb.
   all-features:
@@ -165,9 +159,10 @@ jobs:
   # migration exists to remove and would be worse here than before: a green
   # job reporting on a backend it never built. So the name appears once, at
   # `env:` on the job rather than on each step, and the first step is a run
-  # that CANNOT pass on the hosted backend. Every `tests/rtems_exec_model_gate.rs`
-  # is `#![cfg(exec_backend)]`, so on the wrong backend nextest matches no test
-  # and exits non-zero rather than reporting "0 passed".
+  # that CANNOT pass on the hosted backend. Every
+  # `tests/integration/rtems_exec_model_gate.rs` is `#![cfg(exec_backend)]`, so
+  # on the wrong backend nextest matches no test and exits non-zero rather than
+  # reporting "0 passed".
   #
   # The doc row lives here too, for the same one-name reason. It was previously
   # covered by the `rustdoc` job's `--all-features` row, which turned on
@@ -206,7 +201,7 @@ jobs:
         python3 -c 'import socket; s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM); s.bind(("::1", 0)); s.sendto(b"x", s.getsockname())'
         ip -4 -o addr show scope global up | grep -q .
     - name: The exec backend is what this job actually built
-      run: cargo nextest run --profile ci --workspace -E 'binary(rtems_exec_model_gate)'
+      run: cargo nextest run --profile ci --workspace -E 'binary(integration) & test(/^rtems_exec_model_gate::/)'
     - name: Workspace on the exec backend
       run: cargo nextest run --profile ci --workspace
     - name: Clippy on the exec backend
@@ -601,7 +596,8 @@ jobs:
         exit "$rc"
 
   # raw_float_format (lints/raw_float_format) needs a format argument's type,
-  # which only a rustc_private lint sees, so it runs on the nightly its
+  # and instant_add_duration (lints/instant_add_duration) an operator's, which
+  # only a rustc_private lint sees, so they run on the nightly their
   # rust-toolchain.toml pins while the workspace stays on stable. That pin must
   # be a rust-clippy sync date: dylint_driver registers the clippy_utils
   # symbols of the nearest sync, and on any other nightly rustc panics on the
@@ -624,9 +620,29 @@ jobs:
     - name: Lint UI tests
       working-directory: lints/raw_float_format
       run: cargo test
-    - name: raw_float_format
-      run: cargo dylint --all --workspace -- --all-features --keep-going
-    - name: raw_float_format (thread backend)
+    - name: instant_add_duration UI tests
+      working-directory: lints/instant_add_duration
+      run: cargo test
+    - name: dylint lints
+      run: cargo dylint --all --workspace -- --all-features --all-targets --keep-going
+    - name: dylint lints (thread backend)
       env:
         EPICS_RS_BUILD_EXEC_BACKEND: thread
-      run: cargo dylint --all --workspace -- --all-features --keep-going
+      run: cargo dylint --all --workspace -- --all-features --all-targets --keep-going
+
+  # A fixed sleep or a literal timeout in a test is a bet on the runner's
+  # speed. Test code held 2823 of them at 451531667, so the gate counts only
+  # what a change adds over its merge base, and needs the history to find it.
+  fixed-wait:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: 1.99.0
+    - name: No fixed wait added to a test
+      env:
+        BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+      run: cargo run -q -p fixed-wait-gate -- "$BASE"

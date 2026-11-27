@@ -705,7 +705,7 @@ impl PvaLinkResolver {
         };
         // Poll the link's read() — succeeds once the monitor has
         // delivered at least one event.
-        let deadline = std::time::Instant::now() + timeout;
+        let deadline = epics_base_rs::runtime::time::deadline_from_now(timeout);
         loop {
             if link.read().await.is_ok() {
                 return true;
@@ -729,14 +729,10 @@ impl PvaLinkResolver {
 /// target, where the pre-open of `RTEMS:PVA:UPLNK` was believed to be failing
 /// (it was in fact never attempted — `44c4ef3e`).
 ///
-/// `eprintln!` rather than `tracing::warn!` deliberately, on two grounds:
-/// pvxs reports the `local` refusal with `fprintf(stderr, …)`
-/// (`ioc/pvalink_lset.cpp:71-72`), and the sibling QSRV group loader in this
-/// crate already reports config-load failures the same way
-/// (`qsrv/group_config.rs`, `qsrv/provider.rs:1071`). It is also the only
-/// path that reaches an RTEMS console: the target installs no `tracing`
-/// subscriber, so a `warn!` here would be discarded exactly like the
-/// diagnostic it replaces.
+/// Through errlog, as pvxs's `pvaOpenLink` reports a failed open
+/// (`ioc/pvalink_lset.cpp:47-48`), so `eltc` and an iocLog server see it;
+/// not `tracing`, which reaches no RTEMS console (the target installs no
+/// subscriber).
 fn report_open_failure(
     record: &[u8],
     field: &str,
@@ -750,9 +746,9 @@ fn report_open_failure(
         Err(PvaLinkError::NotLocal(_)) => {}
         // `pvaOpenLink`'s empty-name early-out prints nothing (`:97-98`).
         Err(PvaLinkError::Config(PvaLinkParseError::EmptyPv)) => {}
-        Err(e) => epics_base_rs::stderr_println!(
-            "{record}.{field} Error: pvalink to '{channel}' not opened: {e}"
-        ),
+        Err(e) => epics_base_rs::runtime::log::errlog_vprintf(format_args!(
+            "{record}.{field} Error: pvalink to '{channel}' not opened: {e}\n"
+        )),
     }
 }
 
@@ -1377,10 +1373,10 @@ impl LinkSet for PvaLinkResolver {
     /// and signals.
     fn forward_handle(&self, link: LinkRef<'_>) -> Box<dyn LinkForward> {
         let Some(full) = link_text(link.name) else {
-            epics_base_rs::stderr_println!(
-                "pvalink: link name is not UTF-8: {}",
+            epics_base_rs::runtime::log::errlog_vprintf(format_args!(
+                "pvalink: link name is not UTF-8: {}\n",
                 String::from_utf8_lossy(link.name)
-            );
+            ));
             return Box::new(RefusedForward);
         };
         // A forward link shares the monitor-backed channel a value INP
@@ -4892,6 +4888,50 @@ mod tests {
                 "Disconn".to_string(),
             )
         );
+    }
+
+    /// The errlog messages `f` posted, as a listener (the iocLog client
+    /// among them) receives them.
+    fn errlog_of(f: impl FnOnce()) -> Vec<String> {
+        use epics_base_rs::runtime::log;
+        let heard = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = heard.clone();
+        let id = log::errlog_add_listener(move |m| sink.lock().unwrap().push(m.to_string()));
+        f();
+        log::errlog_flush();
+        log::errlog_remove_listener(id);
+        heard.lock().unwrap().clone()
+    }
+
+    /// pvxs `pvaOpenLink`'s failure line is errlog's (`pvalink_lset.cpp:47-48`).
+    #[test]
+    fn a_link_not_opened_is_reported_through_errlog() {
+        let lines = errlog_of(|| {
+            report_open_failure(
+                b"R",
+                "INP",
+                "X",
+                Err(PvaLinkError::Config(PvaLinkParseError::BadOption(
+                    "q".into(),
+                ))),
+            )
+        });
+        assert_eq!(
+            lines,
+            [
+                "R.INP Error: pvalink to 'X' not opened: link config parse error: \
+                 invalid option: \"q\"\n"
+            ]
+        );
+    }
+
+    /// A forward link this lset cannot open is reported through errlog, as
+    /// pvxs's lset reports a callback that fails (`pvalink_lset.cpp:47-48`).
+    #[epics_macros_rs::epics_test]
+    async fn a_forward_link_not_opened_is_reported_through_errlog() {
+        let resolver = PvaLinkResolver::new(crate::test_reactor());
+        let lines = errlog_of(|| drop(resolver.forward_handle(lref(b"A\xff"))));
+        assert_eq!(lines, ["pvalink: link name is not UTF-8: A\u{fffd}\n"]);
     }
 }
 

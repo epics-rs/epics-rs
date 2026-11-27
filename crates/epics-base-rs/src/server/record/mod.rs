@@ -55,8 +55,8 @@ pub use link::{
     pvajson_identity_key, pvajson_identity_parts,
 };
 pub(crate) use link::{
-    DbLinkAnswer, LinkList, LinkLookup, ReportLine, check_json_link_text_in, implemented_jlif,
-    trim_link_text, warn_discarded_cp,
+    DbLinkAnswer, LinkList, LinkLookup, ReportLine, ShadowedField, check_json_link_text_in,
+    implemented_jlif, trim_link_text, warn_discarded_cp,
 };
 pub use menu_choices::{
     Ftype, MENU_ALARM_SEVR, MENU_ALARM_STAT, MENU_CONVERT, MENU_FTYPE, MENU_IVOA, MENU_OMSL,
@@ -83,11 +83,11 @@ pub use record_trait::{
     ConstantInitLink, ContextSubroutineFn, CycleCell, CycleHooks, CycleList, CycleMarks,
     CyclePostMask, CycleRead, CycleValue, DeadbandCells, DeclaredFields, DeclaredStore,
     DelayedCallback, DelayedCallbackOutcome, DolStatus, EPICS_TIME_EVENT_DEVICE_TIME, EnumSlots,
-    FORCE_GENERAL, FieldDeclaration, FieldDesc, FieldMetadataOverride, FieldSlot, InitLinkReads,
-    InputFetchPolicy, InputLinkRequest, LinkRead, LinkReadAs, MonitorDeadbandCells,
-    MonitorValueClasses, MonitorValueGate, OutTarget, OutView, OwnFrame, OwnRecord, Pact, PostName,
-    PostStage, PostTable, PostedValue, ProcessAction, ProcessActions, ProcessContext,
-    ProcessOutcome, ProcessSnapshot, ProcessStatusRule, RawSoftEntry, Record, RecordProcessResult,
+    FORCE_GENERAL, FieldDeclaration, FieldDesc, FieldMetadataOverride, FieldSlot, InputFetchPolicy,
+    InputLinkRequest, LinkRead, LinkReadAs, MonitorDeadbandCells, MonitorValueClasses,
+    MonitorValueGate, OutTarget, OutView, OwnFrame, OwnRecord, Pact, PostName, PostStage,
+    PostTable, PostedValue, ProcessAction, ProcessActions, ProcessContext, ProcessOutcome,
+    ProcessSnapshot, ProcessStatusRule, RawSoftEntry, Record, RecordProcessResult,
     ResolvedInputLinks, ReturnPact, SecondaryTake, SeedGuard, SharedAfterWork, SimmCells, SlotMut,
     SlotRef, SoftStatus, Special, StampPoint, Subroutine, SubroutineFn, ValuePostGate, ValueView,
     arg_letter_offset, arg_link_field, calc_class_link_backed_metadata_field, coerce_put_value,

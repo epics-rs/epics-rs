@@ -5767,7 +5767,8 @@ ASG(DEFAULT) {
             )
             .nsec_mask
         });
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline =
+            epics_libcom_rs::runtime::time::deadline_from_now(std::time::Duration::from_secs(10));
         while !door.is_finished() && std::time::Instant::now() < deadline {
             epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(10)).await;
         }
@@ -8344,7 +8345,7 @@ record(ai, "linked") { field(INP, "ai.VAL CP") info(Q:form, "String") }
             })
         };
         let asked = [ask("ai"), ask("lso.VAL"), ask("wfC"), ask("lso.VAL$")];
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(10));
         while !asked.iter().all(|t| t.is_finished()) {
             assert!(
                 Instant::now() < deadline,

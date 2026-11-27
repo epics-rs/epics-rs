@@ -15,28 +15,30 @@ pub struct ServerStats {
     pub connects_total: std::sync::atomic::AtomicU64,
     pub disconnects_total: std::sync::atomic::AtomicU64,
     pub started_at: std::sync::OnceLock<std::time::Instant>,
-    /// Total bytes received from clients since startup. Incremented
-    /// by `handle_client` on every TCP read. Mirrors the
-    /// `caServerBytes_in` counter from PR #592's `dbServerStats`.
+    /// Total bytes received from clients since startup, counted on every
+    /// TCP read by the circuit's `CircuitActivity` on both drivers. Mirrors
+    /// the `caServerBytes_in` counter from PR #592's `dbServerStats`.
     pub bytes_in: std::sync::atomic::AtomicU64,
     /// Total bytes sent to clients since startup. Mirrors
-    /// `caServerBytes_out`. Updated when the per-client BufWriter
-    /// reports successful flushes; CA over TLS counts post-decrypt
-    /// plaintext (the rustls handshake bytes are not surfaced).
+    /// `caServerBytes_out`. Updated by each write to a client socket;
+    /// CA over TLS counts post-decrypt plaintext (the rustls handshake
+    /// bytes are not surfaced).
     pub bytes_out: std::sync::atomic::AtomicU64,
     /// Total CREATE_CHAN successes across the server lifetime.
     /// PR #592's `caServerChannelCount` minus the closes (which we
     /// track separately so the open-channel count is computable).
+    /// This and the three below count the circuit's channel table on
+    /// both drivers.
     pub channels_opened_total: std::sync::atomic::AtomicU64,
-    /// Total CLEAR_CHANNEL successes. Subtract from
-    /// `channels_opened_total` for the live channel count.
+    /// Total channels closed, by CLEAR_CHANNEL, destruction or
+    /// disconnect. Subtract from `channels_opened_total` for the live
+    /// channel count.
     pub channels_closed_total: std::sync::atomic::AtomicU64,
     /// Total successful EVENT_ADD setups. Mirrors
     /// `caServerSubscriptionCount`.
     pub subscriptions_opened_total: std::sync::atomic::AtomicU64,
-    /// Total successful EVENT_CANCEL / channel-close subscription
-    /// teardowns. Subtract from opened for the live subscription
-    /// count.
+    /// Total subscriptions closed, by EVENT_CANCEL or with their
+    /// channel. Subtract from opened for the live subscription count.
     pub subscriptions_closed_total: std::sync::atomic::AtomicU64,
     /// Cumulative monitor events posted to client subscriptions since
     /// startup — counted once per subscription update the server

@@ -30,13 +30,14 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use epics_base_rs::error::{CaError, CaResult};
-use epics_base_rs::server::database::{AsyncDbHandle, ProcessCallback};
+use epics_base_rs::server::database::{AsyncDbHandle, ProcessCallback, RecordBand};
 use epics_base_rs::server::recgbl::{alarm_status, rec_gbl_set_sevr};
 use epics_base_rs::server::record::{
     AlarmSeverity, CommonFields, CycleHooks, CycleMarks, CyclePostMask, FieldDeclaration,
     FieldMetadataOverride, ProcessOutcome, Record, RecordProcessResult, ScanType,
 };
 use epics_base_rs::types::{DbFieldType, EpicsValue};
+use epics_libcom_rs::runtime::background::{CallbackBody, CallbackCell};
 
 use crate::drivers::option_parse::{is_option_key, option_key};
 use crate::error::{AsynError, AsynResult, AsynStatus};
@@ -526,15 +527,11 @@ pub struct AsynRecord {
     /// The name as the asyn trace prints it, made once here so the cycle
     /// that copies it into its I/O plan never re-validates the bytes.
     trace_name: String,
-    /// The callback band this record's `PRIO` selects, refreshed from
-    /// `ProcessContext` before every `process()`. C asyn device support
-    /// completes through
-    /// `callbackRequestProcessCallback(&pPvt->callback, pPvt->pr->prio, pPvt->pr)`
-    /// — the record's own PRIO picks the queue the re-entry runs on. Low until
-    /// the first cycle, the band an unwritten `PRIO` already has.
-    callback_priority: epics_libcom_rs::runtime::task::CallbackPriority,
+    /// The record's `PRIO` band, which each request carries and reads as it
+    /// completes: C's `callbackRequestProcessCallback(..., pasynRec->prio, ...)`.
+    band: RecordBand,
     /// The `asynCallbackSpecial` requests queued on a blocking port.
-    special_lane: Arc<SpecialLane>,
+    special_lane: Arc<CallbackCell<SpecialLane>>,
     /// The record's `asynCallbackSpecial` requests — see
     /// [`Self::special_request`].
     special_cells: Vec<SpecialCell>,
@@ -921,8 +918,8 @@ impl Default for AsynRecord {
             drv_user: None,
             async_ctx: None,
             trace_name: String::new(),
-            callback_priority: epics_libcom_rs::runtime::task::CallbackPriority::Low,
-            special_lane: Arc::default(),
+            band: RecordBand::default(),
+            special_lane: CallbackCell::new(SpecialLane::default()),
             special_cells: Vec::new(),
             process_job: Arc::default(),
             process_cell: None,
@@ -968,7 +965,7 @@ struct ProcessJob {
 struct ProcessRequest {
     plan: IoPlan,
     /// C `callbackRequestProcessCallback(..., pasynRec->prio, ...)`.
-    prio: epics_libcom_rs::runtime::task::CallbackPriority,
+    band: RecordBand,
     /// C `asynCallbackProcess`'s `canBlock` test (asynRecord.c:828-831): only
     /// a queued cycle ends in the re-process; one `queueRequest` ran in place
     /// is applied by its caller.
@@ -979,7 +976,7 @@ impl Default for ProcessRequest {
     fn default() -> Self {
         Self {
             plan: IoPlan::default(),
-            prio: epics_libcom_rs::runtime::task::CallbackPriority::Low,
+            band: RecordBand::default(),
             queued: false,
         }
     }
@@ -1013,14 +1010,13 @@ impl CellBody for ProcessJob {
     fn done(self: Arc<Self>) {
         let (prio, queued) = {
             let request = self.request.lock();
-            (request.prio, request.queued)
+            (request.band.priority(), request.queued)
         };
         if !queued {
             return;
         }
         if let Some(cb) = self.reentry.lock().as_ref() {
-            // asynRecord ignores the status (asynRecord.c:830-831).
-            let _ = cb.request(prio);
+            cb.request(prio);
         }
     }
 }
@@ -2218,7 +2214,7 @@ struct SpecialRequest {
     /// `setEos`'s terminator, `dbTranslateEscape`d.
     eos: Vec<u8>,
     /// C `callbackRequestProcessCallback(..., pasynRec->prio, ...)`.
-    prio: epics_libcom_rs::runtime::task::CallbackPriority,
+    band: RecordBand,
     /// Queued on a blocking port: the result goes to the [`SpecialLane`].
     /// Otherwise it ran in place and the put applies it.
     queued: bool,
@@ -2274,7 +2270,7 @@ impl Default for SpecialRequest {
             key: "",
             value: String::new(),
             eos: Vec::new(),
-            prio: epics_libcom_rs::runtime::task::CallbackPriority::Low,
+            band: RecordBand::default(),
             queued: false,
         }
     }
@@ -2408,7 +2404,7 @@ impl SpecialRequest {
 /// request the record wrote. The result goes to the record's [`SpecialLane`]
 /// before the cell is released, so a put that reuses the cell never meets it.
 struct SpecialBody {
-    lane: Arc<SpecialLane>,
+    lane: Arc<CallbackCell<SpecialLane>>,
     request: parking_lot::Mutex<SpecialRequest>,
     /// The result of a request that ran in place, for the put that ran it.
     ran_in_place: parking_lot::Mutex<Option<SpecialDone>>,
@@ -2418,10 +2414,10 @@ impl CellBody for SpecialBody {
     fn process(&self, port: &mut dyn PortCalls) {
         let (done, prio, queued) = {
             let request = self.request.lock();
-            (request.run(port), request.prio, request.queued)
+            (request.run(port), request.band.priority(), request.queued)
         };
         if queued {
-            self.lane.complete(done, prio);
+            SpecialLane::complete(&self.lane, done, prio);
         } else {
             *self.ran_in_place.lock() = Some(done);
         }
@@ -2430,7 +2426,7 @@ impl CellBody for SpecialBody {
     fn unrun(&self, why: Unrun) {
         let (queued_by, prio) = {
             let request = self.request.lock();
-            (request.what.queued_by(), request.prio)
+            (request.what.queued_by(), request.band.priority())
         };
         let e = match why {
             Unrun::Refused(e) => e,
@@ -2439,8 +2435,7 @@ impl CellBody for SpecialBody {
                 port: String::new(),
             },
         };
-        self.lane
-            .complete(SpecialDone::NeverRan(e, queued_by), prio);
+        SpecialLane::complete(&self.lane, SpecialDone::NeverRan(e, queued_by), prio);
     }
 
     fn done(self: Arc<Self>) {}
@@ -2517,12 +2512,13 @@ fn read_eos(port: &mut dyn PortCalls, user: &SpecialUser) -> (String, String) {
 }
 
 /// The record half of the `asynCallbackSpecial` requests the record queued on
-/// a blocking port. C's port thread runs each callback whole, in queue order
-/// (asynRecord.c:834-899); here the port half runs on the port's actor
-/// ([`SpecialBody`]), which hands its result over, and one drainer at
-/// a time applies the results under the record's hold in that order. The hold
-/// is never taken on the actor thread: a record holding it may be waiting on
-/// that actor.
+/// a blocking port. C's port thread runs each callback whole, record fields
+/// included, in queue order (asynRecord.c:834-899). Here the port half runs on
+/// the port's actor ([`SpecialBody`]), which hands its result over, and one
+/// drain at a time applies the results under the record's hold in that order,
+/// on the record's band: the hold is never taken on the actor thread, since a
+/// record holding it may be waiting on that actor. The drain is a
+/// [`CallbackCell`], so a full band delays it and never drops it.
 #[derive(Default)]
 struct SpecialLane {
     done: parking_lot::Mutex<SpecialQueue>,
@@ -2540,26 +2536,25 @@ struct SpecialQueue {
 }
 
 impl SpecialLane {
-    /// From the port's actor, as the callback ends: queue the result, and start
-    /// the drainer — C `callbackRequest` — unless it is running.
+    /// From the port's actor, as the callback ends: queue the result, and
+    /// request the drain unless one is running.
     fn complete(
-        self: &Arc<Self>,
+        lane: &Arc<CallbackCell<Self>>,
         done: SpecialDone,
         prio: epics_libcom_rs::runtime::task::CallbackPriority,
     ) {
-        let mut queue = self.done.lock();
+        let mut queue = lane.body().done.lock();
         queue.done.push_back(done);
         if std::mem::replace(&mut queue.draining, true) {
             return;
         }
         drop(queue);
-        let lane = Arc::clone(self);
-        epics_libcom_rs::runtime::task::spawn_blocking_background(prio, move |on| lane.drain(on));
+        if epics_libcom_rs::runtime::task::request_cell(prio, lane).is_err() {
+            lane.body().done.lock().draining = false;
+        }
     }
 
-    /// C's `callbackRequest` body: the band runs it, so it takes the band's
-    /// proof and the blocking seam cannot reach it.
-    fn drain(&self, _on: epics_libcom_rs::runtime::task::OnBand) {
+    fn drain(&self) {
         let record = self.record.lock().clone();
         loop {
             #[cfg(test)]
@@ -2592,6 +2587,12 @@ impl SpecialLane {
     #[cfg(test)]
     fn is_idle(&self) -> bool {
         !self.done.lock().draining
+    }
+}
+
+impl CallbackBody for SpecialLane {
+    fn run(&self) {
+        self.drain();
     }
 }
 
@@ -3223,7 +3224,8 @@ impl AsynRecord {
     /// Every special request queued so far has run and been applied.
     #[cfg(test)]
     fn specials_settled(&self) -> bool {
-        self.special_cells.iter().all(|s| !s.cell.is_outstanding()) && self.special_lane.is_idle()
+        self.special_cells.iter().all(|s| !s.cell.is_outstanding())
+            && self.special_lane.body().is_idle()
     }
 
     fn queue_port_request(&mut self, handle: PortHandle, special: SpecialCell) {
@@ -3276,7 +3278,10 @@ impl AsynRecord {
             None => {
                 let body = Arc::new(SpecialBody {
                     lane: Arc::clone(&self.special_lane),
-                    request: parking_lot::Mutex::default(),
+                    request: parking_lot::Mutex::new(SpecialRequest {
+                        band: self.band.clone(),
+                        ..SpecialRequest::default()
+                    }),
                     ran_in_place: parking_lot::Mutex::default(),
                 });
                 let cell = handle.new_cell(body.clone());
@@ -3294,7 +3299,6 @@ impl AsynRecord {
             request.user = self.special_user(queue);
             request.option = handle.has_interface(Registry::Option);
             request.octet = handle.has_interface(Registry::Octet);
-            request.prio = self.callback_priority;
         }
         special
     }
@@ -4375,7 +4379,6 @@ impl AsynRecord {
         let user = {
             let mut request = job.request.lock();
             self.fill_io_plan(&mut request.plan, gpib);
-            request.prio = self.callback_priority;
             request.queued = queued;
             io_user(&request.plan).with_priority(crate::port::QueuePriority::Low)
         };
@@ -4595,15 +4598,14 @@ impl Record for AsynRecord {
             let _ = db.put_pv_already_locked(held, passive);
         }));
         *self.process_job.reentry.lock() = Some(db.process_callback(&name));
-        *self.special_lane.record.lock() = Some((name.clone(), db.clone()));
+        *self.special_lane.body().record.lock() = Some((name.clone(), db.clone()));
         self.trace_name = name.to_string();
         self.async_ctx = Some((name, db));
     }
 
-    fn set_process_context(&mut self, ctx: &epics_base_rs::server::record::ProcessContext) {
-        // C re-reads `pPvt->pr->prio` on every completion, so a `PRIO` written
-        // between cycles moves the next one.
-        self.callback_priority = ctx.callback_priority;
+    fn set_record_band(&mut self, band: RecordBand) {
+        self.process_job.request.lock().band = band.clone();
+        self.band = band;
     }
 
     /// The `recGblSetSevr` calls in the `perform*IO` helpers raise a record alarm
@@ -5294,7 +5296,7 @@ impl Record for AsynRecord {
             // `wasQueued==true` analogue — and `done` requests the record's
             // `ProcessCallback`, as C's `special()` does (asynRecord.c:396-404).
             // A cancel that arrives after the port thread claimed it loses the
-            // CAS and is a no-op: the I/O completes and applies normally,
+            // CAS and waits for the I/O, which completes and applies normally,
             // matching C `cancelRequest` returning `wasQueued==0` once the
             // callback is active (asynManager.c:1647-1661). Either way that
             // callback's re-entry is the single owner that applies the outcome
@@ -5442,7 +5444,6 @@ impl Record for AsynRecord {
 
     fn cycle_hooks(&self) -> CycleHooks {
         CycleHooks::CYCLE_POSTED
-            .union(CycleHooks::CONTEXT)
             .union(CycleHooks::PROCESS_POSTED)
             .union(CycleHooks::WRITE_POSTED)
     }
@@ -9996,7 +9997,8 @@ mod tests {
         assert!(port.waits_cell.cancel(), "wasQueued");
         assert_eq!(*port.waits.0.lock().unwrap(), ["canceled"]);
         assert!(!port.waits_cell.is_outstanding());
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let deadline =
+            epics_libcom_rs::runtime::time::deadline_from_now(std::time::Duration::from_secs(2));
         while Arc::strong_count(&port.waits_cell) != 1 {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -11602,7 +11604,7 @@ mod tests {
         // Both requests run and release their cells while the drainer is held,
         // so their results are still unapplied.
         let lane = Arc::clone(&rec.special_lane);
-        let gate = lane.gate.lock();
+        let gate = lane.body().gate.lock();
         release.wait();
         while rec.special_cells.iter().any(|s| s.cell.is_outstanding()) {
             std::thread::yield_now();
@@ -11623,10 +11625,9 @@ mod tests {
     /// for `AQR` (asynRecord.c:393-408) calls `cancelRequest`; once the request
     /// has been dequeued and its callback is running, `cancelRequest` reports
     /// `wasQueued==0` and waits for the callback (asynManager.c:1647-1661), so
-    /// the I/O runs to completion and is reported normally — `AQR` does NOT
-    /// raise "I/O request canceled". Here the read is already parked in the
-    /// driver (the executor has claimed the token, `Running`) when `AQR` fires,
-    /// so the completion re-entry applies the device value, not CANCELED.
+    /// `AQR` returns with the I/O done, which is reported normally — `AQR`
+    /// does NOT raise "I/O request canceled". Here the read is already parked
+    /// in the driver when `AQR` fires, and is let go only while `AQR` waits.
     #[tokio::test]
     async fn aqr_after_driver_dequeue_runs_to_completion() {
         use crate::interrupt::InterruptManager;
@@ -11723,22 +11724,20 @@ mod tests {
             "the off-thread read must reach the driver before AQR"
         );
 
-        // AQR fires while the read is already running in the driver: the token
-        // is `Running`, so the cancel loses (C `wasQueued==0`). Release the
-        // parked read so the request completes.
+        // AQR fires while the read is already running in the driver: the
+        // cancel loses (C `wasQueued==0`) and waits for the read, which another
+        // thread lets go a little later.
+        let releaser = std::thread::spawn(move || {
+            // absence-window: an AQR that does not wait returns before the let-go.
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            release.wait();
+        });
         rec.special("AQR", true, &Default::default()).unwrap();
-        release.wait();
-
-        let job = Arc::clone(&rec.process_job);
-        let mut filled = false;
-        for _ in 0..2000 {
-            if job.outcome.lock().is_some() {
-                filled = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-        }
-        assert!(filled, "the running request still produces an outcome");
+        assert!(
+            rec.process_job.outcome.lock().is_some(),
+            "AQR returns only once the running read has finished"
+        );
+        releaser.join().unwrap();
 
         // Completion re-entry applies the device value: the cancel lost the
         // race (C `wasQueued==0`), so the I/O ran to completion and is reported
@@ -12025,10 +12024,11 @@ A.TMSK 1
 
         // A step's posts, then a settle window for any repeat.
         async fn settle(stream: &std::sync::Mutex<String>, lines: usize) {
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            let deadline =
+                epics_libcom_rs::runtime::task::deadline_from_now(Duration::from_secs(10));
             while stream.lock().unwrap().lines().count() < lines {
                 assert!(
-                    tokio::time::Instant::now() < deadline,
+                    epics_libcom_rs::runtime::task::Instant::now() < deadline,
                     "the step's posts arrive:\n{}",
                     stream.lock().unwrap()
                 );
@@ -12273,7 +12273,8 @@ A.OEOS
             let cell = db.get_record("A").unwrap();
             // The record's special requests have all completed.
             let settled = || async {
-                let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                let deadline =
+                    epics_libcom_rs::runtime::task::deadline_from_now(Duration::from_secs(10));
                 loop {
                     let idle = {
                         let mut inst = cell.write();
@@ -12287,7 +12288,10 @@ A.OEOS
                     if idle {
                         return;
                     }
-                    assert!(tokio::time::Instant::now() < deadline, "the lane drains");
+                    assert!(
+                        epics_libcom_rs::runtime::task::Instant::now() < deadline,
+                        "the lane drains"
+                    );
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
             };
@@ -12442,7 +12446,8 @@ A.OEOS
             .unwrap();
         let cell = db.get_record("A").unwrap();
         let settled = || async {
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            let deadline =
+                epics_libcom_rs::runtime::task::deadline_from_now(Duration::from_secs(10));
             loop {
                 let idle = {
                     let mut inst = cell.write();
@@ -12456,7 +12461,10 @@ A.OEOS
                 if idle {
                     return;
                 }
-                assert!(tokio::time::Instant::now() < deadline, "the lane drains");
+                assert!(
+                    epics_libcom_rs::runtime::task::Instant::now() < deadline,
+                    "the lane drains"
+                );
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         };

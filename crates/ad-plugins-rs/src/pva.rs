@@ -921,7 +921,8 @@ mod tests {
             ),
         );
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline =
+            epics_libcom_rs::runtime::time::deadline_from_now(std::time::Duration::from_secs(10));
         let served = loop {
             if served_unique_id(&pv) == Some(1) {
                 break pv.current().unwrap();
@@ -1004,7 +1005,8 @@ mod tests {
         }
 
         let dropped = handle.plugin_params.dropped_output_arrays;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline =
+            epics_libcom_rs::runtime::time::deadline_from_now(std::time::Duration::from_secs(10));
         while port.read_int32_blocking(dropped, 0).ok() != Some(2)
             && std::time::Instant::now() < deadline
         {

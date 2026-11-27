@@ -1713,6 +1713,17 @@ impl Drop for AsynDriverInterface {
 }
 
 impl StreamBusInterface for AsynDriverInterface {
+    /// C's release deletes the interface (StreamBusInterface.cc:101-104):
+    /// its destructor up to cancelRequest (AsynDriverInterface.cc:285-305),
+    /// and the exception callback C's disconnect refuses to drop
+    /// (asynManager.c:1382-1385), so nothing of the port reaches a client
+    /// that keeps the interface until it has let its record go.
+    fn release(&self) {
+        self.0.cancel_timer();
+        self.0.events.lock().take();
+        self.0.octet.lock().take();
+        self.0.exception.lock().take();
+    }
     fn lock_request(&self, lock_timeout_ms: u64) -> bool {
         self.0.lock_request(lock_timeout_ms)
     }

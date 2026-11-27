@@ -21,6 +21,7 @@ use crate::runtime::background::facility::{recover, run_isolated};
 use crate::runtime::sync::{Event, Signalled};
 use crate::runtime::task::{MandatoryThread, StackSizeClass, ThreadPriority};
 use crate::runtime::taskwd::{CheckIn, TASKWD_DELAY, taskwd_insert};
+use crate::runtime::time::{deadline_after, deadline_from_now};
 use crate::server::database::PvDatabase;
 use crate::server::database::scan_index::ScanPassSnapshot;
 use crate::server::record::ScanType;
@@ -178,6 +179,17 @@ pub struct ScanControl {
     dev_sup: Arc<crate::runtime::interrupt_accept::InterruptGate>,
     /// Set by C `scanInit`'s `buildScanLists`; never cleared.
     lists_built: std::sync::atomic::AtomicBool,
+    /// The I/O Intr pumps' wakes, judged at each transition.
+    io_intr: parking_lot::Mutex<IoIntrJudge>,
+}
+
+#[derive(Default)]
+struct IoIntrJudge {
+    /// Whether a wake sent now is admitted: set before `run` opens the gate
+    /// and after `pause`/`stop` close it, so a device that can see the gate
+    /// open is admitted.
+    admits: bool,
+    wakes: Vec<std::sync::Weak<IoIntrWakes>>,
 }
 
 const SCAN_CTL_PAUSE: u8 = 2;
@@ -191,7 +203,50 @@ impl ScanControl {
             gate: crate::runtime::interrupt_accept::InterruptGate::new(),
             dev_sup: crate::runtime::interrupt_accept::InterruptGate::new(),
             lists_built: std::sync::atomic::AtomicBool::new(false),
+            io_intr: parking_lot::Mutex::default(),
         }
+    }
+
+    /// A record's I/O Intr wakes from `rx`, each judged when it is sent by
+    /// this facility's state then, as C `scanIoRequest` queues nothing unless
+    /// `ctlRun` (`dbScan.c:616-618`). A device that processes directly
+    /// ([`io_intr_processes_directly`]) is not judged: every wake is admitted.
+    ///
+    /// [`io_intr_processes_directly`]: crate::server::device_support::DeviceSupport::io_intr_processes_directly
+    pub(crate) fn io_intr_wakes(
+        &self,
+        rx: crate::runtime::sync::mpsc::Receiver<()>,
+        direct: bool,
+    ) -> Arc<IoIntrWakes> {
+        let wakes = |admits| {
+            Arc::new(IoIntrWakes(parking_lot::Mutex::new(Wakes {
+                rx,
+                judged: std::collections::VecDeque::new(),
+                admits,
+            })))
+        };
+        if direct {
+            return wakes(true);
+        }
+        let mut judge = self.io_intr.lock();
+        let wakes = wakes(judge.admits);
+        judge.wakes.retain(|w| w.strong_count() > 0);
+        judge.wakes.push(Arc::downgrade(&wakes));
+        wakes
+    }
+
+    /// Judge every wake queued so far by the state it was sent in, and the
+    /// ones sent from now on by `admits`.
+    fn judge_io_intr(&self, admits: bool) {
+        let mut judge = self.io_intr.lock();
+        judge.admits = admits;
+        judge.wakes.retain(|w| match w.upgrade() {
+            Some(wakes) => {
+                wakes.judge(admits);
+                true
+            }
+            None => false,
+        });
     }
 
     /// The gate C's `finishDevSup` opens, for a device whose dset `init`
@@ -271,6 +326,7 @@ impl ScanControl {
             .store(SCAN_CTL_PAUSE, std::sync::atomic::Ordering::Release);
         // `iocBuild` runs `finishDevSup` before any `scanRun`.
         self.finish_dev_sup();
+        self.judge_io_intr(true);
         self.gate.set(true);
     }
 
@@ -282,6 +338,7 @@ impl ScanControl {
             .store(SCAN_CTL_PAUSE, std::sync::atomic::Ordering::Release);
         // C `scanPause` clears `interruptAccept` (`dbScan.c:241`).
         self.gate.set(false);
+        self.judge_io_intr(false);
     }
 
     /// C `scanStop` (`dbScan.c:154-178`), less the joins: the threads are
@@ -294,6 +351,64 @@ impl ScanControl {
             .store(SCAN_CTL_EXIT, std::sync::atomic::Ordering::Release);
         // C `scanStop` clears `interruptAccept` (`dbScan.c:165`).
         self.gate.set(false);
+        self.judge_io_intr(false);
+    }
+}
+
+/// One record's I/O Intr wakes, each carrying whether it was admitted when
+/// it was sent: C `ioscanCallback` processes what `scanIoRequest` queued
+/// whatever the state by then (`dbScan.c:961-970`).
+pub(crate) struct IoIntrWakes(parking_lot::Mutex<Wakes>);
+
+struct Wakes {
+    rx: crate::runtime::sync::mpsc::Receiver<()>,
+    /// The wakes queued before each transition and not yet taken, oldest
+    /// first: how many, and whether they were admitted. Those queued since
+    /// the last transition are judged by `admits`.
+    judged: std::collections::VecDeque<(usize, bool)>,
+    admits: bool,
+}
+
+impl IoIntrWakes {
+    /// The next wake and whether it was admitted; `None` once the device has
+    /// dropped its sender.
+    pub(crate) fn poll_next(
+        &self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<bool>> {
+        let mut wakes = self.0.lock();
+        let woke = std::task::ready!(wakes.rx.poll_recv(cx));
+        std::task::Poll::Ready(woke.map(|()| wakes.take_judged()))
+    }
+
+    /// How many wakes are queued.
+    pub(crate) fn len(&self) -> usize {
+        self.0.lock().rx.len()
+    }
+
+    fn judge(&self, admits: bool) {
+        let mut wakes = self.0.lock();
+        let judged: usize = wakes.judged.iter().map(|&(n, _)| n).sum();
+        let fresh = wakes.rx.len().saturating_sub(judged);
+        if fresh > 0 {
+            let was = wakes.admits;
+            wakes.judged.push_back((fresh, was));
+        }
+        wakes.admits = admits;
+    }
+}
+
+impl Wakes {
+    fn take_judged(&mut self) -> bool {
+        let Some((n, admitted)) = self.judged.front_mut() else {
+            return self.admits;
+        };
+        let admitted = *admitted;
+        *n -= 1;
+        if *n == 0 {
+            self.judged.pop_front();
+        }
+        admitted
     }
 }
 
@@ -522,7 +637,7 @@ impl OverrunTracker {
     /// resets to `now + penalty` — the sleeper at the head of the loop waits
     /// until `next`, so C's separate `delay` needs no counterpart here.
     fn after_scan(&mut self, next: &mut Instant, now: Instant) -> TickOutcome {
-        *next += self.period;
+        *next = deadline_after(*next, self.period);
         if now < *next {
             // C `dbScan.c:846-850`. `over_min`/`over_max` are deliberately left
             // alone; the `overtime == 0.0` test below is what reseeds them.
@@ -545,7 +660,7 @@ impl OverrunTracker {
             self.over_min = self.over_min.min(over);
             self.over_max = self.over_max.max(over);
         }
-        *next = now + self.penalty;
+        *next = deadline_after(now, self.penalty);
         self.consecutive += 1;
 
         let warning =
@@ -1491,7 +1606,7 @@ fn periodic_loop(db: Arc<PvDatabase>, duty: PeriodicDuty, stop: Arc<ScanStop>, d
         CheckIn::Every(period * 2 + TASKWD_DELAY),
         None,
     );
-    let mut next = Instant::now() + period;
+    let mut next = deadline_from_now(period);
     let mut overrun = OverrunTracker::new(
         scan_type,
         period,
@@ -1876,11 +1991,11 @@ mod overrun_tests {
         base: Instant,
         remedy: Remedy,
     ) -> Vec<String> {
-        let mut next = base + period;
+        let mut next = crate::runtime::time::deadline_after(base, period);
         let mut tracker = OverrunTracker::new(ScanType::SEC1, period, base, remedy);
         let mut warnings = Vec::new();
         for i in 1..=ticks {
-            let now = base + sweep * i;
+            let now = crate::runtime::time::deadline_after(base, sweep * i);
             if let Some(w) = tracker.after_scan(&mut next, now).warning {
                 warnings.push(w.to_string());
             }
@@ -1917,14 +2032,20 @@ mod overrun_tests {
     fn an_on_time_sweep_advances_the_deadline_by_one_period() {
         let base = Instant::now();
         let period = Duration::from_secs(10);
-        let mut next = base + period;
+        let mut next = crate::runtime::time::deadline_after(base, period);
         let mut tracker = OverrunTracker::new(ScanType::SEC10, period, base, Remedy::FirstHelper);
 
-        let outcome = tracker.after_scan(&mut next, base + Duration::from_secs(3));
+        let outcome = tracker.after_scan(
+            &mut next,
+            crate::runtime::time::deadline_after(base, Duration::from_secs(3)),
+        );
 
         assert!(!outcome.overran);
         assert!(outcome.warning.is_none());
-        assert_eq!(next, base + Duration::from_secs(20));
+        assert_eq!(
+            next,
+            crate::runtime::time::deadline_after(base, Duration::from_secs(20))
+        );
     }
 
     /// BOUNDARY: over-run. The retry deadline is `now + penalty`, not
@@ -1936,16 +2057,16 @@ mod overrun_tests {
     fn an_over_run_retries_after_the_penalty_not_a_whole_period() {
         let base = Instant::now();
         let period = Duration::from_secs(10);
-        let mut next = base + period;
+        let mut next = crate::runtime::time::deadline_after(base, period);
         let mut tracker = OverrunTracker::new(ScanType::SEC10, period, base, Remedy::FirstHelper);
 
-        let now = base + Duration::from_secs(21);
+        let now = crate::runtime::time::deadline_after(base, Duration::from_secs(21));
         let outcome = tracker.after_scan(&mut next, now);
 
         assert!(outcome.overran);
         assert_eq!(
             next,
-            base + Duration::from_secs(22),
+            crate::runtime::time::deadline_after(base, Duration::from_secs(22)),
             "C `dbScan.c:826-830`: delay = penalty, next = now + delay"
         );
     }
@@ -1956,12 +2077,15 @@ mod overrun_tests {
     fn a_sweep_that_lands_exactly_on_the_deadline_is_an_over_run() {
         let base = Instant::now();
         let period = Duration::from_secs(1);
-        let mut next = base + period;
+        let mut next = crate::runtime::time::deadline_after(base, period);
         let mut tracker = OverrunTracker::new(ScanType::SEC1, period, base, Remedy::FirstHelper);
 
-        let now = base + Duration::from_secs(2);
+        let now = crate::runtime::time::deadline_after(base, Duration::from_secs(2));
         assert!(tracker.after_scan(&mut next, now).overran);
-        assert_eq!(next, now + Duration::from_millis(500));
+        assert_eq!(
+            next,
+            crate::runtime::time::deadline_after(now, Duration::from_millis(500))
+        );
     }
 
     /// BOUNDARY: nine consecutive over-runs are silent, the tenth reports —
@@ -2062,16 +2186,22 @@ mod overrun_tests {
     fn an_on_time_sweep_resets_the_consecutive_run() {
         let base = Instant::now();
         let period = Duration::from_secs(1);
-        let mut next = base + period;
+        let mut next = crate::runtime::time::deadline_after(base, period);
         let mut tracker = OverrunTracker::new(ScanType::SEC1, period, base, Remedy::FirstHelper);
 
         // Nine over-runs, then one sweep that beats its deadline.
         for i in 1..=9u32 {
-            tracker.after_scan(&mut next, base + Duration::from_secs(2) * i);
+            tracker.after_scan(
+                &mut next,
+                crate::runtime::time::deadline_after(base, Duration::from_secs(2) * i),
+            );
         }
         assert_eq!(tracker.consecutive, 9);
-        next = base + Duration::from_secs(100);
-        tracker.after_scan(&mut next, base + Duration::from_secs(100));
+        next = crate::runtime::time::deadline_after(base, Duration::from_secs(100));
+        tracker.after_scan(
+            &mut next,
+            crate::runtime::time::deadline_after(base, Duration::from_secs(100)),
+        );
         assert_eq!(tracker.consecutive, 0);
         assert_eq!(tracker.report_delay, OVERRUN_REPORT_DELAY);
     }
@@ -2322,7 +2452,7 @@ mod tests {
 
         /// Wait for `want` complete passes of the fast list, or fail.
         async fn wait_for_passes(observed: &Observed, want: i32) {
-            let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+            let deadline = crate::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
             while observed.passes() < want {
                 assert!(
                     Instant::now() < deadline,
@@ -2336,7 +2466,7 @@ mod tests {
         /// A pass is complete when every PHAS has started and finished the
         /// same number of passes as PHAS 0 — the C test's `waitPassComplete`.
         async fn wait_pass_complete(observed: &Observed) {
-            let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+            let deadline = crate::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
             loop {
                 let passes = observed.passes();
                 if (0..NREC.len()).all(|k| {
@@ -2590,7 +2720,7 @@ mod tests {
                 })
                 .expect("spawn the leader");
 
-            let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+            let deadline = crate::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
             while !entered.load(Ordering::Acquire) {
                 assert!(Instant::now() < deadline, "the pass never reached the gate");
                 tokio::time::sleep(Duration::from_millis(1)).await;
@@ -2640,7 +2770,7 @@ mod tests {
         /// Polled rather than read once: a band is only observable after the
         /// thread has reached the registry, and after it has parked.
         async fn wait_for_idle_bands(want: &[(String, ThreadPriority)]) {
-            let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+            let deadline = crate::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
             loop {
                 let report = crate::runtime::task::thread_report();
                 let wrong: Vec<String> = want
@@ -2913,7 +3043,7 @@ mod tests {
         let db = Arc::new(PvDatabase::new());
         let owner = ScanOwner::start(Arc::clone(&db));
 
-        let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+        let deadline = crate::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
         while !periodic_lists_built() {
             assert!(
                 Instant::now() < deadline,
@@ -2923,7 +3053,7 @@ mod tests {
         }
 
         drop(owner);
-        let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+        let deadline = crate::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
         while periodic_lists_built() {
             assert!(
                 Instant::now() < deadline,
@@ -2990,7 +3120,7 @@ mod tests {
         let task = tokio::spawn(async move { scheduler.run().await });
 
         // Wait until every rate's thread is up (7 clones + task's own).
-        let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+        let deadline = crate::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
         while Arc::strong_count(&db) < 2 + periodic_scans().len() {
             assert!(Instant::now() < deadline, "scan threads never started");
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -3000,7 +3130,7 @@ mod tests {
         let _ = task.await;
 
         // Guard dropped → flag tripped → every thread wakes and exits.
-        let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+        let deadline = crate::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
         while Arc::strong_count(&db) > 1 {
             assert!(
                 Instant::now() < deadline,
@@ -3068,7 +3198,7 @@ mod tests {
 
         let owner = ScanOwner::start(Arc::clone(&db));
 
-        let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+        let deadline = crate::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
         let name = loop {
             if let Some(n) = seen.lock().expect("probe mutex").clone() {
                 break n;
@@ -3112,7 +3242,7 @@ mod tests {
         let db = Arc::new(PvDatabase::new());
         let owner = ScanOwner::start(Arc::clone(&db));
 
-        let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+        let deadline = crate::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
         while !table().contains(&wanted) {
             assert!(
                 Instant::now() < deadline,
@@ -3123,7 +3253,7 @@ mod tests {
         }
 
         drop(owner);
-        let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+        let deadline = crate::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
         while table().contains(&wanted) {
             assert!(
                 Instant::now() < deadline,
@@ -3162,7 +3292,7 @@ mod tests {
         let db = Arc::new(PvDatabase::new());
         let _owner = ScanOwner::start(Arc::clone(&db));
 
-        let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+        let deadline = crate::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
         while !table().contains("scanOnce") {
             assert!(
                 Instant::now() < deadline,
@@ -3175,7 +3305,7 @@ mod tests {
 
     /// Wait until `db`'s strong count satisfies `pred`, or panic after the fact budget.
     async fn wait_for_count(db: &Arc<PvDatabase>, what: &str, pred: impl Fn(usize) -> bool) {
-        let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+        let deadline = crate::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
         while !pred(Arc::strong_count(db)) {
             assert!(
                 Instant::now() < deadline,

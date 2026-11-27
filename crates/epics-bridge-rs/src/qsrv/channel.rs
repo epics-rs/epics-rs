@@ -1664,7 +1664,7 @@ record(ai, "linked") { field(INP, "ai.VAL CP") info(Q:form, "String") }
             })
         };
         let made = [make("ai"), make("lso.VAL"), make("wfC"), make("lso.VAL$")];
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = epics_base_rs::runtime::time::deadline_from_now(Duration::from_secs(10));
         while !made.iter().all(|t| t.is_finished()) {
             assert!(
                 Instant::now() < deadline,

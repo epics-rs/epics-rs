@@ -1088,7 +1088,17 @@ impl InterruptManager {
     /// go through [`notify_octet`](Self::notify_octet), which names its fan-out
     /// rule explicitly.
     pub fn notify(&self, value: InterruptValue) {
-        self.dispatch(value, |_, f, v| f.matches(v));
+        self.dispatch(value, |_, f, v| f.matches(v), || true);
+    }
+
+    /// [`notify`](Self::notify) to the receivers `admit` lets through: it is
+    /// asked once for each receiver `notify` would reach, in delivery order,
+    /// and the value goes to exactly those it answers true for — C's walk of
+    /// an interrupt list that throttles node by node (NDPluginStdArrays.cpp:
+    /// 35-72). `admit` runs under a list's lock: it must not block or
+    /// allocate, nor register or drop a subscription.
+    pub fn notify_admitted(&self, value: InterruptValue, admit: impl FnMut() -> bool) {
+        self.dispatch(value, |_, f, v| f.matches(v), admit);
     }
 
     /// Fire `value` at the one client `id` names, whatever its filter: C
@@ -1096,30 +1106,36 @@ impl InterruptManager {
     /// decoded for that node (drvModbusAsyn.cpp:1669-1924). A ring is no
     /// node and takes none of these; see [`Self::notify_rings`].
     pub fn notify_client(&self, id: ClientId, value: InterruptValue) {
-        self.dispatch(value, |client, _, _| client == Some(id));
+        self.dispatch(value, |client, _, _| client == Some(id), || true);
     }
 
     /// Send `value` to the rings alone, by their filters: what a driver
     /// that decodes per client ([`Self::notify_client`]) decoded for an
     /// observer, which has no drvUser.
     pub fn notify_rings(&self, value: InterruptValue) {
-        self.dispatch(value, |client, f, v| client.is_none() && f.matches(v));
+        self.dispatch(
+            value,
+            |client, f, v| client.is_none() && f.matches(v),
+            || true,
+        );
     }
 
     /// Send an **octet** interrupt under one of C's two octet fan-out rules
     /// (see [`OctetFanOut`]). Neither rule consults `reason`.
     pub fn notify_octet(&self, rule: OctetFanOut, value: InterruptValue) {
-        self.dispatch(value, |_, f, _| f.accepts_octet(rule));
+        self.dispatch(value, |_, f, _| f.accepts_octet(rule), || true);
     }
 
     /// The single delivery path — sync callbacks, then mailboxes, then the
     /// rings — with the caller's fan-out rule as the only variable.
     /// Every emitter routes through here, so a new rule cannot come with its own
-    /// half-implemented delivery.
+    /// half-implemented delivery. `admit` is asked last, for a receiver every
+    /// other gate has passed, so what it admits is what is delivered.
     fn dispatch(
         &self,
         value: InterruptValue,
         pass: impl Fn(Option<ClientId>, &InterruptFilter, &InterruptValue) -> bool,
+        mut admit: impl FnMut() -> bool,
     ) {
         self.state.notify_count.fetch_add(1, Ordering::Relaxed);
 
@@ -1133,7 +1149,7 @@ impl InterruptManager {
             if !cb.active.load(Ordering::Relaxed) {
                 continue;
             }
-            if pass(Some(cb.id), &cb.filter, &value) {
+            if pass(Some(cb.id), &cb.filter, &value) && admit() {
                 (cb.callback)(&value);
             }
         }
@@ -1157,6 +1173,9 @@ impl InterruptManager {
             if sub.accept.as_ref().is_some_and(|accept| !accept()) {
                 continue;
             }
+            if !admit() {
+                continue;
+            }
             let mut latest = sub.latest.lock();
             if latest.is_some() {
                 self.state.coalesce_count.fetch_add(1, Ordering::Relaxed);
@@ -1169,7 +1188,7 @@ impl InterruptManager {
 
         // Deliver to the rings.
         for ring in self.state.async_rings.lock().iter() {
-            if ring.active.load(Ordering::Relaxed) && pass(None, &ring.filter, &value) {
+            if ring.active.load(Ordering::Relaxed) && pass(None, &ring.filter, &value) && admit() {
                 ring.push(&value);
             }
         }
@@ -1472,6 +1491,65 @@ mod tests {
         assert!(
             im.subscribe_async_filtered(on(Some(InterfaceType::Enum)), 1, 0)
                 .is_err()
+        );
+    }
+
+    /// A throttled fire reaches exactly the receivers its admission let
+    /// through: each receiver the value matches is asked once, in delivery
+    /// order, rings included, and a receiver it does not match is not asked.
+    #[test]
+    fn notify_admitted_delivers_to_exactly_the_receivers_it_admits() {
+        use super::{InterruptFilter, InterruptManager, InterruptValue};
+        use crate::interfaces::{InterfaceMask, InterfaceType};
+        use crate::param::ParamValue;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Context, Poll, Waker};
+
+        let im = InterruptManager::with_masks(InterfaceMask::ALL, InterfaceMask::ALL);
+        let on = |reason| InterruptFilter {
+            reason: Some(reason),
+            ..InterruptFilter::default()
+        };
+        let synced = Arc::new(AtomicUsize::new(0));
+        let other = Arc::new(AtomicUsize::new(0));
+        let count = |n: &Arc<AtomicUsize>| {
+            let n = n.clone();
+            move |_: &InterruptValue| {
+                n.fetch_add(1, Ordering::Relaxed);
+            }
+        };
+        let _sync = im.register_sync_callback(on(1), count(&synced)).unwrap();
+        let _elsewhere = im.register_sync_callback(on(2), count(&other)).unwrap();
+        let (_mailbox, mut mailbox) = im.register_interrupt_user(on(1), 64).unwrap();
+        let mut ring = im.subscribe_async_filtered(on(1), 4, 64).unwrap();
+
+        let mut answers = [true, false, true].into_iter();
+        let mut asked = 0;
+        im.notify_admitted(
+            InterruptValue {
+                reason: 1,
+                value: ParamValue::Int8Array(Arc::from([1i8, 2, 3])),
+                iface: Some(InterfaceType::Int8Array),
+                ..InterruptValue::default()
+            },
+            || {
+                asked += 1;
+                answers.next().unwrap()
+            },
+        );
+
+        assert_eq!(asked, 3);
+        assert_eq!(synced.load(Ordering::Relaxed), 1, "the sync callback");
+        assert_eq!(other.load(Ordering::Relaxed), 0);
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(
+            std::pin::pin!(mailbox.recv()).poll(&mut cx).is_pending(),
+            "the refused mailbox"
+        );
+        assert!(
+            matches!(ring.try_recv(), Ok(InterruptValue { value: ParamValue::Int8Array(a), .. }) if *a == [1, 2, 3]),
+            "the ring"
         );
     }
 

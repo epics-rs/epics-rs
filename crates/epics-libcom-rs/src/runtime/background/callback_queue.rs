@@ -192,12 +192,10 @@ impl<T> Default for Node<T> {
 
 /// A never-shrinking arena with two tagged Treiber free lists.
 ///
-/// Chunks are published by index reservation (`fetch_add` on `reserved`), so a
-/// chunk is its grower's alone; past construction one grower at a time
-/// reserves one (see [`Pool::alloc_task`]). A
-/// published chunk pointer is never cleared and never freed before [`Drop`],
-/// which is what makes resolving a stale index defined rather than a
-/// use-after-free.
+/// A chunk is published by one CAS of its pointer from null (see
+/// [`Pool::publish`]). A published chunk pointer is never cleared and never
+/// freed before [`Drop`], which is what makes resolving a stale index defined
+/// rather than a use-after-free.
 ///
 /// The arena is split by index at `ring_slots`: below it are the ring's slots,
 /// above it the nodes that serve run-queue entries. **That split is what
@@ -206,9 +204,6 @@ impl<T> Default for Node<T> {
 /// to CAS and then reconcile with an arena that could also run out.
 struct Pool<T> {
     chunks: [AtomicPtr<Node<T>>; MAX_CHUNKS],
-    /// Chunks handed out to growers — may briefly exceed the number actually
-    /// published. Nothing resolves an index through it.
-    reserved: AtomicUsize,
     /// Tagged head of the ring's slot supply. Empty means the band is full.
     free_ring: AtomicU64,
     /// Ring slots currently out — C `epicsRingPointerGetUsed`.
@@ -222,14 +217,12 @@ struct Pool<T> {
     /// visible to a worker from the moment it is linked: the band then reads
     /// one below zero, which is `usize::MAX`.
     ring_used: AtomicUsize,
-    /// Tagged head of the run-queue supply, grown on demand: a run-queue entry
-    /// is never refused for capacity.
+    /// Tagged head of the run-queue nodes given back. With `fresh` it is the
+    /// run-queue supply, grown on demand: a run-queue entry is never refused
+    /// for capacity.
     free_task: AtomicU64,
-    /// Held by the one requester growing the run-queue supply. Chunk `c` is
-    /// `CHUNK0 << c`, so requesters that each grew on finding it empty reserved
-    /// chunks doubling per requester for one chunk's demand: seventeen threads
-    /// at once took chunks 6 through 22, 268 M nodes for 2 k entries.
-    grower: std::sync::Mutex<()>,
+    /// First index never handed out, claimed from once `free_task` is empty.
+    fresh: AtomicUsize,
     /// First index that is not a ring slot.
     ring_slots: usize,
 }
@@ -246,40 +239,45 @@ impl<T> Pool<T> {
     fn new(ring_slots: usize) -> Self {
         let pool = Pool {
             chunks: std::array::from_fn(|_| AtomicPtr::new(std::ptr::null_mut())),
-            reserved: AtomicUsize::new(0),
             free_ring: AtomicU64::new(pack(IDX_NONE, 0)),
             ring_used: AtomicUsize::new(0),
             free_task: AtomicU64::new(pack(IDX_NONE, 0)),
-            grower: std::sync::Mutex::new(()),
+            fresh: AtomicUsize::new(ring_slots),
             ring_slots,
         };
-        while chunk_base(pool.reserved.load(Ordering::Relaxed)) < ring_slots {
-            let Some((base, len)) = pool.grow() else {
-                break;
-            };
-            let split = (base + len).min(ring_slots).max(base);
-            pool.link(&pool.free_ring, base, split);
-            pool.link(&pool.free_task, split, base + len);
+        let mut c = 0;
+        while c < MAX_CHUNKS && chunk_base(c) < ring_slots {
+            pool.publish(c);
+            let base = chunk_base(c);
+            pool.link(&pool.free_ring, base, (base + chunk_len(c)).min(ring_slots));
+            c += 1;
         }
         pool
     }
 
-    /// Reserve, allocate and publish one more chunk, returning its index range.
-    /// The elements are on no list yet — [`Pool::link`] decides which supply
-    /// they join. `None` once the index space is exhausted.
-    fn grow(&self) -> Option<(usize, usize)> {
-        let c = self.reserved.fetch_add(1, Ordering::AcqRel);
-        if c >= MAX_CHUNKS {
-            self.reserved.fetch_sub(1, Ordering::AcqRel);
-            return None;
+    /// Make chunk `c` resolvable. Whoever finds it unpublished allocates it
+    /// and offers it with one CAS; a loser frees its own copy, so no thread
+    /// ever waits on another's allocation.
+    fn publish(&self, c: usize) {
+        let slot = &self.chunks[c];
+        if !slot.load(Ordering::Acquire).is_null() {
+            return;
         }
         let len = chunk_len(c);
-        let base = chunk_base(c);
-        let elements: Vec<Node<T>> = (0..len).map(|_| Node::default()).collect();
-        let ptr = Box::leak(elements.into_boxed_slice()).as_mut_ptr();
-        // We reserved `c`, so this slot is ours alone.
-        self.chunks[c].store(ptr, Ordering::Release);
-        Some((base, len))
+        let elements: Box<[Node<T>]> = (0..len).map(|_| Node::default()).collect();
+        let ptr = Box::into_raw(elements).cast::<Node<T>>();
+        if slot
+            .compare_exchange(
+                std::ptr::null_mut(),
+                ptr,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            // SAFETY: `ptr` is the box made above, and nobody else has seen it.
+            drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, len)) });
+        }
     }
 
     /// Hand `[from, to)` to `list` as a single pre-linked chain — one CAS for
@@ -342,29 +340,28 @@ impl<T> Pool<T> {
         self.ring_used.load(Ordering::Acquire)
     }
 
-    /// Take one run-queue node, growing the arena when the supply is empty.
-    /// `None` only when the index space itself is exhausted.
+    /// Take one run-queue node: a given-back one, else the next never-used
+    /// index, its chunk published first if nobody has. `None` only when the
+    /// index space itself is exhausted.
     ///
-    /// Only the [`Pool::grower`] holder grows, and only after finding the
-    /// supply still empty under it, so a requester that waited takes a node of
-    /// the chunk its predecessor linked. Each growth doubles the supply, so the
-    /// gate is met a logarithmic number of times per process and never by a
-    /// request that finds a node.
+    /// The chunk a requester grows is the one holding the index it claimed,
+    /// so requesters meeting an empty supply together all grow the same
+    /// chunk, and a later one is only reached once every index before it is
+    /// out. Requesters that each grew their own next chunk instead took
+    /// chunks doubling per requester: seventeen at once took chunks 6 through
+    /// 22, 268 M nodes for 2 k entries.
     fn alloc_task(&self) -> Option<u32> {
-        loop {
-            if let Some(i) = self.pop(&self.free_task) {
-                return Some(i);
-            }
-            let _grower = self
-                .grower
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(i) = self.pop(&self.free_task) {
-                return Some(i);
-            }
-            let (base, len) = self.grow()?;
-            self.link(&self.free_task, base, base + len);
+        if let Some(i) = self.pop(&self.free_task) {
+            return Some(i);
         }
+        let g = self
+            .fresh
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |g| {
+                (g < chunk_base(MAX_CHUNKS)).then_some(g + 1)
+            })
+            .ok()?;
+        self.publish(locate(g as u32).0);
+        Some(g as u32)
     }
 
     fn pop(&self, list: &AtomicU64) -> Option<u32> {
@@ -514,30 +511,6 @@ impl<T> BandQueue<T> {
                 Ok(depth)
             }
             None => Err(v),
-        }
-    }
-
-    /// [`Self::push_ring`] for an entry a claim decides on. The slot is taken
-    /// before `claim` runs, as the intrusive `callbackRequest` reserves its
-    /// place before it claims the object (epics-base `proto/callback-intrusive`
-    /// `callback.c:855-868`), so a full band refuses whether or not the object
-    /// is queued already. `claim` answering `None` gives the slot back and
-    /// publishes nothing: `Ok(None)`. `Err(())` is the band being full.
-    pub(super) fn push_ring_claimed(
-        &self,
-        claim: impl FnOnce() -> Option<T>,
-        recruit: impl FnOnce(),
-    ) -> Result<Option<usize>, ()> {
-        let (i, depth) = self.nodes.alloc_ring().ok_or(())?;
-        match claim() {
-            Some(v) => {
-                self.publish(i, v, recruit);
-                Ok(Some(depth))
-            }
-            None => {
-                self.nodes.dealloc(i);
-                Ok(None)
-            }
         }
     }
 
@@ -1186,7 +1159,13 @@ mod tests {
         for _ in 0..if cfg!(miri) { 1 } else { 50 } {
             let pool = Arc::new(Pool::<u32>::new(CHUNK0));
             while pool.pop(&pool.free_task).is_some() {}
-            let before = pool.reserved.load(Ordering::Relaxed);
+            let published = || {
+                pool.chunks
+                    .iter()
+                    .filter(|c| !c.load(Ordering::Relaxed).is_null())
+                    .count()
+            };
+            let before = published();
             let start = Arc::new(std::sync::Barrier::new(THREADS));
             let threads: Vec<_> = (0..THREADS)
                 .map(|_| {
@@ -1200,7 +1179,7 @@ mod tests {
             for t in threads {
                 t.join().unwrap();
             }
-            assert_eq!(pool.reserved.load(Ordering::Relaxed), before + 1);
+            assert_eq!(published(), before + 1);
         }
     }
 

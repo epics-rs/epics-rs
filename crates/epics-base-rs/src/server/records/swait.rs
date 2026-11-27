@@ -6,7 +6,8 @@ use super::link_status::{SWAIT_NO_PV, SWAIT_PV_NC, SWAIT_PV_OK, SWAIT_PV_STATUS_
 use crate::calc::NumericInputs;
 use crate::calc::{Rpcl, eval as calc_eval};
 use crate::error::{CaError, CaResult};
-use crate::runtime::task::{CallbackPriority, spawn_blocking_background};
+use crate::runtime::background::{CallbackBody, CallbackCell};
+use crate::runtime::task::request_cell;
 use crate::server::database::AsyncDbHandle;
 use crate::server::rec_dyn_link::{
     CaType, Deliver, Io, LinkEvent, LinkHost, LinkSpec, NOTIFY_IN_PROGRESS, RecDynLink,
@@ -45,9 +46,40 @@ enum Cb {
 }
 
 /// Link events in arrival order: queued by a `recDynLink` thread without the
-/// record's lock, applied under it from a callback worker.
+/// record's lock, applied under it from a callback worker. Each carries
+/// whether the `callbackRequest` its `inputChanged` makes would run then.
 #[derive(Default)]
-struct Inbox(Mutex<VecDeque<(usize, u64, LinkEvent)>>);
+struct Inbox(Mutex<VecDeque<(usize, u64, LinkEvent, bool)>>);
+
+/// The record's [`Inbox`] applied under its hold, as one cell per record: C
+/// runs each link callback on the `recDynLink` task (swaitRecord.c:818-926),
+/// and a full band here delays the events, never drops them.
+struct LinkEvents {
+    name: crate::types::RecordName,
+    h: AsyncDbHandle,
+}
+
+impl CallbackBody for LinkEvents {
+    fn run(&self) {
+        let name = &self.name;
+        self.h.with_held(name, |held| {
+            loop {
+                let next = held.with(|rec, common| {
+                    rec.as_any_mut()
+                        .and_then(|a| a.downcast_mut::<SwaitRecord>())
+                        .map_or(Drain::Done, |s| s.drain_inbox(common.scan))
+                });
+                match next {
+                    Drain::Done => break,
+                    Drain::Process => {
+                        let _ = held.db_process(name);
+                    }
+                    Drain::FwdLink => held.fwd_link(),
+                }
+            }
+        });
+    }
+}
 
 /// What a drained link event leaves the callback worker to do outside the
 /// record's borrow.
@@ -181,9 +213,9 @@ pub struct SwaitRecord {
     /// C `caLinkStruct[NUM_LINKS]`, indexed as `pv_status`.
     links: [RecDynLink<Cb>; 14],
     inbox: Arc<Inbox>,
-    /// C `ioProcCb`'s priority, set from PRIO at init (`swaitRecord.c:313`):
-    /// the band link events are applied on.
-    prio: CallbackPriority,
+    /// The band link events are applied on, read at each request. C sets
+    /// `ioProcCb`'s at init and on a `PRIO` special (swaitRecord.c:315, :573).
+    band: crate::server::database::RecordBand,
     /// The `pv_status` and link-name posts owed, a bit per link.
     status_posts: u16,
     name_posts: u16,
@@ -231,6 +263,7 @@ pub struct SwaitRecord {
     simulation_active: bool,
     // The record's name and database, which every link is added on.
     async_ctx: Option<(crate::types::RecordName, AsyncDbHandle)>,
+    link_events: Option<Arc<CallbackCell<LinkEvents>>>,
     /// This cycle's SCAN is I/O Intr.
     io_intr: bool,
     /// C `cbStruct.procPending`: an input changed during the ODLY wait.
@@ -288,7 +321,7 @@ impl Default for SwaitRecord {
             pv_status: [SWAIT_NO_PV; 14],
             links: std::array::from_fn(|_| RecDynLink::default()),
             inbox: Arc::default(),
-            prio: CallbackPriority::Low,
+            band: Default::default(),
             status_posts: 0,
             name_posts: 0,
             fetch_failed: false,
@@ -299,6 +332,7 @@ impl Default for SwaitRecord {
             sims: 0,
             simulation_active: false,
             async_ctx: None,
+            link_events: None,
             io_intr: false,
             proc_pending: false,
             fwd_link: true,
@@ -467,30 +501,17 @@ impl SwaitRecord {
     /// under the record's lock from a callback worker, so the `recDynLink`
     /// threads never wait on that lock.
     fn deliver(&self, li: usize) -> Option<Deliver> {
-        let (name, h) = self.async_ctx.clone()?;
+        let events = self.link_events.clone()?;
         let inbox = self.inbox.clone();
-        let prio = self.prio;
+        let band = self.band.clone();
         Some(Arc::new(move |generation, event| {
-            inbox.0.lock().unwrap().push_back((li, generation, event));
-            let (h, name) = (h.clone(), name.clone());
-            drop(spawn_blocking_background(prio, move |_| {
-                h.with_held(&name, |held| {
-                    loop {
-                        let next = held.with(|rec, common| {
-                            rec.as_any_mut()
-                                .and_then(|a| a.downcast_mut::<Self>())
-                                .map_or(Drain::Done, |s| s.drain_inbox(common.scan))
-                        });
-                        match next {
-                            Drain::Done => break,
-                            Drain::Process => {
-                                let _ = held.db_process(&name);
-                            }
-                            Drain::FwdLink => held.fwd_link(),
-                        }
-                    }
-                });
-            }));
+            let admitted = events.body().h.admits_callback_request();
+            inbox
+                .0
+                .lock()
+                .unwrap()
+                .push_back((li, generation, event, admitted));
+            let _ = request_cell(band.priority(), &events);
         }))
     }
 
@@ -557,16 +578,19 @@ impl SwaitRecord {
     /// Every queued link event, oldest first: `recDynLink` applies it, then
     /// the callback C would call runs, up to the first that leaves the
     /// record to be processed or forward-linked, the later events left
-    /// queued.
+    /// queued. An `ioIntProcess` requested after `callbackStop` never runs,
+    /// so its input is neither stored nor processed.
     fn drain_inbox(&mut self, scan: ScanType) -> Drain {
         loop {
             let next = self.inbox.0.lock().unwrap().pop_front();
-            let Some((li, generation, event)) = next else {
+            let Some((li, generation, event, admitted)) = next else {
                 return Drain::Done;
             };
             match self.links[li].apply(generation, event) {
                 Some(Cb::Search) => self.pv_search_callback(li),
-                Some(Cb::Input) if self.input_changed(li, scan) => return Drain::Process,
+                Some(Cb::Input) if admitted && self.input_changed(li, scan) => {
+                    return Drain::Process;
+                }
                 Some(Cb::Notify) => {
                     self.fwd_link = true;
                     return Drain::FwdLink;
@@ -859,15 +883,21 @@ impl Record for SwaitRecord {
     }
 
     fn set_async_context(&mut self, name: crate::types::RecordName, db: AsyncDbHandle) {
+        self.link_events = Some(CallbackCell::new(LinkEvents {
+            name: name.clone(),
+            h: db.clone(),
+        }));
         self.async_ctx = Some((name, db));
     }
 
-    /// C `init_record` pass 1's search of every PV name (swaitRecord.c:334-371),
-    /// here where PRIO is known: C sets `ioProcCb`'s band in the same pass.
+    fn set_record_band(&mut self, band: crate::server::database::RecordBand) {
+        self.band = band;
+    }
+
+    /// C `init_record` pass 1's search of every PV name (swaitRecord.c:334-371).
     /// `iocInit` calls this again after the loader did; C adds each link
     /// once, so one already added keeps its channel.
-    fn init_links(&mut self, common: &crate::server::record::CommonFields) {
-        self.prio = common.callback_priority();
+    fn init_links(&mut self, _common: &crate::server::record::CommonFields) {
         for li in 0..self.links.len() {
             if self.links[li].is_added() {
                 continue;

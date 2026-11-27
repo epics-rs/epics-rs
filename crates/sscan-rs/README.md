@@ -49,7 +49,8 @@ iocInit
 saveData_Init("saveData.req", "P=xxx:")
 ```
 
-`scanProgress` starts like any compiled program (`tests/scan_progress.rs`):
+`scanProgress` starts like any compiled program
+(`tests/integration/scan_progress.rs`):
 
 ```rust
 epics_seq_rs::seq(&sscan_rs::scan_prog::scanProgress, "S=xxx:,P=xxx:scanProgress:", 0, &db);

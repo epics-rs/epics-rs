@@ -989,14 +989,22 @@ pub struct OutTarget {
     /// (disconnected CA link, or a name this IOC cannot resolve) — C's
     /// `field_type` initializer.
     pub field_type: Option<DbfCode>,
-    /// C's `dbr_field_type`, what `dbGetLinkDBFtype` reports
-    /// (`dbChannelFinalFieldType`, `dbChannel.c:498`): the DBR type
-    /// [`Self::field_type`] is served as, except at a `$` address, which is
-    /// `DBR_CHAR` while a link keeps its `DBF_xxLINK` (`dbAccess.c:690-695`).
-    pub dbr_field_type: Option<DbFieldType>,
-    /// Target field's element capacity — C `no_elements` / `dbCaGetNelements`.
-    /// `1` when unresolved, matching C's `n_elements = 1` initializer.
-    pub element_count: i64,
+    /// What `dbGetLinkDBFtype` reports (`dbChannelFinalFieldType`,
+    /// `dbChannel.c:498`): the DBR type [`Self::field_type`] is served as,
+    /// `DBR_CHAR` at a `$` address while a link keeps its `DBF_xxLINK`
+    /// (`dbAccess.c:690-695`), then the type a `ts` filter puts in its place.
+    /// `None` where unresolved or `DBR_NOACCESS`.
+    pub final_field_type: Option<DbFieldType>,
+    /// C `dbNameToAddr`'s `no_elements`, no filter applied, or
+    /// `dbCaGetNelements` for an external link: the count device support and
+    /// `sCalcoutRecord.c` `fetch_values` (:898, :903) size by. `1` when
+    /// unresolved, matching C's `n_elements = 1` initializer.
+    pub no_elements: i64,
+    /// C `dbGetNelements` (`dbLink.c:297`): `dbChannelFinalElements`, after the
+    /// link's filters (`dbDbLink.c:157-162`), or `dbCaGetNelements` for an
+    /// external link — the count `sseqRecord.c` sizes `DOLn` and `LNKn` by
+    /// (:683, :760). `1` where C's call fails.
+    pub final_elements: i64,
     /// C `plink->type` once `dbInitLink` has run, the value every
     /// `plink->type == CA_LINK` / `CONSTANT` test in device support reads
     /// (`devsCalcoutSoft.c:78`, `:113`, `sseqRecord.c:717`,
@@ -1018,8 +1026,9 @@ impl OutTarget {
     /// class — C's `field_type = 0` matches no `case` and falls to `default:`.
     pub const UNRESOLVED: Self = Self {
         field_type: None,
-        dbr_field_type: None,
-        element_count: 1,
+        final_field_type: None,
+        no_elements: 1,
+        final_elements: 1,
         link_type: LinkType::Constant,
         put_admitted: true,
     };
@@ -1102,6 +1111,27 @@ impl LinkReadAs {
                     ..
                 }
         )
+    }
+
+    /// C's `!pnRequest || *pnRequest == 1` (`dbDbLink.c:185`): every request
+    /// but an array one of another length, the native read included.
+    pub(crate) fn one_element(self) -> bool {
+        match self {
+            Self::Array { n_request, .. } => n_request == 1,
+            Self::CharArrayAsString { max_elements } => max_elements == 1,
+            _ => true,
+        }
+    }
+
+    /// This request at `n` elements, C's `dbGetLink(.., &nelements)` with
+    /// the count `dbGetNelements` gave (`compressRecord.c:328-342`); a scalar
+    /// one is one element already.
+    pub(crate) fn asking(self, n: usize) -> Self {
+        match self {
+            Self::Array { dbr, .. } => Self::Array { dbr, n_request: n },
+            Self::CharArrayAsString { .. } => Self::CharArrayAsString { max_elements: n },
+            other => other,
+        }
     }
 
     /// The scalar `dbrType` this request names; `None` for the native read and
@@ -1254,6 +1284,12 @@ pub enum InputLinkRequest {
     /// The request depends on the source's DBF class / element count: resolve
     /// the target and ask [`Record::input_link_read_as_from_source`].
     FromSource,
+    /// The request depends on what the links before this one landed this
+    /// cycle (printf's `*` precision): the multi-input fetch, which lands
+    /// them in order, asks [`Record::input_link_read_as_from_earlier_links`]
+    /// under the hold it reads this link under. Anywhere else it reads
+    /// nothing.
+    FromEarlierLinks,
 }
 
 impl InputLinkRequest {
@@ -1263,7 +1299,7 @@ impl InputLinkRequest {
     pub(crate) fn renders_at_source(self) -> bool {
         match self {
             Self::As(read_as) => read_as.renders_at_source(),
-            Self::NotRead => false,
+            Self::NotRead | Self::FromEarlierLinks => false,
             Self::FromSource => true,
         }
     }
@@ -2136,10 +2172,10 @@ pub fn alarm_val_arm(rtype: &str) -> AlarmValArm {
 /// `MotorRecord::field_metadata_override` (`motor-rs/src/record/mod.rs:201-205`)
 /// answers `Some(..)` for EVERY field, and the override layer runs after
 /// `route_field_metadata` (pinned by
-/// `epics-base-rs/tests/the_override_layer_runs_last.rs`), so every served
-/// motor field takes its window from `motor-rs` and never from this table.
-/// The arm states what C's rset does for the day a motor field reaches the
-/// routing layer without an override.
+/// `epics-base-rs/tests/integration/the_override_layer_runs_last.rs`), so every
+/// served motor field takes its window from `motor-rs` and never from this
+/// table. The arm states what C's rset does for the day a motor field reaches
+/// the routing layer without an override.
 pub fn graphic_limit_fields(rtype: &str) -> (&'static str, &'static str) {
     match rtype {
         "motor" => ("HLM", "LLM"),
@@ -2760,6 +2796,12 @@ impl<'a> OwnFrame<'a> {
         self.common
     }
 
+    /// The link the record stores in `field`, when `field` is one of its
+    /// type's links.
+    pub(crate) fn link(self, field: &str) -> Option<&'a std::sync::Arc<super::ParsedLink>> {
+        self.link_slots.parse_of(field)
+    }
+
     /// The record this frame is lent for, whose code is `record`.
     pub fn of(self, record: &'a dyn Record) -> OwnRecord<'a> {
         OwnRecord {
@@ -3250,10 +3292,9 @@ pub struct ProcessOutcome {
 pub enum PostStage {
     /// Posted there, `DBE_VALUE` (`sseqRecord.c:304`, `scanparmRecord.c:250`).
     Output,
-    /// Posted by the cycle's `monitor()` change walk with the field's mask,
-    /// after `recGblResetAlarms` (`asyncFinish`'s `abort`/`aborting`,
-    /// `:471`, `:479-482`, which the type declares `DBE_VALUE` plus the alarm
-    /// bit through [`Record::value_only_change_fields`]).
+    /// Posted by the cycle's `monitor()` walk, after `recGblResetAlarms`, as
+    /// the type declares the field (`asyncFinish`'s `abort`/`aborting`,
+    /// `:471`, `:479-482`, from sseq's own marks).
     Monitor,
 }
 
@@ -3408,14 +3449,6 @@ pub struct ProcessContext {
     /// changes nothing a hook may branch on (the epid record's
     /// `devEpidSoftCallback` TRIG write).
     pub soft: Option<crate::server::device_support::SoftDtyp>,
-    /// The callback band `dbCommon.prio` selects for work this cycle defers —
-    /// C `seqRecord.c:145-146`, which re-runs
-    /// `callbackSetPriority(prec->prio, &pcb->callback)` at the top of every
-    /// `process()` so a `PRIO` written between cycles takes effect on the next
-    /// one. Already converted: a record stashes this and hands it to
-    /// [`crate::runtime::task::spawn_background`] rather than re-deriving a
-    /// band from a raw menu index.
-    pub callback_priority: crate::runtime::task::CallbackPriority,
     /// `dbCommon.scan`: StreamEpics.cc `Stream::process` answers an I/O
     /// Intr record's pass from the input it already has.
     pub scan: crate::server::record::ScanType,
@@ -4240,8 +4273,9 @@ pub trait Record: RecordAny + Send + Sync + 'static {
     /// A field with choices but a `Short` declaration is a self-contradictory
     /// declaration: it would be served as a bare `DBR_SHORT` index while
     /// claiming to have labels for it. `menu_choices_are_served_as_dbr_enum`
-    /// (`tests/menu_fields_serve_enum_choices.rs`) fails on any record type
-    /// that breaks it — the storage may be a short, the declaration may not.
+    /// (`tests/integration/menu_fields_serve_enum_choices.rs`) fails on any
+    /// record type that breaks it — the storage may be a short, the declaration
+    /// may not.
     fn menu_field_choices(&self, _field: &str) -> Option<&'static [&'static str]> {
         None
     }
@@ -4676,7 +4710,9 @@ pub trait Record: RecordAny + Send + Sync + 'static {
     ) -> Option<crate::types::DbFieldType> {
         match self.soft_input_request(soft) {
             InputLinkRequest::As(read_as) => read_as.dbr_type(),
-            InputLinkRequest::NotRead | InputLinkRequest::FromSource => None,
+            InputLinkRequest::NotRead
+            | InputLinkRequest::FromSource
+            | InputLinkRequest::FromEarlierLinks => None,
         }
         .or_else(|| crate::server::record::record_instance::declared_field_type_of(self, "VAL"))
     }
@@ -5632,10 +5668,14 @@ pub trait Record: RecordAny + Send + Sync + 'static {
         Ok(())
     }
 
-    /// [`Self::init_record_with_links`], for a type that declares
+    /// [`Self::init_record_step`], for a type that declares
     /// [`CycleHooks::OWN_FRAME`].
-    fn init_record_own(&mut self, reads: &mut InitLinkReads, _own: OwnFrame<'_>) -> CaResult<()> {
-        self.init_record_with_links(reads)
+    fn init_record_own(
+        &mut self,
+        answer: Option<crate::server::recgbl::simm::LinkFetch>,
+        _own: OwnFrame<'_>,
+    ) -> CaResult<Option<(&'static str, LinkReadAs)>> {
+        self.init_record_step(answer)
     }
 
     /// Did `init_record` leave the record PERMANENTLY ACTIVE — C's
@@ -7230,8 +7270,9 @@ pub trait Record: RecordAny + Send + Sync + 'static {
     /// loop; see [`InputFetchPolicy`]. Default: [`InputFetchPolicy::ReadAll`].
     ///
     /// It governs the [`Self::multi_input_links`] loop ONLY.
-    /// [`Self::string_input_links`] is C's *second*, separately-gated fetch
-    /// loop and never participates in this policy.
+    /// [`Self::string_input_links`] is C's *second* fetch loop: its own
+    /// failures never feed this policy, and it runs only when this one
+    /// reports no failure.
     fn input_fetch_policy(&self) -> InputFetchPolicy {
         InputFetchPolicy::ReadAll
     }
@@ -7262,7 +7303,8 @@ pub trait Record: RecordAny + Send + Sync + 'static {
     ///    makes `fetch_values` non-zero, so it cannot suppress the record body.
     ///    The record's single [`Self::input_fetch_policy`] describes the numeric
     ///    loop (`AbortOnFirstFailure` for scalcout) and cannot also describe this
-    ///    one.
+    ///    one. It is reached only when that loop did not `return(status)`
+    ///    (:886), so after a failed numeric read no string field is touched.
     /// 2. **A failed read still writes the field** — with the diagnostic text
     ///    `"<record>:fetch(<FIELD>) failed"`, not with the previous value.
     /// 3. **A `DBF_CHAR`/`DBF_UCHAR` array source is read as text**, C-escaped
@@ -7505,6 +7547,15 @@ pub trait Record: RecordAny + Send + Sync + 'static {
         Some(LinkReadAs::Native)
     }
 
+    /// The request for a link whose [`Self::input_link_request`] answered
+    /// [`InputLinkRequest::FromEarlierLinks`], asked with every link before
+    /// it already landed this cycle. `None` reads nothing. Reached ONLY
+    /// through that answer.
+    fn input_link_read_as_from_earlier_links(&self, link_field: &str) -> Option<LinkReadAs> {
+        let _ = link_field;
+        Some(LinkReadAs::Native)
+    }
+
     /// C's `pdest` of an [`LinkReadAs::Array`] read on `link_field`: the
     /// buffer as it stands before the read. A read keeps it from the element
     /// that fails to convert on; CA ignores that status (`dbCa.c:519`), a DB
@@ -7633,9 +7684,10 @@ pub trait Record: RecordAny + Send + Sync + 'static {
 
     /// INP's `dbIsLinkConnected && dbGetNelements` — `None` where that test
     /// fails — told to a type that declares [`CycleHooks::INP_NELEMENTS`]
-    /// after its pre-input actions and before the INP read, whatever that
-    /// read then delivers. `false` refuses the read: the cycle neither reads
-    /// INP nor raises the alarm a failed `dbGetLink` would.
+    /// after its pre-input actions and before the INP read, which asks that
+    /// many elements, whatever it then delivers. `false` refuses the read:
+    /// the cycle neither reads INP nor raises the alarm a failed `dbGetLink`
+    /// would.
     fn set_inp_nelements(&mut self, _nelements: Option<i64>) -> bool {
         true
     }
@@ -7760,6 +7812,12 @@ pub trait Record: RecordAny + Send + Sync + 'static {
     ) {
     }
 
+    /// The record's `PRIO` band, handed over as the record is created and
+    /// before any other hook: a record that requests callbacks reads it at
+    /// each request, as C reads `prec->prio`, so a `PRIO` put moves the next
+    /// one whether or not the record has processed since. Default: ignore.
+    fn set_record_band(&mut self, _band: crate::server::database::RecordBand) {}
+
     /// Framework init hook: called once at record load *after* the common
     /// link fields (`INP`/`OUT`/`FLNK`/...) have been resolved and the
     /// `init_record` passes have run, with the record's resolved
@@ -7779,20 +7837,19 @@ pub trait Record: RecordAny + Send + Sync + 'static {
     /// Additive, framework-set-hook pattern. Default: ignore.
     fn init_links(&mut self, _common: &crate::server::record::CommonFields) {}
 
-    /// The links C's `init_record(prec, 1)` reads with `dbGetLink`, each with
-    /// the DBR type it requests. The framework reads them once at `iocInit`,
-    /// after every record's pass 0, and hands the answers to
-    /// [`Self::init_record_with_links`].
-    fn init_link_reads(&self) -> &'static [(&'static str, LinkReadAs)] {
-        &[]
-    }
-
-    /// Pass 1 of `init_record`. A type that declares
-    /// [`Self::init_link_reads`] overrides this and runs its C loop over
-    /// `reads`: store, gate, zero or stop on each answer as its C
-    /// `init_record` does.
-    fn init_record_with_links(&mut self, _reads: &mut InitLinkReads) -> CaResult<()> {
-        self.init_record(1)
+    /// Pass 1 of `init_record`, one C `dbGetLink` at a time: `answer` is
+    /// `None` to begin the pass, else the answer to the read the previous
+    /// step named. A step returns the next link C's `init_record(prec, 1)`
+    /// reads, with the DBR type it requests, or `None` once the pass is done.
+    /// The framework makes every read, with this record let go, so a read
+    /// sees the record as the steps before it left it; a type whose C pass
+    /// reads links overrides this and stores, gates, zeroes or stops on each
+    /// answer as its C `init_record` does.
+    fn init_record_step(
+        &mut self,
+        _answer: Option<crate::server::recgbl::simm::LinkFetch>,
+    ) -> CaResult<Option<(&'static str, LinkReadAs)>> {
+        self.init_record(1).map(|()| None)
     }
 
     /// Called by the framework before process() to indicate whether device
@@ -9474,7 +9531,7 @@ pub(crate) mod tests {
             "calc" | "sel" => CycleHooks::INPUT_FETCH,
             "aSub" => CycleHooks::MONITOR_SETS,
             "longout" => CycleHooks::OUTPUT_HOOKS,
-            "sseq" => CycleHooks::ALL,
+            "sseq" => CycleHooks::ALL.union(CycleHooks::OWN_FRAME),
             "scalcout" => CycleHooks::ALL
                 .union(CycleHooks::PUT_REPORT)
                 .union(CycleHooks::LINK_CHECK),
@@ -10741,17 +10798,8 @@ pub(crate) fn seed_trackers_from_val<R: Record + ?Sized>(rec: &mut R) {
     }
 }
 
-/// The answers to a record's [`Record::init_link_reads`], as C's
-/// `dbGetLink` would have given them inside `init_record(prec, 1)`.
-pub struct InitLinkReads {
-    reads: Vec<(&'static str, InitRead)>,
-    /// What the reads the record took did to its pending alarm, in the order
-    /// it took them: `recGblSetSevr` keeps the first status of the highest
-    /// severity, so order decides which one wins a tie.
-    effects: Vec<InitReadEffect>,
-}
-
-/// One link's answer and what taking it does to the reader.
+/// One link's answer to a `dbGetLink` C's `init_record(prec, 1)` makes, and
+/// what taking it does to the reader.
 pub(crate) struct InitRead {
     pub(crate) fetch: crate::server::recgbl::simm::LinkFetch,
     /// `recGblInheritSevrMsg` on a successful read (`dbDbLink.c:228-232`).
@@ -10775,71 +10823,38 @@ pub(crate) enum InitGetFailure {
     Disconn,
 }
 
-enum InitReadEffect {
-    Disconn(&'static str),
-    LinkAlarm(&'static str),
-    Inherit(
-        crate::server::record::MonitorSwitch,
-        crate::server::database::LinkAlarm,
-    ),
-}
-
-impl InitLinkReads {
-    /// The answers, by link field. A link absent from them reads as an
-    /// unset link: success, nothing written.
-    pub(crate) fn new(reads: Vec<(&'static str, InitRead)>) -> Self {
-        Self {
-            reads,
-            effects: Vec::new(),
-        }
-    }
-
-    /// `dbGetLink(&prec->link, ...)`. A failed read raises LINK/INVALID on the
-    /// record, as `dbGetLink`'s `setLinkAlarm` does (`dbLink.c:338-339`), and a
-    /// good one folds the source's alarm by the link's MS flag, but only for a
-    /// link the record actually reads.
-    pub fn get(&mut self, link: &str) -> crate::server::recgbl::simm::LinkFetch {
+impl InitRead {
+    /// Raise on the reader of `link` what this read raises as its
+    /// `dbGetLink` returns: LINK/INVALID for a failed read
+    /// (`dbLink.c:338-339`), the source's alarm by the link's MS flag for a
+    /// good one. The answer the record's step takes.
+    pub(crate) fn land(
+        self,
+        common: &mut crate::server::record::CommonFields,
+        link: &'static str,
+    ) -> crate::server::recgbl::simm::LinkFetch {
         use crate::server::recgbl::simm::LinkFetch;
-        let Some((name, read)) = self.reads.iter().find(|(name, _)| *name == link) else {
-            return LinkFetch::NoData;
-        };
-        match (&read.fetch, &read.inherit) {
-            (LinkFetch::Failed, _) => match read.failure {
+        match (&self.fetch, &self.inherit) {
+            (LinkFetch::Failed, _) => match self.failure {
                 InitGetFailure::NoLset => {}
-                InitGetFailure::LinkAlarm => self.effects.push(InitReadEffect::LinkAlarm(name)),
-                InitGetFailure::Disconn => {
-                    self.effects.push(InitReadEffect::Disconn(name));
-                    self.effects.push(InitReadEffect::LinkAlarm(name));
+                InitGetFailure::LinkAlarm => {
+                    crate::server::recgbl::rec_gbl_set_link_alarm(common, link)
                 }
-            },
-            (LinkFetch::Value(_), Some((ms, alarm))) => {
-                self.effects
-                    .push(InitReadEffect::Inherit(*ms, alarm.clone()));
-            }
-            _ => {}
-        }
-        read.fetch.clone()
-    }
-
-    /// Fold what the taken reads did into the record's pending alarm.
-    pub(crate) fn apply(&self, common: &mut crate::server::record::CommonFields) {
-        for effect in &self.effects {
-            match effect {
-                InitReadEffect::Disconn(field) => {
+                InitGetFailure::Disconn => {
                     crate::server::recgbl::rec_gbl_set_sevr_msg(
                         common,
                         crate::server::recgbl::alarm_status::LINK_ALARM,
                         crate::server::record::AlarmSeverity::Invalid,
-                        crate::server::record::SparseText::link_disconn(field),
+                        crate::server::record::SparseText::link_disconn(link),
                     );
+                    crate::server::recgbl::rec_gbl_set_link_alarm(common, link);
                 }
-                InitReadEffect::LinkAlarm(field) => {
-                    crate::server::recgbl::rec_gbl_set_link_alarm(common, field);
-                }
-                InitReadEffect::Inherit(ms, alarm) => {
-                    crate::server::database::inherit_sevr_msg(common, *ms, alarm);
-                }
+            },
+            (LinkFetch::Value(_), Some((ms, alarm))) => {
+                crate::server::database::inherit_sevr_msg(common, *ms, alarm);
             }
+            _ => {}
         }
+        self.fetch
     }
 }

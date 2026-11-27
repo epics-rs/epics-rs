@@ -293,14 +293,15 @@ required-features = ["qsrv-core", "pvalink", "calink-core"]
 epics-rtems-boot = { workspace = true }
 
 [dev-dependencies]
+fact-budget = { path = "../fact-budget" }
 # Dev-only and `path`-only, so `cargo package` drops it from the uploaded
 # manifest: the source guards in this crate share one production-slice rule.
 source-guard = { path = "../source-guard" }
 # Dev-only, path-only (no `version`, so `cargo publish` strips the entry
 # entirely): the shared exec-backend test-gating census, called by
-# `tests/rtems_exec_model_gate.rs`. Shared rather than copied because every
-# crate that derives the backend has the same hole, and a 300-line audit
-# copied once per crate is how copies of a rule come to disagree.
+# `tests/integration/rtems_exec_model_gate.rs`. Shared rather than copied
+# because every crate that derives the backend has the same hole, and a 300-line
+# audit copied once per crate is how copies of a rule come to disagree.
 rtems-exec-gate = { path = "../../tools/rtems-exec-gate" }
 libc = "0.2"
 # Dev-only and path-only: `boot_on_free_port`, the one owner of starting a C
@@ -309,6 +310,8 @@ libc = "0.2"
 epics-oracle-rs = { path = "../epics-oracle-rs" }
 # Dev-only and path-only: the retry rule for a test that must name a port.
 named-port = { path = "../named-port" }
+# Dev-only and path-only: the counting allocator of the `alloc` binary.
+alloc-count = { path = "../alloc-count" }
 serial_test = "3"
 tempfile = "3"
 tracing-subscriber = "0.3"

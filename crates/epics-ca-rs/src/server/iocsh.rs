@@ -230,7 +230,7 @@ pub fn publish_casr_source(stats: Arc<ServerStats>, addrs: CasrAddrs) {
 /// report — C's two entry points are literally one function
 /// (`rsrv_server.report = casr`, `caservertask.c:1563`), so a second
 /// derivation here could drift from the first.
-fn casr_report_lines(level: i64) -> Vec<String> {
+pub(crate) fn casr_report_lines(level: i64) -> Vec<String> {
     match casr_cell().read().unwrap().as_ref() {
         Some(src) => casr_lines(src.stats.active_clients() as usize, level, &src.addrs),
         None => Vec::new(),
@@ -654,7 +654,8 @@ mod tests {
         let _client =
             std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, serving.tcp_port()))
                 .expect("connect");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline =
+            epics_libcom_rs::runtime::time::deadline_from_now(std::time::Duration::from_secs(5));
         while serving.active_connections() == 0 && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }

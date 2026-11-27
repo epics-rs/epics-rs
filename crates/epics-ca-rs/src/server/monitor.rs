@@ -27,7 +27,7 @@ pub(crate) async fn deliver_monitor_event(
     if let Some(ref s) = m.stats {
         s.subscription_events_posted.fetch_add(1, Ordering::Relaxed);
     }
-    if m.denied.load(Ordering::Acquire) {
+    if m.read_denied() {
         m.gate
             .deliver(|| super::tcp::send_denied_event(m, outbox, client_minor));
         return;
@@ -393,15 +393,28 @@ mod tests {
             epics_base_rs::server::event_queue::EventReader,
         ) {
             let user = Arc::new(epics_base_rs::server::event_queue::EventUser::new());
+            let target = crate::server::tcp::ChannelTarget::SimplePv(pv.clone());
             let context: epics_base_rs::server::event_queue::DeliveryContext =
                 Arc::new(crate::server::tcp::CircuitMonitor {
-                    target: crate::server::tcp::ChannelTarget::SimplePv(pv.clone()),
+                    rights: Arc::new(crate::server::tcp::ChannelRights::new(
+                        Arc::new(crate::server::tcp::CircuitRights::new(
+                            epics_base_rs::server::access_security::new_acf_cell(denied.then(
+                                || {
+                                    epics_base_rs::server::access_security::parse_acf(
+                                        "ASG(DEFAULT) {\n    RULE(1, NONE)\n}\n",
+                                    )
+                                    .unwrap()
+                                },
+                            )),
+                        )),
+                        target.clone(),
+                    )),
+                    target,
                     db: Arc::new(epics_base_rs::server::database::PvDatabase::new()),
                     cid: 0,
                     sub_id: 1,
                     data_type: DBR_DOUBLE,
                     data_count: 0,
-                    denied: AtomicBool::new(denied),
                     gate: crate::server::outbox::MonitorGate::open(),
                     stage: crate::server::DeliveryStage::plain(),
                     req_hdr: crate::protocol::CaHeader::new(crate::protocol::CA_PROTO_EVENT_ADD),

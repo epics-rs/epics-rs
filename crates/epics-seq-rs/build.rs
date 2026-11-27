@@ -10,10 +10,12 @@
 //! would be wrong on exactly the case the workspace predicate exists for: on
 //! RTEMS it is unset while `exec_backend` is ON.
 //!
-//! It also stamps `seq_release.pl`'s `compiled <localtime>`: a build of this
-//! crate is C's build of the sequencer, and `seq` prints the time in its
-//! banner. Under `snc` the same instant goes into the `seq_release.h` the
-//! compiler's programs include.
+//! It also stamps `seq_release.pl`'s `compiled <localtime>`, which `seq`
+//! prints in its banner, as the time this script runs. Under `snc` the same
+//! instant goes into the `seq_release.h` the compiler's programs include. The
+//! script re-runs when the library's own inputs change, not on a `tests/`
+//! edit: tests are not in the shipped binary, and a re-stamp would recompile
+//! every crate whose build script compiles programs with snc.
 fn main() {
     let now = std::time::SystemTime::now();
     let epoch = now
@@ -22,10 +24,9 @@ fn main() {
     println!("cargo::rustc-env=SEQ_RS_BUILD_EPOCH={epoch}");
     #[cfg(feature = "snc")]
     seq_release_h(now);
-    // A `rerun-if-*` below ends Cargo's own watch on the package, which the
-    // stamp needs, so the package is named too.
-    let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("set by Cargo");
-    println!("cargo::rerun-if-changed={manifest}");
+    for input in ["src", "build.rs", "Cargo.toml"] {
+        println!("cargo::rerun-if-changed={input}");
+    }
 
     println!("cargo::rustc-check-cfg=cfg(exec_backend)");
     println!("cargo::rustc-check-cfg=cfg(tokio_backend)");

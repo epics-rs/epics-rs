@@ -1128,7 +1128,7 @@ mod tests {
         // FMOD and `>>>` are base-only symbols. In sCalc/aCalc no entry spells
         // them: `>>>` reads as `>>`, and the `>` left over is in no
         // `operands[]`. The engine-level assertions live in
-        // tests/calc_element_tables.rs.
+        // tests/integration/calc_element_tables.rs.
         assert_eq!(base("FMOD", "o").unwrap()[0], Token::Func(FuncName::Fmod));
         assert_eq!(base("A>>>1", "oxo").unwrap()[1], Token::ShrLogical);
         assert_eq!(scalc("A>>>1", "oxo"), Err(CalcError::Syntax));

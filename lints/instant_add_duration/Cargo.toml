@@ -1,0 +1,23 @@
+[package]
+name = "instant_add_duration"
+version = "0.1.0"
+edition = "2024"
+description = "Dylint lint: a deadline built by Instant + Duration, which panics on overflow"
+license-file = "../../LICENSE"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+dylint_linting = "6.3.0"
+serde = { version = "1.0", features = ["derive"] }
+
+[dev-dependencies]
+dylint_testing = "6.3.0"
+
+[package.metadata.rust-analyzer]
+rustc_private = true
+
+# Built on its own pinned nightly, never by the workspace's stable toolchain.
+[workspace]

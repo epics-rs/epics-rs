@@ -542,13 +542,14 @@ impl Record for HistogramRecord {
     /// SDEL seconds. A non-positive SDEL means no watchdog at all.
     ///
     /// SDEL is `DBF_DOUBLE` (histogramRecord.dbd.pod) and C stores the full
-    /// double range verbatim — `caput REC.SDEL 1e308`/`inf` SUCCEEDS, arming a
-    /// callback so far in the future it never fires. `Duration::from_secs_f64`
+    /// double range verbatim — `caput REC.SDEL 1e308`/`inf` SUCCEEDS, and C's
+    /// epicsTimer wraps a delay that large in `epicsTimeAddSeconds` and fires
+    /// the callback at once. `Duration::from_secs_f64`
     /// PANICS on a non-finite or Duration-overflowing value, so it cannot be the
     /// converter here: a store of `1e308`/`1e39`/`inf` would abort the put the
     /// oracle expects to succeed. `runtime::time::duration_from_secs` — the
-    /// seam's one converter for a record field — maps them to `Duration::MAX`,
-    /// C's never-firing deadline, so `None` here keeps its single meaning:
+    /// seam's one converter for a record field — maps them to `FAR_FUTURE`,
+    /// where Rust waits instead, so `None` here keeps its single meaning:
     /// C's `sdel > 0` test said there is no watchdog.
     fn watchdog_interval(&self) -> Option<std::time::Duration> {
         if self.sdel > 0.0 {

@@ -84,7 +84,8 @@ suite needs no external C tools, so it is **not** gated behind
 The caput-by-label match ("match ENUM value against the menu before numeric
 index") lives entirely in the `caput` CLI (`crates/epics-ca-rs/src/bin/caput-rs.rs`)
 and has no library-client equivalent, so this in-process harness cannot exercise
-it; it is covered by caput-rs's own tests. See the note in `tests/families.rs`.
+it; it is covered by caput-rs's own tests. See the note in
+`tests/integration/families.rs`.
 
 The **PVA monitor overrun bitset** (Family S) is not observable end-to-end. The
 server always emits an empty overrun BitSet (pvxs `servermon.cpp:174` placeholder
@@ -93,4 +94,4 @@ parity), so a client's `nSrvSquash`/`n_srv_squash` counter stays 0 by design and
 here would test behavior pvxs itself does not produce. The wire form is pinned in
 `epics-pva-rs` instead — decode round-trip (`monitor_data_preserves_overrun_bitset`)
 and the hardcoded empty-overrun server emission. See the Family S note in
-`tests/families.rs`.
+`tests/integration/families.rs`.

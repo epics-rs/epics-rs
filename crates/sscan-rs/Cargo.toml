@@ -22,6 +22,7 @@ epics-seq-rs = { workspace = true, features = ["snc"] }
 [features]
 
 [dev-dependencies]
+fact-budget = { path = "../fact-budget" }
 tempfile = "3"
 epics-ca-rs = { workspace = true }
 tokio = { version = "1", features = ["full", "test-util"] }

@@ -77,9 +77,10 @@ mod tests {
 
     /// The label⇄index mapping this type renders is `menuPini`'s, so the one
     /// menu converter (`menu_choices::resolve_menu_field_string`, which owns
-    /// every string→menu-index put — see `tests/menu_field_put_bad_choice.rs`
-    /// and `tests/menu_common_field_scan_pini.rs`) and this type agree on
-    /// every choice.
+    /// every string→menu-index put — see
+    /// `tests/integration/menu_field_put_bad_choice.rs` and
+    /// `tests/integration/menu_common_field_scan_pini.rs`) and this type agree
+    /// on every choice.
     #[test]
     fn labels_match_the_shared_menu_table() {
         for (i, label) in super::super::menu_choices::MENU_PINI.iter().enumerate() {

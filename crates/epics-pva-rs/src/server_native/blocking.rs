@@ -78,9 +78,9 @@
 //! # Shutdown: one wake primitive, three triggers
 //!
 //! A thread cannot be aborted the way the hosted accept loop aborts a task in
-//! its `JoinSet`, and PVA's `op_timeout` defaults to ~64,000 s so `SO_RCVTIMEO`
-//! cannot stand in either (§1.6, §4.2c). So there is exactly one way a parked
-//! connection thread is woken here — `ConnWake::wake`, i.e.
+//! its `JoinSet`, and the accepted socket carries no `SO_RCVTIMEO` to stand in
+//! either (§4.2c). So there is exactly one way a parked connection thread is
+//! woken here — `ConnWake::wake`, i.e.
 //! `shutdown(Shutdown::Both)` on that connection's socket — and all three
 //! termination triggers go through it:
 //!
@@ -161,7 +161,7 @@ use std::net::{
     UdpSocket,
 };
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -548,14 +548,9 @@ pub(super) fn serve_connection_blocking(
         writer: writer_worker,
     } = pumps;
     let _ = stream.set_nodelay(true);
-    // SO_RCVTIMEO (the same move CA's blocking driver makes), fatal: every
-    // target that runs this accepts it, RTEMS included. Note the receive
-    // timeout is NOT a shutdown mechanism here: `op_timeout` defaults to
-    // ~64,000 s, so it is effectively infinite (§1.6). What ends a parked
-    // reader is the `shutdown` below.
-    stream
-        .set_read_timeout(Some(config.op_timeout))
-        .map_err(PvaError::Io)?;
+    // No SO_RCVTIMEO: a wall-time receive bound ends the reader while a
+    // resolver pause holds reads off by choice. `handle_connection_io`'s
+    // `op_timeout` watchdog, which skips the pause, alone judges a stall.
     let send_timeout = config.send_timeout;
     // No SO_SNDTIMEO: it is not needed on any target:
     // `blocking_io::write_frame_deadline` waits for writability against
@@ -860,17 +855,17 @@ impl BlockingPvaServer {
         let udp_port = socket
             .local_addr()
             .map_or(self.config.udp_port, |a| a.port());
-        let replier = OnceLock::from(SearchReplier {
+        let replier = SearchReplier {
             source: self.source.clone(),
             tcp_port: self.config.tcp_port,
             guid: self.config.guid,
             protocol: "tcp",
-        });
+        };
         handle_udp_search_blocking(
             socket,
             &self.config.ignore_addrs,
             udp_port,
-            &replier,
+            || Some(&replier),
             &self.shutdown,
         )
     }
@@ -912,14 +907,20 @@ impl BlockingPvaServer {
     ///
     /// Blocks the calling thread and takes it to `PVA_SERVER_PRIORITY`, so
     /// give it a thread of its own rather than calling it on a thread that has
-    /// other work.
-    pub fn serve(&self, reactor: &epics_base_rs::runtime::task::Reactor) {
+    /// other work. `started` runs once every listener's accept thread exists,
+    /// and the listeners accept only if it returns `true`; an `Err` is a
+    /// thread that could not be created, with nothing accepted.
+    pub fn serve(
+        &self,
+        reactor: &epics_base_rs::runtime::task::Reactor,
+        started: impl FnOnce() -> bool,
+    ) -> io::Result<()> {
         // From here down `reactor` is the server's own — see the reactor
         // driver's `serve`. It carries the per-connection writer task, which
         // is this driver's one spawned future.
         let reactor = &self.conn_reactor(reactor);
         self.listeners
-            .serve(|listener| self.accept_loop(listener, reactor));
+            .serve(|listener| self.accept_loop(listener, reactor), started)
     }
 
     /// One listener's accept loop, on its own thread.
@@ -932,8 +933,8 @@ impl BlockingPvaServer {
                     backoff.accepted();
                     // `shutdown` wakes this parked `accept` by dialling our own
                     // socket; that throwaway connection arrives here and is
-                    // dropped with the flag already set.
-                    if self.shutdown.load(Ordering::Acquire) {
+                    // dropped with the listeners already stopped.
+                    if self.listeners.stopped() {
                         break;
                     }
                     let peer = match stream.peer_addr() {
@@ -948,7 +949,7 @@ impl BlockingPvaServer {
                     }
                 }
                 Err(e) => {
-                    if self.shutdown.load(Ordering::Acquire) {
+                    if self.listeners.stopped() {
                         break;
                     }
                     warn!(error = %e, "blocking PVA server: accept failed");
@@ -959,7 +960,7 @@ impl BlockingPvaServer {
                     thread::sleep(backoff.failed());
                     // `shutdown()` may have been asked for while we slept, and
                     // its self-dial cannot wake an `accept()` that is failing.
-                    if self.shutdown.load(Ordering::Acquire) {
+                    if self.listeners.stopped() {
                         break;
                     }
                 }
@@ -1091,22 +1092,22 @@ impl BlockingPvaServer {
     /// already running. Idempotent.
     ///
     /// Two operations because there are two things to stop, and neither
-    /// implies the other: the flag plus a self-connect returns the parked
+    /// implies the other: stopping the listeners returns the parked
     /// `accept`, and [`ConnRegistry::stop`] shuts every live connection's
     /// socket. Without the second, a peer that never speaks and never hangs up
     /// would hold three threads until the process exits — the semantic CA's
     /// blocking server still has, and the reason the registry exists.
     ///
     /// [`serve_udp_search`](Self::serve_udp_search) needs no third operation:
-    /// nothing parks it for longer than its 200 ms read timeout, so the flag
-    /// alone retires it within one tick.
+    /// nothing parks it for longer than its 200 ms read timeout, so the
+    /// `shutdown` flag alone retires it within one tick.
     ///
     /// Returns once the wakes are issued; each connection retires on its own
     /// pool worker. Nobody joins those connections, so a caller that must
     /// observe them gone watches [`active_connections`](Self::active_connections).
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
-        self.listeners.wake();
+        self.listeners.stop();
         self.connections.stop();
     }
 }
@@ -1121,8 +1122,7 @@ impl Drop for BlockingPvaServer {
     /// never ends. [`shutdown`](Self::shutdown) shuts every live connection's
     /// socket, which unwinds its body down the existing EOF path; running it
     /// here — before the `conn_pool` field drops — is what makes the pool's
-    /// join terminate. Idempotent, so a caller that already called `shutdown`
-    /// pays only a redundant self-dial.
+    /// join terminate. Idempotent, and a repeat dials nothing.
     fn drop(&mut self) {
         self.shutdown();
     }
@@ -1447,8 +1447,8 @@ fn send_search_reply(
 }
 
 /// Read UDP SEARCHes on one socket until `shutdown` is set, answering them
-/// once `replier` is set: before that it only forwards a local unicast one,
-/// as pvxs's collector does between its bind and `Server::start`.
+/// while `replier` names who answers: before that it only forwards a local
+/// unicast one, as pvxs's collector does between its bind and `Server::start`.
 ///
 /// The decode is [`process_search_datagram`] — the same function the hosted
 /// responder drives, moved onto neutral ground by stage D part 1 — so replies
@@ -1466,11 +1466,11 @@ fn send_search_reply(
 /// * `origin` — `Direct` for what arrives on the socket, `FromOriginTag` for a
 ///   datagram peeled out of an ORIGIN_TAG prefix. A [`SearchSocket`] is joined
 ///   to the group, so it receives the tagged copies of its own forwards.
-pub(super) fn handle_udp_search_blocking(
+pub(super) fn handle_udp_search_blocking<'r>(
     socket: SearchSocket,
     ignore_addrs: &[(IpAddr, u16)],
     udp_port: u16,
-    replier: &OnceLock<SearchReplier>,
+    replier: impl Fn() -> Option<&'r SearchReplier>,
     shutdown: &AtomicBool,
 ) -> PvaResult<()> {
     let want_pktinfo = socket.pktinfo();
@@ -1531,7 +1531,7 @@ pub(super) fn handle_udp_search_blocking(
         // RTEMS `block_on_sync` parks this thread; on a host test it does the
         // same, since this loop owns its thread outright.
         let outputs = match block_on_sync(process_search_datagram(
-            replier.get(),
+            replier(),
             forward,
             udp_port,
             frame,
@@ -2113,8 +2113,8 @@ pub(super) mod tests {
     ///
     /// The retire assertion rests on `runtime::blocking_io`'s wait, not on
     /// the park: a local `shutdown(Shutdown::Both)` returns a connection
-    /// parked in `read` behind the ~64,000 s `op_timeout` (§1.6) at once on
-    /// unix (`POLLHUP`), and within the wait's `WAKE_POLL_PERIOD` on Windows,
+    /// parked in an unbounded `read` at once on unix (`POLLHUP`), and within
+    /// the wait's `WAKE_POLL_PERIOD` on Windows,
     /// which does not return the parked `recv` itself (measured, PR #56 CI
     /// 2026-07-24: all eight of these tests timed out on their retire bounds
     /// on both Windows runners while the park carried the bound).
@@ -2353,8 +2353,8 @@ pub(super) mod tests {
     }
 
     /// Boundary: the reader is parked in `read` — the common state, and the
-    /// one nothing else can end. `op_timeout` is ~64,000 s by default (§1.6),
-    /// so if the socket shutdown does not return that `read`, nothing does.
+    /// one nothing else can end. The socket has no receive bound, so if the
+    /// socket shutdown does not return that `read`, nothing does.
     ///
     /// Mutation-checked: make `ConnWake::wake` a no-op and this test fails on
     /// its retire bound instead of hanging, because `wait_retired` is bounded.
@@ -2765,7 +2765,7 @@ pub(super) mod tests {
             peer.clone(),
         );
         let within = |what: String, done: &dyn Fn() -> bool| {
-            let deadline = Instant::now() + RETIRE_BOUND;
+            let deadline = epics_libcom_rs::runtime::time::deadline_from_now(RETIRE_BOUND);
             while !done() {
                 assert!(Instant::now() < deadline, "{what}");
                 thread::sleep(Duration::from_millis(1));
@@ -2819,8 +2819,7 @@ pub(super) mod tests {
     /// `op_timeout` after reads resume — not before, and not a tick later
     /// than that. On a [`ManualClock`], as above; a tick is known evaluated
     /// once the ticker arms a deadline past the clock, and `idle_timeout`
-    /// is set past every advance so only this watchdog can close. `op_timeout`
-    /// is long in wall time because it is also the socket's `SO_RCVTIMEO`.
+    /// is set past every advance so only this watchdog can close.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_read_stall_watchdog_skips_a_resolver_pause_and_closes_at_op_timeout() {
         use super::super::tcp::{CREATE_CHANNEL_QUEUE_DEPTH, CREATE_CHANNEL_RESOLVE_CONCURRENCY};
@@ -2845,7 +2844,7 @@ pub(super) mod tests {
             peer.clone(),
         );
         let within = |what: &str, done: &dyn Fn() -> bool| {
-            let deadline = Instant::now() + RETIRE_BOUND;
+            let deadline = epics_libcom_rs::runtime::time::deadline_from_now(RETIRE_BOUND);
             while !done() {
                 assert!(Instant::now() < deadline, "{what}");
                 thread::sleep(Duration::from_millis(1));
@@ -3305,7 +3304,11 @@ pub(super) mod tests {
             "test-PVAS-accept".into(),
             PVA_SERVER_PRIORITY,
             StackSizeClass::Medium,
-            move || serving.serve(&harness_reactor()),
+            move || {
+                serving
+                    .serve(&harness_reactor(), || true)
+                    .expect("accept threads")
+            },
         )
         .expect("accept thread spawned");
         (server, accept)
@@ -3584,7 +3587,11 @@ pub(super) mod tests {
             "test-PVAS-accept".into(),
             PVA_SERVER_PRIORITY,
             StackSizeClass::Medium,
-            move || serving.serve(&harness_reactor()),
+            move || {
+                serving
+                    .serve(&harness_reactor(), || true)
+                    .expect("accept threads")
+            },
         )
         .expect("accept thread spawned");
         for ip in [Ipv4Addr::LOCALHOST, Ipv4Addr::new(127, 0, 0, 2)] {
@@ -3622,7 +3629,11 @@ pub(super) mod tests {
             "test-PVAS-accept".into(),
             PVA_SERVER_PRIORITY,
             StackSizeClass::Medium,
-            move || serving.serve(&harness_reactor()),
+            move || {
+                serving
+                    .serve(&harness_reactor(), || true)
+                    .expect("accept threads")
+            },
         )
         .expect("accept thread spawned");
         for (ip, port) in [

@@ -9,21 +9,31 @@ enum BlockExit {
     Retried,
     /// Into do_work.
     DoWork,
+    /// Into do_work through its dmov arm (1489): a put that rode the
+    /// pass, or else the latched button/field state, is collected.
+    Collect,
 }
 
 impl MotorRecord {
     /// Check if motion has completed and handle post-motion pipeline.
     pub fn check_completion(&mut self) -> ProcessEffects {
         let mut effects = ProcessEffects::default();
-        // C enter_do_work gate (1487-1492): a stop flagged on this callback
-        // (RDBL 3687-3697, LVIO 1475-1484) is consumed by do_work's top
-        // block after the stopped block, or stays latent past process_exit.
-        // A put that rode the pass and no exit took runs do_work there, or
-        // waits past process_exit or a closed gate for the callback's own
-        // NOTHING_DONE pass.
-        if self.callback_pass(&mut effects) == BlockExit::ProcessExit {
+        // C enter_do_work (1463-1492): past the callback block, LVIO, then
+        // the gate. A stop flagged on this callback (RDBL 3687-3697, LVIO
+        // 1475-1484) is consumed by do_work's top block, or stays latent
+        // past process_exit. A put that rode the pass and no exit took runs
+        // do_work there, or waits past process_exit or a closed gate for
+        // the callback's own NOTHING_DONE pass.
+        let exit = self.callback_pass(&mut effects);
+        if exit == BlockExit::ProcessExit {
             effects.process_exit = true;
-        } else if !self.put_rides() {
+            return effects;
+        }
+        self.recompute_lvio_during_motion();
+        if exit == BlockExit::Collect {
+            self.callback_do_work(&mut effects);
+        }
+        if !self.put_rides() {
             self.take_latent_stop(&mut effects);
         } else if self.ctrl.stop != 0
             || matches!(self.ctrl.spmg, SpmgMode::Stop | SpmgMode::Pause)
@@ -84,12 +94,6 @@ impl MotorRecord {
                 effects.commands.push(MotorCommand::stop_axis());
                 return BlockExit::DoWork;
             }
-            // C enter_do_work (1463-1484) re-evaluates LVIO on every
-            // process pass; for an in-flight motion the poll is the pass
-            // where RBV changes. A rising violation outside SET mode
-            // stops the axis and releases the buttons in the same pass
-            // (1475-1484 sets stop=1, the do_work top block consumes it).
-            self.recompute_lvio_during_motion();
             // Still moving — poll loop is already active.
             return BlockExit::DoWork;
         }
@@ -333,7 +337,7 @@ impl MotorRecord {
                 if self.stat.phase != MotionPhase::Idle {
                     return exit;
                 }
-                if pp && exit != BlockExit::Retried {
+                if pp && exit == BlockExit::DoWork {
                     // This early-return quiesces the axis without
                     // finalize_motion and dispatches nothing, deferring a
                     // held button to a later pass. pp is now cleared, so
@@ -352,8 +356,7 @@ impl MotorRecord {
                 // clears. CALLBACK_DATA pass — the implicit GET_INFO
                 // (C 2546) stays off; the pp completion return above
                 // skips one pass and the next poll lands here.
-                self.callback_do_work(effects);
-                BlockExit::DoWork
+                BlockExit::Collect
             }
         }
     }
@@ -489,10 +492,12 @@ impl MotorRecord {
     /// jog travel (RBV > HLM - JVEL / RBV < LLM + JVEL) or an inverted
     /// dial pair; a home search disables the check; every other state
     /// preserves the latched value. A rising violation outside SET mode
-    /// (`!set && !igset`, 1478) sets stop = 1 (1480-1481) for
-    /// take_latent_stop, whose stop_axis in-motion branch is C's
-    /// clear_buttons() (1482). Returns whether it did.
-    pub(super) fn recompute_lvio_during_motion(&mut self) -> bool {
+    /// (`!set && !igset`, 1478) sets stop = 1 for take_latent_stop and
+    /// releases the buttons (1480-1482). C runs it once per pass, so only
+    /// the pass entries call it: plan_motion and do_process_inner's
+    /// non-callback arms before do_work, check_completion and the STUP
+    /// ack after the callback block.
+    pub(super) fn recompute_lvio_during_motion(&mut self) {
         let old_lvio = self.limits.lvio;
         if self.limits.dhlm == self.limits.dllm && self.limits.dllm == 0.0 {
             self.limits.lvio = 0;
@@ -517,8 +522,8 @@ impl MotorRecord {
         if rising {
             self.ctrl.stop = 1;
             self.mark(m::STOP);
+            self.clear_buttons();
         }
-        rising
     }
 
     /// Set motion phase.
@@ -547,8 +552,7 @@ impl MotorRecord {
                     .mip
                     .remove(MipFlags::DELAY_REQ | MipFlags::DELAY_ACK);
                 self.mark(m::MIP);
-                self.evaluate_position_error(effects);
-                return BlockExit::Retried;
+                return self.evaluate_position_error(effects);
             }
         } else if dmov_edge {
             if !mip.contains(MipFlags::DELAY_REQ) {
@@ -605,7 +609,7 @@ impl MotorRecord {
 
     /// The C `maybeRetry` port (motorRecord.cc:1042-1104), run only by
     /// [`Self::retry_test`].
-    fn evaluate_position_error(&mut self, effects: &mut ProcessEffects) {
+    fn evaluate_position_error(&mut self, effects: &mut ProcessEffects) -> BlockExit {
         let diff = (self.pos.dval - self.pos.drbv).abs();
 
         // C `maybeRetry` (motorRecord.cc:1049): the retry comparison is
@@ -642,12 +646,9 @@ impl MotorRecord {
                         || (self.ctrl.jogr != 0 && self.limits.lls == 0),
                 );
                 // dmov stays TRUE through give-up, so do_work re-fires the
-                // armed jog/home in the SAME process pass (1489 `pmr->dmov`).
-                // finalize_motion above set dmov=true and cleared mip, so
-                // the gate passes and the re-armed jog or a held home
-                // replays now instead of waiting for the next idle poll.
-                self.callback_do_work(effects);
-                return;
+                // armed jog/home in the SAME process pass (1489 `pmr->dmov`),
+                // after enter_do_work's LVIO has seen MIP_DONE.
+                return BlockExit::Collect;
             }
             if self.retry.rmod == RetryMode::InPosition {
                 // C RMOD_I (motorRecord.cc:1432-1438): no move is
@@ -665,7 +666,7 @@ impl MotorRecord {
                 effects.schedule_delay = Some(epics_base_rs::runtime::time::duration_from_secs(
                     self.timing.dly,
                 ));
-                return;
+                return BlockExit::Retried;
             }
 
             // C maybeRetry 1077-1082 only arms the retry (mip = MIP_RETRY,
@@ -711,10 +712,11 @@ impl MotorRecord {
                 self.stat.mip = MipFlags::empty();
                 self.set_phase(MotionPhase::Idle);
                 self.plan_absolute_move(effects);
-                return;
+                return BlockExit::Retried;
             }
             self.finalize_motion(effects);
         }
+        BlockExit::Retried
     }
 
     /// Compute the backlash pre-target position.

@@ -17,6 +17,10 @@
 //!
 //! A site that is not C text names its argument in `dylint.toml` with a
 //! reason; an entry that matches nothing in a checked file fails too.
+//!
+//! A test-harness build (`--test`: a lib's or bin's `#[cfg(test)]` code, a
+//! `tests/` target, a bench) is not checked: its text is an assertion's,
+//! never the IOC's. The same lib built without `--test` is.
 
 #![feature(rustc_private)]
 
@@ -106,7 +110,7 @@ const FORMAT_TRAITS: &[&str] = &["Display", "Debug", "LowerExp", "UpperExp", "To
 
 impl<'tcx> LateLintPass<'tcx> for RawFloatFormat {
     fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx Expr<'tcx>) {
-        if in_debug_impl(cx, expr) {
+        if cx.sess().opts.test || in_debug_impl(cx, expr) {
             return;
         }
         let (formatted, (mut span, text)) = if let Some(formatted) = float_bound(cx, expr) {
@@ -170,6 +174,10 @@ impl<'tcx> LateLintPass<'tcx> for RawFloatFormat {
     }
 
     fn check_crate_post(&mut self, cx: &LateContext<'tcx>) {
+        // Nothing is checked in a `--test` build, so no entry is used in it.
+        if cx.sess().opts.test {
+            return;
+        }
         let sm = cx.sess().source_map();
         let files: Vec<_> = sm
             .files()
@@ -382,6 +390,19 @@ fn ui_allow() {
 allow = [
     { path = "ui_allow/main.rs", arg = "x", reason = "test" },
     { path = "ui_allow/main.rs", arg = "z", reason = "test" },
+]"#,
+        )
+        .run();
+}
+
+#[test]
+fn ui_test_harness() {
+    dylint_testing::ui::Test::src_base(env!("CARGO_PKG_NAME"), "ui_test_harness")
+        .rustc_flags(["--test"])
+        .dylint_toml(
+            r#"[raw_float_format]
+allow = [
+    { path = "ui_test_harness/main.rs", arg = "x", reason = "test" },
 ]"#,
         )
         .run();

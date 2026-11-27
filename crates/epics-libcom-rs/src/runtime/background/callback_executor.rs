@@ -70,12 +70,13 @@
 //! recovers, and it goes quiet while dead, because the message sits past the
 //! gate too. PR #996 drops the flag along with the ring; so does this.
 
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::thread::JoinHandle;
 
 use super::callback_queue::{BandQueue, Parking, ReadyCursor, Returns};
 use super::facility::{run_facility_loop, run_isolated};
+use crate::runtime::sync::UnlistedPriorityInheritanceMutex;
 use crate::runtime::task::{MandatoryThread, StackSizeClass, ThreadPriority};
 
 /// A unit of deferred work. The C `epicsCallback` is a function pointer plus
@@ -287,10 +288,11 @@ pub enum CallbackError {
     NotInit,
 }
 
-/// C `cbState` (`callback.c:69-71`), with `callbackStop`'s drain as a state
-/// of its own: the low bits of a band's [`PriorityQueue::word`], whose other
-/// bits count the requests it was given. Only [`CallbackPool::init`],
-/// [`CallbackPool::stop`] and [`CallbackPool::cleanup`] change it.
+/// C `cbState` (`callback.c:69-71`) for one band, with `callbackStop`'s
+/// drain as a state of its own: the low bits of a band's
+/// [`PriorityQueue::word`], whose other bits count the requests it was given.
+/// It follows the pool's [`pool_state`]: only the pool method that moved
+/// that moves it, and a seal ends a drain.
 mod band_state {
     /// C `cbRun`.
     pub(super) const RUN: u64 = 0;
@@ -310,6 +312,61 @@ mod band_state {
     pub(super) const REFUSE: u64 = 6;
     /// One request in the word's count.
     pub(super) const ONE: u64 = 8;
+}
+
+/// C `cbState` for the pool, the one gate every move of its bands' state
+/// passes, with the bands armed before any `callbackInit` as a state of its
+/// own so that only a repeated `callbackInit` warns.
+mod pool_state {
+    /// C `cbInit`.
+    pub(super) const INIT: u8 = 0;
+    /// A start, left only once every band runs, so `ARMED` and `RUN` mean
+    /// running bands; whoever finds it waits it out. C starts its bands
+    /// from `iocInit`'s one thread, here any thread may.
+    pub(super) const STARTING: u8 = 1;
+    /// The bands run, armed by something that needed them before any
+    /// `callbackInit` ran; C starts its bands only in `callbackInit`.
+    pub(super) const ARMED: u8 = 2;
+    /// C `cbRun`: `callbackInit` has run.
+    pub(super) const RUN: u8 = 3;
+    /// Inside `callbackStop`, until every band is sealed.
+    pub(super) const STOPPING: u8 = 4;
+    /// C `cbStop`.
+    pub(super) const STOPPED: u8 = 5;
+}
+
+/// Test-only: a closure run once on this thread inside a start it holds,
+/// and one run once where it finds a start another thread holds.
+#[cfg(test)]
+mod start_hook {
+    use std::cell::Cell;
+
+    type Hook = Cell<Option<Box<dyn FnOnce()>>>;
+
+    thread_local! {
+        static INSIDE: Hook = const { Cell::new(None) };
+        static WAITING: Hook = const { Cell::new(None) };
+    }
+
+    pub(super) fn inside(f: impl FnOnce() + 'static) {
+        INSIDE.set(Some(Box::new(f)));
+    }
+
+    pub(super) fn waiting(f: impl FnOnce() + 'static) {
+        WAITING.set(Some(Box::new(f)));
+    }
+
+    pub(super) fn fire_inside() {
+        if let Some(f) = INSIDE.take() {
+            f();
+        }
+    }
+
+    pub(super) fn fire_waiting() {
+        if let Some(f) = WAITING.take() {
+            f();
+        }
+    }
 }
 
 /// One worker's count of the requests it has run, on a line of its own so
@@ -332,8 +389,9 @@ enum Queued {
     /// task count and take no ring slot: a wake that the ring could reject
     /// would strand a long-lived task forever.
     Task(TaskEntry),
-    /// A [`CallbackCell`] request — holds a ring slot, as [`Queued::Ring`]
-    /// does, but queues the requester's own cell instead of a closure.
+    /// A [`CallbackCell`] request. Like [`Queued::Task`] it takes no ring
+    /// slot: the cell's `queued` flag is the claim, so these are bounded by
+    /// the live cell count, and a record completion is never refused.
     Cell(CellEntry),
 }
 
@@ -667,9 +725,11 @@ impl PriorityQueue {
         Ok(())
     }
 
-    /// [`Self::request`] for a [`CallbackCell`]: the slot first, then the
-    /// cell's claim, so a full band refuses either way and a cell already
-    /// queued gives its slot back (`callback.c:855-868`, intrusive form).
+    /// [`Self::request`] for a [`CallbackCell`], queued on the run-queue
+    /// supply ([`Queued::Cell`]). Never refused for a full band: C loses a
+    /// full ring's request (`callback.c:367-373`), and with it a record's
+    /// completion; a cell already queued is taken by the run pending for it
+    /// (`callback.c:865-868`, intrusive form).
     fn request_cell<B: CallbackBody>(
         &self,
         name: &str,
@@ -680,20 +740,21 @@ impl PriorityQueue {
         }
         // A swap, not a compare-exchange: a coalesced request must still
         // write, so the run pending for it acquires what it published.
-        let claim = || {
-            (!cell.queued.swap(true, Ordering::AcqRel))
-                .then(|| Queued::Cell(CellEntry(Some(Arc::clone(cell) as Arc<dyn CellRun>))))
-        };
-        match self
-            .queue
-            .push_ring_claimed(claim, || self.parking.wake_one())
-        {
-            Ok(Some(depth)) => self.deepen_high_water(depth),
-            Ok(None) => self.unadmit(),
-            Err(()) => {
-                self.unadmit();
-                return Err(self.report_full(name));
-            }
+        if cell.queued.swap(true, Ordering::AcqRel) {
+            self.unadmit();
+            return Ok(());
+        }
+        let entry = Queued::Cell(CellEntry(Some(Arc::clone(cell) as Arc<dyn CellRun>)));
+        if let Err(entry) = self.queue.push_task(entry, || self.parking.wake_one()) {
+            // Only reachable with the whole 4 G index space queued; dropping
+            // the entry idles the cell.
+            drop(entry);
+            self.unadmit();
+            tracing::error!(
+                target: "epics_base_rs::runtime::callback",
+                band = name,
+                "callback band queue arena exhausted; cell request dropped"
+            );
         }
         Ok(())
     }
@@ -919,7 +980,8 @@ impl CallbackHandle {
     }
 
     /// Queue `cell` on `priority` — `callbackRequest` of a requester-owned
-    /// `epicsCallback`. Allocates nothing. See [`CallbackCell`].
+    /// `epicsCallback`. Allocates nothing, and is never refused for a full
+    /// band: `Err` is only [`CallbackError::NotInit`]. See [`CallbackCell`].
     pub fn request_cell<B: CallbackBody>(
         &self,
         priority: CallbackPriority,
@@ -957,6 +1019,11 @@ impl CallbackHandle {
 pub struct CallbackPool {
     queues: [Arc<PriorityQueue>; NUM_CALLBACK_PRIORITIES],
     workers: Vec<JoinHandle<()>>,
+    /// The pool's [`pool_state`].
+    state: AtomicU8,
+    /// Held by the one thread in [`pool_state::STARTING`] or in
+    /// [`Self::cleanup`]'s band move; waiting out a start is taking it.
+    moving: UnlistedPriorityInheritanceMutex<()>,
 }
 
 #[cfg(test)]
@@ -993,7 +1060,7 @@ impl CallbackPool {
         queue_size: usize,
         threads_per_priority: [usize; NUM_CALLBACK_PRIORITIES],
     ) -> Self {
-        Self::build(queue_size, threads_per_priority, band_state::RUN)
+        Self::build(queue_size, threads_per_priority, pool_state::RUN)
     }
 
     /// [`Self::new`] for the IOC's own pool, whose bands wait at C `cbInit`
@@ -1002,15 +1069,20 @@ impl CallbackPool {
         Self::build(
             CONFIGURED_QUEUE_SIZE.load(Ordering::Relaxed),
             CallbackPriority::ALL.map(|p| CONFIGURED_THREADS[p.index()].load(Ordering::Relaxed)),
-            band_state::INIT,
+            pool_state::INIT,
         )
     }
 
+    /// A pool at `state`, [`pool_state::INIT`] or [`pool_state::RUN`].
     fn build(
         queue_size: usize,
         threads_per_priority: [usize; NUM_CALLBACK_PRIORITIES],
-        state: u64,
+        state: u8,
     ) -> Self {
+        let bands = match state {
+            pool_state::INIT => band_state::INIT,
+            _ => band_state::RUN,
+        };
         let capacity = queue_size.max(1);
         let threads_per_priority = threads_per_priority.map(|n| n.max(1));
         let queues: [Arc<PriorityQueue>; NUM_CALLBACK_PRIORITIES] =
@@ -1018,7 +1090,7 @@ impl CallbackPool {
                 Arc::new(PriorityQueue::new(
                     capacity,
                     threads_per_priority[p.index()],
-                    state,
+                    bands,
                 ))
             });
 
@@ -1072,46 +1144,100 @@ impl CallbackPool {
             }
         }
 
-        CallbackPool { queues, workers }
+        CallbackPool {
+            queues,
+            workers,
+            state: AtomicU8::new(state),
+            moving: UnlistedPriorityInheritanceMutex::new(()),
+        }
     }
 
     /// C `callbackInit`'s state half (`callback.c:292-295`): `cbInit` to
-    /// `cbRun`, or C's warning when the bands are already armed.
+    /// `cbRun`, or C's warning when `callbackInit` has run since the last
+    /// cleanup. Bands [`Self::arm`] armed are taken as they are.
     pub fn init(&self) {
-        if !self.arm() {
-            crate::stderr_println!("Warning: callbackInit called again before callbackCleanup");
+        if !self.start(pool_state::RUN) {
+            crate::stderr_println!("Warning: callbackInit called again before callbackCleanup")
         }
     }
 
-    /// `cbInit` to `cbRun`, or `false` when the bands were not in `cbInit`.
+    /// Arm the bands from `cbInit` without being `callbackInit`, which then
+    /// still runs as the first; `false` when they were not in `cbInit`.
     pub fn arm(&self) -> bool {
-        self.transition_all(band_state::INIT, band_state::RUN)
+        self.start(pool_state::ARMED)
     }
 
-    /// Every band from `from` to `to`, or none when the first is not in
-    /// `from`: only these three pool methods move the bands, and always
-    /// together.
-    fn transition_all(&self, from: u64, to: u64) -> bool {
-        let (first, rest) = self.queues.split_first().expect("three bands");
-        if !first.transition(from, to) {
-            return false;
+    /// The pool to `to`, `ARMED` or `RUN`, from `cbInit` through
+    /// `STARTING` with the bands started, or from `ARMED` to `RUN`; `false`
+    /// from any other state.
+    fn start(&self, to: u8) -> bool {
+        loop {
+            match self.settled() {
+                pool_state::INIT => {
+                    let _moving = self.moving.lock();
+                    if self.move_pool(pool_state::INIT, pool_state::STARTING) {
+                        #[cfg(test)]
+                        start_hook::fire_inside();
+                        self.move_bands(band_state::INIT, band_state::RUN);
+                        self.state.store(to, Ordering::Release);
+                        return true;
+                    }
+                }
+                pool_state::ARMED if to == pool_state::RUN => {
+                    if self.move_pool(pool_state::ARMED, pool_state::RUN) {
+                        return true;
+                    }
+                }
+                _ => return false,
+            }
         }
-        for pq in rest {
+    }
+
+    /// [`Self::state`], a start another thread holds waited out.
+    fn settled(&self) -> u8 {
+        loop {
+            match self.state.load(Ordering::Acquire) {
+                pool_state::STARTING => {
+                    #[cfg(test)]
+                    start_hook::fire_waiting();
+                    drop(self.moving.lock());
+                }
+                state => return state,
+            }
+        }
+    }
+
+    fn move_pool(&self, from: u8, to: u8) -> bool {
+        self.state
+            .compare_exchange(from, to, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Every band from `from` to `to`, by the one pool method whose move of
+    /// [`Self::state`] owns this one.
+    fn move_bands(&self, from: u64, to: u64) {
+        for pq in &self.queues {
             pq.transition(from, to);
         }
-        true
     }
 
-    /// C `callbackStop` (`callback.c:237-260`): from `cbRun` only, wait
+    /// C `callbackStop` (`callback.c:237-260`): from running only, wait
     /// until every band has been found with all it was given run, a request
     /// made before then included, and refuse to run anything more. The
     /// workers stay up for the spawned tasks they also carry. A band this
     /// thread works for is not waited for: C's `callbackStop` would be
     /// joining itself.
     pub fn stop(&self) {
-        if !self.transition_all(band_state::RUN, band_state::STOPPING) {
-            return;
+        loop {
+            let state = self.settled();
+            if !matches!(state, pool_state::ARMED | pool_state::RUN) {
+                return;
+            }
+            if self.move_pool(state, pool_state::STOPPING) {
+                break;
+            }
         }
+        self.move_bands(band_state::RUN, band_state::STOPPING);
         let own = WORKER_OF.get();
         for pq in &self.queues {
             if Arc::as_ptr(pq) as usize == own {
@@ -1122,12 +1248,18 @@ impl CallbackPool {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
         }
+        self.state.store(pool_state::STOPPED, Ordering::Release);
     }
 
     /// C `callbackCleanup`'s state half (`callback.c:262-268`): `cbStop` back
     /// to `cbInit`, the only way the bands are armed again.
     pub fn cleanup(&self) {
-        if !self.transition_all(band_state::STOPPED, band_state::INIT) {
+        let _moving = self.moving.lock();
+        if self.state.load(Ordering::Acquire) == pool_state::STOPPED {
+            // Bands first: a starter that finds `cbInit` finds them there.
+            self.move_bands(band_state::STOPPED, band_state::INIT);
+            self.state.store(pool_state::INIT, Ordering::Release);
+        } else {
             crate::stderr_println!("callbackCleanup() but not stopped");
         }
     }
@@ -2343,8 +2475,7 @@ mod tests {
         gate_tx
     }
 
-    /// Requests of a queued cell are taken by its pending run and give their
-    /// slot back: one run, one slot used.
+    /// Requests of a queued cell are taken by its pending run: one run.
     #[test]
     fn a_queued_cell_takes_a_second_request_into_its_pending_run() {
         let mut pool = CallbackPool::with_config(4, 1);
@@ -2354,7 +2485,6 @@ mod tests {
             assert_eq!(pool.request_cell(CallbackPriority::Low, &cell), Ok(()));
         }
         assert!(cell.is_queued());
-        assert_eq!(pool.stats(CallbackPriority::Low, false).num_used, 1);
         drop(gate);
         assert_eq!(rx.recv_timeout(T).unwrap(), 1);
         assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
@@ -2377,29 +2507,85 @@ mod tests {
         pool.shutdown();
     }
 
-    /// The slot is taken before the claim: a full band refuses an idle cell
-    /// and leaves it idle, and refuses a queued one too, counting both.
+    /// A band of one ring slot, its worker held and the slot taken by an
+    /// ad-hoc request whose run is reported on the returned receiver.
+    fn full_band(pool: &CallbackPool) -> (mpsc::Sender<()>, mpsc::Receiver<()>) {
+        let gate = hold_worker(pool);
+        let (ran_tx, ran_rx) = mpsc::channel();
+        pool.request(
+            CallbackPriority::Low,
+            Box::new(move || ran_tx.send(()).unwrap()),
+        )
+        .unwrap();
+        (gate, ran_rx)
+    }
+
+    /// A cell takes no ring slot: requested on a full band it is queued, runs
+    /// after the ring entry ahead of it, and no overflow is counted.
     #[test]
-    fn a_full_band_refuses_a_cell_queued_or_not() {
+    fn a_cell_request_on_a_full_band_still_runs() {
         let mut pool = CallbackPool::with_config(1, 1);
-        let gate = hold_worker(&pool);
-        let (queued, rx) = count_cell();
-        pool.request_cell(CallbackPriority::Low, &queued).unwrap();
-        let (idle, idle_rx) = count_cell();
+        let (gate, ring_ran) = full_band(&pool);
+        let (cell, rx) = count_cell();
+        assert_eq!(pool.request_cell(CallbackPriority::Low, &cell), Ok(()));
+        assert!(cell.is_queued());
+        drop(gate);
+        assert_eq!(rx.recv_timeout(T).unwrap(), 1);
+        assert!(
+            ring_ran.try_recv().is_ok(),
+            "the cell ran before the ring entry ahead of it"
+        );
+        assert_eq!(pool.overflow_count(CallbackPriority::Low), 0);
+        pool.shutdown();
+    }
+
+    /// Requests of a cell already queued on a full band are taken by its
+    /// pending run: one run, however many requests.
+    #[test]
+    fn a_cell_queued_on_a_full_band_is_not_queued_twice() {
+        let mut pool = CallbackPool::with_config(1, 1);
+        let (gate, _ring_ran) = full_band(&pool);
+        let (cell, rx) = count_cell();
+        for _ in 0..3 {
+            assert_eq!(pool.request_cell(CallbackPriority::Low, &cell), Ok(()));
+        }
+        drop(gate);
+        // `stop` returns once every request the band took has run.
+        pool.stop();
+        assert_eq!(rx.try_iter().collect::<Vec<_>>(), [1]);
+        assert!(!cell.is_queued());
+        pool.shutdown();
+    }
+
+    /// The ring stays bounded beside the cells: an ad-hoc request on a full
+    /// band is refused, counted, and never run, with a cell queued or not.
+    #[test]
+    fn an_ad_hoc_request_on_a_full_band_is_still_refused() {
+        let mut pool = CallbackPool::with_config(1, 1);
+        let (gate, _ring_ran) = full_band(&pool);
+        let (cell, cell_rx) = count_cell();
+        let (refused_tx, refused_rx) = mpsc::channel();
+        let refused = refused_tx.clone();
         assert_eq!(
-            pool.request_cell(CallbackPriority::Low, &idle),
+            pool.request(
+                CallbackPriority::Low,
+                Box::new(move || refused.send(()).unwrap())
+            ),
             Err(CallbackError::QueueFull)
         );
-        assert!(!idle.is_queued(), "a refused cell stayed claimed");
+        pool.request_cell(CallbackPriority::Low, &cell).unwrap();
         assert_eq!(
-            pool.request_cell(CallbackPriority::Low, &queued),
+            pool.request(
+                CallbackPriority::Low,
+                Box::new(move || refused_tx.send(()).unwrap())
+            ),
             Err(CallbackError::QueueFull)
         );
         assert_eq!(pool.overflow_count(CallbackPriority::Low), 2);
         drop(gate);
-        assert_eq!(rx.recv_timeout(T).unwrap(), 1);
-        pool.request_cell(CallbackPriority::Low, &idle).unwrap();
-        assert_eq!(idle_rx.recv_timeout(T).unwrap(), 1);
+        pool.stop();
+        assert_eq!(cell_rx.try_iter().collect::<Vec<_>>(), [1]);
+        assert!(refused_rx.try_recv().is_err());
         pool.shutdown();
     }
 
@@ -2441,7 +2627,7 @@ mod tests {
         for _ in 0..2 {
             pool.request_cell(CallbackPriority::Low, &cell).unwrap();
             rx.recv_timeout(T).unwrap();
-            let deadline = Instant::now() + T;
+            let deadline = crate::runtime::time::deadline_from_now(T);
             while cell.is_queued() {
                 assert!(Instant::now() < deadline, "the cell stayed queued");
                 std::thread::yield_now();
@@ -2468,7 +2654,7 @@ mod tests {
         }
         const N: usize = 50;
         let mut pool = CallbackPool::with_config(1024, 1);
-        let budget = Instant::now() + Duration::from_secs(2);
+        let budget = crate::runtime::time::deadline_from_now(Duration::from_secs(2));
         let (mut trials, mut lost) = (0usize, 0usize);
         while Instant::now() < budget {
             let cell = CallbackCell::new(Latest {
@@ -2477,11 +2663,9 @@ mod tests {
             });
             for i in 1..=N {
                 cell.body().latest.store(i, Ordering::Release);
-                while pool.request_cell(CallbackPriority::Low, &cell).is_err() {
-                    std::thread::yield_now();
-                }
+                pool.request_cell(CallbackPriority::Low, &cell).unwrap();
             }
-            let deadline = Instant::now() + T;
+            let deadline = crate::runtime::time::deadline_from_now(T);
             while cell.body().seen.load(Ordering::Acquire) != N && Instant::now() < deadline {
                 std::thread::yield_now();
             }
@@ -2607,7 +2791,7 @@ mod tests {
                 t.join().expect("a requester thread");
             }
 
-            let deadline = Instant::now() + T;
+            let deadline = crate::runtime::time::deadline_from_now(T);
             while !pool.is_idle() {
                 assert!(
                     Instant::now() < deadline,
@@ -2671,6 +2855,52 @@ mod tests {
         pool.init();
         assert!(pool.queues.iter().all(|pq| pq.state() == band_state::RUN));
         assert!(!pool.arm());
+    }
+
+    /// A starter that arrives while another is held inside its start, here
+    /// `IoIntrPump::start`'s arm and first wake behind an `iocBuild`'s
+    /// `callbackInit`, waits that start out: the wake is served, never
+    /// refused as one made before `callbackInit`.
+    #[test]
+    fn a_wake_behind_a_held_start_is_served() {
+        let pool = Arc::new(CallbackPool::new_uninitialized());
+        let (inside_tx, inside_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let first = {
+            let pool = pool.clone();
+            std::thread::spawn(move || {
+                start_hook::inside(move || {
+                    inside_tx.send(()).unwrap();
+                    let _ = release_rx.recv();
+                });
+                pool.init();
+            })
+        };
+        inside_rx.recv_timeout(T).expect("the first start was held");
+
+        let (cell, ran) = count_cell();
+        let (seen_tx, seen_rx) = mpsc::channel();
+        let second = {
+            let pool = pool.clone();
+            let cell = cell.clone();
+            std::thread::spawn(move || {
+                let waiting = seen_tx.clone();
+                start_hook::waiting(move || waiting.send(None).unwrap());
+                pool.arm();
+                let wake = pool.request_cell(CallbackPriority::High, &cell);
+                seen_tx.send(Some(wake)).unwrap();
+            })
+        };
+        let mut seen = seen_rx.recv_timeout(T).expect("the second starter");
+        release_tx.send(()).unwrap();
+        first.join().unwrap();
+        if seen.is_none() {
+            seen = seen_rx.recv_timeout(T).expect("the wake after the wait");
+        }
+        second.join().unwrap();
+        assert_eq!(seen, Some(Ok(())), "the wake was refused");
+        assert_eq!(ran.recv_timeout(T), Ok(1), "the wake was not run");
+        pool.stop();
     }
 
     /// `callbackStop` returns once work queued before it has run: each
@@ -2751,7 +2981,7 @@ mod tests {
             let pool = Arc::clone(&pool);
             std::thread::spawn(move || pool.stop())
         };
-        let deadline = std::time::Instant::now() + T;
+        let deadline = crate::runtime::time::deadline_from_now(T);
         while medium.state() != band_state::STOPPED {
             assert!(
                 std::time::Instant::now() < deadline,

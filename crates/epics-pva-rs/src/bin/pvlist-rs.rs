@@ -394,7 +394,7 @@ async fn discover_mode(args: &Args) {
         // The seam's clock, not `tokio::time::Instant`: the deadline is read
         // back by `task::timeout_at`, and naming tokio's type here pins the
         // deadline to the tokio clock on a backend that has none.
-        .map(|d| epics_base_rs::runtime::task::Instant::now() + d);
+        .map(epics_base_rs::runtime::task::deadline_from_now);
 
     loop {
         let recv_fut = rx.recv();

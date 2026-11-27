@@ -646,7 +646,7 @@ mod tests {
         other.mark_pini_done();
         crate::seq::seq(on("onServed"), "", 0, served_db()).expect("onServed starts");
         crate::seq::seq(on("onOther"), "", 0, &other).expect("onOther starts");
-        let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
         while SEEN.lock().len() < 2 {
             assert!(std::time::Instant::now() < deadline, "{:?}", SEEN.lock());
             std::thread::sleep(std::time::Duration::from_millis(5));

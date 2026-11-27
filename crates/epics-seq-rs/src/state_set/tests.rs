@@ -1406,7 +1406,7 @@ fn served_db() -> &'static PvDatabase {
 }
 
 fn until(what: &str, f: impl Fn() -> bool) {
-    let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let end = epics_libcom_rs::runtime::time::deadline_from_now(std::time::Duration::from_secs(5));
     while !f() {
         assert!(std::time::Instant::now() < end, "{what}");
         std::thread::sleep(std::time::Duration::from_millis(2));
@@ -1514,7 +1514,8 @@ fn e2e_unsigned_put_goes_as_the_put_type() {
     let v: SeqVar<u16> = SeqVar::new(0xffff);
     assert_eq!(pv.put_no_block(ty, 1, v.load(1)), PvStat::Ok);
     let got = Arc::new(Mutex::new(None));
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline =
+        epics_libcom_rs::runtime::time::deadline_from_now(std::time::Duration::from_secs(5));
     loop {
         let g = Arc::clone(&got);
         assert_eq!(

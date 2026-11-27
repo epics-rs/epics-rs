@@ -1309,7 +1309,9 @@ mod tests {
                 },
                 move |iv| {
                     if let asyn_rs::param::ParamValue::Int32(v) = iv.value {
-                        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(
+                            Duration::from_secs(10),
+                        );
                         while hold
                             && v == 3
                             && !posts.lock().contains(&Seen::Frame(1))
@@ -1331,7 +1333,7 @@ mod tests {
         if write_file {
             up.write_int32_blocking(p.write_file, 0, 1).unwrap();
         }
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(10));
         while !log.lock().ends_with(&[Seen::NumCaptured(0)]) {
             assert!(std::time::Instant::now() < deadline, "{:?}", log.lock());
             std::thread::yield_now();
@@ -1626,7 +1628,8 @@ mod tests {
         assert!(handle.wait_params_applied(std::time::Duration::from_secs(10)));
         // The frame capture registers; it must be done before Capture is set.
         publish(&handle, &frame(7));
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline =
+            epics_libcom_rs::runtime::time::deadline_from_now(std::time::Duration::from_secs(10));
         while port.read_int32_blocking(p.unique_id, 0).ok() != Some(7) {
             assert!(
                 std::time::Instant::now() < deadline,

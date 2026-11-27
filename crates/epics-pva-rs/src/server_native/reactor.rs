@@ -85,7 +85,7 @@
 use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use epics_base_rs::runtime::accept::AcceptBackoff;
@@ -432,17 +432,17 @@ impl ReactorPvaServer {
         let udp_port = socket
             .local_addr()
             .map_or(self.config.udp_port, |a| a.port());
-        let replier = OnceLock::from(SearchReplier {
+        let replier = SearchReplier {
             source: self.source.clone(),
             tcp_port: self.config.tcp_port,
             guid: self.config.guid,
             protocol: "tcp",
-        });
+        };
         handle_udp_search_blocking(
             socket,
             &self.config.ignore_addrs,
             udp_port,
-            &replier,
+            || Some(&replier),
             &self.shutdown,
         )
     }
@@ -459,15 +459,17 @@ impl ReactorPvaServer {
     /// give it a thread of its own. The accept socket stays blocking rather
     /// than joining the poller: an accept loop that parks in `accept()` is
     /// woken by [`shutdown`](Self::shutdown)'s self-connect, which is one
-    /// mechanism instead of two.
-    pub fn serve(&self, reactor: &Reactor) {
+    /// mechanism instead of two. `started` runs once every listener's accept
+    /// thread exists, and the listeners accept only if it returns `true`; an
+    /// `Err` is a thread that could not be created, with nothing accepted.
+    pub fn serve(&self, reactor: &Reactor, started: impl FnOnce() -> bool) -> io::Result<()> {
         // From here down `reactor` is the server's own: every connection
         // future, and every task those futures go on to spawn through their
         // clone of it, runs on this server's band rather than the callback
         // pool's.
         let reactor = &self.conn_reactor(reactor);
         self.listeners
-            .serve(|listener| self.accept_loop(listener, reactor));
+            .serve(|listener| self.accept_loop(listener, reactor), started)
     }
 
     /// One listener's accept loop, on its own thread.
@@ -480,8 +482,8 @@ impl ReactorPvaServer {
                     backoff.accepted();
                     // `shutdown` wakes this parked `accept` by dialling our own
                     // socket; that throwaway connection arrives here and is
-                    // dropped with the flag already set.
-                    if self.shutdown.load(Ordering::Acquire) {
+                    // dropped with the listeners already stopped.
+                    if self.listeners.stopped() {
                         break;
                     }
                     let peer = match stream.peer_addr() {
@@ -496,7 +498,7 @@ impl ReactorPvaServer {
                     }
                 }
                 Err(e) => {
-                    if self.shutdown.load(Ordering::Acquire) {
+                    if self.listeners.stopped() {
                         break;
                     }
                     warn!(error = %e, "reactor PVA server: accept failed");
@@ -506,7 +508,7 @@ impl ReactorPvaServer {
                     thread::sleep(backoff.failed());
                     // `shutdown()` may have been asked for while we slept, and
                     // its self-dial cannot wake an `accept()` that is failing.
-                    if self.shutdown.load(Ordering::Acquire) {
+                    if self.listeners.stopped() {
                         break;
                     }
                 }
@@ -593,8 +595,8 @@ impl ReactorPvaServer {
     /// Stop accepting, stop answering SEARCHes, and end the connections
     /// already running. Idempotent.
     ///
-    /// Three operations, in the order that leaves nothing parked: the flag plus
-    /// a self-connect returns the accept loop, `ConnTable::stop` aborts every
+    /// Three operations, in the order that leaves nothing parked:
+    /// stopping the listeners returns the accept loop, `ConnTable::stop` aborts every
     /// live connection task, and only then is the poll thread stopped — a task
     /// that survives the abort finds its next `arm` refused and unwinds through
     /// its own error path rather than parking on a dead poller.
@@ -604,7 +606,7 @@ impl ReactorPvaServer {
     /// watches [`active_connections`](Self::active_connections).
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
-        self.listeners.wake();
+        self.listeners.stop();
         self.connections.stop();
         self.poller.shutdown();
     }
@@ -649,7 +651,11 @@ mod tests {
             "test-PVAR-accept".into(),
             PVA_SERVER_PRIORITY,
             StackSizeClass::Medium,
-            move || serving.serve(&harness_reactor()),
+            move || {
+                serving
+                    .serve(&harness_reactor(), || true)
+                    .expect("accept threads")
+            },
         )
         .expect("accept thread spawned");
         (server, accept)
@@ -741,7 +747,11 @@ mod tests {
             "test-PVAR-accept".into(),
             PVA_SERVER_PRIORITY,
             StackSizeClass::Medium,
-            move || serving.serve(&harness_reactor()),
+            move || {
+                serving
+                    .serve(&harness_reactor(), || true)
+                    .expect("accept threads")
+            },
         )
         .expect("accept thread spawned");
         for (ip, port) in [

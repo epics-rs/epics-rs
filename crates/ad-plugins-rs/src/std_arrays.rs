@@ -131,7 +131,8 @@ mod tests {
     }
 
     fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline =
+            epics_libcom_rs::runtime::time::deadline_from_now(std::time::Duration::from_secs(10));
         while !cond() {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -429,74 +430,278 @@ mod tests {
         // C NDPluginStdArrays.cpp:202-211 decrements NDArrayCounter when its
         // MaxByteRate throttle drops the waveform output, so a throttled frame
         // leaves ArrayCounter unchanged (ImageJ etc. see no new data) while
-        // DroppedArrays advances.
+        // DroppedOutputArrays advances.
+        // MaxByteRate = 4 bytes/sec, an Int8 client: the bucket starts full
+        // at 4, so the first frame passes and the next (sent before a
+        // meaningful refill) is throttled.
+        let plugin = Waveforms::new(&[asyn_rs::interfaces::InterfaceType::Int8Array]);
+        plugin.set_max_byte_rate(4.0);
+        assert_eq!(plugin.send(1), (1, 0), "first frame is served and counted");
+        assert_eq!(plugin.send(2), (1, 1), "throttled frame is not counted");
+    }
 
-        let pool = NDArrayPool::new(1_000_000);
-        let wiring = Arc::new(WiringRegistry::new());
-        let (handle, _data, _jh) = create_std_arrays_runtime(
-            &asyn_rs::asyn_record::claim_port("IMAGE1").unwrap(),
-            pool.max_memory(),
-            1,
-            0,
-            "",
-            wiring,
-            ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+    /// A StdArrays plugin whose STD_ARRAY_DATA has one waveform client per
+    /// entry of `bound`, each counting the posts it receives.
+    struct Waveforms {
+        handle: PluginRuntimeHandle,
+        posts: Vec<Arc<std::sync::atomic::AtomicUsize>>,
+        _bindings: Vec<asyn_rs::interrupt::SyncCallbackSubscription>,
+        _jh: std::thread::JoinHandle<()>,
+    }
+
+    impl Waveforms {
+        fn new(bound: &[asyn_rs::interfaces::InterfaceType]) -> Self {
+            let (handle, _data, jh) = create_std_arrays_runtime(
+                &asyn_rs::asyn_record::claim_port("IMAGE1").unwrap(),
+                1_000_000,
+                1,
+                0,
+                "",
+                Arc::new(WiringRegistry::new()),
+                ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+            );
+            let port = handle.port_runtime().port_handle().clone();
+            port.write_int32_blocking(handle.plugin_params.enable_callbacks, 0, 1)
+                .unwrap();
+            params_applied(&handle);
+            let std = port
+                .drv_user_create_blocking(&asyn_rs::port::DrvUserRequest::new("STD_ARRAY_DATA", 0))
+                .unwrap()
+                .reason;
+            let posts: Vec<Arc<std::sync::atomic::AtomicUsize>> =
+                bound.iter().map(|_| Arc::default()).collect();
+            let _bindings = bound
+                .iter()
+                .zip(&posts)
+                .map(|(&iface, count)| {
+                    let count = Arc::clone(count);
+                    port.interrupts()
+                        .register_sync_callback(
+                            asyn_rs::interrupt::InterruptFilter {
+                                reason: Some(std),
+                                addr: Some(0),
+                                iface: Some(iface),
+                                ..Default::default()
+                            },
+                            move |_| {
+                                count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            },
+                        )
+                        .unwrap()
+                })
+                .collect();
+            Self {
+                handle,
+                posts,
+                _bindings,
+                _jh: jh,
+            }
+        }
+
+        /// MaxByteRate, which refills the bucket to `rate` bytes.
+        fn set_max_byte_rate(&self, rate: f64) {
+            self.handle
+                .port_runtime()
+                .port_handle()
+                .write_float64_blocking(self.handle.plugin_params.max_byte_rate, 0, rate)
+                .unwrap();
+            params_applied(&self.handle);
+        }
+
+        /// Sends `make_array(id)`, a 4-byte UInt8 frame, and returns
+        /// ArrayCounter and DroppedOutputArrays once its params are posted.
+        fn send(&self, id: i32) -> (i32, i32) {
+            let port = self.handle.port_runtime().port_handle();
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(
+                    self.handle.array_sender().publish(
+                        ad_core_rs::ndarray_pool::DriverPool::standalone(0)
+                            .alloc_copy(&make_array(id))
+                            .unwrap(),
+                    ),
+                );
+            let unique_id = self.handle.ndarray_params.unique_id;
+            wait_until("the frame's params", || {
+                port.read_int32_blocking(unique_id, 0)
+                    .is_ok_and(|v| v == id)
+            });
+            params_applied(&self.handle);
+            let read = |reason| port.read_int32_blocking(reason, 0).unwrap();
+            (
+                read(self.handle.ndarray_params.array_counter),
+                read(self.handle.plugin_params.dropped_output_arrays),
+            )
+        }
+
+        fn posts(&self) -> Vec<usize> {
+            self.posts
+                .iter()
+                .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+                .collect()
+        }
+    }
+
+    /// A frame no waveform client is bound to posts nothing, so MaxByteRate
+    /// has nothing to charge: it is counted and nothing is dropped.
+    #[test]
+    fn a_frame_without_waveform_clients_is_not_throttled() {
+        let plugin = Waveforms::new(&[]);
+        plugin.set_max_byte_rate(1.0);
+        assert_eq!(plugin.send(1), (1, 0));
+    }
+
+    /// Each interface pays for the array converted into it: a 4-byte UInt8
+    /// frame read as Int32 costs 16 bytes.
+    #[test]
+    fn a_waveform_is_charged_its_converted_size() {
+        use asyn_rs::interfaces::InterfaceType::Int32Array;
+        let plugin = Waveforms::new(&[Int32Array]);
+        plugin.set_max_byte_rate(15.0);
+        assert_eq!(plugin.send(1), (0, 1));
+        assert_eq!(plugin.posts(), [0]);
+        plugin.set_max_byte_rate(16.0);
+        assert_eq!(plugin.send(2), (1, 1));
+        assert_eq!(plugin.posts(), [1]);
+    }
+
+    /// Two records on one interface each pay for the converted array, one
+    /// at a time as C walks its client list: a bucket that holds one post
+    /// serves exactly one of them, and the other counts as dropped.
+    #[test]
+    fn a_bucket_that_holds_one_waveform_serves_exactly_one() {
+        use asyn_rs::interfaces::InterfaceType::Int8Array;
+        let plugin = Waveforms::new(&[Int8Array, Int8Array]);
+        plugin.set_max_byte_rate(7.0);
+        assert_eq!(plugin.send(1), (0, 1));
+        assert_eq!(plugin.posts(), [1, 0]);
+        plugin.set_max_byte_rate(8.0);
+        assert_eq!(plugin.send(2), (1, 1));
+        assert_eq!(plugin.posts(), [2, 1]);
+    }
+
+    /// A client bound to every reason of the interface receives the
+    /// waveform as a record bound to STD_ARRAY_DATA does, and pays for it.
+    #[test]
+    fn a_client_of_every_reason_is_served_and_charged() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let plugin = Waveforms::new(&[]);
+        let port = plugin.handle.port_runtime().port_handle().clone();
+        let std = port
+            .drv_user_create_blocking(&asyn_rs::port::DrvUserRequest::new("STD_ARRAY_DATA", 0))
+            .unwrap()
+            .reason;
+        let posts = Arc::new(AtomicUsize::new(0));
+        let _every_reason = port
+            .interrupts()
+            .register_sync_callback(
+                asyn_rs::interrupt::InterruptFilter {
+                    iface: Some(asyn_rs::interfaces::InterfaceType::Int8Array),
+                    ..Default::default()
+                },
+                {
+                    let posts = Arc::clone(&posts);
+                    move |iv| {
+                        if iv.reason == std {
+                            posts.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                },
+            )
+            .unwrap();
+        plugin.set_max_byte_rate(4.0);
+        assert_eq!(plugin.send(1), (1, 0));
+        assert_eq!(posts.load(Ordering::Relaxed), 1);
+        assert_eq!(plugin.send(2), (1, 1));
+        assert_eq!(posts.load(Ordering::Relaxed), 1);
+    }
+
+    /// A waveform client that reads the port while the frame is posted to it
+    /// reads that frame's params, as C posts with the port unlocked after
+    /// `beginProcessCallbacks` has set them (NDPluginStdArrays.cpp:161-166).
+    #[test]
+    fn a_waveform_client_reading_the_port_sees_the_frames_params() {
+        use std::sync::Mutex;
+
+        let plugin = Waveforms::new(&[]);
+        let port = plugin.handle.port_runtime().port_handle().clone();
+        let std = port
+            .drv_user_create_blocking(&asyn_rs::port::DrvUserRequest::new("STD_ARRAY_DATA", 0))
+            .unwrap()
+            .reason;
+        let unique_id = plugin.handle.ndarray_params.unique_id;
+        let read: Arc<Mutex<Vec<asyn_rs::error::AsynResult<i32>>>> = Arc::default();
+        let _reader = port
+            .interrupts()
+            .register_sync_callback(
+                asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(std),
+                    addr: Some(0),
+                    iface: Some(asyn_rs::interfaces::InterfaceType::Int8Array),
+                    ..Default::default()
+                },
+                {
+                    let (read, port) = (Arc::clone(&read), port.clone());
+                    move |_| {
+                        let id = port.read_int32_blocking(unique_id, 0);
+                        read.lock().unwrap().push(id);
+                    }
+                },
+            )
+            .unwrap();
+        assert_eq!(plugin.send(7), (1, 0));
+        let read = read.lock().unwrap();
+        assert!(matches!(read.as_slice(), [Ok(7)]), "{:?}", read.as_slice());
+    }
+
+    /// A record that is gone by the time a frame is posted pays nothing for
+    /// it. Here the first record's post unbinds the second, so a bucket that
+    /// holds one post serves the first and drops nothing.
+    #[test]
+    fn a_waveform_that_leaves_before_the_post_is_not_charged() {
+        use asyn_rs::interrupt::{InterruptFilter, SyncCallbackSubscription};
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let plugin = Waveforms::new(&[]);
+        let port = plugin.handle.port_runtime().port_handle().clone();
+        let std = port
+            .drv_user_create_blocking(&asyn_rs::port::DrvUserRequest::new("STD_ARRAY_DATA", 0))
+            .unwrap()
+            .reason;
+        let filter = InterruptFilter {
+            reason: Some(std),
+            addr: Some(0),
+            iface: Some(asyn_rs::interfaces::InterfaceType::Int8Array),
+            ..Default::default()
+        };
+        let leaving: Arc<Mutex<Option<SyncCallbackSubscription>>> = Arc::default();
+        let posts: [Arc<AtomicUsize>; 2] = Default::default();
+        let _staying = port
+            .interrupts()
+            .register_sync_callback(filter.clone(), {
+                let (posts, leaving) = (Arc::clone(&posts[0]), Arc::clone(&leaving));
+                move |_| {
+                    posts.fetch_add(1, Ordering::Relaxed);
+                    leaving.lock().unwrap().take();
+                }
+            })
+            .unwrap();
+        *leaving.lock().unwrap() = Some(
+            port.interrupts()
+                .register_sync_callback(filter, {
+                    let posts = Arc::clone(&posts[1]);
+                    move |_| {
+                        posts.fetch_add(1, Ordering::Relaxed);
+                    }
+                })
+                .unwrap(),
         );
-        let port = handle.port_runtime().port_handle();
-        port.write_int32_blocking(handle.plugin_params.enable_callbacks, 0, 1)
-            .unwrap();
-        // MaxByteRate = 4 bytes/sec; make_array is a 4-byte UInt8 array. The
-        // bucket starts full at 4, so the first frame passes and the next
-        // (sent before a meaningful refill) is throttled.
-        port.write_float64_blocking(handle.plugin_params.max_byte_rate, 0, 4.0)
-            .unwrap();
-        params_applied(&handle);
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-
-        rt.block_on(
-            handle.array_sender().publish(
-                ad_core_rs::ndarray_pool::DriverPool::standalone(0)
-                    .alloc_copy(&make_array(1))
-                    .unwrap(),
-            ),
-        );
-        wait_until("first frame to be served and counted", || {
-            port.read_int32_blocking(handle.ndarray_params.array_counter, 0)
-                .is_ok_and(|v| v == 1)
-        });
-        let counter_after_first = port
-            .read_int32_blocking(handle.ndarray_params.array_counter, 0)
-            .unwrap();
-
-        rt.block_on(
-            handle.array_sender().publish(
-                ad_core_rs::ndarray_pool::DriverPool::standalone(0)
-                    .alloc_copy(&make_array(2))
-                    .unwrap(),
-            ),
-        );
-        // The throttled frame leaves ArrayCounter unchanged, so wait on the
-        // observable it DOES advance: DroppedArrays.
-        wait_until("throttled frame to advance DroppedArrays", || {
-            port.read_int32_blocking(handle.plugin_params.dropped_output_arrays, 0)
-                .is_ok_and(|v| v == 1)
-        });
-        let counter_after_second = port
-            .read_int32_blocking(handle.ndarray_params.array_counter, 0)
-            .unwrap();
-        let dropped = port
-            .read_int32_blocking(handle.plugin_params.dropped_output_arrays, 0)
-            .unwrap();
-
-        assert_eq!(counter_after_first, 1, "first frame is served and counted");
-        assert_eq!(
-            counter_after_second, 1,
-            "throttled frame must NOT advance ArrayCounter"
-        );
-        assert_eq!(dropped, 1, "throttled frame advances DroppedArrays");
+        plugin.set_max_byte_rate(4.0);
+        assert_eq!(plugin.send(1), (1, 0));
+        assert_eq!(posts.each_ref().map(|n| n.load(Ordering::Relaxed)), [1, 0]);
     }
 }

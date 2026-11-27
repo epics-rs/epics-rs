@@ -229,7 +229,7 @@ unresponsive ends can pin resources:
 | Client TCP | echo idle timeout | 30 s (`EPICS_CA_CONN_TMO`) |
 | Client TCP | echo response timeout | 5 s |
 | Client TCP | send watchdog | 10 s (2 × echo) |
-| Server TCP | inactivity timeout | 600 s (`EPICS_CAS_INACTIVITY_TMO`) |
+| Server TCP | inactivity timeout | 600 s (`EPICS_CAS_INACTIVITY_TMO`; 0 disables) |
 | Server TCP | OS keepalive | 15 s idle / 5 s probe |
 | Beacon monitor | re-register interval | 5 min |
 

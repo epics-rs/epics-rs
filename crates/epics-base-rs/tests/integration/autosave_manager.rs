@@ -1,0 +1,477 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+
+use epics_base_rs::server::database::PvDatabase;
+use epics_base_rs::server::records::ao::AoRecord;
+use epics_base_rs::server::records::stringin::StringinRecord;
+use epics_base_rs::types::EpicsValue;
+
+use epics_base_rs::server::autosave::backup::BackupConfig;
+use epics_base_rs::server::autosave::manager::AutosaveBuilder;
+use epics_base_rs::server::autosave::save_file::{SaveEntry, read_save_file, write_save_file};
+use epics_base_rs::server::autosave::save_set::{SaveSetConfig, SaveStrategy};
+
+fn quick_backup() -> BackupConfig {
+    BackupConfig { enable_savb: false }
+}
+
+async fn setup_db() -> Arc<PvDatabase> {
+    let db = Arc::new(PvDatabase::new());
+    db.add_record("TEMP", Box::new(AoRecord::new(25.5)))
+        .await
+        .unwrap();
+    db.add_record("PRESS", Box::new(AoRecord::new(1013.0)))
+        .await
+        .unwrap();
+    db.add_record("MSG", Box::new(StringinRecord::new("hello")))
+        .await
+        .unwrap();
+    db
+}
+
+#[epics_macros_rs::epics_test]
+async fn test_periodic_save_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let sav_path = dir.path().join("periodic.sav");
+    let db = setup_db().await;
+
+    let mgr = AutosaveBuilder::new()
+        .add_set(
+            SaveSetConfig {
+                name: "test_periodic".into(),
+                save_path: sav_path.clone(),
+                request_file: None,
+                request_pvs: vec!["TEMP".into(), "PRESS".into()],
+                backup: quick_backup(),
+                macros: HashMap::new(),
+                macro_string: None,
+                search_paths: Vec::new(),
+            },
+            SaveStrategy::Periodic {
+                interval: Duration::from_millis(50),
+            },
+        )
+        .build()
+        .await;
+
+    let mgr = Arc::new(mgr);
+    let handle = mgr.clone().start(db.clone()).unwrap();
+
+    // The first pass arms the timer; the next, a MIN_DELAY later, saves.
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
+    while std::time::Instant::now() < deadline {
+        if sav_path.exists() {
+            break;
+        }
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(20)).await;
+    }
+    mgr.shutdown();
+    let _ = handle.await;
+
+    // Verify file was created
+    assert!(sav_path.exists());
+    let entries = read_save_file(&sav_path).await.unwrap().unwrap().entries;
+    assert_eq!(entries.len(), 2);
+}
+
+#[epics_macros_rs::epics_test]
+async fn test_manual_save() {
+    let dir = tempfile::tempdir().unwrap();
+    let sav_path = dir.path().join("manual.sav");
+    let db = setup_db().await;
+
+    let mgr = AutosaveBuilder::new()
+        .add_set(
+            SaveSetConfig {
+                name: "test_manual".into(),
+                save_path: sav_path.clone(),
+                request_file: None,
+                request_pvs: vec!["TEMP".into()],
+                backup: quick_backup(),
+                macros: HashMap::new(),
+                macro_string: None,
+                search_paths: Vec::new(),
+            },
+            SaveStrategy::Manual,
+        )
+        .build()
+        .await;
+
+    let count = mgr.manual_save("test_manual", &db).await.unwrap();
+    assert_eq!(count, 1);
+    assert!(sav_path.exists());
+}
+
+#[epics_macros_rs::epics_test]
+async fn test_multiple_sets_independent() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = setup_db().await;
+
+    let mgr = AutosaveBuilder::new()
+        .add_set(
+            SaveSetConfig {
+                name: "set_a".into(),
+                save_path: dir.path().join("a.sav"),
+                request_file: None,
+                request_pvs: vec!["TEMP".into()],
+                backup: quick_backup(),
+                macros: HashMap::new(),
+                macro_string: None,
+                search_paths: Vec::new(),
+            },
+            SaveStrategy::Manual,
+        )
+        .add_set(
+            SaveSetConfig {
+                name: "set_b".into(),
+                save_path: dir.path().join("b.sav"),
+                request_file: None,
+                request_pvs: vec!["PRESS".into()],
+                backup: quick_backup(),
+                macros: HashMap::new(),
+                macro_string: None,
+                search_paths: Vec::new(),
+            },
+            SaveStrategy::Manual,
+        )
+        .build()
+        .await;
+
+    mgr.manual_save("set_a", &db).await.unwrap();
+    mgr.manual_save("set_b", &db).await.unwrap();
+
+    assert!(dir.path().join("a.sav").exists());
+    assert!(dir.path().join("b.sav").exists());
+}
+
+#[epics_macros_rs::epics_test]
+async fn test_restore_all() {
+    let dir = tempfile::tempdir().unwrap();
+    let sav_path = dir.path().join("restore_all.sav");
+    let db = setup_db().await;
+
+    // Write a save file to restore from
+    write_save_file(
+        &sav_path,
+        &[SaveEntry {
+            pv_name: "TEMP".into(),
+            value: "99.9".into(),
+            connected: true,
+            array_fprintfs: Vec::new(),
+        }],
+    )
+    .await
+    .unwrap();
+
+    let mgr = AutosaveBuilder::new()
+        .add_set(
+            SaveSetConfig {
+                name: "restore_test".into(),
+                save_path: sav_path,
+                request_file: None,
+                request_pvs: vec!["TEMP".into()],
+                backup: quick_backup(),
+                macros: HashMap::new(),
+                macro_string: None,
+                search_paths: Vec::new(),
+            },
+            SaveStrategy::Manual,
+        )
+        .build()
+        .await;
+
+    let results = mgr.restore_all(&db).await;
+    assert_eq!(results.len(), 1);
+    let (name, result) = &results[0];
+    assert_eq!(name, "restore_test");
+    let result = result.as_ref().unwrap();
+    assert_eq!(result.restored, 1);
+
+    // Verify value was restored
+    match db.get_pv("TEMP").unwrap() {
+        EpicsValue::Double(v) => assert!((v - 99.9).abs() < 1e-10),
+        other => panic!("expected Double, got {:?}", other),
+    }
+}
+
+#[epics_macros_rs::epics_test]
+async fn test_one_set_failure_no_impact() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = setup_db().await;
+
+    // set_bad has nonexistent save file -> restore fails
+    // set_good has valid file -> restore succeeds
+    let good_path = dir.path().join("good.sav");
+    write_save_file(
+        &good_path,
+        &[SaveEntry {
+            pv_name: "TEMP".into(),
+            value: "77.0".into(),
+            connected: true,
+            array_fprintfs: Vec::new(),
+        }],
+    )
+    .await
+    .unwrap();
+
+    let mgr = AutosaveBuilder::new()
+        .add_set(
+            SaveSetConfig {
+                name: "set_bad".into(),
+                save_path: dir.path().join("nonexistent.sav"),
+                request_file: None,
+                request_pvs: vec!["PRESS".into()],
+                backup: quick_backup(),
+                macros: HashMap::new(),
+                macro_string: None,
+                search_paths: Vec::new(),
+            },
+            SaveStrategy::Manual,
+        )
+        .add_set(
+            SaveSetConfig {
+                name: "set_good".into(),
+                save_path: good_path,
+                request_file: None,
+                request_pvs: vec!["TEMP".into()],
+                backup: quick_backup(),
+                macros: HashMap::new(),
+                macro_string: None,
+                search_paths: Vec::new(),
+            },
+            SaveStrategy::Manual,
+        )
+        .build()
+        .await;
+
+    let results = mgr.restore_all(&db).await;
+    assert!(results[0].1.is_err()); // set_bad fails
+    assert!(results[1].1.is_ok()); // set_good succeeds
+    assert_eq!(results[1].1.as_ref().unwrap().restored, 1);
+}
+
+#[epics_macros_rs::epics_test]
+async fn test_concurrent_manual_periodic_serialized() {
+    let dir = tempfile::tempdir().unwrap();
+    let sav_path = dir.path().join("concurrent.sav");
+    let db = setup_db().await;
+
+    let mgr = AutosaveBuilder::new()
+        .add_set(
+            SaveSetConfig {
+                name: "concurrent".into(),
+                save_path: sav_path.clone(),
+                request_file: None,
+                request_pvs: vec!["TEMP".into()],
+                backup: quick_backup(),
+                macros: HashMap::new(),
+                macro_string: None,
+                search_paths: Vec::new(),
+            },
+            SaveStrategy::Periodic {
+                interval: Duration::from_millis(30),
+            },
+        )
+        .build()
+        .await;
+
+    let mgr = Arc::new(mgr);
+    let handle = mgr.clone().start(db.clone()).unwrap();
+
+    // Manual saves while periodic is running
+    for _ in 0..5 {
+        let _ = mgr.manual_save("concurrent", &db).await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(10)).await;
+    }
+
+    mgr.shutdown();
+    let _ = handle.await;
+
+    // Just verify no crash/corruption
+    assert!(sav_path.exists());
+    let entries = read_save_file(&sav_path).await.unwrap().unwrap().entries;
+    assert_eq!(entries.len(), 1);
+}
+
+#[epics_macros_rs::epics_test]
+async fn test_shutdown_cleanup() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = setup_db().await;
+
+    let mgr = AutosaveBuilder::new()
+        .add_set(
+            SaveSetConfig {
+                name: "shutdown_test".into(),
+                save_path: dir.path().join("shutdown.sav"),
+                request_file: None,
+                request_pvs: vec!["TEMP".into()],
+                backup: quick_backup(),
+                macros: HashMap::new(),
+                macro_string: None,
+                search_paths: Vec::new(),
+            },
+            SaveStrategy::Periodic {
+                interval: Duration::from_millis(10),
+            },
+        )
+        .build()
+        .await;
+
+    let mgr = Arc::new(mgr);
+    let handle = mgr.clone().start(db.clone()).unwrap();
+
+    epics_base_rs::runtime::task::sleep(Duration::from_millis(50)).await;
+    mgr.shutdown();
+
+    // Should complete within a reasonable time
+    // The event is the outer join resolving: every set task has finished its
+    // in-flight save (a tmp write, `sync_all`, rename, directory sync) and
+    // seen the stop. That save is not cancelled, so its length is the disk's;
+    // the ceiling only catches a task that never stops.
+    epics_base_rs::runtime::task::timeout(Duration::from_secs(60), handle)
+        .await
+        .expect("shutdown never completed");
+}
+
+#[epics_macros_rs::epics_test]
+async fn test_save_once_failure_updates_stats() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = setup_db().await;
+
+    let mgr = AutosaveBuilder::new()
+        .add_set(
+            SaveSetConfig {
+                name: "stats_test".into(),
+                // Path to a directory that doesn't exist -> write fails
+                save_path: dir.path().join("nonexistent_dir/test.sav"),
+                request_file: None,
+                request_pvs: vec!["TEMP".into()],
+                backup: quick_backup(),
+                macros: HashMap::new(),
+                macro_string: None,
+                search_paths: Vec::new(),
+            },
+            SaveStrategy::Manual,
+        )
+        .build()
+        .await;
+
+    let result = mgr.manual_save("stats_test", &db).await;
+    assert!(result.is_err());
+
+    let (set, _) = &mgr.sets()[0];
+    assert_eq!(set.stats().error_count.load(Ordering::Relaxed), 1);
+}
+
+#[epics_macros_rs::epics_test]
+async fn test_empty_pv_list_saves_header_and_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let sav_path = dir.path().join("empty.sav");
+    let db = setup_db().await;
+
+    let mgr = AutosaveBuilder::new()
+        .add_set(
+            SaveSetConfig {
+                name: "empty".into(),
+                save_path: sav_path.clone(),
+                request_file: None,
+                request_pvs: vec![],
+                backup: quick_backup(),
+                macros: HashMap::new(),
+                macro_string: None,
+                search_paths: Vec::new(),
+            },
+            SaveStrategy::Manual,
+        )
+        .build()
+        .await;
+
+    // C builds and saves an empty list (save_restore.c:998-1004).
+    assert_eq!(mgr.set_names(), vec!["empty"]);
+    assert_eq!(mgr.manual_save("empty", &db).await.unwrap(), 0);
+    let text = std::fs::read_to_string(&sav_path).unwrap();
+    assert!(text.ends_with("<END>\n"), "{text}");
+}
+
+/// A shutdown that lands before the set tasks have subscribed still ends
+/// them: under load the outer task `start` spawns can run after it.
+#[epics_macros_rs::epics_test]
+async fn a_shutdown_before_the_tasks_run_still_ends_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = setup_db().await;
+    let mgr = Arc::new(
+        AutosaveBuilder::new()
+            .status_prefix("T:")
+            .add_set(
+                SaveSetConfig {
+                    name: "early".into(),
+                    save_path: dir.path().join("early.sav"),
+                    request_file: None,
+                    request_pvs: vec!["TEMP".into()],
+                    backup: quick_backup(),
+                    macros: HashMap::new(),
+                    macro_string: None,
+                    search_paths: Vec::new(),
+                },
+                SaveStrategy::Periodic {
+                    interval: Duration::from_millis(50),
+                },
+            )
+            .build()
+            .await,
+    );
+    let handle = mgr.clone().start(db.clone()).unwrap();
+    mgr.shutdown();
+    // The event is the outer join resolving: every set task has finished its
+    // in-flight save (a tmp write, `sync_all`, rename, directory sync) and
+    // seen the stop. That save is not cancelled, so its length is the disk's;
+    // the ceiling only catches a task that never stops.
+    epics_base_rs::runtime::task::timeout(Duration::from_secs(60), handle)
+        .await
+        .expect("shutdown never completed");
+}
+
+/// A server's teardown aborts the task `start` returned and never calls
+/// `shutdown`: when that task held the last manager, the sender drops
+/// without sending `true`, and the set task must end on that too.
+#[epics_macros_rs::epics_test]
+async fn a_set_task_ends_when_the_manager_drops_without_shutdown() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = setup_db().await;
+    let mgr = Arc::new(
+        AutosaveBuilder::new()
+            .add_set(
+                SaveSetConfig {
+                    name: "dropped".into(),
+                    save_path: dir.path().join("dropped.sav"),
+                    request_file: None,
+                    request_pvs: vec!["TEMP".into()],
+                    backup: quick_backup(),
+                    macros: HashMap::new(),
+                    macro_string: None,
+                    search_paths: Vec::new(),
+                },
+                SaveStrategy::Periodic {
+                    interval: Duration::from_millis(50),
+                },
+            )
+            .build()
+            .await,
+    );
+    let set = Arc::downgrade(&mgr.sets()[0].0);
+    let handle = mgr.clone().start(db.clone()).unwrap();
+    epics_base_rs::runtime::task::sleep(Duration::from_millis(100)).await;
+    handle.abort();
+    drop(mgr);
+    // The set task owns the last reference to its set.
+    let start = std::time::Instant::now();
+    while set.strong_count() != 0 {
+        assert!(
+            start.elapsed() < fact_budget::FACT_BUDGET,
+            "the set task outlived its manager"
+        );
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(20)).await;
+    }
+}

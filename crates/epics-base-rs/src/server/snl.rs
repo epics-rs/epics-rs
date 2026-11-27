@@ -653,7 +653,7 @@ mod tests {
 
     /// Poll until `probe` holds, or give up.
     async fn eventually(probe: impl Fn() -> bool) -> bool {
-        let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+        let deadline = crate::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
         while std::time::Instant::now() < deadline {
             if probe() {
                 return true;

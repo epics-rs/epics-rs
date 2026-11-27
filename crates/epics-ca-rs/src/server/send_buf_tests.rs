@@ -14,7 +14,7 @@ use epics_base_rs::types::{DbFieldType, EpicsValue};
 use super::*;
 use crate::protocol::MAX_TCP;
 use crate::server::tcp::DestroyedCids;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 
 /// A socket that records each write call, or refuses every one once broken.
 #[derive(Default)]
@@ -44,7 +44,10 @@ impl Wire {
 
 fn send_buf() -> (Arc<Wire>, SendBuf<Wire>) {
     let wire = Arc::new(Wire::default());
-    (wire.clone(), SendBuf::new(wire))
+    (
+        wire.clone(),
+        SendBuf::new(wire, Arc::new(CircuitActivity::new(None))),
+    )
 }
 
 fn frame(tag: u8, len: usize) -> Vec<u8> {
@@ -172,7 +175,10 @@ fn updates_built_in_place_are_the_frames_built_apart() {
     };
     let wire = Arc::new(Wire::default());
     run(&mut |user, ctl_rx, pvs| {
-        let sink = EventSendBuf(Arc::new(Mutex::new(SendBuf::new(wire.clone()))));
+        let sink = EventSendBuf(Arc::new(Mutex::new(SendBuf::new(
+            wire.clone(),
+            Arc::new(CircuitActivity::new(None)),
+        ))));
         let mut task = pin!(run_event_task(
             user,
             ctl_rx,
@@ -269,7 +275,10 @@ fn retirements_swept_together_reach_the_wire_in_one_write() {
             ctl_tx.send(EventTaskControl::Add(Box::new(d))).unwrap();
         }
         let wire = Arc::new(Wire::default());
-        let sink = EventSendBuf(Arc::new(Mutex::new(SendBuf::new(wire.clone()))));
+        let sink = EventSendBuf(Arc::new(Mutex::new(SendBuf::new(
+            wire.clone(),
+            Arc::new(CircuitActivity::new(None)),
+        ))));
         let mut task = pin!(run_event_task(
             user,
             ctl_rx,
@@ -302,7 +311,10 @@ fn streams_ended_together_leave_their_channels_to_the_sweep() {
         }
         let destroyed = DestroyedCids::default();
         let wire = Arc::new(Wire::default());
-        let sink = EventSendBuf(Arc::new(Mutex::new(SendBuf::new(wire.clone()))));
+        let sink = EventSendBuf(Arc::new(Mutex::new(SendBuf::new(
+            wire.clone(),
+            Arc::new(CircuitActivity::new(None)),
+        ))));
         let mut task = pin!(run_event_task(
             user,
             ctl_rx,
@@ -374,16 +386,22 @@ fn gated_circuit_monitored_pvs(
                 format!("CIRCUIT:{cid}"),
                 EpicsValue::Double(0.0),
             ));
+            let target = ChannelTarget::SimplePv(pv.clone());
             let monitor = Arc::new(crate::server::tcp::CircuitMonitor {
                 gate: crate::server::outbox::MonitorGate::open(),
-                denied: AtomicBool::new(false),
+                rights: Arc::new(crate::server::tcp::ChannelRights::new(
+                    Arc::new(crate::server::tcp::CircuitRights::new(
+                        epics_base_rs::server::access_security::new_acf_cell(None),
+                    )),
+                    target.clone(),
+                )),
                 ended: AtomicBool::new(false),
                 data_type: DBR_DOUBLE,
                 sub_id: cid + 1,
                 data_count: 0,
                 stats: None,
                 stage: crate::server::DeliveryStage::plain(),
-                target: ChannelTarget::SimplePv(pv.clone()),
+                target,
                 req_hdr: CaHeader::new(CA_PROTO_EVENT_ADD),
                 cid,
                 db: db.clone(),
@@ -419,7 +437,10 @@ fn updates_ready_together_reach_the_wire_in_one_write() {
     let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
     let pvs = circuit_monitored_pvs(N, &user, &ctl_tx);
     let wire = Arc::new(Wire::default());
-    let sink = EventSendBuf(Arc::new(Mutex::new(SendBuf::new(wire.clone()))));
+    let sink = EventSendBuf(Arc::new(Mutex::new(SendBuf::new(
+        wire.clone(),
+        Arc::new(CircuitActivity::new(None)),
+    ))));
     let mut task = pin!(run_event_task(
         user,
         ctl_rx,
@@ -623,7 +644,10 @@ fn a_failed_send_before_waiting_ends_the_task() {
     let (_ctl_tx, ctl_rx) = mpsc::unbounded_channel();
     let wire = Arc::new(Wire::default());
     wire.broken.store(true, Ordering::Relaxed);
-    let sink = EventSendBuf(Arc::new(Mutex::new(SendBuf::new(wire.clone()))));
+    let sink = EventSendBuf(Arc::new(Mutex::new(SendBuf::new(
+        wire.clone(),
+        Arc::new(CircuitActivity::new(None)),
+    ))));
     let mut task = pin!(run_event_task(
         user,
         ctl_rx,
@@ -647,7 +671,10 @@ fn delivering_events_through_the_real_sink_allocates_nothing() {
     let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
     let pvs = circuit_monitored_pvs(N, &user, &ctl_tx);
     let wire = Arc::new(CountWire::default());
-    let sink = EventSendBuf(Arc::new(Mutex::new(SendBuf::new(wire.clone()))));
+    let sink = EventSendBuf(Arc::new(Mutex::new(SendBuf::new(
+        wire.clone(),
+        Arc::new(CircuitActivity::new(None)),
+    ))));
     let mut task = pin!(run_event_task(
         user,
         ctl_rx,

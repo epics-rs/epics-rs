@@ -1054,8 +1054,8 @@ impl Channel {
             // error. The resolver kind matters because pvxs paces the two
             // through different machinery — the search ring for a searched
             // channel, the circuit's own reconnect timer for a forced one.
-            *self.holdoff_until.lock() =
-                reconnect_holdoff(last_failure, is_direct).map(|d| std::time::Instant::now() + d);
+            *self.holdoff_until.lock() = reconnect_holdoff(last_failure, is_direct)
+                .map(epics_base_rs::runtime::time::deadline_from_now);
             return Err(last_err.unwrap_or_else(|| PvaError::Protocol("connect failed".into())));
         }
     }

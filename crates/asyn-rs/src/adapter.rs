@@ -1784,80 +1784,26 @@ fn asyn_to_ca_error(e: AsynError) -> CaError {
     CaError::Protocol(e.to_string())
 }
 
-/// Convert an asyn error to an EPICS (alarm status, alarm severity) pair
-/// for the device-support READ path.
-///
-/// Mirrors C `asynStatusToEpicsAlarm` (asynEpicsUtils.c:234-266) with the
-/// READ-path defaults the Int32/Float64/UInt32 device support pass:
-/// `defaultStat = READ_ALARM`, `defaultSevr = INVALID_ALARM`
-/// (devAsynInt32.c:844-846). Every non-success asyn status maps to
-/// INVALID severity; only the condition code differs:
-/// - Success      → (NO_ALARM, NO_ALARM)
-/// - Timeout      → (TIMEOUT_ALARM, INVALID)   = (10, 3)
-/// - Overflow     → (HW_LIMIT_ALARM, INVALID)  = (11, 3)
-/// - Disconnected → (COMM_ALARM, INVALID)      = (9, 3)
-/// - Disabled     → (DISABLE_ALARM, INVALID)   = (18, 3)
-/// - Error/other  → (READ_ALARM, INVALID)      = (1, 3)
-///
-/// Pre-fix this mapping was wrong: Timeout / Overflow / Error all yielded
-/// (7, 2) — condition 7 is STATE_ALARM, not READ_ALARM (which is 1), and
-/// MAJOR(2) instead of INVALID(3) — and Disabled was lumped with
-/// Disconnected as COMM_ALARM(9) instead of DISABLE_ALARM(18).
-/// Map an asyn transport status to the EPICS (alarm condition, severity) it
-/// implies — C `asynStatusToEpicsAlarm` with `defaultSevr = INVALID_ALARM`
-/// (asynEpicsUtils.c:238-265). `default_stat` is the condition C uses for the
-/// `asynError`/unknown arm: `READ_ALARM` for input device support,
-/// `WRITE_ALARM` for output. `Timeout`/`Overflow`/`Disconnected`/`Disabled`
-/// map to fixed conditions regardless of direction; `asynSuccess` → (NO_ALARM,
-/// NO severity). This is the per-status mapping only; C's fill-in rule
-/// (overwrite a field only while it is still NO_ALARM, so a sample's own EPICS
-/// alarm is preserved) is applied by callers that carry a base alarm.
+/// The alarm `status` raises on a record with none of its own:
+/// [`crate::alarm::status_to_alarm`] from a clean alarm. `default_stat` is
+/// READ_ALARM for input device support and WRITE_ALARM for output.
 fn asyn_status_to_alarm_with_default(
     status: crate::error::AsynStatus,
     default_stat: u16,
 ) -> (u16, u16) {
-    use crate::error::AsynStatus;
-    use epics_base_rs::server::recgbl::alarm_status;
-    use epics_base_rs::server::record::AlarmSeverity;
-    let invalid = AlarmSeverity::Invalid as u16;
-    match status {
-        AsynStatus::Success => (alarm_status::NO_ALARM, AlarmSeverity::NoAlarm as u16),
-        AsynStatus::Timeout => (alarm_status::TIMEOUT_ALARM, invalid),
-        AsynStatus::Overflow => (alarm_status::HW_LIMIT_ALARM, invalid),
-        AsynStatus::Disconnected => (alarm_status::COMM_ALARM, invalid),
-        AsynStatus::Disabled => (alarm_status::DISABLE_ALARM, invalid),
-        AsynStatus::Error => (default_stat, invalid),
-    }
+    crate::alarm::status_to_alarm(status, default_stat, (0, 0))
 }
 
-/// Resolve the EPICS alarm an interrupt sample raises from its own EPICS alarm
-/// (`sample_alarm`) and its asyn transport status (`aux`), mirroring C
-/// `asynStatusToEpicsAlarm`'s fill-in (asynEpicsUtils.c:238-265): on
-/// `asynSuccess` the sample's alarm passes through unchanged; otherwise the
-/// transport-mapped alarm fills a field only while it is still `NO_ALARM`, so a
-/// sample's own EPICS alarm wins. Shared by the averaging drain and the regular
-/// I/O Intr ring read; each caller owns its own value-discard gate.
+/// The alarm an interrupt sample raises: its own, with what its transport
+/// status `aux` implies filled in where it has none. Shared by the averaging
+/// drain and the regular I/O Intr ring read; each caller owns its own
+/// value-discard gate.
 fn resolve_intr_alarm(
     sample_alarm: (u16, u16),
     aux: crate::error::AsynStatus,
     default_stat: u16,
 ) -> (u16, u16) {
-    if aux == crate::error::AsynStatus::Success {
-        return sample_alarm;
-    }
-    let (mstat, msev) = asyn_status_to_alarm_with_default(aux, default_stat);
-    (
-        if sample_alarm.0 == 0 {
-            mstat
-        } else {
-            sample_alarm.0
-        },
-        if sample_alarm.1 == 0 {
-            msev
-        } else {
-            sample_alarm.1
-        },
-    )
+    crate::alarm::status_to_alarm(aux, default_stat, sample_alarm)
 }
 
 /// Map an asyn transport error to an EPICS alarm with an explicit direction
@@ -1866,7 +1812,7 @@ fn resolve_intr_alarm(
 /// output (write-only) record raises WRITE_ALARM where an input read raises
 /// READ_ALARM. `default_stat` carries that direction; it feeds both the
 /// `asynError`/unknown arm and the status-mapped `asynError`/default within
-/// [`asyn_status_to_alarm_with_default`] (specific statuses —
+/// [`crate::alarm::status_to_alarm`] (specific statuses —
 /// Timeout/Overflow/Disconnected/Disabled — map direction-independently).
 fn asyn_error_to_alarm_with_default(e: &AsynError, default_stat: u16) -> (u16, u16) {
     // `AsynError::status()` is the single owner of error → asynStatus, so a
@@ -1874,7 +1820,7 @@ fn asyn_error_to_alarm_with_default(e: &AsynError, default_stat: u16) -> (u16, u
     // timeout alongside the bytes the device accepted) keeps its condition
     // code instead of silently falling into the generic asynError branch.
     // Non-status variants map to `AsynStatus::Error`, which
-    // `asyn_status_to_alarm_with_default` resolves to C's default branch.
+    // `status_to_alarm` resolves to C's default branch.
     asyn_status_to_alarm_with_default(e.status(), default_stat)
 }
 
@@ -2770,10 +2716,10 @@ impl CellBody for DeviceJob {
             return;
         };
         if wrote {
-            let _ = reentry.complete(*prio);
+            reentry.complete(*prio);
         } else if self.read.lock().is_some() {
             // The result stays for the re-entered pass's `read()`.
-            let _ = reentry.reprocess(*prio);
+            reentry.reprocess(*prio);
         }
     }
 }

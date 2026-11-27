@@ -1050,6 +1050,8 @@ async fn main() {
     }
     // C's ONE stderr warning for a timed-out read phase (`caget.c:229-231`,
     // `:243-244`) — it does not name the PV and does not stop the print loop.
+    // Unlike C, a refused or failed read does not print it: nothing timed out
+    // there (C's line falls out of getCopy.cpp:44 and caget.c:126-139).
     if results.iter().any(|r| r.timed_out) {
         epics_libcom_rs::stderr_println!("Read operation timed out: some PV data was not read.");
     }

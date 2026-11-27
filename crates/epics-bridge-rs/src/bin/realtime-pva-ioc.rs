@@ -634,8 +634,8 @@ mod ioc {
         // (0-env) above has already applied the boot command line, so an
         // `EPICS_PVA_NAME_SERVERS=...` boot argument wins over the value
         // compiled in here, and a host harness
-        // (`tests/realtime_pva_ioc_boots.rs`) points the dial somewhere it
-        // controls the same way.
+        // (`tests/integration/realtime_pva_ioc_boots.rs`) points the dial
+        // somewhere it controls the same way.
         //
         // SAFETY (edition 2024): this runs on the single init thread before
         // the build starts any other thread, so no concurrent

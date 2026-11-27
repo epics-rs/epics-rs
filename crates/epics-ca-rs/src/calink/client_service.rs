@@ -5,28 +5,33 @@
 
 use std::sync::Arc;
 
+use futures_util::StreamExt;
+
 use epics_base_rs::runtime::sync::broadcast;
-use epics_base_rs::runtime::task::{Reactor, TaskHandle};
 use epics_base_rs::server::database::{
-    CaClientService, ClientChannel, ClientSubscription, Connection, PutCompletion,
+    CaClientService, ClientChannel, ClientSubscription, Connection, InProcessEvents, PutCompletion,
 };
 use epics_base_rs::server::snapshot::Snapshot;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
 use super::CaLinkResolver;
-use crate::client::{CaChannel, ConnectionEvent, EnumReadback, MonitorHandle};
+use crate::client::{CaChannel, ConnectionEvent, DbrType, MonitorHandle};
 
 #[async_trait::async_trait]
 impl CaClientService for CaLinkResolver {
-    async fn create_channel(&self, name: &str) -> Option<Arc<dyn ClientChannel>> {
+    async fn create_channel(
+        &self,
+        name: &str,
+        events: &InProcessEvents,
+    ) -> Option<Arc<dyn ClientChannel>> {
         let client = self.client().await.ok()?;
         let channel = client.create_channel(name);
-        let events = channel.connection_events();
+        let connection = channel.connection_events();
         Some(Arc::new(NetChannel {
-            reactor: client.reactor().clone(),
+            events: events.clone(),
             channel,
             watch: tokio::sync::Mutex::new(Watch {
-                events,
+                events: connection,
                 reported: None,
             }),
         }))
@@ -34,7 +39,8 @@ impl CaClientService for CaLinkResolver {
 }
 
 struct NetChannel {
-    reactor: Reactor,
+    /// Its context's: its monitors deliver there.
+    events: InProcessEvents,
     channel: CaChannel,
     watch: tokio::sync::Mutex<Watch>,
 }
@@ -108,15 +114,15 @@ impl ClientChannel for NetChannel {
         mask: u16,
         callback: Box<dyn Fn(Snapshot) + Send + Sync>,
     ) -> Result<ClientSubscription, String> {
+        let dbr_type = DbrType::new(dbr_type).map_err(|e| e.to_string())?;
         let handle = self
             .channel
-            .subscribe_with_mask_readback_count(0.0, mask, EnumReadback::Native, false, Some(count))
+            .subscribe_with_mask_dbr_type(mask, dbr_type, count)
             .await
             .map_err(|e| e.to_string())?;
-        let task = self
-            .reactor
-            .spawn(deliver(handle, dbr_base(dbr_type), callback));
-        Ok(ClientSubscription::new(Abort(task)))
+        let mut values = Box::pin(values(handle));
+        self.events
+            .subscribe_network(Box::new(move |cx| values.poll_next_unpin(cx)), callback)
     }
 
     async fn put(
@@ -142,29 +148,15 @@ impl ClientChannel for NetChannel {
     }
 }
 
-/// Each value of `handle` to `callback`, as `base` when it has one.
-async fn deliver(
-    mut handle: MonitorHandle,
-    base: Option<DbFieldType>,
-    callback: Box<dyn Fn(Snapshot) + Send + Sync>,
-) {
-    while let Some(event) = handle.recv().await {
-        // An error event (the disconnect) delivers nothing; the
-        // subscription resumes on the reconnect.
-        if let Ok(mut snapshot) = event {
-            if let Some(base) = base {
-                snapshot.value = snapshot.value.convert_to(base);
+/// Each value of `handle`.
+fn values(handle: MonitorHandle) -> impl futures_util::Stream<Item = Snapshot> + Send {
+    futures_util::stream::unfold(handle, |mut handle| async move {
+        loop {
+            // An error event (the disconnect) delivers nothing; the
+            // subscription resumes on the reconnect.
+            if let Ok(snapshot) = handle.recv().await? {
+                return Some((snapshot, handle));
             }
-            callback(snapshot);
         }
-    }
-}
-
-/// A subscription's delivery task, aborted on drop.
-struct Abort(TaskHandle<()>);
-
-impl Drop for Abort {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
+    })
 }

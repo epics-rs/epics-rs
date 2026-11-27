@@ -15,6 +15,7 @@ mod link_put_queue;
 mod link_set;
 mod links;
 mod processing;
+mod queued_subscription;
 #[cfg(test)]
 mod reads_leak_tests;
 pub(crate) use processing::{AlarmPosts, alarm_field_posts};
@@ -27,7 +28,7 @@ mod subroutine_context;
 pub use crate::server::record::OwnRecord;
 pub use ca_client::{
     CaClientContext, CaClientService, ClientChannel, ClientFuture, ClientSubscription, Connection,
-    InProcessChannel, InProcessEvents, InProcessSubscription, PutCompletion,
+    EvDisallow, InProcessChannel, InProcessEvents, InProcessSubscription, PutCompletion,
 };
 pub use ca_link::CA_LINK_EVENT_MASK;
 pub use field_io::{
@@ -53,11 +54,12 @@ pub(crate) use links::{
 pub use processing::{
     AsyncDbHandle, AsyncToken, CaLinkInit, DbAddr, DeviceDone, DeviceDoneSource, ExternalCpProcess,
     FieldPut, HeldInstance, InitHold, InputLinkTexts, PostItem, PostRule, ProcStack,
-    ProcessCallback, TokenWatch, hop_floor,
+    ProcessCallback, RecordBand, TokenWatch, hop_floor,
 };
 pub(crate) use processing::{
     DelayedCallbackTimers, NotifiedRead, ReadPolicy, seed_record_constants,
 };
+pub use queued_subscription::{QueuedSubscription, SubscriptionQueue};
 #[cfg(feature = "test-hooks")]
 pub use record_lock::fresh_hold_hook;
 
@@ -1050,6 +1052,10 @@ struct PvDatabaseInner {
     record_attributes: ArcSwap<RecordAttributes>,
     /// Unlisted: C's `attributeList` is written without a lock.
     record_attributes_write: crate::runtime::sync::UnlistedPriorityInheritanceMutex<()>,
+    /// Moved by every attribute name [`Self::record_attributes`] gains, after
+    /// the snapshot naming it is published: an attribute answers a field
+    /// name, so it is part of the link name revision.
+    record_attribute_names_revision: std::sync::atomic::AtomicU64,
     /// Subroutine functions by name, retained at runtime so the processing
     /// path can re-resolve an aSub's subroutine when its name changes
     /// (C `aSubRecord.c::fetch_values` `registryFunctionFind`, LFLG=READ /
@@ -1646,6 +1652,7 @@ impl PvDatabase {
                     record_attributes: ArcSwap::from_pointee(RecordAttributes::new()),
                     record_attributes_write:
                         crate::runtime::sync::UnlistedPriorityInheritanceMutex::new(()),
+                    record_attribute_names_revision: std::sync::atomic::AtomicU64::new(0),
                     subroutine_registry: ArcSwap::from_pointee(HashMap::new()),
                     device_support_resolver: ArcSwapOption::empty(),
                     breaktable_registry: SnapshotCell::new(
@@ -1695,10 +1702,19 @@ impl PvDatabase {
         let truncated: String = value.chars().take(MAX_ATTRIBUTE_LEN).collect();
         let _write = self.inner.record_attributes_write.lock();
         let mut next = RecordAttributes::clone(&self.inner.record_attributes.load());
-        next.entry(record_type.to_string())
+        let created = next
+            .entry(record_type.to_string())
             .or_insert_with(|| seeded_record_attributes(record_type))
-            .insert(name.to_string(), truncated);
+            .insert(name.to_string(), truncated)
+            .is_none();
         self.inner.record_attributes.store(Arc::new(next));
+        if created {
+            // After the store: a link resolved under the old revision may have
+            // missed the name, never one resolved under the new.
+            self.inner
+                .record_attribute_names_revision
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
         Ok(())
     }
 
@@ -3658,13 +3674,12 @@ impl PvDatabase {
         reached: bool,
         err: &dyn Fn(&str),
     ) {
-        let mut init_reads = reached.then(|| self.read_init_links(rec_arc));
         let (scan, phas, record_type) = {
-            let mut guard = rec_arc.write();
-            if let Some(reads) = &mut init_reads {
-                let owed = guard.run_init_pass1(&name.to_str_lossy(), reads, err);
-                guard = self.pay_device_init(rec_arc, guard, owed, &name.to_str_lossy(), err);
-            }
+            let mut guard = if reached {
+                self.run_init_pass1(rec_arc, &name.to_str_lossy(), err)
+            } else {
+                rec_arc.write()
+            };
             let instance = &mut *guard;
             super::database::processing::seed_constant_links(instance);
             rec_arc.settle_addr_facts(instance);
@@ -3718,47 +3733,28 @@ impl PvDatabase {
         rec.write()
     }
 
-    /// The answers to `rec_arc`'s [`Record::init_link_reads`], read with no
-    /// lock of its own held, so a link to the record itself reads it too.
-    ///
-    /// [`Record::init_link_reads`]: crate::server::record::Record::init_link_reads
-    pub(crate) fn read_init_links(
+    /// C `doInitRecord1` for `rec`, a record pass 0 reached: the steps of its
+    /// `init_record(prec, 1)`, each `dbGetLink` one names read here with the
+    /// record let go (a read takes other records' locks, and a link to the
+    /// record itself reads it), then the init tail and the dset init it owes.
+    /// Hands the record back held.
+    pub(crate) fn run_init_pass1<'r>(
         &self,
-        rec_arc: &Arc<RecordCell>,
-    ) -> crate::server::record::InitLinkReads {
-        let links: Vec<_> = {
-            let instance = rec_arc.read();
-            instance
-                .record
-                .init_link_reads()
-                .iter()
-                .map(|&(field, read_as)| {
-                    // The link the record holds; a field that is not one of
-                    // its links is read from its text.
-                    let held = instance.stored_link_shared(field).cloned();
-                    let text = held.is_none().then(|| instance.link_text(field)).flatten();
-                    (field, text, read_as, held)
-                })
-                .collect()
-        };
-        crate::server::record::InitLinkReads::new(
-            links
-                .into_iter()
-                .map(|(field, text, read_as, held)| {
-                    let read = match held {
-                        Some(link) => self.read_link_at_init(rec_arc, &link, read_as),
-                        None => self.read_link_at_init(
-                            rec_arc,
-                            &crate::server::record::parse_link_v2(
-                                text.as_ref().map_or(&b""[..], |t| t.as_bytes()),
-                            ),
-                            read_as,
-                        ),
-                    };
-                    (field, read)
-                })
-                .collect(),
-        )
+        rec: &'r Arc<RecordCell>,
+        name: &str,
+        err: &dyn Fn(&str),
+    ) -> crate::server::record::RecordMut<'r> {
+        let mut guard = rec.write();
+        let mut answer = None;
+        while let Some((field, read_as)) = guard.init_pass1_step(name, answer.take()) {
+            let link = guard.init_read_link(field);
+            drop(guard);
+            let read = self.read_link_at_init(rec, &link, read_as);
+            guard = rec.write();
+            answer = Some(read.land(&mut guard.common, field));
+        }
+        let owed = guard.init_pass1_tail(name, err);
+        self.pay_device_init(rec, guard, owed, name, err)
     }
 
     /// Verify that `name` is not currently registered in any of the
@@ -5860,7 +5856,7 @@ mod tests {
         let db = PvDatabase::new();
         db.ioc_init().await;
 
-        let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+        let deadline = crate::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
         while !table().contains("dbCaLink") {
             assert!(
                 std::time::Instant::now() < deadline,

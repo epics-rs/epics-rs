@@ -21,6 +21,8 @@ epics-ca-rs = { workspace = true, optional = true }
 epics-bridge-rs = { workspace = true, optional = true }
 
 [dev-dependencies]
+# The tests' deadline_from_now: epics-base-rs is optional.
+epics-libcom-rs = { workspace = true }
 tempfile = "3"
 # Dev-only and path-only: the held-port rule for a port the child must bind.
 named-port = { path = "../../crates/named-port" }

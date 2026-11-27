@@ -747,18 +747,49 @@ impl PvDatabase {
     /// integer part in `[1,255]` is normalised to its integer form so
     /// `"5"`, `" 5 "` and `"5.0"` all name the same event.
     pub async fn post_event_named(&self, event_name: impl AsRef<[u8]>) {
-        // `eventNameToHandle` returns NULL for "0"/empty — no event.
-        let Some(want) = EventName::of(event_name.as_ref()) else {
+        if let Some(want) = self.admit_event_post(event_name.as_ref()) {
+            self.scan_event_list(want);
+        }
+    }
+
+    /// C `postEvent` from a record's `process()`: judged when it is posted,
+    /// then the list is scanned on a callback band, as `eventCallback` scans
+    /// it with no check of its own (`dbScan.c:459-465`), never recursively
+    /// inside the posting cycle.
+    pub(crate) fn request_event_post(&self, event_name: impl AsRef<[u8]> + Send + 'static) {
+        if self.admit_event_post(event_name.as_ref()).is_none() {
             return;
-        };
+        }
+        let db = self.clone();
+        // Middle band, not any record's PRIO: C `postEvent` fires one
+        // `callbackRequest` per non-empty band, each carrying the *scanned*
+        // record's priority (`dbScan.c:513-527`), a fan-out the port's single
+        // Event list cannot express. The poster's own PRIO is not the answer,
+        // so this keeps `callbackRequest`'s general band (`callback.h:42`).
+        crate::runtime::task::spawn_background(
+            crate::runtime::task::CallbackPriority::Medium,
+            async move {
+                if let Some(want) = EventName::of(event_name.as_ref()) {
+                    db.scan_event_list(want);
+                }
+            },
+        );
+    }
+
+    /// The event a post of `event_name` scans, if C `postEvent` would scan
+    /// one now.
+    fn admit_event_post<'a>(&self, event_name: &'a [u8]) -> Option<EventName<'a>> {
+        // `eventNameToHandle` returns NULL for "0"/empty — no event.
+        let want = EventName::of(event_name)?;
         // The handle is created whether or not the post then runs: the event
         // record (devEventSoft.c:82) and iocsh `postEvent`
         // (dbIocRegister.c:478) call `eventNameToHandle` before `postEvent`.
         self.inner.scan_index.events.handle(want);
         // C `postEvent` (`dbScan.c:538-539`).
-        if !self.inner.scan_ctl.is_running() {
-            return;
-        }
+        self.inner.scan_ctl.is_running().then_some(want)
+    }
+
+    fn scan_event_list(&self, want: EventName<'_>) {
         let Some(list) = ScanType::Event.scan_list() else {
             return;
         };

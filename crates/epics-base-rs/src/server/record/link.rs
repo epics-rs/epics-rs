@@ -1483,28 +1483,52 @@ pub(crate) enum DbLinkAnswer {
     /// A local record — C's `dbAddr`.
     Local(super::record_instance::ResolvedTarget),
     /// A simple PV spelling the target `REC.FLD`, which shadows the field.
-    Shadowed(std::sync::Arc<crate::server::pv::ProcessVariable>),
+    Shadowed {
+        pv: std::sync::Arc<crate::server::pv::ProcessVariable>,
+        /// The record field it shadows; `None` when no record has the name.
+        field: Option<ShadowedField>,
+        /// As [`ResolvedTarget::chain`](super::record_instance::ResolvedTarget::chain).
+        chain: Option<std::sync::Arc<FilterChain>>,
+    },
     /// A name this IOC serves, but no readable record field; the by-name
     /// path decides.
-    Absent,
+    Absent {
+        /// As [`ResolvedTarget::chain`](super::record_instance::ResolvedTarget::chain).
+        chain: Option<std::sync::Arc<FilterChain>>,
+    },
     /// Not served here: C `dbInitLink` hands it to `dbCaAddLink`
     /// (`dbLink.c:118-130`), and so is settled like an address.
     External,
 }
 
+type FilterChain = crate::server::database::filters::FilterChain;
+
+/// The record field a [`DbLinkAnswer::Shadowed`] PV shadows.
+pub(crate) struct ShadowedField {
+    pub(crate) rec: std::sync::Arc<super::record_instance::RecordCell>,
+    /// As [`ResolvedTarget::final_field_type`](super::record_instance::ResolvedTarget::final_field_type)
+    /// gives it.
+    pub(crate) final_field_type: Option<crate::types::DbFieldType>,
+}
+
 /// The settled [`DbLinkAnswer`] of a [`DbLink`], stamped with the name-map
 /// revision it was resolved under and re-resolved once that moves (records,
-/// aliases and simple PVs can come and go after `iocInit` here, unlike C).
+/// aliases and simple PVs can come and go after `iocInit` here, unlike C,
+/// and a record attribute can be added).
+/// A re-resolve that lands on the target already cached keeps the cached
+/// answer: C's `dbChannelOpen` settles a link's type and count once, so a
+/// target retyped since (an mbbo `VAL` once its states are defined) is still
+/// read as it was opened.
 ///
 /// Two caches, because a link target handle never outlives its target's map
 /// entry and only the reader's `INP` is reached by the sweep that enforces
 /// it. `owned` (any link, any caller) keeps a `Weak`, so no record is held
 /// by a link no sweep reaches. `lent` ([`DbLink::lend_addr`], reachable only
 /// through `RecordInstance::lend_inp_addr` and [`DbLink::lend_out_addr`])
-/// keeps strong handles, which
+/// keeps strong handles to `owned`'s answers, which
 /// [`DbLink::release_addr`] drops when the target is removed or the reader
 /// destroyed; until then it keeps every target it has published — one per
-/// retarget, not per read — since a lent one may still be borrowed.
+/// opening of `owned`, not per read — since a lent one may still be borrowed.
 struct DbAddrCell {
     owned: parking_lot::Mutex<Option<CachedDbAddr>>,
     /// The name-map revision `current` answers for; `u64::MAX` for none.
@@ -1512,7 +1536,8 @@ struct DbAddrCell {
     /// The newest entry of `lent`, or null when the answer at `revision` is
     /// not a local record.
     current: std::sync::atomic::AtomicPtr<super::record_instance::ResolvedTarget>,
-    lent: parking_lot::Mutex<Vec<std::sync::Arc<super::record_instance::ResolvedTarget>>>,
+    /// Each with the [`CachedDbAddr::open`] it was published from.
+    lent: parking_lot::Mutex<Vec<(u64, std::sync::Arc<super::record_instance::ResolvedTarget>)>>,
     /// C `dbDbInitLink`'s `precord` for a forward link: the target's
     /// record-table index, bound when the link is initialised or put
     /// (`dbInitLink` / `dbAddLink`) and only read by a dispatch; `0` unbound.
@@ -1536,6 +1561,9 @@ const NO_REVISION: u64 = u64::MAX;
 struct CachedDbAddr {
     answer: CachedAnswer,
     revision: u64,
+    /// Which opening of the cell this answer is: moved only when a resolve
+    /// replaces it, not when one re-stamps it.
+    open: u64,
 }
 
 enum CachedAnswer {
@@ -1545,10 +1573,121 @@ enum CachedAnswer {
         put: super::record_instance::PutAddr,
         f64_slot: Option<super::record_trait::FieldSlot>,
         final_no_elements: u32,
+        final_field_type: Option<crate::types::DbFieldType>,
+        chain: Option<std::sync::Arc<FilterChain>>,
+        route: Option<crate::server::database::char_view::LinkRoute>,
     },
-    Shadowed(std::sync::Arc<crate::server::pv::ProcessVariable>),
-    Absent,
+    Shadowed {
+        pv: std::sync::Arc<crate::server::pv::ProcessVariable>,
+        field: Option<(
+            std::sync::Weak<super::record_instance::RecordCell>,
+            Option<crate::types::DbFieldType>,
+        )>,
+        chain: Option<std::sync::Arc<FilterChain>>,
+    },
+    Absent {
+        chain: Option<std::sync::Arc<FilterChain>>,
+    },
     External,
+}
+
+impl CachedAnswer {
+    fn of(answer: &DbLinkAnswer) -> Self {
+        match answer {
+            DbLinkAnswer::Local(target) => CachedAnswer::Local {
+                rec: std::sync::Arc::downgrade(&target.rec),
+                name: target.name.clone(),
+                put: target.put,
+                f64_slot: target.f64_slot,
+                final_no_elements: target.final_no_elements,
+                final_field_type: target.final_field_type,
+                chain: target.chain.clone(),
+                route: target.route,
+            },
+            DbLinkAnswer::Shadowed { pv, field, chain } => CachedAnswer::Shadowed {
+                pv: pv.clone(),
+                field: field
+                    .as_ref()
+                    .map(|f| (std::sync::Arc::downgrade(&f.rec), f.final_field_type)),
+                chain: chain.clone(),
+            },
+            DbLinkAnswer::Absent { chain } => CachedAnswer::Absent {
+                chain: chain.clone(),
+            },
+            DbLinkAnswer::External => CachedAnswer::External,
+        }
+    }
+
+    /// The answer this holds, `None` once a record it names is gone.
+    fn answer(&self) -> Option<DbLinkAnswer> {
+        Some(match self {
+            CachedAnswer::Local {
+                rec,
+                name,
+                put,
+                f64_slot,
+                final_no_elements,
+                final_field_type,
+                chain,
+                route,
+            } => DbLinkAnswer::Local(super::record_instance::ResolvedTarget {
+                rec: rec.upgrade()?,
+                name: name.clone(),
+                put: *put,
+                f64_slot: *f64_slot,
+                final_no_elements: *final_no_elements,
+                final_field_type: *final_field_type,
+                chain: chain.clone(),
+                route: *route,
+            }),
+            CachedAnswer::Shadowed { pv, field, chain } => DbLinkAnswer::Shadowed {
+                pv: pv.clone(),
+                field: match field {
+                    Some((rec, final_field_type)) => Some(ShadowedField {
+                        rec: rec.upgrade()?,
+                        final_field_type: *final_field_type,
+                    }),
+                    None => None,
+                },
+                chain: chain.clone(),
+            },
+            CachedAnswer::Absent { chain } => DbLinkAnswer::Absent {
+                chain: chain.clone(),
+            },
+            CachedAnswer::External => DbLinkAnswer::External,
+        })
+    }
+
+    /// Whether `fresh` addresses what this does: the same record, or the same
+    /// simple PV over the same record or none.
+    fn same_target(&self, fresh: &DbLinkAnswer) -> bool {
+        let same = |weak: &std::sync::Weak<_>, rec: &std::sync::Arc<_>| {
+            std::ptr::eq(weak.as_ptr(), std::sync::Arc::as_ptr(rec))
+        };
+        match (self, fresh) {
+            (CachedAnswer::Local { rec, .. }, DbLinkAnswer::Local(target)) => {
+                same(rec, &target.rec)
+            }
+            (
+                CachedAnswer::Shadowed { pv, field, .. },
+                DbLinkAnswer::Shadowed {
+                    pv: fresh_pv,
+                    field: fresh_field,
+                    ..
+                },
+            ) => {
+                std::sync::Arc::ptr_eq(pv, fresh_pv)
+                    && match (field, fresh_field) {
+                        (Some((rec, _)), Some(fresh)) => same(rec, &fresh.rec),
+                        (None, None) => true,
+                        _ => false,
+                    }
+            }
+            (CachedAnswer::Absent { .. }, DbLinkAnswer::Absent { .. })
+            | (CachedAnswer::External, DbLinkAnswer::External) => true,
+            _ => false,
+        }
+    }
 }
 
 impl Clone for DbAddrCell {
@@ -1587,56 +1726,41 @@ impl DbLink {
     }
 
     /// The answer at name-map `revision`: the cached one while the maps are
-    /// at the revision it was resolved under, else `resolve`'s, cached.
+    /// at the revision it was resolved under, else `resolve`'s, cached — or
+    /// the cached one re-stamped, when `resolve` lands on its target.
     pub(crate) fn answer(
         &self,
         revision: u64,
         resolve: impl FnOnce() -> DbLinkAnswer,
     ) -> DbLinkAnswer {
+        self.settle(revision, resolve).0
+    }
+
+    /// [`Self::answer`] with its [`CachedDbAddr::open`].
+    fn settle(&self, revision: u64, resolve: impl FnOnce() -> DbLinkAnswer) -> (DbLinkAnswer, u64) {
         if let Some(cached) = &*self.addr.owned.lock()
             && cached.revision == revision
+            && let Some(answer) = cached.answer.answer()
         {
-            match &cached.answer {
-                CachedAnswer::Local {
-                    rec,
-                    name,
-                    put,
-                    f64_slot,
-                    final_no_elements,
-                } => {
-                    if let Some(rec) = rec.upgrade() {
-                        return DbLinkAnswer::Local(super::record_instance::ResolvedTarget {
-                            rec,
-                            name: name.clone(),
-                            put: *put,
-                            f64_slot: *f64_slot,
-                            final_no_elements: *final_no_elements,
-                        });
-                    }
-                }
-                CachedAnswer::Shadowed(pv) => return DbLinkAnswer::Shadowed(pv.clone()),
-                CachedAnswer::Absent => return DbLinkAnswer::Absent,
-                CachedAnswer::External => return DbLinkAnswer::External,
-            }
+            return (answer, cached.open);
         }
-        let answer = resolve();
-        let cached = match &answer {
-            DbLinkAnswer::Local(target) => CachedAnswer::Local {
-                rec: std::sync::Arc::downgrade(&target.rec),
-                name: target.name.clone(),
-                put: target.put,
-                f64_slot: target.f64_slot,
-                final_no_elements: target.final_no_elements,
-            },
-            DbLinkAnswer::Shadowed(pv) => CachedAnswer::Shadowed(pv.clone()),
-            DbLinkAnswer::Absent => CachedAnswer::Absent,
-            DbLinkAnswer::External => CachedAnswer::External,
-        };
-        *self.addr.owned.lock() = Some(CachedDbAddr {
-            answer: cached,
+        // Outside the cell lock: `resolve` takes record locks.
+        let fresh = resolve();
+        let mut owned = self.addr.owned.lock();
+        if let Some(cached) = &mut *owned
+            && cached.answer.same_target(&fresh)
+            && let Some(kept) = cached.answer.answer()
+        {
+            cached.revision = revision;
+            return (kept, cached.open);
+        }
+        let open = owned.as_ref().map_or(0, |cached| cached.open + 1);
+        *owned = Some(CachedDbAddr {
+            answer: CachedAnswer::of(&fresh),
             revision,
+            open,
         });
-        answer
+        (fresh, open)
     }
 
     /// The local target of [`Self::answer`], lent instead of cloned: on a
@@ -1689,10 +1813,9 @@ impl DbLink {
         unsafe { self.lend_addr(revision, resolve) }
     }
 
-    /// Resolve (outside the cell lock: `resolve` takes record locks) and
-    /// publish the answer to `lent`. The same record re-resolved under a moved
-    /// revision keeps its entry, since its field address is a function of
-    /// the record.
+    /// Publish [`Self::answer`] to `lent`: an answer re-stamped under a
+    /// moved revision keeps its entry, so a lent and an owned read of one link
+    /// never see two openings of it.
     #[cold]
     #[inline(never)]
     fn publish_lent(
@@ -1701,17 +1824,17 @@ impl DbLink {
         resolve: impl FnOnce() -> DbLinkAnswer,
     ) -> Option<std::sync::Arc<super::record_instance::ResolvedTarget>> {
         use std::sync::atomic::Ordering::Release;
-        let DbLinkAnswer::Local(target) = resolve() else {
+        let (DbLinkAnswer::Local(target), open) = self.settle(revision, resolve) else {
             self.addr.current.store(std::ptr::null_mut(), Release);
             self.addr.revision.store(revision, Release);
             return None;
         };
         let mut lent = self.addr.lent.lock();
         let entry = match lent.last() {
-            Some(last) if std::sync::Arc::ptr_eq(&last.rec, &target.rec) => last.clone(),
+            Some((last_open, last)) if *last_open == open => last.clone(),
             _ => {
                 let entry = std::sync::Arc::new(target);
-                lent.push(entry.clone());
+                lent.push((open, entry.clone()));
                 entry
             }
         };

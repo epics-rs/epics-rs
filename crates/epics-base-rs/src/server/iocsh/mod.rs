@@ -1530,7 +1530,7 @@ impl IocShell {
                 ));
                 // C `iocsh.cpp:1140` sleeps through `epicsThreadSleep`,
                 // so an `on error wait 1e300` continues at once instead
-                // of parking the script on a saturated `Duration::MAX`.
+                // of parking the script on a saturated `FAR_FUTURE`.
                 crate::runtime::time::sleep_secs(timeout);
                 ErrorReaction::ResumeFailed
             }

@@ -10,6 +10,8 @@ use epics_base_rs::types::{DbFieldType, EpicsValue, PvString};
 
 use crate::channel::AccessRights;
 use crate::client::state::ChannelState;
+use crate::client::{ReadAdmit, WriteAdmit};
+use crate::protocol::{ECA_NORDACCESS, ECA_NOWTACCESS};
 
 // --- Virtual-circuit identity ---
 
@@ -143,6 +145,28 @@ pub(crate) struct ChannelSnapshotPublic {
     /// 0 until the circuit's VERSION frame is seen, i.e. pre-V49 —
     /// the same conservative starting point as C's `tcpiiu`.
     pub server_minor: u16,
+}
+
+impl ChannelSnapshotPublic {
+    /// libca's cached-rights gate, ahead of queueing (`nciu.cpp:282,329,350`).
+    /// The refusal carries the status `oldChannelNotify.cpp` answers, in the
+    /// variant the server's own denial of that request arrives as.
+    pub(crate) fn permit_read(&self) -> CaResult<()> {
+        if self.access_rights.read {
+            Ok(())
+        } else {
+            Err(CaError::ServerError(ECA_NORDACCESS))
+        }
+    }
+
+    /// The write half of [`Self::permit_read`].
+    pub(crate) fn permit_write(&self) -> CaResult<()> {
+        if self.access_rights.write {
+            Ok(())
+        } else {
+            Err(CaError::WriteFailed(ECA_NOWTACCESS))
+        }
+    }
 }
 
 /// Shared snapshot registry. Coordinator publishes; CaChannel reads.
@@ -1377,6 +1401,8 @@ pub(crate) enum SearchReason {
     Reconnect,
     /// Beacon anomaly detected for the server this channel was on.
     BeaconAnomaly,
+    /// The server refused the channel it announced; it would refuse again.
+    Refused,
 }
 
 pub(crate) enum SearchRequest {
@@ -1463,6 +1489,16 @@ pub(crate) enum TransportCommand {
     },
     ReadNotify {
         sid: u32,
+        admit: ReadAdmit,
+        ioid: u32,
+        server_addr: SocketAddr,
+        priority: u8,
+    },
+    /// The READ_NOTIFY a subscription re-issues under its own id when its
+    /// circuit recovers. C `tcpiiu::subscriptionUpdateRequest`
+    /// (`tcpiiu.cpp:1610-1641`) sends it without `nciu::read`'s gate.
+    SubscriptionUpdate {
+        sid: u32,
         data_type: u16,
         count: u32,
         ioid: u32,
@@ -1478,17 +1514,15 @@ pub(crate) enum TransportCommand {
         /// (`cac::writeExcep` reads `hdr.m_available`).
         cid: u32,
         data_type: u16,
-        count: u32,
-        payload: Vec<u8>,
+        admit: WriteAdmit,
         server_addr: SocketAddr,
         priority: u8,
     },
     WriteNotify {
         sid: u32,
         data_type: u16,
-        count: u32,
         ioid: u32,
-        payload: Vec<u8>,
+        admit: WriteAdmit,
         server_addr: SocketAddr,
         priority: u8,
     },
@@ -1547,13 +1581,22 @@ pub(crate) enum TransportEvent {
     ChannelCreated {
         cid: u32,
         sid: u32,
-        data_type: u16,
+        native_type: DbFieldType,
         element_count: u32,
         access: AccessRights,
         server_addr: SocketAddr,
         /// priority of the circuit the CREATE_CH_RESP arrived
         /// on. Lets the coordinator clear a late response for an
         /// already-dropped cid on the right circuit.
+        priority: u8,
+    },
+    /// A CREATE_CH_RESP whose native type is no DBF type: the channel is
+    /// not created, though the server allocated `sid` for it.
+    ChannelRefused {
+        cid: u32,
+        sid: u32,
+        data_type: u16,
+        server_addr: SocketAddr,
         priority: u8,
     },
     MonitorData {

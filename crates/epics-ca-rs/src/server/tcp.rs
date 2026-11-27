@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 // These `tokio::io` traits/wrappers are used only by the async accept/read
-// front-end (`handle_client`, `drain_and_flush`); the shared read helper takes
+// front-end (`handle_client`, `run_circuit_writer`); the shared read helper takes
 // a `tokio::io::AsyncReadExt` bound by full path. Gated to `tokio_backend`,
 // with the rest of the async front-end.
 #[cfg(tokio_backend)]
@@ -26,20 +26,26 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufWriter};
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 
-/// Optional application-level idle timeout before forcibly closing a TCP
-/// client. Disabled by default — OS-level TCP keepalive (set in `accept_loop`,
-/// 15s idle + 5s probes) is the primary half-open detector and matches C
-/// epics-base rsrv (`caservertask.c:1457-1463` sets `SO_KEEPALIVE` and
-/// refuses the connection if it fails; C has no application-level idle timeout
-/// at all — the socket option is its only half-open detector).
+/// `EPICS_CAS_INACTIVITY_TMO` when unset or unparseable
+/// (`doc/08-environment.md`).
+const DEFAULT_INACTIVITY_TMO: Duration = Duration::from_secs(600);
+
+/// The floor a positive `EPICS_CAS_INACTIVITY_TMO` is raised to.
+const MIN_INACTIVITY_TMO_SECS: f64 = 30.0;
+
+/// Application-level idle cap before forcibly closing a TCP client, on both
+/// drivers. C rsrv has none: `caservertask.c:1457-1463` sets `SO_KEEPALIVE`
+/// and refuses the connection if it fails, its only half-open detector. The
+/// cap backs up keepalive (set in `accept_loop`, 15s idle + 5s probes) where
+/// it is unreliable, such as behind NAT.
 ///
 /// A C client receiving a continuous monitor stream may never send
 /// `CA_PROTO_ECHO` (libca resets its echo timer on every received frame from
 /// the server), so an inactivity timeout based purely on incoming reads
-/// produces false-positive disconnects on healthy connections. Operators who
-/// want a defensive cap (e.g., NAT environments where TCP keepalive is
-/// unreliable) can set `EPICS_CAS_INACTIVITY_TMO` to a positive value;
-/// values < 30 are clamped to 30 to avoid pathological short timeouts.
+/// produces false-positive disconnects on healthy connections; the cap runs
+/// from the last byte read or written instead ([`CircuitActivity`]).
+///
+/// `None` means the cap is off, which only a value of 0 or below asks for.
 pub(crate) fn inactivity_timeout() -> Option<Duration> {
     static RESOLVED: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
     *RESOLVED.get_or_init(resolve_inactivity_timeout)
@@ -47,28 +53,107 @@ pub(crate) fn inactivity_timeout() -> Option<Duration> {
 
 /// The uncached resolution behind [`inactivity_timeout`].
 fn resolve_inactivity_timeout() -> Option<Duration> {
-    crate::estdlib::env_double("EPICS_CAS_INACTIVITY_TMO")
-        .ok()
-        .filter(|v| *v > 0.0)
-        .map(|v| crate::estdlib::duration_from_secs(v.max(30.0)))
+    match crate::estdlib::env_double("EPICS_CAS_INACTIVITY_TMO") {
+        Ok(v) if v <= 0.0 => None,
+        Ok(v) if v > 0.0 => Some(crate::estdlib::duration_from_secs(
+            v.max(MIN_INACTIVITY_TMO_SECS),
+        )),
+        // Unset, unreadable, or NaN (which fails both comparisons above).
+        _ => Some(DEFAULT_INACTIVITY_TMO),
+    }
+}
+
+/// The one place both drivers report a circuit's reads and writes: it keeps
+/// when a byte last moved either way, which is what [`inactivity_timeout`]
+/// measures idleness from, and counts the bytes into
+/// `ServerStats::bytes_in` / `bytes_out`. rsrv stamps `time_at_last_send` and
+/// `time_at_last_recv` at the same two sites (`caserverio.c:72`,
+/// `camsgtask.c:113`).
+pub(crate) struct CircuitActivity {
+    since: std::time::Instant,
+    /// Nanoseconds from `since` to the latest byte read or written.
+    last: std::sync::atomic::AtomicU64,
+    /// `None` counts nothing (dispatch fixtures without a server).
+    stats: Option<Arc<super::stats::ServerStats>>,
+}
+
+impl CircuitActivity {
+    pub(crate) fn new(stats: Option<Arc<super::stats::ServerStats>>) -> Self {
+        Self {
+            since: std::time::Instant::now(),
+            last: std::sync::atomic::AtomicU64::new(0),
+            stats,
+        }
+    }
+
+    /// A read took `n` bytes off the circuit.
+    pub(crate) fn received(&self, n: usize) {
+        self.moved(n, |s| &s.bytes_in);
+    }
+
+    /// A write put `n` bytes on the circuit.
+    pub(crate) fn sent(&self, n: usize) {
+        self.moved(n, |s| &s.bytes_out);
+    }
+
+    fn moved(
+        &self,
+        n: usize,
+        counter: impl FnOnce(&super::stats::ServerStats) -> &std::sync::atomic::AtomicU64,
+    ) {
+        if n == 0 {
+            return;
+        }
+        let at = u64::try_from(self.since.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.last.fetch_max(at, Ordering::Relaxed);
+        if let Some(stats) = &self.stats {
+            counter(stats).fetch_add(n as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// What is left of `cap` since bytes last moved; `None` once it has run out.
+    pub(crate) fn idle_remaining(&self, cap: Duration) -> Option<Duration> {
+        let idle = self
+            .since
+            .elapsed()
+            .saturating_sub(Duration::from_nanos(self.last.load(Ordering::Relaxed)));
+        cap.checked_sub(idle).filter(|left| !left.is_zero())
+    }
+}
+
+#[cfg(tokio_backend)]
+impl CircuitActivity {
+    /// Resolves once `cap` passes with no byte moved.
+    async fn idle_for(&self, cap: Duration) {
+        while let Some(left) = self.idle_remaining(cap) {
+            tokio::time::sleep(left).await;
+        }
+    }
 }
 
 /// Read into `buf` with an optional idle cap. If `cap` is `None`, the read
 /// is unbounded (matches C `recv()` blocking semantics in `camsgtask.c`);
-/// if `cap` is `Some(d)`, returns `Err(d)` after `d` of inactivity.
+/// if `cap` is `Some(d)`, returns `Err(d)` once `d` passes with no byte
+/// moved on the circuit either way.
 #[cfg(tokio_backend)]
 async fn read_with_optional_timeout<R: tokio::io::AsyncReadExt + Unpin>(
     reader: &mut R,
     buf: &mut [u8],
     cap: Option<Duration>,
+    activity: &CircuitActivity,
 ) -> Result<std::io::Result<usize>, Duration> {
-    match cap {
-        None => Ok(reader.read(buf).await),
-        Some(d) => match tokio::time::timeout(d, reader.read(buf)).await {
-            Ok(r) => Ok(r),
-            Err(_) => Err(d),
+    let read = match cap {
+        None => reader.read(buf).await,
+        Some(d) => tokio::select! {
+            biased;
+            read = reader.read(buf) => read,
+            () = activity.idle_for(d) => return Err(d),
         },
+    };
+    if let Ok(n) = read {
+        activity.received(n);
     }
+    Ok(read)
 }
 
 /// Parse an opt-in resource cap from an env value. `None` (variable
@@ -219,8 +304,6 @@ pub enum ServerConnectionEvent {
         cid: u32,
     },
     /// `CA_PROTO_EVENT_ADD` accepted; a new subscription is live.
-    /// Drives `ServerStats::subscriptions_opened_total` (PR #592's
-    /// `caServerSubscriptionCount`).
     ///
     /// `mask` is the validated `DBE_*` event-select mask the client
     /// requested (`1..=255`). The CA gateway consults `mask & DBE_PROPERTY`
@@ -235,9 +318,7 @@ pub enum ServerConnectionEvent {
         mask: u16,
     },
     /// `CA_PROTO_EVENT_CANCEL` or channel teardown closed a
-    /// subscription. Drives `ServerStats::subscriptions_closed_total`.
-    /// Subtract from the opened counter for the live subscription
-    /// count.
+    /// subscription.
     SubscriptionClosed {
         peer: SocketAddr,
         pv_name: Arc<[u8]>,
@@ -256,10 +337,10 @@ pub(crate) use epics_base_rs::server::database::dbr_delivery::prepare_read;
 // host `exec_backend` build with them.
 #[cfg(tokio_backend)]
 use crate::server::recv::{Admit, Gate, RecvAccumulator};
-// `OutboxDrain` is consumed only by the async `drain_and_flush`; same gate.
+// `OutboxDrain` is consumed only by the async `run_circuit_writer`; same gate.
 use crate::server::frame::{FrameBuf, size_dbr_reply};
 #[cfg(tokio_backend)]
-use crate::server::outbox::OutboxDrain;
+use crate::server::outbox::{Drained, OutboxDrain};
 use epics_base_rs::error::CaResult;
 #[cfg(tokio_backend)]
 use epics_base_rs::server::database::channel_io::get_read_snapshot;
@@ -271,6 +352,7 @@ use epics_base_rs::server::database::channel_io::{
 // builds reach the same primitive from `server::blocking`.
 #[cfg(tokio_backend)]
 use epics_base_rs::runtime::accept::AcceptBackoff;
+use epics_base_rs::runtime::time::deadline_after;
 use epics_base_rs::server::access_security::{AccessLevel, AccessSecurityConfig};
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::database::filters::ChannelCreateError;
@@ -697,7 +779,7 @@ impl PutNotifySlot {
                 {
                     let wait = PutNotifyWait {
                         settled: reg.settled.clone(),
-                        deadline: reg.busy_since + PUT_NOTIFY_BLOCK_TIMEOUT,
+                        deadline: deadline_after(reg.busy_since, PUT_NOTIFY_BLOCK_TIMEOUT),
                     };
                     *slot = Some(reg);
                     return Ok(Some(wait));
@@ -747,8 +829,63 @@ impl PutNotifySlot {
     }
 }
 
+type TableCounter = fn(&super::stats::ServerStats) -> &std::sync::atomic::AtomicU64;
+
+/// One channel or monitor in a circuit's table as `ServerStats` counts it:
+/// opened when it enters the table, closed when it is dropped, so every way
+/// out (CLEAR_CHANNEL, EVENT_CANCEL, destruction, disconnect, either driver
+/// dropping its [`ClientState`]) closes it exactly once.
+struct TableCount {
+    /// `None` counts nothing (dispatch fixtures without a server).
+    stats: Option<Arc<super::stats::ServerStats>>,
+    closed: TableCounter,
+}
+
+impl TableCount {
+    fn channel(stats: &Option<Arc<super::stats::ServerStats>>) -> Self {
+        Self::open(
+            stats,
+            |s| &s.channels_opened_total,
+            |s| &s.channels_closed_total,
+        )
+    }
+
+    fn subscription(stats: &Option<Arc<super::stats::ServerStats>>) -> Self {
+        Self::open(
+            stats,
+            |s| &s.subscriptions_opened_total,
+            |s| &s.subscriptions_closed_total,
+        )
+    }
+
+    fn open(
+        stats: &Option<Arc<super::stats::ServerStats>>,
+        opened: TableCounter,
+        closed: TableCounter,
+    ) -> Self {
+        if let Some(s) = stats {
+            opened(s).fetch_add(1, Ordering::Relaxed);
+        }
+        Self {
+            stats: stats.clone(),
+            closed,
+        }
+    }
+}
+
+impl Drop for TableCount {
+    fn drop(&mut self) {
+        if let Some(s) = &self.stats {
+            (self.closed)(s).fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 struct ChannelEntry {
+    _counted: TableCount,
     target: ChannelTarget,
+    /// This channel's asLib client; each of its monitors holds a clone.
+    rights: Arc<ChannelRights>,
     cid: u32,
     /// PV name as the client originally requested it (with any
     /// `.FIELD` suffix). Retained so the `ChannelCleared` lifecycle
@@ -822,6 +959,8 @@ pub(crate) struct ChannelMonitor {
     /// Its gate and read-access flag.
     pub monitor: Arc<CircuitMonitor>,
     pub id: epics_base_rs::server::event_queue::AttachId,
+    /// Private, so [`ClientState::link_subscription`] is the only way in.
+    _counted: TableCount,
 }
 
 impl ChannelEntry {
@@ -903,15 +1042,10 @@ pub(crate) struct ClientState {
     channels: HashMap<u32, ChannelEntry>,
     /// Keyed by slot, never sub_id, which a client may install twice.
     subscriptions: HashMap<epics_base_rs::server::event_queue::AttachId, SubscriptionEntry>,
-    channel_access: HashMap<u32, AccessLevel>,
-    /// per-SID write-trap mask of the ACF rule that resolved
-    /// the channel's access level. Kept parallel to `channel_access`
-    /// (same key set, inserted/removed together) because the trap
-    /// flag has no `CA_PROTO_ACCESS_RIGHTS` wire representation — it
-    /// is consumed only by TRAPWRITE put-logging dispatch, never
-    /// diffed for access-rights transition frames. Mirrors C
-    /// `pasgclient->trapMask` (`asLibRoutines.c:1048`).
-    channel_trap: HashMap<u32, bool>,
+    /// Per SID, the rights the client was last sent in
+    /// `CA_PROTO_ACCESS_RIGHTS`. Only [`reeval_access_rights`] compares
+    /// against it, to send a notice on a transition; no check reads it.
+    advertised_access: HashMap<u32, AccessLevel>,
     /// Monitor ids [`destroy_channel`] retired but could not finish tearing
     /// down, because the delivery machinery lives in the driver's own
     /// registry. Drained by the driver after each dispatch — see
@@ -923,27 +1057,10 @@ pub(crate) struct ClientState {
     /// still naming one crossed that frame, and gets [`answer_pcas_refusal`];
     /// every other unknown sid keeps rsrv's answer. Freed with the circuit.
     retired: HashMap<u32, u32>,
-    /// This circuit's access-security host identity. See [`HostIdentity`]
-    /// — the variant, not a runtime check at the write site, decides
-    /// whether `CA_PROTO_HOST_NAME` may replace it.
-    hostname: HostIdentity,
-    /// C `client_name_action` keeps the `CLIENT_NAME` bytes as sent.
-    username: Vec<u8>,
-    /// Authentication method for ACF `METHOD()` clause matching.
-    /// `"x509"` for mTLS-authenticated peers (epics-base PR #641);
-    /// `"ca"` (or empty for backwards compat) for plaintext peers.
-    /// ACF rules without a `METHOD()` clause ignore this field
-    /// — the legacy `check_access_asl()` codepath continues to work.
-    auth_method: String,
-    /// Authority for ACF `AUTHORITY()` clause matching. mTLS peers
-    /// carry their cert's *issuer* DN here so rules like
-    /// `RULE(1, WRITE) { METHOD("x509") AUTHORITY("CN=ops-ca, …") }`
-    /// can pin write access to certs minted by a specific CA.
-    /// Empty for plaintext peers.
-    auth_authority: String,
-    acf: epics_base_rs::server::access_security::AcfCell,
-    /// record database, for resolving ACF `INP*` links to live
-    /// values when evaluating CALC-gated rules in `compute_access`.
+    /// Who the peer is and the ACF in force; each channel's
+    /// [`ChannelRights`] holds a clone.
+    rights: Arc<CircuitRights>,
+    /// The record database.
     db: Arc<PvDatabase>,
     tcp_port: u16,
     minor: CircuitMinor,
@@ -991,8 +1108,9 @@ pub(crate) struct ClientState {
     /// `subscription_events_posted` / `subscription_events_processed`
     /// counters (PCAS `caServer` parity, feeding the gateway's
     /// `serverPostRate` / `serverEventRate`) advance from the delivery
-    /// layer. `None` in unit tests that drive the TCP path without a
-    /// full `ServerStats` wired up.
+    /// layer, and into each channel's and monitor's [`TableCount`].
+    /// `None` in unit tests that drive the TCP path without a full
+    /// `ServerStats` wired up.
     stats: Option<Arc<super::stats::ServerStats>>,
 }
 
@@ -1056,16 +1174,252 @@ impl HostIdentity {
     }
 }
 
+/// Who the peer is to access security: the arguments of C `asAddClient`
+/// and `asChangeClient`.
+#[derive(Debug, Clone)]
+struct ClientIdentity {
+    /// See [`HostIdentity`] — the variant, not a runtime check at the write
+    /// site, decides whether `CA_PROTO_HOST_NAME` may replace it.
+    hostname: HostIdentity,
+    /// C `client_name_action` keeps the `CLIENT_NAME` bytes as sent.
+    username: Vec<u8>,
+    /// Authentication method for ACF `METHOD()` clause matching.
+    /// `"x509"` for mTLS-authenticated peers (epics-base PR #641);
+    /// `"ca"` (or empty for backwards compat) for plaintext peers.
+    /// ACF rules without a `METHOD()` clause ignore this field
+    /// — the legacy `check_access_asl()` codepath continues to work.
+    auth_method: String,
+    /// Authority for ACF `AUTHORITY()` clause matching. mTLS peers
+    /// carry their cert's *issuer* DN here so rules like
+    /// `RULE(1, WRITE) { METHOD("x509") AUTHORITY("CN=ops-ca, …") }`
+    /// can pin write access to certs minted by a specific CA.
+    /// Empty for plaintext peers.
+    auth_authority: String,
+}
+
+/// The circuit's asLib identity and policy, which every channel's
+/// [`ChannelRights`] computes from.
+pub(crate) struct CircuitRights {
+    /// Written only through [`ClientState::update_identity`], whose `&mut`
+    /// receiver makes the circuit's client loop its single writer. Each
+    /// change stores a new `Arc`, which is what [`ChannelRights`] keys on.
+    identity: arc_swap::ArcSwap<ClientIdentity>,
+    acf: epics_base_rs::server::access_security::AcfCell,
+}
+
+impl CircuitRights {
+    /// C's default identity: `""` for host and user until the client
+    /// names them.
+    pub(crate) fn new(acf: epics_base_rs::server::access_security::AcfCell) -> Self {
+        Self {
+            identity: arc_swap::ArcSwap::from_pointee(ClientIdentity {
+                hostname: HostIdentity::Claimed(Vec::new()),
+                username: Vec::new(),
+                auth_method: String::new(),
+                auth_authority: String::new(),
+            }),
+            acf,
+        }
+    }
+
+    /// Evaluate `cfg`'s rules for `asg_name`.
+    ///
+    /// The rule walk and the CALC results both belong to `epics-base-rs`:
+    /// `AccessSecurityConfig::compute_rules` reads the results its `INP*`
+    /// watcher published, as C's `asComputePvt` reads `pasgrule->result`.
+    /// This server used to carry its own evaluator, and then its own link
+    /// reads; both drifted from C.
+    fn access_for_asg(
+        cfg: &AccessSecurityConfig,
+        asg_name: &str,
+        asl: u8,
+        id: &ClientIdentity,
+    ) -> (AccessLevel, bool) {
+        cfg.compute_for_name(
+            asg_name,
+            id.hostname.as_bytes(),
+            &id.username,
+            &[],
+            asl,
+            &id.auth_method,
+            &id.auth_authority,
+        )
+    }
+
+    /// C `asComputePvt`: the level the ACF grants `id` on `target`, with the
+    /// write-trap mask of the rule that resolved it. The trap flag is `false`
+    /// when no `TRAPWRITE` rule resolved the level, including the no-ACF
+    /// permissive fallback.
+    fn compute(&self, target: &ChannelTarget, id: &ClientIdentity) -> (AccessLevel, bool) {
+        let (asg, asl) = match target {
+            // Simple PVs have no per-record ASL field; treat them as ASL=0
+            // so the most-restrictive rule applies. Matches the C IOC's
+            // behaviour for names that never went through `dbAddMember`.
+            ChannelTarget::SimplePv(_) => ("DEFAULT".to_owned(), 0),
+            ChannelTarget::RecordField { record, .. } => {
+                let instance = record.read();
+                (
+                    instance.common.access_group().to_string(),
+                    instance.common.asl,
+                )
+            }
+        };
+        match self.acf.load_full() {
+            // PR #641: method/authority for mTLS rules. CALC rules are
+            // evaluated against resolved INP* links.
+            Some(cfg) => Self::access_for_asg(&cfg, &asg, asl, id),
+            // No ACF attached: permissive ReadWrite, no rule resolved
+            // access, so no TRAPWRITE applies.
+            None => (AccessLevel::ReadWrite, false),
+        }
+    }
+}
+
+/// One channel's asLib client, C `ASGCLIENT` (`pciu->asClientPVT`).
+///
+/// C `asCheckGet`/`asCheckPut` read the access `asComputePvt` cached in it
+/// (`asLib.h:46-49`), recomputed by `asChangeClient` on a new identity, by
+/// `asComputeAsg` on an `INP*` event and by `asComputeAllAsg`/`asChangeGroup`
+/// on a load or an ASG put (`asLibRoutines.c:411`, `asCa.c:161`, `:205`,
+/// `asDbLib.c:109`). Here those last three bump the policy generation
+/// after publishing, and an identity change stores a new snapshot, so a
+/// check recomputes exactly when either moved since the cached result.
+pub(crate) struct ChannelRights {
+    circuit: Arc<CircuitRights>,
+    target: ChannelTarget,
+    computed: parking_lot::Mutex<Option<Computed>>,
+}
+
+/// What [`CircuitRights::compute`] returned, with what it was computed from.
+struct Computed {
+    policy: u64,
+    /// Held, so a later identity cannot reuse its address.
+    identity: Arc<ClientIdentity>,
+    level: AccessLevel,
+    rule_was_trap: bool,
+}
+
+impl ChannelRights {
+    pub(crate) fn new(circuit: Arc<CircuitRights>, target: ChannelTarget) -> Self {
+        Self {
+            circuit,
+            target,
+            computed: parking_lot::Mutex::new(None),
+        }
+    }
+
+    /// C `asCheckGet`, which `read_reply` calls per event
+    /// (`camessage.c:498`).
+    pub(crate) fn can_read(&self) -> bool {
+        matches!(self.level().0, AccessLevel::Read | AccessLevel::ReadWrite)
+    }
+
+    /// C `asCheckGet` and `rsrvCheckPut` together, as `access_rights_reply`
+    /// and every request handler see them.
+    pub(crate) fn access(&self) -> crate::server::access_token::CaAccessChecked {
+        let (level, rule_was_trap) = self.level();
+        let level = match (level, &self.target) {
+            // C `rsrvCheckPut` (rsrv/camessage.c:2540-2551):
+            //
+            //     /* SPC_NOMOD fields are always unwritable */
+            //     if (dbChannelSpecial(pciu->dbch) == SPC_NOMOD) return 0;
+            //
+            // and its `0` clears the ACCESS_RIGHTS write bit at
+            // camessage.c:1123-1125. The declaration has one owner
+            // (`RecordInstance::is_no_mod`), shared with the `dbPut`
+            // gate — reading `field_list().read_only` alone here saw
+            // neither the dbCommon NOMOD set (NAME/STAT/SEVR/ACKS/…,
+            // which no record's field_list declares) nor the
+            // state-raised NOMOD of `Record::field_no_mod` (compress
+            // VAL under BALG=LIFO), so the server advertised WRITE on
+            // fields it would then refuse. It strips only the WRITE bit
+            // and leaves the trap mask of the rule that matched; being
+            // state-raised, it is read live rather than cached.
+            (AccessLevel::ReadWrite, ChannelTarget::RecordField { record, field })
+                if record.read().is_no_mod(field) =>
+            {
+                AccessLevel::Read
+            }
+            (level, _) => level,
+        };
+        crate::server::access_token::CaAccessChecked::from_level(level, rule_was_trap)
+    }
+
+    /// The `CA_PROTO_ACCESS_RIGHTS` word for `level`: read bit 0, write
+    /// bit 1 (`access_rights_reply`, camessage.c:1117-1127).
+    fn wire_bits(level: AccessLevel) -> u32 {
+        match level {
+            AccessLevel::ReadWrite => 3,
+            AccessLevel::Read => 1,
+            AccessLevel::NoAccess => 0,
+        }
+    }
+
+    fn level(&self) -> (AccessLevel, bool) {
+        let identity = self.circuit.identity.load();
+        if let ChannelTarget::SimplePv(pv) = &self.target
+            && let Some(hook) = pv.access_hook()
+        {
+            // a gateway shadow PV carries an access hook routing the
+            // decision through the gateway's own ACF (`.pvlist` ASG +
+            // `AccessConfig::can_read/write`) for this downstream
+            // `(user, host)`. When present it is authoritative for this PV
+            // — the server's own ACF never saw the `.pvlist` ASG. It reads
+            // the gateway's ACL and the upstream's rights, which move under
+            // no generation here, so it is asked every time. The gateway
+            // audits/traps writes in its own write hook, so no TRAPWRITE
+            // rule resolves here.
+            let decision = hook(&identity.username, identity.hostname.as_bytes());
+            let level = match (decision.read, decision.write) {
+                (_, true) => AccessLevel::ReadWrite,
+                (true, false) => AccessLevel::Read,
+                (false, false) => AccessLevel::NoAccess,
+            };
+            return (level, false);
+        }
+        // Read before the policy: a change published after this read
+        // leaves a newer generation, so its result is never kept as current.
+        let policy = epics_base_rs::server::access_security::asg_change_generation();
+        if let Some(c) = &*self.computed.lock()
+            && c.policy == policy
+            && Arc::ptr_eq(&c.identity, &identity)
+        {
+            return (c.level, c.rule_was_trap);
+        }
+        let identity = arc_swap::Guard::into_inner(identity);
+        let (level, rule_was_trap) = self.circuit.compute(&self.target, &identity);
+        *self.computed.lock() = Some(Computed {
+            policy,
+            identity,
+            level,
+            rule_was_trap,
+        });
+        (level, rule_was_trap)
+    }
+}
+
 impl ClientState {
     /// Link a new subscription onto its channel — C `event_add_action`
     /// appending the `event_ext` to `pciu->eventq` (`camessage.c:1846`).
     ///
     /// The single owner of the channel→monitor association, so both drivers
     /// register through it and [`destroy_channel`] can cancel a cleared
-    /// channel's monitors without knowing which registry holds them.
-    pub(crate) fn link_subscription(&mut self, sid: u32, monitor: ChannelMonitor) {
+    /// channel's monitors without knowing which registry holds them, and so
+    /// both count their subscriptions here.
+    pub(crate) fn link_subscription(
+        &mut self,
+        sid: u32,
+        sub_id: u32,
+        monitor: Arc<CircuitMonitor>,
+        id: epics_base_rs::server::event_queue::AttachId,
+    ) {
         if let Some(chan) = self.channels.get_mut(&sid) {
-            chan.subscriptions.push(monitor);
+            chan.subscriptions.push(ChannelMonitor {
+                sub_id,
+                monitor,
+                id,
+                _counted: TableCount::subscription(&self.stats),
+            });
         }
     }
 
@@ -1117,19 +1471,15 @@ impl ClientState {
         acf: epics_base_rs::server::access_security::AcfCell,
         tcp_port: u16,
         db: Arc<PvDatabase>,
+        stats: Option<Arc<super::stats::ServerStats>>,
     ) -> Self {
         Self {
             channels: HashMap::new(),
             subscriptions: HashMap::new(),
-            channel_access: HashMap::new(),
-            channel_trap: HashMap::new(),
+            advertised_access: HashMap::new(),
             retired_subscriptions: Vec::new(),
             retired: HashMap::new(),
-            hostname: HostIdentity::Claimed(Vec::new()),
-            username: Vec::new(),
-            auth_method: String::new(),
-            auth_authority: String::new(),
-            acf,
+            rights: Arc::new(CircuitRights::new(acf)),
             db,
             tcp_port,
             minor: CircuitMinor::new(0),
@@ -1145,7 +1495,7 @@ impl ClientState {
             #[cfg(tokio_backend)]
             parked_reads: ParkedReads::default(),
             circuit_monitors: None,
-            stats: None,
+            stats,
         }
     }
 
@@ -1206,7 +1556,7 @@ impl ClientState {
         initial_hostname: Option<String>,
         tls_authority: Option<String>,
     ) {
-        self.hostname = match initial_hostname {
+        let hostname = match initial_hostname {
             // Port extension, no C counterpart: an mTLS-verified cert identity
             // outranks both of C's modes and no client-supplied name replaces
             // it.
@@ -1223,10 +1573,13 @@ impl ClientState {
         // PR #641: surface the mTLS authentication context to the ACF
         // check. Plaintext peers stay with empty fields — every legacy
         // rule (no METHOD/AUTHORITY clause) ignores them.
-        if let Some(authority) = tls_authority {
-            self.auth_method = "x509".to_string();
-            self.auth_authority = authority;
-        }
+        self.update_identity(|id| {
+            id.hostname = hostname;
+            if let Some(authority) = tls_authority {
+                id.auth_method = "x509".to_string();
+                id.auth_authority = authority;
+            }
+        });
         self.peer = peer.to_string();
     }
 
@@ -1287,12 +1640,13 @@ impl ClientState {
 
     fn audit(&self, event: &str, pv: impl AsRef<[u8]>, value: &str, result: &str) {
         if let Some(ref logger) = self.audit {
+            let id = self.identity();
             logger.log(crate::audit::AuditEvent {
                 event,
                 peer: &self.peer,
                 // The audit log is Rust-only JSON, which needs text.
-                user: &String::from_utf8_lossy(&self.username),
-                host: &String::from_utf8_lossy(self.hostname.as_bytes()),
+                user: &String::from_utf8_lossy(&id.username),
+                host: &String::from_utf8_lossy(id.hostname.as_bytes()),
                 pv: &String::from_utf8_lossy(pv.as_ref()),
                 value,
                 result,
@@ -1313,157 +1667,29 @@ impl ClientState {
         }
     }
 
-    /// Return the type-state-wrapped access token for a
-    /// SID. Op handlers MUST consult this — direct reads of the
-    /// underlying `channel_access` HashMap bypass the typed gate
-    /// and recreate the missed-path defects fixed in rounds 38-39.
-    /// Missing SIDs map to a "denied" token so a corrupted
-    /// channel-table state can never silently grant access.
-    fn lookup_access(&self, sid: u32) -> crate::server::access_token::CaAccessChecked {
+    /// The type-state-wrapped access token for a SID, which every op
+    /// handler checks through: [`ChannelRights::access`] for its channel
+    /// (`camessage.c:2608-2617`). A SID with no channel is denied.
+    async fn current_access(&self, sid: u32) -> crate::server::access_token::CaAccessChecked {
         use crate::server::access_token::CaAccessChecked;
-        match self.channel_access.get(&sid).copied() {
-            Some(level) => {
-                // the trap mask is kept in a parallel map
-                // populated alongside `channel_access`. A missing
-                // entry means the rule carried no trap option.
-                let rule_was_trap = self.channel_trap.get(&sid).copied().unwrap_or(false);
-                CaAccessChecked::from_level(level, rule_was_trap)
-            }
-            None => CaAccessChecked::denied(),
-        }
+        let Some(entry) = self.channels.get(&sid) else {
+            return CaAccessChecked::denied();
+        };
+        entry.rights.access()
     }
 
-    /// Evaluate `cfg`'s rules for `asg_name`.
-    ///
-    /// The rule walk and the CALC results both belong to `epics-base-rs`:
-    /// `AccessSecurityConfig::compute_rules` reads the results its `INP*`
-    /// watcher published, as C's `asComputePvt` reads `pasgrule->result`.
-    /// This server used to carry its own evaluator, and then its own link
-    /// reads; both drifted from C.
-    fn access_for_asg(
-        &self,
-        cfg: &AccessSecurityConfig,
-        asg_name: &str,
-        asl: u8,
-    ) -> (AccessLevel, bool) {
-        cfg.compute_for_name(
-            asg_name,
-            self.hostname.as_bytes(),
-            &self.username,
-            &[],
-            asl,
-            &self.auth_method,
-            &self.auth_authority,
-        )
+    /// C `asChangeClient`, run by the client thread alone: the `&mut`
+    /// receiver is what keeps the circuit's client loop the identity's
+    /// single writer while its monitors read it.
+    fn update_identity<R>(&mut self, change: impl FnOnce(&mut ClientIdentity) -> R) -> R {
+        let mut identity = ClientIdentity::clone(&self.rights.identity.load());
+        let out = change(&mut identity);
+        self.rights.identity.store(Arc::new(identity));
+        out
     }
 
-    /// Compute access rights bits for a channel target, together with
-    /// the write-trap mask of the ACF rule that resolved the level
-    ///. The trap flag is `false` for `SimplePv`/`RecordField`
-    /// targets whose access was not resolved through a `TRAPWRITE`
-    /// rule — including the no-ACF permissive fallback.
-    async fn compute_access(&self, target: &ChannelTarget) -> (u32, bool) {
-        match target {
-            ChannelTarget::SimplePv(pv) => {
-                // a gateway shadow PV carries an access
-                // hook routing the decision through the gateway's own
-                // ACF (`.pvlist` ASG + `AccessConfig::can_read/write`)
-                // for this downstream `(user, host)`. When present it
-                // is authoritative for this PV — the server's own ACF
-                // never saw the `.pvlist` ASG, so consulting `self.acf`
-                // with a hardcoded "DEFAULT" would mis-report read
-                // access. The gateway audits/traps writes in its own
-                // write hook, so no TRAPWRITE rule resolves here.
-                if let Some(hook) = pv.access_hook() {
-                    let decision = hook(&self.username, self.hostname.as_bytes());
-                    let bits = match (decision.read, decision.write) {
-                        (_, true) => 3,
-                        (true, false) => 1,
-                        (false, false) => 0,
-                    };
-                    return (bits, false);
-                }
-                let policy = self.acf.load_full();
-                if let Some(ref acf_cfg) = policy {
-                    // Simple PVs have no per-record ASL field; treat
-                    // them as ASL=0 so the most-restrictive rule
-                    // applies. Matches the C IOC's behaviour for
-                    // names that never went through `dbAddMember`.
-                    // PR #641: pass auth method/authority so
-                    // METHOD("x509") / AUTHORITY(<issuer>) rules
-                    // can gate mTLS-authenticated peers. CALC
-                    // rules are evaluated against resolved INP* links.
-                    let (level, rule_was_trap) = self.access_for_asg(acf_cfg, "DEFAULT", 0);
-                    let bits = match level {
-                        AccessLevel::ReadWrite => 3,
-                        AccessLevel::Read => 1,
-                        AccessLevel::NoAccess => 0,
-                    };
-                    (bits, rule_was_trap)
-                } else {
-                    // No ACF attached: permissive ReadWrite, no rule
-                    // resolved access, so no TRAPWRITE applies.
-                    (3, false)
-                }
-            }
-            ChannelTarget::RecordField { record, field: f } => {
-                // extract is_ro/asg/asl and DROP the record
-                // read-guard before resolving ACF INP* links, so a CALC
-                // input pointing back at this record can't re-acquire the
-                // same lock.
-                let (is_ro, asg, asl) = {
-                    let instance = record.read();
-                    // C `rsrvCheckPut` (rsrv/camessage.c:2540-2551):
-                    //
-                    //     /* SPC_NOMOD fields are always unwritable */
-                    //     if (dbChannelSpecial(pciu->dbch) == SPC_NOMOD) return 0;
-                    //
-                    // and its `0` clears the ACCESS_RIGHTS write bit at
-                    // camessage.c:1123-1125. The declaration has one owner
-                    // (`RecordInstance::is_no_mod`), shared with the `dbPut`
-                    // gate — reading `field_list().read_only` alone here saw
-                    // neither the dbCommon NOMOD set (NAME/STAT/SEVR/ACKS/…,
-                    // which no record's field_list declares) nor the
-                    // state-raised NOMOD of `Record::field_no_mod` (compress
-                    // VAL under BALG=LIFO), so the server advertised WRITE on
-                    // fields it would then refuse.
-                    let is_ro = instance.is_no_mod(f);
-                    (
-                        is_ro,
-                        instance.common.access_group().to_string(),
-                        instance.common.asl,
-                    )
-                };
-                // Read-only field-ness must AND
-                // with ACF, never replace it. Pre-fix the read-only
-                // branch returned `Read`(1) unconditionally — a
-                // peer whose ACF resolved to `NoAccess` could still
-                // READ / EVENT_ADD on every read-only field because
-                // the cached access_rights skipped the ACF check
-                // entirely. Now ACF runs first; the read-only flag
-                // only strips the WRITE bit from the result.
-                let policy = self.acf.load_full();
-                let (acf_level, rule_was_trap) = if let Some(ref acf_cfg) = policy {
-                    // Thread the per-record ASL so
-                    // `RULE(N, …)` gates correctly. PR #641: method/
-                    // authority for mTLS rules. CALC rules are
-                    // evaluated against resolved INP* links.
-                    self.access_for_asg(acf_cfg, &asg, asl)
-                } else {
-                    (AccessLevel::ReadWrite, false)
-                };
-                let bits = match (acf_level, is_ro) {
-                    (AccessLevel::NoAccess, _) => 0,
-                    (AccessLevel::Read, _) => 1,
-                    (AccessLevel::ReadWrite, true) => 1,
-                    (AccessLevel::ReadWrite, false) => 3,
-                };
-                // The trap mask reflects the rule that granted access;
-                // a read-only field stripping the WRITE bit does not
-                // change which rule matched.
-                (bits, rule_was_trap)
-            }
-        }
+    fn identity(&self) -> Arc<ClientIdentity> {
+        self.rights.identity.load_full()
     }
 }
 
@@ -1717,9 +1943,10 @@ pub async fn run_tcp_listener(
     // One accept-loop task per bound interface. When the parent
     // `run_tcp_listener` future is dropped (CaServer shutdown via
     // `tcp_abort.abort()`), this JoinSet is dropped which aborts all
-    // accept loops as a unit. First task to error wins; the rest
-    // are aborted via JoinSet::Drop.
-    let mut accept_tasks: tokio::task::JoinSet<CaResult<()>> = tokio::task::JoinSet::new();
+    // accept loops as a unit. No task returns, so the first to end has
+    // panicked; the rest are aborted via JoinSet::Drop.
+    let mut accept_tasks: tokio::task::JoinSet<std::convert::Infallible> =
+        tokio::task::JoinSet::new();
 
     // ASG-field-change forwarder. C
     // `database/src/ioc/as/asDbLib.c:107-110,144` `asSpcAsCallback`
@@ -1760,10 +1987,11 @@ pub async fn run_tcp_listener(
                         );
                         let _ = acf_reload_tx_t.send(());
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        std::future::pending().await
+                    }
                 }
             }
-            Ok(())
         });
     }
 
@@ -1779,50 +2007,39 @@ pub async fn run_tcp_listener(
         let tls_t = tls.clone();
         #[cfg(feature = "cap-tokens")]
         let cap_token_verifier_t = cap_token_verifier.clone();
-        accept_tasks.spawn(async move {
-            accept_loop(
-                listener,
-                intf,
-                actual_port,
-                db_t,
-                acf_t,
-                acf_reload_tx_t,
-                conn_events_t,
-                audit_t,
-                drain_t,
-                stats_t,
-                #[cfg(feature = "experimental-rust-tls")]
-                tls_t,
-                #[cfg(feature = "cap-tokens")]
-                cap_token_verifier_t,
-            )
-            .await
-        });
+        accept_tasks.spawn(accept_loop(
+            listener,
+            intf,
+            actual_port,
+            db_t,
+            acf_t,
+            acf_reload_tx_t,
+            conn_events_t,
+            audit_t,
+            drain_t,
+            stats_t,
+            #[cfg(feature = "experimental-rust-tls")]
+            tls_t,
+            #[cfg(feature = "cap-tokens")]
+            cap_token_verifier_t,
+        ));
     }
 
-    // Wait for the first error (or for all loops to exit cleanly via
-    // drain). On error, JoinSet::Drop aborts the surviving loops.
-    while let Some(res) = accept_tasks.join_next().await {
-        match res {
-            Ok(Ok(())) => continue,
-            Ok(Err(e)) => return Err(e),
-            Err(join_err) if join_err.is_cancelled() => continue,
-            Err(join_err) => {
-                return Err(epics_base_rs::error::CaError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    join_err.to_string(),
-                )));
-            }
-        }
+    match accept_tasks.join_next().await {
+        Some(Err(join_err)) => Err(epics_base_rs::error::CaError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            join_err.to_string(),
+        ))),
+        None => unreachable!("the ASG forwarder never ends"),
     }
-    Ok(())
 }
 
 /// Per-interface accept loop. Owned by `run_tcp_listener` via a
-/// `JoinSet` — one task per `EPICS_CAS_INTF_ADDR_LIST` entry. Drains
-/// when the shared `drain` flag is set; otherwise spawns a
+/// `JoinSet` — one task per `EPICS_CAS_INTF_ADDR_LIST` entry. Spawns a
 /// `handle_client` task into the local `conn_tasks` `JoinSet` per
-/// accepted connection.
+/// accepted connection, or closes the connection while the shared `drain`
+/// flag is set. It never returns: `conn_tasks` belongs to this future, so
+/// an exit would abort every connected client, which drain must keep.
 ///
 /// `intf` is the bound interface IP; recorded on accept-error logs so
 /// multi-NIC hosts can tell which listener saw the failure. The
@@ -1845,7 +2062,7 @@ async fn accept_loop(
         Arc<std::sync::RwLock<Arc<tokio_rustls::rustls::ServerConfig>>>,
     >,
     #[cfg(feature = "cap-tokens")] cap_token_verifier: Option<Arc<crate::cap_token::TokenVerifier>>,
-) -> CaResult<()> {
+) -> std::convert::Infallible {
     // track per-connection tasks in a JoinSet so they're
     // aborted as a unit when this accept-loop future is dropped (e.g.
     // CaServer shutdown via tcp_abort.abort()). Without this, every
@@ -1865,14 +2082,6 @@ async fn accept_loop(
     let mut backoff = AcceptBackoff::new();
 
     loop {
-        // Drain mode: stop accepting new connections. Existing
-        // connections continue to be served by their own tasks; the
-        // CaServer::run() loop coordinates the grace period and the
-        // ultimate exit.
-        if drain.load(std::sync::atomic::Ordering::Acquire) {
-            tracing::info!(intf = %intf, "TCP listener: drain mode set, exiting accept loop");
-            return Ok(());
-        }
         let (stream, peer) = tokio::select! {
             biased;
             // Was `res?`. A single transient failure — `ECONNABORTED` from a
@@ -1954,8 +2163,8 @@ async fn accept_loop(
             // `dispatch_message` as "the actual stall guard". It is not one:
             // `dispatch_message` takes `&Outbox` and cannot touch the socket,
             // so no socket stall can make it late. Every server write now
-            // happens in `drain_and_flush` at the bottom of the read loop,
-            // which is not wrapped. **The hosted driver therefore has no stall
+            // happens in `run_circuit_writer`, which is not wrapped. **The
+            // hosted driver therefore has no stall
             // guard**, which happens to match the blocking driver and C — both
             // block in the write for as long as the peer takes. Whether to
             // keep that or restore a bound is an open decision, not an
@@ -2140,34 +2349,172 @@ pub(crate) fn is_peer_disconnect(kind: std::io::ErrorKind) -> bool {
     )
 }
 
-/// Drain every frame currently queued in the connection outbox into the
-/// socket buffer (in arrival order) and flush once. This is the single-owner
-/// drain that replaces every former out-of-band `writer.lock().await` write.
-/// Returns the number of wire bytes written, for `ServerStats::bytes_out`.
+/// The circuit's socket writer: the single drain owner that replaces every
+/// former out-of-band `writer.lock().await` write. It writes each frame into
+/// `sock` as it is queued and flushes where a flush is asked for, so a frame
+/// an out-of-loop producer flushed does not wait for the connection loop's
+/// read batch (see `super::outbox`).
 ///
-/// It is *not* the only place server bytes reach the socket, and the comment
-/// that used to say so was wrong: `handle_client` writes the unsolicited
-/// `CA_PROTO_VERSION` greeting directly before the loop starts, and the
-/// out-of-band monitor arm writes its first frame directly before draining the
-/// rest. What is genuinely single-owner is the *policy* those three share —
-/// `sock`'s innermost writer is a [`crate::server::send::RetryTransientAsync`],
-/// so all three inherit C's transient-failure handling without a branch.
+/// It is *not* the only place server bytes reach the socket: `handle_client`
+/// writes the unsolicited `CA_PROTO_VERSION` greeting directly before starting
+/// it. What is genuinely single-owner is the *policy* the two share — `sock`'s
+/// innermost writer is a [`crate::server::send::RetryTransientAsync`], so both
+/// inherit C's transient-failure handling without a branch.
 ///
-/// Batching is preserved: a whole dispatch burst (or a run of monitor
-/// frames) is written back-to-back before the single `flush`, so N framed
-/// replies still collapse to one TCP write.
+/// Batching is preserved: frames queued between two flushes are written
+/// back-to-back into the `BufWriter`, so N framed replies still collapse to
+/// one TCP write.
+///
+/// `stop` is looked at only between frames, and what was written is flushed
+/// before returning, so a stopped writer leaves the wire on a frame boundary.
 #[cfg(tokio_backend)]
-async fn drain_and_flush<W: AsyncWrite + Unpin>(
-    sock: &mut BufWriter<W>,
-    drain: &mut OutboxDrain,
-) -> std::io::Result<u64> {
-    let mut total = 0u64;
-    while let Some(frame) = drain.try_next() {
-        sock.write_all(&frame).await?;
-        total += frame.len() as u64;
+async fn run_circuit_writer<W: AsyncWrite + Unpin>(
+    mut sock: BufWriter<W>,
+    mut drain: OutboxDrain,
+    mut stop: tokio::sync::oneshot::Receiver<()>,
+) -> std::io::Result<()> {
+    // Frames written since the last flush. Their credit is released only once
+    // they are flushed, so the buffer's capacity is not backlog.
+    let mut held = Vec::new();
+    loop {
+        let next = tokio::select! {
+            biased;
+            _ = &mut stop => break,
+            next = drain.recv() => next,
+        };
+        let Some(next) = next else { break };
+        match next {
+            Drained::Frame(frame) => {
+                sock.write_all(&frame).await?;
+                held.push(frame);
+            }
+            flush @ (Drained::Flush | Drained::FlushAck(_)) => {
+                sock.flush().await?;
+                held.clear();
+                if let Drained::FlushAck(ack) = flush {
+                    let _ = ack.send(());
+                }
+            }
+        }
     }
     sock.flush().await?;
-    Ok(total)
+    Ok(())
+}
+
+/// The circuit's socket write half, reporting to the circuit's
+/// [`CircuitActivity`] what each write puts on the wire, so a write cut off
+/// by an abort or an error still counts the part that went out.
+#[cfg(tokio_backend)]
+struct CountedWrites<W> {
+    inner: W,
+    activity: Arc<CircuitActivity>,
+}
+
+#[cfg(tokio_backend)]
+impl<W: AsyncWrite + Unpin> AsyncWrite for CountedWrites<W> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let me = self.get_mut();
+        let written = std::pin::Pin::new(&mut me.inner).poll_write(cx, buf);
+        if let std::task::Poll::Ready(Ok(n)) = written {
+            me.activity.sent(n);
+        }
+        written
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+/// `handle_client`'s handle on its [`run_circuit_writer`].
+#[cfg(tokio_backend)]
+enum CircuitWriter {
+    Running {
+        task: WriterTask,
+        stop: tokio::sync::oneshot::Sender<()>,
+    },
+    /// The error the writer stopped on, which every later caller sees too.
+    Failed(std::io::Error),
+}
+
+/// Dropping it stops the writer, so an aborted circuit leaves no task holding
+/// its socket.
+#[cfg(tokio_backend)]
+struct WriterTask(epics_base_rs::runtime::task::TaskHandle<std::io::Result<()>>);
+
+#[cfg(tokio_backend)]
+impl Drop for WriterTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+#[cfg(tokio_backend)]
+impl CircuitWriter {
+    /// Wait until every frame queued in `outbox` before this call is on the
+    /// wire.
+    async fn flushed(&mut self, outbox: &Outbox) -> std::io::Result<()> {
+        match outbox.flushed().await {
+            Ok(()) => Ok(()),
+            Err(_) => Err(self.failed().await),
+        }
+    }
+
+    /// The error the writer stopped on; pending while it runs.
+    async fn failed(&mut self) -> std::io::Error {
+        let error = match self {
+            CircuitWriter::Failed(error) => return copy_error(error),
+            CircuitWriter::Running { task, .. } => match (&mut task.0).await {
+                Ok(Err(e)) => e,
+                // Every `Outbox` handle is gone, which the loop's own handle
+                // rules out.
+                Ok(Ok(())) => std::io::Error::other("the circuit writer ended on an open circuit"),
+                Err(join) => std::io::Error::other(join),
+            },
+        };
+        let seen = copy_error(&error);
+        *self = CircuitWriter::Failed(error);
+        seen
+    }
+
+    /// Stop the writer at its next frame boundary and wait until it has let
+    /// go of the socket. A peer that stopped reading gets the send timeout to
+    /// take the frame on the wire, then the writer is cut off mid-frame.
+    async fn stop(self) {
+        if let CircuitWriter::Running { mut task, stop } = self {
+            let _ = stop.send(());
+            if tokio::time::timeout(send_timeout(), &mut task.0)
+                .await
+                .is_err()
+            {
+                task.0.abort();
+                let _ = (&mut task.0).await;
+            }
+        }
+    }
+}
+
+/// `error` again, for a caller after the first: `io::Error` is not `Clone`.
+#[cfg(tokio_backend)]
+fn copy_error(error: &std::io::Error) -> std::io::Error {
+    match error.raw_os_error() {
+        Some(code) => std::io::Error::from_raw_os_error(code),
+        None => std::io::Error::new(error.kind(), error.to_string()),
+    }
 }
 
 /// A postponed request, held by the connection loop until what it waits
@@ -2214,9 +2561,8 @@ async fn handle_client<S>(
     tls_authority: Option<String>,
     audit: Option<crate::audit::AuditLogger>,
     conn_events: Option<broadcast::Sender<ServerConnectionEvent>>,
-    // PR #592 dbServerStats: bytes_in/bytes_out counters. Incremented
-    // post-read (per accepted UDP/TCP buffer) and at each BufWriter
-    // flush (by inspecting `BufWriter::buffer().len()` before flush).
+    // PR #592 dbServerStats: bytes_in/bytes_out counters, counted by the
+    // circuit's `CircuitActivity` on every read and write.
     // `None` skips all counter bookkeeping — used by the unit-test
     // dispatch fixtures that don't spin up a full CaServer.
     stats: Option<Arc<super::stats::ServerStats>>,
@@ -2248,13 +2594,13 @@ where
         None,
     );
     let (reader, write_half) = tokio::io::split(stream);
-    // The connection loop is the SOLE owner of the socket writer — no
+    // The circuit writer is the SOLE owner of the socket writer — no
     // `Arc<Mutex<..>>`, so no other task can write the socket. Bigger
     // BufWriter so a 100-PV batched response burst (~3 KB) fits without
     // auto-flushing mid-batch. The dispatch hot-path no longer writes the
-    // socket at all: handlers push framed bytes into `outbox`, and this
-    // loop drains that outbox into `sock` and flushes once per outer read
-    // iteration — turning N small TCP writes into one. Default 8 KB was hit
+    // socket at all: handlers push framed bytes into `outbox`, the writer
+    // copies them into `sock`, and this loop has it flush once per outer
+    // read iteration — turning N small TCP writes into one. Default 8 KB was hit
     // at ~330 responses; 64 KB covers the common bulk_caget(100) case with
     // headroom for follow-on monitor events queued in the same tick.
     // The write half is wrapped before it is buffered, so `BufWriter`'s spill,
@@ -2262,17 +2608,20 @@ where
     // `ENOBUFS` burst parks this circuit for 15 s and retries, where the bare
     // `write_all` used to return `Err` and `?` used to disconnect the client.
     // See `crate::server::send`.
+    let activity = Arc::new(CircuitActivity::new(stats.clone()));
     let mut sock = BufWriter::with_capacity(
         64 * 1024,
-        crate::server::send::RetryTransientAsync::new(write_half),
+        crate::server::send::RetryTransientAsync::new(CountedWrites {
+            inner: write_half,
+            activity: activity.clone(),
+        }),
     );
     // The single per-connection outbox. `outbox` is the cloneable producer
     // handle every emit site holds (dispatch handlers in this task, plus
-    // the spawned monitor / put-notify tasks); `outbox_drain` is owned only
-    // here. See `super::outbox` for the invariant this establishes.
-    let (outbox, mut outbox_drain) = crate::server::outbox::channel();
-    let mut state = ClientState::new(acf, tcp_port, db.clone());
-    state.stats = stats.clone();
+    // the spawned monitor / put-notify tasks); `outbox_drain` goes to the
+    // circuit writer. See `super::outbox` for the invariant this establishes.
+    let (outbox, outbox_drain) = crate::server::outbox::channel();
+    let mut state = ClientState::new(acf, tcp_port, db.clone(), stats.clone());
     #[cfg(feature = "cap-tokens")]
     {
         state.cap_token_verifier = cap_token_verifier;
@@ -2306,6 +2655,11 @@ where
         sock.write_all(&hdr.to_bytes()).await?;
         sock.flush().await?;
     }
+    let (stop_writer, writer_stop) = tokio::sync::oneshot::channel();
+    let mut writer = CircuitWriter::Running {
+        task: WriterTask(conn_reactor.spawn(run_circuit_writer(sock, outbox_drain, writer_stop))),
+        stop: stop_writer,
+    };
 
     let mut reader = reader;
 
@@ -2369,7 +2723,7 @@ where
                             // the outbox; drain them to the socket now so the
                             // re-evaluation reaches the client promptly (RSRV
                             // flushes these immediately).
-                            if let Err(e) = drain_and_flush(&mut sock, &mut outbox_drain).await {
+                            if let Err(e) = writer.flushed(&outbox).await {
                                 if is_peer_disconnect(e.kind()) {
                                     break 'client_loop Ok(());
                                 }
@@ -2405,7 +2759,7 @@ where
                             .await
                                 > 0
                             {
-                                if let Err(e) = drain_and_flush(&mut sock, &mut outbox_drain).await {
+                                if let Err(e) = writer.flushed(&outbox).await {
                                     if is_peer_disconnect(e.kind()) {
                                         break 'client_loop Ok(());
                                     }
@@ -2425,16 +2779,12 @@ where
                 // client that keeps sending cannot hold its own replies back.
                 settled = state.parked_reads.next_settled() => {
                     if let Err(e) = answer_parked_reads(&mut state, &outbox, settled) {
-                        let _ = drain_and_flush(&mut sock, &mut outbox_drain).await;
+                        let _ = writer.flushed(&outbox).await;
                         print_forcing_disconnect(peer);
                         break 'client_loop Err(e);
                     }
-                    match drain_and_flush(&mut sock, &mut outbox_drain).await {
-                        Ok(out) => {
-                            if let Some(ref s) = stats {
-                                s.bytes_out.fetch_add(out, std::sync::atomic::Ordering::Relaxed);
-                            }
-                        }
+                    match writer.flushed(&outbox).await {
+                        Ok(()) => {}
                         Err(e) if is_peer_disconnect(e.kind()) => break 'client_loop Ok(()),
                         Err(e) => break 'client_loop Err(e.into()),
                     }
@@ -2456,15 +2806,13 @@ where
                     .await;
                     None
                 }
-                read = read_with_optional_timeout(&mut reader, &mut buf[..room], inactivity), if room > 0 => {
+                read = read_with_optional_timeout(&mut reader, &mut buf[..room], inactivity, &activity), if room > 0 => {
                     match read {
                         Ok(Ok(n)) => Some(n),
                         Ok(Err(e)) if is_peer_disconnect(e.kind()) => break 'client_loop Ok(()),
                         Ok(Err(e)) => break 'client_loop Err(e.into()),
                         Err(idle) => {
                             // Inactivity timeout — close the connection.
-                            // Disabled by default (matches C rsrv); fires only
-                            // when EPICS_CAS_INACTIVITY_TMO is set explicitly.
                             tracing::warn!(
                                 target: "epics_ca_rs::server",
                                 peer = %state.peer,
@@ -2475,55 +2823,19 @@ where
                         }
                     }
                 }
-                // Out-of-band frame produced by a spawned monitor / put-notify
-                // task while this loop was idle on the socket read. This arm is
-                // last (biased) so socket reads keep priority; under a steady
-                // read stream these frames still flush via the per-burst drain
-                // at the bottom of the loop, so they are never starved.
-                frame = outbox_drain.recv() => {
-                    match frame {
-                        Some(frame) => {
-                            let first = frame.len() as u64;
-                            if let Err(e) = sock.write_all(&frame).await {
-                                if is_peer_disconnect(e.kind()) {
-                                    break 'client_loop Ok(());
-                                }
-                                break 'client_loop Err(e.into());
-                            }
-                            match drain_and_flush(&mut sock, &mut outbox_drain).await {
-                                Ok(rest) => {
-                                    if let Some(ref s) = stats {
-                                        s.bytes_out.fetch_add(
-                                            first + rest,
-                                            std::sync::atomic::Ordering::Relaxed,
-                                        );
-                                    }
-                                }
-                                Err(e) if is_peer_disconnect(e.kind()) => {
-                                    break 'client_loop Ok(());
-                                }
-                                Err(e) => break 'client_loop Err(e.into()),
-                            }
-                            continue;
-                        }
-                        // Unreachable while this loop still holds `outbox`; a
-                        // `None` would mean every producer handle was dropped.
-                        None => break 'client_loop Ok(()),
+                // The writer stopped on a socket error while this loop was idle
+                // on the read, writing what a spawned monitor / put-notify task
+                // flushed.
+                e = writer.failed() => {
+                    if is_peer_disconnect(e.kind()) {
+                        break 'client_loop Ok(());
                     }
+                    break 'client_loop Err(e.into());
                 }
             };
             if let Some(n) = read {
                 if n == 0 {
                     break 'client_loop Ok(());
-                }
-
-                // PR #592 dbServerStats: bytes_in mirrors RSRV's
-                // `caServerBytes_in`. Counted on every successful read of `n`
-                // wire bytes, regardless of whether the inner dispatch
-                // accepts or rejects the message.
-                if let Some(ref s) = stats {
-                    s.bytes_in
-                        .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
                 }
 
                 // Chaos: optional stall + simulated read drop. Compiles to a
@@ -2572,7 +2884,7 @@ where
                             // subscription it holds; only this message is lost.
                             parsed_any = true;
                             report_gate_error(&outbox, &state, peer, &err);
-                            let _ = drain_and_flush(&mut sock, &mut outbox_drain).await;
+                            let _ = writer.flushed(&outbox).await;
                             continue;
                         }
                         Gate::TearDown { error, reason } => {
@@ -2580,7 +2892,7 @@ where
                             if let Some(err) = error {
                                 report_gate_error(&outbox, &state, peer, &err);
                             }
-                            let _ = drain_and_flush(&mut sock, &mut outbox_drain).await;
+                            let _ = writer.flushed(&outbox).await;
                             print_forcing_disconnect(peer);
                             break 'client_loop Err(reason);
                         }
@@ -2636,7 +2948,7 @@ where
                         // Regression defence: dispatch_message no longer
                         // flushes per response (batched at the bottom of
                         // this outer loop). On a propagated dispatch
-                        // error, exit-via-`?` would drop the BufWriter
+                        // error, exit-via-`?` would stop the writer
                         // before the outer flush fires, so any responses
                         // queued by earlier successful handlers in this
                         // batch — or by an error-path `send_cmd_error`
@@ -2645,7 +2957,7 @@ where
                         // the client sees them; ignore errors here
                         // because the underlying TCP is most likely
                         // already broken (which is why dispatch failed).
-                        let _ = drain_and_flush(&mut sock, &mut outbox_drain).await;
+                        let _ = writer.flushed(&outbox).await;
                         print_forcing_disconnect(peer);
                         break 'client_loop Err(e);
                     }
@@ -2661,32 +2973,27 @@ where
                 // (server-side throughput floor was ~2.2µs/PV due to
                 // per-message flush; this collapses it to one syscall).
                 //
-                // The drain also picks up any monitor / put-notify frames
-                // pushed by spawned tasks during this dispatch burst, so those
-                // ride out on the same syscall.
+                // The flush also covers any monitor / put-notify frames
+                // pushed by spawned tasks during this dispatch burst and not
+                // yet flushed by them, so those ride out on the same syscall.
                 //
                 // Errors here mean the TCP write stalled / peer closed —
                 // surface as the read loop's normal disconnect path.
                 //
                 // PR #592 dbServerStats: bytes_out mirrors RSRV's
-                // `caServerBytes_out`. `drain_and_flush` returns the exact
-                // wire-byte count that left on this syscall. CA-over-TLS counts
-                // post-decrypt plaintext since the rustls layer wraps the
-                // BufWriter externally — matches what the comment on
-                // ServerStats::bytes_out already documents.
-                match drain_and_flush(&mut sock, &mut outbox_drain).await {
-                    Ok(pending_out) => {
-                        if let Some(ref s) = stats {
-                            s.bytes_out
-                                .fetch_add(pending_out, std::sync::atomic::Ordering::Relaxed);
-                        }
-                    }
+                // `caServerBytes_out`; `CountedWrites` counts it per write.
+                // CA-over-TLS counts post-decrypt plaintext since the rustls
+                // layer wraps the BufWriter externally — matches what the
+                // comment on ServerStats::bytes_out already documents.
+                match writer.flushed(&outbox).await {
+                    Ok(()) => {}
                     Err(e) if is_peer_disconnect(e.kind()) => break 'client_loop Ok(()),
                     Err(e) => break 'client_loop Err(e.into()),
                 }
             }
         }
     };
+    writer.stop().await;
 
     // Cleanup: cancel all subscriptions. PR #592 dbServerStats —
     // emit `SubscriptionClosed` for each so the running close-count
@@ -2779,8 +3086,7 @@ fn destroy_channel(
     conn_events: Option<&broadcast::Sender<ServerConnectionEvent>>,
 ) -> Option<ChannelEntry> {
     let entry = state.channels.remove(&sid)?;
-    state.channel_access.remove(&sid);
-    state.channel_trap.remove(&sid);
+    state.advertised_access.remove(&sid);
     if let Some(tx) = conn_events {
         let _ = tx.send(ServerConnectionEvent::ChannelCleared {
             peer,
@@ -3072,7 +3378,7 @@ pub(crate) async fn dispatch_message(
             // exists anywhere in epics-base), so a `HOST(node)` HAG that
             // granted WRITE under C granted nothing here.
             let claimed = payload[..end].to_vec();
-            if state.hostname.claim(claimed.clone()) {
+            if state.update_identity(|id| id.hostname.claim(claimed.clone())) {
                 // Re-evaluate access rights for all existing channels.
                 reeval_access_rights(state, writer).await?;
             } else {
@@ -3080,7 +3386,7 @@ pub(crate) async fn dispatch_message(
                 tracing::debug!(
                     peer = %peer,
                     claimed_host = %claimed,
-                    identity = %String::from_utf8_lossy(state.hostname.as_bytes()),
+                    identity = %String::from_utf8_lossy(state.identity().hostname.as_bytes()),
                     "HOST_NAME ignored: identity is pinned (asCheckClientIP or mTLS)"
                 );
                 state.audit("host_name", "", &claimed, "ignored_pinned");
@@ -3144,7 +3450,7 @@ pub(crate) async fn dispatch_message(
                 // The previous double-strip yielded MissingPrefix on
                 // every well-formed token; cap-tokens was non-
                 // functional whenever a verifier was configured.
-                state.username = match (&state.cap_token_verifier, raw.starts_with(b"cap:")) {
+                let username = match (&state.cap_token_verifier, raw.starts_with(b"cap:")) {
                     // A token is base64 after the prefix, so non-UTF-8 bytes
                     // fail verification like any other malformed token.
                     (Some(v), true) => match std::str::from_utf8(&raw)
@@ -3164,8 +3470,10 @@ pub(crate) async fn dispatch_message(
                             // empty (or `"x509"` if mTLS is also active),
                             // so cap-token METHOD/AUTHORITY clauses
                             // could not match a verified token.
-                            state.auth_method = "cap-token".to_string();
-                            state.auth_authority = claims.iss.clone();
+                            state.update_identity(|id| {
+                                id.auth_method = "cap-token".to_string();
+                                id.auth_authority = claims.iss.clone();
+                            });
                             claims.sub.into_bytes()
                         }
                         Err(e) => {
@@ -3184,10 +3492,11 @@ pub(crate) async fn dispatch_message(
                     },
                     _ => raw,
                 };
+                state.update_identity(|id| id.username = username);
             }
             #[cfg(not(feature = "cap-tokens"))]
             {
-                state.username = raw;
+                state.update_identity(|id| id.username = raw);
             }
             // Re-evaluate access rights for all existing channels
             reeval_access_rights(state, writer).await?;
@@ -3348,18 +3657,17 @@ pub(crate) async fn dispatch_message(
                 }
             }
 
-            let (access, rule_was_trap) = state.compute_access(&target).await;
-            let access_level = match access {
-                3 => AccessLevel::ReadWrite,
-                1 => AccessLevel::Read,
-                _ => AccessLevel::NoAccess,
-            };
+            let rights = Arc::new(ChannelRights::new(state.rights.clone(), target.clone()));
+            let access_level = rights.access().level();
+            let access = ChannelRights::wire_bits(access_level);
 
             let shared_name: Arc<[u8]> = pv_name.into();
             state.channels.insert(
                 sid,
                 ChannelEntry {
+                    _counted: TableCount::channel(&state.stats),
                     target,
+                    rights,
                     cid: client_cid,
                     pv_name: shared_name.clone(),
                     filter_suffix: filter_suffix.clone(),
@@ -3373,11 +3681,7 @@ pub(crate) async fn dispatch_message(
                     subscriptions: Vec::new(),
                 },
             );
-            state.channel_access.insert(sid, access_level);
-            // keep the trap-mask map in lockstep with
-            // `channel_access` so `lookup_access` always finds a
-            // consistent pair for this SID.
-            state.channel_trap.insert(sid, rule_was_trap);
+            state.advertised_access.insert(sid, access_level);
 
             let mut ar = CaHeader::new(CA_PROTO_ACCESS_RIGHTS);
             ar.cid = client_cid;
@@ -3569,12 +3873,12 @@ pub(crate) async fn dispatch_message(
             }
 
             // Type-state:
-            // `state.lookup_access(sid)` is the only path to the
-            // access cache. `require_read()` returns a witness on
+            // `state.current_access(sid)` is the only path to the
+            // current rights. `require_read()` returns a witness on
             // success and an `AccessDenied` carrying the matching
             // ECA code on failure — no `if access ==` ad-hoc
             // comparison, no missing-entry default to argue about.
-            let _read_grant = match state.lookup_access(sid).require_read() {
+            let _read_grant = match state.current_access(sid).await.require_read() {
                 Ok(g) => g,
                 Err(denied) => {
                     if is_notify {
@@ -3732,11 +4036,9 @@ pub(crate) async fn dispatch_message(
                     // knows its monitors, so CLEAR_CHANNEL can cancel them.
                     state.link_subscription(
                         s.channel_sid,
-                        ChannelMonitor {
-                            sub_id: s.sub_id,
-                            monitor: s.monitor.clone(),
-                            id: s.reader.id(),
-                        },
+                        s.sub_id,
+                        s.monitor.clone(),
+                        s.reader.id(),
                     );
                     state.subscriptions.insert(
                         s.reader.id(),
@@ -4419,7 +4721,7 @@ pub(crate) async fn serve_write_head(
         // `require_write` returns the matching ECA code on
         // denial.
         let entry_cid = entry.cid;
-        let write_grant = match state.lookup_access(sid).require_write() {
+        let write_grant = match state.current_access(sid).await.require_write() {
             Ok(g) => g,
             Err(denied) => {
                 if is_notify {
@@ -4553,8 +4855,8 @@ pub(crate) async fn serve_write_head(
     // deprecated WRITE carrying a bad type to a channel the peer cannot
     // write is now a silent drop, not ECA_NOWTACCESS + keep.
     //
-    // A type-state WRITE gate: `lookup_access` is the only path to the
-    // cache; the witness ensures the matching ECA code reaches the wire.
+    // A type-state WRITE gate: `current_access` is the only path to the
+    // rights; the witness ensures the matching ECA code reaches the wire.
     let wire_type = match AcceptedWriteType::classify(hdr.data_type) {
         Some(t) => t,
         None => {
@@ -4644,7 +4946,7 @@ pub(crate) async fn serve_write_head(
     };
 
     let write_grant = if is_notify {
-        let write_grant = match state.lookup_access(sid).require_write() {
+        let write_grant = match state.current_access(sid).await.require_write() {
             Ok(g) => g,
             Err(denied) => {
                 // route through the refinement helper so
@@ -4680,7 +4982,7 @@ pub(crate) async fn serve_write_head(
         // `cac::exception` never fired, so a `caput` from a read-only
         // peer looked like it had succeeded even though the value never
         // reached the DB.
-        match state.lookup_access(sid).require_write() {
+        match state.current_access(sid).await.require_write() {
             Ok(g) => g,
             Err(denied) => {
                 send_ca_error(
@@ -5011,6 +5313,7 @@ async fn write_admitted(
     // (RecordField pre-rejections happen inside the called
     // function) without a deeper refactor.
     let mut trap_guard = trap_listeners_active.then(|| {
+        let id = state.identity();
         epics_base_rs::server::access_security::TrapWriteGuard::begin(
             epics_base_rs::server::access_security::TrapWriteFields {
                 pv_name: state
@@ -5018,8 +5321,8 @@ async fn write_admitted(
                     .get(&sid)
                     .map(|e| e.target.audit_name())
                     .unwrap_or_default(),
-                user: state.username.clone(),
-                host: state.hostname.as_bytes().to_vec(),
+                user: id.username.clone(),
+                host: id.hostname.as_bytes().to_vec(),
                 peer: state.peer.clone(),
                 value_str: display_value.clone(),
                 // C `asTrapWriteWithData` (`camessage.c:768-771`) logs
@@ -5063,6 +5366,7 @@ async fn write_admitted(
             "dbr-type-not-puttable",
         ),
         PutPlan::Write { write } => {
+            let id = state.identity();
             let put = epics_base_rs::server::database::channel_io::put(
                 db,
                 &entry.target,
@@ -5070,17 +5374,14 @@ async fn write_admitted(
                 write,
                 is_notify,
                 || epics_base_rs::server::pv::WriteContext {
-                    user: state.username.clone(),
-                    host: state.hostname.as_bytes().to_vec(),
+                    user: id.username.clone(),
+                    host: id.hostname.as_bytes().to_vec(),
                     peer: state.peer.clone(),
                 },
             );
-            let result = crate::server::current_client::attached(
-                &state.username,
-                state.hostname.as_bytes(),
-                put,
-            )
-            .await;
+            let result =
+                crate::server::current_client::attached(&id.username, id.hostname.as_bytes(), put)
+                    .await;
             let (tail, result) = match result {
                 Ok(PutStarted::Started(completion)) => (WriteTail::chain(completion), Ok(())),
                 Ok(PutStarted::Posted(end)) => (WriteTail::posted(end), Ok(())),
@@ -5965,11 +6266,9 @@ pub(crate) async fn register_subscription(
     // Rust returned `ECA_NORDACCESS` here without installing —
     // a subscription opened while denied was permanently
     // absent, so a later ACF reload that granted access could
-    // not re-arm anything. Capture access as a flag and let
-    // the install path below populate the `denied` gate so
-    // `reeval_access_rights` can flip it later (Bug 4 parity).
-    let access_denied = state.lookup_access(sid).require_read().is_err();
-
+    // not re-arm anything. Each delivery asks the channel's
+    // [`ChannelRights`] instead, so a later grant reaches this
+    // monitor too (Bug 4 parity).
     let target = entry.target.clone();
     // C `pevext`, handed to `db_add_event` as `user_arg`: every entry of this
     // monitor, the initial one included, is framed from it. C stores the
@@ -5979,7 +6278,7 @@ pub(crate) async fn register_subscription(
     // (C `db_cancel_event`).
     let monitor = Arc::new(CircuitMonitor {
         gate: crate::server::outbox::MonitorGate::open(),
-        denied: AtomicBool::new(access_denied),
+        rights: entry.rights.clone(),
         ended: AtomicBool::new(false),
         data_type: requested_type,
         sub_id,
@@ -6173,6 +6472,8 @@ enum EventStep {
     Ended(usize),
     /// The database destroyed something since the last sweep.
     Destroyed,
+    /// Access security changed since the last re-evaluation.
+    AccessChanged,
     /// A control message (`None` = the dispatch thread dropped the sender).
     Control(Option<EventTaskControl>),
     /// Pending write-completion `idx` ended.
@@ -6242,7 +6543,7 @@ async fn next_event_step(
     events: &epics_base_rs::server::event_queue::EventUser,
     subs: &mut [MonitorDelivery],
     pending_writes: &mut [PendingWriteNotify],
-    destroyed: &mut impl DestroyedChannels,
+    table: &mut impl ChannelTable,
     control: &mut tokio::sync::mpsc::UnboundedReceiver<EventTaskControl>,
     slot: &mut Option<epics_base_rs::server::event_queue::CircuitEvent>,
 ) -> EventStep {
@@ -6275,16 +6576,22 @@ async fn next_event_step(
         }
     });
     let writes = next_settled_write_notify(pending_writes);
-    let gone = destroyed.destroyed();
+    let woke = table.wake();
     let ctrl = control.recv();
-    tokio::pin!(readers, writes, gone, ctrl);
+    tokio::pin!(readers, writes, woke, ctrl);
 
-    match select(select(select(readers, writes), gone), ctrl).await {
-        Either::Left((Either::Left((Either::Left((step, _writes)), _gone)), _ctrl)) => step,
-        Either::Left((Either::Left((Either::Right(((res, idx), _readers)), _gone)), _ctrl)) => {
+    // C `event_task` runs its extra labor, which sends an access change's
+    // `CA_PROTO_ACCESS_RIGHTS`, before `event_read` (`dbEvent.c:1051`,
+    // `:1059`): a backlog of updates must not hold the notice back.
+    match select(select(woke, select(readers, writes)), ctrl).await {
+        Either::Left((Either::Left((TableWake::Destroyed, _)), _ctrl)) => EventStep::Destroyed,
+        Either::Left((Either::Left((TableWake::AccessChanged, _)), _ctrl)) => {
+            EventStep::AccessChanged
+        }
+        Either::Left((Either::Right((Either::Left((step, _writes)), _woke)), _ctrl)) => step,
+        Either::Left((Either::Right((Either::Right(((res, idx), _readers)), _woke)), _ctrl)) => {
             EventStep::WriteDone(idx, res)
         }
-        Either::Left((Either::Right(((), _)), _ctrl)) => EventStep::Destroyed,
         Either::Right((ctrl_msg, _)) => EventStep::Control(ctrl_msg),
     }
 }
@@ -6301,41 +6608,76 @@ async fn next_event_step(
 /// (`casStrmClient.cc:2171-2209`), monitored or not. libca fails every IO on
 /// it with `ECA_DISCONN` (`cac::disconnectAllIO`,
 /// `modules/ca/src/client/cac.cpp:676-694` at R7.0.10).
-pub(crate) trait DestroyedChannels {
-    /// Resolves once the database has destroyed something since it last did.
-    async fn destroyed(&mut self);
+///
+/// rsrv's event task is also where an access change lands: asLib's
+/// `casAccessRightsCB` queues the channel and posts extra labor, and the
+/// event task sends its `CA_PROTO_ACCESS_RIGHTS` (`rsrv_extra_labor`,
+/// `camessage.c:1070-1138`, `:1502-1508`).
+pub(crate) trait ChannelTable {
+    /// Resolves with the next reason to take the table.
+    async fn wake(&mut self) -> TableWake;
     /// With the table held, retire every channel whose target is destroyed
     /// ([`retire_destroyed_channels`]) and hand their client cids to `stage`
     /// before letting go. `false` reports the peer gone.
     async fn retire(&mut self, stage: impl FnOnce(Vec<u32>) -> bool) -> bool;
+    /// With the table held, re-evaluate every channel's rights
+    /// ([`reeval_access_rights`]) and send what moved. `false` reports the
+    /// peer gone.
+    async fn reevaluate_access(&mut self) -> bool;
 }
 
-/// A blocking driver's client under its lock, as [`ClientDestroys`] retires
+/// What [`ChannelTable::wake`] resolved to.
+pub(crate) enum TableWake {
+    /// The database has destroyed something since it last did.
+    Destroyed,
+    /// Access security changed since it last did.
+    AccessChanged,
+}
+
+/// A blocking driver's client under its lock, as [`ClientTable`] works
 /// against it. Synchronous, so the driver's own code awaits nothing.
 pub(crate) trait LockedClient {
     fn state(&mut self) -> &mut ClientState;
+    /// Send the replies queued in the outbox. `false` reports the peer gone.
+    fn send_queued(&mut self) -> bool;
     /// Channels were just retired: send the replies queued ahead of their
     /// `CA_PROTO_SERVER_DISCONN`s and drop their subscriptions. `false`
     /// reports the peer gone.
     fn channels_retired(&mut self) -> bool;
 }
 
-/// The blocking driver's [`DestroyedChannels`]: the database's destroy
-/// wake-up, and the client lock to retire under.
-pub(crate) struct ClientDestroys<C> {
+/// The blocking driver's [`ChannelTable`]: the client lock, and the wake-ups
+/// that send the event thread to it.
+pub(crate) struct ClientTable<C> {
     pub(crate) client: Arc<tokio::sync::Mutex<C>>,
-    pub(crate) wake: broadcast::Receiver<()>,
+    /// [`PvDatabase::pv_destroyed_events`](epics_base_rs::server::database::PvDatabase::pv_destroyed_events).
+    pub(crate) destroyed: broadcast::Receiver<()>,
+    /// [`subscribe_asg_changes`](epics_base_rs::server::access_security::subscribe_asg_changes).
+    pub(crate) access: broadcast::Receiver<()>,
+    /// The client's outbox, which `reevaluate_access` queues into.
+    pub(crate) outbox: Outbox,
     pub(crate) peer: SocketAddr,
 }
 
-impl<C: LockedClient> DestroyedChannels for ClientDestroys<C> {
-    async fn destroyed(&mut self) {
-        match self.wake.recv().await {
-            // A missed wake still means "re-check what you serve".
-            Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {}
-            // The client holds the database, the sender's owner, until the
-            // event thread is joined.
-            Err(broadcast::error::RecvError::Closed) => std::future::pending().await,
+/// A missed wake still means "re-check what you serve". Neither sender is
+/// dropped while the event thread runs: the client holds the database, and
+/// the access-change sender is a process static.
+async fn next_wake(rx: &mut broadcast::Receiver<()>) {
+    match rx.recv().await {
+        Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+        Err(broadcast::error::RecvError::Closed) => std::future::pending().await,
+    }
+}
+
+impl<C: LockedClient> ChannelTable for ClientTable<C> {
+    async fn wake(&mut self) -> TableWake {
+        use futures_util::future::{Either, select};
+        let destroyed = next_wake(&mut self.destroyed);
+        let access = next_wake(&mut self.access);
+        tokio::pin!(destroyed, access);
+        match select(destroyed, access).await {
+            Either::Left(_) => TableWake::Destroyed,
+            Either::Right(_) => TableWake::AccessChanged,
         }
     }
 
@@ -6346,6 +6688,14 @@ impl<C: LockedClient> DestroyedChannels for ClientDestroys<C> {
             return false;
         }
         stage(cids)
+    }
+
+    async fn reevaluate_access(&mut self) -> bool {
+        let mut client = self.client.lock().await;
+        reeval_access_rights(client.state(), &self.outbox)
+            .await
+            .is_ok()
+            && client.send_queued()
     }
 }
 
@@ -6370,13 +6720,17 @@ impl DestroyedCids {
 }
 
 #[cfg(test)]
-impl DestroyedChannels for DestroyedCids {
-    async fn destroyed(&mut self) {
+impl ChannelTable for DestroyedCids {
+    async fn wake(&mut self) -> TableWake {
         self.1.notified().await;
+        TableWake::Destroyed
     }
     async fn retire(&mut self, stage: impl FnOnce(Vec<u32>) -> bool) -> bool {
         let cids = std::mem::take(&mut *self.0.lock().unwrap());
         stage(cids)
+    }
+    async fn reevaluate_access(&mut self) -> bool {
+        true
     }
 }
 
@@ -6408,7 +6762,7 @@ fn take_control(
 /// ahead of that channel's `CA_PROTO_SERVER_DISCONN`. `false` reports the
 /// peer gone.
 async fn retire_destroyed(
-    destroyed: &mut impl DestroyedChannels,
+    table: &mut impl ChannelTable,
     control: &mut tokio::sync::mpsc::UnboundedReceiver<EventTaskControl>,
     subs: &mut Vec<MonitorDelivery>,
     pending_writes: &mut Vec<PendingWriteNotify>,
@@ -6416,7 +6770,7 @@ async fn retire_destroyed(
     events: &epics_base_rs::server::event_queue::EventUser,
     client_minor: u16,
 ) -> bool {
-    destroyed
+    table
         .retire(|cids| {
             let mut acks = Vec::new();
             while let Ok(msg) = control.try_recv() {
@@ -6574,7 +6928,8 @@ impl<S: EventSink> Drop for FlushOnExit<S> {
 /// fires, sends the deferred reply via [`PendingWriteNotify::settle`] under the
 /// send lock. So there is no third socket writer — monitors and write
 /// completions share this one owner. A destroyed channel's retirement is
-/// staged here too, through [`DestroyedChannels`], behind the writes it owes.
+/// staged here too, through [`ChannelTable`], behind the writes it owes, and
+/// so is an access change's `CA_PROTO_ACCESS_RIGHTS`.
 ///
 /// Frames are staged into the client's send buffer and sent at the end of a
 /// drained queue, or once nothing more is ready (see [`EventSink`]); on the
@@ -6583,7 +6938,7 @@ impl<S: EventSink> Drop for FlushOnExit<S> {
 pub(crate) async fn run_event_task(
     events: Arc<epics_base_rs::server::event_queue::EventUser>,
     mut control: tokio::sync::mpsc::UnboundedReceiver<EventTaskControl>,
-    mut destroyed: impl DestroyedChannels,
+    mut table: impl ChannelTable,
     sink: impl EventSink,
     minor: CircuitMinor,
 ) {
@@ -6607,7 +6962,7 @@ pub(crate) async fn run_event_task(
                 &events,
                 &mut subs,
                 &mut pending_writes,
-                &mut destroyed,
+                &mut table,
                 &mut control,
                 &mut slot,
             );
@@ -6630,7 +6985,7 @@ pub(crate) async fn run_event_task(
                     continue;
                 };
                 if !retire_destroyed(
-                    &mut destroyed,
+                    &mut table,
                     &mut control,
                     &mut subs,
                     &mut pending_writes,
@@ -6646,7 +7001,7 @@ pub(crate) async fn run_event_task(
             }
             EventStep::Destroyed => {
                 if !retire_destroyed(
-                    &mut destroyed,
+                    &mut table,
                     &mut control,
                     &mut subs,
                     &mut pending_writes,
@@ -6656,6 +7011,11 @@ pub(crate) async fn run_event_task(
                 )
                 .await
                 {
+                    break;
+                }
+            }
+            EventStep::AccessChanged => {
+                if !table.reevaluate_access().await {
                     break;
                 }
             }
@@ -6792,10 +7152,10 @@ async fn reeval_access_rights(state: &mut ClientState, writer: &Outbox) -> CaRes
     if state.channels.is_empty() {
         return Ok(());
     }
-    let chan_info: Vec<(u32, u32, ChannelTarget)> = state
+    let chan_info: Vec<(u32, u32, Arc<ChannelRights>)> = state
         .channels
         .iter()
-        .map(|(&sid, entry)| (sid, entry.cid, entry.target.clone()))
+        .map(|(&sid, entry)| (sid, entry.cid, entry.rights.clone()))
         .collect();
 
     // (sid, old_level, new_level) — old defaults to NoAccess for a
@@ -6813,21 +7173,12 @@ async fn reeval_access_rights(state: &mut ClientState, writer: &Outbox) -> CaRes
     // reloads (typo fix, new UAG that doesn't intersect, etc.).
     // Mirror C: only emit on actual transition.
     let mut transitions: Vec<(u32, AccessLevel, AccessLevel)> = Vec::new();
-    for (sid, cid, target) in chan_info {
-        let (new_access, new_rule_was_trap) = state.compute_access(&target).await;
-        let new_level = match new_access {
-            3 => AccessLevel::ReadWrite,
-            1 => AccessLevel::Read,
-            _ => AccessLevel::NoAccess,
-        };
+    for (sid, cid, rights) in chan_info {
+        let new_level = rights.access().level();
         let old_level = state
-            .channel_access
+            .advertised_access
             .insert(sid, new_level)
             .unwrap_or(AccessLevel::NoAccess);
-        // an ACF reload can change which rule grants
-        // access (e.g. a new TRAPWRITE rule), so the trap mask
-        // must be refreshed alongside the level.
-        state.channel_trap.insert(sid, new_rule_was_trap);
         if old_level == new_level {
             continue;
         }
@@ -6836,7 +7187,7 @@ async fn reeval_access_rights(state: &mut ClientState, writer: &Outbox) -> CaRes
         // into the outbox for the connection loop to drain and flush.
         let mut ar = CaHeader::new(CA_PROTO_ACCESS_RIGHTS);
         ar.cid = cid;
-        ar.available = new_access;
+        ar.available = ChannelRights::wire_bits(new_level);
         writer.push(ar.to_bytes().to_vec());
     }
 
@@ -6864,7 +7215,6 @@ async fn reeval_access_rights(state: &mut ClientState, writer: &Outbox) -> CaRes
         // enabled and then posts the current value. Both posts take the
         // monitor's pre-chain and ring like any update.
         for monitor in &entry.subscriptions {
-            monitor.monitor.denied.store(!new_read, Ordering::Release);
             let id = monitor.id;
             match &entry.target {
                 ChannelTarget::SimplePv(pv) => {
@@ -7463,17 +7813,14 @@ pub(crate) struct ReplyContext {
 /// to the circuit's event task with each queued entry
 /// ([`attach_with`](epics_base_rs::server::event_queue::attach_with)).
 ///
-/// The one owner of the subscription's gate and access flag: the channel, the
-/// circuit's registry and the cancel path hold this `Arc`, not copies of them.
-/// Every field an update reads comes first, on one 64-byte line (C's
+/// The one owner of the subscription's gate: the channel, the circuit's
+/// registry and the cancel path hold this `Arc`, not copies of it. Every
+/// field an update frames from comes first, on one 64-byte line (C's
 /// `event_ext` is freelist-allocated and walked in order instead); see the
 /// `circuit_monitor_layout` test.
 #[repr(C, align(64))]
 pub(crate) struct CircuitMonitor {
     pub(crate) gate: crate::server::outbox::MonitorGate,
-    /// C `asCheckGet` as `read_reply` sees it; flipped by
-    /// [`reeval_access_rights`].
-    pub(crate) denied: AtomicBool,
     /// The monitor's frame could not be built; its later entries are dropped.
     /// Only the event task touches it.
     pub(crate) ended: AtomicBool,
@@ -7483,6 +7830,11 @@ pub(crate) struct CircuitMonitor {
     pub(crate) stats: Option<Arc<super::stats::ServerStats>>,
     pub(crate) stage: super::DeliveryStage,
     pub(crate) target: ChannelTarget,
+    /// The channel's, asked per update as C `read_reply` calls `asCheckGet`
+    /// per event (`camessage.c:498`). Off the first line: the check reads
+    /// the circuit's identity and the policy generation from lines of their
+    /// own anyway.
+    pub(crate) rights: Arc<ChannelRights>,
     // Cold: read only to refuse an update or by an option read.
     /// The EVENT_ADD request, echoed by a refusal.
     pub(crate) req_hdr: CaHeader,
@@ -7497,6 +7849,11 @@ pub(crate) static LIVE_OPTION_READS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 impl CircuitMonitor {
+    /// Whether this update goes out as `no_read_access_event`.
+    pub(crate) fn read_denied(&self) -> bool {
+        !self.rights.can_read()
+    }
+
     /// The channel's options at delivery, through the door the monitor's
     /// initial value takes; a monitor never reads through a gateway read
     /// hook (`SimplePv::read_snapshot`). CLASS_NAME is the record's type.
@@ -7535,14 +7892,13 @@ mod circuit_monitor_layout {
     use std::mem::{align_of, offset_of, size_of};
 
     #[test]
-    fn every_field_an_update_reads_is_on_the_first_line() {
+    fn every_field_an_update_frames_from_is_on_the_first_line() {
         assert_eq!(align_of::<CircuitMonitor>(), 64);
         let ends = [
             (
                 "gate",
                 offset_of!(CircuitMonitor, gate) + size_of::<crate::server::outbox::MonitorGate>(),
             ),
-            ("denied", offset_of!(CircuitMonitor, denied) + 1),
             ("ended", offset_of!(CircuitMonitor, ended) + 1),
             ("data_type", offset_of!(CircuitMonitor, data_type) + 2),
             ("sub_id", offset_of!(CircuitMonitor, sub_id) + 4),
@@ -7579,12 +7935,15 @@ pub(crate) async fn run_circuit_monitors(
     use epics_base_rs::server::event_queue::CircuitEvent;
     // The connection loop aborts this task when the circuit ends.
     let _closed = CloseReplies(&events);
+    let mut owed = false;
     loop {
-        let (context, event) = match std::future::poll_fn(|cx| events.poll_next(cx)).await {
+        let next = std::future::poll_fn(|cx| events.poll_next(cx));
+        let (context, event) = match outbox.flush_before_waiting(&mut owed, next).await {
             CircuitEvent::Event { context, event, .. } => (context, event),
             CircuitEvent::Reply { frame, hold } => {
                 if !frame.is_empty() {
                     outbox.push(frame);
+                    owed = true;
                 }
                 drop(hold);
                 continue;
@@ -7607,6 +7966,7 @@ pub(crate) async fn run_circuit_monitors(
                 deliver_record_field_event(m, event, &outbox, minor.get()).await
             }
         }
+        owed = true;
     }
 }
 
@@ -7656,7 +8016,7 @@ async fn deliver_record_field_event(
     if let Some(ref s) = m.stats {
         s.subscription_events_posted.fetch_add(1, Ordering::Relaxed);
     }
-    if m.denied.load(Ordering::Acquire) {
+    if m.read_denied() {
         m.gate.deliver(|| send_denied_event(m, outbox, minor));
         return;
     }
@@ -7855,13 +8215,18 @@ mod delivery_reads_options {
         data_type: u16,
     ) -> CircuitMonitor {
         CircuitMonitor {
+            rights: Arc::new(ChannelRights::new(
+                Arc::new(CircuitRights::new(
+                    epics_base_rs::server::access_security::new_acf_cell(None),
+                )),
+                target.clone(),
+            )),
             target,
             db: db.clone(),
             cid: 0,
             sub_id: 1,
             data_type,
             data_count: 0,
-            denied: AtomicBool::new(false),
             gate: crate::server::outbox::MonitorGate::open(),
             stage: super::super::DeliveryStage::plain(),
             req_hdr: CaHeader::new(CA_PROTO_EVENT_ADD),
@@ -8381,7 +8746,7 @@ fn deliver_update(
             s.subscription_events_posted.fetch_add(1, Ordering::Relaxed);
         }
         let to = StageNow::new(sink);
-        let denied = m.denied.load(Ordering::Acquire);
+        let denied = m.read_denied();
         if denied {
             send_denied_event(m, &to, client_minor);
         } else if let Some(update) = source {
@@ -8490,8 +8855,10 @@ async fn run_write_notify_queue(
     minor: CircuitMinor,
 ) {
     let mut pending: Vec<PendingWriteNotify> = Vec::new();
+    let mut owed = false;
     loop {
-        match next_write_notify_step(&mut pending, &mut control).await {
+        let next = next_write_notify_step(&mut pending, &mut control);
+        match outbox.flush_before_waiting(&mut owed, next).await {
             WriteNotifyStep::Control(None) => break,
             WriteNotifyStep::Control(Some(WriteNotifyQueueMsg::Queue(p))) => pending.push(*p),
             WriteNotifyStep::Control(Some(WriteNotifyQueueMsg::FreeChannel(sid))) => {
@@ -8501,6 +8868,7 @@ async fn run_write_notify_queue(
             WriteNotifyStep::Control(Some(WriteNotifyQueueMsg::Retire(sids, done))) => {
                 for (mut p, ended) in take_owed_writes(&mut pending, |p| sids.contains(&p.sid)) {
                     let _ = p.settle(ended, &outbox, &events, minor.get());
+                    owed = true;
                 }
                 let _ = done.send(());
             }
@@ -8511,6 +8879,7 @@ async fn run_write_notify_queue(
                 // An unshippable reply (16k-array boundary) is dropped, as it
                 // is on the blocking driver's owner; the circuit keeps serving.
                 let _ = p.settle(res, &outbox, &events, minor.get());
+                owed = true;
             }
         }
     }
@@ -9130,10 +9499,11 @@ fn pcas_log_bad_id(
         "CAS: bad resource id in \"{FILE}\" at line {line}\n"
     ));
     // `caServerI::dumpMsg` (`caServerI.cc:312-321`) puts this one on stderr.
+    let id = state.identity();
     let mut request = b"CAS Request: ".to_vec();
-    request.extend_from_slice(&state.username);
+    request.extend_from_slice(&id.username);
     request.extend_from_slice(b" on ");
-    request.extend_from_slice(state.hostname.as_bytes());
+    request.extend_from_slice(id.hostname.as_bytes());
     let _ = writeln!(
         request,
         ": cmd={} cid={} typ={} cnt={} psz={} avail={:x}",
@@ -9213,8 +9583,8 @@ fn refuse_install(
     ))
 }
 
-/// Push a `CA_PROTO_ERROR` reply into the connection outbox. The connection
-/// loop is the sole owner that drains the outbox to the socket, so this
+/// Push a `CA_PROTO_ERROR` reply into the connection outbox. The circuit's
+/// writer is the sole owner that drains the outbox to the socket, so this
 /// only builds one framed message and enqueues it — see
 /// [`build_ca_error_frame`]. Synchronous: enqueueing is a pure buffer
 /// push with no I/O, so callers do not `.await` it.
@@ -10613,6 +10983,97 @@ mod multi_nic_listener_tests {
 
 #[cfg(tokio_backend)]
 #[cfg(test)]
+mod drain_tests {
+    //! Drain (SIGTERM under `EPICS_CAS_DRAIN_GRACE_SECS`, POST /drain) closes
+    //! admission and keeps serving the clients already connected.
+    use super::*;
+    use epics_base_rs::server::database::PvDatabase;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpStream;
+
+    /// Whether `client` gets its `CA_PROTO_ECHO` answered, skipping whatever
+    /// the server sent first; `false` on EOF, reset or silence.
+    async fn echo_answered(client: &mut TcpStream) -> bool {
+        if client
+            .write_all(&CaHeader::new(CA_PROTO_ECHO).to_bytes())
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        let exchange = async {
+            loop {
+                let mut frame = [0u8; CaHeader::SIZE];
+                client.read_exact(&mut frame).await?;
+                let (h, _) = CaHeader::from_bytes_extended(&frame).expect("header parses");
+                let mut body = vec![0u8; h.actual_postsize()];
+                client.read_exact(&mut body).await?;
+                if h.cmmd == CA_PROTO_ECHO {
+                    return std::io::Result::Ok(());
+                }
+            }
+        };
+        matches!(
+            tokio::time::timeout(fact_budget::FACT_BUDGET, exchange).await,
+            Ok(Ok(()))
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn a_connected_client_keeps_being_served_after_a_connect_during_drain() {
+        let acf = epics_base_rs::server::access_security::new_acf_cell(None);
+        let (acf_reload_tx, _) = broadcast::channel::<()>(4);
+        let drain = Arc::new(AtomicBool::new(false));
+        let bound = bind_tcp_listeners(0).await.expect("listener bound");
+        let port = bound.port();
+        let server = tokio::spawn(run_tcp_listener(
+            Arc::new(PvDatabase::new()),
+            bound,
+            acf,
+            acf_reload_tx,
+            None,
+            None,
+            drain.clone(),
+            None,
+            #[cfg(feature = "experimental-rust-tls")]
+            None,
+            #[cfg(feature = "cap-tokens")]
+            None,
+        ));
+
+        let mut served = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("first client connects");
+        let mut ver = CaHeader::new(CA_PROTO_VERSION);
+        ver.count = CA_MINOR_VERSION;
+        served.write_all(&ver.to_bytes()).await.expect("version");
+        assert!(echo_answered(&mut served).await, "served before drain");
+
+        drain.store(true, Ordering::Release);
+
+        let mut refused = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("the kernel completes the handshake");
+        let mut byte = [0u8; 1];
+        let read = tokio::time::timeout(fact_budget::FACT_BUDGET, refused.read(&mut byte))
+            .await
+            .expect("the server closes a connection made during drain");
+        assert!(
+            matches!(read, Ok(0) | Err(_)),
+            "a connection made during drain is closed unserved, got {read:?}"
+        );
+
+        assert!(
+            echo_answered(&mut served).await,
+            "the client connected before drain is still served"
+        );
+        server.abort();
+    }
+}
+
+#[cfg(tokio_backend)]
+#[cfg(test)]
 mod pre_v49_peer_tests {
     //! R6-18 — the server must never speak the extended (24-byte) CA
     //! header to a peer that has not announced CA_V49, in either
@@ -11492,7 +11953,7 @@ mod non_graceful_disconnect_teardown_tests {
         timeout: Duration,
         mut pred: impl FnMut(&ServerConnectionEvent) -> bool,
     ) -> Option<ServerConnectionEvent> {
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = epics_libcom_rs::runtime::task::deadline_from_now(timeout);
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
@@ -11520,7 +11981,7 @@ mod non_graceful_disconnect_teardown_tests {
     ) -> u32 {
         let mut acc: Vec<u8> = Vec::new();
         let mut buf = [0u8; 512];
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = epics_libcom_rs::runtime::task::deadline_from_now(timeout);
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             assert!(
@@ -11558,7 +12019,7 @@ mod non_graceful_disconnect_teardown_tests {
     ) -> CaHeader {
         let mut acc: Vec<u8> = Vec::new();
         let mut buf = [0u8; 512];
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = epics_libcom_rs::runtime::task::deadline_from_now(timeout);
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             assert!(
@@ -11776,7 +12237,7 @@ mod non_graceful_disconnect_teardown_tests {
 
     /// Regression: a `$` long-string channel on a string SimplePv must
     /// advertise CHAR[40], not the native DBR_STRING/1. The channel stores
-    /// `long_string` and every delivery path runs `apply_long_string` to
+    /// `long_string` and every delivery path reads its `DollarView` to
     /// emit CHAR[40], so the SimplePv arm must override the advertised
     /// type/count to match — like the RecordField arm and C
     /// dbChannel.c:486-505.
@@ -12319,7 +12780,7 @@ mod write_gate_order_tests {
     ) -> CaHeader {
         let mut acc: Vec<u8> = Vec::new();
         let mut buf = [0u8; 512];
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = epics_libcom_rs::runtime::task::deadline_from_now(timeout);
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             assert!(
@@ -12536,7 +12997,7 @@ mod deprecated_read_autosize_tests {
     ) -> CaHeader {
         let mut acc: Vec<u8> = Vec::new();
         let mut buf = [0u8; 512];
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = epics_libcom_rs::runtime::task::deadline_from_now(timeout);
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             assert!(
@@ -13364,7 +13825,7 @@ mod bfr7_event_context_filter_tests {
         let mut acc: Vec<u8> = Vec::new();
         let mut frames: Vec<(u16, usize)> = Vec::new();
         let mut buf = [0u8; 512];
-        let deadline = tokio::time::Instant::now() + window;
+        let deadline = epics_libcom_rs::runtime::task::deadline_from_now(window);
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
@@ -13660,7 +14121,7 @@ mod r46_zero_mask_event_add_tests {
         // frame before the connection closes.
         let mut acc: Vec<u8> = Vec::new();
         let mut buf = [0u8; 256];
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let deadline = epics_libcom_rs::runtime::task::deadline_from_now(Duration::from_secs(3));
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             assert!(
@@ -13788,7 +14249,7 @@ mod r46_zero_mask_event_add_tests {
 
         let mut acc: Vec<u8> = Vec::new();
         let mut buf = [0u8; 256];
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let deadline = epics_libcom_rs::runtime::task::deadline_from_now(Duration::from_secs(3));
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             assert!(
@@ -13966,7 +14427,7 @@ mod r46_zero_mask_event_add_tests {
     ) -> Vec<u8> {
         let mut acc: Vec<u8> = Vec::new();
         let mut buf = [0u8; 256];
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = epics_libcom_rs::runtime::task::deadline_from_now(timeout);
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             assert!(
@@ -14227,7 +14688,7 @@ mod send_tmo_env_tests {
             (Some(" 2.5 "), Duration::from_millis(2500)),
             (Some("0x10"), Duration::from_secs(16)),
             // Never-expiring send deadline instead of an abort.
-            (Some("inf"), Duration::MAX),
+            (Some("inf"), epics_base_rs::runtime::time::FAR_FUTURE),
             // Rejected by `epicsScanDouble` → default.
             (Some("1e400"), default),
             (Some("abc"), default),
@@ -14251,21 +14712,26 @@ mod send_tmo_env_tests {
     #[test]
     #[serial_test::serial]
     fn inactivity_tmo_boundaries() {
+        // `doc/08-environment.md`: default 600, minimum 30, 0 disables.
+        let default = Some(Duration::from_secs(600));
+        let floor = Some(Duration::from_secs(30));
         let cases: &[(Option<&str>, Option<Duration>)] = &[
-            // Disabled by default; an unparseable value keeps it disabled.
-            (None, None),
-            (Some(""), None),
-            (Some("abc"), None),
-            (Some("1e400"), None),
-            // NaN fails the `> 0.0` gate, as every C comparison against it does.
-            (Some("nan"), None),
+            // Unset, empty or unreadable, NaN included: the default.
+            (None, default),
+            (Some(""), default),
+            (Some("abc"), default),
+            (Some("1e400"), default),
+            (Some("nan"), default),
+            // 0 or below turns the cap off.
             (Some("0"), None),
             (Some("-1"), None),
-            // Positive values are honoured, floored at 30 s.
+            // A positive value is honoured, raised to the 30 s floor.
+            (Some("10"), floor),
+            (Some("30"), floor),
             (Some("60"), Some(Duration::from_secs(60))),
-            (Some("1"), Some(Duration::from_secs(30))),
+            (Some("600"), Some(Duration::from_secs(600))),
             (Some("0x40"), Some(Duration::from_secs(64))),
-            (Some("inf"), Some(Duration::MAX)),
+            (Some("inf"), Some(epics_base_rs::runtime::time::FAR_FUTURE)),
         ];
         for (raw, want) in cases {
             with_env("EPICS_CAS_INACTIVITY_TMO", *raw, || {
@@ -14608,7 +15074,7 @@ mod destroyed_channel_teardown_tests {
     ) -> CaHeader {
         let mut acc: Vec<u8> = Vec::new();
         let mut buf = [0u8; 1024];
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = epics_libcom_rs::runtime::task::deadline_from_now(timeout);
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             assert!(!remaining.is_zero(), "timed out waiting for command {cmmd}");
@@ -14897,6 +15363,7 @@ mod destroyed_channel_teardown_tests {
             epics_base_rs::server::access_security::new_acf_cell(None),
             5064,
             db.clone(),
+            None,
         );
         let (outbox, drain) = crate::server::outbox::channel();
         for frame in [version_frame(), create_chan_frame(1, "AR4:pending")] {
@@ -16725,6 +17192,7 @@ mod destroyed_channel_teardown_tests {
             None,
             "closed after EVENT_CANCEL"
         );
+        epics_base_rs::runtime::log::errlog_flush();
         epics_base_rs::runtime::log::errlog_remove_listener(listener);
         assert_eq!(
             *logged.lock().unwrap(),
@@ -16862,7 +17330,7 @@ mod destroyed_channel_teardown_tests {
             .await
             .expect("add pv");
         let acf = epics_base_rs::server::access_security::new_acf_cell(None);
-        let mut state = ClientState::new(acf, 5064, db.clone());
+        let mut state = ClientState::new(acf, 5064, db.clone(), None);
         let (outbox, mut drain) = crate::server::outbox::channel();
         let peer: SocketAddr = "127.0.0.1:55308".parse().unwrap();
         let version = CaHeader::from_bytes(&version_frame()).expect("header");
@@ -17085,7 +17553,8 @@ mod cancel_confirmation_ordering_tests {
             // stream has gone quiet, so a late frame has had its chance.
             let mut acc: Vec<u8> = Vec::new();
             let mut buf = [0u8; 8192];
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            let deadline =
+                epics_libcom_rs::runtime::task::deadline_from_now(Duration::from_secs(5));
             loop {
                 let seen = frames(&acc);
                 let confirmed = seen
@@ -18217,9 +18686,7 @@ mod access_change_walk_tests {
                         .downcast_ref::<CircuitMonitor>()
                         .expect("a CA monitor");
                     match event.value() {
-                        LogValue::Val(EpicsValue::Double(v)) => {
-                            (m.denied.load(Ordering::Acquire), v)
-                        }
+                        LogValue::Val(EpicsValue::Double(v)) => (m.read_denied(), v),
                         v => panic!("unexpected value {v:?}"),
                     }
                 }
@@ -18252,8 +18719,8 @@ mod access_change_walk_tests {
         let acf = epics_base_rs::server::access_security::new_acf_cell(Some(
             epics_base_rs::server::access_security::parse_acf(ACF).unwrap(),
         ));
-        let mut state = ClientState::new(acf, 5064, db.clone());
-        state.username = "ops".into();
+        let mut state = ClientState::new(acf, 5064, db.clone(), None);
+        state.update_identity(|id| id.username = "ops".into());
         let (outbox, mut drain) = crate::server::outbox::channel();
         let peer: SocketAddr = "127.0.0.1:55990".parse().unwrap();
 
@@ -18312,7 +18779,7 @@ mod access_change_walk_tests {
         assert_eq!(next_event(&state), Some((false, 1.5)), "initial value");
 
         // Revoke: AR 0, then one post, delivered as `no_read_access_event`.
-        state.username = "nobody".into();
+        state.update_identity(|id| id.username = "nobody".into());
         reeval_access_rights(&mut state, &outbox).await.unwrap();
         let out = frames(&mut drain);
         assert_eq!(out.len(), 1);
@@ -18324,7 +18791,7 @@ mod access_change_walk_tests {
         );
 
         // Restore: AR 3, then the current value.
-        state.username = "ops".into();
+        state.update_identity(|id| id.username = "ops".into());
         reeval_access_rights(&mut state, &outbox).await.unwrap();
         let out = frames(&mut drain);
         assert_eq!(out.len(), 1);
@@ -18338,7 +18805,7 @@ mod access_change_walk_tests {
     async fn a_non_utf8_host_name_reaches_the_acf_check_byte_for_byte() {
         use epics_base_rs::server::access_security::{AccessLevel, new_acf_cell, parse_acf};
         let db = Arc::new(PvDatabase::new());
-        let mut state = ClientState::new(new_acf_cell(None), 5064, db.clone());
+        let mut state = ClientState::new(new_acf_cell(None), 5064, db.clone(), None);
         let (outbox, _drain) = crate::server::outbox::channel();
         let payload = b"h\xff\0\0\0\0\0\0".to_vec();
         let mut hdr = CaHeader::new(CA_PROTO_HOST_NAME);
@@ -18355,10 +18822,9 @@ mod access_change_walk_tests {
         )
         .await
         .unwrap();
-        assert_eq!(state.hostname.as_bytes(), b"h\xff");
+        assert_eq!(state.identity().hostname.as_bytes(), b"h\xff");
         let access = |acf: &[u8]| {
-            state
-                .access_for_asg(&parse_acf(acf).unwrap(), "DEFAULT", 0)
+            CircuitRights::access_for_asg(&parse_acf(acf).unwrap(), "DEFAULT", 0, &state.identity())
                 .0
         };
         let rule = b"ASG(DEFAULT) {\n    RULE(1, WRITE) { HAG(hs) }\n}\n";
@@ -18380,6 +18846,7 @@ mod access_change_walk_tests {
             epics_base_rs::server::access_security::new_acf_cell(None),
             5064,
             db.clone(),
+            None,
         );
         let (outbox, mut drain) = crate::server::outbox::channel();
         for (name, want) in [
@@ -18421,6 +18888,7 @@ mod access_change_walk_tests {
             new_acf_cell(Some(parse_acf(acf).unwrap())),
             5064,
             db.clone(),
+            None,
         );
         let (outbox, _drain) = crate::server::outbox::channel();
         let payload = b"op\xff\0\0\0\0\0".to_vec();
@@ -18438,20 +18906,28 @@ mod access_change_walk_tests {
         )
         .await
         .unwrap();
-        assert_eq!(state.username, b"op\xff");
+        assert_eq!(state.identity().username, b"op\xff");
         assert_eq!(
-            state
-                .access_for_asg(&parse_acf(acf).unwrap(), "DEFAULT", 0)
-                .0,
+            CircuitRights::access_for_asg(
+                &parse_acf(acf).unwrap(),
+                "DEFAULT",
+                0,
+                &state.identity()
+            )
+            .0,
             AccessLevel::NoAccess
         );
         // The member spelled with the same bytes is the one that matches.
         let exact: &[u8] =
             b"UAG(ops) { \"op\xff\" }\nASG(DEFAULT) {\n    RULE(1, WRITE) { UAG(ops) }\n}\n";
         assert_eq!(
-            state
-                .access_for_asg(&parse_acf(exact).unwrap(), "DEFAULT", 0)
-                .0,
+            CircuitRights::access_for_asg(
+                &parse_acf(exact).unwrap(),
+                "DEFAULT",
+                0,
+                &state.identity()
+            )
+            .0,
             AccessLevel::ReadWrite
         );
     }
@@ -18472,6 +18948,7 @@ mod unrouted_command_tests {
             epics_base_rs::server::access_security::new_acf_cell(None),
             5064,
             db.clone(),
+            None,
         );
         state.minor.set(13);
         let (outbox, mut drain) = crate::server::outbox::channel();
@@ -18506,6 +18983,556 @@ mod unrouted_command_tests {
 }
 
 #[cfg(test)]
+mod access_change_tests {
+    //! asLib updates a client's access before it notifies anyone
+    //! (`asLibRoutines.c:1056-1059`): rsrv's checks read the new value at
+    //! once (`camessage.c:2608-2617`), and the event task sends the
+    //! `CA_PROTO_ACCESS_RIGHTS` ahead of its queued updates
+    //! (`dbEvent.c:1051`, `:1059`).
+    use super::*;
+    use crate::protocol::{
+        CA_MINOR_VERSION, CA_PROTO_ERROR, CA_PROTO_VERSION, ECA_NORDACCESS, ECA_NORMAL,
+        ECA_NOWTACCESS, pad_string,
+    };
+    use epics_base_rs::server::access_security::{AcfCell, new_acf_cell, parse_acf};
+    use epics_base_rs::server::database::PvDatabase;
+    use epics_base_rs::types::{DBR_DOUBLE, EpicsValue};
+
+    const READ_WRITE: &str = "ASG(DEFAULT) {\n    RULE(1, READ)\n    RULE(1, WRITE)\n}\n";
+    const READ_ONLY: &str = "ASG(DEFAULT) {\n    RULE(1, READ)\n}\n";
+    const NO_ACCESS: &str = "ASG(DEFAULT) {\n    RULE(1, NONE)\n}\n";
+    const PEER: &str = "127.0.0.1:55992";
+
+    fn frames(drain: &mut crate::server::outbox::OutboxDrain) -> Vec<Vec<u8>> {
+        std::iter::from_fn(|| drain.try_next().map(|f| f.to_vec())).collect()
+    }
+
+    fn word(frame: &[u8], at: usize) -> u32 {
+        u32::from_be_bytes(frame[at..at + 4].try_into().unwrap())
+    }
+
+    async fn dispatch(
+        state: &mut ClientState,
+        db: &Arc<PvDatabase>,
+        outbox: &Outbox,
+        hdr: CaHeader,
+        payload: &[u8],
+    ) {
+        dispatch_message(
+            &hdr,
+            payload,
+            state,
+            db,
+            outbox,
+            PEER.parse().unwrap(),
+            None,
+            SubscriptionDelivery::HandOff,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// A circuit with channel cid 0x1234 open on `AR:LIVE` (1.5) under a
+    /// read-write ACF, its replies drained. Returns the channel's sid.
+    async fn open(
+        db: &Arc<PvDatabase>,
+    ) -> (
+        AcfCell,
+        ClientState,
+        Outbox,
+        crate::server::outbox::OutboxDrain,
+        u32,
+    ) {
+        db.add_pv("AR:LIVE", EpicsValue::Double(1.5)).await.unwrap();
+        let acf = new_acf_cell(Some(parse_acf(READ_WRITE).unwrap()));
+        let mut state = ClientState::new(acf.clone(), 5064, db.clone(), None);
+        let (outbox, mut drain) = crate::server::outbox::channel();
+        let mut version = CaHeader::new(CA_PROTO_VERSION);
+        version.count = CA_MINOR_VERSION;
+        dispatch(&mut state, db, &outbox, version, &[]).await;
+        let name = pad_string("AR:LIVE");
+        let mut create = CaHeader::new(CA_PROTO_CREATE_CHAN);
+        create.cid = 0x1234;
+        create.available = CA_MINOR_VERSION as u32;
+        create.postsize = name.len() as u16;
+        dispatch(&mut state, db, &outbox, create, &name).await;
+        let sid = *state.channels.keys().next().unwrap();
+        let _ = frames(&mut drain);
+        (acf, state, outbox, drain, sid)
+    }
+
+    /// Nothing re-evaluates this circuit after `asInit`, as nothing does
+    /// while its event thread is stuck sending to a client that stopped
+    /// reading: the checks alone must see the change.
+    // RTEMS-EXEC-MODEL-ALLOW(2): both run and pass under
+    // `EPICS_RS_BUILD_EXEC_BACKEND=thread`.
+    #[tokio::test]
+    async fn a_revoked_right_is_refused_before_its_notice_is_sent() {
+        let db = Arc::new(PvDatabase::new());
+        let (acf, mut state, outbox, mut drain, sid) = open(&db).await;
+        let mut read = CaHeader::new(CA_PROTO_READ_NOTIFY);
+        read.data_type = DBR_DOUBLE;
+        read.count = 1;
+        read.cid = sid;
+        read.available = 7;
+        // The ECA status a READ_NOTIFY reply carries in its cid word.
+        async fn read_status(
+            state: &mut ClientState,
+            db: &Arc<PvDatabase>,
+            outbox: &Outbox,
+            drain: &mut crate::server::outbox::OutboxDrain,
+            read: CaHeader,
+        ) -> u32 {
+            dispatch(state, db, outbox, read, &[]).await;
+            let out = frames(drain);
+            assert_eq!(out.len(), 1);
+            assert_eq!(
+                u16::from_be_bytes([out[0][0], out[0][1]]),
+                CA_PROTO_READ_NOTIFY
+            );
+            word(&out[0], 8)
+        }
+
+        acf.install_async(parse_acf(READ_ONLY).unwrap()).await;
+        let mut write = CaHeader::new(CA_PROTO_WRITE);
+        write.data_type = DBR_DOUBLE;
+        write.count = 1;
+        write.cid = sid;
+        write.available = 1;
+        write.postsize = 8;
+        dispatch(&mut state, &db, &outbox, write, &42.0f64.to_be_bytes()).await;
+        let out = frames(&mut drain);
+        assert_eq!(out.len(), 1, "one reply to the write");
+        assert_eq!(u16::from_be_bytes([out[0][0], out[0][1]]), CA_PROTO_ERROR);
+        assert_eq!(word(&out[0], 12), ECA_NOWTACCESS);
+        assert_eq!(
+            db.find_pv("AR:LIVE").unwrap().get(),
+            EpicsValue::Double(1.5)
+        );
+        assert_eq!(
+            read_status(&mut state, &db, &outbox, &mut drain, read).await,
+            ECA_NORMAL
+        );
+
+        acf.install_async(parse_acf(NO_ACCESS).unwrap()).await;
+        assert_eq!(
+            read_status(&mut state, &db, &outbox, &mut drain, read).await,
+            ECA_NORDACCESS
+        );
+    }
+
+    /// The client's socket, by command, in the order frames reach it: the
+    /// event thread's staged frames and the replies its table sends share
+    /// one send buffer, as `BlockingClient` and `EventSendBuf` do.
+    #[derive(Clone, Default)]
+    struct Wire(Arc<std::sync::Mutex<Vec<u16>>>);
+
+    impl Wire {
+        fn push(&self, frame: &[u8]) {
+            self.0
+                .lock()
+                .unwrap()
+                .push(u16::from_be_bytes([frame[0], frame[1]]));
+        }
+    }
+
+    impl EventSink for Wire {
+        fn stage(&mut self, frame: &[u8]) -> std::io::Result<()> {
+            self.push(frame);
+            Ok(())
+        }
+        fn send(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct Locked {
+        state: ClientState,
+        drain: crate::server::outbox::OutboxDrain,
+        wire: Wire,
+    }
+
+    impl LockedClient for Locked {
+        fn state(&mut self) -> &mut ClientState {
+            &mut self.state
+        }
+        fn send_queued(&mut self) -> bool {
+            for frame in frames(&mut self.drain) {
+                self.wire.push(&frame);
+            }
+            true
+        }
+        fn channels_retired(&mut self) -> bool {
+            self.send_queued()
+        }
+    }
+
+    /// An access change that lands with monitor updates queued is sent
+    /// first, however many are queued.
+    #[tokio::test]
+    async fn an_access_change_is_sent_ahead_of_queued_updates() {
+        use std::future::Future;
+        let db = Arc::new(PvDatabase::new());
+        let (acf, mut state, outbox, drain, sid) = open(&db).await;
+        let mut add = CaHeader::new(CA_PROTO_EVENT_ADD);
+        add.data_type = DBR_DOUBLE;
+        add.count = 1;
+        add.cid = sid;
+        add.available = 0xAB;
+        let mut mon_info = vec![0u8; 16];
+        mon_info[12..14].copy_from_slice(&5u16.to_be_bytes());
+        let Ok(SubscriptionOutcome::HandedOff(r)) = register_subscription(
+            &add,
+            &mon_info,
+            &state,
+            &outbox,
+            SubscriptionDelivery::HandOff,
+            || 0,
+        )
+        .await
+        else {
+            panic!("EVENT_ADD refused");
+        };
+        let (ctl_tx, mut ctl_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut blk_subs = std::collections::HashMap::new();
+        crate::server::blocking::hand_off_subscription(&mut state, &mut blk_subs, &ctl_tx, r);
+        // The initial value, then two updates.
+        let pv = db.find_pv("AR:LIVE").unwrap();
+        pv.set(EpicsValue::Double(2.0));
+        pv.set(EpicsValue::Double(3.0));
+
+        let (access_tx, access) = broadcast::channel(4);
+        acf.install_async(parse_acf(READ_ONLY).unwrap()).await;
+        access_tx.send(()).unwrap();
+
+        let events = state.event_user();
+        let wire = Wire::default();
+        let table = ClientTable {
+            client: Arc::new(tokio::sync::Mutex::new(Locked {
+                state,
+                drain,
+                wire: wire.clone(),
+            })),
+            destroyed: db.pv_destroyed_events(),
+            access,
+            outbox,
+            peer: PEER.parse().unwrap(),
+        };
+        let (task_tx, task_rx) = tokio::sync::mpsc::unbounded_channel();
+        while let Ok(msg) = ctl_rx.try_recv() {
+            task_tx.send(msg).unwrap();
+        }
+        let mut task = std::pin::pin!(run_event_task(
+            events,
+            task_rx,
+            table,
+            wire.clone(),
+            CircuitMinor::new(CA_MINOR_VERSION),
+        ));
+        // Run the event thread until it waits.
+        assert!(
+            task.as_mut()
+                .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+                .is_pending()
+        );
+        let sent = wire.0.lock().unwrap().clone();
+        assert_eq!(sent.first(), Some(&CA_PROTO_ACCESS_RIGHTS), "{sent:?}");
+        assert!(
+            sent.len() > 1 && sent[1..].iter().all(|&c| c == CA_PROTO_EVENT_ADD),
+            "the queued updates follow: {sent:?}"
+        );
+        drop(task_tx);
+        task.await;
+    }
+
+    /// Every frame read until `done` holds, as (command, cid word).
+    #[cfg(tokio_backend)]
+    async fn read_until(
+        client: &mut tokio::io::DuplexStream,
+        acc: &mut Vec<u8>,
+        seen: &mut Vec<(u16, u32)>,
+        done: impl Fn(&[(u16, u32)]) -> bool,
+    ) {
+        use tokio::io::AsyncReadExt;
+        let mut buf = [0u8; 256];
+        while !done(seen) {
+            let n = tokio::time::timeout(fact_budget::FACT_BUDGET, client.read(&mut buf))
+                .await
+                .expect("a frame within the budget")
+                .expect("read ok");
+            assert!(n > 0, "server closed: {seen:?}");
+            acc.extend_from_slice(&buf[..n]);
+            let mut at = 0;
+            while at + CaHeader::SIZE <= acc.len() {
+                let (hdr, size) = CaHeader::from_bytes_extended(&acc[at..]).unwrap();
+                if at + size + hdr.actual_postsize() > acc.len() {
+                    break;
+                }
+                seen.push((hdr.cmmd, hdr.cid));
+                at += size + hdr.actual_postsize();
+            }
+            acc.drain(..at);
+        }
+    }
+
+    /// A circuit whose loop is parked writing to a client that stopped
+    /// reading cannot take an ACF change's notice; a value posted after the
+    /// revoke still reaches that client only as a no-read-access event, as C
+    /// `read_reply` checks `asCheckGet` per event (`camessage.c:498`).
+    #[cfg(tokio_backend)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_value_posted_after_a_revoke_is_withheld_while_the_loop_is_parked() {
+        use super::non_graceful_disconnect_teardown_tests::{
+            create_chan_frame, event_add_frame, read_create_chan_sid, version_frame,
+        };
+        use crate::protocol::{CA_PROTO_ACCESS_RIGHTS, CA_PROTO_ECHO};
+        use std::time::Duration;
+        use tokio::io::AsyncWriteExt;
+
+        let db = Arc::new(PvDatabase::new());
+        let (acf, _, _, _, _) = open(&db).await;
+        let pv = db.find_pv("AR:LIVE").unwrap();
+        let stats = Arc::new(super::super::stats::ServerStats::default());
+        let (acf_tx, acf_rx) = broadcast::channel(4);
+        // Room for two 16-byte echo replies each way.
+        let (mut client, server_io) = tokio::io::duplex(32);
+        let server = tokio::spawn(handle_client(
+            server_io,
+            PEER.parse().unwrap(),
+            db.clone(),
+            acf.clone(),
+            acf_rx,
+            5064,
+            None,
+            None,
+            None,
+            None,
+            Some(stats.clone()),
+            #[cfg(feature = "cap-tokens")]
+            None,
+            #[cfg(feature = "cap-tokens")]
+            None,
+        ));
+
+        let (mut acc, mut seen) = (Vec::new(), Vec::new());
+        for frame in [version_frame(), create_chan_frame(1, "AR:LIVE")] {
+            client.write_all(&frame).await.unwrap();
+        }
+        let sid = read_create_chan_sid(&mut client, fact_budget::FACT_BUDGET).await;
+        client.write_all(&event_add_frame(sid, 0xAB)).await.unwrap();
+        read_until(&mut client, &mut acc, &mut seen, |s| {
+            s.iter().any(|&(c, _)| c == CA_PROTO_EVENT_ADD)
+        })
+        .await;
+        seen.clear();
+
+        // Stop reading and keep sending echoes: once the server no longer
+        // takes them, its loop is parked in a write to this client.
+        let echo = CaHeader::new(CA_PROTO_ECHO).to_bytes();
+        'park: loop {
+            let mut rest = &echo[..];
+            while !rest.is_empty() {
+                // absence-window: a parked loop takes nothing, so no reply can
+                // mark it parked.
+                match tokio::time::timeout(Duration::from_millis(300), client.write(rest)).await {
+                    Ok(n) => rest = &rest[n.unwrap()..],
+                    Err(_) => break 'park,
+                }
+            }
+        }
+
+        acf.install_async(parse_acf(NO_ACCESS).unwrap()).await;
+        acf_tx.send(()).unwrap();
+        let posted = stats.subscription_events_posted.load(Ordering::Relaxed);
+        pv.set(EpicsValue::Double(2.0));
+        // The delivery counts the post right before it checks read access.
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
+        while stats.subscription_events_posted.load(Ordering::Relaxed) == posted {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the post was never delivered"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // The loop, unparked, takes the notice and posts the denial too.
+        read_until(&mut client, &mut acc, &mut seen, |s| {
+            s.iter()
+                .skip_while(|&&(c, _)| c != CA_PROTO_ACCESS_RIGHTS)
+                .any(|&(c, _)| c == CA_PROTO_EVENT_ADD)
+        })
+        .await;
+        let events: Vec<u32> = seen
+            .iter()
+            .filter(|&&(c, _)| c == CA_PROTO_EVENT_ADD)
+            .map(|&(_, status)| status)
+            .collect();
+        assert!(
+            events.len() >= 2 && events.iter().all(|&s| s == ECA_NORDACCESS),
+            "every update after the revoke is a denial: {seen:?}"
+        );
+        server.abort();
+    }
+
+    /// An `INP*` value that turns a CALC rule off reaches the monitor's next
+    /// update, as C `asComputeAsg` recomputes the group's clients on the
+    /// event (`asCa.c:161`) that `read_reply`'s `asCheckGet` then reads.
+    #[cfg(tokio_backend)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_inp_change_that_revokes_read_reaches_the_next_update() {
+        use super::non_graceful_disconnect_teardown_tests::{
+            create_chan_frame, event_add_frame, read_create_chan_sid, version_frame,
+        };
+        use epics_base_rs::server::access_security::new_acf_cell_watching;
+        use epics_base_rs::server::records::ai::AiRecord;
+        use tokio::io::AsyncWriteExt;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_pv("AR:LIVE", EpicsValue::Double(1.5)).await.unwrap();
+        db.add_record("AR:GATE", Box::new(AiRecord::new(1.0)))
+            .await
+            .unwrap();
+        db.put_record_field_from_ca("AR:GATE", "VAL", EpicsValue::Double(1.0))
+            .await
+            .unwrap();
+        let acf = new_acf_cell_watching(None, &db);
+        acf.install_async(
+            parse_acf(r#"ASG(DEFAULT) { INPA("AR:GATE") RULE(1, READ) { CALC("A=1") } }"#).unwrap(),
+        )
+        .await;
+        let (_acf_tx, acf_rx) = broadcast::channel(4);
+        let (mut client, server_io) = tokio::io::duplex(4096);
+        let server = tokio::spawn(handle_client(
+            server_io,
+            PEER.parse().unwrap(),
+            db.clone(),
+            acf.clone(),
+            acf_rx,
+            5064,
+            None,
+            None,
+            None,
+            None,
+            None,
+            #[cfg(feature = "cap-tokens")]
+            None,
+            #[cfg(feature = "cap-tokens")]
+            None,
+        ));
+        for frame in [version_frame(), create_chan_frame(1, "AR:LIVE")] {
+            client.write_all(&frame).await.unwrap();
+        }
+        let sid = read_create_chan_sid(&mut client, fact_budget::FACT_BUDGET).await;
+        client.write_all(&event_add_frame(sid, 0xAB)).await.unwrap();
+        let (mut acc, mut seen) = (Vec::new(), Vec::new());
+        let updates = |s: &[(u16, u32)]| {
+            s.iter()
+                .filter(|&&(c, _)| c == CA_PROTO_EVENT_ADD)
+                .map(|&(_, status)| status)
+                .collect::<Vec<_>>()
+        };
+        read_until(&mut client, &mut acc, &mut seen, |s| !updates(s).is_empty()).await;
+        assert_eq!(updates(&seen), [ECA_NORMAL], "the initial value");
+
+        db.put_record_field_from_ca("AR:GATE", "VAL", EpicsValue::Double(0.0))
+            .await
+            .unwrap();
+        // The watcher takes the value on its own task, so post until an
+        // update carries the denial.
+        let pv = db.find_pv("AR:LIVE").unwrap();
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
+        for value in 2.. {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "none of {} updates after the INP change was a denial",
+                updates(&seen).len()
+            );
+            let before = updates(&seen).len();
+            pv.set(EpicsValue::Double(value as f64));
+            read_until(&mut client, &mut acc, &mut seen, |s| {
+                updates(s).len() > before
+            })
+            .await;
+            if updates(&seen).last() == Some(&ECA_NORDACCESS) {
+                break;
+            }
+        }
+        server.abort();
+    }
+
+    /// A `dbPut` of the record's ASG reaches the monitor's next update, as C
+    /// `asChangeGroup` recomputes the record's clients (`asDbLib.c:109`).
+    #[cfg(tokio_backend)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_asg_put_that_revokes_read_reaches_the_next_update() {
+        use super::non_graceful_disconnect_teardown_tests::{
+            create_chan_frame, event_add_frame, read_create_chan_sid, version_frame,
+        };
+        use epics_base_rs::server::records::ai::AiRecord;
+        use tokio::io::AsyncWriteExt;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("AR:REC", Box::new(AiRecord::new(1.0)))
+            .await
+            .unwrap();
+        let acf = new_acf_cell(Some(
+            parse_acf(
+                "ASG(DEFAULT) {\n    RULE(1, READ)\n}\nASG(LOCKED) {\n    RULE(1, NONE)\n}\n",
+            )
+            .unwrap(),
+        ));
+        let (_acf_tx, acf_rx) = broadcast::channel(4);
+        let (mut client, server_io) = tokio::io::duplex(4096);
+        let server = tokio::spawn(handle_client(
+            server_io,
+            PEER.parse().unwrap(),
+            db.clone(),
+            acf,
+            acf_rx,
+            5064,
+            None,
+            None,
+            None,
+            None,
+            None,
+            #[cfg(feature = "cap-tokens")]
+            None,
+            #[cfg(feature = "cap-tokens")]
+            None,
+        ));
+        for frame in [version_frame(), create_chan_frame(1, "AR:REC")] {
+            client.write_all(&frame).await.unwrap();
+        }
+        let sid = read_create_chan_sid(&mut client, fact_budget::FACT_BUDGET).await;
+        client.write_all(&event_add_frame(sid, 0xAB)).await.unwrap();
+        let (mut acc, mut seen) = (Vec::new(), Vec::new());
+        let updates = |s: &[(u16, u32)]| {
+            s.iter()
+                .filter(|&&(c, _)| c == CA_PROTO_EVENT_ADD)
+                .map(|&(_, status)| status)
+                .collect::<Vec<_>>()
+        };
+        read_until(&mut client, &mut acc, &mut seen, |s| !updates(s).is_empty()).await;
+        assert_eq!(updates(&seen), [ECA_NORMAL], "the initial value");
+        seen.clear();
+
+        db.put_record_field_from_ca("AR:REC", "ASG", EpicsValue::String("LOCKED".into()))
+            .await
+            .unwrap();
+        db.put_record_field_from_ca("AR:REC", "VAL", EpicsValue::Double(2.0))
+            .await
+            .unwrap();
+        read_until(&mut client, &mut acc, &mut seen, |s| !updates(s).is_empty()).await;
+        assert_eq!(
+            updates(&seen)[0],
+            ECA_NORDACCESS,
+            "the first update after the ASG put"
+        );
+        server.abort();
+    }
+}
+
+#[cfg(test)]
 mod clear_channel_revoke_tests {
     //! C `clear_channel_reply` runs `db_cancel_event` for every monitor on
     //! the channel before it writes the delete-confirmed echo
@@ -18522,7 +19549,7 @@ mod clear_channel_revoke_tests {
         let db = Arc::new(PvDatabase::new());
         db.add_pv("CC:VAL", EpicsValue::Double(1.5)).await.unwrap();
         let acf = epics_base_rs::server::access_security::new_acf_cell(None);
-        let mut state = ClientState::new(acf, 5064, db.clone());
+        let mut state = ClientState::new(acf, 5064, db.clone(), None);
         let (outbox, mut drain) = crate::server::outbox::channel();
         let peer: SocketAddr = "127.0.0.1:55991".parse().unwrap();
 
@@ -18621,8 +19648,10 @@ mod bind_tcp_set_tests {
     /// OS-picked number (`caservertask.c:266`), not just the first interface.
     #[tokio::test]
     async fn a_requested_port_held_on_a_later_interface_moves_every_interface() {
-        let held = std::net::TcpListener::bind((LO2, 0)).unwrap();
-        let port = held.local_addr().unwrap().port();
+        // Held, so no other socket on the box was handed the number on LO.
+        let held = named_port::HeldPort::tcp();
+        let port = held.port;
+        let _taken_on_lo2 = std::net::TcpListener::bind((LO2, port)).unwrap();
         let (listeners, bound) = bind_tcp_set(vec![LO, LO2], port).await.expect("bind");
         assert_ne!(bound, port);
         assert_eq!(ports(&listeners), [(LO, bound), (LO2, bound)]);
@@ -18669,5 +19698,387 @@ mod bind_tcp_set_tests {
     async fn an_empty_set_fails() {
         let r = bind_tcp_set(vec![Ipv4Addr::new(192, 0, 2, 1)], 0).await;
         assert!(r.is_err());
+    }
+}
+
+#[cfg(all(test, tokio_backend))]
+mod circuit_writer_tests {
+    //! What the peer and the operator see when the circuit's socket writer
+    //! fails or stops.
+    use super::*;
+    use crate::audit::{AuditLogger, AuditSink, AuditWriter};
+    use epics_base_rs::error::CaError;
+    use epics_base_rs::server::database::PvDatabase;
+    use epics_base_rs::types::EpicsValue;
+    use fact_budget::FACT_BUDGET;
+    use std::pin::Pin;
+    use std::sync::atomic::AtomicUsize;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncReadExt, DuplexStream, ReadBuf};
+    use tokio::sync::mpsc;
+
+    /// The server end of a circuit whose writes fail once `budget` more bytes
+    /// have been accepted.
+    struct Budgeted {
+        io: DuplexStream,
+        budget: Arc<AtomicUsize>,
+    }
+
+    impl AsyncRead for Budgeted {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.io).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for Budgeted {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let left = self.budget.load(Ordering::SeqCst);
+            if left == 0 {
+                return Poll::Ready(Err(std::io::Error::other("injected write failure")));
+            }
+            let take = buf.len().min(left);
+            let written = Pin::new(&mut self.io).poll_write(cx, &buf[..take]);
+            if let Poll::Ready(Ok(n)) = written {
+                self.budget.fetch_sub(n, Ordering::SeqCst);
+            }
+            written
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.io).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.io).poll_shutdown(cx)
+        }
+    }
+
+    /// The peer's end of a circuit, counting what it reads.
+    struct Peer {
+        io: DuplexStream,
+        received: usize,
+    }
+
+    impl AsyncRead for Peer {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let before = buf.filled().len();
+            let read = Pin::new(&mut self.io).poll_read(cx, buf);
+            self.received += buf.filled().len() - before;
+            read
+        }
+    }
+
+    impl AsyncWrite for Peer {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.io).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.io).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.io).poll_shutdown(cx)
+        }
+    }
+
+    /// Audit lines, in the order the logger wrote them.
+    struct Lines(mpsc::UnboundedSender<String>);
+
+    #[async_trait::async_trait]
+    impl AuditWriter for Lines {
+        async fn write_line(&self, line: &str) {
+            let _ = self.0.send(line.to_string());
+        }
+    }
+
+    struct Circuit {
+        client: Peer,
+        server: tokio::task::JoinHandle<CaResult<()>>,
+        audit: mpsc::UnboundedReceiver<String>,
+        budget: Arc<AtomicUsize>,
+        stats: Arc<super::super::stats::ServerStats>,
+        _acf_reload: broadcast::Sender<()>,
+    }
+
+    fn circuit(db: Arc<PvDatabase>, duplex: usize) -> Circuit {
+        let budget = Arc::new(AtomicUsize::new(usize::MAX));
+        let (lines, audit) = mpsc::unbounded_channel();
+        let logger = AuditLogger::new(
+            &epics_base_rs::runtime::task::Reactor::current().expect("test runtime"),
+            AuditSink::Custom(Box::new(Lines(lines))),
+        );
+        let (acf_reload, acf_reload_rx) = broadcast::channel::<()>(4);
+        let stats = Arc::new(super::super::stats::ServerStats::default());
+        let (client, server_io) = tokio::io::duplex(duplex);
+        let server = tokio::spawn(handle_client(
+            Budgeted {
+                io: server_io,
+                budget: budget.clone(),
+            },
+            "127.0.0.1:55501".parse().unwrap(),
+            db,
+            epics_base_rs::server::access_security::new_acf_cell(None),
+            acf_reload_rx,
+            5064,
+            None,
+            None,
+            Some(logger),
+            None,
+            Some(stats.clone()),
+            #[cfg(feature = "cap-tokens")]
+            None,
+            #[cfg(feature = "cap-tokens")]
+            None,
+        ));
+        Circuit {
+            client: Peer {
+                io: client,
+                received: 0,
+            },
+            server,
+            audit,
+            budget,
+            stats,
+            _acf_reload: acf_reload,
+        }
+    }
+
+    /// The circuit's `disconnect` audit line.
+    async fn disconnect_line(audit: &mut mpsc::UnboundedReceiver<String>) -> String {
+        loop {
+            let line = tokio::time::timeout(FACT_BUDGET, audit.recv())
+                .await
+                .expect("a disconnect audit line")
+                .expect("the audit logger is up");
+            if line.contains("\"ev\":\"disconnect\"") {
+                return line;
+            }
+        }
+    }
+
+    /// One whole frame: its header and its payload.
+    async fn read_frame(client: &mut Peer) -> (CaHeader, Vec<u8>) {
+        let mut head = vec![0u8; CaHeader::SIZE];
+        tokio::time::timeout(FACT_BUDGET, client.read_exact(&mut head))
+            .await
+            .expect("a frame within the budget")
+            .expect("a frame header");
+        if u16::from_be_bytes([head[2], head[3]]) == 0xffff {
+            let mut ext = [0u8; 8];
+            client.read_exact(&mut ext).await.expect("extended header");
+            head.extend_from_slice(&ext);
+        }
+        let (hdr, _) = CaHeader::from_bytes_extended(&head).expect("header parses");
+        let mut payload = vec![0u8; hdr.actual_postsize()];
+        tokio::time::timeout(FACT_BUDGET, client.read_exact(&mut payload))
+            .await
+            .expect("a payload within the budget")
+            .expect("a frame payload");
+        (hdr, payload)
+    }
+
+    /// A circuit that subscribed `pv` as DBR_DOUBLE × `count` and read its
+    /// initial value.
+    async fn monitoring(c: &mut Circuit, pv: &str, count: u32) {
+        let (hdr, _) = read_frame(&mut c.client).await;
+        assert_eq!(hdr.cmmd, CA_PROTO_VERSION, "the greeting comes first");
+        c.client
+            .write_all(&super::non_graceful_disconnect_teardown_tests::version_frame())
+            .await
+            .expect("write VERSION");
+        c.client
+            .write_all(&super::non_graceful_disconnect_teardown_tests::create_chan_frame(1, pv))
+            .await
+            .expect("write CREATE_CHAN");
+        let sid = loop {
+            let (hdr, _) = read_frame(&mut c.client).await;
+            if hdr.cmmd == CA_PROTO_CREATE_CHAN {
+                break hdr.available;
+            }
+        };
+        let mut h = CaHeader::new(CA_PROTO_EVENT_ADD);
+        h.data_type = epics_base_rs::types::DBR_DOUBLE;
+        h.cid = sid;
+        h.available = 7;
+        h.set_payload_size(16, count, CA_MINOR_VERSION)
+            .expect("modern peer accepts the extended header");
+        let mut add = h.to_bytes().to_vec();
+        add.extend_from_slice(&[0; 12]);
+        add.extend_from_slice(&3u16.to_be_bytes());
+        add.extend_from_slice(&[0; 2]);
+        c.client.write_all(&add).await.expect("write EVENT_ADD");
+        loop {
+            let (hdr, _) = read_frame(&mut c.client).await;
+            if hdr.cmmd == CA_PROTO_EVENT_ADD {
+                return;
+            }
+        }
+    }
+
+    /// A circuit that ends while a monitor frame is half on the wire still
+    /// hands its peer the whole frame: a cut frame would leave a partial
+    /// message as the last thing the peer reads.
+    #[tokio::test]
+    async fn a_circuit_ending_mid_frame_finishes_the_frame_first() {
+        const COUNT: usize = 2000;
+        let db = Arc::new(PvDatabase::new());
+        db.add_pv("BIG", EpicsValue::DoubleArray(vec![0.0; COUNT].into()))
+            .await
+            .expect("add pv");
+        // A pipe far smaller than the frame, so the frame is still being
+        // written when the peer hangs up.
+        let mut c = circuit(db.clone(), 1024);
+        monitoring(&mut c, "BIG", COUNT as u32).await;
+
+        db.find_pv("BIG")
+            .expect("pv")
+            .set(EpicsValue::DoubleArray(vec![1.0; COUNT].into()));
+        let mut head = [0u8; CaHeader::SIZE];
+        tokio::time::timeout(FACT_BUDGET, c.client.read_exact(&mut head))
+            .await
+            .expect("the monitor frame starts within the budget")
+            .expect("the monitor frame's header");
+        let (hdr, _) = CaHeader::from_bytes_extended(&head).expect("header parses");
+        assert_eq!(hdr.cmmd, CA_PROTO_EVENT_ADD);
+        let payload = hdr.actual_postsize();
+        assert!(payload > 1024 * 2, "the frame must outsize the pipe");
+        c.client.shutdown().await.expect("hang up");
+
+        let mut rest = Vec::new();
+        tokio::time::timeout(FACT_BUDGET, c.client.read_to_end(&mut rest))
+            .await
+            .expect("the circuit closes within the budget")
+            .expect("read to the close");
+        assert_eq!(
+            rest.len(),
+            payload,
+            "the peer must read the frame's whole {payload}-byte payload before the close"
+        );
+    }
+
+    /// A peer that hangs up and stops reading mid-frame does not hold the
+    /// circuit's teardown: the writer gets the send timeout to finish the
+    /// frame, then is cut off.
+    #[tokio::test]
+    async fn a_circuit_ending_mid_frame_to_a_peer_that_stopped_reading_still_ends() {
+        const COUNT: usize = 2000;
+        let db = Arc::new(PvDatabase::new());
+        db.add_pv("BIG", EpicsValue::DoubleArray(vec![0.0; COUNT].into()))
+            .await
+            .expect("add pv");
+        let mut c = circuit(db.clone(), 1024);
+        monitoring(&mut c, "BIG", COUNT as u32).await;
+
+        db.find_pv("BIG")
+            .expect("pv")
+            .set(EpicsValue::DoubleArray(vec![1.0; COUNT].into()));
+        let mut head = [0u8; CaHeader::SIZE];
+        tokio::time::timeout(FACT_BUDGET, c.client.read_exact(&mut head))
+            .await
+            .expect("the monitor frame starts within the budget")
+            .expect("the monitor frame's header");
+        c.client.shutdown().await.expect("hang up");
+
+        tokio::time::timeout(send_timeout() + FACT_BUDGET, c.server)
+            .await
+            .expect("the circuit ends though its peer reads nothing more")
+            .expect("handle_client does not panic")
+            .expect("a hang-up ends the circuit cleanly");
+        // What the cut-off writer got onto the wire still counts.
+        let mut rest = Vec::new();
+        c.client
+            .read_to_end(&mut rest)
+            .await
+            .expect("read to the close");
+        assert_eq!(
+            c.stats.bytes_out.load(Ordering::Relaxed),
+            c.client.received as u64
+        );
+    }
+
+    /// Bytes a write put on the wire before it failed count in `bytes_out`:
+    /// the counter is what the peers got.
+    #[tokio::test]
+    async fn bytes_out_counts_what_reached_the_peer_before_a_write_failed() {
+        let db = Arc::new(PvDatabase::new());
+        db.add_pv("PV", EpicsValue::Double(0.0))
+            .await
+            .expect("add pv");
+        let mut c = circuit(db, 8192);
+        let (hdr, _) = read_frame(&mut c.client).await;
+        assert_eq!(hdr.cmmd, CA_PROTO_VERSION, "the greeting comes first");
+        // Less than the CREATE_CHAN replies, which then fail part way.
+        c.budget.store(20, Ordering::SeqCst);
+        c.client
+            .write_all(&super::non_graceful_disconnect_teardown_tests::version_frame())
+            .await
+            .expect("write VERSION");
+        c.client
+            .write_all(&super::non_graceful_disconnect_teardown_tests::create_chan_frame(1, "PV"))
+            .await
+            .expect("write CREATE_CHAN");
+
+        let mut rest = Vec::new();
+        tokio::time::timeout(FACT_BUDGET, c.client.read_to_end(&mut rest))
+            .await
+            .expect("the circuit closes within the budget")
+            .expect("read to the close");
+        assert_eq!(rest.len(), 20, "the failing write's part reached the peer");
+        assert_eq!(
+            c.stats.bytes_out.load(Ordering::Relaxed),
+            c.client.received as u64
+        );
+    }
+
+    /// A write failure met while answering a refused message ends the circuit
+    /// as the error it is, not as a peer that hung up.
+    #[tokio::test]
+    async fn a_write_failure_answering_a_refused_message_is_audited_as_an_error() {
+        let mut c = circuit(Arc::new(PvDatabase::new()), 8192);
+        let mut greeting = [0u8; CaHeader::SIZE];
+        tokio::time::timeout(FACT_BUDGET, c.client.read_exact(&mut greeting))
+            .await
+            .expect("the greeting within the budget")
+            .expect("the greeting");
+        c.budget.store(0, Ordering::SeqCst);
+        // Before its VERSION the peer is minor 0, so this ECHO is refused.
+        c.client
+            .write_all(&CaHeader::new(CA_PROTO_ECHO).to_bytes())
+            .await
+            .expect("write the ECHO");
+
+        let ended = tokio::time::timeout(FACT_BUDGET, c.server)
+            .await
+            .expect("the circuit ends within the budget")
+            .expect("handle_client does not panic");
+        match ended {
+            Err(CaError::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::Other, "{e}"),
+            other => panic!("the circuit must end on the write error, got {other:?}"),
+        }
+        let line = disconnect_line(&mut c.audit).await;
+        assert!(line.contains("\"result\":\"error\""), "{line}");
     }
 }

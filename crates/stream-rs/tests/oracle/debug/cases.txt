@@ -1,6 +1,7 @@
-# DebugInterface cases for run-debug.sh and tests/debug_interface.rs, tab
-# separated: case  record  link  options ('-' for none; "intr" makes the
-# record SCAN "I/O Intr" and processes nothing, "twice" processes twice)
+# DebugInterface cases for run-debug.sh and
+# tests/integration/debug_interface.rs, tab separated: case  record  link
+# options ('-' for none; "intr" makes the record SCAN "I/O Intr" and processes
+# nothing, "twice" processes twice)
 read_ok	ai	d.proto f debug	-
 mismatch	longin	d.proto m debug 3	-
 nul_output	ai	d.proto z debug	-

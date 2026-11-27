@@ -39,10 +39,10 @@ which softIoc caget caput camonitor cainfo
 
 ```bash
 # Rust client ↔ C softIoc
-cargo test -p epics-ca-rs --test interop_rust_client_c_ioc -- --test-threads=1
+cargo test -p epics-ca-rs --test integration interop_rust_client_c_ioc:: -- --test-threads=1
 
 # C tools (caget/caput/camonitor/cainfo) ↔ Rust softioc-rs
-cargo test -p epics-ca-rs --test interop_c_client_rust_ioc -- --test-threads=1
+cargo test -p epics-ca-rs --test integration interop_c_client_rust_ioc:: -- --test-threads=1
 
 # Both
 cargo test -p epics-ca-rs --tests -- --test-threads=1
@@ -71,7 +71,7 @@ sockets.
 ## 3. Load / failure tests
 
 ```bash
-cargo test -p epics-ca-rs --test stress_load -- --test-threads=1
+cargo test -p epics-ca-rs --test integration stress_load:: -- --test-threads=1
 ```
 
 `stress_load` covers:

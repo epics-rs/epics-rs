@@ -1,5 +1,6 @@
 // The standard converters of StreamFormatConverter.cc, called the way
-// StreamCore calls them, for tests/std_converters.rs (see run-c.sh).
+// StreamCore calls them, for tests/integration/std_converters.rs (see
+// run-c.sh).
 //
 // Each stdin line is mode<TAB>format<TAB>arg[<TAB>size]. The format starts
 // at its '%' (or the ')' of a field name). Mode p* parses it as an output
@@ -24,7 +25,8 @@
 #include "StreamError.h"
 
 // TimestampConverter::scanDouble fills the fields a format leaves out from
-// time(NULL); ORACLE_NOW pins it, as tests/timestamp_converter.rs pins its.
+// time(NULL); ORACLE_NOW pins it, as tests/integration/timestamp_converter.rs
+// pins its.
 extern "C" time_t time(time_t* t) {
     struct timespec ts;
     const char* now = getenv("ORACLE_NOW");

@@ -768,7 +768,7 @@ impl<H: StreamCoreHooks> StreamCore<H> {
         self.flags.set(self.flags.get() & !f);
     }
 
-    fn bus(&self) -> Option<Arc<BusInterface>> {
+    pub(crate) fn bus(&self) -> Option<Arc<BusInterface>> {
         self.businterface.borrow().clone()
     }
 

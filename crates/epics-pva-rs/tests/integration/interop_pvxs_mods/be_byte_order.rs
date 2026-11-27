@@ -1,0 +1,221 @@
+//! BE (big-endian) wire byte-order cross-impl interop.
+//!
+//! PVA frames carry a per-frame byte-order flag (control header
+//! bit 7) so both peers can talk BE or LE independent of host
+//! endian. The default in pvxs (and Rust) is LE. The wire-decode
+//! paths on each side must also accept the opposite endian when
+//! a peer signals it via SET_BYTE_ORDER (server → client) or
+//! flag on every frame (client → server).
+//!
+//! Two tests:
+//!
+//! - **Direction A**: Rust server with `wire_byte_order = Big`
+//!   hosts the complex_pv_matrix. `pvxget` (always LE on the
+//!   client side by default) reads each PV, asserts the formatted
+//!   output matches. Proves pvxs's client wire decoder handles a
+//!   BE server end-to-end.
+//!
+//! - **Direction B**: pvxs server with `Config::overrideSendBE(true)`
+//!   hosts the same matrix; Rust client reads each PV via name-
+//!   server search. Asserts decoded values match. Proves the Rust
+//!   client wire decoder handles a BE server.
+// The tests that drive a live server are `tokio_backend`-only, so on
+// `exec_backend` the fixtures and imports they share go unreferenced while the
+// rest of this file still runs. The default build lints it in full.
+#![cfg_attr(exec_backend, allow(dead_code, unused_imports))]
+
+// RTEMS-EXEC-MODEL-ALLOW(1): not run by the default nextest profile - this file is a module of `interop_pvxs` in the `integration` binary, whose tests `.config/nextest.toml`'s default-filter excludes.
+
+use super::interop_helpers::PvxsOutput;
+use super::interop_helpers::pv_builders::complex_pv_matrix;
+use super::interop_helpers::{PVXGET, pvxs_command, pvxs_lib_dir, require_pvxs};
+
+use epics_pva_rs::pvdata::ScalarValue;
+#[cfg(tokio_backend)]
+use epics_pva_rs::server_native::PvaServer;
+use epics_pva_rs::server_native::SharedSource;
+
+use std::process::Stdio;
+use std::sync::Arc;
+use std::time::Duration;
+
+fn env_key() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "DYLD_LIBRARY_PATH"
+    } else {
+        "LD_LIBRARY_PATH"
+    }
+}
+
+#[cfg(tokio_backend)]
+/// Direction A: Rust server emits BE wire, pvxget (LE client) reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interop_be_a_rust_server_emits_be_to_pvxget() {
+    let pvxget = require_pvxs(PVXGET);
+    let pvs = complex_pv_matrix();
+
+    let source = SharedSource::new();
+    for b in &pvs {
+        source.add(b.name, b.open());
+    }
+
+    // Build a server with wire_byte_order forced to Big.
+    let cfg = epics_pva_rs::server_native::PvaServerConfig {
+        wire_byte_order: epics_pva_rs::proto::ByteOrder::Big,
+        // The remaining fields come from the isolated() defaults —
+        // ephemeral TCP port, ephemeral UDP, beacon off.
+        tcp_port: 0,
+        ..epics_pva_rs::server_native::PvaServerConfig::isolated()
+    };
+    let server = PvaServer::start(Arc::new(source), cfg).expect("server start");
+    let addr = server.tcp_addr();
+    let server_str = format!("127.0.0.1:{}", addr.port());
+
+    // Sample subset — one PV per category covers every fixed-width
+    // type plus an array, an enum, and a struct array. Keeps the
+    // test fast; the complete matrix is covered by the existing
+    // LE forward + reverse interop.
+    let cases: &[(&str, &[&str])] = &[
+        ("T:STR", &[r#"value string = "hello world""#]),
+        ("T:INT", &["value int32_t = -12345"]),
+        ("T:LONG", &["value int64_t = 9000000000"]),
+        ("T:DBL", &["value double = 123.457"]),
+        ("T:WF:DBL", &["1.5", "2.5", "3.5"]),
+        ("T:WF:INT", &["7", "8", "9", "10"]),
+        ("T:ENUM", &["value.index int32_t = 2"]),
+        (
+            "T:SA",
+            &[
+                "x int32_t = 1",
+                r#"y string = "alpha""#,
+                "x int32_t = 3",
+                r#"y string = "gamma""#,
+            ],
+        ),
+    ];
+
+    let mut failures: Vec<String> = Vec::new();
+    for (pv, needles) in cases {
+        let pvxget = pvxget.clone();
+        let server_str = server_str.clone();
+        let pv_s = pv.to_string();
+        let lib = pvxs_lib_dir().into_os_string();
+        let out = tokio::task::spawn_blocking(move || {
+            pvxs_command(&pvxget)
+                .arg("-w")
+                .arg("3")
+                .arg(&pv_s)
+                .env("EPICS_PVA_AUTO_ADDR_LIST", "NO")
+                .env("EPICS_PVA_NAME_SERVERS", &server_str)
+                .env(env_key(), lib)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .pvxs_output()
+                .expect("pvxget exec")
+        })
+        .await
+        .expect("join pvxget");
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        if !out.status.success() {
+            failures.push(format!(
+                "[BE A {pv}] pvxget exit={:?}\n  stdout: {stdout}\n  stderr: {stderr}",
+                out.status,
+            ));
+            continue;
+        }
+        for needle in *needles {
+            if !stdout.contains(needle) {
+                failures.push(format!(
+                    "[BE A {pv}] missing {needle:?}\n  stdout: {stdout}"
+                ));
+            }
+        }
+    }
+
+    server.stop();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    assert!(
+        failures.is_empty(),
+        "{} BE direction-A failure(s):\n{}",
+        failures.len(),
+        failures.join("\n----\n"),
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interop_be_b_rust_client_decodes_pvxs_be_server() {
+    super::interop_helpers::require_cxx();
+    let helper = super::interop_helpers::cpp_helper("be_reverse_server");
+
+    let ready = super::interop_helpers::ReadyFile::new("be_rev_ready");
+
+    let (srv, port) = super::interop_helpers::start_cpp_server(&helper, &ready, &[]);
+
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let client = epics_pva_rs::client_native::PvaClient::builder()
+        .timeout(Duration::from_secs(5))
+        .name_servers(vec![addr])
+        .build();
+
+    let mut failures: Vec<String> = Vec::new();
+
+    // T:STR
+    let v = client.pvget("T:STR").await;
+    match v {
+        Ok(decoded) => {
+            let want = ScalarValue::String("hello world".into());
+            if !value_matches_scalar(&decoded, "value", &want) {
+                failures.push(format!("T:STR mismatch: {decoded:?}"));
+            }
+        }
+        Err(e) => failures.push(format!("T:STR pvget: {e:?}")),
+    }
+    // T:LONG  — int64 is the BE-sensitive case (8 bytes).
+    let v = client.pvget("T:LONG").await;
+    match v {
+        Ok(decoded) => {
+            let want = ScalarValue::Long(9_000_000_000_i64);
+            if !value_matches_scalar(&decoded, "value", &want) {
+                failures.push(format!("T:LONG mismatch: {decoded:?}"));
+            }
+        }
+        Err(e) => failures.push(format!("T:LONG pvget: {e:?}")),
+    }
+    // T:DBL  — 8-byte float (BE-sensitive).
+    let v = client.pvget("T:DBL").await;
+    match v {
+        Ok(decoded) => {
+            let want = ScalarValue::Double(123.456_789_f64);
+            if !value_matches_scalar(&decoded, "value", &want) {
+                failures.push(format!("T:DBL mismatch: {decoded:?}"));
+            }
+        }
+        Err(e) => failures.push(format!("T:DBL pvget: {e:?}")),
+    }
+
+    drop(srv);
+
+    assert!(
+        failures.is_empty(),
+        "{} BE direction-B failure(s):\n{}",
+        failures.len(),
+        failures.join("\n----\n"),
+    );
+}
+
+fn value_matches_scalar(
+    decoded: &epics_pva_rs::pvdata::PvField,
+    field: &str,
+    want: &ScalarValue,
+) -> bool {
+    use epics_pva_rs::pvdata::PvField;
+    let PvField::Structure(s) = decoded else {
+        return false;
+    };
+    s.fields
+        .iter()
+        .find(|(n, _)| n == field)
+        .is_some_and(|(_, v)| matches!(v, PvField::Scalar(sv) if sv == want))
+}

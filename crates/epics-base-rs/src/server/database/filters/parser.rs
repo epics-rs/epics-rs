@@ -240,6 +240,28 @@ pub struct ChannelName {
     pub json_suffix: Option<String>,
 }
 
+impl ChannelName {
+    /// C `dbChannelFinalFieldType` of this channel over a field
+    /// `dbNameToAddr` types `field_type`: the DBR type it is served as,
+    /// `DBR_CHAR` at a `$` address (`dbAccess.c:690-695`), unless a filter
+    /// of `chain`, this channel's suffix parsed, puts its own in place
+    /// (`dbChannel.c:577-621`).
+    pub(crate) fn final_field_type_through(
+        &self,
+        field_type: crate::types::DbfCode,
+        chain: Option<&FilterChain>,
+    ) -> crate::types::DbfCode {
+        let served = if self.string_view {
+            crate::types::DbfCode::Char
+        } else {
+            field_type.dbr_code()
+        };
+        chain
+            .and_then(FilterChain::log_type)
+            .map_or(served, crate::types::DbFieldType::dbf_code)
+    }
+}
+
 /// Whether a channel's field text can name a field at all. C
 /// `dbFindFieldPart` finds the declaration with `strncmp` (and
 /// `dbGetRecordAttribute` the attribute with `strcmp`), so the spelling must be

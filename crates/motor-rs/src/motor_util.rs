@@ -16,10 +16,10 @@ use epics_base_rs::error::eca::ECA_TIMEOUT;
 use epics_base_rs::runtime::log::errlog_vprintf;
 use epics_base_rs::runtime::sync::mpsc;
 use epics_base_rs::runtime::task::{
-    BlockingBridge, StackSizeClass, ThreadPriority, block_on_sync, spawn_dedicated_thread, timeout,
+    BlockingBridge, StackSizeClass, ThreadPriority, spawn_dedicated_thread, timeout,
 };
 use epics_base_rs::server::database::{
-    CaClientContext, ClientChannel, ClientSubscription, Connection, PvDatabase,
+    CaClientContext, ClientChannel, Connection, PvDatabase, QueuedSubscription,
 };
 use epics_base_rs::server::iocsh::registry::*;
 use epics_base_rs::server::snapshot::Snapshot;
@@ -121,19 +121,14 @@ impl Ca {
         ch: &Chan,
         dbr_type: u16,
         f: impl Fn(Snapshot) -> Msg + Send + Sync + 'static,
-    ) -> Option<ClientSubscription> {
+    ) -> Option<QueuedSubscription> {
         let tx = self.tx.clone();
-        let callback = Box::new(move |s| {
-            // The wait for room holds the delivering thread; a reactor
-            // worker that may not block drops the value.
-            if let Err(mpsc::error::TrySendError::Full(msg)) = tx.try_send(f(s)) {
-                let _ = block_on_sync(tx.send(msg));
-            }
+        let sub = QueuedSubscription::new(&**ch, dbr_type, 1, DBE_DEFAULT, tx, move |s, queue| {
+            queue.send(f(s));
         });
         // C answers a failed ca_add_event with ca_task_exit and then goes on
         // searching on the context it destroyed; only this monitor is lost.
-        self.run(ch.subscribe(dbr_type, 1, DBE_DEFAULT, callback))
-            .ok()
+        self.run(sub).ok()
     }
 
     /// `ca_put`, issued and not waited on.
@@ -391,4 +386,62 @@ pub fn motor_util_commands() -> [CommandDef; 3] {
             },
         ),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The task thread panics in `moving` while a `.DMOV` value waits for
+    /// room in the queue only that thread reads; its unwind, which drops
+    /// the monitors before the queue, ends.
+    #[epics_base_rs::epics_test]
+    async fn a_task_panic_with_a_value_waiting_for_room_unwinds() {
+        use epics_base_rs::server::ioc_builder::IocBuilder;
+
+        let (db, _) = IocBuilder::new()
+            .db_string("record(ao, \"X\") {}\n", &std::collections::HashMap::new())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let (tx, rx) = mpsc::channel(1);
+        let ca = Ca {
+            ctx: db.ca_client(),
+            bridge: BlockingBridge::capture(),
+            tx,
+        };
+        let (took_tx, mut took) = mpsc::unbounded_channel();
+        let (panic_now, panic_signal) = std::sync::mpsc::channel::<()>();
+        let (unwound_tx, unwound) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let task = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let _queue = rx;
+                let ch = ca.get_ch_id("X").expect("X is served here");
+                let _monitor = ca.monitor(&ch, DBR_SHORT, move |s| {
+                    let dmov = s.value.to_f64().unwrap() as i16;
+                    let _ = took_tx.send(dmov);
+                    Msg::Dmov(0, dmov)
+                });
+                let _ = panic_signal.recv();
+                panic!("moving panicked");
+            }));
+            let _ = unwound_tx.send(task.is_err());
+        });
+        let budget = fact_budget::FACT_BUDGET;
+        // The first value fills the queue; the next one waits for room.
+        assert_eq!(timeout(budget, took.recv()).await, Ok(Some(0)));
+        db.put_record_field_from_ca_no_notify("X", "VAL", EpicsValue::Double(1.0))
+            .await
+            .unwrap();
+        assert_eq!(timeout(budget, took.recv()).await, Ok(Some(1)));
+
+        panic_now.send(()).unwrap();
+        let unwound = unwound.recv_timeout(budget);
+        if unwound.is_err() {
+            // Nothing can make room in the queue the stuck thread owns.
+            std::mem::forget(db);
+        }
+        assert_eq!(unwound, Ok(true), "the task thread's unwind ended");
+    }
 }

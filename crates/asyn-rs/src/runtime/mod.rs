@@ -167,17 +167,11 @@ mod tokio_is_not_the_executor {
     fn epics_test_files_wait_through_the_seam_too() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
         let mut checked = 0usize;
-        for entry in std::fs::read_dir(&dir).expect("asyn-rs/tests") {
-            let path = entry.expect("directory entry").path();
-            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-                continue;
-            }
-            let src = std::fs::read_to_string(&path).expect("test source");
+        for (name, src) in source_guard::rust_sources(&dir) {
             if !src.contains("epics_test") {
                 continue;
             }
             checked += 1;
-            let name = path.file_name().unwrap().to_string_lossy().into_owned();
             for needle in NEEDLES {
                 assert_eq!(
                     src.matches(needle).count(),
@@ -188,6 +182,11 @@ mod tokio_is_not_the_executor {
                 );
             }
         }
-        assert!(checked > 0, "no #[epics_test] file found under {dir:?}");
+        // 42 today, all below `tests/`'s top level: a scan that stops
+        // descending finds a handful or none, not 30.
+        assert!(
+            checked >= 30,
+            "only {checked} #[epics_test] files found under {dir:?}"
+        );
     }
 }

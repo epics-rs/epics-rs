@@ -97,7 +97,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
+use epics_base_rs::error::DbStatus;
 use epics_base_rs::server::database::PvDatabase;
+use epics_base_rs::server::pv::{WriteForward, WriteHook};
 use epics_base_rs::types::EpicsValue;
 use epics_ca_rs::server::ServerStats;
 use tokio::sync::{Mutex, RwLock};
@@ -303,6 +305,13 @@ impl Stats {
         if p.is_empty() {
             return;
         }
+        // A client's write to a stat fails, as `gateServer::processStat`
+        // answers it `S_casApp_noSupport` (gateServer.cc:1864-1866). C has
+        // posted the written value by then (gateStat.cc:261-264); here it is
+        // never stored.
+        let refuse: WriteHook = Arc::new(|_write, _ctx| {
+            Box::pin(async { Err::<WriteForward, _>(DbStatus::CAS_APP_NO_SUPPORT) })
+        });
 
         for (suffix, init) in [
             ("totalPvs", EpicsValue::Long(0)),
@@ -378,7 +387,7 @@ impl Stats {
             ("loopCount", EpicsValue::Long(0)),
         ] {
             let pv = format!("{p}{suffix}");
-            if let Err(e) = db.add_pv(&pv, init).await {
+            if let Err(e) = db.add_pv_with_hook(&pv, init, refuse.clone()).await {
                 tracing::warn!(
                     pv = %pv,
                     error = %e,
@@ -864,6 +873,73 @@ mod tests {
         assert!(db.has_name("g:heartbeat").await);
         assert!(db.has_name("g:eventRate").await);
         assert!(db.has_name("g:existTestRate").await);
+    }
+
+    /// A stat PV is the gateway's to set: a client's caput fails with
+    /// `ECA_PUTFAIL` and leaves the value as it was.
+    // An in-process async `CaServer` needs the tokio reactor.
+    #[cfg(tokio_backend)]
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial(epics_env)]
+    async fn a_caput_to_a_stat_pv_fails_and_leaves_its_value() {
+        use epics_base_rs::error::CaError;
+        use epics_ca_rs::client::CaClient;
+        use epics_ca_rs::protocol::ECA_PUTFAIL;
+        use epics_ca_rs::server::CaServer;
+        use std::time::Duration;
+
+        let bound = Duration::from_secs(10);
+        let db = Arc::new(PvDatabase::new());
+        Stats::new("gw:".into()).publish_initial(&db).await;
+        let server = Arc::new(
+            CaServer::from_parts(
+                db.clone(),
+                0,
+                None,
+                epics_base_rs::server::access_security::new_acf_cell(None),
+                None,
+                None,
+            )
+            .await
+            .expect("CA server"),
+        );
+        // SAFETY: serialized on `epics_env`; no other thread reads or writes
+        // these vars meanwhile.
+        unsafe {
+            let port = server.udp_port();
+            std::env::set_var("EPICS_CA_ADDR_LIST", format!("127.0.0.1:{port}"));
+            std::env::set_var("EPICS_CA_AUTO_ADDR_LIST", "NO");
+            std::env::set_var("EPICS_CA_SERVER_PORT", port.to_string());
+        }
+        let serving = tokio::spawn({
+            let server = server.clone();
+            async move {
+                let _ = server.run().await;
+            }
+        });
+        let client = CaClient::new().await.expect("CA client");
+
+        let names = db.all_simple_pv_names();
+        assert!(names.len() > 20, "the stat PVs are published: {names:?}");
+        for name in names {
+            let channel = client.create_channel(name.as_bytes());
+            channel.wait_connected(bound).await.expect("connects");
+            let (_, before) = channel.get_with_timeout(bound).await.expect("get");
+
+            let put = channel
+                .put_with_timeout(&EpicsValue::Double(42.0), bound)
+                .await;
+            assert!(
+                matches!(put, Err(CaError::WriteFailed(ECA_PUTFAIL))),
+                "{name}: caput -c answered {put:?}"
+            );
+            channel
+                .put_no_callback(&EpicsValue::Double(43.0))
+                .expect("sent");
+            let (_, after) = channel.get_with_timeout(bound).await.expect("get");
+            assert_eq!(after, before, "{name}: a caput changed it");
+        }
+        serving.abort();
     }
 
     #[tokio::test]

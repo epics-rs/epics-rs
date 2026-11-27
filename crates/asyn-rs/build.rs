@@ -25,8 +25,8 @@ fn main() {
 
     // The workspace backend predicate, derived here the way `epics-libcom-rs`
     // (the original), `epics-base-rs`, `epics-ca-rs` and `epics-pva-rs` derive
-    // theirs. `tests/process_gate_tests.rs` drives the asyn record through a
-    // real CA server's put gate, and that server is reactor-backed.
+    // theirs. `tests/integration/process_gate_tests.rs` drives the asyn record
+    // through a real CA server's put gate, and that server is reactor-backed.
     //
     // A cfg set by a dependency's build script is not visible here, so the
     // fact arrives twice: from `EPICS_RS_BUILD_EXEC_BACKEND` and from the

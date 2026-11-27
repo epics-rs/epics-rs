@@ -1,8 +1,8 @@
-//! sequencer R2-2-9 `test/validate`, compiled by snc-rs from `build.rs` and
-//! run on epics-seq-rs: a companion module per program, the
-//! `testSupport.c` it includes ([`support`]), and the `epicsUnitTest.c`
-//! calls it makes ([`unit_test`]). `tests/validate.rs` runs each program as
-//! the validate `.t` scripts do and holds its results to C's.
+//! sequencer R2-2-9 `test/validate`, compiled by snc-rs from `build.rs` and run
+//! on epics-seq-rs: a companion module per program, the `testSupport.c` it
+//! includes ([`support`]), and the `epicsUnitTest.c` calls it makes
+//! ([`unit_test`]). `tests/integration/validate.rs` runs each program as the
+//! validate `.t` scripts do and holds its results to C's.
 
 pub mod seq_snc;
 pub mod stdlib;

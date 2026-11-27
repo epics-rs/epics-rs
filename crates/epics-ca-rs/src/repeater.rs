@@ -283,8 +283,9 @@ pub async fn ensure_repeater(repeater_port: u16) {
         return;
     }
 
-    // No repeater running — spawn one
-    spawn_repeater();
+    // No repeater running — spawn one. Off the reactor: the spawn waits out
+    // the child's O(OPEN_MAX) descriptor loop, 128 ms at OPEN_MAX 2^20.
+    let _ = epics_base_rs::runtime::task::spawn_blocking(spawn_repeater).await;
 
     // Give it a moment to start, then register
     epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(50)).await;
@@ -367,22 +368,34 @@ fn spawn_repeater() {
 
     // Fallback: run repeater in-process on a background thread.
     // This ensures beacon reception works even without the external binary.
-    std::thread::spawn(|| {
-        // C's in-process fallback is `caRepeaterThread` (`repeater.cpp:632`),
-        // which registers with the watchdog before entering `ca_repeater()`.
-        // Unbounded: the loop parks on `recv_from`, and a host with no CA
-        // traffic is quiet rather than wedged.
-        let _watched = epics_base_rs::runtime::taskwd::taskwd_insert(
-            "CAC-repeater",
-            epics_base_rs::runtime::taskwd::CheckIn::Unbounded,
-            None,
+    // C `udpiiu.cpp:639`: its own name and band, not the calling thread's.
+    use epics_base_rs::runtime::task::{StackSizeClass, ThreadPriority, spawn_dedicated_thread};
+    let started = spawn_dedicated_thread(
+        "CAC-repeater".to_string(),
+        ThreadPriority::Low,
+        StackSizeClass::Medium,
+        || {
+            // C's in-process fallback is `caRepeaterThread` (`repeater.cpp:632`),
+            // which registers with the watchdog before entering `ca_repeater()`.
+            // Unbounded: the loop parks on `recv_from`, and a host with no CA
+            // traffic is quiet rather than wedged.
+            let _watched = epics_base_rs::runtime::taskwd::taskwd_insert(
+                "CAC-repeater",
+                epics_base_rs::runtime::taskwd::CheckIn::Unbounded,
+                None,
+            );
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("repeater runtime");
+            let _ = rt.block_on(run_repeater());
+        },
+    );
+    if started.is_err() {
+        epics_base_rs::stderr_println!(
+            "caStartRepeaterIfNotInstalled : unable to create CA repeater daemon thread"
         );
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("repeater runtime");
-        let _ = rt.block_on(run_repeater());
-    });
+    }
 }
 
 /// The daemon `osiSpawnDetachedProcess` starts, with null stdio. It outlives
@@ -445,6 +458,8 @@ fn spawn_detached(bin: &std::path::Path) -> bool {
 /// Unix: every descriptor past stdio closes at exec, as C closes them
 /// (posix/osdProcess.c:110-126); std marks its own CLOEXEC, not those our
 /// parent left us. Marked rather than closed, so std's exec-error pipe works.
+/// On Linux the daemon starts on SCHED_OTHER, as C drops a client's
+/// SCHED_FIFO before exec (posix/osdProcess.c:128-137).
 #[cfg(not(windows))]
 fn spawn_detached(bin: &std::path::Path) -> bool {
     use std::os::unix::process::CommandExt;
@@ -455,12 +470,17 @@ fn spawn_detached(bin: &std::path::Path) -> bool {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    // SAFETY: the hook only calls fcntl, which is async-signal-safe.
+    // SAFETY: the hook only calls fcntl and sched_setscheduler, plain
+    // syscalls that take no lock, on a parameter built before the fork.
     unsafe {
+        #[cfg(target_os = "linux")]
+        let other: libc::sched_param = std::mem::zeroed();
         cmd.pre_exec(move || {
             for fd in 3..open_max as libc::c_int {
                 libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
             }
+            #[cfg(target_os = "linux")]
+            libc::sched_setscheduler(0, libc::SCHED_OTHER, &other);
             Ok(())
         });
     }
@@ -723,7 +743,9 @@ mod tests {
                     // not turn into a flake.
                     let mut confirm = tokio::task::spawn_blocking(move || {
                         let register = CaHeader::new(CA_PROTO_REPEATER_REGISTER).to_bytes();
-                        let deadline = Instant::now() + Duration::from_secs(5);
+                        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(
+                            Duration::from_secs(5),
+                        );
                         let mut buf = [0u8; 64];
                         while Instant::now() < deadline && !stopped.load(Ordering::Relaxed) {
                             let _ = client.send_to(&register, ("127.0.0.1", free_port));
@@ -856,5 +878,200 @@ mod tests {
             ready
         };
         assert_eq!(ready, 1, "the daemon holds the write end");
+    }
+
+    /// With no daemon binary to spawn, C starts the repeater on a thread
+    /// `epicsThreadShowAll` lists as `CAC-repeater` at `epicsThreadPriorityLow`,
+    /// 10 (`udpiiu.cpp:639`), whatever thread the client called from.
+    #[test]
+    fn the_in_process_repeater_is_listed_as_cac_repeater_at_low() {
+        use std::time::{Duration, Instant};
+        let exe = std::env::current_exe().unwrap();
+        let daemon = exe.with_file_name(format!("ca-repeater-rs{}", std::env::consts::EXE_SUFFIX));
+        assert!(
+            !daemon.exists(),
+            "a sibling {daemon:?} would take the daemon arm"
+        );
+        // RTEMS-EXEC-MODEL-ALLOW(1): the module is tokio_backend-only
+        // (lib.rs), so it never builds on the exec backend.
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("client runtime");
+
+        // Another process can take, or answer on, a probed port before this
+        // one's repeater binds it; a fresh port is a fresh attempt.
+        for _ in 0..5 {
+            let port = StdUdpSocket::bind("127.0.0.1:0")
+                .and_then(|s| s.local_addr())
+                .expect("probe port")
+                .port();
+            // SAFETY: nextest runs each test in its own process.
+            unsafe { std::env::set_var("EPICS_CA_REPEATER_PORT", port.to_string()) };
+
+            rt.block_on(ensure_repeater(port));
+
+            let deadline =
+                epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
+            while Instant::now() < deadline {
+                if let Some(row) = epics_base_rs::runtime::task::thread_by_name("CAC-repeater")
+                    && rt.block_on(try_register(port)).is_ok()
+                {
+                    assert_eq!(row.epics_priority(), 10, "epicsThreadPriorityLow");
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        panic!("no CAC-repeater thread is listed and serving registrations");
+    }
+
+    /// A client thread on SCHED_FIFO starts the daemon on SCHED_OTHER.
+    /// Excluded from `profile.ci` by name: it fails, not skips, where the
+    /// process may not have SCHED_FIFO.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_daemon_started_from_a_fifo_thread_runs_sched_other() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("policy");
+        let daemon = dir.path().join("daemon");
+        // Field 41 of /proc/<pid>/stat is the policy: 0 SCHED_OTHER, 1 SCHED_FIFO.
+        std::fs::write(
+            &daemon,
+            format!(
+                "#!/bin/sh\ncut -d' ' -f41 /proc/$$/stat > '{0}.tmp' && mv '{0}.tmp' '{0}'\n",
+                out.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&daemon, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (fifo, spawned) = std::thread::spawn(move || {
+            // SAFETY: a plain C struct, valid all-zero.
+            let mut param: libc::sched_param = unsafe { std::mem::zeroed() };
+            param.sched_priority = 1;
+            // SAFETY: this thread, with a stack-local param.
+            let fifo = unsafe {
+                libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_FIFO, &param)
+            };
+            (fifo, fifo == 0 && spawn_detached(&daemon))
+        })
+        .join()
+        .unwrap();
+        assert_eq!(
+            fifo, 0,
+            "this pin needs root or a non-zero RLIMIT_RTPRIO; without it the reset is unverified"
+        );
+        assert!(spawned);
+
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
+        let policy = loop {
+            if let Ok(policy) = std::fs::read_to_string(&out) {
+                break policy;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the daemon never reported its policy"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        assert_eq!(
+            policy.trim(),
+            "0",
+            "the daemon must run SCHED_OTHER (0), not the client's SCHED_FIFO (1)"
+        );
+    }
+
+    /// A client created on a current-thread runtime starts the repeater
+    /// daemon while that runtime's other tasks keep running, though the
+    /// spawn itself waits out the child's O(OPEN_MAX) descriptor loop.
+    ///
+    /// The daemon arm needs a sibling `ca-repeater-rs`, so the test re-runs
+    /// itself from a hard link that has one. Linux only: there the fd limit
+    /// can be raised until the spawn outlasts scheduling noise.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_client_runtime_keeps_running_while_the_daemon_starts() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+        const TEST: &str =
+            "repeater::tests::a_client_runtime_keeps_running_while_the_daemon_starts";
+        const ROLE: &str = "EPICS_RS_REPEATER_SIBLING_DIR";
+
+        let Some(dir) = std::env::var_os(ROLE).map(std::path::PathBuf::from) else {
+            let exe = std::env::current_exe().unwrap();
+            let dir = tempfile::tempdir_in(exe.parent().unwrap()).unwrap();
+            let link = dir.path().join(exe.file_name().unwrap());
+            std::fs::hard_link(&exe, &link).unwrap();
+            let daemon = dir.path().join("ca-repeater-rs");
+            let started = dir.path().join("started");
+            std::fs::write(&daemon, format!("#!/bin/sh\n: > '{}'\n", started.display())).unwrap();
+            std::fs::set_permissions(&daemon, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let out = std::process::Command::new(&link)
+                .args(["--exact", TEST, "--nocapture"])
+                .env(ROLE, dir.path())
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        };
+
+        // SAFETY: a plain C struct, valid all-zero; the calls take its address.
+        unsafe {
+            let mut nofile: libc::rlimit = std::mem::zeroed();
+            libc::getrlimit(libc::RLIMIT_NOFILE, &mut nofile);
+            nofile.rlim_cur = nofile.rlim_max;
+            libc::setrlimit(libc::RLIMIT_NOFILE, &nofile);
+        }
+        let begun = Instant::now();
+        assert!(spawn_detached(std::path::Path::new("/bin/sh")));
+        let spawn = begun.elapsed();
+
+        let port = StdUdpSocket::bind("127.0.0.1:0")
+            .and_then(|s| s.local_addr())
+            .expect("probe port")
+            .port();
+        // SAFETY: this process runs this one test and has no other thread yet.
+        unsafe {
+            std::env::set_var("EPICS_CA_REPEATER_PORT", port.to_string());
+            std::env::set_var("EPICS_CA_ADDR_LIST", "");
+            std::env::set_var("EPICS_CA_AUTO_ADDR_LIST", "NO");
+        }
+        // RTEMS-EXEC-MODEL-ALLOW(1): the module is tokio_backend-only
+        // (lib.rs), so it never builds on the exec backend.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("client runtime");
+        let started = dir.join("started");
+        let longest = rt.block_on(async {
+            let _client = crate::client::CaClient::new().await.expect("CA client");
+            let deadline =
+                epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
+            let mut longest = Duration::ZERO;
+            let mut last = Instant::now();
+            loop {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                let now = Instant::now();
+                longest = longest.max(now - last);
+                last = now;
+                if started.exists() {
+                    return longest;
+                }
+                assert!(now < deadline, "the client never started the daemon");
+            }
+        });
+        assert!(
+            longest < spawn / 2,
+            "the client's runtime stood still for {longest:?} while the daemon \
+             started; the spawn alone takes {spawn:?}"
+        );
     }
 }

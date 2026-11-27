@@ -680,7 +680,7 @@ mod tests {
 
     /// Waits for `log` to hold `n` polls.
     async fn logged<T>(log: &Mutex<Vec<T>>, n: usize) {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(10));
         while log.lock().unwrap().len() < n {
             assert!(Instant::now() < deadline, "{n} polls never ran");
             tokio::time::sleep(Duration::from_millis(1)).await;
@@ -1050,7 +1050,8 @@ mod tests {
         let passes = |n: usize| {
             let log = log.clone();
             async move {
-                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                let deadline =
+                    epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(10));
                 while log.lock().unwrap().len() < n && std::time::Instant::now() < deadline {
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }

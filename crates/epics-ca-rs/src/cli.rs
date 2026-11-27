@@ -20,14 +20,13 @@ pub const DEFAULT_CLI_TIMEOUT_SECS: f64 = 1.0;
 /// straight to `ca_pend_io` / `ca_pend_event`, where a value of `0.0`
 /// waits forever — `ca_pend_io(0)` calls `pendIO(DBL_MAX)` and
 /// `ca_pend_event(0)` loops `pendEvent(60.0)` without end (EPICS base
-/// `access.cpp:495-498,468-474`). A far-future finite `Duration`
-/// (≈10 years) reproduces that "0 == forever" without an `Option`,
-/// keeping the `Duration`-typed client API (`wait_connected`,
-/// `get_with_timeout`, `put_with_timeout`) unchanged; it is effectively
-/// unbounded for any CLI session and stays well inside tokio's timer
-/// range, so arming a `timeout` / `sleep` with it does not overflow.
-pub const INDEFINITE_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(10 * 365 * 24 * 60 * 60);
+/// `access.cpp:495-498,468-474`). The runtime's one "never",
+/// [`epics_base_rs::runtime::time::FAR_FUTURE`] (≈30 years), reproduces
+/// that "0 == forever" without an `Option`, keeping the `Duration`-typed
+/// client API (`wait_connected`, `get_with_timeout`, `put_with_timeout`)
+/// unchanged; it is tokio's own far-future offset, so arming a `timeout` /
+/// `sleep` with it does not overflow.
+pub const INDEFINITE_TIMEOUT: std::time::Duration = epics_base_rs::runtime::time::FAR_FUTURE;
 
 /// Deadline meaning "already expired", which is what a NEGATIVE `-w` (or
 /// `EPICS_CLI_TIMEOUT`) is in C (W10-B1).
@@ -108,8 +107,8 @@ pub fn env_default_timeout() -> f64 {
 /// through literally, so the guard against them stays — they resolve to
 /// [`DEFAULT_CLI_TIMEOUT_SECS`]. That guard is NOT the whole panic,
 /// though: `-w 1e300` is finite and positive, passes every check above,
-/// and `from_secs_f64` still panics above `u64::MAX` seconds. Such a value
-/// saturates to [`INDEFINITE_TIMEOUT`], which is what C does with it in
+/// and `from_secs_f64` still panics above `u64::MAX` seconds. Such a value,
+/// like any past [`INDEFINITE_TIMEOUT`], saturates to it, which is what C does with it in
 /// effect — `ca_pend_io(1e300)` returns when the I/O completes, never on
 /// the deadline.
 ///
@@ -131,7 +130,7 @@ pub fn timeout_duration(secs: f64) -> std::time::Duration {
     } else {
         DEFAULT_CLI_TIMEOUT_SECS
     };
-    std::time::Duration::try_from_secs_f64(s).unwrap_or(INDEFINITE_TIMEOUT)
+    crate::estdlib::duration_from_secs(s)
 }
 
 /// The C `connect_pvs` diagnostic for a connect timeout
@@ -1657,8 +1656,8 @@ mod tests {
         // so the saturated INDEFINITE_TIMEOUT is that outcome.
         assert_eq!(timeout_duration(1e300), INDEFINITE_TIMEOUT);
         assert_eq!(timeout_duration(u64::MAX as f64), INDEFINITE_TIMEOUT);
-        // The representable edge stays representable.
-        assert_eq!(timeout_duration(9.0e18).as_secs_f64(), 9.0e18);
+        // Representable, but past the cap.
+        assert_eq!(timeout_duration(1e19), INDEFINITE_TIMEOUT);
     }
 
     /// Sane positive values pass through unchanged.

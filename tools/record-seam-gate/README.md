@@ -39,7 +39,7 @@ runtime, so it is correct on either executor.
 Each crate names a **directory**, not a set of files:
 
 ```rust
-// crates/std-rs/tests/record_seam_gate.rs
+// crates/std-rs/tests/integration/record_seam_gate.rs
 record_seam_gate::assert_no_ambient_seam_in_tree(
     env!("CARGO_MANIFEST_DIR"),
     &["src/records", "src/device_support"],
@@ -72,10 +72,11 @@ and the throttle one began panicking the moment its caller moved onto the
 callback pool.
 
 The answer to "the same rule in three crates" is not three copies of it. Each
-crate keeps a short `tests/record_seam_gate.rs` (for `epics-base-rs`, a module
-in `server/mod.rs`) naming *its own* roots and exemptions; the rule and its
-message live here once. The production slice it runs on is one level further
-down, in `source-guard`, shared with every other source guard in the workspace.
+crate keeps a short `tests/integration/record_seam_gate.rs` (for
+`epics-base-rs`, a module in `server/mod.rs`) naming *its own* roots and
+exemptions; the rule and its message live here once. The production slice it
+runs on is one level further down, in `source-guard`, shared with every other
+source guard in the workspace.
 
 ## Testing
 

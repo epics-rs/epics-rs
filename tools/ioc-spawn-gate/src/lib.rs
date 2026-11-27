@@ -215,10 +215,33 @@ fn code_only(line: &str, in_block: &mut bool) -> String {
 ///
 /// A token inside a string literal counts only when the literal holds no
 /// whitespace: `which("softIoc")` and `"/opt/epics/bin/softIoc"` are program
-/// names, `"... clears UDF at init (softIoc: UDF 0)"` is a sentence about one.
+/// names, `"... clears UDF at init (softIoc: UDF 0)"` is a sentence about one,
+/// and `"x_softioc::child"` is the path of a test a binary re-runs itself for.
 /// Outside a string literal the token is an identifier -- `spawn_softioc`,
 /// `SOFT_IOC_PVX` -- and always counts.
 fn names_ioc_program(code: &str, tokens: &BTreeSet<String>) -> bool {
+    let (outside, literals) = split_literals(code);
+    let outside = outside.to_ascii_lowercase();
+    if tokens.iter().any(|t| outside.contains(t.as_str())) {
+        return true;
+    }
+    let rust_path = |lit: &str| {
+        lit.contains("::")
+            && lit
+                .split("::")
+                .all(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_alphanumeric() || c == '_'))
+    };
+    literals.iter().any(|lit| {
+        !lit.chars().any(char::is_whitespace) && !rust_path(lit) && {
+            let lower = lit.to_ascii_lowercase();
+            tokens.iter().any(|t| lower.contains(t.as_str()))
+        }
+    })
+}
+
+/// One line of code as the text outside its string literals, and the
+/// literals.
+fn split_literals(code: &str) -> (String, Vec<String>) {
     let mut outside = String::new();
     let mut literals: Vec<String> = Vec::new();
     let mut current = String::new();
@@ -248,16 +271,7 @@ fn names_ioc_program(code: &str, tokens: &BTreeSet<String>) -> bool {
     if in_str {
         literals.push(current);
     }
-    let outside = outside.to_ascii_lowercase();
-    if tokens.iter().any(|t| outside.contains(t.as_str())) {
-        return true;
-    }
-    literals.iter().any(|lit| {
-        !lit.chars().any(char::is_whitespace) && {
-            let lower = lit.to_ascii_lowercase();
-            tokens.iter().any(|t| lower.contains(t.as_str()))
-        }
-    })
+    (outside, literals)
 }
 
 /// The `std::process` / `tokio::process` items that start or hold a child,
@@ -495,7 +509,7 @@ fn command_bindings(stmt: &str, names: &ProcessNames, out: &mut BTreeSet<String>
     }
 }
 
-/// Does this file start a child process, and where?
+/// The statements of `code` that build or start a child process.
 ///
 /// The judgement is per STATEMENT, not per file. A method marker on its own
 /// is a name, not a spawn — `Failure::status`, `Response::status` and
@@ -507,7 +521,7 @@ fn command_bindings(stmt: &str, names: &ProcessNames, out: &mut BTreeSet<String>
 /// Constructing a resolved `Command` counts on its own, with no marker: a
 /// builder that hands the `Command` back spawns through its caller, and the
 /// caller is routinely a different file of the same closure.
-fn spawn_site(code: &str) -> bool {
+fn spawn_statements<'a>(stmts: &[Statement<'a>], names: &ProcessNames) -> Vec<Statement<'a>> {
     // Assembled with `concat!` so the live scan cannot match this file on its
     // own marker table -- the same trick the sibling gate uses for its fixtures.
     const SPAWN_METHODS: [&str; 3] = [
@@ -515,35 +529,487 @@ fn spawn_site(code: &str) -> bool {
         concat!(".out", "put()"),
         concat!(".sta", "tus()"),
     ];
-    let names = resolve_process_names(code);
     let mut bound: BTreeSet<String> = BTreeSet::new();
-    for stmt in code.split(';') {
-        command_bindings(stmt, &names, &mut bound);
-        if constructs_command(stmt, &names) {
-            return true;
-        }
-        if !SPAWN_METHODS.iter().any(|m| stmt.contains(m)) {
-            continue;
-        }
-        if names_child_side(stmt, &names) || bound.iter().any(|b| has_path(stmt, b)) {
-            return true;
+    let mut out = Vec::new();
+    for &stmt in stmts {
+        command_bindings(stmt.text, names, &mut bound);
+        let starts = constructs_command(stmt.text, names)
+            || (SPAWN_METHODS.iter().any(|m| stmt.text.contains(m))
+                && (names_child_side(stmt.text, names)
+                    || bound.iter().any(|b| has_path(stmt.text, b))));
+        if starts {
+            out.push(stmt);
         }
     }
-    false
+    out
 }
 
-/// Does this file both name an IOC executable and spawn a process?
+/// One statement of a de-commented file: where it starts in the file, and
+/// the index of its first line among the file's code lines.
+#[derive(Debug, Clone, Copy)]
+struct Statement<'a> {
+    start: usize,
+    first_line: usize,
+    text: &'a str,
+}
+
+/// `code` cut at each `;` and around each `fn` signature and body. A
+/// signature declares its name and parameters and uses neither, yet without
+/// its own cuts it shares a statement with the tail expression of the
+/// function above and with the first statement of its body: `fn
+/// the_softioc_case() { let out = Command::new("caget")` would be one
+/// statement. The cut at a body's `}` keeps an item after it out of the
+/// function's scope.
+fn statements<'a>(code: &'a str, fns: &Functions<'_>) -> Vec<Statement<'a>> {
+    // (where the cut is, how many bytes of `code` it drops)
+    let mut cuts: Vec<(usize, usize)> = code.match_indices(';').map(|(i, _)| (i, 1)).collect();
+    for f in &fns.sigs {
+        cuts.push((f.at, 0));
+        cuts.extend(f.open.map(|b| (b, 1)));
+        cuts.extend(f.close.map(|b| (b, 1)));
+    }
+    cuts.sort_unstable();
+    let mut out = Vec::new();
+    let (mut start, mut first_line) = (0, 0);
+    for (at, len) in cuts.into_iter().chain([(code.len(), 0)]) {
+        let at = at.max(start);
+        let text = &code[start..at];
+        out.push(Statement {
+            start,
+            first_line,
+            text,
+        });
+        first_line += text.matches('\n').count();
+        start = at + len;
+    }
+    out
+}
+
+fn is_ident_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// The identifier `text` starts with, if any.
+fn leading_ident(text: &str) -> &str {
+    let end = text.find(|c: char| !is_ident_char(c)).unwrap_or(text.len());
+    &text[..end]
+}
+
+/// The line of `code` that names an IOC program, else the first that uses a
+/// `visible` binding an IOC program reached.
+fn ioc_line(code: &str, tokens: &BTreeSet<String>, visible: &BTreeSet<&str>) -> Option<usize> {
+    code.split('\n')
+        .position(|line| names_ioc_program(line, tokens))
+        .or_else(|| {
+            without_let_patterns(code).split('\n').position(|line| {
+                let (outside, _) = split_literals(line);
+                visible.iter().any(|r| has_path(&outside, r))
+            })
+        })
+}
+
+fn names_ioc(code: &str, tokens: &BTreeSet<String>, visible: &BTreeSet<&str>) -> bool {
+    ioc_line(code, tokens, visible).is_some()
+}
+
+/// `stmt` with each `let` pattern blanked up to its `=`, lines kept: a
+/// pattern declares a name, and a shadowing `let out` does not use the `out`
+/// before it.
+fn without_let_patterns(stmt: &str) -> String {
+    let mut out = String::with_capacity(stmt.len());
+    let mut rest = stmt;
+    while let Some(i) = rest.find("let ") {
+        let boundary = rest[..i].chars().last().is_none_or(|c| !is_ident_char(c));
+        out.push_str(&rest[..i + 4]);
+        rest = &rest[i + 4..];
+        if !boundary {
+            continue;
+        }
+        let b = rest.as_bytes();
+        let eq = (0..b.len())
+            .find(|&j| {
+                b[j] == b'='
+                    && !matches!(b.get(j + 1), Some(b'=' | b'>'))
+                    && !(j > 0 && matches!(b[j - 1], b'=' | b'!' | b'<' | b'>'))
+            })
+            .unwrap_or(b.len());
+        out.extend(rest[..eq].chars().map(|c| if c == '\n' { c } else { ' ' }));
+        rest = &rest[eq..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Split the text after an opening bracket at its top-level commas, up to the
+/// bracket that closes it. Brackets inside string literals do not nest, and
+/// `<`/`>` nest only where `angle` says the text is a signature, since in a
+/// call's arguments they are comparisons.
+fn bracket_items(after_open: &str, angle: bool) -> Vec<&str> {
+    let mut items = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0;
+    let mut in_str = false;
+    let mut prev = '\0';
+    let mut escaped = false;
+    for (i, c) in after_open.char_indices() {
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_str = false;
+            }
+            prev = c;
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            '<' | '>' if !angle => {}
+            '>' if prev == '-' || prev == '=' => {}
+            '(' | '[' | '{' | '<' => depth += 1,
+            ')' | ']' | '}' | '>' if depth > 0 => depth -= 1,
+            ')' | ']' | '}' => {
+                items.push(&after_open[start..i]);
+                return items;
+            }
+            ',' if depth == 0 => {
+                items.push(&after_open[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        prev = c;
+    }
+    items.push(&after_open[start..]);
+    items
+}
+
+/// How far [`bracket_items`] read: its items, the comma after each but the
+/// last, and the closing bracket.
+fn bracket_len(items: &[&str]) -> usize {
+    items.iter().map(|s| s.len() + 1).sum()
+}
+
+/// The byte spans of a file's string and char literals, and the `}` that
+/// closes each `{` outside them.
+struct LiteralStructure {
+    literals: Vec<(usize, usize)>,
+    ends: BTreeMap<usize, usize>,
+}
+
+/// `None` when a literal or a brace of `code` is left open, which
+/// de-commenting line by line can cause.
+fn literal_structure(code: &str) -> Option<LiteralStructure> {
+    let b = code.as_bytes();
+    let ident = |j: usize| b[j].is_ascii_alphanumeric() || b[j] == b'_';
+    let (mut literals, mut ends, mut open) = (Vec::new(), BTreeMap::new(), Vec::new());
+    let mut i = 0;
+    while i < b.len() {
+        // `r"…"`, `r#"…"#`, `br"…"`: no escapes, closed by a quote and as
+        // many `#`s as opened it.
+        let standalone = i == 0 || !ident(i - 1) || (b[i - 1] == b'b' && (i == 1 || !ident(i - 2)));
+        if b[i] == b'r' && standalone {
+            let hashes = b[i + 1..].iter().take_while(|&&c| c == b'#').count();
+            if b.get(i + 1 + hashes) == Some(&b'"') {
+                let body = i + 2 + hashes;
+                let close = format!("\"{}", "#".repeat(hashes));
+                let end = body + code[body..].find(&close)? + close.len();
+                literals.push((i, end));
+                i = end;
+                continue;
+            }
+        }
+        match b[i] {
+            b'"' => {
+                let mut j = i + 1;
+                while *b.get(j)? != b'"' {
+                    j += if b[j] == b'\\' { 2 } else { 1 };
+                }
+                literals.push((i, j + 1));
+                i = j + 1;
+                continue;
+            }
+            b'\'' => {
+                // `'x'`, `'\''`, `'\u{7d}'`; a lifetime `'a` has no closing
+                // quote after its first character.
+                let rest = &code[i + 1..];
+                let content = if rest.starts_with('\\') {
+                    rest.get(2..).and_then(|r| r.find('\'')).map(|k| k + 2)
+                } else {
+                    rest.chars()
+                        .next()
+                        .map(char::len_utf8)
+                        .filter(|&n| rest[n..].starts_with('\''))
+                };
+                if let Some(n) = content {
+                    literals.push((i, i + n + 2));
+                    i += n + 2;
+                    continue;
+                }
+            }
+            b'{' => open.push(i),
+            b'}' => {
+                ends.insert(open.pop()?, i);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    open.is_empty()
+        .then_some(LiteralStructure { literals, ends })
+}
+
+/// The `fn`s one file defines, and which of them each byte belongs to.
+struct Functions<'a> {
+    sigs: Vec<FnSig<'a>>,
+    /// `false` when [`literal_structure`] could not delimit the bodies:
+    /// every name is then file-wide, which can over-count a spawner but
+    /// never miss one.
+    scoped: bool,
+}
+
+/// One `fn` this file defines.
+struct FnSig<'a> {
+    /// Where its `fn` keyword starts.
+    at: usize,
+    name: &'a str,
+    /// The identifier each non-`self` parameter binds, in order; `""` for a
+    /// parameter that binds a pattern instead of one name.
+    params: Vec<String>,
+    /// The `{` that opens its body; `None` for a declaration without one.
+    open: Option<usize>,
+    /// The `}` that closes it, where the file is [`Functions::scoped`].
+    close: Option<usize>,
+}
+
+impl<'a> Functions<'a> {
+    fn new(code: &'a str) -> Self {
+        let structure = literal_structure(code);
+        let in_literal = |at: usize| {
+            structure
+                .as_ref()
+                .is_some_and(|st| st.literals.iter().any(|&(s, e)| s <= at && at < e))
+        };
+        let mut sigs = fn_signatures(code);
+        sigs.retain(|f| !in_literal(f.at));
+        if let Some(st) = &structure {
+            for f in &mut sigs {
+                f.close = f.open.and_then(|o| st.ends.get(&o).copied());
+            }
+        }
+        Functions {
+            sigs,
+            scoped: structure.is_some(),
+        }
+    }
+
+    /// The function whose body holds byte `at`, innermost first; `None` for
+    /// an item outside every function, or for any byte of an unscoped file.
+    fn scope_at(&self, at: usize) -> Option<usize> {
+        self.sigs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, f)| Some((f.open?, f.close?, i)))
+            .filter(|&(open, close, _)| open < at && at <= close)
+            .max_by_key(|&(open, _, _)| open)
+            .map(|(_, _, i)| i)
+    }
+
+    /// The scope function `i`'s parameters are visible in.
+    fn param_scope(&self, i: usize) -> Option<usize> {
+        self.scoped.then_some(i)
+    }
+}
+
+fn fn_signatures(code: &str) -> Vec<FnSig<'_>> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(i) = code[from..].find("fn ") {
+        let at = from + i;
+        from = at + 3;
+        if code[..at].chars().last().is_some_and(is_ident_char) {
+            continue;
+        }
+        let name = leading_ident(&code[from..]);
+        if name.is_empty() {
+            continue;
+        }
+        let skip_space = |pos: usize| {
+            let rest = code.get(pos..).unwrap_or("");
+            pos + rest.len() - rest.trim_start().len()
+        };
+        let mut pos = skip_space(from + name.len());
+        if code.get(pos..).is_some_and(|r| r.starts_with('<')) {
+            pos = skip_space(pos + 1 + bracket_len(&bracket_items(&code[pos + 1..], true)));
+        }
+        if !code.get(pos..).is_some_and(|r| r.starts_with('(')) {
+            continue;
+        }
+        let items = bracket_items(&code[pos + 1..], true);
+        let params_end = pos + 1 + bracket_len(&items);
+        let params = items
+            .into_iter()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .filter(|p| {
+                let p = p.trim_start_matches('&').trim_start();
+                let p = p.strip_prefix("mut ").unwrap_or(p).trim_start();
+                leading_ident(p) != "self" && !p.starts_with('\'')
+            })
+            .map(|p| {
+                let p = p.strip_prefix("mut ").unwrap_or(p);
+                let ident = leading_ident(p);
+                let typed = p[ident.len()..].trim_start().starts_with(':');
+                if typed {
+                    ident.to_string()
+                } else {
+                    String::new()
+                }
+            })
+            .collect();
+        let open = code
+            .get(params_end..)
+            .and_then(|rest| rest.find(['{', ';']))
+            .map(|j| params_end + j)
+            .filter(|&j| code.as_bytes()[j] == b'{');
+        out.push(FnSig {
+            at,
+            name,
+            params,
+            open,
+            close: None,
+        });
+    }
+    out
+}
+
+/// The names each `let`, `const` or `static` in `stmt` binds. In a `let`
+/// pattern a capitalised word is a variant or a type (`Some(x)`), not a
+/// binding.
+fn bound_names(stmt: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for keyword in ["let ", "const ", "static "] {
+        for (at, _) in stmt.match_indices(keyword) {
+            if stmt[..at]
+                .chars()
+                .last()
+                .is_some_and(|c| is_ident_char(c) || c == '*')
+            {
+                continue; // `outlet `, `*const T`
+            }
+            let rest = &stmt[at + keyword.len()..];
+            if keyword != "let " {
+                let name = leading_ident(rest.strip_prefix("mut ").unwrap_or(rest));
+                if !name.is_empty() && name != "fn" {
+                    out.push(name.to_string());
+                }
+                continue;
+            }
+            let pattern = rest.split(['=', '\n']).next().unwrap_or_default();
+            let pattern = pattern.split(": ").next().unwrap_or_default();
+            out.extend(
+                pattern
+                    .split(|c: char| !is_ident_char(c))
+                    .filter(|w| w.starts_with(|c: char| c.is_lowercase() || c == '_'))
+                    .filter(|w| !matches!(*w, "mut" | "ref" | "_"))
+                    .map(str::to_string),
+            );
+        }
+    }
+    out
+}
+
+/// The calls in `stmt` to a function of this file, with their arguments.
+fn calls_into<'a, V>(stmt: &'a str, fns: &BTreeMap<&str, V>) -> Vec<(&'a str, Vec<&'a str>)> {
+    let mut out = Vec::new();
+    for (i, _) in stmt.match_indices('(') {
+        let head = &stmt[..i];
+        let start = head
+            .char_indices()
+            .rev()
+            .take_while(|(_, c)| is_ident_char(*c))
+            .last()
+            .map_or(i, |(s, _)| s);
+        let name = &stmt[start..i];
+        let defines = head[..start]
+            .trim_end()
+            .strip_suffix("fn")
+            .is_some_and(|b| b.chars().last().is_none_or(|c| !is_ident_char(c)));
+        if name.is_empty() || !fns.contains_key(name) || defines {
+            continue;
+        }
+        out.push((name, bracket_items(&stmt[i + 1..], false)));
+    }
+    out
+}
+
+/// A binding an IOC program reached, and the function it is local to;
+/// `None` for an item outside every function.
+type Reached = BTreeSet<(Option<usize>, String)>;
+
+/// The reached names a statement in `scope` can see.
+fn visible_in(reached: &Reached, scope: Option<usize>) -> BTreeSet<&str> {
+    reached
+        .iter()
+        .filter(|(s, _)| s.is_none() || *s == scope)
+        .map(|(_, name)| name.as_str())
+        .collect()
+}
+
+/// Every binding an IOC program reaches in this file: a `let`, `const` or
+/// `static` whose statement names one or a binding already reached, and a
+/// parameter of this file's function that a call hands one to. A name is
+/// local to the function that binds it; within one, it is not tracked by
+/// block, so a reach over-approximates.
+fn reached_bindings(
+    stmts: &[Statement<'_>],
+    fns: &Functions<'_>,
+    tokens: &BTreeSet<String>,
+) -> Reached {
+    let mut by_name: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for (i, sig) in fns.sigs.iter().enumerate() {
+        by_name.entry(sig.name).or_default().push(i);
+    }
+    let mut reached = Reached::new();
+    loop {
+        let before = reached.len();
+        for stmt in stmts {
+            let scope = fns.scope_at(stmt.start);
+            let mut found = Vec::new();
+            {
+                let visible = visible_in(&reached, scope);
+                if names_ioc(stmt.text, tokens, &visible) {
+                    found.extend(bound_names(stmt.text).into_iter().map(|n| (scope, n)));
+                }
+                for (name, args) in calls_into(stmt.text, &by_name) {
+                    for &i in &by_name[name] {
+                        for (param, arg) in fns.sigs[i].params.iter().zip(&args) {
+                            if !param.is_empty() && names_ioc(arg, tokens, &visible) {
+                                found.push((fns.param_scope(i), param.clone()));
+                            }
+                        }
+                    }
+                }
+            }
+            reached.extend(found);
+        }
+        if reached.len() == before {
+            return reached;
+        }
+    }
+}
+
+/// Where this file hands an IOC executable to a process it starts.
 ///
-/// Both halves are needed. A file that names `softIocPVX` without spawning is
-/// a helper constant; a file that spawns without naming one runs `pvxget` or
-/// `python3`. The two together is what puts an IOC on the host, and it is the
-/// granularity of the verdict anyway — the whole binary is capped or not.
-///
-/// "Spawns" is `spawn_site`: a resolved `process::Command` reached in one
-/// statement, never a method marker on its own.
+/// Naming an IOC and starting a process are not enough apart: a file that
+/// relaunches its own test binary and reads an IOC's source as text does both
+/// and starts no IOC. The name has to reach a statement that builds or starts
+/// a resolved `Command` — written there, or through a binding or parameter it
+/// reached. The evidence is that statement's line where it arrives.
 pub fn spawn_evidence(text: &str, tokens: &BTreeSet<String>) -> Option<String> {
     let mut code = String::with_capacity(text.len());
-    let mut lines: Vec<(usize, String, &str)> = Vec::new();
+    let mut lines: Vec<(usize, &str)> = Vec::new();
     let mut in_block = false;
     for (i, raw) in text.lines().enumerate() {
         let line = code_only(raw, &mut in_block);
@@ -552,15 +1018,21 @@ pub fn spawn_evidence(text: &str, tokens: &BTreeSet<String>) -> Option<String> {
         }
         code.push_str(&line);
         code.push('\n');
-        lines.push((i + 1, line, raw));
+        lines.push((i + 1, raw));
     }
-    if !spawn_site(&code) {
+    let fns = Functions::new(&code);
+    let stmts = statements(&code, &fns);
+    let spawns = spawn_statements(&stmts, &resolve_process_names(&code));
+    if spawns.is_empty() {
         return None;
     }
-    lines
-        .iter()
-        .find(|(_, line, _)| names_ioc_program(line, tokens))
-        .map(|(n, _, raw)| format!("{n}: {}", raw.trim()))
+    let reached = reached_bindings(&stmts, &fns, tokens);
+    spawns.iter().find_map(|stmt| {
+        let visible = visible_in(&reached, fns.scope_at(stmt.start));
+        let k = ioc_line(stmt.text, tokens, &visible)?;
+        let (n, raw) = lines[stmt.first_line + k];
+        Some(format!("{n}: {}", raw.trim()))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -576,16 +1048,21 @@ pub struct Spawner {
     /// library unit-test binary, whose name is a cargo-derived detail — those
     /// are required to be covered by a `package()` term instead.
     pub binary: Option<String>,
+    /// The top-level module of a merged `tests/<dir>/main.rs` binary, whose
+    /// tests nextest names `<module>::…` and `test(/^<module>::/)` selects;
+    /// `None` for a binary that is one unit.
+    pub module: Option<String>,
     /// The file and line that made it a spawner.
     pub evidence: String,
 }
 
 impl Spawner {
-    /// How the failure text names it.
+    /// How the failure text names it, in nextest's own `binary test` order.
     pub fn label(&self) -> String {
-        match &self.binary {
-            Some(b) => format!("{}::{b}", self.package),
-            None => format!("{} (lib tests)", self.package),
+        match (&self.binary, &self.module) {
+            (Some(b), Some(m)) => format!("{}::{b} {m}::", self.package),
+            (Some(b), None) => format!("{}::{b}", self.package),
+            (None, _) => format!("{} (lib tests)", self.package),
         }
     }
 }
@@ -642,63 +1119,256 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// The files a `tests/<name>.rs` root pulls in, following `mod` and `#[path]`.
+/// One out-of-line `mod name;`, resolved to the file it loads and the
+/// directory that file's own plain `mod`s resolve under.
+struct ModDecl {
+    name: String,
+    file: PathBuf,
+    children: PathBuf,
+}
+
+/// The out-of-line `mod name;` declarations of `file`, resolved as rustc
+/// resolves them: a `#[path]` relative to `file`'s directory, a plain `mod`
+/// under `children`. A crate root, a `mod.rs` and a `#[path]` file own their
+/// own directory; any other module file `x.rs` owns `x/`, which is where a
+/// merged binary's `tests/<dir>/x.rs` keeps its private modules. A
+/// declaration whose file does not exist is dropped.
+fn mod_decls(file: &Path, children: &Path) -> Vec<ModDecl> {
+    let Some(dir) = file.parent() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut pending_path: Option<String> = None;
+    for line in read(file).lines() {
+        let mut trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("#[path") {
+            if let Some(open) = rest.find('"') {
+                let tail = &rest[open + 1..];
+                if let Some(close) = tail.find('"') {
+                    pending_path = Some(tail[..close].to_string());
+                }
+            }
+            // `#[path = ".."] mod x;` on one line carries its `mod` after `]`.
+            trimmed = rest.split_once(']').map_or("", |(_, after)| after.trim());
+            if trimmed.is_empty() {
+                continue;
+            }
+        }
+        let decl = trimmed.strip_prefix("pub ").unwrap_or(trimmed);
+        let Some(rest) = decl.strip_prefix("mod ") else {
+            if trimmed.starts_with("#[") || trimmed.is_empty() {
+                continue; // cfg attributes sit between #[path] and mod
+            }
+            pending_path = None;
+            continue;
+        };
+        let Some(name) = rest.strip_suffix(';') else {
+            pending_path = None;
+            continue;
+        };
+        let name = name.trim().to_string();
+        let found = match pending_path.take() {
+            Some(p) => Some(dir.join(p)).filter(|f| f.is_file()).map(|f| {
+                let owns = f.parent().unwrap_or(dir).to_path_buf();
+                (f, owns)
+            }),
+            None => {
+                let owns = children.join(&name);
+                [children.join(format!("{name}.rs")), owns.join("mod.rs")]
+                    .into_iter()
+                    .find(|c| c.is_file())
+                    .map(|f| (f, owns))
+            }
+        };
+        if let Some((file, children)) = found {
+            out.push(ModDecl {
+                name,
+                file,
+                children,
+            });
+        }
+    }
+    out
+}
+
+/// The files `root` pulls in, following `mod` and `#[path]`, sorted; its
+/// plain `mod`s resolve under `children`.
 ///
 /// A test binary's spawn sites are usually in a shared helper module —
-/// `tests/common/mod.rs`, `tests/parity/interop.rs` — so scanning only the
+/// `tests/integration/common/mod.rs`,
+/// `tests/integration/interop_helpers/mod.rs` — so scanning only the
 /// root file would attribute nothing to the binary that actually spawns.
-fn module_closure(root: &Path) -> Vec<PathBuf> {
+fn module_closure(root: &Path, children: &Path) -> Vec<PathBuf> {
     let mut seen = BTreeSet::new();
-    let mut queue = vec![root.to_path_buf()];
+    let mut queue = vec![(root.to_path_buf(), children.to_path_buf())];
     let mut out = Vec::new();
-    while let Some(file) = queue.pop() {
+    while let Some((file, children)) = queue.pop() {
         if !seen.insert(file.clone()) {
             continue;
         }
-        out.push(file.clone());
-        let Some(dir) = file.parent().map(Path::to_path_buf) else {
+        for d in mod_decls(&file, &children) {
+            queue.push((d.file, d.children));
+        }
+        out.push(file);
+    }
+    out.sort();
+    out
+}
+
+/// [`module_closure`] of a crate root, which owns its own directory.
+fn crate_root_closure(root: &Path) -> Vec<PathBuf> {
+    module_closure(root, root.parent().unwrap_or(root))
+}
+
+/// Whether `text` declares a test: an attribute whose last path segment says
+/// `test` — `#[test]`, `#[tokio::test]`, `#[epics_test]`, `#[test_case(..)]`.
+fn declares_a_test(text: &str) -> bool {
+    let mut in_block = false;
+    text.lines().any(|line| {
+        let code = code_only(line, &mut in_block);
+        code.match_indices("#[").any(|(at, _)| {
+            let path: String = code[at + 2..]
+                .trim_start()
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == ':')
+                .collect();
+            path.rsplit("::")
+                .next()
+                .is_some_and(|last| last.contains("test"))
+        })
+    })
+}
+
+/// The first path segment of everything `text` names through `crate::`:
+/// `crate::h::f()` and `use crate::{h, g as k};` both name `h` (and `g`).
+fn crate_refs(text: &str) -> BTreeSet<String> {
+    let mut in_block = false;
+    let code: String = text
+        .lines()
+        .map(|l| code_only(l, &mut in_block) + "\n")
+        .collect();
+    let ident = |s: &str| -> String {
+        s.trim_start()
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect()
+    };
+    let mut out = BTreeSet::new();
+    for (at, needle) in code.match_indices("crate::") {
+        if code[..at]
+            .chars()
+            .last()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_')
+        {
+            continue;
+        }
+        let rest = &code[at + needle.len()..];
+        let Some(group) = rest.strip_prefix('{') else {
+            out.insert(ident(rest));
             continue;
         };
-        let text = read(&file);
-        let mut pending_path: Option<String> = None;
-        for line in text.lines() {
-            let trimmed = line.trim();
-            if let Some(rest) = trimmed.strip_prefix("#[path") {
-                if let Some(open) = rest.find('"') {
-                    let tail = &rest[open + 1..];
-                    if let Some(close) = tail.find('"') {
-                        pending_path = Some(tail[..close].to_string());
+        // Split the group at its own commas, not a nested group's.
+        let mut depth = 0usize;
+        let mut seg = String::new();
+        for c in group.chars() {
+            match c {
+                '{' => depth += 1,
+                '}' if depth == 0 => break,
+                '}' => depth -= 1,
+                ',' if depth == 0 => {
+                    out.insert(ident(&std::mem::take(&mut seg)));
+                    continue;
+                }
+                _ => {}
+            }
+            seg.push(c);
+        }
+        out.insert(ident(&seg));
+    }
+    out.remove("");
+    out
+}
+
+/// One test unit nextest can select. A `tests/<name>.rs` is a binary of its
+/// own, `binary(<name>)`. A `tests/<dir>/main.rs` is one binary, `<dir>`,
+/// built from every module it declares, and each top-level module `m` that
+/// declares a test is a unit of it: its tests are named `m::<test>` and
+/// `binary(<dir>) & test(/^m::/)` selects them.
+struct TestUnit {
+    binary: String,
+    module: Option<String>,
+    /// Every file the unit compiles: its module closure and, for a merged
+    /// module, the closures of the sibling modules it reaches through
+    /// `crate::` — the shared helpers `main.rs` declares once.
+    files: Vec<PathBuf>,
+}
+
+/// Every test unit of one crate, sorted by binary then module.
+fn test_units(crate_dir: &Path) -> Vec<TestUnit> {
+    let mut out = Vec::new();
+    for path in dir_entries(&crate_dir.join("tests")) {
+        if path.is_file() && path.extension().is_some_and(|e| e == "rs") {
+            let Some(stem) = path.file_stem() else {
+                continue;
+            };
+            out.push(TestUnit {
+                binary: stem.to_string_lossy().into_owned(),
+                module: None,
+                files: crate_root_closure(&path),
+            });
+        } else if path.join("main.rs").is_file()
+            && let Some(name) = path.file_name()
+        {
+            out.extend(merged_units(&path.join("main.rs"), &name.to_string_lossy()));
+        }
+    }
+    out.sort_by(|a, b| (&a.binary, &a.module).cmp(&(&b.binary, &b.module)));
+    out
+}
+
+/// The units of one merged binary. A top-level module that declares no test
+/// is a helper: it is no unit, and its spawn sites count for every module
+/// that reaches it through `crate::`. `main.rs`'s own tests, if any, are a
+/// unit without a module.
+fn merged_units(main: &Path, binary: &str) -> Vec<TestUnit> {
+    let dir = main.parent().unwrap_or(main);
+    let closures: BTreeMap<String, Vec<PathBuf>> = mod_decls(main, dir)
+        .into_iter()
+        .map(|d| {
+            let files = module_closure(&d.file, &d.children);
+            (d.name, files)
+        })
+        .collect();
+    let mut out = Vec::new();
+    if declares_a_test(&read(main)) {
+        out.push(TestUnit {
+            binary: binary.to_string(),
+            module: None,
+            files: vec![main.to_path_buf()],
+        });
+    }
+    for (name, own) in &closures {
+        if !own.iter().any(|f| declares_a_test(&read(f))) {
+            continue;
+        }
+        let mut files = own.clone();
+        let mut at = 0;
+        while at < files.len() {
+            for used in crate_refs(&read(&files[at])) {
+                for f in closures.get(&used).into_iter().flatten() {
+                    if !files.contains(f) {
+                        files.push(f.clone());
                     }
                 }
-                continue;
             }
-            let decl = trimmed.strip_prefix("pub ").unwrap_or(trimmed);
-            let Some(rest) = decl.strip_prefix("mod ") else {
-                if trimmed.starts_with("#[") || trimmed.is_empty() {
-                    continue; // cfg attributes sit between #[path] and mod
-                }
-                pending_path = None;
-                continue;
-            };
-            let Some(name) = rest.strip_suffix(';') else {
-                pending_path = None;
-                continue;
-            };
-            let name = name.trim();
-            let candidates = match pending_path.take() {
-                Some(p) => vec![dir.join(p)],
-                None => vec![
-                    dir.join(format!("{name}.rs")),
-                    dir.join(name).join("mod.rs"),
-                ],
-            };
-            for c in candidates {
-                if c.is_file() {
-                    queue.push(c);
-                    break;
-                }
-            }
+            at += 1;
         }
+        files.sort();
+        out.push(TestUnit {
+            binary: binary.to_string(),
+            module: Some(name.clone()),
+            files,
+        });
     }
     out
 }
@@ -724,18 +1394,6 @@ fn first_evidence(
     })
 }
 
-/// Every `tests/<name>.rs` root of one crate, sorted.
-fn test_roots(crate_dir: &Path) -> Vec<PathBuf> {
-    let mut roots: Vec<PathBuf> = Vec::new();
-    for path in dir_entries(&crate_dir.join("tests")) {
-        if path.is_file() && path.extension().is_some_and(|e| e == "rs") {
-            roots.push(path);
-        }
-    }
-    roots.sort();
-    roots
-}
-
 /// A crate's bin targets with their module closures, and the library files
 /// none of those bins own.
 fn split_targets(crate_dir: &Path) -> (Vec<(String, Vec<PathBuf>)>, Vec<PathBuf>) {
@@ -747,8 +1405,7 @@ fn split_targets(crate_dir: &Path) -> (Vec<(String, Vec<PathBuf>)>, Vec<PathBuf>
         if !root.is_file() {
             continue;
         }
-        let mut closure = module_closure(&root);
-        closure.sort();
+        let closure = crate_root_closure(&root);
         owned_by_a_bin.extend(closure.iter().cloned());
         bin_closures.push((bin.name.clone(), closure));
     }
@@ -867,11 +1524,13 @@ fn named_dev_dep_evidence(files: &[PathBuf], deps: &[DevDepSpawner]) -> Option<S
 /// Three kinds of binary, enumerated separately because nextest addresses them
 /// separately: the library's unit tests (`package()` only), each bin target's
 /// unit tests (`binary(<bin name>)`, id `package::bin/<name>`), and each
-/// `tests/<name>.rs` (`binary(<name>)`).
+/// `tests/<name>.rs` (`binary(<name>)`) — or, for a merged
+/// `tests/<dir>/main.rs`, each top-level module that declares a test
+/// (`binary(<dir>) & test(/^<module>::/)`).
 ///
 /// A spawn site in the *library* additionally makes every binary in the
 /// package a spawner, because the library is what they all call:
-/// `tests/oracle.rs` spawns three IOCs per case through
+/// `tests/integration/oracle.rs` spawns three IOCs per case through
 /// `epics-oracle-rs/src/ioc.rs` without containing the word `Command`. That
 /// promotion ADDS rows. It must never replace them — a library match used to
 /// return one package row and drop the crate's real per-binary census on the
@@ -891,14 +1550,16 @@ pub fn spawners_in_crate(crate_dir: &Path, tokens: &BTreeSet<String>) -> Vec<Spa
 
     let through_lib = |ev: &str| format!("{ev} (through the {package} library this binary links)");
 
-    // Keyed by the nextest binary, because a `binary()` term selects by name
-    // and `epics-oracle-rs` has both a bin target and a `tests/oracle.rs`
-    // called `oracle` — one name, one row, one declaration. First-hand
-    // evidence wins over the library fallback; otherwise the first found.
-    let mut rows: BTreeMap<Option<String>, (String, bool)> = BTreeMap::new();
-    let mut record = |binary: Option<String>, evidence: Option<String>, via_lib: bool| {
+    // Keyed by the nextest binary and module, because a `binary()` term
+    // selects by name: a bin target and a `tests/<name>.rs` of one name are
+    // one name, one row, one declaration.
+    // First-hand evidence wins over the library fallback; otherwise the first
+    // found.
+    type Key = (Option<String>, Option<String>);
+    let mut rows: BTreeMap<Key, (String, bool)> = BTreeMap::new();
+    let mut record = |key: Key, evidence: Option<String>, via_lib: bool| {
         let Some(evidence) = evidence else { return };
-        match rows.entry(binary) {
+        match rows.entry(key) {
             std::collections::btree_map::Entry::Vacant(slot) => {
                 slot.insert((evidence, via_lib));
             }
@@ -910,40 +1571,37 @@ pub fn spawners_in_crate(crate_dir: &Path, tokens: &BTreeSet<String>) -> Vec<Spa
     };
 
     match lib.clone() {
-        Some(ev) => record(None, Some(ev), false),
-        None => record(None, named_dev_dep_evidence(&lib_files, &dev_deps), true),
+        Some(ev) => record((None, None), Some(ev), false),
+        None => record(
+            (None, None),
+            named_dev_dep_evidence(&lib_files, &dev_deps),
+            true,
+        ),
     }
-    for (name, closure) in &bin_closures {
-        match first_evidence(closure, crate_dir, tokens) {
-            Some(ev) => record(Some(name.clone()), Some(ev), false),
+    let units = bin_closures
+        .into_iter()
+        .map(|(name, files)| ((Some(name), None), files))
+        .chain(
+            test_units(crate_dir)
+                .into_iter()
+                .map(|u| ((Some(u.binary), u.module), u.files)),
+        );
+    for (key, files) in units {
+        match first_evidence(&files, crate_dir, tokens) {
+            Some(ev) => record(key, Some(ev), false),
             None => record(
-                Some(name.clone()),
-                named_dev_dep_evidence(closure, &dev_deps).or(lib.as_deref().map(through_lib)),
-                true,
-            ),
-        }
-    }
-    for root in test_roots(crate_dir) {
-        let binary = root
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let mut closure = module_closure(&root);
-        closure.sort();
-        match first_evidence(&closure, crate_dir, tokens) {
-            Some(ev) => record(Some(binary), Some(ev), false),
-            None => record(
-                Some(binary),
-                named_dev_dep_evidence(&closure, &dev_deps).or(lib.as_deref().map(through_lib)),
+                key,
+                named_dev_dep_evidence(&files, &dev_deps).or(lib.as_deref().map(through_lib)),
                 true,
             ),
         }
     }
 
     rows.into_iter()
-        .map(|(binary, (evidence, _))| Spawner {
+        .map(|((binary, module), (evidence, _))| Spawner {
             package: package.clone(),
             binary,
+            module,
             evidence,
         })
         .collect()
@@ -995,19 +1653,19 @@ pub fn workspace_crates(root: &Path) -> Vec<PathBuf> {
 }
 
 /// Every name a `binary()` term can legally select, for the dead-name check:
-/// each `tests/<name>.rs` and each bin target. A bin target's unit tests run as
-/// `package::bin/<name>` and `binary(<name>)` selects them, so a declaration
-/// naming one is live, not a leftover.
-pub fn all_declarable_binaries(root: &Path) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
+/// each `tests/<name>.rs`, each merged `tests/<dir>/main.rs` and each bin
+/// target. A bin target's unit tests run as `package::bin/<name>` and
+/// `binary(<name>)` selects them, so a declaration naming one is live, not a
+/// leftover. Each name carries the test modules a `test(/^<module>::/)` beside
+/// it can select — empty for a binary that is one unit.
+pub fn all_declarable_binaries(root: &Path) -> BTreeMap<String, BTreeSet<String>> {
+    let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for dir in workspace_crates(root) {
-        for root in test_roots(&dir) {
-            if let Some(stem) = root.file_stem() {
-                out.insert(stem.to_string_lossy().into_owned());
-            }
+        for unit in test_units(&dir) {
+            out.entry(unit.binary).or_default().extend(unit.module);
         }
         for bin in bin_targets(&dir) {
-            out.insert(bin.name);
+            out.entry(bin.name).or_default();
         }
     }
     out
@@ -1026,10 +1684,16 @@ pub enum Term {
     BinaryContains(String),
     /// `test(...)`, which selects INSIDE a binary rather than selecting one.
     ///
-    /// The argument is carried for the message and is never matched: whatever
-    /// it names, the block cannot be a whole binary's declaration, and that is
-    /// the only thing this gate asks a filter.
+    /// Whatever it names, the block cannot be a whole binary's declaration,
+    /// and that is the only thing this gate asks a filter of a binary. Of a
+    /// merged binary's module it asks one more: an exact `test(=name)` outside
+    /// the module takes none of it.
     Test(String),
+    /// `test(/^P/)` with a literal `P`: the tests whose names start with `P`.
+    /// A merged binary's module `m` is all named `m::…`, so `P` takes all of
+    /// it when `m::` starts with `P`, part of it when `P` starts with `m::`,
+    /// and none of it otherwise. Of any other binary it takes part.
+    TestPrefix(String),
     Unknown(String),
 }
 
@@ -1052,68 +1716,244 @@ pub enum Match {
 }
 
 impl Term {
-    fn selects(&self, package: &str, binary: Option<&str>) -> Match {
+    fn selects(&self, package: &str, binary: Option<&str>, module: Option<&str>) -> Match {
         let yes = |b: bool| if b { Match::Yes } else { Match::No };
         match self {
             Term::Package(p) => yes(p == package),
             Term::Binary(b) => yes(binary == Some(b.as_str())),
             Term::BinaryContains(s) => yes(binary.is_some_and(|b| b.contains(s.as_str()))),
-            Term::Test(_) => Match::Partial,
+            Term::Test(t) => match (module, t.strip_prefix('=')) {
+                (Some(m), Some(name)) if !name.starts_with(&format!("{m}::")) => Match::No,
+                _ => Match::Partial,
+            },
+            Term::TestPrefix(p) => module.map_or(Match::Partial, |m| prefix_selects(p, m)),
             Term::Unknown(_) => Match::Maybe,
         }
     }
 }
 
-/// A filterset as a disjunction of conjunctions — `a and b | c` — which is all
-/// the shape this config uses.
+/// What `test(/^prefix/)` takes of a merged binary's module `module`.
+fn prefix_selects(prefix: &str, module: &str) -> Match {
+    let whole = format!("{module}::");
+    if whole.starts_with(prefix) {
+        Match::Yes
+    } else if prefix.starts_with(&whole) {
+        Match::Partial
+    } else {
+        Match::No
+    }
+}
+
+/// The `test(/^P/)` of one conjunction, which narrows its `binary()` terms.
+fn clause_prefix(clause: &[Term]) -> Option<&str> {
+    clause.iter().find_map(|t| match t {
+        Term::TestPrefix(p) => Some(p.as_str()),
+        _ => None,
+    })
+}
+
+/// A filterset as a disjunction of conjunctions — `a & b | c`.
 pub type Filterset = Vec<Vec<Term>>;
 
-/// Parse `binary(a) | package(b) and test(c)` into disjunctive normal form.
-pub fn parse_filterset(filter: &str) -> Filterset {
-    filter
-        .split('|')
-        .map(|clause| {
-            clause
-                .split(" and ")
-                .map(|raw| {
-                    let t = raw.trim();
-                    let Some((kind, arg)) = t.split_once('(') else {
-                        return Term::Unknown(t.to_string());
-                    };
-                    let Some(arg) = arg.strip_suffix(')') else {
-                        return Term::Unknown(t.to_string());
-                    };
-                    if arg.starts_with('/') {
-                        return Term::Unknown(t.to_string());
+/// One token of a filterset expression.
+enum Tok {
+    Atom(Term),
+    Open,
+    Close,
+    Or,
+    And,
+    Not,
+    Minus,
+}
+
+/// Split a filterset into tokens; `None` when it holds something this
+/// grammar does not read. A predicate's argument is read whole, so the `|`
+/// and parentheses inside `test(/^a::(b|c)$/)` stay in it.
+fn filter_tokens(filter: &str) -> Option<Vec<Tok>> {
+    let chars: Vec<char> = filter.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let op = match c {
+            '(' => Some(Tok::Open),
+            ')' => Some(Tok::Close),
+            '|' | '+' => Some(Tok::Or),
+            '&' => Some(Tok::And),
+            '!' => Some(Tok::Not),
+            '-' => Some(Tok::Minus),
+            _ => None,
+        };
+        if let Some(op) = op {
+            out.push(op);
+            i += 1;
+            continue;
+        }
+        if c.is_whitespace() {
+            i += 1;
+            continue;
+        }
+        if !(c.is_alphabetic() || c == '_') {
+            return None;
+        }
+        let start = i;
+        while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+            i += 1;
+        }
+        let word: String = chars[start..i].iter().collect();
+        match word.as_str() {
+            "or" => out.push(Tok::Or),
+            "and" => out.push(Tok::And),
+            "not" => out.push(Tok::Not),
+            _ => {
+                if chars.get(i) != Some(&'(') {
+                    return None;
+                }
+                i += 1;
+                let arg_start = i;
+                if chars.get(i) == Some(&'/') {
+                    i += 1;
+                    while i < chars.len() && chars[i] != '/' {
+                        i += if chars[i] == '\\' { 2 } else { 1 };
                     }
-                    match kind.trim() {
-                        "package" => Term::Package(arg.to_string()),
-                        "test" => Term::Test(arg.to_string()),
-                        "binary" => match arg.strip_prefix('~') {
-                            Some(sub) => Term::BinaryContains(sub.to_string()),
-                            None => Term::Binary(arg.to_string()),
-                        },
-                        _ => Term::Unknown(t.to_string()),
-                    }
-                })
-                .collect()
-        })
+                    i += 1;
+                }
+                while i < chars.len() && chars[i] != ')' {
+                    i += 1;
+                }
+                if i >= chars.len() {
+                    return None;
+                }
+                let arg: String = chars[arg_start..i].iter().collect();
+                i += 1;
+                out.push(Tok::Atom(atom(&word, arg.trim())));
+            }
+        }
+    }
+    Some(out)
+}
+
+/// One predicate, `kind(arg)`.
+fn atom(kind: &str, arg: &str) -> Term {
+    let literal_prefix = arg
+        .strip_prefix("/^")
+        .and_then(|p| p.strip_suffix('/'))
+        .filter(|p| {
+            !p.is_empty()
+                && p.chars()
+                    .all(|c| c.is_alphanumeric() || c == '_' || c == ':')
+        });
+    match (kind, literal_prefix) {
+        ("test", Some(p)) => Term::TestPrefix(p.to_string()),
+        _ if arg.starts_with('/') => Term::Unknown(format!("{kind}({arg})")),
+        ("package", _) => Term::Package(arg.to_string()),
+        ("binary", _) => match arg.strip_prefix('~') {
+            Some(sub) => Term::BinaryContains(sub.to_string()),
+            None => Term::Binary(arg.to_string()),
+        },
+        ("test", _) => Term::Test(arg.to_string()),
+        _ => Term::Unknown(format!("{kind}({arg})")),
+    }
+}
+
+/// Every conjunction of `a` joined with every conjunction of `b`.
+fn product(a: &Filterset, b: &Filterset) -> Filterset {
+    a.iter()
+        .flat_map(|x| b.iter().map(move |y| x.iter().chain(y).cloned().collect()))
         .collect()
 }
 
-/// Evaluate a whole filterset against one binary.
+/// Recursive descent over [`Tok`], building disjunctive normal form as it
+/// goes. A negated operand — `not x`, `!x`, the `x` of `a - x` — is one term
+/// the gate cannot evaluate, because the form has no negation.
+struct FilterParser<'a> {
+    toks: &'a [Tok],
+    at: usize,
+}
+
+impl FilterParser<'_> {
+    fn or(&mut self) -> Option<Filterset> {
+        let mut set = self.and()?;
+        while matches!(self.toks.get(self.at), Some(Tok::Or)) {
+            self.at += 1;
+            set.extend(self.and()?);
+        }
+        Some(set)
+    }
+
+    fn and(&mut self) -> Option<Filterset> {
+        let mut set = self.unary()?;
+        loop {
+            let negate = match self.toks.get(self.at) {
+                Some(Tok::And) => false,
+                Some(Tok::Minus) => true,
+                _ => return Some(set),
+            };
+            self.at += 1;
+            let rhs = self.unary()?;
+            let rhs = if negate { Self::negated(&rhs) } else { rhs };
+            set = product(&set, &rhs);
+        }
+    }
+
+    fn unary(&mut self) -> Option<Filterset> {
+        let tok = self.toks.get(self.at)?;
+        self.at += 1;
+        match tok {
+            Tok::Atom(t) => Some(vec![vec![t.clone()]]),
+            Tok::Not => {
+                let inner = self.unary()?;
+                Some(Self::negated(&inner))
+            }
+            Tok::Open => {
+                let set = self.or()?;
+                matches!(self.toks.get(self.at), Some(Tok::Close)).then_some(())?;
+                self.at += 1;
+                Some(set)
+            }
+            Tok::Close | Tok::Or | Tok::And | Tok::Minus => None,
+        }
+    }
+
+    fn negated(inner: &Filterset) -> Filterset {
+        vec![vec![Term::Unknown(format!("not {inner:?}"))]]
+    }
+}
+
+/// Parse `binary(a) | package(b) & (test(c) or test(d))` into disjunctive
+/// normal form: `|`, `or` and `+` join, `&` and `and` bind tighter, and
+/// parentheses group. A filter this grammar cannot read is one `Unknown`.
+pub fn parse_filterset(filter: &str) -> Filterset {
+    let unknown = || vec![vec![Term::Unknown(filter.trim().to_string())]];
+    let Some(toks) = filter_tokens(filter) else {
+        return unknown();
+    };
+    let mut parser = FilterParser { toks: &toks, at: 0 };
+    match parser.or() {
+        Some(set) if parser.at == toks.len() => set,
+        _ => unknown(),
+    }
+}
+
+/// Evaluate a whole filterset against one binary, or one module of a merged
+/// binary.
 ///
 /// A conjunction is as weak as its weakest term and a disjunction as strong as
 /// its strongest clause, over `No` < `Partial` < `Maybe` < `Yes`. `Maybe`
 /// outranks `Partial` in both directions on purpose: an unreadable term might
 /// claim the whole binary, so it can hide a declaration, while a `test()` term
 /// is known to claim only part of one.
-pub fn evaluate(set: &Filterset, package: &str, binary: Option<&str>) -> Match {
+pub fn evaluate(
+    set: &Filterset,
+    package: &str,
+    binary: Option<&str>,
+    module: Option<&str>,
+) -> Match {
     let mut best = Match::No;
     for clause in set {
         let mut clause_verdict = Match::Yes;
         for term in clause {
-            match term.selects(package, binary) {
+            match term.selects(package, binary, module) {
                 Match::No => {
                     clause_verdict = Match::No;
                     break;
@@ -1278,6 +2118,7 @@ fn effective_group<'a>(
     profile: &str,
     package: &str,
     binary: Option<&str>,
+    module: Option<&str>,
 ) -> Result<Option<&'a Override>, String> {
     let mut shadow: Option<&Override> = None;
     let mut narrowed: Vec<&Override> = Vec::new();
@@ -1287,7 +2128,7 @@ fn effective_group<'a>(
             .filter(|b| profile != "default" && b.profile == "default"),
     );
     for b in chain {
-        match evaluate(&b.terms, package, binary) {
+        match evaluate(&b.terms, package, binary, module) {
             Match::Yes => {
                 if let Some(s) = shadow {
                     return Err(format!(
@@ -1371,15 +2212,31 @@ pub fn check(root: &Path) -> Option<String> {
 
     let known = all_declarable_binaries(root);
     for b in &blocks {
-        for term in b.terms.iter().flatten() {
-            if let Term::Binary(name) = term
-                && !known.contains(name)
-            {
-                problems.push(format!(
-                    "profile.{}'s `{}` filter names `binary({name})`, which is no tests/*.rs \
-                     in the workspace — a dead name left by a rename or a deletion",
-                    b.profile, b.group
-                ));
+        for clause in &b.terms {
+            let prefix = clause_prefix(clause);
+            for term in clause {
+                let Term::Binary(name) = term else { continue };
+                match known.get(name) {
+                    None => problems.push(format!(
+                        "profile.{}'s `{}` filter names `binary({name})`, which is no test \
+                         binary or bin target in the workspace — a dead name left by a rename \
+                         or a deletion",
+                        b.profile, b.group
+                    )),
+                    Some(modules) => {
+                        if let Some(p) = prefix
+                            && !modules.is_empty()
+                            && modules.iter().all(|m| prefix_selects(p, m) == Match::No)
+                        {
+                            problems.push(format!(
+                                "profile.{}'s `{}` filter narrows `binary({name})` with \
+                                 `test(/^{p}/)`, which is none of its modules — a dead name \
+                                 left by a rename or a deletion",
+                                b.profile, b.group
+                            ));
+                        }
+                    }
+                }
             }
         }
     }
@@ -1400,32 +2257,45 @@ pub fn check(root: &Path) -> Option<String> {
     // declarations lost their evidence. A floor could only say "fewer than
     // before".
     let spawner_packages: BTreeSet<&str> = spawners.iter().map(|s| s.package.as_str()).collect();
-    let spawner_binaries: BTreeSet<&str> = spawners
-        .iter()
-        .filter_map(|s| s.binary.as_deref())
-        .collect();
     for b in &blocks {
         if !IOC_GROUPS.contains(&b.group.as_str()) {
             continue;
         }
-        for term in b.terms.iter().flatten() {
-            let missing = match term {
-                Term::Binary(name) if !spawner_binaries.contains(name.as_str()) => {
-                    Some(format!("binary({name})"))
+        for clause in &b.terms {
+            // A `test(/^m::/)` beside a `binary()` declares that module, not
+            // the binary, so the module is what must still scan as a spawner.
+            let prefix = clause_prefix(clause);
+            for term in clause {
+                let missing = match term {
+                    Term::Binary(name)
+                        if !spawners.iter().any(|s| {
+                            s.binary.as_deref() == Some(name.as_str())
+                                && prefix.is_none_or(|p| {
+                                    s.module
+                                        .as_deref()
+                                        .is_none_or(|m| prefix_selects(p, m) != Match::No)
+                                })
+                        }) =>
+                    {
+                        Some(match prefix {
+                            Some(p) => format!("binary({name}) & test(/^{p}/)"),
+                            None => format!("binary({name})"),
+                        })
+                    }
+                    Term::Package(name) if !spawner_packages.contains(name.as_str()) => {
+                        Some(format!("package({name})"))
+                    }
+                    _ => None,
+                };
+                if let Some(what) = missing {
+                    problems.push(format!(
+                        "profile.{}'s `{}` filter declares `{what}` an IOC spawner, but the \
+                         scan finds no spawn site under it. Either the spawn site went away \
+                         and the declaration should too, or the scan stopped recognising it \
+                         and the forward check above is now blind",
+                        b.profile, b.group
+                    ));
                 }
-                Term::Package(name) if !spawner_packages.contains(name.as_str()) => {
-                    Some(format!("package({name})"))
-                }
-                _ => None,
-            };
-            if let Some(what) = missing {
-                problems.push(format!(
-                    "profile.{}'s `{}` filter declares `{what}` an IOC spawner, but the scan \
-                     finds no spawn site under it. Either the spawn site went away and the \
-                     declaration should too, or the scan stopped recognising it and the \
-                     forward check above is now blind",
-                    b.profile, b.group
-                ));
             }
         }
     }
@@ -1434,7 +2304,13 @@ pub fn check(root: &Path) -> Option<String> {
         let mut landed: BTreeMap<&str, String> = BTreeMap::new();
         let mut undeclared: Vec<&str> = Vec::new();
         for profile in PROFILES {
-            match effective_group(&blocks, profile, &s.package, s.binary.as_deref()) {
+            match effective_group(
+                &blocks,
+                profile,
+                &s.package,
+                s.binary.as_deref(),
+                s.module.as_deref(),
+            ) {
                 Ok(Some(b)) => {
                     landed.insert(profile, b.group.clone());
                 }
@@ -1582,6 +2458,23 @@ mod tests {
         assert_eq!(spawn_evidence(&src, &tokens()), None);
     }
 
+    /// Nor is the path of a test a merged binary re-runs itself for, whose
+    /// module is named after the file and so may hold a program's name.
+    #[test]
+    fn a_test_path_naming_a_program_is_not_a_spawner() {
+        let reexec = |arg: &str| {
+            format!(
+                "{}    let c = {}(std::env::current_exe().unwrap()).arg(\"{arg}\");\n",
+                process_import(),
+                spawn_call()
+            )
+        };
+        let src = reexec("posts_like_softioc::child_cooldown");
+        assert_eq!(spawn_evidence(&src, &tokens()), None);
+        let src = reexec("bin/softIoc");
+        assert!(spawn_evidence(&src, &tokens()).is_some());
+    }
+
     /// Nor is a doc comment. Every parity-review file in this workspace names
     /// softIoc somewhere in prose.
     #[test]
@@ -1599,6 +2492,31 @@ mod tests {
     fn spawning_something_that_is_not_an_ioc_is_not_a_spawner() {
         let src = format!("    let c = {}(\"camonitor\");\n", spawn_call());
         assert_eq!(spawn_evidence(&src, &tokens()), None);
+    }
+
+    /// Starting a process and naming an IOC are not enough apart: this file
+    /// relaunches its own test binary and reads an IOC's source as text, as
+    /// `epics-ca-rs/src/server/blocking.rs` once did, and starts no IOC.
+    #[test]
+    fn relaunching_itself_beside_an_ioc_source_read_as_text_is_not_a_spawner() {
+        let src = concat!(
+            "use std::proc",
+            "ess::Command;\n",
+            "fn every_thread_states_a_stack_size() {\n",
+            "    let text = include_str!(\"../bin/qsrv-ioc.rs\");\n",
+            "    assert!(text.contains(\"stack_size\"));\n",
+            "}\n",
+            "fn in_a_process_of_its_own() {\n",
+            "    let out = Comm",
+            "and::new(std::env::current_exe().unwrap())\n",
+            "        .args([\"--exact\", \"tests::in_a_process_of_its_own\"])\n",
+            "        .out",
+            "put()\n",
+            "        .unwrap();\n",
+            "    assert!(out.status.success());\n",
+            "}\n"
+        );
+        assert_eq!(spawn_evidence(src, &tokens()), None);
     }
 
     /// Naming one without spawning it is a helper constant, not a spawner.
@@ -1677,9 +2595,9 @@ mod tests {
         assert!(spawn_evidence(&src, &tokens()).is_some());
     }
 
-    /// No `use` item at all. `epics-oracle-rs/tests/oracle.rs` spells the path
-    /// in full, and a module probe that demanded nothing precede `process`
-    /// would refuse the commonest spelling there is.
+    /// No `use` item at all. `epics-oracle-rs/tests/integration/oracle.rs`
+    /// spells the path in full, and a module probe that demanded nothing
+    /// precede `process` would refuse the commonest spelling there is.
     #[test]
     fn a_fully_qualified_path_needs_no_import() {
         let src = format!(
@@ -1712,8 +2630,9 @@ mod tests {
     }
 
     /// A spawn marker on a binding this file never built, typed as a
-    /// `Command` by its parameter list. Resolving the type is the only way to
-    /// tell it from `Failure::exit_status`.
+    /// `Command` by its parameter list, and handed the IOC's `Command` by a
+    /// caller. Resolving the type is the only way to tell it from
+    /// `Failure::exit_status`.
     #[test]
     fn a_spawn_on_a_parameter_typed_as_a_command_counts() {
         let src = concat!(
@@ -1722,9 +2641,125 @@ mod tests {
             "fn run(cmd: &mut Command) {\n",
             "    let _ = cmd.sta",
             "tus();\n}\n",
-            "const EXE: &str = \"softIoc\";\n"
+            "const EXE: &str = \"softIoc\";\n",
+            "fn go() {\n",
+            "    let mut ioc = ioc_command(EXE);\n",
+            "    run(&mut ioc);\n",
+            "}\n"
         );
-        assert!(spawn_evidence(src, &tokens()).is_some());
+        assert_eq!(
+            spawn_evidence(src, &tokens()).as_deref(),
+            Some(concat!("3: let _ = cmd.sta", "tus();"))
+        );
+    }
+
+    /// The program may reach the `Command` through the file's own functions:
+    /// `boot_stderr_matches_softioc.rs` hands `CARGO_BIN_EXE_softioc-rs` to
+    /// `boot`, which hands it to `spawn`, which builds the `Command`.
+    #[test]
+    fn a_name_handed_down_to_the_function_that_builds_the_command_counts() {
+        let src = concat!(
+            "use std::proc",
+            "ess::Command;\n",
+            "fn spawn(port: u16, bin: &str) {\n",
+            "    let _ = Comm",
+            "and::new(bin).arg(port.to_string());\n",
+            "}\n",
+            "fn boot(bin: &str) {\n",
+            "    spawn(5064, bin);\n",
+            "}\n",
+            "fn go() {\n",
+            "    boot(env!(\"CARGO_BIN_EXE_softioc-rs\"));\n",
+            "}\n"
+        );
+        assert_eq!(
+            spawn_evidence(src, &tokens()).as_deref(),
+            Some(concat!(
+                "3: let _ = Comm",
+                "and::new(bin).arg(port.to_string());"
+            ))
+        );
+    }
+
+    /// And only through the parameter it is handed to: a call that passes
+    /// the IOC to one parameter does not make another one an IOC.
+    #[test]
+    fn a_name_handed_to_another_parameter_does_not_reach_the_command() {
+        let src = concat!(
+            "use std::proc",
+            "ess::Command;\n",
+            "fn relaunch(test: &str, source: &str) {\n",
+            "    assert!(!source.is_empty());\n",
+            "    let _ = Comm",
+            "and::new(std::env::current_exe().unwrap()).arg(test);\n",
+            "}\n",
+            "fn go() {\n",
+            "    relaunch(\"tests::scan\", include_str!(\"../bin/qsrv-ioc.rs\"));\n",
+            "}\n"
+        );
+        assert_eq!(spawn_evidence(src, &tokens()), None);
+    }
+
+    /// A `let` is local to its function: one function's `out` holding an IOC
+    /// source is not another function's `out`.
+    #[test]
+    fn a_name_bound_in_another_function_does_not_reach_the_command() {
+        let src = concat!(
+            "use std::proc",
+            "ess::Command;\n",
+            "fn source() -> usize {\n",
+            "    let out = include_str!(\"../bin/qsrv-ioc.rs\");\n",
+            "    out.len()\n",
+            "}\n",
+            "fn relaunch(out: &str) {\n",
+            "    let _ = Comm",
+            "and::new(std::env::current_exe().unwrap()).arg(out).sta",
+            "tus();\n",
+            "}\n"
+        );
+        assert_eq!(spawn_evidence(src, &tokens()), None);
+    }
+
+    /// A `let` that shadows a name declares it; the new binding is not the
+    /// IOC source the old one held.
+    #[test]
+    fn a_let_that_rebinds_a_reached_name_does_not_use_it() {
+        let src = concat!(
+            "use std::proc",
+            "ess::Command;\n",
+            "fn relaunch() {\n",
+            "    let out = include_str!(\"../bin/qsrv-ioc.rs\");\n",
+            "    assert!(!out.is_empty());\n",
+            "    let out = Comm",
+            "and::new(std::env::current_exe().unwrap()).out",
+            "put().unwrap();\n",
+            "    assert!(out.status.success());\n",
+            "}\n"
+        );
+        assert_eq!(spawn_evidence(src, &tokens()), None);
+    }
+
+    /// A brace inside a char or raw string literal does not end the function,
+    /// so the IOC bound above it still reaches the `Command` below it. The
+    /// `{`s in `OPEN` keep the file balanced even when its literals are
+    /// misread, so a misread cannot hide behind the unscoped fallback.
+    #[test]
+    fn a_brace_inside_a_literal_does_not_end_the_function() {
+        let src = concat!(
+            "use std::proc",
+            "ess::Command;\n",
+            "const OPEN: (char, &str) = ('{', r#\"a\"{\"b\"#);\n",
+            "fn go() {\n",
+            "    let exe = env!(\"CARGO_BIN_EXE_softioc-rs\");\n",
+            "    let close = ('}', r#\"a\"}\"b\"#);\n",
+            "    let _ = Comm",
+            "and::new(exe).arg(close.1);\n",
+            "}\n"
+        );
+        assert_eq!(
+            spawn_evidence(src, &tokens()).as_deref(),
+            Some(concat!("6: let _ = Comm", "and::new(exe).arg(close.1);"))
+        );
     }
 
     /// THE regression. A spawn marker appearing under `src/` used to make
@@ -1954,9 +2989,15 @@ mod tests {
     #[test]
     fn the_first_matching_block_wins() {
         let blocks = filters();
-        let b = effective_group(&blocks, "default", "epics-pva-rs", Some("gated_suite"))
-            .expect("evaluable")
-            .expect("declared");
+        let b = effective_group(
+            &blocks,
+            "default",
+            "epics-pva-rs",
+            Some("gated_suite"),
+            None,
+        )
+        .expect("evaluable")
+        .expect("declared");
         assert_eq!(b.group, "pva_listener");
     }
 
@@ -1966,7 +3007,7 @@ mod tests {
     #[test]
     fn an_unevaluable_block_that_cannot_match_shadows_nothing() {
         let blocks = filters();
-        let b = effective_group(&blocks, "default", "epics-ca-rs", Some("stress_load"))
+        let b = effective_group(&blocks, "default", "epics-ca-rs", Some("stress_load"), None)
             .expect("evaluable")
             .expect("declared");
         assert_eq!(b.group, "ca_softioc");
@@ -1987,7 +3028,7 @@ mod tests {
              filter = 'binary(stress_load)'\n\
              test-group = 'ca_softioc'\n",
         );
-        let r = effective_group(&blocks, "default", "epics-ca-rs", Some("stress_load"));
+        let r = effective_group(&blocks, "default", "epics-ca-rs", Some("stress_load"), None);
         assert!(r.is_err(), "{r:?}");
     }
 
@@ -2003,10 +3044,10 @@ mod tests {
              test-group = 'ndarray_io'\n",
         );
         assert_eq!(
-            evaluate(&blocks[0].terms, "ad-plugins-rs", Some("whatever")),
+            evaluate(&blocks[0].terms, "ad-plugins-rs", Some("whatever"), None),
             Match::Partial
         );
-        let r = effective_group(&blocks, "default", "ad-plugins-rs", Some("whatever"));
+        let r = effective_group(&blocks, "default", "ad-plugins-rs", Some("whatever"), None);
         assert!(matches!(r, Ok(None)), "{r:?}");
     }
 
@@ -2025,7 +3066,7 @@ mod tests {
              filter = 'binary(stress_load)'\n\
              test-group = 'ca_softioc'\n",
         );
-        let r = effective_group(&split, "default", "epics-ca-rs", Some("stress_load"));
+        let r = effective_group(&split, "default", "epics-ca-rs", Some("stress_load"), None);
         assert!(r.is_err(), "{r:?}");
 
         // Narrowing WITHIN the declared group takes nothing out of it.
@@ -2038,7 +3079,7 @@ mod tests {
              filter = 'binary(stress_load)'\n\
              test-group = 'ca_softioc'\n",
         );
-        let b = effective_group(&same, "default", "epics-ca-rs", Some("stress_load"))
+        let b = effective_group(&same, "default", "epics-ca-rs", Some("stress_load"), None)
             .expect("evaluable")
             .expect("declared");
         assert_eq!(b.group, "ca_softioc");
@@ -2053,6 +3094,7 @@ mod tests {
             "default",
             "epics-ca-rs",
             Some("brand_new_ioc_test"),
+            None,
         )
         .expect("evaluable");
         assert!(r.is_none());
@@ -2064,9 +3106,15 @@ mod tests {
     #[test]
     fn a_profile_without_its_own_overrides_inherits_the_default_profile() {
         let blocks = filters();
-        let b = effective_group(&blocks, "interop", "epics-pva-rs", Some("gated_suite"))
-            .expect("evaluable")
-            .expect("declared");
+        let b = effective_group(
+            &blocks,
+            "interop",
+            "epics-pva-rs",
+            Some("gated_suite"),
+            None,
+        )
+        .expect("evaluable")
+        .expect("declared");
         assert_eq!(b.group, "pva_listener");
     }
 
@@ -2082,7 +3130,7 @@ mod tests {
              test-group = 'ca_softioc'\n",
         );
         assert!(
-            effective_group(&blocks, "default", "epics-oracle-rs", None)
+            effective_group(&blocks, "default", "epics-oracle-rs", None, None)
                 .expect("evaluable")
                 .is_none()
         );
@@ -2092,7 +3140,7 @@ mod tests {
              test-group = 'ca_softioc'\n",
         );
         assert!(
-            effective_group(&blocks, "default", "epics-oracle-rs", None)
+            effective_group(&blocks, "default", "epics-oracle-rs", None, None)
                 .expect("evaluable")
                 .is_some()
         );
@@ -2104,11 +3152,11 @@ mod tests {
     fn a_substring_term_selects_by_substring() {
         let set = parse_filterset("binary(~_ioc_boots)");
         assert_eq!(
-            evaluate(&set, "epics-ca-rs", Some("realtime_ca_ioc_boots")),
+            evaluate(&set, "epics-ca-rs", Some("realtime_ca_ioc_boots"), None),
             Match::Yes
         );
         assert_eq!(
-            evaluate(&set, "epics-ca-rs", Some("stress_load")),
+            evaluate(&set, "epics-ca-rs", Some("stress_load"), None),
             Match::No
         );
     }
@@ -2124,8 +3172,191 @@ mod tests {
         );
         assert_eq!(blocks.len(), 1);
         assert_eq!(
-            evaluate(&blocks[0].terms, "whatever", Some("b")),
+            evaluate(&blocks[0].terms, "whatever", Some("b"), None),
             Match::Yes
+        );
+    }
+
+    /// A merged `tests/<dir>/main.rs` is one binary whose test modules are
+    /// the units: each spawns through its own files, through a private
+    /// `x/sub.rs`, or through a helper `main.rs` declares and it reaches by
+    /// `crate::`. The helper, declaring no test, is no unit; a module that
+    /// reaches nothing that spawns is no spawner.
+    #[test]
+    fn a_merged_binary_s_test_modules_are_its_units() {
+        let tmp = tempfile::tempdir().unwrap();
+        let crate_dir = tmp.path().join("fixture");
+        let spawns = format!(
+            "{}pub fn go() {{ let _ = {}(\"softIoc\"); }}\n",
+            process_import(),
+            spawn_call()
+        );
+        let spawns_test = format!("#[test]\nfn t() {{}}\n{spawns}");
+        write_crate(
+            &crate_dir,
+            "[package]\nname = \"fixture\"\n",
+            &[
+                (
+                    "tests/integration/main.rs",
+                    "mod helper;\nmod direct;\nmod via_path;\nmod via_group;\n\
+                     mod nested;\nmod silent;\n#[path = \"deep/probe.rs\"] mod deep_probe;\n",
+                ),
+                ("tests/integration/helper.rs", &spawns),
+                ("tests/integration/deep/probe.rs", &spawns),
+                ("tests/integration/direct.rs", &spawns_test),
+                (
+                    "tests/integration/via_path.rs",
+                    "#[tokio::test]\nasync fn t() { crate::helper::go(); }\n",
+                ),
+                (
+                    "tests/integration/via_group.rs",
+                    "use crate::{silent, deep_probe as p};\n#[test]\nfn t() { p::go(); }\n",
+                ),
+                (
+                    "tests/integration/nested.rs",
+                    "mod sub;\n#[test]\nfn t() {}\n",
+                ),
+                ("tests/integration/nested/sub.rs", &spawns),
+                (
+                    "tests/integration/silent.rs",
+                    "// crate::helper::go() is not called here\n#[test]\nfn t() {}\n",
+                ),
+                ("tests/kept.rs", &spawns_test),
+            ],
+        );
+        assert_eq!(
+            labels(&spawners_in_crate(&crate_dir, &tokens())),
+            [
+                "fixture::integration direct::",
+                "fixture::integration nested::",
+                "fixture::integration via_group::",
+                "fixture::integration via_path::",
+                "fixture::kept",
+            ]
+        );
+    }
+
+    /// `binary(B) & test(/^m::/)` declares module `m` of a merged binary and
+    /// no other, whatever the clause around it; a prefix inside `m` narrows
+    /// it, and an exact name outside `m` takes nothing from it.
+    #[test]
+    fn a_module_prefix_declares_that_module_and_no_other() {
+        let set = parse_filterset("(binary(integration) & test(/^boots/)) | binary(other)");
+        let at = |binary, module| evaluate(&set, "p", Some(binary), module);
+        assert_eq!(at("integration", Some("boots")), Match::Yes);
+        assert_eq!(at("integration", Some("boots_twice")), Match::Yes);
+        assert_eq!(at("integration", Some("silent")), Match::No);
+        assert_eq!(at("other", None), Match::Yes);
+        assert_eq!(at("third", None), Match::No);
+
+        let deeper = parse_filterset("binary(integration) & test(/^boots::slow::/)");
+        assert_eq!(
+            evaluate(&deeper, "p", Some("integration"), Some("boots")),
+            Match::Partial
+        );
+        let exact = parse_filterset("binary(integration) and test(=boots::t)");
+        assert_eq!(
+            evaluate(&exact, "p", Some("integration"), Some("boots")),
+            Match::Partial
+        );
+        assert_eq!(
+            evaluate(&exact, "p", Some("integration"), Some("silent")),
+            Match::No
+        );
+    }
+
+    /// `&` binds tighter than `|`, parentheses distribute, a negation is a
+    /// term the gate cannot evaluate, and a filter it cannot read at all is
+    /// one `Unknown` rather than a partial parse.
+    #[test]
+    fn a_filter_reads_ands_ors_and_parentheses() {
+        let set = parse_filterset("package(p) & (binary(a) or binary(b)) | binary(c)");
+        let at = |package, binary| evaluate(&set, package, Some(binary), None);
+        assert_eq!(at("p", "a"), Match::Yes);
+        assert_eq!(at("p", "b"), Match::Yes);
+        assert_eq!(at("q", "a"), Match::No);
+        assert_eq!(at("q", "c"), Match::Yes);
+
+        let negated = parse_filterset("binary(a) - test(=t)");
+        assert_eq!(evaluate(&negated, "p", Some("a"), None), Match::Maybe);
+        assert_eq!(evaluate(&negated, "p", Some("b"), None), Match::No);
+
+        let regex = parse_filterset("binary(a) & test(/^x::(y|z)$/)");
+        assert_eq!(regex.len(), 1, "{regex:?}");
+        assert_eq!(evaluate(&regex, "p", Some("a"), None), Match::Maybe);
+
+        assert!(matches!(
+            parse_filterset("binary(a").as_slice(),
+            [clause] if matches!(clause.as_slice(), [Term::Unknown(_)])
+        ));
+    }
+
+    /// A workspace with one merged binary whose `boots` module spawns
+    /// through a helper and whose `silent` module does not, declared by
+    /// `filter`; the `check` verdict.
+    fn check_merged(filter: &str) -> Option<String> {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+        let spawns = format!(
+            "{}pub fn go() {{ let _ = {}(\"softIoc\"); }}\n",
+            process_import(),
+            spawn_call()
+        );
+        write_crate(
+            &tmp.path().join("crates/fixture"),
+            "[package]\nname = \"fixture\"\n",
+            &[
+                ("src/lib.rs", "pub fn nothing() {}\n"),
+                (
+                    "tests/integration/main.rs",
+                    "mod helper;\nmod boots;\nmod silent;\n",
+                ),
+                ("tests/integration/helper.rs", &spawns),
+                (
+                    "tests/integration/boots.rs",
+                    "use crate::helper;\n#[test]\nfn t() { helper::go(); }\n",
+                ),
+                ("tests/integration/silent.rs", "#[test]\nfn t() {}\n"),
+            ],
+        );
+        fs::create_dir_all(tmp.path().join(".config")).unwrap();
+        fs::write(
+            tmp.path().join(".config/nextest.toml"),
+            format!(
+                "[[profile.default.overrides]]\nfilter = '{filter}'\n\
+                 test-group = 'ca_softioc'\n\n[test-groups]\n\
+                 ca_softioc = {{ max-threads = 1 }}\n\
+                 ioc_unthrottled = {{ max-threads = 4 }}\n"
+            ),
+        )
+        .unwrap();
+        check(tmp.path())
+    }
+
+    /// The gate's three judgements on a merged binary: the spawning module
+    /// is declared by its prefix or by the whole binary; a prefix naming no
+    /// module is a dead name; a prefix naming a module that does not spawn
+    /// is a declaration that lost its evidence.
+    #[test]
+    fn the_gate_judges_a_merged_binary_by_module() {
+        assert_eq!(check_merged("binary(integration) & test(/^boots::/)"), None);
+        assert_eq!(check_merged("binary(integration)"), None);
+
+        let dead = check_merged("binary(integration) & test(/^gone::/)").unwrap();
+        assert!(
+            dead.contains("`test(/^gone::/)`, which is none of its modules"),
+            "{dead}"
+        );
+        assert!(dead.contains("fixture::integration boots::"), "{dead}");
+
+        let lost = check_merged("binary(integration) & test(/^silent::/)").unwrap();
+        assert!(
+            lost.contains("declares `binary(integration) & test(/^silent::/)` an IOC spawner"),
+            "{lost}"
         );
     }
 }

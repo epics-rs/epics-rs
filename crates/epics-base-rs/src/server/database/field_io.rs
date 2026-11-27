@@ -4107,93 +4107,91 @@ impl PvDatabase {
     /// busy record — the deferral is closed under its own restart. Called only
     /// from `PvDatabase::apply_pact_exit`, the single drain owner.
     pub(crate) async fn restart_next_notify_put(&self, record_name: &[u8]) {
-        // A replayed put that drives no cycle leaves the record free, and C
-        // then hands it to the next entry (`restartCheck`, dbNotify.c:263-264);
-        // one that does is owned again and `take_next_notify_restart` stops.
-        loop {
-            // The clients already hold their receivers; a failure here (record gone,
-            // field refused) must still release them, which dropping the senders
-            // does — the same completion a `dbNotifyCancel` gives the C client.
-            let held = loop {
-                let _record_gate = self.acquire_put_gate(record_name, "", None);
-                let Some(rec) = self.get_record(record_name) else {
-                    return;
-                };
-                let Some(queued) = rec.write().take_next_notify_restart() else {
-                    return;
-                };
-                break match queued {
-                    crate::server::record::DeferredNotify::Put(
-                        crate::server::record::DeferredNotifyPut {
-                            field,
-                            value,
-                            completion,
-                        },
-                    ) => {
-                        let link_text = is_link_text(&value);
-                        let mut tail = PutTail::default();
-                        // No parses: a put to a DBF link field is never deferred
-                        // (`is_dbf_link_field` in the body), so none replays.
-                        let put = self.put_record_field_from_ca_body(
-                            record_name,
-                            &field,
-                            value,
-                            NotifyRequest::Deferred(completion),
-                            &mut LinkPutParses::default(),
-                            &mut tail,
-                        );
-                        (field, link_text, put, tail)
-                    }
-                    // C `processRequest` on restart: no put, no process; the
-                    // next entry is checked before the callback (`dbNotify.c:263-270`).
-                    crate::server::record::DeferredNotify::Wait { completion } => {
-                        let _ = completion.send(());
-                        continue;
-                    }
-                    // C `processGetRequest` on restart: `processNotifyCommon`
-                    // re-enters with no `putCallback`, so the replay is the process
-                    // alone. The gate is already held, so this takes the
-                    // already-locked entry.
-                    crate::server::record::DeferredNotify::Process { completion } => {
-                        // Only a Passive record is processed (`dbNotify.c:248-250`);
-                        // any other completes and the next entry is checked.
-                        if rec.read().common.scan != crate::server::record::ScanType::Passive {
-                            let _ = completion.send(());
-                            continue;
-                        }
-                        let _ = self.install_notify_and_process_already_locked(
-                            record_name,
-                            completion,
-                            NotifyArrival::Replay,
-                        );
-                        return;
-                    }
-                    // C `processNotifyCommon` with `first == 0`: a cancelled
-                    // request was taken off the list (`dbNotify.c:400-410`), and
-                    // one whose record is no longer Passive completes without a
-                    // process (`:263-270`); either way the next entry is checked.
-                    crate::server::record::DeferredNotify::ProcessGet {
-                        completion,
-                        requester,
-                    } => {
-                        if !requester.is_current() {
-                            continue;
-                        }
-                        if rec.read().common.scan != crate::server::record::ScanType::Passive {
-                            let _ = completion.send(());
-                            continue;
-                        }
-                        let _ = self.install_notify_and_process_already_locked(
-                            record_name,
-                            completion,
-                            NotifyArrival::Replay,
-                        );
-                        return;
-                    }
-                };
+        use crate::server::record::{DeferredNotify, ProcessCompletion, ScanType};
+        // One entry per callback, as C queues one `callbackRequest` per restart
+        // (`restartCheck`, dbNotify.c:169): an entry that drives a cycle leaves
+        // the next to that cycle's end (`:463-465`), one that drives none hands
+        // it on through a fresh callback (`:263-264`).
+        //
+        // The clients already hold their receivers; a failure here (record gone,
+        // field refused) must still release them, which dropping the senders
+        // does — the same completion a `dbNotifyCancel` gives the C client.
+        let (rec, hands_on, put) = {
+            let _record_gate = self.acquire_put_gate(record_name, "", None);
+            let Some(rec) = self.get_record(record_name) else {
+                return;
             };
-            let (field, link_text, put, tail) = held;
+            let queued = loop {
+                match rec.write().take_next_notify_restart() {
+                    None => return,
+                    // C `dbNotifyCancel` took a cancelled request off the list
+                    // (`dbNotify.c:400-410`), so it costs no callback.
+                    Some(DeferredNotify::ProcessGet { requester, .. })
+                        if !requester.is_current() => {}
+                    Some(queued) => break queued,
+                }
+            };
+            match queued {
+                DeferredNotify::Put(crate::server::record::DeferredNotifyPut {
+                    field,
+                    value,
+                    completion,
+                }) => {
+                    let link_text = is_link_text(&value);
+                    let mut tail = PutTail::default();
+                    // No parses: a put to a DBF link field is never deferred
+                    // (`is_dbf_link_field` in the body), so none replays.
+                    let put = self.put_record_field_from_ca_body(
+                        record_name,
+                        &field,
+                        value,
+                        NotifyRequest::Deferred(completion),
+                        &mut LinkPutParses::default(),
+                        &mut tail,
+                    );
+                    let unprocessed = matches!(
+                        put,
+                        Ok(ProcessCompletion::Unprocessed)
+                            | Err(PutRefused {
+                                completion: ProcessCompletion::Unprocessed,
+                                ..
+                            })
+                    );
+                    (rec, unprocessed, Some((field, link_text, put, tail)))
+                }
+                // C `processRequest` on restart: no put, no process
+                // (`dbNotify.c:263-270`).
+                DeferredNotify::Wait { completion } => {
+                    let _ = completion.send(());
+                    (rec, true, None)
+                }
+                // C `processGetRequest` on restart: `processNotifyCommon`
+                // re-enters with no `putCallback`, so the replay is the process
+                // alone, and only a Passive record is processed
+                // (`dbNotify.c:248-250`). The gate is already held, so this
+                // takes the already-locked entry.
+                DeferredNotify::Process { completion }
+                | DeferredNotify::ProcessGet { completion, .. } => {
+                    if rec.read().common.scan != ScanType::Passive {
+                        let _ = completion.send(());
+                        (rec, true, None)
+                    } else {
+                        let _ = self.install_notify_and_process_already_locked(
+                            record_name,
+                            completion,
+                            NotifyArrival::Replay,
+                        );
+                        (rec, false, None)
+                    }
+                }
+            }
+        };
+        if let Some((field, link_text, put, tail)) = put {
             let _ = self.after_put_gate(record_name, &field, link_text, put, tail);
+        }
+        if hands_on {
+            let exit = rec.read().pact_exit_without_release();
+            self.apply_pact_exit(record_name, exit);
         }
     }
 

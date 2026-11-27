@@ -1,0 +1,18 @@
+[package]
+name = "alloc-count"
+version.workspace = true
+edition.workspace = true
+description = "Test-only: the one counting global allocator every crate's `alloc` test binary installs, with per-thread and per-thread-name windows"
+license-file = "LICENSE"
+authors.workspace = true
+repository.workspace = true
+# Never published. Every consumer takes it as a `path`-only dev-dependency,
+# which `cargo package` drops from the uploaded manifest, so this crate's
+# absence from crates.io is not a hole in anyone's dependency graph.
+publish = false
+
+[dev-dependencies]
+fact-budget = { path = "../fact-budget" }
+# The test's deadline_from_now. epics-libcom-rs takes this crate only as a
+# dev-dependency, so the edge back is not a cycle.
+epics-libcom-rs = { path = "../epics-libcom-rs" }

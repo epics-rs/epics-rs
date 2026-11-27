@@ -4428,7 +4428,7 @@ mod tests {
         // when that thread gets there, not after a fixed number of yields on
         // this one; wait on the write itself with a bound that only trips on
         // a genuinely dead poller.
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = epics_base_rs::runtime::time::deadline_from_now(Duration::from_secs(10));
         while written.lock().unwrap().is_empty() {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -4750,7 +4750,7 @@ mod tests {
             .expect("the POLL_DELAY write must land");
 
         // The write signals the poller, which must exist to hear it.
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = epics_base_rs::runtime::time::deadline_from_now(Duration::from_secs(10));
         while requests.lock().unwrap().is_empty() {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -8315,7 +8315,7 @@ mod tests {
 
         // The two failures cost the 1.0 s persistent-error backoff; after it the
         // recovered link must produce successful reads. A dead poller reads 0.
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = epics_base_rs::runtime::time::deadline_from_now(Duration::from_secs(10));
         loop {
             let read_ok = handle
                 .read_int32(read_ok_reason, 0)
@@ -8387,7 +8387,7 @@ mod tests {
             fanout_pending,
         ));
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = epics_base_rs::runtime::time::deadline_from_now(Duration::from_secs(10));
         while written.lock().unwrap().is_empty() {
             assert!(
                 std::time::Instant::now() < deadline,

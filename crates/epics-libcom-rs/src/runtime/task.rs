@@ -535,9 +535,9 @@ pub fn background_init() {
     background().callbacks().init();
 }
 
-/// Arm the callback bands if they are in `cbInit`, silently otherwise —
-/// [`background_init`] without C's second-call warning, for a build that has
-/// no `iocBuild` to call `callbackInit`.
+/// Arm the callback bands if they are in `cbInit`, silently otherwise, for
+/// what needs them where no `iocBuild` has called `callbackInit`. It is not
+/// that call: a later [`background_init`] is still the first.
 pub fn background_arm() {
     background().callbacks().arm();
 }
@@ -627,6 +627,13 @@ pub fn background_scan_once(
     background().scan_once().scan_once(name, cb)
 }
 
+/// Queue a record's one-shot process behind the requests already queued,
+/// never refused — see
+/// [`ScanOnceQueue::scan_once_record`](crate::runtime::background::ScanOnceQueue::scan_once_record).
+pub fn background_scan_once_record(cb: crate::runtime::background::OnceCallback) {
+    background().scan_once().scan_once_record(cb)
+}
+
 /// Ring statistics for the `scanOnce` facility, or `None` before the
 /// background executor exists — C `scanOnceQueueStatus` (`dbScan.c:734-757`)
 /// and its `if (!onceQ) return -1` guard.
@@ -695,16 +702,32 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
+    spawn_background_after_admitted(priority, delay, || true, future)
+}
+
+/// [`spawn_background_after`] whose request its owner may refuse: `admit` is
+/// asked when the delay expires — at once for a zero delay — which is when C's
+/// timer calls `callbackRequest` (`callback.c:404-408`), and a `false` cancels
+/// the task unrun, its handle resolving as cancelled.
+pub fn spawn_background_after_admitted<F, A>(
+    priority: CallbackPriority,
+    delay: Duration,
+    admit: A,
+    future: F,
+) -> BackgroundTaskHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+    A: FnOnce() -> bool + Send + 'static,
+{
     use crate::runtime::background::spawn_future_after;
-    if delay.is_zero() {
-        return spawn_background(priority, future);
-    }
     let exec = background();
     spawn_future_after(
         &exec.callbacks().handle(),
         &exec.timer().handle(),
         priority,
         delay,
+        admit,
         future,
     )
 }
@@ -726,7 +749,8 @@ where
 /// Queue a requester-owned [`CallbackCell`] on the process-global pool's
 /// `priority` band — C `callbackRequest` (`callback.c:341`). Unlike
 /// [`spawn_background`] this allocates nothing per request; a cell already
-/// queued is taken by its pending run.
+/// queued is taken by its pending run. Never refused for a full band: `Err`
+/// is only `NotInit`.
 ///
 /// [`CallbackCell`]: crate::runtime::background::CallbackCell
 pub fn request_cell<B: crate::runtime::background::CallbackBody>(
@@ -1205,10 +1229,8 @@ pub type Instant = std::time::Instant;
 /// the alias above.
 ///
 /// The alias exists so a deadline cannot be built in the wrong timeline;
-/// this exists so it cannot be built by a panicking add. Any `Duration`
-/// that came from a `double` — a record field, an `EPICS_*` env var, a
-/// caller-supplied timeout — can be [`Duration::MAX`] by the rule in
-/// [`crate::runtime::time::duration_from_secs`], and `Instant + MAX`
+/// this exists so it cannot be built by a panicking add. A caller's own
+/// "no bound" timeout can be [`Duration::MAX`], and `Instant + MAX`
 /// aborts the task rather than never firing. Both concrete `Instant`
 /// types offer `checked_add`, so one body covers both backends.
 pub fn deadline_after(base: Instant, d: Duration) -> Instant {
@@ -4480,7 +4502,7 @@ mod tests {
     /// Rooted at `src`, not at `src/runtime`, because the claim these guards
     /// make is about this crate. `epics-base-rs`'s two thread-creating files
     /// (`server/ioc_app.rs`, `server/scan.rs`) are swept by the same
-    /// assertions in that crate's own `tests/thread_census.rs`:
+    /// assertions in that crate's own `tests/integration/thread_census.rs`:
     /// `include_str!` must not cross a crate boundary — a path outside the
     /// package directory does not survive `cargo publish` — so the guard is
     /// split by subject, not weakened.

@@ -172,12 +172,12 @@ server.run().await?;
 # Ok(()) }
 ```
 
-The end-to-end test at `tests/procserv_e2e.rs` shows a complete config
-literal with TCP listener, key bindings, restart policy and a
-`/bin/cat` child — useful as a copy-paste starting point. It binds the
-listeners itself and hands them over with `ProcServ::with_prebound`,
-which is what the binary does so a bind failure fail-fasts before
-`fork_and_go`; library use as above lets `run` bind them.
+The end-to-end test at `tests/integration/procserv_e2e.rs` shows a complete
+config literal with TCP listener, key bindings, restart policy and a `/bin/cat`
+child — useful as a copy-paste starting point. It binds the listeners itself and
+hands them over with `ProcServ::with_prebound`, which is what the binary does so
+a bind failure fail-fasts before `fork_and_go`; library use as above lets `run`
+bind them.
 
 `cargo nextest run -p epics-tools-rs` runs 173 tests, the e2e ones over
 a real socket against a real `/bin/cat`.

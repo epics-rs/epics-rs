@@ -218,7 +218,7 @@ pub fn subscription_readback_dbr(
         .unwrap_or_else(|| native.time_dbr_type())
 }
 
-use state::ChannelInner;
+use state::{ChannelInner, Link};
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -523,27 +523,10 @@ enum CoordRequest {
         mask: u16,
         deadband: f64,
         consumer: subscription::Consumer,
-        /// Requested element-count cap (`camonitor -#`), or `None` for the
-        /// full native count. Carried onto the subscription record and
-        /// clamped to the channel's native element count at connect-time by
-        /// the single owner [`subscription::resolve_subscription_count`]
-        /// (C `camonitor.c:169`), so it works even though the subscribe is
-        /// issued before the channel connects.
-        req_count: Option<u32>,
-        /// Which ENUM readback type the subscription requests: `Native`
-        /// (keep `DBR_TIME_ENUM` — the plain library/gateway subscribe),
-        /// `Label` (the `camonitor` default, `DBR_TIME_STRING`), or
-        /// `Numeric` (`camonitor -n`, `DBR_TIME_INT`). See [`EnumReadback`].
-        /// Applied by the coordinator at connect-time type derivation, so it
-        /// works even though the subscribe is issued before the channel
-        /// connects.
-        enum_readback: EnumReadback,
-        /// When set, a FLOAT/DOUBLE field is subscribed in its
-        /// `DBR_TIME_STRING` form so the server renders the value to a
-        /// string at record precision (`camonitor -s` / `floatAsString`;
-        /// C `camonitor.c:162-166`). Folded into the readback derivation
-        /// after the ENUM case, mirroring C's `else if`.
-        float_as_string: bool,
+        /// The DBR type and count: derived at connect-time from the native
+        /// type (so a subscribe issued before connect works), or fixed by
+        /// the caller.
+        kind: subscription::SubscribeType,
         /// the coordinator owns the `subid` table, so it
         /// allocates the id (probing live subscriptions) and returns
         /// it here rather than accepting one minted at the call site.
@@ -1694,27 +1677,98 @@ async fn within<T>(
         .unwrap_or(Err(CaError::Timeout))
 }
 
-/// C `nciu::write` (`libca/nciu.cpp`) and its write-callback
-/// overload reject `countIn > this->count` before queueing the
-/// request, surfacing as `ECA_BADCOUNT`. Pre-fix Rust forwarded any
-/// caller-supplied count to the server, which the server would then
-/// reject asynchronously (callback path) or accept past its array
-/// bound (nowait path). Validate client-side so the call fails
-/// synchronously the way libca does.
-fn validate_put_count(snap: &types::ChannelSnapshotPublic, count: u32) -> CaResult<()> {
+/// The fields of [`ReadAdmit`] and [`WriteAdmit`] are private to this
+/// module, so outside it only `admit_read` / `admit_write` can make one, and
+/// the READ_NOTIFY / WRITE / WRITE_NOTIFY senders and their
+/// `TransportCommand`s take one.
+mod admission {
+    use super::*;
+
+    /// A READ_NOTIFY that passed [`admit_read`]: its DBR type and the element
+    /// count it carries on the wire.
+    pub(crate) struct ReadAdmit {
+        data_type: u16,
+        count: u32,
+    }
+
+    impl ReadAdmit {
+        pub(crate) fn data_type(&self) -> u16 {
+            self.data_type
+        }
+
+        pub(crate) fn count(&self) -> u32 {
+            self.count
+        }
+    }
+
+    /// A write that passed [`admit_write`], with the bytes it was admitted for.
+    pub(crate) struct WriteAdmit {
+        count: u32,
+        payload: Vec<u8>,
+    }
+
+    impl WriteAdmit {
+        pub(crate) fn count(&self) -> u32 {
+            self.count
+        }
+
+        pub(crate) fn into_parts(self) -> (u32, Vec<u8>) {
+            (self.count, self.payload)
+        }
+    }
+
+    /// libca `nciu::read`'s gate ahead of queueing, in its order: the read
+    /// right, then `countIn > this->count` as `ECA_BADCOUNT`
+    /// (`nciu.cpp:282-287`), then `tcpiiu::readNotifyRequest`'s
+    /// (`tcpiiu.cpp:1463-1478`): the type, the bound of what the circuit can
+    /// carry (ECA_TOLARGE), and the native count for a zero (autosize)
+    /// request to a peer before CA_V413, which would read `m_count == 0` as
+    /// "no elements". Every read passes it before its waiter exists.
+    pub(super) fn admit_read(
+        snap: &ChannelSnapshotPublic,
+        data_type: u16,
+        count: u32,
+    ) -> CaResult<ReadAdmit> {
+        snap.permit_read()?;
+        validate_count(snap, count)?;
+        let count = crate::protocol::read_notify_wire_count(
+            count,
+            snap.element_count,
+            data_type,
+            snap.server_minor,
+        )?;
+        Ok(ReadAdmit { data_type, count })
+    }
+
+    /// libca `nciu::write`'s gate, both overloads, in their order: the write
+    /// right, the count, then each string (`nciu.cpp:329-337,350-358`).
+    pub(super) fn admit_write(
+        snap: &ChannelSnapshotPublic,
+        value: &EpicsValue,
+    ) -> CaResult<WriteAdmit> {
+        snap.permit_write()?;
+        validate_count(snap, value.count())?;
+        validate_put_strings(value)?;
+        Ok(WriteAdmit {
+            count: value.count(),
+            payload: value.to_bytes(),
+        })
+    }
+}
+use admission::{ReadAdmit, WriteAdmit, admit_read, admit_write};
+
+/// `countIn > this->count` is `outOfBounds`, `ECA_BADCOUNT`.
+fn validate_count(snap: &ChannelSnapshotPublic, count: u32) -> CaResult<()> {
     if count > snap.element_count {
-        return Err(CaError::Protocol(format!(
-            "put count {} exceeds channel element count {} \
-             (matches libca nciu::write ECA_BADCOUNT)",
-            count, snap.element_count
-        )));
+        return Err(CaError::BadCount);
     }
     Ok(())
 }
 
 /// C `nciu::stringVerify` rejects DBR_STRING elements that
 /// exceed `MAX_STRING_SIZE` (40 bytes including the NUL terminator)
-/// with `ECA_STRTOBIG`. Pre-fix Rust silently truncated long strings
+/// with `badString`, which `oldChannelNotify.cpp:445-447,502-504` answer
+/// `ECA_BADSTR`. Pre-fix Rust silently truncated long strings
 /// to 39 bytes + NUL inside `EpicsValue::to_bytes()`, so a
 /// `put_string()` could write a different value than the caller
 /// supplied. Validate up front so the call fails synchronously.
@@ -1725,10 +1779,7 @@ fn validate_string_length(s: impl AsRef<[u8]>) -> CaResult<()> {
     // C requires room for the trailing NUL: payload >= len + 1.
     let len = s.as_ref().len();
     if len >= MAX_STRING_SIZE {
-        return Err(CaError::Protocol(format!(
-            "string of {len} bytes exceeds MAX_STRING_SIZE - 1 = 39 \
-             (matches libca nciu::stringVerify ECA_STRTOBIG)"
-        )));
+        return Err(CaError::WriteFailed(ECA_BADSTR));
     }
     Ok(())
 }
@@ -1936,6 +1987,28 @@ impl ReqCount {
     }
 }
 
+/// A DBR type a subscription names, `0..=LAST_BUFFER_TYPE`. Its own type,
+/// so a mask or a count cannot be passed in its place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DbrType(u16);
+
+impl DbrType {
+    /// `code` as a request type; past `LAST_BUFFER_TYPE` it is
+    /// `CaError::UnsupportedType`, libca's `ECA_BADTYPE`
+    /// (`oldChannelNotify.cpp:551`).
+    pub fn new(code: u16) -> CaResult<Self> {
+        if code > epics_base_rs::types::LAST_BUFFER_TYPE {
+            return Err(CaError::UnsupportedType(code));
+        }
+        Ok(Self(code))
+    }
+
+    /// The type code on the wire.
+    pub fn code(self) -> u16 {
+        self.0
+    }
+}
+
 impl CaChannel {
     pub async fn wait_connected(&self, timeout: Duration) -> CaResult<()> {
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -2006,15 +2079,15 @@ impl CaChannel {
     }
 
     fn build_read_notify_frame(
-        sid: u32,
-        data_type: u16,
-        count: u32,
+        snap: &ChannelSnapshotPublic,
+        admit: &ReadAdmit,
         ioid: u32,
-        peer_minor: u16,
     ) -> CaResult<Vec<u8>> {
+        let count = admit.count();
+        let peer_minor = snap.server_minor;
         let mut hdr = CaHeader::new(CA_PROTO_READ_NOTIFY);
-        hdr.data_type = data_type;
-        hdr.cid = sid;
+        hdr.data_type = admit.data_type();
+        hdr.cid = snap.sid;
         hdr.available = ioid;
         // C parity (`comQueSend.cpp:285`): extended form is needed for
         // `nElem >= 0xffff`, not just `> 0xffff`. Routing 0xFFFF
@@ -2089,49 +2162,17 @@ impl CaChannel {
     fn send_read_notify_fast(
         &self,
         snap: &ChannelSnapshotPublic,
-        data_type: u16,
-        count: u32,
+        admit: ReadAdmit,
         ioid: u32,
     ) -> CaResult<()> {
-        // C `libca/nciu.cpp::read()` rejects before queueing
-        // when `!accessRightState.readPermit()` (ECA_NORDACCESS).
-        // Pre-fix Rust forwarded the request anyway and let the
-        // server (or a timeout) surface the denial; the cached
-        // access bits from the last CA_PROTO_ACCESS_RIGHTS frame
-        // are the authoritative client-side gate libca consults.
-        if !snap.access_rights.read {
-            return Err(CaError::Protocol(format!(
-                "read denied by cached access rights (matches libca \
-                 nciu::read ECA_NORDACCESS); ioid {ioid}"
-            )));
-        }
-        // C `tcpiiu::readNotifyRequest` (`tcpiiu.cpp:1463-1478`) bounds the
-        // requested element count against what the circuit can carry
-        // (ECA_TOLARGE past it), then substitutes the channel's native count
-        // for a zero (autosize) request when the peer predates CA_V413 —
-        // those servers have no zero-count autosize contract and would read
-        // `m_count == 0` as "no elements".
-        let count = crate::protocol::read_notify_wire_count(
-            count,
-            snap.element_count,
-            data_type,
-            snap.server_minor,
-        )?;
         if let Some(writer) = self.direct_writer(snap.server_addr) {
-            return writer.send_frame(Self::build_read_notify_frame(
-                snap.sid,
-                data_type,
-                count,
-                ioid,
-                snap.server_minor,
-            )?);
+            return writer.send_frame(Self::build_read_notify_frame(snap, &admit, ioid)?);
         }
 
         self.transport_tx
             .send(TransportCommand::ReadNotify {
                 sid: snap.sid,
-                data_type,
-                count,
+                admit,
                 ioid,
                 server_addr: snap.server_addr,
                 priority: self.priority,
@@ -2147,18 +2188,9 @@ impl CaChannel {
         &self,
         snap: &ChannelSnapshotPublic,
         data_type: u16,
-        count: u32,
+        admit: WriteAdmit,
         ioid: u32,
-        payload: Vec<u8>,
     ) -> CaResult<()> {
-        // C `libca/nciu.cpp::write()` rejects before queueing
-        // when `!accessRightState.writePermit()` (ECA_NOWTACCESS).
-        if !snap.access_rights.write {
-            return Err(CaError::Protocol(format!(
-                "write denied by cached access rights (matches libca \
-                 nciu::write ECA_NOWTACCESS); ioid {ioid}"
-            )));
-        }
         // C `comQueSend::insertRequestWithPayLoad` refuses a DBR type past
         // `INVALID_DB_REQ` (`comQueSend.cpp:323`, → ECA_BADTYPE) and an array
         // past the peer's message-body limit (`:352-364`, → ECA_BADCOUNT),
@@ -2167,8 +2199,9 @@ impl CaChannel {
         // unframeable request on the wire — and so a caller-chosen type from
         // `put_as_dbr_*` is answered locally instead of costing the circuit
         // the server would drop it on.
-        crate::protocol::check_write_request(count, data_type, snap.server_minor)?;
+        crate::protocol::check_write_request(admit.count(), data_type, snap.server_minor)?;
         if let Some(writer) = self.direct_writer(snap.server_addr) {
+            let (count, payload) = admit.into_parts();
             return writer.send_frame(Self::build_write_frame(
                 CA_PROTO_WRITE_NOTIFY,
                 snap.sid,
@@ -2184,39 +2217,27 @@ impl CaChannel {
             .send(TransportCommand::WriteNotify {
                 sid: snap.sid,
                 data_type,
-                count,
                 ioid,
-                payload,
+                admit,
                 server_addr: snap.server_addr,
                 priority: self.priority,
             })
             .map_err(|_| CaError::Shutdown)
     }
 
-    /// Send a fire-and-forget `CA_PROTO_WRITE`. See
+    /// Send the admitted value as a fire-and-forget `CA_PROTO_WRITE`. See
     /// [`Self::send_write_notify_fast`] for the `data_type` contract.
     fn send_write_nowait_fast(
         &self,
         snap: &ChannelSnapshotPublic,
         data_type: u16,
-        count: u32,
-        payload: Vec<u8>,
+        admit: WriteAdmit,
     ) -> CaResult<()> {
-        // cached-access write gate (see send_write_notify_fast).
-        // The nowait variant otherwise returned Ok(()) after putting
-        // an oversized / forbidden request on the wire.
-        if !snap.access_rights.write {
-            return Err(CaError::Protocol(
-                "write denied by cached access rights (matches libca \
-                 nciu::write ECA_NOWTACCESS)"
-                    .into(),
-            ));
-        }
         // Same pre-queue type and element bounds as `send_write_notify_fast`
         // — a fire-and-forget put goes through the identical
         // `comQueSend::insertRequestWithPayLoad`, so `ca_array_put` returns
         // ECA_BADTYPE / ECA_BADCOUNT synchronously rather than sending.
-        crate::protocol::check_write_request(count, data_type, snap.server_minor)?;
+        crate::protocol::check_write_request(admit.count(), data_type, snap.server_minor)?;
         // Bind the identity to the request before the request exists on the
         // wire, at the one site both routes pass through. A plain write has
         // no ioid and no completion, so this record is the only thing that
@@ -2226,6 +2247,7 @@ impl CaChannel {
             .write_identities
             .insert(self.cid, Arc::clone(&self.pv_name));
         if let Some(writer) = self.direct_writer(snap.server_addr) {
+            let (count, payload) = admit.into_parts();
             return writer.send_frame(Self::build_write_frame(
                 CA_PROTO_WRITE,
                 snap.sid,
@@ -2242,8 +2264,7 @@ impl CaChannel {
                 sid: snap.sid,
                 cid: self.cid,
                 data_type,
-                count,
-                payload,
+                admit,
                 server_addr: snap.server_addr,
                 priority: self.priority,
             })
@@ -2309,8 +2330,11 @@ impl CaChannel {
         let mut pending: Vec<Pending> = Vec::new();
 
         for (index, ch) in channels.iter().enumerate() {
-            let snap = match ch.snapshot() {
-                Ok(s) => s,
+            let (snap, admit) = match ch
+                .snapshot()
+                .and_then(|s| admit_read(&s, s.native_type as u16, s.element_count).map(|a| (s, a)))
+            {
+                Ok(admitted) => admitted,
                 Err(e) => {
                     results[index] = Some(Err(e));
                     continue;
@@ -2346,26 +2370,7 @@ impl CaChannel {
                 // Refill the reusable Sender slot. The dispatcher takes
                 // this on response without removing the DashMap entry.
                 *cached.slot.lock() = Some(reply_tx);
-                let count = match crate::protocol::read_notify_wire_count(
-                    cached.element_count,
-                    cached.element_count,
-                    cached.data_type,
-                    snap.server_minor,
-                ) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        ch.in_flight.reads.remove(&cached.ioid);
-                        results[index] = Some(Err(e));
-                        continue;
-                    }
-                };
-                let frame = match Self::build_read_notify_frame(
-                    cached.sid,
-                    cached.data_type,
-                    count,
-                    cached.ioid,
-                    snap.server_minor,
-                ) {
+                let frame = match Self::build_read_notify_frame(&snap, &admit, cached.ioid) {
                     Ok(f) => f,
                     Err(e) => {
                         // Unframeable for this peer — drop the borrowed
@@ -2393,26 +2398,7 @@ impl CaChannel {
                         reply_tx,
                     },
                 );
-                let count = match crate::protocol::read_notify_wire_count(
-                    snap.element_count,
-                    snap.element_count,
-                    snap.native_type as u16,
-                    snap.server_minor,
-                ) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        ch.in_flight.reads.remove(&ioid);
-                        results[index] = Some(Err(e));
-                        continue;
-                    }
-                };
-                let frame = match Self::build_read_notify_frame(
-                    snap.sid,
-                    snap.native_type as u16,
-                    count,
-                    ioid,
-                    snap.server_minor,
-                ) {
+                let frame = match Self::build_read_notify_frame(&snap, &admit, ioid) {
                     Ok(f) => f,
                     Err(e) => {
                         ch.in_flight.reads.remove(&ioid);
@@ -2457,12 +2443,7 @@ impl CaChannel {
                 match pending_read.kind {
                     PendingKind::Cold {
                         ioid, in_flight, ..
-                    } => match ch.send_read_notify_fast(
-                        &snap,
-                        snap.native_type as u16,
-                        snap.element_count,
-                        ioid,
-                    ) {
+                    } => match ch.send_read_notify_fast(&snap, admit, ioid) {
                         Ok(()) => pending.push(Pending {
                             index,
                             reply_rx: pending_read.reply_rx,
@@ -2832,21 +2813,7 @@ impl CaChannel {
     ) -> CaResult<PendingRead> {
         // Resolve the request mode (`Fixed(0)` → native count; `Autosize`
         // passes its count through, including the `0` autosize request).
-        let request_count = count.resolve(snap.element_count);
-        // C `libca/nciu.cpp::read()` rejects `countIn > this->count` with
-        // ECA_BADCOUNT before queueing the read. Pre-fix Rust silently
-        // clamped with `.min(snap.element_count)`, so a caller bug
-        // requesting 100 elements from a 10-element PV got a 10-element
-        // response from Rust where libca would have returned ECA_BADCOUNT
-        // without sending anything. Validate the resolved count up front;
-        // `0` (native or autosize) is always in range.
-        if request_count > snap.element_count {
-            return Err(CaError::Protocol(format!(
-                "get count {} exceeds channel element count {} \
-                 (matches libca nciu::read ECA_BADCOUNT)",
-                request_count, snap.element_count
-            )));
-        }
+        let admit = admit_read(&snap, request_type, count.resolve(snap.element_count))?;
 
         let ioid = self.in_flight.alloc_ioid();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -2866,7 +2833,7 @@ impl CaChannel {
             ioid,
             reply_rx,
         };
-        self.send_read_notify_fast(&snap, request_type, request_count, ioid)?;
+        self.send_read_notify_fast(&snap, admit, ioid)?;
         Ok(read)
     }
 
@@ -2899,15 +2866,15 @@ impl CaChannel {
         Ok(self.issue_write_notify_as(dbr_type, value)?.reply())
     }
 
-    /// Register a write waiter and send `count` elements of `payload` as a
-    /// `dbr_type` `CA_PROTO_WRITE_NOTIFY`.
+    /// Register a write waiter and send `value` as a `dbr_type`
+    /// `CA_PROTO_WRITE_NOTIFY`.
     fn send_write_notify(
         &self,
         snap: &ChannelSnapshotPublic,
         dbr_type: u16,
-        count: u32,
-        payload: Vec<u8>,
+        value: &EpicsValue,
     ) -> CaResult<PendingWrite> {
+        let admit = admit_write(snap, value)?;
         let ioid = self.in_flight.alloc_ioid();
         let (reply_tx, reply_rx) = oneshot::channel();
         // Direct registry insert (Option C Phase A).
@@ -2917,7 +2884,7 @@ impl CaChannel {
             ioid,
             reply_rx,
         };
-        self.send_write_notify_fast(snap, dbr_type, count, ioid, payload)?;
+        self.send_write_notify_fast(snap, dbr_type, admit, ioid)?;
         Ok(write)
     }
 
@@ -2933,17 +2900,11 @@ impl CaChannel {
         // `Long(1)` landed as 0, silently. `convert_to` is the single
         // value-coercion owner (C cast semantics), so the header/payload
         // pairing holds for every variant. Menu labels still go through
-        // `put_string`, which the server resolves against its menu.
-        let value = value.convert_to(snap.native_type);
-        // C `nciu::write` rejects countIn > channel count with
-        // ECA_BADCOUNT before queueing the request. Validated on the
-        // converted value — the count of the actual wire request, which
+        // `put_string`, which the server resolves against its menu. The gate
+        // counts the converted value — the actual wire request, whose count
         // conversion can change (String → CHAR-array on a CHAR field).
-        validate_put_count(&snap, value.count())?;
-        validate_put_strings(&value)?;
-
-        let count = value.count() as u32;
-        self.send_write_notify(&snap, snap.native_type as u16, count, value.to_bytes())
+        let value = value.convert_to(snap.native_type);
+        self.send_write_notify(&snap, snap.native_type as u16, &value)
     }
 
     /// Fire-and-forget put (CA_PROTO_WRITE). Returns immediately without
@@ -2960,12 +2921,7 @@ impl CaChannel {
         // Native encoding to match the native-typed header; see
         // `issue_write_notify`.
         let value = value.convert_to(snap.native_type);
-        validate_put_count(&snap, value.count())?;
-        validate_put_strings(&value)?;
-
-        let payload = value.to_bytes();
-        let count = value.count() as u32;
-        self.send_write_nowait_fast(&snap, snap.native_type as u16, count, payload)
+        self.send_write_nowait_fast(&snap, snap.native_type as u16, admit_write(&snap, &value)?)
     }
 
     /// Write `value`'s payload under an explicit DBR wire type
@@ -3004,11 +2960,7 @@ impl CaChannel {
 
     /// Send `value` under `dbr_type` as a `CA_PROTO_WRITE_NOTIFY`.
     fn issue_write_notify_as(&self, dbr_type: u16, value: &EpicsValue) -> CaResult<PendingWrite> {
-        let snap = self.snapshot()?;
-        let count = value.count() as u32;
-        validate_put_count(&snap, count)?;
-        validate_put_strings(value)?;
-        self.send_write_notify(&snap, dbr_type, count, value.to_bytes())
+        self.send_write_notify(&self.snapshot()?, dbr_type, value)
     }
 
     /// Fire-and-forget variant of [`Self::put_as_dbr_with_timeout`] —
@@ -3022,11 +2974,7 @@ impl CaChannel {
     /// `ca_array_put`'s status is known once the request is queued.
     pub fn put_as_dbr_no_callback(&self, dbr_type: u16, value: &EpicsValue) -> CaResult<()> {
         let snap = self.snapshot()?;
-        let count = value.count() as u32;
-        validate_put_count(&snap, count)?;
-        validate_put_strings(value)?;
-        let payload = value.to_bytes();
-        self.send_write_nowait_fast(&snap, dbr_type, count, payload)
+        self.send_write_nowait_fast(&snap, dbr_type, admit_write(&snap, value)?)
     }
 
     /// Write a string value to the channel as `DBR_STRING` (DBR type 0)
@@ -3042,18 +2990,14 @@ impl CaChannel {
     /// [`EpicsValue::Enum`].
     ///
     /// Note: a CA `DBR_STRING` is a fixed 40-byte field, so a `value` of 40
-    /// bytes or more is REJECTED (`ECA_STRTOBIG`), not truncated — libca
+    /// bytes or more is REJECTED (`ECA_BADSTR`), not truncated — libca
     /// `nciu::stringVerify` refuses it before the request is queued (R6-29).
     /// ENUM menu names are well within the 39-byte cap.
     pub async fn put_string(&self, value: &str, timeout: Duration) -> CaResult<()> {
-        let snap = self.snapshot()?;
-        validate_put_count(&snap, 1)?;
-        validate_string_length(value)?;
-
-        let payload = EpicsValue::String(value.into()).to_bytes();
         // DBR_STRING = 0; count 1. The server interprets the bytes
         // against its own field type (e.g. ENUM menu resolution).
-        let write = self.send_write_notify(&snap, 0, 1, payload)?;
+        let write =
+            self.send_write_notify(&self.snapshot()?, 0, &EpicsValue::String(value.into()))?;
         within(timeout, write.reply()).await
     }
 
@@ -3062,10 +3006,8 @@ impl CaChannel {
     /// server acknowledgement.
     pub async fn put_string_nowait(&self, value: &str) -> CaResult<()> {
         let snap = self.snapshot()?;
-        validate_put_count(&snap, 1)?;
-        validate_string_length(value)?;
-        let payload = EpicsValue::String(value.into()).to_bytes();
-        self.send_write_nowait_fast(&snap, 0, 1, payload)
+        let value = EpicsValue::String(value.into());
+        self.send_write_nowait_fast(&snap, 0, admit_write(&snap, &value)?)
     }
 
     /// Array variant of [`Self::put_string`] — writes `values` as a
@@ -3077,34 +3019,20 @@ impl CaChannel {
     /// `DBR_ENUM` waveform writes each element as a `DBR_STRING` and the
     /// **server** resolves each menu string. Each element is subject to the
     /// same 39-byte cap as [`Self::put_string`]: an over-long element is
-    /// rejected with `ECA_STRTOBIG`, not truncated.
+    /// rejected with `ECA_BADSTR`, not truncated.
     pub async fn put_string_array(&self, values: &[String], timeout: Duration) -> CaResult<()> {
-        let snap = self.snapshot()?;
-        validate_put_count(&snap, values.len() as u32)?;
-        for s in values {
-            validate_string_length(s)?;
-        }
-
-        let payload =
-            EpicsValue::StringArray(values.iter().map(PvString::from).collect()).to_bytes();
-        let count = values.len() as u32;
+        let value = EpicsValue::StringArray(values.iter().map(PvString::from).collect());
         // DBR_STRING = 0. The server interprets each 40-byte element
         // against its own field type (e.g. ENUM menu resolution).
-        let write = self.send_write_notify(&snap, 0, count, payload)?;
+        let write = self.send_write_notify(&self.snapshot()?, 0, &value)?;
         within(timeout, write.reply()).await
     }
 
     /// Fire-and-forget variant of [`Self::put_string_array`].
     pub async fn put_string_array_nowait(&self, values: &[String]) -> CaResult<()> {
+        let value = EpicsValue::StringArray(values.iter().map(PvString::from).collect());
         let snap = self.snapshot()?;
-        validate_put_count(&snap, values.len() as u32)?;
-        for s in values {
-            validate_string_length(s)?;
-        }
-        let payload =
-            EpicsValue::StringArray(values.iter().map(PvString::from).collect()).to_bytes();
-        let count = values.len() as u32;
-        self.send_write_nowait_fast(&snap, 0, count, payload)
+        self.send_write_nowait_fast(&snap, 0, admit_write(&snap, &value)?)
     }
 
     pub async fn subscribe(&self) -> CaResult<MonitorHandle> {
@@ -3229,6 +3157,20 @@ impl CaChannel {
         float_as_string: bool,
         req_count: Option<u32>,
     ) -> CaResult<MonitorHandle> {
+        self.subscribe_handle(
+            deadband,
+            mask,
+            subscription::SubscribeType::derived(enum_readback, float_as_string, req_count),
+        )
+        .await
+    }
+
+    async fn subscribe_handle(
+        &self,
+        deadband: f64,
+        mask: u16,
+        kind: subscription::SubscribeType,
+    ) -> CaResult<MonitorHandle> {
         let env = epics_base_rs::runtime::env::get_lossy("EPICS_CA_MONITOR_QUEUE")
             .and_then(|s| s.parse::<usize>().ok());
         let queue_size = resolve_monitor_queue_size(env);
@@ -3239,14 +3181,7 @@ impl CaChannel {
             slot: coalesce_slot.clone(),
         };
         let subid = self
-            .subscribe_consumer(
-                deadband,
-                mask,
-                enum_readback,
-                float_as_string,
-                req_count,
-                consumer,
-            )
+            .subscribe_consumer(deadband, mask, kind, consumer)
             .await?;
         Ok(MonitorHandle {
             subid,
@@ -3283,19 +3218,56 @@ impl CaChannel {
             callback: Box::new(callback),
             gone: monitor.gone.clone(),
         };
-        monitor.subid = self
-            .subscribe_consumer(0.0, mask, EnumReadback::Native, false, None, consumer)
-            .await?;
+        let kind = subscription::SubscribeType::derived(EnumReadback::Native, false, None);
+        monitor.subid = self.subscribe_consumer(0.0, mask, kind, consumer).await?;
         Ok(monitor)
+    }
+
+    /// Subscribe in `dbr_type` for `count` elements, as
+    /// `ca_create_subscription(type, count, ...)` does: the server converts
+    /// each event to that type, and the pair is kept across reconnects and
+    /// native-type changes. `count` 0 is CA autosize; a count past the
+    /// native one is clamped per request (`netIO.h:241-251`).
+    ///
+    /// ```no_run
+    /// # async fn f(ch: epics_ca_rs::client::CaChannel) -> epics_ca_rs::CaResult<()> {
+    /// use epics_base_rs::types::DBR_TIME_DOUBLE;
+    /// use epics_ca_rs::client::DbrType;
+    /// use epics_ca_rs::protocol::DBE_VALUE;
+    /// let monitor = ch
+    ///     .subscribe_with_mask_dbr_type(DBE_VALUE, DbrType::new(DBR_TIME_DOUBLE)?, 0)
+    ///     .await?;
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// The type and the mask cannot be swapped:
+    ///
+    /// ```compile_fail,E0308
+    /// # async fn f(ch: epics_ca_rs::client::CaChannel) {
+    /// use epics_base_rs::types::DBR_TIME_DOUBLE;
+    /// use epics_ca_rs::protocol::DBE_VALUE;
+    /// let _ = ch.subscribe_with_mask_dbr_type(DBR_TIME_DOUBLE, DBE_VALUE, 0).await;
+    /// # }
+    /// ```
+    pub async fn subscribe_with_mask_dbr_type(
+        &self,
+        mask: u16,
+        dbr_type: DbrType,
+        count: u32,
+    ) -> CaResult<MonitorHandle> {
+        self.subscribe_handle(
+            0.0,
+            mask,
+            subscription::SubscribeType::Fixed { dbr_type, count },
+        )
+        .await
     }
 
     async fn subscribe_consumer(
         &self,
         deadband: f64,
         mask: u16,
-        enum_readback: EnumReadback,
-        float_as_string: bool,
-        req_count: Option<u32>,
+        kind: subscription::SubscribeType,
         consumer: subscription::Consumer,
     ) -> CaResult<u32> {
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -3304,9 +3276,7 @@ impl CaChannel {
             mask,
             deadband,
             consumer,
-            req_count,
-            enum_readback,
-            float_as_string,
+            kind,
             reply: reply_tx,
         });
 
@@ -3651,9 +3621,9 @@ async fn run_coordinator(
                             cid,
                             pv_name: pv_name.clone(),
                             priority,
-                            state: ChannelState::Searching,
+                            link: Link::Searching,
                             sid: 0,
-                            native_type: None,
+                            last_native: None,
                             element_count: 0,
                             server_addr: None,
                             access_rights: AccessRights::from_u32(0),
@@ -3664,7 +3634,7 @@ async fn run_coordinator(
                         // Process any Found response that arrived before registration.
                         if let Some(server_addr) = pending_found.remove(&cid) {
                             let ch = channels.get_mut(&cid).unwrap();
-                            ch.state = ChannelState::Connecting;
+                            ch.link = Link::Connecting;
                             ch.server_addr = Some(server_addr);
                             server_channels.entry((server_addr, priority)).or_default().insert(cid);
                             let _ = transport_tx.send(TransportCommand::CreateChannel {
@@ -3677,7 +3647,7 @@ async fn run_coordinator(
                     }
                     CoordRequest::WaitConnected { cid, reply } => {
                         if let Some(ch) = channels.get_mut(&cid) {
-                            if ch.state == ChannelState::Connected {
+                            if ch.state() == ChannelState::Connected {
                                 let _ = reply.send(());
                             } else {
                                 ch.conn_tx.add_waiter(reply);
@@ -3691,7 +3661,7 @@ async fn run_coordinator(
                                 .push(reply);
                         }
                     }
-                    CoordRequest::Subscribe { cid, mask, deadband, consumer, req_count, enum_readback, float_as_string, reply } => {
+                    CoordRequest::Subscribe { cid, mask, deadband, consumer, kind, reply } => {
                         if let Some(ch) = channels.get(&cid) {
                             let server_addr = ch.server_addr.unwrap_or_else(|| {
                                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
@@ -3702,24 +3672,13 @@ async fn run_coordinator(
                             // which includes an unresponsive circuit's channels:
                             // the EVENT_ADD queues on the live socket and the
                             // server answers it when the circuit recovers.
-                            let installed = ch.state.is_operational();
-                            // Single owner of the subscribe-time readback
-                            // derivation: ENUM substituted per enum_readback
-                            // (Label→DBR_TIME_STRING, Numeric→DBR_TIME_INT,
-                            // Native→keep), else FLOAT/DOUBLE under -s becomes
-                            // DBR_TIME_STRING, else native TIME type
-                            // (C camonitor.c:155-166).
-                            let data_type = ch
-                                .native_type
-                                .map(|t| subscription_readback_dbr(t, enum_readback, float_as_string));
-                            // Single owner of the reqElems→wire-count rule: a
-                            // `-#` cap is clamped to the native element count,
-                            // no cap resolves to wire 0 (autosize) (C
-                            // camonitor.c:168-169). Reconnect re-resolves via
-                            // restore_for_channel against the fresh count.
-                            let count = ch
-                                .native_type
-                                .map(|_| subscription::resolve_subscription_count(req_count, ch.element_count));
+                            // An installed channel chooses a derived pair now;
+                            // otherwise its first connect does.
+                            let mut kind = kind;
+                            let request = ch
+                                .link
+                                .installed()
+                                .map(|native| kind.connect(native, ch.element_count, false));
                             // C keeps the user's cap in `netSubscription::count`
                             // and resolves the WIRE count per request via
                             // `getCount(guard, CA_V413(minor))` (`netIO.h:241-251`)
@@ -3742,35 +3701,18 @@ async fn run_coordinator(
                             subscriptions.add(subscription::SubscriptionRecord {
                                 subid,
                                 cid,
-                                data_type,
-                                count,
-                                // Requested cap preserved across reconnects;
-                                // restore_for_channel re-clamps it to the
-                                // fresh native count each connect.
-                                req_count,
-                                // The public subscribe API auto-derives the
-                                // DBR type from the channel's native type, so
-                                // it must re-derive on NativeTypeChanged. The
-                                // `enum_readback` / `float_as_string`
-                                // preferences are carried on the record so the
-                                // restore re-derivation applies the same
-                                // substitution chain.
-                                type_user_supplied: false,
-                                enum_readback,
-                                float_as_string,
+                                kind,
                                 mask,
                                 server_addr,
                                 priority,
                                 deadband,
                                 consumer,
-                                needs_restore: !installed,
+                                needs_restore: request.is_none(),
                                 last_value: None,
                                 nreplace: 0,
                             });
 
-                            if installed {
-                                let data_type =
-                                    data_type.expect("installed channel has native type");
+                            if let Some((data_type, count)) = request {
                                 // C `tcpiiu::subscriptionRequest`
                                 // (`tcpiiu.cpp:1572-1585`): resolve the wire
                                 // count, then bound it against what the circuit
@@ -3778,7 +3720,7 @@ async fn run_coordinator(
                                 // never installed and `ca_create_subscription`
                                 // returns ECA_TOLARGE.
                                 let wire_count = crate::protocol::subscription_wire_count(
-                                    count.expect("installed channel has element count"),
+                                    count,
                                     ch.element_count,
                                     data_type,
                                     peer_minor,
@@ -3830,7 +3772,7 @@ async fn run_coordinator(
                         // Clear channel on server + clean reverse index
                         let mut cleared_on_server = false;
                         if let Some(ch) = channels.get(&cid) {
-                            if ch.state.is_operational() {
+                            if ch.state().is_operational() {
                                 let _ = transport_tx.send(TransportCommand::ClearChannel {
                                     cid,
                                     sid: ch.sid,
@@ -3840,7 +3782,7 @@ async fn run_coordinator(
                                 cleared_on_server = true;
                             }
                             // Cancel search for any non-connected state
-                            match ch.state {
+                            match ch.state() {
                                 ChannelState::Searching
                                 | ChannelState::Connecting
                                 | ChannelState::Disconnected => {
@@ -3882,7 +3824,7 @@ async fn run_coordinator(
                     }
                     CoordRequest::GetWatchdogDelay { cid, reply } => {
                         let delay = channels.get(&cid).and_then(|ch| {
-                            if !ch.state.is_operational() {
+                            if !ch.state().is_operational() {
                                 return None;
                             }
                             let addr = ch.server_addr?;
@@ -3892,7 +3834,7 @@ async fn run_coordinator(
                     }
                     CoordRequest::GetHostMinorProtocol { cid, reply } => {
                         let v = channels.get(&cid).and_then(|ch| {
-                            if !ch.state.is_operational() {
+                            if !ch.state().is_operational() {
                                 return None;
                             }
                             let addr = ch.server_addr?;
@@ -3909,13 +3851,13 @@ async fn run_coordinator(
                         // unit-testable without the coordinator.
                         let states = channels
                             .values()
-                            .map(|ch| (ch.state, ch.server_addr, ch.priority));
+                            .map(|ch| (ch.state(), ch.server_addr, ch.priority));
                         let _ = reply.send(operational_circuit_count(states));
                     }
                     CoordRequest::Shutdown { reply } => {
                         // Send ClearChannel for all connected channels
                         for ch in channels.values() {
-                            if ch.state.is_operational() {
+                            if ch.state().is_operational() {
                                 if let Some(addr) = ch.server_addr {
                                     let _ = transport_tx.send(TransportCommand::ClearChannel {
                                         cid: ch.cid,
@@ -3990,8 +3932,8 @@ async fn run_coordinator(
                         // ing libca's split between udpiiu (search
                         // wake) and tcpRecvWatchdog (lazy probe).
                         for ch in channels.values() {
-                            if ch.state == ChannelState::Disconnected
-                                || ch.state == ChannelState::Searching
+                            if ch.state() == ChannelState::Disconnected
+                                || ch.state() == ChannelState::Searching
                             {
                                 let _ = search_tx.send(SearchRequest::Schedule {
                                     cid: ch.cid,
@@ -4011,7 +3953,7 @@ async fn run_coordinator(
                         // unit-tested without standing up the full
                         // coordinator. See the function's doc
                         // comment for the full rationale.
-                        let states = channels.values().map(|ch| (ch.state, ch.server_addr));
+                        let states = channels.values().map(|ch| (ch.state(), ch.server_addr));
                         for target in beacon_arrival_targets(states, server_addr) {
                             let _ = transport_tx.send(
                                 TransportCommand::BeaconArrivalNotify {
@@ -4028,12 +3970,12 @@ async fn run_coordinator(
                 match resp {
                     SearchResponse::Found { cid, server_addr } => {
                         if let Some(ch) = channels.get_mut(&cid) {
-                            if ch.state == ChannelState::Searching || ch.state == ChannelState::Disconnected {
+                            if ch.state() == ChannelState::Searching || ch.state() == ChannelState::Disconnected {
                                 let priority = ch.priority;
                                 if let Some(old_addr) = ch.server_addr {
                                     remove_server_channel(&mut server_channels, (old_addr, priority), cid);
                                 }
-                                ch.state = ChannelState::Connecting;
+                                ch.link = Link::Connecting;
                                 ch.server_addr = Some(server_addr);
                                 server_channels.entry((server_addr, priority)).or_default().insert(cid);
                                 let _ = transport_tx.send(TransportCommand::CreateChannel {
@@ -4076,62 +4018,49 @@ async fn run_coordinator(
                 // trip through this match (Option C, Phase A/D). This
                 // arm therefore no longer touches `last_rx_at`.
                 match evt {
-                    TransportEvent::ChannelCreated { cid, sid, data_type, element_count, access, server_addr, priority } => {
+                    TransportEvent::ChannelCreated { cid, sid, native_type, element_count, access, server_addr, priority } => {
                         if let Some(ch) = channels.get_mut(&cid) {
-                            let was_disconnected = matches!(ch.state, ChannelState::Disconnected);
-                            let dbr_type = DbFieldType::from_u16(data_type).ok();
+                            let was_disconnected = matches!(ch.state(), ChannelState::Disconnected);
                             // epics-base `16877577` parity: detect native
                             // DBR type change across reconnects so consumers
                             // (camonitor, archiver) can rebuild their
                             // per-type decoders / display metadata before
                             // the next event flows.
-                            let previous_native = ch.native_type;
-                            let native_changed = match (previous_native, dbr_type) {
-                                (Some(p), Some(c)) => p != c,
-                                (Some(_), None) | (None, Some(_)) => true,
-                                (None, None) => false,
-                            };
-                            ch.state = ChannelState::Connected;
+                            let previous_native = ch.last_native;
+                            let native_changed = previous_native != Some(native_type);
+                            ch.link = Link::Connected(native_type);
                             ch.sid = sid;
-                            ch.native_type = dbr_type;
+                            ch.last_native = Some(native_type);
                             ch.element_count = element_count;
                             ch.server_addr = Some(server_addr);
                             ch.access_rights = access;
                             ch.last_connected_at = Some(std::time::Instant::now());
 
                             // Phase B: publish snapshot for fast-path readers.
-                            // Only publish if we have a usable native_type;
-                            // otherwise the channel is still effectively
-                            // unusable and CaChannel hot paths should fall
-                            // back to "no snapshot → Disconnected".
-                            if let Some(dbr) = dbr_type {
-                                snapshots.insert(
-                                    cid,
-                                    types::ChannelSnapshotPublic {
-                                        sid,
-                                        native_type: dbr,
-                                        element_count,
-                                        server_addr,
-                                        access_rights: access,
-                                        state: ChannelState::Connected,
-                                        // The circuit's VERSION frame is parsed
-                                        // (and its ServerVersion event queued)
-                                        // before the CREATE_CHAN_RESP that
-                                        // produced this event, so the map is
-                                        // populated for any compliant server.
-                                        // A server that never sent VERSION is
-                                        // treated as pre-V49 — C's `tcpiiu`
-                                        // starts from the same conservative
-                                        // minor version.
-                                        server_minor: server_minor_version
-                                            .get(&(server_addr, priority))
-                                            .copied()
-                                            .unwrap_or(0),
-                                    },
-                                );
-                            } else {
-                                snapshots.remove(&cid);
-                            }
+                            snapshots.insert(
+                                cid,
+                                types::ChannelSnapshotPublic {
+                                    sid,
+                                    native_type,
+                                    element_count,
+                                    server_addr,
+                                    access_rights: access,
+                                    state: ChannelState::Connected,
+                                    // The circuit's VERSION frame is parsed
+                                    // (and its ServerVersion event queued)
+                                    // before the CREATE_CHAN_RESP that
+                                    // produced this event, so the map is
+                                    // populated for any compliant server.
+                                    // A server that never sent VERSION is
+                                    // treated as pre-V49 — C's `tcpiiu`
+                                    // starts from the same conservative
+                                    // minor version.
+                                    server_minor: server_minor_version
+                                        .get(&(server_addr, priority))
+                                        .copied()
+                                        .unwrap_or(0),
+                                },
+                            );
 
                             if was_disconnected {
                                 tracing::info!(pv = %ch.pv_name, cid, sid, server = %server_addr, "channel reconnected");
@@ -4177,28 +4106,26 @@ async fn run_coordinator(
                             // `restore_for_channel`; only the consumer-facing
                             // event is gated on a real prior type.
                             if native_changed && previous_native.is_some() {
-                                if let Some(cur) = dbr_type {
-                                    ch.announce(
-                                        &snapshots,
-                                        ConnectionEvent::NativeTypeChanged {
-                                            previous: previous_native,
-                                            current: cur,
-                                        },
-                                    );
-                                    tracing::info!(
-                                        pv = %ch.pv_name,
-                                        previous = ?previous_native,
-                                        current = ?cur,
-                                        "channel native DBR type changed"
-                                    );
-                                }
+                                ch.announce(
+                                    &snapshots,
+                                    ConnectionEvent::NativeTypeChanged {
+                                        previous: previous_native,
+                                        current: native_type,
+                                    },
+                                );
+                                tracing::info!(
+                                    pv = %ch.pv_name,
+                                    previous = ?previous_native,
+                                    current = ?native_type,
+                                    "channel native DBR type changed"
+                                );
                             }
 
                             // Restore subscriptions
                             let (restored, stale) = subscriptions.restore_for_channel(
                                 cid,
                                 sid,
-                                data_type,
+                                native_type,
                                 element_count,
                                 native_changed,
                                 server_addr,
@@ -4255,6 +4182,36 @@ async fn run_coordinator(
                                 sid,
                                 server_addr,
                                 priority,
+                            });
+                        }
+                    }
+                    // libca throws from `nciu::connect` and drops the whole
+                    // circuit with every channel on it (`tcpiiu.cpp:588`);
+                    // only the refused channel is cleared here, and it
+                    // searches again on the search engine's disconnect
+                    // governor tick.
+                    TransportEvent::ChannelRefused { cid, sid, data_type, server_addr, priority } => {
+                        let _ = transport_tx.send(TransportCommand::ClearChannel {
+                            cid,
+                            sid,
+                            server_addr,
+                            priority,
+                        });
+                        if let Some(ch) = channels.get_mut(&cid) {
+                            epics_libcom_rs::stderr_println!(
+                                "CA client library: Ignored conn resp with bad native data type {data_type} for \"{}\"",
+                                ch.pv_name
+                            );
+                            remove_server_channel(&mut server_channels, (server_addr, priority), cid);
+                            ch.link = if ch.last_connected_at.is_some() {
+                                Link::Disconnected
+                            } else {
+                                Link::Searching
+                            };
+                            let _ = search_tx.send(SearchRequest::Schedule {
+                                cid,
+                                pv_name: ch.pv_name.clone(),
+                                reason: SearchReason::Refused,
                             });
                         }
                     }
@@ -4347,7 +4304,7 @@ async fn run_coordinator(
                             // only means this specific attempt/server failed;
                             // the channel will immediately re-search and may
                             // still connect before the caller's timeout.
-                            ch.state = ChannelState::Disconnected;
+                            ch.link = Link::Disconnected;
                             ch.announce(&snapshots, ConnectionEvent::Disconnected);
                             let _ = search_tx.send(SearchRequest::Schedule {
                                 cid,
@@ -4403,7 +4360,7 @@ async fn run_coordinator(
                         if channels.values().any(|ch| {
                             ch.server_addr == Some(server_addr)
                                 && ch.priority == priority
-                                && ch.state == ChannelState::Connected
+                                && ch.state() == ChannelState::Connected
                         }) {
                             types::dispatch_exception(
                                 &exception_slot,
@@ -4424,7 +4381,7 @@ async fn run_coordinator(
                             |ch| {
                                 ch.server_addr == Some(server_addr)
                                     && ch.priority == priority
-                                    && ch.state == ChannelState::Connected
+                                    && ch.state() == ChannelState::Connected
                             },
                             |_| {},
                         );
@@ -4447,9 +4404,9 @@ async fn run_coordinator(
                         for ch in channels.values_mut() {
                             if ch.server_addr == Some(server_addr)
                                 && ch.priority == priority
-                                && ch.state == ChannelState::Unresponsive
+                                && let Link::Unresponsive(native) = ch.link
                             {
-                                ch.state = ChannelState::Connected;
+                                ch.link = Link::Connected(native);
                                 // The down edge told the receiver no-rights;
                                 // C's connect handlers re-read the held
                                 // permits (`dbCa.c:875-876`,
@@ -4465,9 +4422,7 @@ async fn run_coordinator(
                         for cid in recovered_cids {
                             for sub_id in subscriptions.for_cid(cid) {
                                 if let Some(rec) = subscriptions.get(sub_id) {
-                                    if let (Some(data_type), Some(_count)) =
-                                        (rec.data_type, rec.count)
-                                    {
+                                    if let Some((data_type, req_count)) = rec.kind.request() {
                                         if let Some(ch) = channels.get(&cid) {
                                             if let Some(addr) = ch.server_addr {
                                                 let peer_minor = server_minor_version
@@ -4475,7 +4430,7 @@ async fn run_coordinator(
                                                     .copied()
                                                     .unwrap_or(0);
                                                 match crate::protocol::read_notify_wire_count(
-                                                    rec.count.unwrap_or(0),
+                                                    req_count,
                                                     ch.element_count,
                                                     data_type,
                                                     peer_minor,
@@ -4495,7 +4450,7 @@ async fn run_coordinator(
                                                         let ioid = in_flight
                                                             .register_sub_update(cid, sub_id);
                                                         let _ = transport_tx.send(
-                                                            TransportCommand::ReadNotify {
+                                                            TransportCommand::SubscriptionUpdate {
                                                                 sid: ch.sid,
                                                                 data_type,
                                                                 count,
@@ -4578,10 +4533,11 @@ enum DisconnectKind {
 }
 
 impl DisconnectKind {
-    fn terminal_state(self) -> ChannelState {
-        match self {
-            Self::CircuitGone => ChannelState::Disconnected,
-            Self::Unresponsive => ChannelState::Unresponsive,
+    fn leave(self, link: Link) -> Link {
+        match (self, link) {
+            (Self::Unresponsive, Link::Connected(native)) => Link::Unresponsive(native),
+            (Self::Unresponsive, other) => other,
+            (Self::CircuitGone, _) => Link::Disconnected,
         }
     }
 }
@@ -4654,7 +4610,7 @@ fn disconnect_channels(
         // An unresponsive channel stays on its circuit
         // (`tcpiiu.cpp:929-937` only moves it to `unrespCircuit`), so its
         // permits are held and `ca_write_access` keeps answering them.
-        ch.state = kind.terminal_state();
+        ch.link = kind.leave(ch.link);
         if kind == DisconnectKind::CircuitGone {
             ch.access_rights = NO_RIGHTS;
         }
@@ -4779,7 +4735,7 @@ fn handle_disconnect(
         |ch| {
             ch.server_addr == Some(server_addr)
                 && ch.priority == priority
-                && (ch.state.is_operational() || ch.state == ChannelState::Connecting)
+                && (ch.state().is_operational() || ch.state() == ChannelState::Connecting)
         },
         |ch| {
             // Reconnection backoff: if the connection was short-lived (<30s),
@@ -4980,8 +4936,8 @@ fn cancel_subscription(
     // Same predicate as the EVENT_ADD: the server holds the subscription
     // while the circuit is unresponsive.
     if let Some(ch) = channels.get(&rec.cid)
-        && ch.state.is_operational()
-        && let Some(data_type) = rec.data_type
+        && ch.state().is_operational()
+        && let Some((data_type, req_count)) = rec.kind.request()
     {
         let server_addr = ch.server_addr.unwrap();
         // C `tcpiiu::subscriptionCancelRequest` (`tcpiiu.cpp:1659`)
@@ -4997,7 +4953,7 @@ fn cancel_subscription(
             subid,
             data_type,
             count: crate::protocol::subscription_cancel_wire_count(
-                rec.count.unwrap_or(0),
+                req_count,
                 ch.element_count,
                 peer_minor,
             ),
@@ -6501,9 +6457,9 @@ mod disconnect_transition_tests {
             cid,
             pv_name: format!("TEST:PV{cid}").into(),
             priority,
-            state: ChannelState::Connected,
+            link: Link::Connected(DbFieldType::Double),
             sid: 7,
-            native_type: None,
+            last_native: Some(DbFieldType::Double),
             element_count: 1,
             server_addr: Some(addr()),
             access_rights: AccessRights {
@@ -6620,7 +6576,7 @@ mod disconnect_transition_tests {
         );
 
         let ch = channels.get(&42).expect("channel stays registered");
-        assert_eq!(ch.state, ChannelState::Disconnected);
+        assert_eq!(ch.state(), ChannelState::Disconnected);
         assert!(
             !ch.access_rights.read && !ch.access_rights.write,
             "C `setServerAddressUnknown` clears both permits on circuit close"
@@ -6673,7 +6629,7 @@ mod disconnect_transition_tests {
         );
 
         let ch = channels.get(&42).unwrap();
-        assert_eq!(ch.state, ChannelState::Disconnected);
+        assert_eq!(ch.state(), ChannelState::Disconnected);
         assert!(
             !ch.access_rights.read && !ch.access_rights.write,
             "SERVER_DISCONN must reset access rights (C disconnectChannel)"
@@ -6690,7 +6646,7 @@ mod disconnect_transition_tests {
         );
 
         let other = channels.get(&43).unwrap();
-        assert_eq!(other.state, ChannelState::Connected);
+        assert_eq!(other.state(), ChannelState::Connected);
         assert!(
             other.access_rights.read && other.access_rights.write,
             "a sibling cid on the same circuit is untouched"
@@ -6718,12 +6674,12 @@ mod disconnect_transition_tests {
             &in_flight,
             &snapshots,
             DisconnectKind::Unresponsive,
-            |ch| ch.state == ChannelState::Connected,
+            |ch| ch.state() == ChannelState::Connected,
             |_| {},
         );
 
         let ch = channels.get(&42).unwrap();
-        assert_eq!(ch.state, ChannelState::Unresponsive);
+        assert_eq!(ch.state(), ChannelState::Unresponsive);
         assert!(
             ch.access_rights.read && ch.access_rights.write,
             "an unresponsive channel keeps its permits (no setServerAddressUnknown)"
@@ -7128,5 +7084,270 @@ mod deadline_tests {
         )
         .await;
         sent("put_string_array");
+    }
+}
+
+#[cfg(all(test, tokio_backend))]
+mod refused_before_queueing_tests {
+    //! libca refuses a request before queueing it — denied by the cached
+    //! `CA_PROTO_ACCESS_RIGHTS` bits (`nciu.cpp:282,329,350`), a count above
+    //! the channel's, or a string past `MAX_STRING_SIZE` — and answers the
+    //! status `oldChannelNotify.cpp:301-315,370-384,445-459,502-516` maps
+    //! the refusal to.
+    use super::*;
+    use epics_base_rs::error::CaOp;
+    use std::sync::atomic::AtomicUsize;
+
+    const READ_ONLY: u32 = 1;
+    const WRITE_ONLY: u32 = 2;
+    const READ_WRITE: u32 = 3;
+    const BOUND: Duration = Duration::from_secs(2);
+    const DBR_TIME_DOUBLE: u16 = 20;
+
+    /// What reached the server: the transport route and, when the circuit
+    /// has one, the direct writer.
+    struct Wire {
+        transport: mpsc::UnboundedReceiver<TransportCommand>,
+        direct: mpsc::UnboundedReceiver<Vec<u8>>,
+    }
+
+    impl Wire {
+        fn assert_silent(&mut self, route: &str) {
+            assert!(
+                self.transport.try_recv().is_err(),
+                "{route}: a request reached the transport"
+            );
+            assert!(
+                self.direct.try_recv().is_err(),
+                "{route}: a frame reached the direct writer"
+            );
+        }
+    }
+
+    /// A connected DOUBLE channel granted `rights`, with or without a
+    /// direct writer for its circuit.
+    fn connected(rights: u32, with_writer: bool) -> (CaChannel, Wire) {
+        let (coord_tx, _coord_rx) = mpsc::unbounded_channel();
+        let mut ch = CaChannel::for_test(coord_tx);
+        let (transport_tx, transport) = mpsc::unbounded_channel();
+        ch.transport_tx = transport_tx;
+        let server_addr: SocketAddr = "127.0.0.1:5064".parse().unwrap();
+        ch.snapshots.insert(
+            ch.cid,
+            ChannelSnapshotPublic {
+                sid: 1,
+                native_type: DbFieldType::Double,
+                element_count: 1,
+                server_addr,
+                access_rights: AccessRights::from_u32(rights),
+                state: ChannelState::Connected,
+                server_minor: 13,
+            },
+        );
+        let (write_tx, direct) = mpsc::unbounded_channel();
+        if with_writer {
+            ch.server_writers.insert(
+                (server_addr, ch.priority),
+                DirectServerWriter {
+                    write_tx,
+                    pending_frames: Arc::new(AtomicUsize::new(0)),
+                },
+            );
+        }
+        (ch, Wire { transport, direct })
+    }
+
+    fn status<T>(op: CaOp, result: CaResult<T>) -> Option<u32> {
+        result.err().map(|e| e.to_eca_status(op))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_read_the_cached_rights_deny_answers_no_read_access() {
+        for (route, direct) in [("transport", false), ("direct", true)] {
+            let (ch, mut wire) = connected(WRITE_ONLY, direct);
+            let denied = Some(ECA_NORDACCESS);
+            assert_eq!(
+                status(CaOp::Read, ch.get_with_timeout(BOUND).await),
+                denied,
+                "{route}: get"
+            );
+            assert_eq!(
+                status(
+                    CaOp::Read,
+                    ch.get_with_metadata(DbrClass::Time, BOUND).await
+                ),
+                denied,
+                "{route}: get_with_metadata"
+            );
+            assert_eq!(
+                status(CaOp::Read, ch.get_callback(DBR_TIME_DOUBLE, 1).map(drop)),
+                denied,
+                "{route}: get_callback"
+            );
+            let many = CaChannel::get_many_with_timeout(std::slice::from_ref(&ch), BOUND).await;
+            assert_eq!(
+                status(CaOp::Read, many.into_iter().next().expect("one result")),
+                denied,
+                "{route}: get_many_with_timeout"
+            );
+            wire.assert_silent(route);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_write_the_cached_rights_deny_answers_no_write_access() {
+        for (route, direct) in [("transport", false), ("direct", true)] {
+            let (ch, mut wire) = connected(READ_ONLY, direct);
+            let denied = Some(ECA_NOWTACCESS);
+            let one = EpicsValue::Double(1.0);
+            assert_eq!(
+                status(CaOp::Write, ch.put_with_timeout(&one, BOUND).await),
+                denied,
+                "{route}: put"
+            );
+            assert_eq!(
+                status(CaOp::Write, ch.put_callback(&one).map(drop)),
+                denied,
+                "{route}: put_callback"
+            );
+            assert_eq!(
+                status(CaOp::Write, ch.put_nowait(&one).await),
+                denied,
+                "{route}: put_nowait"
+            );
+            assert_eq!(
+                status(CaOp::Write, ch.put_string("1", BOUND).await),
+                denied,
+                "{route}: put_string"
+            );
+            assert_eq!(
+                status(CaOp::Write, ch.put_string_nowait("1").await),
+                denied,
+                "{route}: put_string_nowait"
+            );
+            wire.assert_silent(route);
+        }
+    }
+
+    /// `nciu::read` and `nciu::write` test the right before the count and the
+    /// strings (`nciu.cpp:282-287,329-337`), so a denied request answers the
+    /// denial whatever else is wrong with it.
+    #[tokio::test(start_paused = true)]
+    async fn a_denial_outranks_a_bad_count_or_string() {
+        let (ch, mut wire) = connected(WRITE_ONLY, false);
+        assert_eq!(
+            status(CaOp::Read, ch.get_callback(DBR_TIME_DOUBLE, 2).map(drop)),
+            Some(ECA_NORDACCESS),
+            "get_callback of 2"
+        );
+        wire.assert_silent("read");
+
+        let (ch, mut wire) = connected(READ_ONLY, false);
+        let denied = Some(ECA_NOWTACCESS);
+        let two = EpicsValue::DoubleArray(vec![1.0, 2.0].into());
+        let long = "x".repeat(40);
+        assert_eq!(
+            status(CaOp::Write, ch.put_with_timeout(&two, BOUND).await),
+            denied,
+            "put of 2"
+        );
+        assert_eq!(
+            status(CaOp::Write, ch.put_nowait(&two).await),
+            denied,
+            "put_nowait of 2"
+        );
+        let strings = ["1".to_string(), "2".to_string()];
+        assert_eq!(
+            status(CaOp::Write, ch.put_string_array(&strings, BOUND).await),
+            denied,
+            "put_string_array of 2"
+        );
+        assert_eq!(
+            status(CaOp::Write, ch.put_string(&long, BOUND).await),
+            denied,
+            "put_string of 40 bytes"
+        );
+        assert_eq!(
+            status(CaOp::Write, ch.put_string_nowait(&long).await),
+            denied,
+            "put_string_nowait of 40 bytes"
+        );
+        assert_eq!(
+            status(
+                CaOp::Write,
+                ch.put_as_dbr_nowait(0, &EpicsValue::String(long.as_str().into()))
+                    .await
+            ),
+            denied,
+            "put_as_dbr_nowait of 40 bytes"
+        );
+        wire.assert_silent("write");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_status_the_client_decides_prints_as_ca_message() {
+        let (ch, _wire) = connected(WRITE_ONLY, false);
+        let err = ch.get_with_timeout(BOUND).await.expect_err("denied");
+        assert_eq!(err.to_string(), "Read access denied");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_count_above_the_channels_answers_bad_count() {
+        let (ch, mut wire) = connected(READ_WRITE, false);
+        let bad = Some(ECA_BADCOUNT);
+        let two = EpicsValue::DoubleArray(vec![1.0, 2.0].into());
+        assert_eq!(
+            status(CaOp::Read, ch.get_callback(DBR_TIME_DOUBLE, 2).map(drop)),
+            bad,
+            "get_callback"
+        );
+        assert_eq!(
+            status(CaOp::Write, ch.put_with_timeout(&two, BOUND).await),
+            bad,
+            "put"
+        );
+        assert_eq!(
+            status(CaOp::Write, ch.put_nowait(&two).await),
+            bad,
+            "put_nowait"
+        );
+        let strings = ["1".to_string(), "2".to_string()];
+        assert_eq!(
+            status(CaOp::Write, ch.put_string_array(&strings, BOUND).await),
+            bad,
+            "put_string_array"
+        );
+        wire.assert_silent("count");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_string_past_39_bytes_answers_bad_string() {
+        let (ch, mut wire) = connected(READ_WRITE, false);
+        let bad = Some(ECA_BADSTR);
+        let long = "x".repeat(40);
+        assert_eq!(
+            status(CaOp::Write, ch.put_string(&long, BOUND).await),
+            bad,
+            "put_string"
+        );
+        assert_eq!(
+            status(CaOp::Write, ch.put_string_nowait(&long).await),
+            bad,
+            "put_string_nowait"
+        );
+        assert_eq!(
+            status(
+                CaOp::Write,
+                ch.put_as_dbr_nowait(0, &EpicsValue::String(long.as_str().into()))
+                    .await
+            ),
+            bad,
+            "put_as_dbr_nowait"
+        );
+        wire.assert_silent("string");
+        ch.put_string_nowait(&long[..39])
+            .await
+            .expect("39 bytes leave room for the NUL");
+        assert!(wire.transport.try_recv().is_ok(), "the 39-byte put is sent");
     }
 }

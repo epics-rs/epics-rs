@@ -606,8 +606,10 @@ impl Record for CompressRecord {
         "compress"
     }
 
-    /// `compressRecord.c:342` reads INP at `DBF_DOUBLE` for all the source's
-    /// elements, so a source that request cannot convert is a failed read.
+    /// `compressRecord.c:342` reads INP at `DBF_DOUBLE` for the count INP's
+    /// `dbGetNelements` gave, which the fetch asks once it has told it
+    /// ([`Record::set_inp_nelements`]), so a source that request cannot
+    /// convert is a failed read: a bare link field's one element is refused.
     fn input_link_request(&self, link_field: &str) -> crate::server::record::InputLinkRequest {
         use crate::server::record::LinkReadAs;
         crate::server::record::InputLinkRequest::As(match link_field {

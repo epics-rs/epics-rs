@@ -10,9 +10,12 @@ use std::future::Future;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use asyn_rs::interrupt::InterruptValue;
+use asyn_rs::param::ParamValue;
 use asyn_rs::port_handle::PortHandle;
-use asyn_rs::request::SectionScope;
+use asyn_rs::request::{CancelToken, ParamSetValue, RequestOp, SectionScope};
 use asyn_rs::trace::TraceMask;
+use asyn_rs::user::AsynUser;
 use parking_lot::Mutex;
 
 use epics_libcom_rs::runtime::task::ThreadDrive;
@@ -23,7 +26,9 @@ use crate::ndarray_pool::{DriverPool, NDArrayPool, PublishedArray};
 
 use super::super::channel::{NDArrayOutput, NDArraySender, publish_each};
 use super::super::throttler::Throttler;
-use super::{ArrayCallbacks, CopyArray, Frame, PluginPool, SortBuffer};
+use super::{
+    ArrayCallbacks, CopyArray, Frame, PluginPool, SortBuffer, StdArrayPost, StdArrayPosts,
+};
 use smallvec::smallvec;
 
 pub(super) struct Delivery {
@@ -31,8 +36,9 @@ pub(super) struct Delivery {
     /// list is per address. Index 0 is the `endProcessCallbacks` output.
     outputs: Vec<Arc<Mutex<NDArrayOutput>>>,
     array_callbacks: ArrayCallbacks,
-    /// NDPluginStdArrays, which routes its waveform with NDArrayCallbacks 0.
-    std_arrays: bool,
+    /// NDPluginStdArrays' STD_ARRAY_DATA reason: it posts its waveforms
+    /// with NDArrayCallbacks 0.
+    std_array_data: Option<usize>,
     port_handle: PortHandle,
     /// The processor allocates from this same pool ([`super::NDPluginProcess::bind_pool`]).
     pool: PluginPool,
@@ -64,6 +70,28 @@ struct State {
     last_output_array: Option<Arc<NDArray>>,
 }
 
+/// What [`Delivery::end_process`] made of a frame.
+#[derive(Default)]
+pub(super) struct Routed {
+    /// NDPluginStdArrays' STD_ARRAY_DATA posts, one per interface a client
+    /// is bound to. C posts them inside `processCallbacks`, ahead of
+    /// `endProcessCallbacks` and its sort buffer (NDPluginStdArrays.cpp:
+    /// 58-72, :202), so they never wait for a drain.
+    pub waveforms: Vec<StdArrayPost>,
+    /// The deliveries ready now; the rest wait in the sort buffer.
+    pub ready: Frame<PublishedArray>,
+}
+
+impl Routed {
+    /// Deliveries that serve no waveform: a sort drain's, say.
+    pub(super) fn ready(ready: Frame<PublishedArray>) -> Self {
+        Self {
+            ready,
+            ..Self::default()
+        }
+    }
+}
+
 /// The counters C's sort path sets.
 #[derive(Clone, Copy)]
 pub(super) struct SortCounters {
@@ -78,13 +106,13 @@ impl Delivery {
         outputs: Vec<Arc<Mutex<NDArrayOutput>>>,
         pool: PluginPool,
         array_callbacks: ArrayCallbacks,
-        std_arrays: bool,
+        std_array_data: Option<usize>,
         port_handle: PortHandle,
     ) -> Self {
         Self {
             outputs,
             array_callbacks,
-            std_arrays,
+            std_array_data,
             port_handle,
             pool,
             state: Mutex::new(State {
@@ -105,13 +133,13 @@ impl Delivery {
     /// writes (NDPluginFile.cpp:252, :301, :349). `pArrays[0]` is cached
     /// before the throttle and the sort buffer see the array: the array
     /// itself with NDArrayCallbacks 0 (:273-280), otherwise its copy once
-    /// the copy succeeded (:285-299). Returns what is ready to deliver.
+    /// the copy succeeded (:285-299).
     pub(super) fn end_process(
         &self,
         arrays: Frame<Arc<NDArray>>,
         attributes: Option<&NDAttributeList>,
         copy: CopyArray<'_>,
-    ) -> Frame<PublishedArray> {
+    ) -> Routed {
         self.end(arrays, attributes, copy, true)
     }
 
@@ -130,7 +158,7 @@ impl Delivery {
         &self,
         arrays: Frame<Arc<NDArray>>,
         attributes: Option<&NDAttributeList>,
-    ) -> Frame<PublishedArray> {
+    ) -> Routed {
         self.end(arrays, attributes, CopyArray::Never, false)
     }
 
@@ -140,8 +168,15 @@ impl Delivery {
         attributes: Option<&NDAttributeList>,
         copy: CopyArray<'_>,
         cache: bool,
-    ) -> Frame<PublishedArray> {
+    ) -> Routed {
         let callbacks = self.array_callbacks.get();
+        // Read off the registry before the leaf lock is taken.
+        let waveforms = match (self.std_array_data, arrays.first()) {
+            (Some(param), Some(first)) => {
+                super::std_array_waveforms(self.port_handle.interrupts(), param, first.data())
+            }
+            _ => Vec::new(),
+        };
         let mut state = self.state.lock();
         if cache
             && !callbacks
@@ -149,20 +184,98 @@ impl Delivery {
         {
             state.last_output_array = Some(Arc::clone(last));
         }
-        if !callbacks && !self.std_arrays {
-            return Frame::new();
+        let mut routed = Routed {
+            waveforms,
+            ready: Frame::new(),
+        };
+        if !callbacks {
+            return routed;
         }
-        // C copies only past the NDArrayCallbacks return (:274-286); the
-        // StdArrays waveform route takes the frame as it is.
-        let copy = if callbacks { copy } else { CopyArray::Never };
         let arrays = self.publishable(arrays, attributes, copy);
-        if cache
-            && callbacks
-            && let Some(last) = arrays.last()
-        {
+        if cache && let Some(last) = arrays.last() {
             state.last_output_array = Some(Arc::clone(last.array()));
         }
-        state.route_output_arrays(arrays)
+        routed.ready = state.route_output_arrays(arrays);
+        routed
+    }
+
+    /// C `arrayInterruptCallback`'s walk of each interface's clients
+    /// (NDPluginStdArrays.cpp:35-72): every receiver of a post pays its
+    /// converted size, one by one in delivery order, and gets the post only
+    /// when the MaxByteRate bucket held it; each one refused counts in
+    /// DroppedOutputArrays. Returns C `wasThrottled`, after posting from
+    /// `scope` the ArrayCounter that nets the frame back out and the
+    /// DroppedOutputArrays the walk left (`:202-210`).
+    ///
+    /// The walk waits for the port to have run the frame's stored params, so
+    /// the dims post `beginProcessCallbacks` makes goes out first (C
+    /// NDPluginDriver.cpp:245-247), and runs in `scope`, so a receiver that
+    /// calls the port is served inside the section, as C unlocks the port for
+    /// it (NDPluginStdArrays.cpp:166).
+    ///
+    /// A mailbox whose record is not accepting interrupts is neither posted
+    /// nor charged; C charges it and the record drops the value. The
+    /// downstream copy has already paid in [`Self::end_process`], so it, not
+    /// the waveforms, takes a bucket too small for both.
+    pub(super) async fn post_std_arrays(&self, frame: StdArrayPosts, scope: SectionScope) -> bool {
+        let Some(param) = self.std_array_data else {
+            return false;
+        };
+        let stored = {
+            let _in = scope.enter();
+            self.port_handle.try_submit_cancellable(
+                RequestOp::SetParams {
+                    updates: Vec::new(),
+                },
+                AsynUser::new(0).with_addr(0),
+                CancelToken::new(),
+            )
+        };
+        if let Ok(stored) = stored {
+            // A port that cannot answer has posted no dims to come after.
+            let _ = stored.await;
+        }
+        let _in = scope.enter();
+        let interrupts = self.port_handle.interrupts();
+        let mut throttled = false;
+        for post in frame.posts {
+            let value = InterruptValue {
+                reason: param,
+                addr: 0,
+                value: post.value,
+                timestamp: frame.time_stamp,
+                iface: Some(post.iface),
+                ..InterruptValue::default()
+            };
+            interrupts.notify_admitted(value, || {
+                let mut state = self.state.lock();
+                let admitted = state.take(post.bytes as f64);
+                if !admitted {
+                    state.sort_buffer.dropped_output_arrays += 1;
+                    throttled = true;
+                }
+                admitted
+            });
+        }
+        if throttled {
+            let (counter, value) = frame.array_counter;
+            let dropped = self.state.lock().sort_buffer.dropped_output_arrays;
+            let sent = self.port_handle.submit_unanswered(
+                RequestOp::SetParams {
+                    updates: vec![
+                        ParamSetValue::new(counter, 0, ParamValue::Int32(value - 1)),
+                        ParamSetValue::new(
+                            frame.dropped_output_arrays,
+                            0,
+                            ParamValue::Int32(dropped),
+                        ),
+                    ],
+                },
+                AsynUser::new(0).with_addr(0),
+            );
+            super::flush_failed(sent);
+        }
+        throttled
     }
 
     /// NDArrayCallbacks.
@@ -179,6 +292,7 @@ impl Delivery {
         attributes: Option<&NDAttributeList>,
     ) -> Frame<PublishedArray> {
         self.end_process(smallvec![Arc::clone(array)], attributes, CopyArray::Always)
+            .ready
     }
 
     /// Deliver what [`Self::hand_on`] made ready before this returns. A
@@ -345,14 +459,16 @@ impl State {
         }
     }
 
+    /// Takes `cost` bytes from the MaxByteRate bucket; always passes with the
+    /// throttle off.
+    fn take(&mut self, cost: f64) -> bool {
+        self.max_byte_rate == 0.0 || self.throttler.try_take(cost)
+    }
+
     /// Apply the output throttle to one array. Returns `true` if the array
     /// should be emitted, `false` if it was dropped (and counts the drop).
     fn throttle_ok(&mut self, array: &NDArray) -> bool {
-        if self.max_byte_rate == 0.0 {
-            return true;
-        }
-        let cost = Self::array_byte_cost(array);
-        if self.throttler.try_take(cost) {
+        if self.take(Self::array_byte_cost(array)) {
             true
         } else {
             self.sort_buffer.dropped_output_arrays += 1;
@@ -360,8 +476,8 @@ impl State {
         }
     }
 
-    /// Route output arrays through the throttle, the in-order fast path, and
-    /// the sort buffer. Returns arrays ready to emit *now*, in order.
+    /// Route output arrays through the throttle, then the in-order fast path
+    /// and the sort buffer.
     ///
     /// Port of C++ `endProcessCallbacks` (NDPluginDriver.cpp:295-328): an
     /// array whose uniqueId is contiguous with `prevUniqueId_` is emitted

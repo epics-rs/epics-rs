@@ -1,6 +1,6 @@
 // Captures pvxs's actual `to_wire` byte output for every fixture
 // asserted by the Rust wire-golden suite under
-// `crates/epics-pva-rs/tests/pva_cases/`.
+// `crates/epics-pva-rs/tests/integration/pva_cases/`.
 //
 // The point: a "golden" derived by reading pvxs source can share
 // blind spots with the encoder under test. Bytes that came out of

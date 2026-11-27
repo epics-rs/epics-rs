@@ -10,6 +10,7 @@ use asyn_rs::param::ParamValue;
 use asyn_rs::port_handle::PortHandle;
 use asyn_rs::request::ParamSetValue;
 use asyn_rs::trace::TraceMask;
+use epics_libcom_rs::runtime::task::{Instant, deadline_after, sleep_until};
 use rumqttc::{
     AsyncClient, ClientError, ConnectionError, Event, Incoming, MqttOptions, Outgoing, Packet,
     PubAckReason, PubCompReason, PubRecReason, PublishNoticeError, PublishOptions, PublishResult,
@@ -17,7 +18,6 @@ use rumqttc::{
 };
 use socket2::{Domain, Socket, Type};
 use tokio::sync::{Notify, mpsc};
-use tokio::time::Instant;
 
 use crate::address::{PayloadFormat, TopicAddress, ValueType};
 use crate::config::MqttConfig;
@@ -319,7 +319,7 @@ pub async fn mqtt_event_loop(
                 // `poll()` is not running, so this `select!` drops nothing
                 // half-done; a shutdown cannot wait out a 72 s retry.
                 tokio::select! {
-                    _ = tokio::time::sleep_until(retry_at) => {}
+                    _ = sleep_until(retry_at) => {}
                     _ = abort.notified() => {
                         tracing::info!("MQTT event loop exiting while disconnected");
                         break;
@@ -857,7 +857,8 @@ impl Backoff {
         self.base = Some(base);
         let draw =
             std::hash::BuildHasher::hash_one(&std::collections::hash_map::RandomState::new(), base);
-        self.tick_after(now + Duration::from_secs(u64::from(jitter_secs(base, draw))))
+        let jitter = Duration::from_secs(u64::from(jitter_secs(base, draw)));
+        self.tick_after(deadline_after(now, jitter))
     }
 
     /// The loss of a live session at `now`: `onDisconnectCb`'s `reconnect()`
@@ -871,7 +872,8 @@ impl Backoff {
 
     fn tick_after(&self, t: Instant) -> Instant {
         let secs = t.saturating_duration_since(self.ticks_from).as_secs();
-        self.ticks_from + Duration::from_secs((secs / RETRY_TICK_SECS + 1) * RETRY_TICK_SECS)
+        let tick = Duration::from_secs((secs / RETRY_TICK_SECS + 1) * RETRY_TICK_SECS);
+        deadline_after(self.ticks_from, tick)
     }
 
     /// A ConnAck clears `retrying` (MQTTAsyncUtils.c:2014).
@@ -3106,13 +3108,34 @@ mod tests {
         let t0 = Instant::now();
         let mut b = Backoff::new(t0);
         let s = Duration::from_secs;
-        assert_eq!(b.lost(t0 + Duration::from_millis(100)), t0 + s(3));
-        assert_eq!(b.lost(t0 + s(3)), t0 + s(6));
+        assert_eq!(
+            b.lost(epics_libcom_rs::runtime::task::deadline_after(
+                t0,
+                Duration::from_millis(100)
+            )),
+            epics_libcom_rs::runtime::task::deadline_after(t0, s(3))
+        );
+        assert_eq!(
+            b.lost(epics_libcom_rs::runtime::task::deadline_after(t0, s(3))),
+            epics_libcom_rs::runtime::task::deadline_after(t0, s(6))
+        );
         // Base 4 after the loss: an interval of 3 or 4 s.
-        let at = b.failed(t0 + Duration::from_millis(3500)) - t0;
+        let at = b.failed(epics_libcom_rs::runtime::task::deadline_after(
+            t0,
+            Duration::from_millis(3500),
+        )) - t0;
         assert!(at == s(9), "{at:?}");
-        assert_eq!(b.tick_after(t0), t0 + s(3));
-        assert_eq!(b.tick_after(t0 + Duration::from_millis(2999)), t0 + s(3));
+        assert_eq!(
+            b.tick_after(t0),
+            epics_libcom_rs::runtime::task::deadline_after(t0, s(3))
+        );
+        assert_eq!(
+            b.tick_after(epics_libcom_rs::runtime::task::deadline_after(
+                t0,
+                Duration::from_millis(2999)
+            )),
+            epics_libcom_rs::runtime::task::deadline_after(t0, s(3))
+        );
     }
 
     /// Each PUBLISH prints from its own ack, whatever order the acks come in.

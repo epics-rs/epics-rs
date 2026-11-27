@@ -196,7 +196,7 @@ pub(crate) fn run_blocking_beacon_emitter(
 /// a client connect or disconnect never touches it. The port used to pulse on
 /// every accept and every disconnect, which restarted the 20 ms ramp and made
 /// every other client of the server flag `ShortPeriod` beacon anomalies (R6-30,
-/// pinned by `tests/beacon_ramp_connect.rs`).
+/// pinned by `tests/integration/beacon_ramp_connect.rs`).
 ///
 // The `signer` paragraph is gated on the same feature as the parameter it
 // describes. Without `cap-tokens` there is no `signer` argument, so an

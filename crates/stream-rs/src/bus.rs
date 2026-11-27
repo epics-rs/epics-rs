@@ -155,8 +155,9 @@ pub trait StreamBusInterface: Send + Sync {
     fn accept_event(&self, _mask: u64, _replytimeout_ms: u64) -> bool {
         false
     }
-    /// `release`: the client is done with the bus. C deletes the object;
-    /// here the [`BusInterface`] is dropped right after this returns.
+    /// `release`: the client is done with the bus, which calls it back no
+    /// more. C deletes the object; here the [`BusInterface`] may be
+    /// dropped later, once the client has let its record go.
     fn release(&self) {}
     fn connect_request(&self, _connecttimeout_ms: u64) -> bool {
         false

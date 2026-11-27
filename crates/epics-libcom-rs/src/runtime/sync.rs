@@ -1971,7 +1971,7 @@ mod tests {
     fn a_deadline_wait_answers_which_of_the_two_happened() {
         let event = Event::new();
         let waiter = event.waiter();
-        let far = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let far = crate::runtime::time::deadline_from_now(std::time::Duration::from_secs(30));
         assert!(
             waiter.wait_until_deadline(far, || true),
             "a condition that holds was reported as a timeout"
@@ -1980,7 +1980,10 @@ mod tests {
         let wait = std::time::Duration::from_millis(30);
         let started = std::time::Instant::now();
         assert!(
-            !waiter.wait_until_deadline(started + wait, || false),
+            !waiter
+                .wait_until_deadline(crate::runtime::time::deadline_after(started, wait), || {
+                    false
+                }),
             "a condition that never holds was reported as met"
         );
         assert!(
@@ -2291,7 +2294,10 @@ mod tests {
             !waiter.is_finished(),
             "inconclusive: the waiter timed out before the lock"
         );
-        let past_deadline = began.end + TIMEOUT + std::time::Duration::from_millis(100);
+        let past_deadline = crate::runtime::time::deadline_after(
+            crate::runtime::time::deadline_after(began.end, TIMEOUT),
+            std::time::Duration::from_millis(100),
+        );
         std::thread::sleep(past_deadline.saturating_duration_since(std::time::Instant::now()));
         *full = true;
         drop(full);
@@ -2315,7 +2321,10 @@ mod tests {
             began.start.elapsed() < TIMEOUT,
             "inconclusive: notified after the deadline"
         );
-        let past_deadline = began.end + TIMEOUT + std::time::Duration::from_millis(20);
+        let past_deadline = crate::runtime::time::deadline_after(
+            crate::runtime::time::deadline_after(began.end, TIMEOUT),
+            std::time::Duration::from_millis(20),
+        );
         std::thread::sleep(past_deadline.saturating_duration_since(std::time::Instant::now()));
         drop(full);
         assert!(waiter.join().unwrap(), "C: epicsEventOK");

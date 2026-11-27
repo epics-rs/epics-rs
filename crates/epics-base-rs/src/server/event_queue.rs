@@ -759,7 +759,7 @@ pub struct EvQue {
 /// this module, so nothing but [`EvQue::lock_retiring`] can build one, and
 /// every one drops after the lock it was filled under.
 mod retiring {
-    use super::{EvQue, FlowCtrl, QueInner, SubQ};
+    use super::{DeliveryContext, EvQue, FlowCtrl, QueInner, SubQ};
 
     /// What a holder of a queue's lock displaced: subscriptions freed from
     /// their slots and a parked waker replaced. Either can own user state
@@ -817,6 +817,14 @@ mod retiring {
     impl QueGuard<'_> {
         pub(super) fn parts(&mut self) -> (&mut QueInner, &mut Retired) {
             (&mut self.q, &mut self.retired)
+        }
+
+        /// The contexts of the subscriptions this holder freed, moved to
+        /// `freed` for a caller that drops them after a lock of its own.
+        pub(super) fn hand_over(&mut self, freed: &mut Vec<DeliveryContext>) {
+            if let Some(displaced) = self.retired.0.as_mut() {
+                freed.extend(displaced.subs.drain(..).map(|sub| sub.context));
+            }
         }
 
         /// Park `cx` as the consumer. Taken under the polled queue's lock, so
@@ -1049,15 +1057,18 @@ impl EvQue {
         &self,
         cx: &mut std::task::Context<'_>,
         out: &mut Option<CircuitEvent>,
+        freed: &mut Vec<DeliveryContext>,
     ) -> std::task::Poll<()> {
         use std::task::Poll;
         let mut guard = self.lock_retiring();
         let flow_on = self.flow.is_on();
         let (q, retired) = guard.parts();
-        if q.take_oldest(flow_on, retired, out) {
+        let taken = q.take_oldest(flow_on, retired, out);
+        guard.hand_over(freed);
+        if taken {
             return Poll::Ready(());
         }
-        if let Some(ended) = q.take_ended() {
+        if let Some(ended) = guard.take_ended() {
             *out = Some(ended);
             return Poll::Ready(());
         }
@@ -1370,6 +1381,18 @@ impl EventUser {
         cx: &mut std::task::Context<'_>,
         out: &mut Option<CircuitEvent>,
     ) -> std::task::Poll<()> {
+        self.poll_next_freeing(cx, out, &mut Vec::new())
+    }
+
+    /// [`Self::poll_next_into`], the contexts of the subscriptions it frees
+    /// moved to `freed` instead of dropped, for a caller polling under a
+    /// lock of its own: a context can own client code.
+    pub(crate) fn poll_next_freeing(
+        &self,
+        cx: &mut std::task::Context<'_>,
+        out: &mut Option<CircuitEvent>,
+        freed: &mut Vec<DeliveryContext>,
+    ) -> std::task::Poll<()> {
         if out.is_some() {
             return std::task::Poll::Ready(());
         }
@@ -1382,7 +1405,7 @@ impl EventUser {
         for step in 0..n {
             // `reading < n`: no divide per poll.
             let at = wrap(chain.reading + step, n);
-            if chain.ques[at].poll_oldest(cx, out).is_ready() {
+            if chain.ques[at].poll_oldest(cx, out, freed).is_ready() {
                 chain.reading = at;
                 return std::task::Poll::Ready(());
             }

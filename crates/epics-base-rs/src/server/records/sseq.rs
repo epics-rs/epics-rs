@@ -1,16 +1,17 @@
 use super::link_status::{
-    DBF_NOACCESS, DBF_UNKNOWN, LINK_CON as LNKV_CON, LINK_EXT_NC as LNKV_EXT_NC, LINK_RECHECK,
-    LINK_STATUS_CHOICES as SSEQ_LNKV_CHOICES, LinkCheckSpec, LinkCheckState, LinkCheckTail,
-    LinkRole, LinkRule, LinkStatusGen, classify_link,
+    CheckBand, DBF_NOACCESS, DBF_UNKNOWN, LINK_CON as LNKV_CON, LINK_EXT_NC as LNKV_EXT_NC,
+    LINK_RECHECK, LINK_STATUS_CHOICES as SSEQ_LNKV_CHOICES, LinkCheckSpec, LinkCheckState,
+    LinkCheckTail, LinkRule, LinkStatusGen, classify_parsed_link,
 };
 use crate::error::{CaError, CaResult};
 use crate::server::database::{AsyncDbHandle, PostRule};
 use crate::server::record::{CycleCell, CycleRead, CycleValue};
 use crate::server::record::{
-    CycleMarks, CyclePostMask, LinkReadAs, OutTarget, PostStage, ProcessAction, ProcessActions,
-    ProcessOutcome, Record, RecordProcessResult,
+    CycleMarks, CyclePostMask, LinkReadAs, OutTarget, ParsedLink, PostStage, ProcessAction,
+    ProcessActions, ProcessOutcome, Record, RecordProcessResult, parse_link_v2,
+    parse_output_link_v2,
 };
-use crate::types::{DbfCode, EpicsValue, PvString};
+use crate::types::{DbFieldType, EpicsValue, PvString};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Notify;
@@ -56,8 +57,10 @@ const STR_FIELDS: [&str; NUM_STEPS] = [
 /// The posts [`SseqRecord::mark_value_write`] can owe: step `i`'s written
 /// view (`DBE_VALUE|DBE_LOG`) and derived view (`DBE_VALUE`) for a numeric
 /// write at `4i`, `4i + 1`, for a string write at `4i + 2`, `4i + 3`; then
-/// a `DLYn` put's DLY1 post at [`DLY1_POST`]; then the `ABORT` `special()`'s
-/// `busy`, `aborting` and `waiting` posts from [`BUSY_POST`].
+/// a `DLYn` put's post of that `DLYn` from [`DLY_POST`]; then the `ABORT`
+/// `special()`'s `busy`, `aborting` and `waiting` posts from [`BUSY_POST`];
+/// last `asyncFinish`'s `abort` and `aborting` posts with `MonitorMask`
+/// (`sseqRecord.c:471`, `:481-482`), VAL's own mask here.
 const VALUE_WRITE_POSTS_NAMED: [(&str, CyclePostMask); POSTS] = {
     let mut table = [("", CyclePostMask::Value); POSTS];
     let mut i = 0;
@@ -68,7 +71,11 @@ const VALUE_WRITE_POSTS_NAMED: [(&str, CyclePostMask); POSTS] = {
         table[4 * i + 3] = (DO_FIELDS[i], CyclePostMask::Value);
         i += 1;
     }
-    table[DLY1_POST] = ("DLY1", CyclePostMask::Value);
+    let mut i = 0;
+    while i < NUM_STEPS {
+        table[DLY_POST + i] = (DLY_FIELDS[i], CyclePostMask::Value);
+        i += 1;
+    }
     table[BUSY_POST] = ("BUSY", CyclePostMask::Value);
     table[ABORTING_POST] = ("ABORTING", CyclePostMask::Value);
     let mut i = 0;
@@ -76,13 +83,20 @@ const VALUE_WRITE_POSTS_NAMED: [(&str, CyclePostMask); POSTS] = {
         table[WTG_POST + i] = (WTG_FIELDS[i], CyclePostMask::Value);
         i += 1;
     }
+    table[ABORT_DONE_POST] = ("ABORT", CyclePostMask::MonitorValue);
+    table[ABORTING_DONE_POST] = ("ABORTING", CyclePostMask::MonitorValue);
     table
 };
-const DLY1_POST: usize = 4 * NUM_STEPS;
-const BUSY_POST: usize = DLY1_POST + 1;
+const DLY_POST: usize = 4 * NUM_STEPS;
+const BUSY_POST: usize = DLY_POST + NUM_STEPS;
 const ABORTING_POST: usize = BUSY_POST + 1;
 const WTG_POST: usize = ABORTING_POST + 1;
-const POSTS: usize = WTG_POST + NUM_STEPS;
+const ABORT_DONE_POST: usize = WTG_POST + NUM_STEPS;
+const ABORTING_DONE_POST: usize = ABORT_DONE_POST + 1;
+const POSTS: usize = ABORTING_DONE_POST + 1;
+const DLY_FIELDS: [&str; NUM_STEPS] = [
+    "DLY1", "DLY2", "DLY3", "DLY4", "DLY5", "DLY6", "DLY7", "DLY8", "DLY9", "DLYA",
+];
 const LNK_FIELDS: [&str; NUM_STEPS] = [
     "LNK1", "LNK2", "LNK3", "LNK4", "LNK5", "LNK6", "LNK7", "LNK8", "LNK9", "LNKA",
 ];
@@ -150,6 +164,7 @@ static SSEQ_LINK_CHECK: LinkCheckSpec = LinkCheckSpec {
     mask: crate::server::recgbl::EventMask::VALUE,
     repost_local: true,
     in_cycle: false,
+    band: CheckBand::Prio,
 };
 
 /// Index of step `step`'s DOL (`lnk` false) or LNK in [`SSEQ_LINK_CHECK`].
@@ -205,9 +220,13 @@ impl LinkCheckTail for [SseqStep; NUM_STEPS] {
 /// tell `DBE_VALUE|DBE_LOG` from a bare `DBE_VALUE`) nor that a client `caput`
 /// to `DOn` already posted `DOn` on the put path. So the record marks both, and
 /// the framework's change loop must not see them at all.
-static VALUE_PAIR_FIELDS: [&str; 2 * NUM_STEPS] = [
+///
+/// `ABORT` and `ABORTING` follow: `asyncFinish` posts both whenever `abort`
+/// is set (`:477-482`), so a refusal that never raised `aborting` still posts
+/// it, which no change test can see.
+static MARK_POSTED_FIELDS: [&str; 2 * NUM_STEPS + 2] = [
     "DO1", "DO2", "DO3", "DO4", "DO5", "DO6", "DO7", "DO8", "DO9", "DOA", "STR1", "STR2", "STR3",
-    "STR4", "STR5", "STR6", "STR7", "STR8", "STR9", "STRA",
+    "STR4", "STR5", "STR6", "STR7", "STR8", "STR9", "STRA", "ABORT", "ABORTING",
 ];
 
 /// The fields a process cycle may post; see `process_posted_fields`.
@@ -329,6 +348,19 @@ struct SseqStep {
 }
 
 impl SseqStep {
+    /// C `dol.type != CONSTANT`: a number or empty `DOLn` was consumed at
+    /// init and is never read again.
+    fn reads_dol(&self) -> bool {
+        !parse_link_v2(&self.dol).is_constant_type()
+    }
+
+    /// C `lnk.type != CONSTANT || dol.type != CONSTANT`
+    /// (sseqRecord.c:355-356): a group with nothing to read and nowhere to
+    /// write is no step, so its `DLYn` is not waited.
+    fn is_step(&self) -> bool {
+        !parse_output_link_v2(&self.lnk).is_constant_type() || self.reads_dol()
+    }
+
     /// Write the step's value FROM its numeric view, re-deriving the string
     /// view — the single owner of `dov → s` (C `cvtDoubleToString(dov, s,
     /// pR->prec)`).
@@ -338,7 +370,8 @@ impl SseqStep {
     /// `special()` on a `STRn` put (:1129-1137), `init_record` (:243-249), and
     /// the `processCallback` link read (:657-661, :676-680). A write that
     /// updates one view and leaves the other stale is the defect — so no site
-    /// assigns `dov`/`str_val` directly; every one goes through this pair.
+    /// assigns `dov`/`str_val` directly; every one goes through this pair,
+    /// except the `.db` load (`load_field`), which `init_record` reconciles.
     ///
     /// `PREC` is `DBF_SHORT` and reaches C's
     /// `cvtDoubleToString(double, char*, epicsUInt16 prec)` by implicit
@@ -358,11 +391,11 @@ impl SseqStep {
     }
 
     /// Write the step's value FROM its string view, re-deriving the numeric
-    /// view — the single owner of `s → dov` (C `dov = atof(s)`). The string
-    /// is kept byte-exact; a non-numeric string is `0.0`, exactly as `atof`
-    /// reports it.
+    /// view — the single owner of `s → dov` (C `dov = atof(s)`). `atof` is
+    /// `strtod`'s prefix, not a strict parse: `"12abc"` is 12, and text with
+    /// no number 0. The string is kept byte-exact.
     fn set_string(&mut self, s: PvString) -> StepWrite {
-        let dov = EpicsValue::String(s.clone()).to_f64().unwrap_or(0.0);
+        let dov = crate::runtime::stdlib::strtod(s.as_bytes()).value;
         let w = StepWrite {
             numeric_changed: self.dov != dov,
             string_changed: self.str_val != s,
@@ -422,6 +455,11 @@ pub struct SseqRecord {
     phase: SeqPhase,
     active: Vec<usize>,
     cursor: usize,
+    /// No further step fires; the sequence finishes once `in_flight` drains
+    /// (C `processCallback`'s abort gate, sseqRecord.c:621-627). Set by an
+    /// `ABORT` put while busy, whatever it wrote, and by a refused
+    /// put-callback; cleared by `finish`.
+    stopping: bool,
     steps: [SseqStep; NUM_STEPS],
     /// The `WAITn` put-callbacks currently outstanding (C the still-`waiting`
     /// entries of `pcb->plinkGroups`). A step is dispatched without awaiting
@@ -437,17 +475,19 @@ pub struct SseqRecord {
     /// disturb the next sequence. `None` while `Idle`.
     seq_wake: Option<Arc<Notify>>,
     /// Canonical record name + cycle-free database handle, stashed at
-    /// `add_record` via [`Record::set_async_context`]. Drives the `ABORT` finish
-    /// re-entry and the link-status refresh — the surfaces a `process()`
+    /// `add_record` via [`Record::set_async_context`]. Drives the put-callback
+    /// wake re-entry and the link-status refresh — the surfaces a `process()`
     /// cannot reach itself.
     async_ctx: Option<(crate::types::RecordName, AsyncDbHandle)>,
-    /// The callback band this record's `PRIO` selects, refreshed from
-    /// [`crate::server::record::ProcessContext`] before every `process()` — C
-    /// `sseqRecord.c:178` `callbackSetPriority(pR->prio, &pcb->callback)`,
-    /// which likewise re-stamps the band the deferred group walk runs on. Low
-    /// until the first cycle, the band a record whose `PRIO` was never written
-    /// already has.
-    callback_priority: crate::runtime::task::CallbackPriority,
+    /// `special(ABORT)`'s `callbackRequest` (sseqRecord.c:1188, :1212), taken
+    /// by the put as a zero-delay `ReprocessAfter` whose token supersedes any
+    /// pending `DLYn` timer. C cancels the timer only with over 0.1 s left
+    /// (:1204) and otherwise lets it finish the abort; here any is superseded.
+    finish_now: bool,
+    /// The record's `PRIO` band, read as each deferred step is requested. C
+    /// re-stamps it once per cycle (sseqRecord.c:308), so a `PRIO` put
+    /// mid-walk moves only the next cycle there.
+    band: crate::server::database::RecordBand,
     /// The `DOn`/`STRn` posts this cycle's writes OWE, each with the mask of
     /// the C `db_post_events` call site that made it (see `mark_value_write`).
     /// Drained by [`Record::take_cycle_posted_fields`] — on a put by the put
@@ -491,11 +531,13 @@ impl Default for SseqRecord {
             phase: SeqPhase::Idle,
             active: Vec::new(),
             cursor: 0,
+            stopping: false,
             steps,
             in_flight: Vec::new(),
             seq_wake: None,
             async_ctx: None,
-            callback_priority: crate::runtime::task::CallbackPriority::Low,
+            finish_now: false,
+            band: Default::default(),
             pending_posts: 0,
             link_gen: LinkStatusGen::default(),
             // An empty link is a CONSTANT link. C `init_record` marks the DOL
@@ -658,13 +700,8 @@ impl SseqRecord {
         // bridge that re-enters the machine when one completes.
         self.in_flight.clear();
         self.seq_wake = Some(Arc::new(Notify::new()));
-        // C `process` (sseqRecord.c:347-365): a step joins the active list
-        // when it is selected AND has a non-constant `LNKn` or `DOLn`.
         self.active = (0..NUM_STEPS)
-            .filter(|&i| {
-                self.should_execute_step(i)
-                    && (!self.steps[i].lnk.is_empty() || !self.steps[i].dol.is_empty())
-            })
+            .filter(|&i| self.should_execute_step(i) && self.steps[i].is_step())
             .collect();
         self.cursor = 0;
         if self.active.is_empty() {
@@ -811,11 +848,11 @@ impl SseqRecord {
                     // remaining step is skipped: `processNextLink` takes the
                     // no-delay path (`:443`, gated on `!pR->abort`) and the
                     // callback it requests bails at `processCallback`'s abort
-                    // gate (`:621-627`) straight into `asyncFinish`. Emptying
-                    // the cursor is that skip; outstanding callbacks from
-                    // earlier steps still drain first.
-                    self.cursor = self.active.len();
-                    return self.advance_sequence(live);
+                    // gate (`:621-627`) straight into `asyncFinish`.
+                    // Outstanding callbacks from earlier steps still drain
+                    // first.
+                    self.stopping = true;
+                    return self.drain_abort(live);
                 }
                 self.cursor += 1;
                 return self.advance_sequence(live);
@@ -906,8 +943,7 @@ impl SseqRecord {
             let name = name.clone();
             let handle = handle.clone();
             let wake = wake.clone();
-            let prio = self.callback_priority;
-            crate::runtime::task::spawn_background(prio, async move {
+            crate::runtime::task::spawn_background(self.band.priority(), async move {
                 if let Some(rx) = handle.put_link_notify(&name, LNK_FIELDS[i], value).await {
                     // `Err` means the put vanished without firing — treat it as
                     // completion so the step is never stranded.
@@ -939,10 +975,13 @@ impl SseqRecord {
         let name = name.clone();
         let handle = handle.clone();
         let wake = wake.clone();
-        let prio = self.callback_priority;
-        crate::runtime::task::spawn_background(prio, async move {
+        crate::runtime::task::spawn_background(self.band.priority(), async move {
             wake.notified().await;
-            reenter_now(&name, &handle).await;
+            if let Some(token) = handle.mint_async_token(&name) {
+                let (waitset, completion) = AsyncDbHandle::new_put_notify();
+                waitset.leave();
+                handle.reprocess_on_notify(token, completion);
+            }
         });
     }
 
@@ -985,8 +1024,8 @@ impl SseqRecord {
     /// now would expose `BUSY == 0` with `LNKn` unwritten — a state C cannot
     /// produce. The `waiting`, `abort` and `aborting` clears travel out as
     /// [`ProcessAction::PutInLinkStage`] after them, stored once they have run;
-    /// `monitor()`'s walk posts `abort` and `aborting` after
-    /// `recGblResetAlarms` with its mask (`:471`, `:479-482`). `busy` is a
+    /// `abort` and `aborting` post from their marks in `monitor()`'s walk,
+    /// after `recGblResetAlarms` with its mask (`:471`, `:479-482`). `busy` is a
     /// [`ProcessAction::PutAfterEpilogue`], stored and posted after
     /// `recGblFwdLink` and the stamp (`:499-505`), so an FLNK target still
     /// reads `BUSY == 1` as it does in C — and posted whatever it held, as
@@ -1006,13 +1045,17 @@ impl SseqRecord {
                 value: CycleValue::Short(0),
                 post: PostStage::Monitor,
             });
+            self.pending_posts |= 1 << ABORT_DONE_POST;
         }
-        if self.aborting != 0 {
+        // C clears `aborting` only under `abort`, so an `ABORT = 0` put while
+        // busy leaves it set there for good; it is cleared here too.
+        if self.abort != 0 || self.aborting != 0 {
             live.push(ProcessAction::PutInLinkStage {
                 field: "ABORTING",
                 value: CycleValue::Short(0),
                 post: PostStage::Monitor,
             });
+            self.pending_posts |= 1 << ABORTING_DONE_POST;
         }
         for i in 0..NUM_STEPS {
             if self.steps[i].waiting != 0 {
@@ -1025,6 +1068,7 @@ impl SseqRecord {
         }
         self.active.clear();
         self.cursor = 0;
+        self.stopping = false;
         self.phase = SeqPhase::Idle;
         // Drop the per-sequence concurrency state. Any waiter still running
         // holds its own `done` Arc and a clone of the (now replaced-on-next-
@@ -1035,25 +1079,6 @@ impl SseqRecord {
             field: "BUSY",
             value: crate::server::record::CycleValue::Short(0),
         }])
-    }
-
-    /// Drive an immediate abort completion from `special` (C
-    /// `epicsTimerCancel` + `callbackRequest`): supersede any pending
-    /// `DLYn` re-entry, then re-enter so the next `process()` runs the abort
-    /// drain at once. The superseded timer, when it wakes, re-enters nothing
-    /// (the `AsyncToken` generation gate). Used when the machine is in phase
-    /// `Fire` (a delay is pending); a phase-`Wait` abort instead wakes the
-    /// already-parked bridge task via [`Self::wake_machine`].
-    fn force_finish_reentry(&self) {
-        if let Some((name, handle)) = &self.async_ctx {
-            let name = name.clone();
-            let handle = handle.clone();
-            let prio = self.callback_priority;
-            crate::runtime::task::spawn_background(prio, async move {
-                handle.cancel_async_reentry(&name);
-                reenter_now(&name, &handle).await;
-            });
-        }
     }
 
     /// Recompute the per-step DOL/LNK link-status diagnostics
@@ -1078,18 +1103,12 @@ impl SseqRecord {
     /// On a complete database a `special` stores the put link's status and
     /// type, and the put path posts the status, before the put returns, as C
     /// does (:1003-1018, :1044-1071); the task only arms the recheck.
-    fn refresh_link_status(&mut self, trigger: LinkPass) {
+    fn refresh_link_status(&mut self, trigger: LinkPass, put: Option<&ParsedLink>) {
         let Some((name, handle)) = &self.async_ctx else {
             return;
         };
         let name = name.clone();
         let handle = handle.clone();
-        let groups: Vec<(PvString, PvString)> = (0..NUM_STEPS)
-            .map(|i| {
-                let s = &self.steps[i];
-                (s.dol.clone(), s.lnk.clone())
-            })
-            .collect();
         // Claim the links C classifies in this pass, so a later put's refresh
         // supersedes only its own link: `special()` classifies the put link
         // alone (sseqRecord.c:987-1079).
@@ -1099,15 +1118,9 @@ impl SseqRecord {
         };
         let token = self.link_gen.next_for(claim);
         let rule = trigger.rule();
-        let stored = match trigger {
-            LinkPass::Special { step, lnk } if handle.classifies_links_at_once() => {
-                let (dol, lnk_str) = &groups[step];
-                let (link, role) = if lnk {
-                    (lnk_str, LinkRole::Output)
-                } else {
-                    (dol, LinkRole::Input)
-                };
-                let (status, dbf) = classify_link(&handle, link, role, rule);
+        let stored = match (trigger, put) {
+            (LinkPass::Special { step, lnk }, Some(link)) if handle.classifies_links_at_once() => {
+                let (status, dbf) = classify_parsed_link(&handle, link, rule);
                 let ix = link_ix(step, lnk);
                 self.link_status[ix] = status;
                 self.link_check.put_posts |= 1 << ix;
@@ -1125,17 +1138,21 @@ impl SseqRecord {
         // The parking key; `name` itself moves into the future below.
         let init_key = name.clone();
         sched.schedule_record_init(&init_key, async move {
-            let class: Vec<(i16, i16, i16, i16)> = groups
+            // The links as stored, in [`SSEQ_LINK_CHECK`] order: each one's
+            // cached answer is the one its step reads and puts through.
+            let fields: [&str; 2 * NUM_STEPS] = std::array::from_fn(|i| SSEQ_LINK_CHECK.links[i].0);
+            let Some(links) = handle.stored_links(&name, &fields) else {
+                return;
+            };
+            let class: Vec<(i16, i16)> = links
                 .iter()
-                .map(|(dol, lnk)| {
-                    let (ds, dt) = classify_link(&handle, dol, LinkRole::Input, rule);
-                    let (ls, lt) = classify_link(&handle, lnk, LinkRole::Output, rule);
-                    (ds, dt, ls, lt)
+                .map(|link| {
+                    link.as_deref().map_or((LNKV_CON, DBF_UNKNOWN), |link| {
+                        classify_parsed_link(&handle, link, rule)
+                    })
                 })
                 .collect();
-            let not_ok = class
-                .iter()
-                .any(|&(ds, _, ls, _)| ds == LNKV_EXT_NC || ls == LNKV_EXT_NC);
+            let not_ok = class.iter().any(|&(status, _)| status == LNKV_EXT_NC);
             let mut fields: Vec<(usize, String, EpicsValue, PostRule)> = Vec::new();
             let mut push = |link: usize, f: &str, v: EpicsValue, r: PostRule| {
                 fields.push((link, f.to_string(), v, r));
@@ -1145,9 +1162,10 @@ impl SseqRecord {
                 LinkPass::Init => {
                     // sseqRecord.c:221, :240. Only `init_record` marks a
                     // constant DOL `DBF_NOACCESS` (:206).
-                    for (i, &(ds, dt, ls, lt)) in class.iter().enumerate() {
-                        let dt = if ds == LNKV_CON { DBF_NOACCESS } else { dt };
+                    for i in 0..NUM_STEPS {
                         let (d, l) = (link_ix(i, false), link_ix(i, true));
+                        let ((ds, dt), (ls, lt)) = (class[d], class[l]);
+                        let dt = if ds == LNKV_CON { DBF_NOACCESS } else { dt };
                         push(d, DOLV_FIELDS[i], status(ds), PostRule::Always);
                         push(d, DT_FIELDS[i], EpicsValue::Short(dt), PostRule::Silent);
                         push(l, LNKV_FIELDS[i], status(ls), PostRule::Always);
@@ -1157,12 +1175,12 @@ impl SseqRecord {
                 }
                 LinkPass::Special { step, lnk } => {
                     // sseqRecord.c:1005-1011 (DOLn), :1047-1057 (LNKn).
-                    let (ds, dt, ls, lt) = class[step];
                     let link = link_ix(step, lnk);
-                    let (field, type_field, put, dbf) = if lnk {
-                        (LNKV_FIELDS[step], LT_FIELDS[step], ls, lt)
+                    let (put, dbf) = class[link];
+                    let (field, type_field) = if lnk {
+                        (LNKV_FIELDS[step], LT_FIELDS[step])
                     } else {
-                        (DOLV_FIELDS[step], DT_FIELDS[step], ds, dt)
+                        (DOLV_FIELDS[step], DT_FIELDS[step])
                     };
                     let put = match stored {
                         Some(put) => put,
@@ -1201,6 +1219,114 @@ impl SseqRecord {
         });
     }
 
+    /// C `special`, `put` the link `dbPutFieldLink` stored in `field` and
+    /// opened (`dbAccess.c:1105-1112`), when the holder lent it.
+    fn special_put(&mut self, field: &str, after: bool, put: Option<&ParsedLink>) -> CaResult<()> {
+        if !after {
+            return Ok(());
+        }
+        // A put to DLYn quantizes and posts that DLYn. C defect not copied
+        // (sseqRecord.c:1150-1155): `special` computes `lnkIndex` and never
+        // adds it to `plinkGroup`, as the STRn case above does, so C rounds
+        // and posts DLY1 and leaves the written DLYn raw.
+        if let Some((step, "DLY")) = Self::step_index_from_suffix(field) {
+            self.steps[step].dly =
+                crate::runtime::time::quantize_to_sleep_quantum(self.steps[step].dly);
+            self.pending_posts |= 1 << (DLY_POST + step);
+            return Ok(());
+        }
+        // A put to a DOL/LNK/WAIT field re-classifies the link diagnostics
+        // (C `sseqRecord.c::special`, `SPC_MOD`); a `WAITn` put only
+        // schedules `checkLinks`.
+        if Self::is_link_config_field(field) {
+            match Self::step_index_from_suffix(field) {
+                Some((step, "DOL")) => {
+                    self.refresh_link_status(LinkPass::Special { step, lnk: false }, put)
+                }
+                Some((step, "LNK")) => {
+                    self.refresh_link_status(LinkPass::Special { step, lnk: true }, put)
+                }
+                _ => self.arm_check_links(),
+            }
+            return Ok(());
+        }
+        // ABORTING is `special(SPC_MOD)` but C `sseqRecord.c::special` has NO
+        // `case(sseqRecordABORTING)` — it falls to the `default:` arm,
+        // `recGblDbaddrError(S_db_badChoice, ...); return(S_db_badChoice)`
+        // (sseqRecord.c:1218-1220). `dbPut` had already stored the value (so
+        // `aborting` reads back what the client wrote), but the put STATUS is a
+        // failure. ABORTING is the ONLY SPC_MOD sseq field with no switch case;
+        // DLYn/DOn/DOLn/LNKn/STRn/WAITn all have one and are accepted, so this
+        // is the whole rejected-family besides ABORT-when-idle below.
+        if field.eq_ignore_ascii_case("ABORTING") {
+            return Err(CaError::BadChoice("ABORTING".into()));
+        }
+        // C `sseqRecord.c::special` handles `ABORT` (SPC_MOD) entirely
+        // outside the process cycle — a put to `ABORT` does NOT process the
+        // record (only `VAL` is process-passive). `pR->abort` already holds
+        // the value the put just stored.
+        if !field.eq_ignore_ascii_case("ABORT") {
+            return Ok(());
+        }
+        // The posts below are C's `db_post_events` calls under the put's lock,
+        // so they are marks the put path drains, never a spawned post that
+        // could land after the finish re-entry clears what it stores.
+        if self.busy == 0 {
+            // C: "no activity to abort" (sseqRecord.c:1173-1178) — reset `abort`
+            // silently, post `busy`, and `return(-1)`: the put is REJECTED, so
+            // `dbPut` posts nothing for `abort` either.
+            self.abort = 0;
+            self.pending_posts |= 1 << BUSY_POST;
+            return Err(CaError::BadField("ABORT".to_string()));
+        }
+        if self.aborting != 0 {
+            // Second abort while already draining (C sseqRecord.c:1179-1190):
+            // a downstream put-callback is hung. Abandon every outstanding
+            // callback — clear its `waiting`/`WTGn`, drop the in-flight set —
+            // and finish now. The abandoned waiters set their (now-dropped)
+            // `done` Arcs and notify the per-sequence bridge nobody listens
+            // on, so they are harmless (C's `waiting == 0` abandoned-callback
+            // guard).
+            // C clears and posts all ten, waiting or not (:1183-1186).
+            for i in 0..NUM_STEPS {
+                self.steps[i].waiting = 0;
+                self.pending_posts |= 1 << (WTG_POST + i);
+            }
+            self.in_flight.clear();
+            self.stopping = true;
+            // With `in_flight` empty the drain finishes immediately on
+            // re-entry: wake the parked phase-`Wait` task, or request a fresh
+            // re-entry if somehow not blocked.
+            if self.phase == SeqPhase::Wait {
+                self.wake_machine();
+            } else {
+                self.finish_now = true;
+            }
+            return Ok(());
+        }
+        self.aborting = 1;
+        self.pending_posts |= 1 << ABORTING_POST;
+        // No further step dispatches; the drain only waits out the in-flight
+        // callbacks.
+        self.stopping = true;
+        // C cancels a pending `DLYn` delay timer and completes the abort
+        // immediately (sseqRecord.c:1194-1215); when instead blocked on a
+        // put-callback it lets the outstanding callback wake the finish —
+        // that rule exists only as C's own comment inside
+        // `case(sseqRecordABORT)` (sseqRecord.c:1161-1164), there being no
+        // code that cancels a `dbCaPutLinkCallback`. Phase `Fire` has a
+        // `ReprocessAfter` pending, so cancel it and re-enter to drain;
+        // phase `Wait` already has a parked bridge task, so just wake it
+        // (firing its current, un-superseded token — no competing re-entry
+        // task).
+        if self.phase == SeqPhase::Fire {
+            self.finish_now = true;
+        } else if self.phase == SeqPhase::Wait {
+            self.wake_machine();
+        }
+        Ok(())
+    }
+
     /// `special` of `WAITn` (sseqRecord.c:1088-1094): a `checkLinks` pass
     /// 0.5 s out unless one is pending, for its `WERRn`. Not a refresh, so
     /// no classification in flight is superseded.
@@ -1224,21 +1350,6 @@ impl SseqRecord {
             Self::step_index_from_suffix(name),
             Some((_, "DOL")) | Some((_, "LNK")) | Some((_, "WAIT"))
         )
-    }
-}
-
-/// Mint a fresh async re-entry token wired to an already-fired completion,
-/// so the record's `process()` runs again as soon as the framework
-/// schedules it (C `callbackRequest`). Shared by `arm_wake` (after a
-/// completion notify) and `force_finish_reentry` (after cancelling a
-/// pending delay). Minting supersedes any prior pending token; callers
-/// invoke it only where that is intended (phase `Wait`, where nothing is
-/// pending, or right after `cancel_async_reentry`).
-async fn reenter_now(name: &[u8], handle: &AsyncDbHandle) {
-    if let Some(token) = handle.mint_async_token(name) {
-        let (waitset, completion) = AsyncDbHandle::new_put_notify();
-        waitset.leave();
-        handle.reprocess_on_notify(token, completion);
     }
 }
 
@@ -1321,6 +1432,14 @@ impl Record for SseqRecord {
         Ok(())
     }
 
+    fn take_special_actions(&mut self) -> Vec<ProcessAction> {
+        if std::mem::take(&mut self.finish_now) {
+            vec![ProcessAction::ReprocessAfter(std::time::Duration::ZERO)]
+        } else {
+            Vec::new()
+        }
+    }
+
     /// Every post of a `DOn`/`STRn` is one the record's own writer made
     /// (`mark_value_write`), with that C call site's mask and comparison.
     fn take_cycle_posted_fields(&mut self) -> CycleMarks {
@@ -1337,10 +1456,9 @@ impl Record for SseqRecord {
         )
     }
 
-    /// C change-detects neither view of a step's value pair; see
-    /// `VALUE_PAIR_FIELDS`.
+    /// See `MARK_POSTED_FIELDS`.
     fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
-        &VALUE_PAIR_FIELDS
+        &MARK_POSTED_FIELDS
     }
 
     /// C's process path posts these and nothing else (`asyncFinish` :474-505,
@@ -1355,14 +1473,6 @@ impl Record for SseqRecord {
                 )
             },
         )
-    }
-
-    /// C `sseqRecord.c:1155` posts the re-quantized DLY1 with a bare
-    /// `DBE_VALUE`, not the framework default `DBE_VALUE | DBE_LOG`;
-    /// `asyncFinish` posts `abort` and `aborting` with `MonitorMask`,
-    /// `DBE_VALUE` plus the alarm bit (`:471`, `:481-482`).
-    fn value_only_change_fields(&self) -> &'static [&'static str] {
-        &["DLY1", "ABORT", "ABORTING"]
     }
 
     /// C `sseqRecord.c::asyncFinish` (474) posts `VAL` on EVERY process:
@@ -1395,12 +1505,10 @@ impl Record for SseqRecord {
         // An abort in flight drains the outstanding put-callbacks, then
         // finishes — C `processNextLink` under `pR->abort` returns until the
         // last callback drains, and `process` takes the `pact` path to
-        // `asyncFinish`. The gate is `abort`, the flag C's `processCallback`
-        // itself tests (`sseqRecord.c:621`), not the `aborting` request flag:
-        // a client abort sets both (the put stores `abort`, `special` raises
-        // `aborting`), while a refused `dbCaPutLinkCallback` sets only `abort`
-        // (`:745-748`) and must stop the sequence just the same.
-        let mut outcome = if self.busy != 0 && self.abort != 0 {
+        // `asyncFinish`. The gate is the machine's `stopping`, not the
+        // record's `abort`: an `ABORT` put stores what the client wrote, 0
+        // included, and only the machine knows the sequence was stopped.
+        let mut outcome = if self.stopping {
             self.drain_abort(&mut live)
         } else {
             // `busy == 0` (phase `Idle`) is a genuine start: the framework
@@ -1439,7 +1547,7 @@ impl Record for SseqRecord {
         // the earliest hook (it runs before the selection is resolved), and
         // only at a sequence start (`busy == 0`); a continuation must not
         // re-read `SELL` mid-sequence.
-        if self.busy == 0 && self.selm != 0 && !self.sell.is_empty() {
+        if self.busy == 0 && self.selm != 0 && !parse_link_v2(&self.sell).is_constant_type() {
             ProcessActions::from(vec![ProcessAction::ReadDbLink {
                 link_field: "SELL",
                 target_field: "SELN",
@@ -1454,10 +1562,10 @@ impl Record for SseqRecord {
         // has elapsed (sseqRecord.c:643-666). The per-step `ReprocessAfter`
         // re-enters in phase `Fire` with `cursor` on that step, so the DOL
         // read is scoped to exactly that step here — not all steps up front.
-        if self.phase == SeqPhase::Fire && self.cursor < self.active.len() {
+        if self.phase == SeqPhase::Fire && !self.stopping {
             let i = self.active[self.cursor];
             let mut actions = Vec::with_capacity(2);
-            if !self.steps[i].dol.is_empty() {
+            if self.steps[i].reads_dol() {
                 actions.push(ProcessAction::ReadDbLink {
                     link_field: DOL_FIELDS[i],
                     target_field: DO_FIELDS[i],
@@ -1495,128 +1603,26 @@ impl Record for SseqRecord {
         after: bool,
         _common: &crate::server::record::CommonFields,
     ) -> CaResult<()> {
-        if !after {
-            return Ok(());
-        }
-        // A put to any DLYn re-quantizes DLY1 — yes, DLY1, not the field that
-        // was written. C `sseqRecord.c::special` (1140-1156) computes
-        // `lnkIndex` from the put field and then never applies it, unlike the
-        // STRn case right above it which does `plinkGroup += lnkIndex`:
-        //
-        //     lnkIndex = ((char *)paddr->pfield - (char *)&pR->dly1) /
-        //                sizeof(struct linkGroup);
-        //     plinkGroup = (struct linkGroup *)&pR->dly1;
-        //     plinkGroup->dly = epicsThreadSleepQuantum() *
-        //                       NINT(plinkGroup->dly/epicsThreadSleepQuantum());
-        //     db_post_events(pR, &plinkGroup->dly, DBE_VALUE);
-        //
-        // So `plinkGroup` still points at the DLY1 group. The put DLYn keeps
-        // its raw value and DLY1 is what gets rounded and posted. Present since
-        // the record was moved into the calc module (calc c9115f8) and never
-        // corrected upstream; it is C's observable behaviour, so it is the
-        // contract. (Every DLYn IS quantized — at init, see `init_record`.)
-        if Self::step_index_from_suffix(field).is_some_and(|(_, p)| p == "DLY") {
-            self.steps[0].dly = crate::runtime::time::quantize_to_sleep_quantum(self.steps[0].dly);
-            self.pending_posts |= 1 << DLY1_POST;
-            return Ok(());
-        }
-        // A put to a DOL/LNK/WAIT field re-classifies the link diagnostics
-        // (C `sseqRecord.c::special`, `SPC_MOD`); a `WAITn` put only
-        // schedules `checkLinks`.
-        if Self::is_link_config_field(field) {
-            match Self::step_index_from_suffix(field) {
-                Some((step, "DOL")) => {
-                    self.refresh_link_status(LinkPass::Special { step, lnk: false })
-                }
-                Some((step, "LNK")) => {
-                    self.refresh_link_status(LinkPass::Special { step, lnk: true })
-                }
-                _ => self.arm_check_links(),
-            }
-            return Ok(());
-        }
-        // ABORTING is `special(SPC_MOD)` but C `sseqRecord.c::special` has NO
-        // `case(sseqRecordABORTING)` — it falls to the `default:` arm,
-        // `recGblDbaddrError(S_db_badChoice, ...); return(S_db_badChoice)`
-        // (sseqRecord.c:1218-1220). `dbPut` had already stored the value (so
-        // `aborting` reads back what the client wrote), but the put STATUS is a
-        // failure. ABORTING is the ONLY SPC_MOD sseq field with no switch case;
-        // DLYn/DOn/DOLn/LNKn/STRn/WAITn all have one and are accepted, so this
-        // is the whole rejected-family besides ABORT-when-idle below.
-        if field.eq_ignore_ascii_case("ABORTING") {
-            return Err(CaError::BadChoice("ABORTING".into()));
-        }
-        // C `sseqRecord.c::special` handles `ABORT` (SPC_MOD) entirely
-        // outside the process cycle — a put to `ABORT` does NOT process the
-        // record (only `VAL` is process-passive). `pR->abort` already holds
-        // the value the put just stored.
-        if !field.eq_ignore_ascii_case("ABORT") {
-            return Ok(());
-        }
-        // The posts below are C's `db_post_events` calls under the put's lock,
-        // so they are marks the put path drains, never a spawned post that
-        // could land after the finish re-entry clears what it stores.
-        if self.busy == 0 {
-            // C: "no activity to abort" (sseqRecord.c:1173-1178) — reset `abort`
-            // silently, post `busy`, and `return(-1)`: the put is REJECTED, so
-            // `dbPut` posts nothing for `abort` either.
-            self.abort = 0;
-            self.pending_posts |= 1 << BUSY_POST;
-            return Err(CaError::BadField("ABORT".to_string()));
-        }
-        if self.aborting != 0 {
-            // Second abort while already draining (C sseqRecord.c:1179-1190):
-            // a downstream put-callback is hung. Abandon every outstanding
-            // callback — clear its `waiting`/`WTGn`, drop the in-flight set —
-            // and finish now. The abandoned waiters set their (now-dropped)
-            // `done` Arcs and notify the per-sequence bridge nobody listens
-            // on, so they are harmless (C's `waiting == 0` abandoned-callback
-            // guard).
-            // C clears and posts all ten, waiting or not (:1183-1186).
-            for i in 0..NUM_STEPS {
-                self.steps[i].waiting = 0;
-                self.pending_posts |= 1 << (WTG_POST + i);
-            }
-            self.in_flight.clear();
-            self.cursor = self.active.len();
-            // With `in_flight` empty the drain finishes immediately on
-            // re-entry: wake the parked phase-`Wait` task, or mint a fresh
-            // re-entry if somehow not blocked.
-            if self.phase == SeqPhase::Wait {
-                self.wake_machine();
-            } else {
-                self.force_finish_reentry();
-            }
-            return Ok(());
-        }
-        self.aborting = 1;
-        self.pending_posts |= 1 << ABORTING_POST;
-        // No further step dispatches; the drain only waits out the in-flight
-        // callbacks.
-        self.cursor = self.active.len();
-        // C cancels a pending `DLYn` delay timer and completes the abort
-        // immediately (sseqRecord.c:1194-1215); when instead blocked on a
-        // put-callback it lets the outstanding callback wake the finish —
-        // that rule exists only as C's own comment inside
-        // `case(sseqRecordABORT)` (sseqRecord.c:1161-1164), there being no
-        // code that cancels a `dbCaPutLinkCallback`. Phase `Fire` has a
-        // `ReprocessAfter` pending, so cancel it and re-enter to drain;
-        // phase `Wait` already has a parked bridge task, so just wake it
-        // (firing its current, un-superseded token — no competing re-entry
-        // task).
-        if self.phase == SeqPhase::Fire {
-            self.force_finish_reentry();
-        } else if self.phase == SeqPhase::Wait {
-            self.wake_machine();
-        }
-        Ok(())
+        self.special_put(field, after, None)
     }
 
-    fn set_process_context(&mut self, ctx: &crate::server::record::ProcessContext) {
-        // C `sseqRecord.c:178` re-runs `callbackSetPriority(pR->prio, ...)`
-        // every time the sequence is (re)armed, so a `PRIO` written between
-        // cycles moves the next one. Same rule here.
-        self.callback_priority = ctx.callback_priority;
+    fn special_own(
+        &mut self,
+        field: &str,
+        after: bool,
+        own: crate::server::record::OwnFrame<'_>,
+    ) -> CaResult<()> {
+        self.special_put(field, after, own.link(field).map(|link| &**link))
+    }
+
+    /// [`Self::special_own`] lends `special` the stored link.
+    fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
+        use crate::server::record::CycleHooks;
+        CycleHooks::ALL.union(CycleHooks::OWN_FRAME)
+    }
+
+    fn set_record_band(&mut self, band: crate::server::database::RecordBand) {
+        self.band = band;
     }
 
     fn set_async_context(&mut self, name: crate::types::RecordName, db: AsyncDbHandle) {
@@ -1625,7 +1631,7 @@ impl Record for SseqRecord {
         // initial status (sseqRecord.c:203-240). This is the framework's
         // init-time hook, so refresh now that the async surface exists.
         // `init_record` itself never runs `checkLinks`.
-        self.refresh_link_status(LinkPass::Init);
+        self.refresh_link_status(LinkPass::Init, None);
     }
 
     fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
@@ -1689,25 +1695,21 @@ impl Record for SseqRecord {
         _link_field: &str,
         source: &OutTarget,
     ) -> Option<LinkReadAs> {
-        match source.field_type? {
-            DbfCode::String
-            | DbfCode::Enum
-            | DbfCode::Menu
-            | DbfCode::Device
-            | DbfCode::Inlink
-            | DbfCode::Outlink
-            | DbfCode::Fwdlink => Some(LinkReadAs::String),
-            DbfCode::Char | DbfCode::UChar => Some(LinkReadAs::CharArrayAsString {
+        // `dbGetLinkDBFtype` is a DBR type: `MENU`/`DEVICE` arrive as `ENUM`,
+        // the link classes as `STRING`.
+        match source.final_field_type? {
+            DbFieldType::String | DbFieldType::Enum => Some(LinkReadAs::String),
+            DbFieldType::Char | DbFieldType::UChar => Some(LinkReadAs::CharArrayAsString {
                 // C `if (n_elements>40) n_elements=40` against `char s[40]`.
-                max_elements: source.element_count.clamp(1, SSEQ_STRING_SIZE as i64) as usize,
+                max_elements: source.final_elements.clamp(1, SSEQ_STRING_SIZE as i64) as usize,
             }),
-            DbfCode::Short
-            | DbfCode::UShort
-            | DbfCode::Long
-            | DbfCode::ULong
-            | DbfCode::Float
-            | DbfCode::Double => Some(LinkReadAs::Double),
-            DbfCode::Int64 | DbfCode::UInt64 | DbfCode::NoAccess => None,
+            DbFieldType::Short
+            | DbFieldType::UShort
+            | DbFieldType::Long
+            | DbFieldType::ULong
+            | DbFieldType::Float
+            | DbFieldType::Double => Some(LinkReadAs::Double),
+            DbFieldType::Int64 | DbFieldType::UInt64 => None,
         }
     }
 
@@ -1769,19 +1771,15 @@ impl Record for SseqRecord {
             return None;
         };
         let step = &self.steps[i];
-        match target.field_type? {
-            DbfCode::String
-            | DbfCode::Enum
-            | DbfCode::Menu
-            | DbfCode::Device
-            | DbfCode::Inlink
-            | DbfCode::Outlink
-            | DbfCode::Fwdlink => Some(EpicsValue::String(step.str_val.clone())),
-            DbfCode::Char | DbfCode::UChar => {
-                if target.element_count > 1 {
+        match target.final_field_type? {
+            DbFieldType::String | DbFieldType::Enum => {
+                Some(EpicsValue::String(step.str_val.clone()))
+            }
+            DbFieldType::Char | DbFieldType::UChar => {
+                if target.final_elements > 1 {
                     // C puts `n` bytes straight out of the 40-byte `s`, so the
                     // string is NUL-padded out to the requested count.
-                    let n = target.element_count.min(SSEQ_STRING_SIZE as i64) as usize;
+                    let n = target.final_elements.min(SSEQ_STRING_SIZE as i64) as usize;
                     let mut buf = step.str_val.as_bytes().to_vec();
                     buf.resize(n, 0);
                     Some(EpicsValue::CharArray(buf.into()))
@@ -1789,15 +1787,15 @@ impl Record for SseqRecord {
                     Some(EpicsValue::Double(step.dov))
                 }
             }
-            DbfCode::Short
-            | DbfCode::UShort
-            | DbfCode::Long
-            | DbfCode::ULong
-            | DbfCode::Float
-            | DbfCode::Double => Some(EpicsValue::Double(step.dov)),
-            // C's switch has no `DBF_INT64`/`DBF_UINT64` or `DBF_NOACCESS`
-            // case → `default: break` → no put.
-            DbfCode::Int64 | DbfCode::UInt64 | DbfCode::NoAccess => None,
+            DbFieldType::Short
+            | DbFieldType::UShort
+            | DbFieldType::Long
+            | DbFieldType::ULong
+            | DbFieldType::Float
+            | DbFieldType::Double => Some(EpicsValue::Double(step.dov)),
+            // C's switch has no `DBF_INT64`/`DBF_UINT64` case → `default:
+            // break` → no put.
+            DbFieldType::Int64 | DbFieldType::UInt64 => None,
         }
     }
 
@@ -1916,6 +1914,18 @@ impl Record for SseqRecord {
         // override (`acalcout.rs:1672`) already routes through here; this is the
         // same rule.
         crate::server::record::put_field_internal_default(self, name, value)
+    }
+
+    /// A `.db` `DOn`/`STRn` stores its own view only, as C `dbPutString` does
+    /// with no `special()`; `init_record` reconciles the pair before the
+    /// record runs, so `DOn` is never rounded to PREC at load.
+    fn load_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
+        match (Self::step_index_from_suffix(name), value) {
+            (Some((idx, "DO")), EpicsValue::Double(dov)) => self.steps[idx].dov = dov,
+            (Some((idx, "STR")), EpicsValue::String(s)) => self.steps[idx].str_val = s,
+            (_, value) => return self.put_field(name, value),
+        }
+        Ok(())
     }
 
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
@@ -2434,6 +2444,24 @@ mod tests {
         );
     }
 
+    /// `atof` takes `strtod`'s prefix; the `DOn` the C oracle reads after
+    /// each `STRn` put (`epics-oracle-rs` `sseq_atof_oracle`).
+    #[test]
+    fn test_sseq_str_put_takes_the_atof_prefix() {
+        let mut rec = SseqRecord::new();
+        for (s, dov) in [
+            ("0123456789abc", 123456789.0),
+            ("  -3.5e2xyz", -350.0),
+            ("0x1p3", 8.0),
+            ("+.5e", 0.5),
+            ("1,5", 1.0),
+            ("", 0.0),
+        ] {
+            rec.put_field("STR1", EpicsValue::String(s.into())).unwrap();
+            assert_eq!(rec.get_field("DO1"), Some(EpicsValue::Double(dov)), "{s:?}");
+        }
+    }
+
     /// R16-2, init boundary — C `init_record` (sseqRecord.c:243-249)
     /// reconciles the pair before the record can run: a `.db`-configured
     /// `STRn` wins (`dov = atof(s)`), otherwise `STRn` is rendered from `DOn`.
@@ -2498,13 +2526,12 @@ mod tests {
             "a STRn put posts only the derived DOn = atof(s)"
         );
 
-        // C's DLYn special posts DLY1 whichever DLY was written.
         rec.special("DLY3", true, &Default::default()).unwrap();
         assert_eq!(
             rec.take_cycle_posted_fields()
                 .map(|(f, m)| (name(f), m))
                 .collect::<Vec<_>>(),
-            vec![("DLY1", CyclePostMask::Value)],
+            vec![("DLY3", CyclePostMask::Value)],
         );
         rec.special("LNK1", true, &Default::default()).unwrap();
         assert!(rec.take_cycle_posted_fields().is_empty());

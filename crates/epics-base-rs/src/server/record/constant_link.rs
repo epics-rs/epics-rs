@@ -196,11 +196,14 @@ pub(crate) fn constant_load_as(
     let InputLinkRequest::As(read_as) = request else {
         return None;
     };
-    if let LinkReadAs::CharArrayAsString { .. } = read_as {
-        return Some(EpicsValue::CharArray(match constant.load_ls()? {
-            LsLoad::Text(s) => s.into_bytes().into(),
-            LsLoad::LenOnly => Vec::new().into(),
-        }));
+    if let LinkReadAs::CharArrayAsString { max_elements } = read_as {
+        let mut text = match constant.load_ls()? {
+            LsLoad::Text(s) => s.into_bytes(),
+            LsLoad::LenOnly => Vec::new(),
+        };
+        // `strncpy(pbuffer, pstr, --size)` (`lnkConst.c:445`).
+        text.truncate(max_elements.saturating_sub(1));
+        return Some(EpicsValue::CharArray(text.into()));
     }
     match constant_load_scalar(constant, read_as.dbr_type()?)? {
         crate::types::c_parse::Converted::Stored(v) => Some(v),

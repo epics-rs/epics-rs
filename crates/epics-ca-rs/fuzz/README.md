@@ -3,7 +3,7 @@
 This directory contains [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html)
 targets exercising the CA wire-protocol parsers under arbitrary
 adversarial inputs. They complement the `proptest`-based tests in
-`tests/property_tests.rs` by running for hours/days with libFuzzer's
+`tests/integration/property_tests.rs` by running for hours/days with libFuzzer's
 coverage-guided mutation engine.
 
 The four targets:
@@ -42,7 +42,7 @@ cargo +nightly fuzz run fuzz_header_extended
 
 Discovered crashes are saved to
 `fuzz/artifacts/<target>/crash-<hash>` and a regression test should be
-added to `tests/property_tests.rs` reproducing them.
+added to `tests/integration/property_tests.rs` reproducing them.
 
 ## What we expect to find
 

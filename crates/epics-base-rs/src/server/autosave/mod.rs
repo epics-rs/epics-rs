@@ -104,7 +104,7 @@ pub async fn reboot_restore(
         ));
     }
     if let Ok(r) = &result
-        && r.not_connected_at_save > 0
+        && r.error_message_line
     {
         set(ListStatus::new(
             SrStatus::Warn,

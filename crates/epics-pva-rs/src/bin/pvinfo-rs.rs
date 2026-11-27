@@ -373,12 +373,12 @@ mod tests {
     /// requiring a PV name (`tools/info.cpp:62-64`), so `pvinfo-rs -D`
     /// with no PV must parse.
     ///
-    /// A bare invocation must parse too, and that is the change: C
-    /// checks the missing name itself and returns 1 with its own message
-    /// (pvinfo.cpp:166-170), so leaving it to clap exited 2. This test
-    /// used to assert the clap rejection. The diagnostic and the exit
-    /// code are pinned in `tests/cli_missing_pv_name_exit.rs`, which is
-    /// where the check now lives.
+    /// A bare invocation must parse too, and that is the change: C checks the
+    /// missing name itself and returns 1 with its own message
+    /// (pvinfo.cpp:166-170), so leaving it to clap exited 2. This test used to
+    /// assert the clap rejection. The diagnostic and the exit code are pinned
+    /// in `tests/integration/cli_missing_pv_name_exit.rs`, which is where the
+    /// check now lives.
     #[test]
     fn a_pv_name_is_not_a_clap_requirement() {
         let d = Args::try_parse_from(["pvinfo-rs", "-D"]).expect("-D needs no PV name");

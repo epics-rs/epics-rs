@@ -13,7 +13,7 @@ use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::database::AsyncDbHandle;
 use epics_base_rs::server::recgbl::simm::LinkFetch;
 use epics_base_rs::server::record::{
-    CycleMarks, CyclePostMask, FieldDeclaration, FieldDesc, FieldMetadataOverride, InitLinkReads,
+    CycleMarks, CyclePostMask, FieldDeclaration, FieldDesc, FieldMetadataOverride,
     InputLinkRequest, LinkRead, LinkReadAs, LinkType, OutTarget, ProcessAction, ProcessActions,
     ProcessOutcome, Record, ReturnPact, StampPoint,
 };
@@ -77,21 +77,6 @@ const HI_LIMIT_LINK: [&str; 6] = ["H0XL", "H0YL", "H1YL", "H2XL", "H2YL", "H2ZL"
 const HI_LIMIT_VAL: [&str; 6] = ["H0X", "H0Y", "H1Y", "H2X", "H2Y", "H2Z"];
 const LO_LIMIT_LINK: [&str; 6] = ["L0XL", "L0YL", "L1YL", "L2XL", "L2YL", "L2ZL"];
 const LO_LIMIT_VAL: [&str; 6] = ["L0X", "L0Y", "L1Y", "L2X", "L2Y", "L2Z"];
-
-/// The links C `init_record` pass 1 reads with `dbGetLink(DBR_DOUBLE)`:
-/// `GetReadback`, `ReadEncoders` and `GetMotorLimits` (tableRecord.c:386-401).
-static INIT_LINK_READS: [(&str, LinkReadAs); 24] = {
-    let mut reads = [("", LinkReadAs::Double); 24];
-    let mut i = 0;
-    while i < 6 {
-        reads[i].0 = MOTOR_RBV_LINK[i];
-        reads[6 + i].0 = ENCODER_LINK[i];
-        reads[12 + 2 * i].0 = HI_LIMIT_LINK[i];
-        reads[13 + 2 * i].0 = LO_LIMIT_LINK[i];
-        i += 1;
-    }
-    reads
-};
 
 // ---------------------------------------------------------------------------
 // Enums
@@ -560,6 +545,26 @@ pub struct TableRecord {
 
     // --- Internal: where the cycle resumes after its link-stage read ---
     resume: Resume,
+
+    // --- Internal: where init pass 1 resumes after its read ---
+    init_at: InitAt,
+}
+
+/// The `dbGetLink` C `init_record` pass 1 (`tableRecord.c:383-403`) has in
+/// flight: the framework makes each read the pass names, and
+/// [`Record::init_record_step`] picks the pass up again here.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+enum InitAt {
+    /// No read in flight.
+    #[default]
+    Idle,
+    /// `GetReadback`'s read of axis `i` (`:1101-1108`).
+    Readback(usize),
+    /// `ReadEncoders`' read of axis `i` (`:1125-1132`).
+    Encoder(usize),
+    /// `GetMotorLimits`' read `k`: axis `k / 2`'s high limit, then its low one
+    /// (`:1020-1031`).
+    Limit(usize),
 }
 
 /// The read or put a cycle has in flight: C's `process()` reads and puts its
@@ -783,6 +788,7 @@ impl Default for TableRecord {
             curr_yang: 0.0,
             special_posts: 0,
             resume: Resume::default(),
+            init_at: InitAt::default(),
         }
     }
 }
@@ -2456,76 +2462,125 @@ impl TableRecord {
         }
     }
 
-    /// C `init_record` pass 1 (tableRecord.c:383-403), with `read` answering
-    /// each `dbGetLink`.
-    fn init_pass1(&mut self, mut read: impl FnMut(&str) -> LinkFetch) {
-        self.seed_link_kinds();
-        self.check_links();
-
-        // GetReadback and ReadEncoders stop at the first failed read
-        // (:1109, :1133); the axes after it keep what they held.
-        let mut r = self.motor_readback();
-        let mut e = self.encoder_motor();
-        for (vals, links, gate) in [
-            (
-                &mut r,
-                &MOTOR_RBV_LINK,
-                self.lnk_stat.map(|s| s.can_rw_drive),
-            ),
-            (
-                &mut e,
-                &ENCODER_LINK,
-                self.lnk_stat.map(|s| s.can_read_position),
-            ),
-        ] {
-            for i in 0..6 {
-                vals[i] = 0.0;
-                if !gate[i] {
-                    continue;
+    /// One step of C `init_record` pass 1 (tableRecord.c:383-403): `answer`
+    /// is the answer to the read the last step named, `None` to begin. Returns
+    /// the link C reads next.
+    fn init_pass1_step(&mut self, answer: Option<LinkFetch>) -> Option<&'static str> {
+        let Some(answer) = answer else {
+            self.seed_link_kinds();
+            self.check_links();
+            return self.init_readbacks(0);
+        };
+        // What the read wrote: an unset link writes nothing.
+        let wrote = match &answer {
+            LinkFetch::Value(v) => Some(v.to_f64().unwrap_or(0.0)),
+            LinkFetch::NoData | LinkFetch::Failed => None,
+        };
+        let failed = !answer.is_ok();
+        match std::mem::take(&mut self.init_at) {
+            InitAt::Idle => None,
+            // GetReadback and ReadEncoders return at their first failed read
+            // (:1109, :1133); the axes after it keep what they held.
+            InitAt::Readback(i) => {
+                if let Some(v) = wrote {
+                    let mut r = self.motor_readback();
+                    r[i] = v;
+                    self.set_motor_readback(&r);
                 }
-                match read(links[i]) {
-                    LinkFetch::Value(v) => vals[i] = v.to_f64().unwrap_or(0.0),
-                    LinkFetch::NoData => {}
-                    LinkFetch::Failed => break,
+                self.init_readbacks(if failed { 6 } else { i + 1 })
+            }
+            InitAt::Encoder(i) => {
+                if let Some(v) = wrote {
+                    let mut e = self.encoder_motor();
+                    e[i] = v;
+                    self.set_encoder_motor(&e);
                 }
+                self.init_encoders(if failed { 6 } else { i + 1 })
+            }
+            // GetMotorLimits zeroes a failed limit and goes on (:1026, :1031).
+            InitAt::Limit(k) => {
+                if let Some(v) = wrote.or(failed.then_some(0.0)) {
+                    self.set_motor_limit(k, v);
+                }
+                self.init_limits(k + 1)
             }
         }
-        self.set_motor_readback(&r);
-        self.set_encoder_motor(&e);
+    }
 
+    /// `GetReadback` from axis `from` (`:1094-1112`), then `MotorToUser` into
+    /// the user drive (`:387`) and `ReadEncoders`.
+    fn init_readbacks(&mut self, from: usize) -> Option<&'static str> {
+        for i in from..6 {
+            let mut r = self.motor_readback();
+            r[i] = 0.0;
+            self.set_motor_readback(&r);
+            if self.lnk_stat[i].can_rw_drive {
+                self.init_at = InitAt::Readback(i);
+                return Some(MOTOR_RBV_LINK[i]);
+            }
+        }
+        let r = self.motor_readback();
         let u = self.do_motor_to_user(&r);
         self.set_user_drive(&u);
-        self.set_user_readback(&u);
+        self.init_encoders(0)
+    }
+
+    /// `ReadEncoders` from axis `from` (`:1118-1136`), then `MotorToUser` into
+    /// the encoder user values (`:391`), the readback propagation (`:394-398`)
+    /// and `GetMotorLimits`.
+    fn init_encoders(&mut self, from: usize) -> Option<&'static str> {
+        for i in from..6 {
+            let mut e = self.encoder_motor();
+            e[i] = 0.0;
+            self.set_encoder_motor(&e);
+            if self.lnk_stat[i].can_read_position {
+                self.init_at = InitAt::Encoder(i);
+                return Some(ENCODER_LINK[i]);
+            }
+        }
+        let e = self.encoder_motor();
         let eu = self.do_motor_to_user(&e);
         self.set_encoder_user(&eu);
 
+        let r = self.motor_readback();
+        let u = self.user_drive();
         let ax0 = self.user_offset();
-        let mut axl = [0.0; 6];
-        for i in 0..6 {
-            axl[i] = u[i] + ax0[i];
-        }
         self.set_motor_drive(&r);
-        self.set_user_last(&axl);
+        self.set_user_readback(&u);
+        self.set_user_last(&std::array::from_fn(|i| u[i] + ax0[i]));
+        self.init_limits(0)
+    }
 
-        // GetMotorLimits zeroes a failed limit and goes on (:1026, :1031).
-        let mut h = self.hi_motor_limit();
-        let mut l = self.lo_motor_limit();
-        for i in 0..6 {
-            if !self.lnk_stat[i].can_read_limits {
-                continue;
-            }
-            for (vals, links) in [(&mut h, &HI_LIMIT_LINK), (&mut l, &LO_LIMIT_LINK)] {
-                match read(links[i]) {
-                    LinkFetch::Value(v) => vals[i] = v.to_f64().unwrap_or(0.0),
-                    LinkFetch::NoData => {}
-                    LinkFetch::Failed => vals[i] = 0.0,
-                }
+    /// `GetMotorLimits` from read `from` (`:1012-1035`), then
+    /// `CalcUserLimits` (`:402`).
+    fn init_limits(&mut self, from: usize) -> Option<&'static str> {
+        for k in from..12 {
+            let i = k / 2;
+            if self.lnk_stat[i].can_read_limits {
+                self.init_at = InitAt::Limit(k);
+                return Some(if k.is_multiple_of(2) {
+                    HI_LIMIT_LINK[i]
+                } else {
+                    LO_LIMIT_LINK[i]
+                });
             }
         }
-        self.set_hi_motor_limit(&h);
-        self.set_lo_motor_limit(&l);
-
         self.do_calc_user_limits();
+        None
+    }
+
+    /// The limit `GetMotorLimits`' read `k` lands in.
+    fn set_motor_limit(&mut self, k: usize, v: f64) {
+        let i = k / 2;
+        if k.is_multiple_of(2) {
+            let mut h = self.hi_motor_limit();
+            h[i] = v;
+            self.set_hi_motor_limit(&h);
+        } else {
+            let mut l = self.lo_motor_limit();
+            l[i] = v;
+            self.set_lo_motor_limit(&l);
+        }
     }
 
     /// Perform the full user-limit calculation and store results.
@@ -3581,18 +3636,21 @@ impl Record for TableRecord {
             return Ok(());
         }
 
-        // Pass 1 with no link answered, as an unset link reads.
-        self.init_pass1(|_| LinkFetch::NoData);
+        // Pass 1 with each read answered as an unset link's.
+        let mut answer = None;
+        while self.init_pass1_step(answer.take()).is_some() {
+            answer = Some(LinkFetch::NoData);
+        }
         Ok(())
     }
 
-    fn init_link_reads(&self) -> &'static [(&'static str, LinkReadAs)] {
-        &INIT_LINK_READS
-    }
-
-    fn init_record_with_links(&mut self, reads: &mut InitLinkReads) -> CaResult<()> {
-        self.init_pass1(|link| reads.get(link));
-        Ok(())
+    fn init_record_step(
+        &mut self,
+        answer: Option<LinkFetch>,
+    ) -> CaResult<Option<(&'static str, LinkReadAs)>> {
+        Ok(self
+            .init_pass1_step(answer)
+            .map(|link| (link, LinkReadAs::Double)))
     }
 
     /// C `init_record` ends in `monitor(ptbl)` (`tableRecord.c:405`), whose

@@ -71,7 +71,9 @@ use tokio::sync::{mpsc, oneshot};
 // actually runs on — hosted that is tokio's, which is virtual under
 // `start_paused`. Taking `Instant` from the seam alongside the timer is what
 // keeps the two from being different timelines.
-use epics_base_rs::runtime::task::{Instant, Period, Sleep, interval, sleep, timeout};
+use epics_base_rs::runtime::task::{
+    Instant, Period, Sleep, deadline_after, deadline_from_now, interval, sleep, timeout,
+};
 use tracing::debug;
 use tracing::warn;
 
@@ -1499,7 +1501,7 @@ async fn run_engine(
     // One-shot search timer, re-armed by each tick and pulled in by a poke.
     // Its first tick is one period after start, as pvxs arms `searchTimer`
     // (src/client.cpp:658).
-    let mut next_tick = Instant::now() + BUCKET_INTERVAL;
+    let mut next_tick = deadline_from_now(BUCKET_INTERVAL);
     // The loop's sleeps, held across passes so one that moves no deadline
     // arms no timer. `hold_until` brings each to its deadline before the
     // `select!`; with no deadline none is held and its arm parks.
@@ -1569,7 +1571,7 @@ async fn run_engine(
                         // batched SEARCH on flush (pvxs initialSearcher).
                         initial_pending.push(sid);
                         if initial_deadline.is_none() {
-                            initial_deadline = Some(Instant::now() + INITIAL_SEARCH_DELAY);
+                            initial_deadline = Some(deadline_from_now(INITIAL_SEARCH_DELAY));
                         }
                         None
                     } else {
@@ -1602,7 +1604,7 @@ async fn run_engine(
                         // window (see the Find branch above).
                         initial_pending.push(sid);
                         if initial_deadline.is_none() {
-                            initial_deadline = Some(Instant::now() + INITIAL_SEARCH_DELAY);
+                            initial_deadline = Some(deadline_from_now(INITIAL_SEARCH_DELAY));
                         }
                         None
                     } else {
@@ -1983,7 +1985,7 @@ async fn run_engine(
 
                     if let Some(p) = pending.get_mut(&sid) {
                         if let Responder::Multi { ref mut deadline, .. } = p.responder {
-                            deadline.get_or_insert(now + MULTI_SERVER_WINDOW);
+                            deadline.get_or_insert(deadline_after(now, MULTI_SERVER_WINDOW));
                         }
                         to_send.push((sid, p.pv_name.clone()));
                         rearm_ids.push(sid);
@@ -2033,8 +2035,8 @@ async fn run_engine(
                 if poked {
                     fast_ticks_remaining -= 1;
                 }
-                next_tick = Instant::now()
-                    + if poked { BUCKET_INTERVAL_FAST } else { BUCKET_INTERVAL };
+                next_tick =
+                    deadline_from_now(if poked { BUCKET_INTERVAL_FAST } else { BUCKET_INTERVAL });
             }
         }
     }
@@ -2276,7 +2278,7 @@ fn flush_initial_searches(
             Responder::Multi { responder, .. } if responder.is_closed() => continue,
             Responder::Single(_) => {}
             Responder::Multi { deadline, .. } => {
-                deadline.get_or_insert(now + MULTI_SERVER_WINDOW);
+                deadline.get_or_insert(deadline_after(now, MULTI_SERVER_WINDOW));
             }
         }
         p.bucket = Some(bucket);
@@ -3243,7 +3245,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn maybe_poke_first_poke_granted_arms_revolution() {
         // last_poke == None, no active revolution → granted.
-        let mut next_tick = Instant::now() + BUCKET_INTERVAL;
+        let mut next_tick = epics_libcom_rs::runtime::task::deadline_from_now(BUCKET_INTERVAL);
         let mut ftr = 0u32;
         let mut last = None;
         assert!(maybe_poke(&mut next_tick, &mut ftr, &mut last));
@@ -3253,7 +3255,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn a_granted_poke_ticks_at_once() {
-        let mut next_tick = Instant::now() + BUCKET_INTERVAL;
+        let mut next_tick = epics_libcom_rs::runtime::task::deadline_from_now(BUCKET_INTERVAL);
         let (mut ftr, mut last) = (0u32, None);
         assert!(maybe_poke(&mut next_tick, &mut ftr, &mut last));
         assert!(
@@ -3265,7 +3267,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn maybe_poke_declines_while_revolution_active() {
         // fast_ticks_remaining > 0 → skip-while-active, no re-arm/extend.
-        let mut next_tick = Instant::now() + BUCKET_INTERVAL;
+        let mut next_tick = epics_libcom_rs::runtime::task::deadline_from_now(BUCKET_INTERVAL);
         let mut ftr = 5u32;
         let mut last = None;
         assert!(!maybe_poke(&mut next_tick, &mut ftr, &mut last));
@@ -3276,7 +3278,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn maybe_poke_declines_within_holdoff_window() {
         // last_poke just now, no active revolution → inside 30 s holdoff.
-        let mut next_tick = Instant::now() + BUCKET_INTERVAL;
+        let mut next_tick = epics_libcom_rs::runtime::task::deadline_from_now(BUCKET_INTERVAL);
         let mut ftr = 0u32;
         let mut last = Some(Instant::now());
         assert!(!maybe_poke(&mut next_tick, &mut ftr, &mut last));
@@ -3289,7 +3291,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn maybe_poke_granted_once_holdoff_elapsed() {
         // last_poke older than POKE_HOLDOFF, no active revolution → granted.
-        let mut next_tick = Instant::now() + BUCKET_INTERVAL;
+        let mut next_tick = epics_libcom_rs::runtime::task::deadline_from_now(BUCKET_INTERVAL);
         let mut ftr = 0u32;
         let prev = Instant::now() - (POKE_HOLDOFF + Duration::from_secs(1));
         let mut last = Some(prev);
@@ -5628,7 +5630,7 @@ mod tests {
         // mirrors the real PVA beacon cadence and makes the recv-decode-track
         // chain this test guards deterministic without masking a recv bug —
         // if the v6 arm were broken, no number of re-sends would be observed.
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(2));
         let found_guid = loop {
             tx.send_to(&frame, dest).await.expect("send beacon");
             if let Some(g) = engine.beacon_guid_for(resolved_server) {
@@ -5936,7 +5938,7 @@ mod tests {
         ));
 
         // Wait for CONNECTION_VALIDATED: `ready` flips true only then.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(5));
         while !ready.load(Ordering::SeqCst) {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -7087,7 +7089,7 @@ mod tests {
         }
 
         let mut copies = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = epics_libcom_rs::runtime::task::deadline_from_now(Duration::from_secs(3));
         let mut buf = [0u8; 1500];
         while !done(nic, &copies) && Instant::now() < deadline {
             match server.recv_from(&mut buf) {
@@ -7266,7 +7268,9 @@ mod tests {
     /// and its `select!` arm wins every pass.
     #[test]
     fn a_gone_deadline_drops_the_held_sleep() {
-        let mut held = Some(Sleep::until(Instant::now() + Duration::from_secs(3600)));
+        let mut held = Some(Sleep::until(
+            epics_libcom_rs::runtime::task::deadline_from_now(Duration::from_secs(3600)),
+        ));
         hold_until(&mut held, None);
         assert!(held.is_none());
     }

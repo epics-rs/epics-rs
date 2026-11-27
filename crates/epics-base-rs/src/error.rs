@@ -30,7 +30,7 @@ pub enum CaError {
     #[error("unsupported DBR type: {0}")]
     UnsupportedType(u16),
 
-    #[error("write failed: ECA status {0:#06x}")]
+    #[error("{}", eca::eca_message(*.0))]
     WriteFailed(u32),
 
     #[error("field not found: {0}")]
@@ -121,15 +121,12 @@ pub enum CaError {
     #[error("client shut down")]
     Shutdown,
 
-    /// Server-emitted ECA status carried out-of-band on an otherwise
-    /// data-shaped frame — used by libca `cac::eventAddRespAction`
-    /// (`cac.cpp:973-977`) when a monitor frame's `m_cid` is non-
-    /// NORMAL (e.g. `ECA_NORDACCESS` from `no_read_access_event`
-    /// after an ACF reload). Routed to the per-subscription
-    /// callback as `Err(CaError::ServerError(eca_status))` so the
-    /// subscriber surfaces the status instead of seeing the bogus
-    /// zeroed payload that travels with the frame.
-    #[error("server reported ECA status {0:#06x}")]
+    /// An ECA status that ended a request, whether the server decided it
+    /// (a `CA_PROTO_ERROR`, or a READ_NOTIFY or EVENT_ADD frame whose
+    /// `m_cid` is not ECA_NORMAL, `cac.cpp:973-977`) or libca did before
+    /// sending (`nciu`'s cached read-rights gate, a subscription's
+    /// disconnect). Prints as `ca_message` does.
+    #[error("{}", eca::eca_message(*.0))]
     ServerError(u32),
 
     /// Request cannot be framed for the peer: it needs the extended
@@ -142,13 +139,14 @@ pub enum CaError {
     #[error("request too large for the peer's CA protocol version (ECA_TOLARGE)")]
     TooLarge,
 
-    /// Element count out of bounds for the request C would build. libca's
-    /// put path throws `cacChannel::outOfBounds()` for an array that cannot
-    /// fit the peer's message-body limit (`comQueSend.cpp:361`) or that
-    /// needs an extended header the peer cannot parse
+    /// Element count out of bounds for the request C would build. libca
+    /// throws `cacChannel::outOfBounds()` for a count above the channel's
+    /// (`nciu.cpp:285,332,353`), and on the put path for an array that
+    /// cannot fit the peer's message-body limit (`comQueSend.cpp:361`) or
+    /// that needs an extended header the peer cannot parse
     /// (`comQueSend.cpp:313`); `oldChannelNotify.cpp:309,378,453` map that
     /// to `ECA_BADCOUNT`. Raised locally — no byte reaches the wire.
-    #[error("element count out of bounds for this CA circuit (ECA_BADCOUNT)")]
+    #[error("element count out of bounds (ECA_BADCOUNT)")]
     BadCount,
 
     /// A get conversion returned a non-zero status: C
@@ -920,7 +918,8 @@ impl CaError {
             CaError::WriteFailed(code) | CaError::ServerError(code) => *code,
             // C's `rsrvCheckPut` gate, above the put (`camessage.c:741-751`).
             // Its read-side twin ECA_NORDACCESS has no variant of its own —
-            // that one arrives from the wire as `ServerError`.
+            // it rides `ServerError`, from the server's reply or from the
+            // client's cached-rights gate alike.
             CaError::ReadOnlyField(_) => ECA_NOWTACCESS,
             // Everything else is the database refusing: a value the field's
             // converter rejected, a menu string naming no choice, a link field

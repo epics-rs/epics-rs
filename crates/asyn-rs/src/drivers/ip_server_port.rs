@@ -1960,7 +1960,7 @@ mod tests {
     /// (drvAsynIPServerPort.c:297-401) — so a test observes an accept by waiting
     /// for the slot to fill, not by driving the accept itself. Returns `idx`.
     fn wait_for_slot(srv: &DrvAsynIPServerPort, idx: usize) -> usize {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(5));
         while srv.peer(idx as i32).is_none() {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -2002,7 +2002,7 @@ mod tests {
     /// after the child inherits the parent's trace — so a test that checks
     /// anything past the slot waits here.
     fn wait_for_announcements(seen: &std::sync::Mutex<Vec<String>>, n: usize) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(5));
         while seen.lock().unwrap().len() < n {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -2049,7 +2049,7 @@ mod tests {
     fn read_until_slot_torn_down(
         mut step: impl FnMut() -> (AsynResult<usize>, bool),
     ) -> AsynResult<usize> {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(5));
         loop {
             let (res, torn_down) = step();
             match res {
@@ -2672,7 +2672,7 @@ mod tests {
     /// `read` until the peer's close is visible: the first outcome that is not
     /// a retryable timeout.
     fn read_past_timeouts(mut read: impl FnMut() -> OctetReadResult) -> OctetReadResult {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(5));
         loop {
             let r = read();
             if !matches!(&r.status, Err(e) if e.status() == AsynStatus::Timeout) {
@@ -2748,7 +2748,7 @@ mod tests {
         });
         srv.connect(&AsynUser::default()).unwrap();
         let wait_for = |n: usize| {
-            let until = Instant::now() + Duration::from_secs(5);
+            let until = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(5));
             while events.lock().len() < n {
                 assert!(Instant::now() < until, "edge {n} never published");
                 std::thread::sleep(Duration::from_millis(5));
@@ -2798,7 +2798,7 @@ mod tests {
             create_port_runtime_unclaimed(child, RuntimeConfig::default()).unwrap();
         srv.connect(&AsynUser::default()).unwrap();
         let mut client = std::net::TcpStream::connect(("127.0.0.1", srv.local_port())).unwrap();
-        let until = Instant::now() + Duration::from_secs(5);
+        let until = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(5));
         while events.lock().len() < 3 {
             assert!(Instant::now() < until, "the child never connected");
             std::thread::sleep(Duration::from_millis(5));
@@ -3172,7 +3172,7 @@ mod tests {
         let client = ClientSock::bind("127.0.0.1:0").unwrap();
         client.send_to(b"telemetry", server_addr).unwrap();
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(3));
         loop {
             if !seen.lock().unwrap().is_empty() {
                 break;
@@ -3222,7 +3222,7 @@ mod tests {
             .with_addr(0)
             .with_timeout(Duration::from_secs(2));
         let mut got: Vec<String> = Vec::new();
-        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(3));
         let mut buf = [0u8; 64];
         while got.len() < 2 && std::time::Instant::now() < deadline {
             let n = srv.io_read_octet(&user, &mut buf).into_count().unwrap();
@@ -3948,7 +3948,7 @@ mod tests {
         let writer = Arc::clone(&slot);
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let started = Instant::now();
-        let cap = started + TMOT;
+        let cap = epics_libcom_rs::runtime::time::deadline_after(started, TMOT);
         std::thread::spawn(move || {
             let res = writer.write_or_close(&payload, Some(TMOT), Some(cap), "srv:0");
             let _ = done_tx.send((started.elapsed(), res));

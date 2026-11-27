@@ -18,11 +18,11 @@ use std::time::{Duration, Instant};
 
 use epics_base_rs::runtime::sync::mpsc;
 use epics_base_rs::runtime::task::{
-    BlockingBridge, ThreadPriority, apply_to_current_thread, block_on_sync, timeout,
+    BlockingBridge, ThreadPriority, apply_to_current_thread, timeout,
 };
 use epics_base_rs::server::builtin_devices::timestamp::epics_time_to_strftime;
 use epics_base_rs::server::database::{
-    CaClientContext, ClientChannel, ClientSubscription, Connection,
+    CaClientContext, ClientChannel, Connection, QueuedSubscription, SubscriptionQueue,
 };
 use epics_base_rs::server::iocsh::register_command;
 use epics_base_rs::server::iocsh::registry::{
@@ -190,12 +190,16 @@ fn extra_value(dbr_type: u16, s: &Snapshot) -> ExtraValue {
 }
 
 type Chan = Arc<dyn ClientChannel>;
+/// A [`Ca::monitor`] subscription (C's `evid`).
+type Monitor = QueuedSubscription;
+/// The queue as a monitor's handler sends to it.
+type Queue = SubscriptionQueue<Msg>;
 
 /// A channel and the subscription on it (C's `cpxds`/`crxds`/`cdxds` with
 /// their `descMonitor`).
 struct Watched {
     _ch: Chan,
-    _sub: Option<ClientSubscription>,
+    _sub: Option<Monitor>,
 }
 
 /// Where a `descMonitor` string lands (C's `pdest`).
@@ -347,22 +351,62 @@ impl Ca {
         count: u32,
         mask: u16,
         f: impl Fn(Snapshot) -> Option<(Msg, bool)> + Send + Sync + 'static,
-    ) -> Option<ClientSubscription> {
-        let tx = self.tx.clone();
-        let callback = Box::new(move |s: Snapshot| match f(s) {
+    ) -> Option<Monitor> {
+        self.monitor_queue(ch, dbr_type, count, mask, move |s, queue| match f(s) {
             Some((msg, true)) => {
-                // The wait for room holds the delivering thread, as C's
-                // does; a reactor worker that may not block drops it.
-                if let Err(mpsc::error::TrySendError::Full(msg)) = tx.try_send(msg) {
-                    let _ = block_on_sync(tx.send(msg));
-                }
+                queue.send(msg);
             }
             Some((msg, false)) => {
-                let _ = tx.try_send(msg);
+                queue.try_send(msg);
             }
             None => {}
-        });
-        self.run(ch.subscribe(dbr_type, count, mask, callback)).ok()
+        })
+    }
+
+    /// `ca_add_masked_array_event` whose handler `f` sends to the queue.
+    fn monitor_queue(
+        &self,
+        ch: &Chan,
+        dbr_type: u16,
+        count: u32,
+        mask: u16,
+        f: impl Fn(Snapshot, &Queue) + Send + Sync + 'static,
+    ) -> Option<Monitor> {
+        let tx = self.tx.clone();
+        self.run(Monitor::new(&**ch, dbr_type, count, mask, tx, f))
+            .ok()
+    }
+}
+
+/// `cptMonitor`. Under policies 2 and 3 `cpt_time` is stamped once the
+/// value is queued, not before its send as C's is: a value the full queue
+/// drops, or whose wait its monitor's drop ended, reaches no file and must
+/// not hold back the next `.CPT` value.
+fn cpt_monitor(
+    scan: usize,
+    cpt_time: Arc<Mutex<Instant>>,
+) -> impl Fn(Snapshot, &Queue) + Send + Sync + 'static {
+    move |s, queue| {
+        debug!(2, "cptMonitor:entry\n");
+        let msg = Msg::Cpt {
+            scan,
+            val: s.value.to_f64().unwrap_or(0.0) as i32,
+        };
+        let policy = MESSAGE_POLICY.load(Ordering::Relaxed);
+        let now = Instant::now();
+        if matches!(policy, 2 | 3)
+            && now.duration_since(*cpt_time.lock()).as_secs_f64() < cpt_wait_time()
+        {
+            return;
+        }
+        let queued = match policy {
+            0 | 3 => queue.send(msg),
+            1 | 2 => queue.try_send(msg),
+            _ => false,
+        };
+        if matches!(policy, 2 | 3) && queued {
+            *cpt_time.lock() = now;
+        }
     }
 }
 
@@ -396,10 +440,10 @@ struct ScanChans {
     txpv: [Option<Chan>; SCAN_NBT],
     txcd: [Option<Chan>; SCAN_NBT],
     /// `cpt_evid` (`cpt_monitored` is its presence).
-    cpt_sub: Option<ClientSubscription>,
+    cpt_sub: Option<Monitor>,
     /// `cpt_time`, read by the `.CPT` forwarder.
     cpt_time: Arc<Mutex<Instant>>,
-    subs: Vec<ClientSubscription>,
+    subs: Vec<Monitor>,
 }
 
 impl ScanChans {
@@ -510,7 +554,7 @@ struct Task {
     curr_retries: i64,
     total_retries: i64,
     abandoned_writes: i64,
-    subs: Vec<ClientSubscription>,
+    subs: Vec<Monitor>,
 }
 
 /// `msg_queue` and `threadId` once `saveData_Init` ran.
@@ -1488,28 +1532,8 @@ impl Task {
             );
             let cpt_time = self.chans[scan].cpt_time.clone();
             let sub = self.chans[scan].cpt.clone().and_then(|ch| {
-                self.ca.monitor(&ch, DBR_LONG, 1, DBE_VALUE, move |s| {
-                    // cptMonitor
-                    debug!(2, "cptMonitor:entry\n");
-                    let msg = Msg::Cpt {
-                        scan,
-                        val: s.value.to_f64().unwrap_or(0.0) as i32,
-                    };
-                    let policy = MESSAGE_POLICY.load(Ordering::Relaxed);
-                    if policy == 2 || policy == 3 {
-                        let now = Instant::now();
-                        let mut last = cpt_time.lock();
-                        if now.duration_since(*last).as_secs_f64() < cpt_wait_time() {
-                            return None;
-                        }
-                        *last = now;
-                    }
-                    match policy {
-                        0 | 3 => Some((msg, true)),
-                        1 | 2 => Some((msg, false)),
-                        _ => None,
-                    }
-                })
+                let cpt = cpt_monitor(scan, cpt_time);
+                self.ca.monitor_queue(&ch, DBR_LONG, 1, DBE_VALUE, cpt)
             });
             match sub {
                 Some(sub) => self.chans[scan].cpt_sub = Some(sub),
@@ -2668,5 +2692,205 @@ mod tests {
         assert_eq!(extra_dbr_type(DbFieldType::Enum), DBR_STRING);
         assert_eq!(extra_dbr_type(DbFieldType::UShort), DBR_CTRL_LONG);
         assert_eq!(extra_dbr_type(DbFieldType::Int64), DBR_CTRL_DOUBLE);
+    }
+
+    /// The task thread drops a monitor whose value waits for room in the
+    /// queue only that thread reads, as `updateScan` clears `.CPT` under
+    /// `saveData_MessagePolicy` 0; the drop returns. C's
+    /// `ca_clear_subscription` there waits on `cptMonitor` for good.
+    #[epics_base_rs::epics_test]
+    async fn dropping_a_monitor_ends_its_wait_for_room() {
+        use epics_base_rs::runtime::sync::oneshot;
+        use epics_base_rs::server::ioc_builder::IocBuilder;
+
+        let (db, _) = IocBuilder::new()
+            .db_string("record(ao, \"X\") {}\n", &std::collections::HashMap::new())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let (tx, mut queue) = mpsc::channel(1);
+        let ca = Ca {
+            ctx: db.ca_client(),
+            bridge: BlockingBridge::capture(),
+            tx,
+        };
+        let (took_tx, mut took) = mpsc::unbounded_channel();
+        let (clear, cleared_to_drop) = std::sync::mpsc::channel::<()>();
+        let (dropped_tx, mut dropped) = oneshot::channel::<()>();
+        std::thread::spawn(move || {
+            let ch = ca.search("X").expect("X is served here");
+            let monitor = ca.monitor(&ch, DBR_DOUBLE, 1, DBE_VALUE, move |s| {
+                let val = s.value.to_f64().unwrap();
+                let _ = took_tx.send(val);
+                Some((
+                    Msg::Cpt {
+                        scan: 0,
+                        val: val as i32,
+                    },
+                    true,
+                ))
+            });
+            assert!(monitor.is_some(), "X is monitored");
+            let _ = cleared_to_drop.recv();
+            drop(monitor);
+            let _ = dropped_tx.send(());
+        });
+        let budget = fact_budget::FACT_BUDGET;
+        // The first value fills the queue; the next one waits for room.
+        assert_eq!(timeout(budget, took.recv()).await, Ok(Some(0.0)));
+        db.put_record_field_from_ca_no_notify("X", "VAL", EpicsValue::Double(1.0))
+            .await
+            .unwrap();
+        assert_eq!(timeout(budget, took.recv()).await, Ok(Some(1.0)));
+
+        clear.send(()).unwrap();
+        let drop_returned = timeout(budget, &mut dropped).await;
+        if drop_returned.is_err() {
+            // Room for the waiting value, so the task thread gets past it.
+            let _ = queue.recv().await;
+        }
+        assert_eq!(drop_returned, Ok(Ok(())), "the monitor's drop returned");
+    }
+
+    /// Under `saveData_MessagePolicy` 3, a `.CPT` value whose wait for room
+    /// its monitor's drop ended does not count as sent: a `.CPT` monitor
+    /// made again inside `cpt_wait_time` of it queues its first value.
+    #[epics_base_rs::epics_test]
+    async fn a_cpt_monitor_made_again_after_a_dropped_wait_queues_its_first_value() {
+        use epics_base_rs::runtime::sync::oneshot;
+        use epics_base_rs::server::ioc_builder::IocBuilder;
+
+        let (db, _) = IocBuilder::new()
+            .db_string("record(ao, \"X\") {}\n", &std::collections::HashMap::new())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let (tx, mut queue) = mpsc::channel(1);
+        let ca = Ca {
+            ctx: db.ca_client(),
+            bridge: BlockingBridge::capture(),
+            tx,
+        };
+        let budget = fact_budget::FACT_BUDGET;
+        MESSAGE_POLICY.store(3, Ordering::Relaxed);
+        // not-a-wait: the window `cptMonitor` lets one value through in; the
+        // whole test runs inside one.
+        CPT_WAIT_TIME.store(budget.as_secs_f64().to_bits(), Ordering::Relaxed);
+        // The scan's last `.CPT` value went out a window ago.
+        let ago = Instant::now().checked_sub(budget);
+        let cpt_time = Arc::new(Mutex::new(ago.expect("a clock older than a window")));
+        ca.tx.try_send(Msg::Cpt { scan: 1, val: -1 }).unwrap();
+        let (dropped_tx, dropped) = oneshot::channel::<()>();
+        let (again_tx, again) = std::sync::mpsc::channel::<()>();
+        let (_done, done) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let ch = ca.search("X").expect("X is served here");
+            let (entered_tx, entered) = std::sync::mpsc::channel();
+            let cpt = cpt_monitor(0, cpt_time.clone());
+            let first = ca.monitor_queue(&ch, DBR_LONG, 1, DBE_VALUE, move |s, queue| {
+                let _ = entered_tx.send(());
+                cpt(s, queue);
+            });
+            assert!(first.is_some(), "X is monitored");
+            // Its first value waits for room in the full queue, or is about to.
+            entered.recv_timeout(budget).expect("X's first value");
+            drop(first);
+            let _ = dropped_tx.send(());
+            let _ = again.recv();
+            let cpt = cpt_monitor(0, cpt_time);
+            let again = ca.monitor_queue(&ch, DBR_LONG, 1, DBE_VALUE, cpt);
+            assert!(again.is_some(), "X is monitored again");
+            let _ = done.recv();
+        });
+        assert_eq!(
+            timeout(budget, dropped).await,
+            Ok(Ok(())),
+            "the drop returned"
+        );
+        assert!(matches!(
+            queue.try_recv(),
+            Ok(Msg::Cpt { scan: 1, val: -1 })
+        ));
+        assert!(
+            queue.try_recv().is_err(),
+            "the dropped wait's value was queued"
+        );
+
+        again_tx.send(()).unwrap();
+        assert!(
+            matches!(
+                timeout(budget, queue.recv()).await,
+                Ok(Some(Msg::Cpt { scan: 0, val: 0 }))
+            ),
+            "the new monitor's first value was queued"
+        );
+    }
+
+    /// Under `saveData_MessagePolicy` 2, a `.CPT` value its full queue drops
+    /// does not count as sent: the next one, inside `cpt_wait_time` of it,
+    /// is queued.
+    #[epics_base_rs::epics_test]
+    async fn a_cpt_value_its_full_queue_drops_holds_back_no_later_one() {
+        use epics_base_rs::server::ioc_builder::IocBuilder;
+
+        let (db, _) = IocBuilder::new()
+            .db_string("record(ao, \"X\") {}\n", &std::collections::HashMap::new())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let (tx, mut queue) = mpsc::channel(1);
+        let ca = Ca {
+            ctx: db.ca_client(),
+            bridge: BlockingBridge::capture(),
+            tx,
+        };
+        let budget = fact_budget::FACT_BUDGET;
+        MESSAGE_POLICY.store(2, Ordering::Relaxed);
+        // not-a-wait: the window `cptMonitor` lets one value through in; the
+        // whole test runs inside one.
+        CPT_WAIT_TIME.store(budget.as_secs_f64().to_bits(), Ordering::Relaxed);
+        // The scan's last `.CPT` value went out a window ago.
+        let ago = Instant::now().checked_sub(budget);
+        let cpt_time = Arc::new(Mutex::new(ago.expect("a clock older than a window")));
+        ca.tx.try_send(Msg::Cpt { scan: 1, val: -1 }).unwrap();
+        let (handled_tx, mut handled) = mpsc::channel::<()>(4);
+        let (_done, done) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let ch = ca.search("X").expect("X is served here");
+            let cpt = cpt_monitor(0, cpt_time);
+            let monitor = ca.monitor_queue(&ch, DBR_LONG, 1, DBE_VALUE, move |s, queue| {
+                cpt(s, queue);
+                let _ = handled_tx.try_send(());
+            });
+            assert!(monitor.is_some(), "X is monitored");
+            let _ = done.recv();
+        });
+        assert_eq!(
+            timeout(budget, handled.recv()).await,
+            Ok(Some(())),
+            "X's first value"
+        );
+        assert!(matches!(
+            queue.try_recv(),
+            Ok(Msg::Cpt { scan: 1, val: -1 })
+        ));
+        assert!(
+            queue.try_recv().is_err(),
+            "the full queue took X's first value"
+        );
+
+        db.put_record_field_from_ca_no_notify("X", "VAL", EpicsValue::Double(1.0))
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                timeout(budget, queue.recv()).await,
+                Ok(Some(Msg::Cpt { scan: 0, val: 1 }))
+            ),
+            "X's next value was queued"
+        );
     }
 }

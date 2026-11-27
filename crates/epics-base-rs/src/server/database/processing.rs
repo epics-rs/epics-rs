@@ -300,13 +300,15 @@ impl AsyncToken {
 pub struct ProcessCallback(Arc<crate::runtime::background::CallbackCell<ProcessReentry>>);
 
 impl ProcessCallback {
-    /// C `callbackRequestProcessCallback(&cb, priority, prec)`. A request
-    /// while one is queued is taken by that one; `Err` is a full band.
-    pub fn request(
-        &self,
-        priority: crate::runtime::task::CallbackPriority,
-    ) -> Result<(), crate::runtime::background::CallbackError> {
-        crate::runtime::task::request_cell(priority, &self.0)
+    /// C `callbackRequestProcessCallback(&cb, priority, prec)`, never refused
+    /// for a full band. A request while one is queued is taken by that one.
+    /// One made once the database's scan has stopped never runs, as C's
+    /// after `callbackStop`.
+    pub fn request(&self, priority: crate::runtime::task::CallbackPriority) {
+        if admits_cell_request(&self.0.body().db) {
+            // `Err` is only `NotInit`, already logged as C's `S_db_notInit`.
+            let _ = crate::runtime::task::request_cell(priority, &self.0);
+        }
     }
 
     /// C `ProcessCallback`'s body on the calling thread (`callback.c:379-387`):
@@ -344,6 +346,33 @@ impl crate::runtime::background::CallbackBody for ProcessReentry {
     }
 }
 
+/// A record's `PRIO`, one per record and shared by everything that requests
+/// a callback for it, read at request time without the record lock as C
+/// reads `prec->prio` in `callbackRequestProcessCallback`. Only
+/// `RecordInstance::set_prio` stores here, beside `common.prio`.
+#[derive(Clone, Default, Debug)]
+pub struct RecordBand(Arc<std::sync::atomic::AtomicI16>);
+
+impl RecordBand {
+    pub(crate) fn new(prio: i16) -> Self {
+        Self(Arc::new(std::sync::atomic::AtomicI16::new(prio)))
+    }
+
+    pub(crate) fn set(&self, prio: i16) {
+        self.0.store(prio, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// `PRIO` now.
+    pub fn prio(&self) -> i16 {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The band `PRIO` selects now.
+    pub fn priority(&self) -> crate::runtime::task::CallbackPriority {
+        crate::runtime::task::CallbackPriority::from_record_prio(self.prio())
+    }
+}
+
 /// The completion of an asynchronous device read or write: C devAsyn's
 /// `callbackRequestProcessCallback(&pPvt->processCallback, pr->prio, pr)` from
 /// the port thread once the driver call ran, which re-enters the record's
@@ -363,18 +392,18 @@ impl DeviceDone {
         Self::with_db(
             Arc::downgrade(&db.inner),
             record.name.clone(),
-            record.common.prio,
+            record.band.clone(),
             record.reprocess_generation.clone(),
         )
     }
 
     /// A cell no database owns, whose completion runs nothing: the
     /// `RecordInstance` default until `add_loaded_record` installs its own.
-    pub(crate) fn detached(prio: i16) -> Self {
+    pub(crate) fn detached(band: RecordBand) -> Self {
         Self::with_db(
             std::sync::Weak::new(),
             RecordName::from(&b""[..]),
-            prio,
+            band,
             Arc::default(),
         )
     }
@@ -382,14 +411,14 @@ impl DeviceDone {
     fn with_db(
         db: std::sync::Weak<super::PvDatabaseInner>,
         name: RecordName,
-        prio: i16,
+        band: RecordBand,
         generation: Arc<AtomicU64>,
     ) -> Self {
         DeviceDone(crate::runtime::background::CallbackCell::new(
             DeviceReentry {
                 db,
                 name,
-                band: std::sync::atomic::AtomicU8::new(band_index(prio)),
+                band,
                 generation,
                 epoch: AtomicU64::new(0),
                 owed: std::sync::Mutex::new(Owed::default()),
@@ -401,17 +430,7 @@ impl DeviceDone {
     /// The record's band, read without the record lock as C's
     /// `callbackRequestProcessCallback` reads `pr->prio` on the port thread.
     pub fn priority(&self) -> crate::runtime::task::CallbackPriority {
-        use crate::runtime::task::CallbackPriority;
-        match self
-            .0
-            .body()
-            .band
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            1 => CallbackPriority::Medium,
-            2 => CallbackPriority::High,
-            _ => CallbackPriority::Low,
-        }
+        self.0.body().band.priority()
     }
 
     /// The database this record's completion re-enters.
@@ -421,22 +440,12 @@ impl DeviceDone {
         }
     }
 
-    /// Only `RecordInstance::set_prio` stores here, beside `common.prio`.
-    pub(crate) fn set_prio(&self, prio: i16) {
-        self.0
-            .body()
-            .band
-            .store(band_index(prio), std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// Queue the pass that completes an asynchronous write on `priority`. The
-    /// write's alarm is the device's own, read through `last_alarm` on that
-    /// pass. `Err` is a full band, which C's caller ignores as well.
-    pub fn complete(
-        &self,
-        priority: crate::runtime::task::CallbackPriority,
-    ) -> Result<(), crate::runtime::background::CallbackError> {
-        self.owe(priority, Completion::Write)
+    /// Queue the pass that completes an asynchronous write on `priority`,
+    /// never refused for a full band. The write's alarm is the device's own,
+    /// read through `last_alarm` on that pass. A request once the scan has
+    /// stopped runs nothing, as [`ProcessCallback::request`]'s.
+    pub fn complete(&self, priority: crate::runtime::task::CallbackPriority) {
+        self.owe(priority, Completion::Write);
     }
 
     /// [`Self::complete`] on the record's band `delay` from now: C
@@ -446,20 +455,19 @@ impl DeviceDone {
     pub(crate) fn complete_after(&self, delay: std::time::Duration) {
         let done = self.clone();
         // The task is C's ProcessCallback, so it drains the pass itself.
-        crate::runtime::task::spawn_background_after(self.priority(), delay, async move {
-            done.complete_now();
-        });
+        self.database()
+            .spawn_callback_after(self.priority(), delay, async move {
+                done.complete_now();
+            });
     }
 
     /// Queue the pass that ends a [`ReadStart::Pending`](crate::server::device_support::ReadStart::Pending)
     /// read on `priority`: the record's `process()` again with PACT set, whose
     /// [`DeviceSupport::read`](crate::server::device_support::DeviceSupport::read)
-    /// applies what the device read. `Err` is a full band.
-    pub fn reprocess(
-        &self,
-        priority: crate::runtime::task::CallbackPriority,
-    ) -> Result<(), crate::runtime::background::CallbackError> {
-        self.owe(priority, Completion::Read)
+    /// applies what the device read. Never refused for a full band; a request
+    /// once the scan has stopped runs nothing, as [`ProcessCallback::request`]'s.
+    pub fn reprocess(&self, priority: crate::runtime::task::CallbackPriority) {
+        self.owe(priority, Completion::Read);
     }
 
     /// One pass per request, in order, as C's asyn callback processes the
@@ -467,22 +475,20 @@ impl DeviceDone {
     /// owed to an idle cell requests a run, and that run drains every pass
     /// owed until none is: one at a time on one worker, as C runs them on
     /// the port thread, however many workers the band has.
-    fn owe(
-        &self,
-        priority: crate::runtime::task::CallbackPriority,
-        completion: Completion,
-    ) -> Result<(), crate::runtime::background::CallbackError> {
-        if !self.push(completion) {
-            return Ok(());
-        }
+    fn owe(&self, priority: crate::runtime::task::CallbackPriority, completion: Completion) {
         let body = self.0.body();
-        crate::runtime::task::request_cell(priority, &self.0).inspect_err(|_| {
-            // No run will drain them: lost, as C loses a refused
-            // `callbackRequest`, so the next pass owed requests afresh.
+        // Judged before it is owed: a run already draining the cell takes
+        // what it finds owed, admitted or not.
+        if !admits_cell_request(&body.db) || !self.push(completion) {
+            return;
+        }
+        if crate::runtime::task::request_cell(priority, &self.0).is_err() {
+            // Only before `callbackInit` (C `S_db_notInit`): no run will
+            // drain them, so the next pass owed requests afresh.
             let mut owed = body.owed.lock().unwrap();
             *owed = Owed::default();
             body.pending.store(0, Ordering::Release);
-        })
+        }
     }
 
     /// [`Self::complete`] on the calling thread, for a callback that runs
@@ -492,6 +498,18 @@ impl DeviceDone {
     pub fn complete_now(&self) {
         use crate::runtime::background::CallbackBody;
         if self.push(Completion::Write) {
+            self.0.body().run();
+        }
+    }
+
+    /// [`Self::reprocess`] on the calling thread: C devMcaAsyn's port-thread
+    /// callback, which runs `dbScanLock; process; dbScanUnlock` itself
+    /// (devMcaAsyn.c:359-361, :381-383) and so never meets a full band. The
+    /// caller holds no lock set. A run already draining the cell on another
+    /// thread takes this pass after its own.
+    pub fn reprocess_now(&self) {
+        use crate::runtime::background::CallbackBody;
+        if self.push(Completion::Read) {
             self.0.body().run();
         }
     }
@@ -507,12 +525,9 @@ impl DeviceDone {
 
     /// [`Self::reprocess`] at the record's band for the re-entry `epoch`
     /// names, for a completion that minted its own [`AsyncToken`].
-    pub(crate) fn reprocess_at(
-        &self,
-        epoch: u64,
-    ) -> Result<(), crate::runtime::background::CallbackError> {
+    pub(crate) fn reprocess_at(&self, epoch: u64) {
         self.0.body().epoch.store(epoch, Ordering::Release);
-        self.reprocess(self.priority())
+        self.reprocess(self.priority());
     }
 }
 
@@ -643,21 +658,11 @@ impl<'a> DeviceDoneSource<'a> {
     }
 }
 
-/// `PRIO` as the band index [`DeviceDone::priority`] decodes, folded as
-/// [`crate::runtime::task::CallbackPriority::from_record_prio`] folds it.
-fn band_index(prio: i16) -> u8 {
-    match crate::runtime::task::CallbackPriority::from_record_prio(prio) {
-        crate::runtime::task::CallbackPriority::Low => 0,
-        crate::runtime::task::CallbackPriority::Medium => 1,
-        crate::runtime::task::CallbackPriority::High => 2,
-    }
-}
-
 /// The body of a [`DeviceDone`].
 struct DeviceReentry {
     db: std::sync::Weak<super::PvDatabaseInner>,
     name: RecordName,
-    band: std::sync::atomic::AtomicU8,
+    band: RecordBand,
     /// The record's `reprocess_generation`, and its value when the request
     /// was queued.
     generation: Arc<AtomicU64>,
@@ -750,6 +755,75 @@ impl DelayedCallbackArm {
     fn is_current(&self) -> bool {
         self.timers[self.callback.index()].load(Ordering::Acquire) == self.epoch
     }
+}
+
+/// [`CallbackRequests::verdict`]: no wake since the last poll.
+const UNJUDGED: u8 = 0;
+/// A wake made while the scan facility had not stopped.
+const ADMITTED: u8 = 1;
+/// Wakes all made once it had.
+const REFUSED: u8 = 2;
+
+/// The waker a [`PvDatabase::spawn_callback_after`] task polls its body with:
+/// each wake is that body's next `callbackRequest`, judged as it is made.
+struct CallbackRequests {
+    scan: Arc<crate::server::scan::ScanControl>,
+    /// The judgement of the wakes since the last poll; one admitted wake
+    /// outweighs any refused one.
+    verdict: std::sync::atomic::AtomicU8,
+    /// The runtime task's own waker, as of its last poll.
+    outer: std::sync::Mutex<Option<std::task::Waker>>,
+}
+
+impl CallbackRequests {
+    /// Track `outer` and take the verdict that brought this poll.
+    fn next_poll(&self, outer: &std::task::Waker) -> u8 {
+        let mut held = self.outer.lock().unwrap();
+        if !held.as_ref().is_some_and(|w| w.will_wake(outer)) {
+            *held = Some(outer.clone());
+        }
+        drop(held);
+        self.verdict.swap(UNJUDGED, Ordering::AcqRel)
+    }
+}
+
+impl std::task::Wake for CallbackRequests {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        if !admits_callback_request(&self.scan) {
+            let _ = self.verdict.compare_exchange(
+                UNJUDGED,
+                REFUSED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        } else {
+            self.verdict.store(ADMITTED, Ordering::Release);
+        }
+        let outer = self.outer.lock().unwrap().clone();
+        if let Some(outer) = outer {
+            outer.wake();
+        }
+    }
+}
+
+/// Whether a `callbackRequest` made now runs: not once the scan facility has
+/// stopped, as C `iocShutdown` runs `callbackStop` right after `scanStop`
+/// (iocInit.c:733-735). Judged once, when the request is made: what it
+/// admits runs to its end, as `callbackTask` empties its ring before it
+/// rereads `shutdown` (callback.c:210-235).
+fn admits_callback_request(scan: &crate::server::scan::ScanControl) -> bool {
+    !scan.is_exiting()
+}
+
+/// [`admits_callback_request`] for the database a callback cell holds: a
+/// request that outlives it is refused.
+fn admits_cell_request(db: &std::sync::Weak<super::PvDatabaseInner>) -> bool {
+    db.upgrade()
+        .is_some_and(|inner| admits_callback_request(&inner.scan_ctl))
 }
 
 /// What a SoftCallback input dset's `getCallback` reads off the notified
@@ -1114,6 +1188,52 @@ impl AsyncDbHandle {
         self.db().is_some_and(|db| db.scan_control().is_running())
     }
 
+    /// C `callbackRequest`: [`Self::spawn_callback_after`] with no delay.
+    pub fn spawn_callback<F>(&self, priority: crate::runtime::task::CallbackPriority, task: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.spawn_callback_after(priority, std::time::Duration::ZERO, task);
+    }
+
+    /// C `callbackRequestDelayed`: `task` on `priority`'s band `delay` from
+    /// now. The delay's expiry, and each later wake of `task`, is a new
+    /// request, as C record support makes one again; a request made after
+    /// this database's `scanStop` does not run, and `task` ends there.
+    /// Nothing runs once the database is gone.
+    pub fn spawn_callback_after<F>(
+        &self,
+        priority: crate::runtime::task::CallbackPriority,
+        delay: std::time::Duration,
+        task: F,
+    ) where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        if let Some(db) = self.db() {
+            db.spawn_callback_after(priority, delay, task);
+        }
+    }
+
+    /// C `callbackRequest` of a record or device support's own callback
+    /// `cell`, judged against this database's scan as [`Self::spawn_callback`]
+    /// is: whether a run of it will come. None does once the scan has
+    /// stopped or the database is gone, nor before `callbackInit`; a full
+    /// band never refuses it.
+    pub fn request_callback<B: crate::runtime::background::CallbackBody>(
+        &self,
+        priority: crate::runtime::task::CallbackPriority,
+        cell: &Arc<crate::runtime::background::CallbackCell<B>>,
+    ) -> bool {
+        admits_cell_request(&self.inner)
+            && crate::runtime::task::request_cell(priority, cell).is_ok()
+    }
+
+    /// Whether a `callbackRequest` made now would run.
+    pub(crate) fn admits_callback_request(&self) -> bool {
+        self.db()
+            .is_some_and(|db| admits_callback_request(db.scan_control()))
+    }
+
     /// C `dbNameToAddr(name)` succeeding: `name` is a field this database
     /// serves. [`Self::name_to_addr`] takes no lock, so a device asks this of
     /// its own record during its `init` or `process` as of any other.
@@ -1277,6 +1397,32 @@ impl AsyncDbHandle {
         link: &crate::server::record::ParsedLink,
     ) -> Option<crate::types::DbfCode> {
         self.db()?.parsed_link_target_field_type(link)
+    }
+
+    /// `PvDatabase::db_link_answer`: `db`'s cached answer. `None` if the
+    /// database is gone.
+    pub(crate) fn db_link_answer(
+        &self,
+        db: &crate::server::record::DbLink,
+    ) -> Option<crate::server::record::DbLinkAnswer> {
+        Some(self.db()?.db_link_answer(db))
+    }
+
+    /// The links `record` stores in `fields`, the parses its reads take.
+    /// `None` if the record or the database is gone.
+    pub(crate) fn stored_links(
+        &self,
+        record: impl AsRef<[u8]>,
+        fields: &[&str],
+    ) -> Option<Vec<Option<std::sync::Arc<crate::server::record::ParsedLink>>>> {
+        let rec = self.db()?.get_record(record.as_ref())?;
+        let inst = rec.read();
+        Some(
+            fields
+                .iter()
+                .map(|f| inst.stored_link_shared(f).cloned())
+                .collect(),
+        )
     }
 
     /// See `PvDatabase::link_check_classified`.
@@ -1699,19 +1845,17 @@ struct AsubDynamicSub {
     /// `Some` → swap the live subroutine and set ONAM to `snam` (the name
     /// changed and was found in the registry).
     swap: Option<Arc<crate::server::record::Subroutine>>,
-    /// `true` → do not run the subroutine this cycle, matching C skipping
-    /// `do_sub`: the link read failed, or the changed name was not registered
-    /// (`S_db_BadSub`).
-    skip_run: bool,
+    /// `true` → C `fetch_values` returns here, before A..U: the link read
+    /// failed, or the changed name was not registered (`S_db_BadSub`). Goes
+    /// to the cycle's fetch gate, which skips the inputs and `do_sub`.
+    stops_fetch: bool,
 }
 
 /// Apply an aSub LFLG=READ resolution (from
 /// [`PvDatabase::resolve_asub_dynamic_subroutine`]) to a locked record: write
-/// the read-back SNAM, swap the subroutine + set ONAM when the name changed,
-/// and arm the one-shot suppress flag when the name was bad. The single apply
-/// owner, shared by the engine path ([`PvDatabase::process_record_with_links_inner`])
-/// and the foreign path ([`PvDatabase::process_record`]); the skip is consumed
-/// uniformly by `RecordInstance::run_registered_subroutine`.
+/// the read-back SNAM, and swap the subroutine + set ONAM when the name
+/// changed. A failed resolution is not acted on here: the input stage's fetch
+/// gate already skipped the inputs and armed the `do_sub` skip.
 fn apply_asub_dynamic_sub(instance: &mut RecordInstance, ds: &AsubDynamicSub) {
     if let Some(snam) = &ds.snam {
         let _ = instance
@@ -1725,12 +1869,6 @@ fn apply_asub_dynamic_sub(instance: &mut RecordInstance, ds: &AsubDynamicSub) {
                 .record
                 .put_field("ONAM", EpicsValue::String(snam.as_str().into()));
         }
-    }
-    // One-shot, armed by any reason and cleared only by its owner
-    // (`run_registered_subroutine`): armed, never cleared here, so a failed
-    // `fetch_values` that armed it before this hook still skips the run.
-    if ds.skip_run {
-        instance.skip_subroutine_this_cycle();
     }
 }
 
@@ -2326,6 +2464,8 @@ struct MultiInputLink<'a> {
     link_field: &'static str,
     val_field: &'static str,
     parsed: &'a crate::server::record::ParsedLink,
+    /// The route of the target the fetch resolved `parsed` to.
+    route: Option<super::char_view::LinkRoute>,
     /// [`Record::input_link_request`](crate::server::record::Record::input_link_request) for the link — C's `dbrType` argument
     /// to `dbGetLink`.
     request: crate::server::record::InputLinkRequest,
@@ -2399,7 +2539,7 @@ impl PvDatabase {
         let store_raw = self.convert_link_fetch_as(
             Reader::Held(&mut *record, reader.set()),
             link.link_field,
-            link.parsed,
+            super::links::ReadLink::Resolved(link.parsed, link.route),
             link.request,
             &mut fetch,
             render,
@@ -2569,6 +2709,11 @@ enum HeldFetch {
 #[derive(Default)]
 struct FetchFold {
     resolved: u64,
+    /// C `fetch_values` returned before its input loop: the read that names
+    /// what the loop reads or runs failed — sel's `NVL` (`selRecord.c:423-425`),
+    /// aSub's `SUBL` or the unregistered name it delivered
+    /// (`aSubRecord.c:256-265`). Set before the loop, which then reads nothing.
+    stopped_before_inputs: bool,
     /// This cycle's `fetch_values()` outcome — non-zero status in C, i.e.
     /// "the record body must not run" — under every policy but the sel one.
     fetch_values_failed: bool,
@@ -2611,9 +2756,10 @@ impl FetchFold {
         false
     }
 
-    /// C `fetch_values`' return, folded with the sel gate into the ONE
-    /// boolean delivered to `Record::set_fetch_gate_failed` (calc/calcout/
-    /// scalcout/acalcout/swait/sel) and `suppress_subroutine_run` (sub/aSub).
+    /// C `fetch_values`' return, folded with its early return before the
+    /// loop and the sel gate into the ONE boolean delivered to
+    /// `Record::set_fetch_gate_failed` (calc/calcout/scalcout/acalcout/swait/
+    /// sel) and `suppress_subroutine_run` (sub/aSub).
     ///
     /// C `selRecord.c::fetch_values` returns the status of its LAST
     /// `dbGetLink` (`:434-437` assigns `status` unguarded every pass), and
@@ -2622,13 +2768,13 @@ impl FetchFold {
     /// `dbGetLink` on an unset OR constant link returns success
     /// (`dbConstGetValue`), and the field it would have written keeps its
     /// init-seeded value, which flows into `do_sel`.
-    fn failed(&self, policy: InputFetchPolicy, sel_nvl_read_failed: bool) -> bool {
+    fn failed(&self, policy: InputFetchPolicy) -> bool {
         let failed = if matches!(policy, InputFetchPolicy::ReadAllGateOnLastFailure) {
             self.last_input_read_failed
         } else {
             self.fetch_values_failed
         };
-        failed || sel_nvl_read_failed
+        failed || self.stopped_before_inputs
     }
 }
 
@@ -2750,7 +2896,15 @@ impl PvDatabase {
             );
             InputLinkRequest::As(LinkReadAs::Native)
         } else {
-            entry.link_request(&*inst.record, link_field, generation)
+            match entry.link_request(&*inst.record, link_field, generation) {
+                // Every link before this one has landed: the loops visit
+                // them in order, under this hold.
+                InputLinkRequest::FromEarlierLinks => inst
+                    .record
+                    .input_link_read_as_from_earlier_links(link_field)
+                    .map_or(InputLinkRequest::NotRead, InputLinkRequest::As),
+                request => request,
+            }
         };
         // C's `default: break`: the record's switch has no case for this
         // link, so `dbGetLink` is never called — no PP of the source, no
@@ -2759,10 +2913,13 @@ impl PvDatabase {
             return not_read_slot();
         }
         let (parsed, target) = entry.target(self, rec.unframed(), cache_slot);
+        let route = target.and_then(|at| at.route);
         // The native funnel is these readers' `DBR_DOUBLE`, which a `$`
         // link's or attribute's text answers itself, never its char image.
         let request = match request {
-            InputLinkRequest::As(LinkReadAs::Native) if self.text_route_of(parsed).is_some() => {
+            InputLinkRequest::As(LinkReadAs::Native)
+                if route.and_then(super::char_view::LinkRoute::text).is_some() =>
+            {
                 InputLinkRequest::As(LinkReadAs::Double)
             }
             request => request,
@@ -2817,6 +2974,7 @@ impl PvDatabase {
             link_field,
             val_field,
             parsed,
+            route,
             request,
         };
         Some(self.land_multi_input(record, common, rec, &link, plan, read))
@@ -2851,7 +3009,7 @@ impl PvDatabase {
                 break;
             }
         }
-        let fetch_values_failed = fold.failed(policy, false);
+        let fetch_values_failed = fold.failed(policy);
         let inst = guard.hold();
         inst.set_fetch_gate_failed(fetch_values_failed);
         if fetch_values_failed {
@@ -3553,6 +3711,11 @@ trait SoftDbValue: Sized {
     ) -> (Option<Self>, Self::Left, Option<super::links::SourceAlarm>);
     /// Lands [`Self::Left`] in the reader's INP buffer.
     fn land(left: Self::Left, record: &mut dyn crate::server::record::Record);
+    /// `request` at `n` elements ([`LinkReadAs::asking`](crate::server::record::LinkReadAs::asking)):
+    /// a scalar one is one element already.
+    fn asking(request: Self::Request, _n: usize) -> Self::Request {
+        request
+    }
 }
 
 impl SoftDbValue for f64 {
@@ -3644,6 +3807,13 @@ impl SoftDbValue for EpicsValue {
         if let Some(left) = left {
             record.land_failed_array_read("INP", *left);
         }
+    }
+
+    fn asking(
+        read_as: crate::server::record::LinkReadAs,
+        n: usize,
+    ) -> crate::server::record::LinkReadAs {
+        read_as.asking(n)
     }
 }
 
@@ -3801,10 +3971,10 @@ impl PvDatabase {
     ///
     /// The single owner of this entry is the I/O Intr wiring
     /// (`crate::server::ioc_app::setup_io_intr` and its `ioc_builder`
-    /// twin): the spawned task processes a record because the driver
+    /// twin): its pump processes a record because the driver
     /// fired an interrupt callback, not because of a client put / FLNK /
     /// scan. `device_callback = true` tells
-    /// `Self::process_record_with_links_inner` that, for an *output*
+    /// `Self::run_process_frame` that, for an *output*
     /// record, this cycle must READ the callback value back into VAL and
     /// MUST NOT write it to the driver — C `devAsynInt32.c::processBo`
     /// (and `processAo`/`processLongout`/…) take the readback branch when
@@ -3823,10 +3993,17 @@ impl PvDatabase {
         visited: &'a mut ProcStack,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CaResult<()>> + Send + 'a>> {
         let name = name.as_ref();
-        Box::pin(async move {
-            self.process_record_with_links_inner(name, visited, false, true, true)
-                .await
-        })
+        Box::pin(async move { self.process_record_readback_sync(name, visited) })
+    }
+
+    /// [`Self::process_record_readback`] called directly, from the I/O Intr
+    /// pump's callback run.
+    pub(crate) fn process_record_readback_sync(
+        &self,
+        name: &[u8],
+        visited: &mut ProcStack,
+    ) -> CaResult<()> {
+        self.run_process_frame(ProcessTarget::Name(name), visited, true, false, true)
     }
 
     /// An output's callback-readback read, in its OUT stage: the device sets
@@ -4385,18 +4562,65 @@ impl PvDatabase {
         generation: &AtomicU64,
         epoch: u64,
     ) -> CaResult<()> {
-        if generation.load(Ordering::Acquire) != epoch || !self.accepts_reentry() {
+        if generation.load(Ordering::Acquire) != epoch {
             return Ok(());
         }
         self.run_process_frame(target, &mut ProcStack::new(), true, true, false)
     }
 
-    /// Whether a callback-band re-entry may still process: not once the
-    /// database's scan facility has stopped. C `iocShutdown` runs
-    /// `callbackStop` right after `scanStop` (iocInit.c:733-735), so a
-    /// completion a port delivers while closing at exit processes nothing.
-    fn accepts_reentry(&self) -> bool {
-        !self.scan_control().is_exiting()
+    /// [`Self::spawn_callback_after`] with no delay: C `callbackRequest`.
+    pub(crate) fn spawn_callback<F>(
+        &self,
+        priority: crate::runtime::task::CallbackPriority,
+        task: F,
+    ) -> crate::runtime::task::BackgroundTaskHandle<()>
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.spawn_callback_after(priority, std::time::Duration::ZERO, task)
+    }
+
+    /// The one spawner of this database's callback-band tasks: C
+    /// `callbackRequestDelayed`, whose expiry is a `callbackRequest`
+    /// (callback.c:404-408). That request reads no state, and `callbackTask`
+    /// empties its ring before it rereads `shutdown` (callback.c:210-235,
+    /// :341-376), so `callbackStop` after `scanStop` (iocInit.c:733-735)
+    /// leaves a callback requested before it to run and one requested after
+    /// it unrun. Each request is judged when it is made: the delay's expiry,
+    /// and every later wake of `task` — a requeue, a sleep's expiry, a
+    /// completion — as the request C's record support makes again. The
+    /// runtime's own stop cannot do this: it is process-wide and comes later.
+    pub(crate) fn spawn_callback_after<F>(
+        &self,
+        priority: crate::runtime::task::CallbackPriority,
+        delay: std::time::Duration,
+        task: F,
+    ) -> crate::runtime::task::BackgroundTaskHandle<()>
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        // The scan cell, not the database: a task must not keep it alive.
+        let requests = Arc::new(CallbackRequests {
+            scan: Arc::clone(self.scan_control()),
+            verdict: std::sync::atomic::AtomicU8::new(UNJUDGED),
+            outer: std::sync::Mutex::new(None),
+        });
+        let admit = {
+            let scan = Arc::clone(&requests.scan);
+            move || admits_callback_request(&scan)
+        };
+        let inner = std::task::Waker::from(Arc::clone(&requests));
+        crate::runtime::task::spawn_background_after_admitted(priority, delay, admit, async move {
+            let mut task = std::pin::pin!(task);
+            std::future::poll_fn(|cx| {
+                if requests.next_poll(cx.waker()) == REFUSED {
+                    return std::task::Poll::Ready(());
+                }
+                task.as_mut()
+                    .poll(&mut std::task::Context::from_waker(&inner))
+            })
+            .await
+        })
     }
 
     /// Cancel any outstanding async re-entry token for `name` (C
@@ -4419,10 +4643,10 @@ impl PvDatabase {
     /// For the deferral sites that hold a record *name* rather than a locked
     /// instance. Takes the record's read lock, so it must not be called from
     /// inside that record's own `process()`/`special()` — those run under the
-    /// instance write lock and read the band off
-    /// [`ProcessContext::callback_priority`](crate::server::record::ProcessContext)
-    /// instead. A record that is gone answers `Low`, the band an unwritten
-    /// `PRIO` already has; the work being scheduled for it is a no-op anyway.
+    /// instance write lock and read the band off the [`RecordBand`] handed to
+    /// the record instead. A record that is gone answers `Low`, the band an
+    /// unwritten `PRIO` already has; the work being scheduled for it is a
+    /// no-op anyway.
     pub fn record_callback_priority(
         &self,
         name: impl AsRef<[u8]>,
@@ -4450,7 +4674,7 @@ impl PvDatabase {
         let token = Self::mint_async_token_in(name, rec);
         let prio = rec.read().common.callback_priority();
         let db = self.clone();
-        crate::runtime::task::spawn_background_after(prio, delay, async move {
+        self.spawn_callback_after(prio, delay, async move {
             let _ = token.fire(&db).await;
         });
     }
@@ -4475,11 +4699,8 @@ impl PvDatabase {
         let mut arm = rec.read().delayed_callbacks().arm(name, callback);
         let prio = rec.read().common.callback_priority();
         let db = self.clone();
-        crate::runtime::task::spawn_background_after(prio, delay, async move {
+        self.spawn_callback_after(prio, delay, async move {
             loop {
-                if !db.accepts_reentry() {
-                    return;
-                }
                 let Some(rec) = db.get_record_no_resolve(&arm.name) else {
                     return;
                 };
@@ -4540,7 +4761,7 @@ impl PvDatabase {
         let token = Self::mint_async_token_in(name, rec);
         let prio = rec.read().common.callback_priority();
         let db = self.clone();
-        crate::runtime::task::spawn_background_after(prio, delay, async move {
+        self.spawn_callback_after(prio, delay, async move {
             if !token.is_current() {
                 return;
             }
@@ -4617,7 +4838,7 @@ impl PvDatabase {
 
     /// [`Self::arm_watchdog`] for a caller inside the record's frame.
     pub(crate) fn arm_watchdog_in(&self, frame: InFrame<'_>) {
-        let (generation, epoch, prio, interval) = {
+        let (generation, epoch, interval) = {
             let instance = frame.read();
             let Some(interval) = instance.record.watchdog_interval() else {
                 // Bumping the generation still cancels a watchdog left running
@@ -4629,12 +4850,7 @@ impl PvDatabase {
             };
             let generation = instance.watchdog_generation.clone();
             let epoch = generation.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
-            (
-                generation,
-                epoch,
-                instance.common.callback_priority(),
-                interval,
-            )
+            (generation, epoch, interval)
         };
         let rec = frame.unframed().clone();
         // C `histogramRecord.c::wdogCallback` stamps with `recGblGetTimeStamp`
@@ -4642,7 +4858,10 @@ impl PvDatabase {
         // a live watchdog never keeps the database alive — the tick simply
         // stamps without TSEL if the database is already gone.
         let db = self.async_handle();
-        crate::runtime::task::spawn_background_after(prio, interval, async move {
+        // C `wdogInit` pins the tick to `priorityLow` (`histogramRecord.c:141`),
+        // whatever the record's PRIO.
+        let prio = crate::runtime::task::CallbackPriority::Low;
+        self.spawn_callback_after(prio, interval, async move {
             loop {
                 // A newer arm superseded this task while it waited.
                 if generation.load(std::sync::atomic::Ordering::Acquire) != epoch {
@@ -4834,10 +5053,10 @@ impl PvDatabase {
     /// Resolve a link's target field [`DbFieldType`] for a LOCAL `DB_LINK`,
     /// or `None` for a constant / external / unresolvable link.
     ///
-    /// Parity of C `dbGetLinkDBFtype` as `sseqRecord.c:checkLinks`
-    /// (sseqRecord.c:884-941) uses it to fill the `DTn`/`LTn` diagnostics:
-    /// a `DB_LINK` whose target record is on this IOC reports its addressed
-    /// field's type (C `dbNameToAddr` → `pAddr->field_type`). A constant or
+    /// C `dbNameToAddr` → `pAddr->field_type`, no filter applied: a `DB_LINK`
+    /// whose target record is on this IOC reports its addressed field's
+    /// type, from which a DB link's answer takes its filtered type
+    /// ([`ChannelName::final_field_type_through`](crate::server::database::filters::ChannelName)). A constant or
     /// `CA`/`PVA` (external) link returns `None` — epics-base-rs has no
     /// client-side introspection of a remote field's type, so the caller
     /// renders those as the `DBF_unknown` sentinel.
@@ -4856,8 +5075,18 @@ impl PvDatabase {
         // Through the split: a filtered link's raw halves name a record that
         // does not exist (`SRC.VAL[0]` whole, field `VAL`), so `get_record`
         // missed and every filtered DB link reported no type at all.
+        let rec = self.get_record(&db.target().record)?;
+        self.db_link_field_type(db, &rec)
+    }
+
+    /// [`Self::parsed_link_target_field_type`] of `db` on `rec`, its target
+    /// record, from the facts `rec` settled.
+    pub(crate) fn db_link_field_type(
+        &self,
+        db: &crate::server::record::DbLink,
+        rec: &crate::server::record::RecordCell,
+    ) -> Option<crate::types::DbfCode> {
         let addressed = db.target();
-        let rec = self.get_record(&addressed.record)?;
         let field = if addressed.field.is_empty() {
             "VAL"
         } else {
@@ -4866,9 +5095,9 @@ impl PvDatabase {
         // C `dbNameToAddr` takes no lock, and table's `init_record` asks
         // under its own set.
         if addressed.string_view {
-            return self.char_addressed(&rec, field, None).map(|(t, _)| t);
+            return self.char_addressed(rec, field, None).map(|(t, _)| t);
         }
-        self.addressed_field_type(&rec, field, None)
+        self.addressed_field_type(rec, field, None)
     }
 
     /// Create a put-notify wait-set for a downstream operation a record is
@@ -4902,7 +5131,7 @@ impl PvDatabase {
     ) -> crate::runtime::task::BackgroundTaskHandle<()> {
         let prio = self.record_callback_priority(token.record_name());
         let db = self.clone();
-        crate::runtime::task::spawn_background(prio, async move {
+        self.spawn_callback(prio, async move {
             // `Err` means the sender was dropped without firing (the
             // downstream op vanished); treat it the same as completion so a
             // waiting record is never stranded — `fire` is a no-op if the
@@ -5027,7 +5256,7 @@ impl PvDatabase {
     ) {
         let prio = self.record_callback_priority(token.record_name());
         let db = self.clone();
-        crate::runtime::task::spawn_background(prio, async move {
+        self.spawn_callback(prio, async move {
             let _ = completion.await;
             if !token.is_current() {
                 return;
@@ -5058,7 +5287,7 @@ impl PvDatabase {
                     instance.dpvt.set_notified_read(read);
                     instance.device_done.clone()
                 };
-                let _ = done.reprocess_at(token.epoch);
+                done.reprocess_at(token.epoch);
             }
         });
     }
@@ -5193,11 +5422,11 @@ impl PvDatabase {
         };
 
         let Some(name) = name else {
-            // Link read failed — C `if (status) return status` skips do_sub.
+            // Link read failed — C `if (status) return status`, before A..U.
             return Some(AsubDynamicSub {
                 snam: None,
                 swap: None,
-                skip_run: true,
+                stops_fetch: true,
             });
         };
 
@@ -5208,21 +5437,21 @@ impl PvDatabase {
                 Some(f) => Some(AsubDynamicSub {
                     snam: Some(name),
                     swap: Some(f),
-                    skip_run: false,
+                    stops_fetch: false,
                 }),
-                // Name changed but not registered — C returns S_db_BadSub,
-                // skipping do_sub; ONAM is left unchanged so it retries.
+                // Name changed but not registered — C returns S_db_BadSub
+                // before A..U; ONAM is left unchanged so it retries.
                 None => Some(AsubDynamicSub {
                     snam: Some(name),
                     swap: None,
-                    skip_run: true,
+                    stops_fetch: true,
                 }),
             }
         } else {
             Some(AsubDynamicSub {
                 snam: Some(name),
                 swap: None,
-                skip_run: false,
+                stops_fetch: false,
             })
         }
     }
@@ -5846,11 +6075,17 @@ impl PvDatabase {
             return None;
         }
         // C `dbGetNelements`, settled with the address; told before the read,
-        // whose failure must still find what the count decided. A refused
-        // count takes the general path, which carries the refusal.
-        if tell_nelements && !reader.set_inp_nelements(Some(i64::from(at.final_no_elements))) {
-            return None;
-        }
+        // whose failure must still find what the count decided, and asked
+        // for. A refused count takes the general path, which carries the
+        // refusal.
+        let request = if tell_nelements {
+            if !reader.set_inp_nelements(Some(i64::from(at.final_no_elements))) {
+                return None;
+            }
+            V::asking(request, at.final_no_elements as usize)
+        } else {
+            request
+        };
         let (value, left, alarm) = V::read(self, rec.set(), link, at, &*reader, request);
         let inherited = self.input_link_inheritance(rec, link, alarm);
         if let Some((ms, alarm)) = inherited {
@@ -6169,9 +6404,15 @@ impl PvDatabase {
             }
         };
         // The reads between here and the multi-input loop — pre-input
-        // actions, INP, DOL, NVL — go through the by-name link readers, which
-        // take the record's lock themselves; the loop takes the guard back.
-        if inp.is_some() || dol_info.is_some() || plan.sel_nvl || !pre_input_actions.is_empty() {
+        // actions, INP, DOL, NVL, SUBL — go through the by-name link readers,
+        // which take the record's lock themselves; the loop takes the guard
+        // back.
+        if inp.is_some()
+            || dol_info.is_some()
+            || plan.sel_nvl
+            || plan.resolves_subroutine_from_link
+            || !pre_input_actions.is_empty()
+        {
             guard.release();
         }
 
@@ -6263,9 +6504,11 @@ impl PvDatabase {
         // conversion applied to it either.
         // Asked with the guard released (a self-referencing INP resolves
         // through this record), and told before the read, whose failure
-        // must still find what the count decided. A count the record refuses
-        // leaves no INP to read (`compressRecord.c:328-331`).
+        // must still find what the count decided, and which asks that many.
+        // A count the record refuses leaves no INP to read
+        // (`compressRecord.c:328-331`).
         let mut inp_refused = false;
+        let mut inp_request = inp_request;
         let inp = match inp {
             Some(inp_parsed)
                 if plan
@@ -6276,6 +6519,12 @@ impl PvDatabase {
                 let reads = guard.hold().record.set_inp_nelements(nelements);
                 guard.release();
                 inp_refused = !reads;
+                if let (Some(crate::server::record::InputLinkRequest::As(read_as)), Some(n)) = (
+                    &mut inp_request,
+                    nelements.and_then(|n| usize::try_from(n).ok()),
+                ) {
+                    *read_as = read_as.asking(n);
+                }
                 reads.then_some(inp_parsed)
             }
             inp => inp,
@@ -6422,6 +6671,16 @@ impl PvDatabase {
         // What the cycle applies to SELN (DBF_USHORT, selRecord.dbd.pod:295).
         let sel_seln = sel_selector;
 
+        // aSub LFLG=READ: read the subroutine name from the SUBL link and, if
+        // it changed, re-resolve the function. C `aSubRecord.c::fetch_values`
+        // does this before A..U (`:256-265`). `None` for everything that is
+        // not an aSub in READ mode.
+        let asub_dynamic = if plan.resolves_subroutine_from_link {
+            self.resolve_asub_dynamic_subroutine(rec, visited)
+        } else {
+            None
+        };
+
         // 1.5. Multi-input link fetch (calc/calcout/sel/sub)
         // C's `fetch_values` runs inside `process()`, under the record lock
         // it entered with, and each `dbGetLink` writes its result straight
@@ -6441,74 +6700,84 @@ impl PvDatabase {
         // the `multi_input_links` fetch, and the pre-process ReadDbLink reads.
         // Built only for a type that reads it.
         let resolved_link_fields = pre_input_resolved;
-        let mut fold = FetchFold::default();
-        {
+        let mut fold = FetchFold {
+            stopped_before_inputs: sel_nvl_read_failed
+                || asub_dynamic.as_ref().is_some_and(|ds| ds.stops_fetch),
+            ..FetchFold::default()
+        };
+        let fetch_values_failed = {
             // The shape questions — what a failed read means
             // (`input_fetch_policy`), whether a constant delivers at process
             // (`printf` alone), and whether the fetch is C's `dbGetLink` —
             // are settled when the type is compiled, so the cycle carries
             // them rather than asking the record.
             let input_fetch_policy = plan.input_fetch_policy;
-            let instance = guard.hold();
-            // Restrict to the record's active inputs this cycle (sel
-            // `Specified` → only INP[SELN]); `None` = fetch every link, which
-            // is every record type but `sel` / `swait` and every pass of them
-            // that does not narrow. That unrestricted case is what the cycle
-            // pre-read at its top — see `read_input_link_texts` — so it is
-            // taken here rather than read a second time. A restriction that
-            // selects nothing is still a restriction: the `Option`, not the
-            // emptiness, says whether the record narrowed its inputs this
-            // pass.
-            let restricted: Option<InputLinkTexts> = if plan.narrows_input_links {
-                instance
-                    .record
-                    .select_input_links(sel_selector)
-                    .map(|subset| input_link_texts.read_narrowed(instance, subset))
-            } else {
-                None
-            };
-            let link_texts = restricted.as_ref().unwrap_or(input_link_texts);
-            let declared = link_texts.links();
-            // The record's cache is indexed by its OWN list; a narrowed list
-            // maps each of its slots back by name.
-            let own = link_texts.own();
-            let own_list = std::ptr::eq(declared, own);
-            // Over the set links only: C's loop visits every declared link,
-            // but an unset one is a `dbConstGetValue` success with nothing to
-            // deliver, so the passes it would make here are no-ops.
-            let mut wired = link_texts.wired();
-            while wired != 0 {
-                let slot = wired.trailing_zeros() as usize;
-                wired &= wired - 1;
-                let (link_field, val_field) = declared[slot];
-                let cache_slot = if own_list {
-                    Some(slot)
+            // C `fetch_values` returns before this loop when the read that
+            // names what it reads or runs failed — sel's NVL, aSub's SUBL or
+            // the unregistered name it delivered — so no input is read.
+            if !fold.stopped_before_inputs {
+                let instance = guard.hold();
+                // Restrict to the record's active inputs this cycle (sel
+                // `Specified` → only INP[SELN]); `None` = fetch every link, which
+                // is every record type but `sel` / `swait` and every pass of them
+                // that does not narrow. That unrestricted case is what the cycle
+                // pre-read at its top — see `read_input_link_texts` — so it is
+                // taken here rather than read a second time. A restriction that
+                // selects nothing is still a restriction: the `Option`, not the
+                // emptiness, says whether the record narrowed its inputs this
+                // pass.
+                let restricted: Option<InputLinkTexts> = if plan.narrows_input_links {
+                    instance
+                        .record
+                        .select_input_links(sel_selector)
+                        .map(|subset| input_link_texts.read_narrowed(instance, subset))
                 } else {
-                    own.iter().position(|(lf, _)| *lf == link_field)
+                    None
                 };
-                debug_assert!(
-                    cache_slot.is_some(),
-                    "select_input_links must narrow to a subset of multi_input_links"
-                );
-                let Some(cache_slot) = cache_slot else {
-                    continue;
-                };
-                debug_assert_eq!(
-                    own[cache_slot],
-                    (link_field, val_field),
-                    "a narrowed link is the same pair as its multi_input_links entry"
-                );
-                let Some(outcome) = self.fetch_multi_input(guard, plan, own, cache_slot, visited)
-                else {
-                    continue;
-                };
-                if fold.note(
-                    input_fetch_policy,
-                    cache_slot,
-                    slot + 1 == declared.len(),
-                    outcome,
-                ) {
-                    break;
+                let link_texts = restricted.as_ref().unwrap_or(input_link_texts);
+                let declared = link_texts.links();
+                // The record's cache is indexed by its OWN list; a narrowed list
+                // maps each of its slots back by name.
+                let own = link_texts.own();
+                let own_list = std::ptr::eq(declared, own);
+                // Over the set links only: C's loop visits every declared link,
+                // but an unset one is a `dbConstGetValue` success with nothing to
+                // deliver, so the passes it would make here are no-ops.
+                let mut wired = link_texts.wired();
+                while wired != 0 {
+                    let slot = wired.trailing_zeros() as usize;
+                    wired &= wired - 1;
+                    let (link_field, val_field) = declared[slot];
+                    let cache_slot = if own_list {
+                        Some(slot)
+                    } else {
+                        own.iter().position(|(lf, _)| *lf == link_field)
+                    };
+                    debug_assert!(
+                        cache_slot.is_some(),
+                        "select_input_links must narrow to a subset of multi_input_links"
+                    );
+                    let Some(cache_slot) = cache_slot else {
+                        continue;
+                    };
+                    debug_assert_eq!(
+                        own[cache_slot],
+                        (link_field, val_field),
+                        "a narrowed link is the same pair as its multi_input_links entry"
+                    );
+                    let Some(outcome) =
+                        self.fetch_multi_input(guard, plan, own, cache_slot, visited)
+                    else {
+                        continue;
+                    };
+                    if fold.note(
+                        input_fetch_policy,
+                        cache_slot,
+                        slot + 1 == declared.len(),
+                        outcome,
+                    ) {
+                        break;
+                    }
                 }
             }
 
@@ -6519,18 +6788,15 @@ impl PvDatabase {
             // delivered no value": `dbGetLink` on an unset OR constant link
             // returns success (`dbConstGetValue`), and the field it would have
             // written keeps its init-seeded value, which flows into `do_sel`.
-            // `Specified` mode returns early on a failed NVL read
-            // (`selRecord.c:423-425`), before any INP is touched. Only `sel`
-            // reads NVL, so this needs no record-type test.
-            let fetch_values_failed = fold.failed(input_fetch_policy, sel_nvl_read_failed);
+            let fetch_values_failed = fold.failed(input_fetch_policy);
 
             // The outcome, delivered here under the guard the loop holds: to
             // `Record::set_fetch_gate_failed` for the records that compute in
             // their own `process()` (calc/calcout/scalcout/acalcout/swait/sel)
             // — written on EVERY cycle, `false` included, so the flag cannot
             // outlive the cycle it belongs to — and, for sub/aSub, whose body
-            // is the framework-dispatched subroutine, to the same one-shot
-            // skip the bad-SNAM path arms (C `subRecord.c:144-147`,
+            // is the framework-dispatched subroutine, to the one-shot do_sub
+            // skip (C `subRecord.c:144-147`,
             // `aSubRecord.c:216-218`: `status = fetch_values(prec); if
             // (status == 0) status = do_sub(prec);`), consumed by the single
             // owner `run_registered_subroutine`.
@@ -6539,11 +6805,12 @@ impl PvDatabase {
             if fetch_values_failed {
                 inst.skip_subroutine_this_cycle();
             }
-        }
+            fetch_values_failed
+        };
         let resolved = fold.resolved;
-        // The two stages below read this record by name through the shared
-        // lock, so they run with the guard released.
-        if plan.string_input || plan.resolves_subroutine_from_link {
+        // The string-input fetch below reads this record by name through the
+        // shared lock, so it runs with the guard released.
+        if plan.string_input {
             guard.release();
         }
 
@@ -6579,24 +6846,16 @@ impl PvDatabase {
         // fetch gate (`return(0)` at :943, so a failing string link never
         // suppresses sCalcPerform), a failed read writes a diagnostic INTO the
         // value field instead of leaving it alone, and a multi-element
-        // DBF_CHAR/DBF_UCHAR source is read as escaped text. See
+        // DBF_CHAR/DBF_UCHAR source is read as escaped text. It is reached
+        // only past the numeric loop's `return(status)` (:886), so a failed
+        // numeric input leaves AA..LL as they were. See
         // `Record::string_input_links`.
-        let string_input_values: Vec<(String, EpicsValue)> = if !plan.string_input {
-            Vec::new()
-        } else {
-            self.fetch_string_inputs(rec, name, visited, &mut link_alarms)
-        };
-
-        // aSub LFLG=READ: re-read the subroutine name from the SUBL link and,
-        // if it changed, re-resolve the function — computed here, before the
-        // process write lock, so the SUBL link read cannot deadlock against
-        // this record (C `aSubRecord.c::fetch_values`). `None` for everything
-        // that is not an aSub in READ mode.
-        let asub_dynamic = if plan.resolves_subroutine_from_link {
-            self.resolve_asub_dynamic_subroutine(rec, visited)
-        } else {
-            None
-        };
+        let string_input_values: Vec<(String, EpicsValue)> =
+            if !plan.string_input || fetch_values_failed {
+                Vec::new()
+            } else {
+                self.fetch_string_inputs(rec, name, visited, &mut link_alarms)
+            };
 
         InputStage {
             is_soft,
@@ -7639,51 +7898,52 @@ impl PvDatabase {
                             self.apply_pact_exit(name, cycle_end.take());
                             return Ok(());
                         }
-                        let read = match begun {
-                            Ok(_) if facts.device_reads_own => {
-                                let (record, own) = instance.split_own();
-                                dev.read_own(record, own)
-                            }
-                            Ok(_) => dev.read_common(&mut *instance.record, &mut instance.common),
-                            Err(e) => Err(e),
-                        };
-                        match read {
-                            Ok(read_outcome) => {
-                                let status = read_outcome.status;
-                                device_did_compute = status.skips_conversion();
-                                if status.read_failed() {
-                                    read_produced_no_value = true;
-                                    cycle_status.io(Err(DbStatus::FAILED));
+                        let refused = begun.is_err();
+                        // A read that errs or was refused sourced no value, as
+                        // C's `-1` from `read_ai` misses `if (status==0)
+                        // convert` (aiRecord.c:158). C prints nothing for it
+                        // (`aiRecord.c:482`, `dbAccess.c:612`).
+                        let read_outcome = begun
+                            .and_then(|_| {
+                                if facts.device_reads_own {
+                                    let (record, own) = instance.split_own();
+                                    dev.read_own(record, own)
+                                } else {
+                                    dev.read_common(&mut *instance.record, &mut instance.common)
                                 }
-                                device_read_computed = matches!(
-                                    status,
-                                    crate::server::device_support::DeviceReadStatus::Computed
-                                );
-                                // A C dset writes `prec->udf` itself, before
-                                // its `return` — `devBiSoft.c::readLocked` and
-                                // `devBiDbState.c:67` clear it, `devAsynInt32.c
-                                // :902` sets it. Ours cannot reach `dbCommon`
-                                // through the `&mut dyn Record` it holds, so the
-                                // framework — the single owner of the UDF
-                                // transition — applies what the outcome states,
-                                // HERE, before the record's own rule below: C's
-                                // order is dset first, `process()` second, and
-                                // for the record types that re-derive
-                                // unconditionally the second write is what wins.
-                                use crate::server::device_support::DeviceUdf;
-                                match read_outcome.udf() {
-                                    DeviceUdf::Untouched => {}
-                                    DeviceUdf::Defined => instance.common.udf = 0,
-                                    DeviceUdf::Undefined => instance.common.udf = 1,
-                                }
-                                if !read_outcome.actions.is_empty() {
-                                    device_actions = Some(read_outcome.actions);
-                                }
-                            }
-                            // C prints nothing for a failed `read_ai`
-                            // (`aiRecord.c:482`, `dbAccess.c:612`); the device
-                            // support says what it has to.
-                            Err(_) => cycle_status.io(Err(DbStatus::FAILED)),
+                            })
+                            .unwrap_or_else(|_| {
+                                crate::server::device_support::DeviceReadOutcome::failed()
+                            });
+                        let status = read_outcome.status;
+                        device_did_compute = status.skips_conversion();
+                        if status.read_failed() {
+                            read_produced_no_value = true;
+                            cycle_status.io(Err(DbStatus::FAILED));
+                        }
+                        device_read_computed = matches!(
+                            status,
+                            crate::server::device_support::DeviceReadStatus::Computed
+                        );
+                        // A C dset writes `prec->udf` itself, before
+                        // its `return` — `devBiSoft.c::readLocked` and
+                        // `devBiDbState.c:67` clear it, `devAsynInt32.c
+                        // :902` sets it. Ours cannot reach `dbCommon`
+                        // through the `&mut dyn Record` it holds, so the
+                        // framework — the single owner of the UDF
+                        // transition — applies what the outcome states,
+                        // HERE, before the record's own rule below: C's
+                        // order is dset first, `process()` second, and
+                        // for the record types that re-derive
+                        // unconditionally the second write is what wins.
+                        use crate::server::device_support::DeviceUdf;
+                        match read_outcome.udf() {
+                            DeviceUdf::Untouched => {}
+                            DeviceUdf::Defined => instance.common.udf = 0,
+                            DeviceUdf::Undefined => instance.common.udf = 1,
+                        }
+                        if !read_outcome.actions.is_empty() {
+                            device_actions = Some(read_outcome.actions);
                         }
                         instance.device = Some(dev);
                         if rec.callbacks_owed() {
@@ -7692,7 +7952,9 @@ impl PvDatabase {
                         }
                         // An input's device raises its alarm in `readValue`,
                         // ahead of the record body.
-                        if !plan.output_stage {
+                        if refused {
+                            apply_refused_read_alarm(instance);
+                        } else if !plan.output_stage {
                             apply_device_alarm(instance, is_soft);
                         }
                     }
@@ -7841,8 +8103,7 @@ impl PvDatabase {
                 instance.set_process_continuation(is_continuation);
 
                 // Apply the aSub LFLG=READ resolution computed above (outside the
-                // lock). The single apply owner; the bad-sub skip is carried on the
-                // instance and consumed by `run_registered_subroutine`.
+                // lock). The single apply owner.
                 if let Some(ds) = links
                     .and_then(|l| l.rare.as_ref())
                     .and_then(|r| r.asub_dynamic.as_ref())
@@ -8540,21 +8801,7 @@ impl PvDatabase {
                     // on the callback path, not recursively inside this cycle.
                     if !skip_out && plan.posts_output_event {
                         if let Some(event_name) = instance.record.output_event() {
-                            let db = self.clone();
-                            // Middle band, not this record's PRIO: C `postEvent`
-                            // fires one `callbackRequest` per non-empty band and
-                            // each carries the *scanned* record's priority
-                            // (`dbScan.c:513-527`), a fan-out the port's single
-                            // Event list cannot express (`scan_index.rs`
-                            // `post_event_named`). The poster's own PRIO is not
-                            // the answer, so this keeps `callbackRequest`'s
-                            // general band (`callback.h:42`).
-                            crate::runtime::task::spawn_background(
-                                crate::runtime::task::CallbackPriority::Medium,
-                                async move {
-                                    db.post_event_named(event_name.as_bytes()).await;
-                                },
-                            );
+                            self.request_event_post(event_name);
                         }
                     }
 
@@ -9447,12 +9694,9 @@ impl PvDatabase {
         // C pins every put-notify callback to the low band —
         // `callbackSetPriority(priorityLow, &pnotifyPvt->callback)`
         // (`dbNotify.c:131`) — regardless of the record's PRIO.
-        crate::runtime::task::spawn_background(
-            crate::runtime::task::CallbackPriority::Low,
-            async move {
-                db.restart_next_notify_put(&put_name).await;
-            },
-        );
+        self.spawn_callback(crate::runtime::task::CallbackPriority::Low, async move {
+            db.restart_next_notify_put(&put_name).await;
+        });
     }
 
     /// Forward-link / CP / RPRO tail for the simulation-mode path.
@@ -10331,9 +10575,6 @@ impl PvDatabase {
     /// [`Self::complete_async_record`] on the calling thread: a
     /// [`DeviceDone`]'s callback band runs it.
     fn complete_async_write(&self, name: &[u8]) -> CaResult<()> {
-        if !self.accepts_reentry() {
-            return Ok(());
-        }
         // Alias-aware entry — same pattern as
         // `process_record_with_links_inner`. `name` may arrive as an alias
         // from an async device-support callback that captured the original
@@ -10370,9 +10611,6 @@ impl PvDatabase {
         canonical: RecordName,
         rec: InFrame<'_>,
     ) -> CaResult<()> {
-        if !self.accepts_reentry() {
-            return Ok(());
-        }
         self.complete_async_record_inner(canonical, rec, &mut ProcStack::new())
     }
 
@@ -10510,21 +10748,7 @@ impl PvDatabase {
                 // `process_record_with_links_inner`.
                 if !skip_out {
                     if let Some(event_name) = instance.output_event() {
-                        let db = self.clone();
-                        // Middle band, not this record's PRIO: C `postEvent`
-                        // fires one `callbackRequest` per non-empty band and
-                        // each carries the *scanned* record's priority
-                        // (`dbScan.c:513-527`), a fan-out the port's single
-                        // Event list cannot express (`scan_index.rs`
-                        // `post_event_named`). The poster's own PRIO is not
-                        // the answer, so this keeps `callbackRequest`'s
-                        // general band (`callback.h:42`).
-                        crate::runtime::task::spawn_background(
-                            crate::runtime::task::CallbackPriority::Medium,
-                            async move {
-                                db.post_event_named(event_name.as_bytes()).await;
-                            },
-                        );
+                        self.request_event_post(event_name);
                     }
                 }
 
@@ -11027,7 +11251,7 @@ impl PvDatabase {
         self.convert_link_fetch_as(
             Reader::Frame(reader),
             link_field,
-            link,
+            super::links::ReadLink::Unresolved(link),
             request,
             &mut fetch,
             render,
@@ -11099,12 +11323,17 @@ impl PvDatabase {
         &self,
         reader: Reader<'_>,
         link_field: &'static str,
-        link: &crate::server::record::ParsedLink,
+        link: super::links::ReadLink<'_>,
         request: crate::server::record::InputLinkRequest,
         fetch: &mut crate::server::recgbl::simm::LinkFetch,
         render: Option<crate::server::record::record_instance::SourceRender>,
     ) -> bool {
         if !link_fetch_converts(request, fetch) {
+            if let crate::server::recgbl::simm::LinkFetch::Value(value) = &*fetch
+                && self.refuses_native(link, value)
+            {
+                *fetch = crate::server::recgbl::simm::LinkFetch::Failed;
+            }
             return false;
         }
         self.convert_link_value(reader, link_field, link, request, fetch, render)
@@ -11116,7 +11345,7 @@ impl PvDatabase {
         &self,
         reader: Reader<'_>,
         link_field: &'static str,
-        link: &crate::server::record::ParsedLink,
+        link: super::links::ReadLink<'_>,
         request: crate::server::record::InputLinkRequest,
         fetch: &mut crate::server::recgbl::simm::LinkFetch,
         render: Option<crate::server::record::record_instance::SourceRender>,
@@ -11126,15 +11355,17 @@ impl PvDatabase {
         let LinkFetch::Value(value) = std::mem::replace(fetch, LinkFetch::NoData) else {
             unreachable!("gated by convert_link_fetch_as");
         };
-        match reader.read_as(self, link_field, link, request) {
+        match reader.read_as(self, link_field, link.parsed(), request) {
             None => false,
             Some(LinkReadAs::Array { dbr, n_request })
                 if value.is_array()
                     && value.db_field_type() == dbr
-                    && dbr != crate::types::DbFieldType::Enum =>
+                    && dbr != crate::types::DbFieldType::Enum
+                    && self.read_link_route(link).is_none() =>
             {
-                // The source already holds the request's element type: a
-                // truncate and a move, not a conversion.
+                // The source already holds the request's element type, and
+                // `dbGet` takes no route past the convert: a truncate and a
+                // move, not a conversion.
                 let mut value = value;
                 value.truncate(n_request);
                 *fetch = LinkFetch::Value(value);
@@ -11227,6 +11458,9 @@ impl PvDatabase {
             target,
             request.renders_at_source(),
         );
+        let link = target.map_or(super::links::ReadLink::Unresolved(link), |at| {
+            super::links::ReadLink::Resolved(link, at.route)
+        });
         let store_raw = self.convert_link_fetch_as(
             Reader::Frame(rec),
             link_field,
@@ -11286,7 +11520,7 @@ impl PvDatabase {
             InputLinkRequest::As(read_as) => Some(read_as),
             // C's `default:` arm — the record's switch has no case for this
             // link, so `dbGetLink` is never called.
-            InputLinkRequest::NotRead => None,
+            InputLinkRequest::NotRead | InputLinkRequest::FromEarlierLinks => None,
             InputLinkRequest::FromSource => from_source(&self.resolve_out_target(link)),
         }
     }
@@ -11307,13 +11541,13 @@ impl PvDatabase {
         let read = match request {
             InputLinkRequest::As(read_as) => self.apply_link_read_as(
                 Some(rec.set()),
-                link,
+                super::links::ReadLink::Unresolved(link),
                 read_as,
                 value,
                 render,
                 ReadDest::Frame(rec, link_field),
             ),
-            InputLinkRequest::NotRead => return None,
+            InputLinkRequest::NotRead | InputLinkRequest::FromEarlierLinks => return None,
             InputLinkRequest::FromSource => {
                 self.typed_input_value(rec, link_field, link, value, render)
             }
@@ -11341,6 +11575,7 @@ impl PvDatabase {
             return Err(None);
         };
         let dest = ReadDest::Frame(rec, link_field);
+        let link = super::links::ReadLink::Unresolved(link);
         self.apply_link_read_as(Some(rec.set()), link, read_as, value, render, dest)
     }
 
@@ -11669,7 +11904,7 @@ impl PvDatabase {
 /// (`aoRecord.c:112` before `:127`, `lsoRecord.c:82` before `:85`,
 /// `aSubRecord.c:126` before the SNAM lookup at `:139`), so a device that
 /// reads back at init sees the seed and overwrites it. Only
-/// `RecordInstance::run_init_pass1` calls this, before `init_device_support`.
+/// `RecordInstance::init_pass1_tail` calls this, before `init_device_support`.
 ///
 /// [`Record::constant_init_links`]: crate::server::record::Record::constant_init_links
 pub(crate) fn seed_record_constants(instance: &mut RecordInstance) {
@@ -12795,6 +13030,22 @@ fn apply_hard_device_alarm(instance: &mut RecordInstance) {
         crate::server::record::AlarmSeverity::from_u16(alarm.sevr),
         alarm.msg,
     );
+}
+
+/// A refused `read_begin`'s alarm: the device's own, with READ_ALARM and
+/// INVALID filling what it left unset, as C `processAi` maps a refused
+/// `queueRequest` through `asynStatusToEpicsAlarm` (asynEpicsUtils.c:234-266).
+fn apply_refused_read_alarm(instance: &mut RecordInstance) {
+    use crate::server::recgbl::alarm_status::{NO_ALARM, READ_ALARM};
+    use crate::server::record::AlarmSeverity;
+    let alarm = instance.device.as_ref().and_then(|d| d.last_alarm());
+    let (stat, sevr, msg) = alarm.map_or((NO_ALARM, 0, ""), |a| (a.stat, a.sevr, a.msg));
+    let stat = if stat == NO_ALARM { READ_ALARM } else { stat };
+    let sevr = match AlarmSeverity::from_u16(sevr) {
+        AlarmSeverity::NoAlarm => AlarmSeverity::Invalid,
+        sevr => sevr,
+    };
+    crate::server::recgbl::rec_gbl_set_sevr_msg(&mut instance.common, stat, sevr, msg);
 }
 
 /// Shared tail of a simulated (`SIMM` != NO) process cycle — the part of
@@ -13948,13 +14199,16 @@ impl PvDatabase {
             return simple(&pv);
         }
         let parts = super::DbNameParts::of(name);
-        let char_view = parts.char_view().then_some(request);
         let cell = self.get_record(parts.record)?;
         let field = cell.canonical_field(parts.field_or_val()).into_owned();
         self.no_elements(&cell, &field)?;
-        if char_view.is_some() {
+        if parts.char_view() {
             self.char_addressed(&cell, &field, None)?;
         }
+        // `getAttrValue` reads the attribute's text with or without `$`, and
+        // refuses any request but a string or chars (`dbAccess.c:865-895,950-953`).
+        let attribute = self.attribute_field_type(&cell, &field).is_some();
+        let char_view = (parts.char_view() || attribute).then_some(request);
         let own = own.and_then(|own| Some((self.get_record(own.name())?, own)));
         let own = own.as_ref().map(|(cell, own)| (&**cell, *own));
         if let Some(got) = self.db_get_held(&cell, &field, char_view, own, read) {
@@ -14015,12 +14269,12 @@ impl PvDatabase {
 }
 
 /// What [`PvDatabase::db_get_owed`] reads of a field, its set held: through
-/// its `$` address, as the [`CharGet`] asks, when there is one.
+/// its `$` address, or an attribute's text, as the [`CharGet`] asks.
 type FieldRead<T> =
     fn(&PvDatabase, &Arc<RecordCell>, &str, Option<CharGet>, ReadPolicy<'_>) -> Option<T>;
 
 /// `dbGet`'s request type and `nRequest`, which a read through a `$`
-/// address converts in (`CharView::get`).
+/// address, or of an attribute's text, converts in (`CharView::get`).
 #[derive(Clone, Copy)]
 pub(crate) struct CharGet {
     dbr: DbFieldType,
@@ -14083,7 +14337,7 @@ fn dbr_string_at(
         .flatten()
 }
 
-/// `dbGet` of `get` through `field`'s `$` address.
+/// `dbGet` of `get` through `field`'s `$` address or attribute text.
 fn char_get_at(
     cell: &RecordCell,
     field: &str,

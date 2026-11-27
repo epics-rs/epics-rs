@@ -1387,6 +1387,11 @@ impl LocalChannel {
         self.chan.final_element_count
     }
 
+    /// The record, or the PV, the channel addresses.
+    pub(super) fn target(&self) -> &ChannelTarget {
+        &self.chan.target
+    }
+
     /// `dbContextReadNotifyCache::callReadNotify`
     /// (`dbContextReadNotifyCache.cpp:60-110`): `dbChannel_get` of
     /// `dbr_type`, `count` elements, completed synchronously.
@@ -1929,7 +1934,7 @@ record(ao, "OUT") { field(OUT, "SRC CA") }
         );
 
         assert_eq!(db.inner.ca_links.get_cached_value(out), None);
-        let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+        let deadline = crate::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
         while db.inner.ca_links.get_cached_value(out).is_none() {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -2018,7 +2023,7 @@ record(ao, "OUT") { field(OUT, "SRC CA") }
         }
         release.send(()).unwrap();
         holder.join().unwrap();
-        let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+        let deadline = crate::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
         while monitors() == 0 {
             assert!(std::time::Instant::now() < deadline, "the open subscribes");
             crate::runtime::task::sleep(Duration::from_millis(5)).await;
@@ -2130,7 +2135,7 @@ record(calc, "H2") { field(INPA, "SRC CP") field(CALC, "A") }
     /// second: long enough for any other thread to overtake.
     #[cfg(tokio_backend)]
     fn hold_until(done: impl Fn() -> bool) {
-        let deadline = std::time::Instant::now() + Duration::from_millis(200);
+        let deadline = crate::runtime::time::deadline_from_now(Duration::from_millis(200));
         while !done() && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -2417,7 +2422,7 @@ record(calc, "H2") { field(INPA, "SRC CP") field(CALC, "A") }
     }
 
     async fn until(done: impl Fn() -> bool, what: &str) {
-        let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+        let deadline = crate::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
         while !done() {
             assert!(
                 std::time::Instant::now() < deadline,

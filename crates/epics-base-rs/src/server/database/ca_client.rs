@@ -17,9 +17,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::task::{Context, Poll, Wake, Waker};
 
-use super::ca_link::{LocalChannel, StateNotify};
+use super::ca_link::StateNotify;
 use super::{PvDatabase, PvDatabaseInner};
 use crate::error::CaError;
+use crate::error::eca::{ECA_EVDISALLOW, eca_message};
 use crate::runtime::task::{
     BlockingBridge, NotBlockable, StackSizeClass, TaskHandle, ThreadPriority, block_on_sync,
     current_thread_id, spawn_dedicated_thread, thread_by_id,
@@ -28,6 +29,7 @@ use crate::server::event_queue::{CircuitEvent, DeliveryContext, EventReader, Eve
 use crate::server::pv::MonitorEvent;
 use crate::server::snapshot::Snapshot;
 use crate::types::{DbFieldType, EpicsValue};
+use context_channel::ContextChannel;
 
 /// A boxed future the client hands back, run wherever the caller spawns it.
 pub type ClientFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
@@ -66,7 +68,8 @@ pub trait ClientChannel: Send + Sync {
 
     /// `ca_add_masked_array_event` of `count` elements of `dbr_type`: each
     /// value reaches `callback` until the subscription drops, one callback
-    /// at a time per context.
+    /// at a time with the context's others of the channel's kind, in-process
+    /// or network; neither kind waits on the other.
     async fn subscribe(
         &self,
         dbr_type: u16,
@@ -82,14 +85,17 @@ pub trait ClientChannel: Send + Sync {
     -> Result<Option<PutCompletion>, String>;
 }
 
-/// One `evid`: dropping it is `ca_clear_subscription`. It does not wait
-/// for a callback already running.
+/// One `evid`: dropping it is `ca_clear_subscription`. Outside every
+/// subscription's callback the drop waits for this one's running callback,
+/// and none runs after it. Inside a callback, of any context, it waits for
+/// none: a callback whose delivery had begun may still run after it, and
+/// no later delivery reaches one.
 pub struct ClientSubscription {
     _held: Box<dyn Send>,
 }
 
 impl ClientSubscription {
-    /// A subscription that ends when `held` drops.
+    /// A subscription that ends when `held` drops, which keeps that rule.
     pub fn new(held: impl Send + 'static) -> Self {
         Self {
             _held: Box::new(held),
@@ -100,9 +106,14 @@ impl ClientSubscription {
 /// The network context's half of [`CaClientContext::create_channel`].
 #[async_trait::async_trait]
 pub trait CaClientService: Send + Sync {
-    /// `ca_create_channel` of a name this database does not serve; `None`
-    /// when the client cannot start.
-    async fn create_channel(&self, name: &str) -> Option<Arc<dyn ClientChannel>>;
+    /// `ca_create_channel` of a name this database does not serve, for the
+    /// context whose event context is `events`; `None` when the client
+    /// cannot start.
+    async fn create_channel(
+        &self,
+        name: &str,
+        events: &InProcessEvents,
+    ) -> Option<Arc<dyn ClientChannel>>;
 }
 
 /// libca's context with `dbContext` installed as its service. Its clones
@@ -147,15 +158,14 @@ impl CaClientContext {
     /// whose search nobody answers.
     pub async fn create_channel(&self, name: &str) -> Option<Arc<dyn ClientChannel>> {
         let db = self.db()?;
-        if let Some(channel) = LocalChannel::create(&db, name.as_bytes()).await {
+        if let Some(chan) = ContextChannel::create(&db, name, &self.events).await {
             return Some(Arc::new(LocalClientChannel {
-                channel,
-                events: self.events.clone(),
+                chan,
                 announced: std::sync::atomic::AtomicBool::new(false),
             }));
         }
         let service = db.inner.ca_links.client_service()?;
-        service.create_channel(name).await
+        service.create_channel(name, &self.events).await
     }
 
     /// `dbContext::createChannel`'s `dbChannel_create`, on the calling
@@ -164,19 +174,15 @@ impl CaClientContext {
     pub fn create_in_process(&self, name: &str) -> Option<InProcessChannel> {
         let db = self.db()?;
         let bridge = db.inner.link_puts.network()?.clone();
-        let channel = in_caller(&bridge, LocalChannel::create(&db, name.as_bytes())).ok()??;
-        Some(InProcessChannel {
-            channel,
-            bridge,
-            events: self.events.clone(),
-        })
+        let chan = in_caller(&bridge, ContextChannel::create(&db, name, &self.events)).ok()??;
+        Some(InProcessChannel { chan, bridge })
     }
 
     /// `dbContext::createChannel`'s network context alone, for a name
     /// [`Self::create_in_process`] did not find.
     pub async fn create_network(&self, name: &str) -> Option<Arc<dyn ClientChannel>> {
         let service = self.db()?.inner.ca_links.client_service()?;
-        service.create_channel(name).await
+        service.create_channel(name, &self.events).await
     }
 
     /// Run `future` on the reactor the database's CA links run on. `None`
@@ -214,26 +220,24 @@ fn in_caller<F: Future>(bridge: &BlockingBridge, fut: F) -> Result<F::Output, No
 /// disconnected, full access, and each request made on the calling thread,
 /// which waits there as C's caller does.
 pub struct InProcessChannel {
-    channel: LocalChannel,
+    chan: ContextChannel,
     bridge: BlockingBridge,
-    /// Its context's.
-    events: InProcessEvents,
 }
 
 impl InProcessChannel {
     /// `dbChannelIO::nativeType`.
     pub fn native_type(&self) -> DbFieldType {
-        self.channel.native_type()
+        self.chan.native_type()
     }
 
     /// `dbChannelIO::nativeElementCount`.
     pub fn element_count(&self) -> u32 {
-        self.channel.element_count()
+        self.chan.element_count()
     }
 
     /// `dbChannelIO::read`: `count` elements of `dbr_type`.
     pub fn get(&self, dbr_type: u16, count: u32) -> Result<Snapshot, String> {
-        read(&self.channel, dbr_type, count)
+        self.chan.get(dbr_type, count)
     }
 
     /// `dbChannelIO::subscribe` on its context's event context: the first
@@ -246,27 +250,14 @@ impl InProcessChannel {
         mask: u16,
         callback: impl Fn(Snapshot) + Send + Sync + 'static,
     ) -> Result<InProcessSubscription, String> {
-        subscribe(
-            &self.channel,
-            &self.events,
-            dbr_type,
-            count,
-            mask,
-            Box::new(callback),
-        )
+        self.chan
+            .subscribe(dbr_type, count, mask, Box::new(callback))
     }
 
     /// `dbChannelIO::write`: `dbChannel_put`, done when this returns, run
     /// as a put of its context.
     pub fn put(&self, value: EpicsValue) -> Result<(), String> {
-        let value = put_value(&self.channel, value);
-        let put = self
-            .events
-            .0
-            .0
-            .running
-            .run(self.channel.issue_put(value, false));
-        in_caller(&self.bridge, put)
+        in_caller(&self.bridge, self.chan.put(value, false))
             .map_err(|e| e.to_string())?
             .map(drop)
     }
@@ -281,9 +272,7 @@ impl InProcessChannel {
         value: EpicsValue,
         issued: impl FnOnce(PutCompletion) -> R,
     ) -> Result<R, CaError> {
-        let value = put_value(&self.channel, value);
-        let put = async { self.channel.put_callback(value).await.map(issued) };
-        in_caller(&self.bridge, self.events.0.0.running.run(put))
+        in_caller(&self.bridge, self.chan.put_callback(value, issued))
             .map_err(|e| CaError::Protocol(e.to_string()))?
     }
 }
@@ -293,31 +282,70 @@ impl InProcessChannel {
 /// `CAC-event`, its consumer, which the first subscription starts at the
 /// lowest priority above its own thread's. Entries reach their callbacks
 /// one at a time in post order, on that thread or in [`Self::deliver`],
-/// each after the runs of the context's puts going when it is taken
-/// (`Running`). The thread returns when the last clone
-/// drops (`db_close_events`).
+/// each after the runs of the context's puts on its record going when it
+/// is taken (`Running`). The context's network subscriptions
+/// ([`Self::subscribe_network`]) are delivered apart, on their own thread.
+/// The threads return when the last clone drops (`db_close_events`).
 #[derive(Clone, Default)]
 pub struct InProcessEvents(Arc<EventsOwner>);
 
 impl InProcessEvents {
-    /// What is queued now, delivered on the calling thread in its turn
-    /// with what `CAC-event` delivers. The caller holds no lock a callback
-    /// takes. Inside one of this context's callbacks it does nothing, as
-    /// C's callbacks run on the one thread that is already delivering.
-    pub fn deliver(&self) {
+    /// The in-process entries queued now, delivered on the calling thread
+    /// in their turn with what `CAC-event` delivers. The caller holds no
+    /// lock a callback takes. Inside a subscription's callback, of any
+    /// context, it is refused, as libca refuses `ca_pend_event` on a
+    /// callback thread (`ca_client_context.cpp:529-532`): a callback
+    /// delivering another context could wait on one delivering its own.
+    /// Inside a put of any client context, in its record's processing or
+    /// [`InProcessChannel::put_callback`]'s `issued`, it does nothing:
+    /// `CAC-event` may be waiting on that put, and delivers after it.
+    pub fn deliver(&self) -> Result<(), EvDisallow> {
+        if IN_CALLBACK.get() {
+            return Err(EvDisallow);
+        }
         self.0.0.deliver();
+        Ok(())
+    }
+
+    /// A network subscription of this context: each value `values` yields
+    /// (`None` once it ends) reaches `callback` on the context's
+    /// `CAC-callback` thread, one at a time with its other network
+    /// callbacks, as libca's receive thread calls them under the context's
+    /// `cbMutex` (`tcpiiu.cpp:498-519`). The thread starts at the highest
+    /// priority below the first network subscriber's, as the receive thread
+    /// is below the context creator's (`tcpiiu.cpp:676-678`). A callback
+    /// that waits holds up the context's network delivery only.
+    pub fn subscribe_network(
+        &self,
+        values: Box<dyn FnMut(&mut Context<'_>) -> Poll<Option<Snapshot>> + Send>,
+        callback: Box<dyn Fn(Snapshot) + Send + Sync>,
+    ) -> Result<ClientSubscription, String> {
+        let events = &self.0.0;
+        events.start_network()?;
+        let route = Arc::new(NetworkRoute {
+            values: parking_lot::Mutex::new(Some(values)),
+            callback: Callback::new(callback),
+        });
+        events.network.routes.lock().push(Arc::downgrade(&route));
+        // Its first poll is what registers the waker its values wake.
+        events.network.thread.wake();
+        Ok(ClientSubscription::new(NetworkSubscription(route)))
     }
 }
+
+/// `ECA_EVDISALLOW`: [`InProcessEvents::deliver`] inside a subscription's
+/// callback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("{}", eca_message(ECA_EVDISALLOW))]
+pub struct EvDisallow;
 
 #[derive(Default)]
 struct EventsOwner(Arc<Events>);
 
 impl Drop for EventsOwner {
     fn drop(&mut self) {
-        self.0.stop.store(true, Ordering::Release);
-        if let Some(started) = self.0.started.get() {
-            started.thread.unpark();
-        }
+        self.0.cac_event.stop();
+        self.0.network.thread.stop();
     }
 }
 
@@ -328,17 +356,91 @@ struct Events {
     /// callbacks in post order whichever thread takes them.
     consumer: parking_lot::Mutex<()>,
     running: Running,
-    starting: parking_lot::Mutex<()>,
-    started: OnceLock<Started>,
-    stop: AtomicBool,
+    cac_event: Deliverer,
+    network: Network,
 }
 
-/// `CAC-event`, and the waker every take parks the chain on: the chain has
-/// one `ppendsem`, so a take with any other waker would leave the thread
-/// asleep on the next post.
+/// The context's network subscriptions, which only their own thread
+/// delivers.
+#[derive(Default)]
+struct Network {
+    routes: parking_lot::Mutex<Vec<Weak<NetworkRoute>>>,
+    thread: Deliverer,
+}
+
+/// One of a context's delivery threads, started by the first subscription
+/// it delivers and parked between passes.
+#[derive(Default)]
+struct Deliverer {
+    starting: parking_lot::Mutex<()>,
+    started: OnceLock<Started>,
+    stop: Arc<AtomicBool>,
+}
+
+/// The thread, and the waker every take it delivers parks on: the event
+/// chain has one `ppendsem`, so a take with any other waker would leave the
+/// thread asleep on the next post.
 struct Started {
     thread: std::thread::Thread,
     waker: Waker,
+}
+
+impl Deliverer {
+    /// `name` at `priority`, each pass `pass`, unless it is started.
+    fn start(
+        &self,
+        name: &str,
+        priority: u32,
+        stack: StackSizeClass,
+        pass: impl Fn() + Send + 'static,
+    ) -> Result<(), String> {
+        let _starting = self.starting.lock();
+        if self.started.get().is_some() {
+            return Ok(());
+        }
+        let stop = self.stop.clone();
+        let handle = spawn_dedicated_thread(
+            name.into(),
+            ThreadPriority::Custom(priority),
+            stack,
+            move || {
+                while !stop.load(Ordering::Acquire) {
+                    pass();
+                    std::thread::park();
+                }
+            },
+        )
+        .map_err(|e| format!("{name} thread could not be created: {e}"))?;
+        let thread = handle.thread().clone();
+        let waker = Waker::from(Arc::new(Unpark(thread.clone())));
+        let _ = self.started.set(Started {
+            thread: thread.clone(),
+            waker,
+        });
+        // Its first pass may have run before it had the waker to park on.
+        thread.unpark();
+        Ok(())
+    }
+
+    fn waker(&self) -> Option<&Waker> {
+        self.started.get().map(|started| &started.waker)
+    }
+
+    fn wake(&self) {
+        if let Some(started) = self.started.get() {
+            started.thread.unpark();
+        }
+    }
+
+    fn stop(&self) {
+        self.stop.store(true, Ordering::Release);
+        self.wake();
+    }
+}
+
+/// The calling thread's EPICS priority.
+fn own_priority() -> u32 {
+    thread_by_id(current_thread_id()).map_or(ThreadPriority::Medium.value(), |t| t.epics_priority())
 }
 
 struct Unpark(std::thread::Thread);
@@ -350,8 +452,32 @@ impl Wake for Unpark {
 }
 
 thread_local! {
-    /// The event context whose entry this thread is delivering.
+    /// The event context whose callbacks, of either kind, this thread is
+    /// delivering.
     static DELIVERING: Cell<*const Events> = const { Cell::new(std::ptr::null()) };
+
+    /// How many runs of client contexts' puts this thread is in.
+    static IN_RUNS: Cell<usize> = const { Cell::new(0) };
+
+    /// Whether this thread is inside a subscription's callback, where no
+    /// drop of a subscription waits and [`InProcessEvents::deliver`] is
+    /// refused.
+    static IN_CALLBACK: Cell<bool> = const { Cell::new(false) };
+}
+
+/// [`IN_CALLBACK`] across one callback, restored on every exit.
+struct InCallback(bool);
+
+impl InCallback {
+    fn enter() -> Self {
+        Self(IN_CALLBACK.replace(true))
+    }
+}
+
+impl Drop for InCallback {
+    fn drop(&mut self) {
+        IN_CALLBACK.set(self.0);
+    }
 }
 
 /// [`DELIVERING`] for one delivery pass, restored on every exit.
@@ -372,97 +498,164 @@ impl Drop for Delivering {
 impl Events {
     /// `db_start_events` for `dbContext::subscribe`'s first call.
     fn start(self: &Arc<Self>) -> Result<(), String> {
-        let _starting = self.starting.lock();
-        if self.started.get().is_some() {
-            return Ok(());
-        }
-        let own = thread_by_id(current_thread_id())
-            .map_or(ThreadPriority::Medium.value(), |t| t.epics_priority());
+        let own = own_priority();
         // `epicsThreadLowestPriorityLevelAbove`, or the caller's own at 99.
         let above = if own < 99 { own + 1 } else { own };
         let events = self.clone();
-        let handle = spawn_dedicated_thread(
-            "CAC-event".into(),
-            ThreadPriority::Custom(above),
-            StackSizeClass::Medium,
-            move || {
-                while !events.stop.load(Ordering::Acquire) {
-                    events.deliver();
-                    std::thread::park();
-                }
-            },
-        )
-        .map_err(|e| format!("CAC-event thread could not be created: {e}"))?;
-        let thread = handle.thread().clone();
-        let waker = Waker::from(Arc::new(Unpark(thread.clone())));
-        let _ = self.started.set(Started {
-            thread: thread.clone(),
-            waker,
-        });
-        // Its first pass may have run before it had the waker to park on.
-        thread.unpark();
-        Ok(())
+        self.cac_event
+            .start("CAC-event", above, StackSizeClass::Medium, move || {
+                events.deliver()
+            })
+    }
+
+    /// The network thread, for the first network subscription.
+    fn start_network(self: &Arc<Self>) -> Result<(), String> {
+        // `cac::highestPriorityLevelBelow`, or the caller's own at 0.
+        let below = own_priority().saturating_sub(1);
+        let events = self.clone();
+        self.network
+            .thread
+            .start("CAC-callback", below, StackSizeClass::Big, move || {
+                let _delivering = Delivering::enter(&events);
+                events.network.deliver();
+            })
     }
 
     fn deliver(&self) {
-        let Some(started) = self.started.get() else {
+        let Some(waker) = self.cac_event.waker() else {
             return;
         };
-        if std::ptr::eq(DELIVERING.get(), self) {
+        // A thread in a run never waits for the turn: its holder may be
+        // waiting on that run.
+        if std::ptr::eq(DELIVERING.get(), self) || IN_RUNS.get() > 0 {
             return;
         }
+        let mut cx = Context::from_waker(waker);
+        let (mut taken, mut last) = (Vec::new(), Vec::new());
+        // The last owner of a route drops the client's closure, which may
+        // wait on another context's callback: never in the turn.
+        while self.deliver_turn(&mut cx, &mut taken, &mut last) {
+            last.clear();
+        }
+    }
+
+    /// Entries to their callbacks in the consumer's turn, until none is
+    /// ready or the turn lets go of the last owner of a context, which goes
+    /// to `last` for the caller to drop after the turn; whether entries may
+    /// remain. `taken` holds each context the turn takes until it lets go.
+    fn deliver_turn(
+        &self,
+        cx: &mut Context<'_>,
+        taken: &mut Vec<DeliveryContext>,
+        last: &mut Vec<Box<dyn Send>>,
+    ) -> bool {
         let _consumer = self.consumer.lock();
         let _delivering = Delivering::enter(self);
-        let mut cx = Context::from_waker(&started.waker);
-        while let Poll::Ready(entry) = self.user.poll_next(&mut cx) {
+        loop {
+            let mut entry = None;
+            let ready = self
+                .user
+                .poll_next_freeing(cx, &mut entry, taken)
+                .is_ready();
             // An ended producer's subscription ends when the client drops it.
-            if let CircuitEvent::Event { context, event, .. } = entry
-                && let Some(route) = context.downcast_ref::<Route>()
-            {
-                self.running.wait();
-                route.deliver(event);
+            if let Some(CircuitEvent::Event { context, event, .. }) = entry {
+                if let Some(route) = context.downcast_ref::<Route>() {
+                    self.running.wait(route.record);
+                    route.deliver(event);
+                }
+                taken.push(context);
+            }
+            last.extend(taken.drain(..).filter_map(let_go));
+            if !ready || !last.is_empty() {
+                return ready;
             }
         }
     }
 }
 
+/// A context the delivery turn took, let go of in the turn: `None` when
+/// another owner remains, which then drops it, so nothing of it runs here;
+/// else the whole of it, for after the turn.
+fn let_go(context: DeliveryContext) -> Option<Box<dyn Send>> {
+    match context.downcast::<Route>() {
+        Ok(route) => Arc::into_inner(route).map(|route| Box::new(route) as Box<dyn Send>),
+        Err(context) => Some(Box::new(context)),
+    }
+}
+
+impl Network {
+    /// Each value ready now to its callback, the subscriptions in turn.
+    fn deliver(&self) {
+        let Some(waker) = self.thread.waker() else {
+            return;
+        };
+        let mut cx = Context::from_waker(waker);
+        let routes = self.routes();
+        loop {
+            let mut taken = false;
+            for route in &routes {
+                taken |= route.deliver(&mut cx);
+            }
+            if !taken {
+                break;
+            }
+        }
+    }
+
+    /// The routes whose subscriptions live.
+    fn routes(&self) -> Vec<Arc<NetworkRoute>> {
+        let mut routes = self.routes.lock();
+        routes.retain(|route| route.strong_count() > 0);
+        routes.iter().filter_map(Weak::upgrade).collect()
+    }
+}
+
 /// The puts of a client context while they run on their callers, each poll
-/// of one a run; what a run posts reaches its callback after the run. C's
-/// `CAC-event` must be woken and scheduled before it delivers, so
-/// `dbChannelIO::write` is ordinarily back in the poster first
+/// of one a run; what a run posts on its own record reaches its callback
+/// after the run. C's `CAC-event` must be woken and scheduled before it
+/// delivers, so `dbChannelIO::write` is ordinarily back in the poster first
 /// (MM4005_trajectoryScan's `pvPut(motorMDVS[j])` then
 /// `efClear(motorMDVSMon)` sees the event after the clear on 287 of 300 C
-/// boots). A put parked between polls (`dbPutNotifyBlocker`, a postponed
-/// write) runs nothing and holds up no one, as C's blocked caller does
-/// not, and no put waits for another.
+/// boots). An entry waits only for runs on its own record, whose value is
+/// the one still changing, and a network value, on its own thread, for
+/// none; C's `CAC-event` waits on the record's whole lockset only because
+/// it reads under `dbScanLock` (`db_access.c:158`). A put parked between
+/// polls (`dbPutNotifyBlocker`, a postponed write) runs nothing and holds up
+/// no one, as C's blocked caller does not, and no put waits for another.
 #[derive(Default)]
 struct Running {
-    /// The next run's number, and the numbers of the runs not ended.
-    runs: parking_lot::Mutex<(u64, Vec<u64>)>,
+    /// The next run's number, and the number and record of each run not
+    /// ended.
+    runs: parking_lot::Mutex<(u64, Vec<(u64, RecordKey)>)>,
     ended: parking_lot::Condvar,
 }
 
 impl Running {
-    /// `put`, each poll of it a run.
-    async fn run<F: Future>(&self, put: F) -> F::Output {
+    /// `put` to `record`, each poll of it a run.
+    async fn run<F: Future>(&self, record: RecordKey, put: F) -> F::Output {
         let mut put = std::pin::pin!(put);
         std::future::poll_fn(|cx| {
-            let _run = Run::start(self);
+            let _run = Run::start(self, record);
             put.as_mut().poll(cx)
         })
         .await
     }
 
-    /// Until each run going now has ended; one started later is not waited
-    /// for.
-    fn wait(&self) {
+    /// Until each run on `record` going now has ended; one started later is
+    /// not waited for.
+    fn wait(&self, record: RecordKey) {
         let mut runs = self.runs.lock();
         let now = runs.0;
-        while runs.1.iter().any(|&run| run < now) {
+        while runs.1.iter().any(|&(run, on)| run < now && on == record) {
             self.ended.wait(&mut runs);
         }
     }
 }
+
+/// The record a channel addresses. The run's channel and the entry's
+/// subscription each hold it, so while both live, equal keys are one record.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RecordKey(usize);
 
 /// One poll of a put, ended on every exit.
 struct Run<'a> {
@@ -471,50 +664,131 @@ struct Run<'a> {
 }
 
 impl<'a> Run<'a> {
-    fn start(running: &'a Running) -> Self {
+    fn start(running: &'a Running, record: RecordKey) -> Self {
         let mut runs = running.runs.lock();
         let number = runs.0;
         runs.0 += 1;
-        runs.1.push(number);
+        runs.1.push((number, record));
+        IN_RUNS.set(IN_RUNS.get() + 1);
         Run { running, number }
     }
 }
 
 impl Drop for Run<'_> {
     fn drop(&mut self) {
+        IN_RUNS.set(IN_RUNS.get() - 1);
         let mut runs = self.running.runs.lock();
-        if let Some(at) = runs.1.iter().position(|&run| run == self.number) {
+        if let Some(at) = runs.1.iter().position(|&(run, _)| run == self.number) {
             runs.1.swap_remove(at);
         }
         self.running.ended.notify_all();
     }
 }
 
+/// A subscription's callback, which its drop cancels: the cancel waits for
+/// one running, and none runs after. Inside a callback it waits for none,
+/// so a waiter holds no callback's lock and nothing waits on it; C's
+/// `db_cancel_event` skips the wait only on its own event task.
+struct Callback {
+    /// Held across each call, and taken by the cancel.
+    running: parking_lot::ReentrantMutex<()>,
+    canceled: AtomicBool,
+    call: Box<dyn Fn(Snapshot) + Send + Sync>,
+}
+
+impl Callback {
+    fn new(call: Box<dyn Fn(Snapshot) + Send + Sync>) -> Self {
+        Self {
+            running: parking_lot::ReentrantMutex::new(()),
+            canceled: AtomicBool::new(false),
+            call,
+        }
+    }
+
+    fn canceled(&self) -> bool {
+        self.canceled.load(Ordering::Acquire)
+    }
+
+    fn call(&self, snapshot: Snapshot) {
+        let _running = self.running.lock();
+        if !self.canceled() {
+            let _in = InCallback::enter();
+            (self.call)(snapshot);
+        }
+    }
+
+    /// Returns only once no call can pass its check.
+    fn cancel(&self) {
+        let _running = (!IN_CALLBACK.get()).then(|| self.running.lock());
+        self.canceled.store(true, Ordering::Release);
+    }
+}
+
 /// One subscription's way from an entry to its callback.
 struct Route {
+    record: RecordKey,
     notify: StateNotify,
     count: u32,
-    callback: Box<dyn Fn(Snapshot) + Send + Sync>,
-    canceled: AtomicBool,
+    callback: Callback,
 }
 
 impl Route {
     fn deliver(&self, event: MonitorEvent) {
-        if self.canceled.load(Ordering::Acquire) {
+        if self.callback.canceled() {
             return;
         }
         // `callStateNotify`'s `ECA_GETFAIL` reaches no callback here.
         if let Some(snapshot) = self.notify.state_notify(event, self.count) {
-            (self.callback)(snapshot);
+            self.callback.call(snapshot);
         }
     }
 }
 
+/// A network subscription's values, as a stream's `poll_next`.
+type NetworkValues = Box<dyn FnMut(&mut Context<'_>) -> Poll<Option<Snapshot>> + Send>;
+
+/// One network subscription's way from its values to its callback.
+struct NetworkRoute {
+    /// `None` once they end or the subscription drops.
+    values: parking_lot::Mutex<Option<NetworkValues>>,
+    callback: Callback,
+}
+
+impl NetworkRoute {
+    /// Its next value to its callback, if one is there; whether one was.
+    fn deliver(&self, cx: &mut Context<'_>) -> bool {
+        let next = {
+            let mut values = self.values.lock();
+            let Some(poll_next) = values.as_mut() else {
+                return false;
+            };
+            let next = poll_next(cx);
+            if let Poll::Ready(None) = next {
+                *values = None;
+            }
+            next
+        };
+        let Poll::Ready(Some(snapshot)) = next else {
+            return false;
+        };
+        self.callback.call(snapshot);
+        true
+    }
+}
+
+/// Dropping it cancels its callback and ends its values.
+struct NetworkSubscription(Arc<NetworkRoute>);
+
+impl Drop for NetworkSubscription {
+    fn drop(&mut self) {
+        self.0.callback.cancel();
+        let values = self.0.values.lock().take();
+        drop(values);
+    }
+}
+
 /// A subscription on a context's [`InProcessEvents`]. Dropping it cancels
-/// the event (`db_cancel_event`), and no entry taken after reaches the
-/// callback. It does not wait for a callback already running, as C's
-/// cancel does: a drop can come under a lock that callback takes, so the
-/// client waits itself.
+/// the event (`db_cancel_event`) as dropping a [`ClientSubscription`] does.
 pub struct InProcessSubscription {
     _reader: EventReader,
     route: Arc<Route>,
@@ -522,72 +796,152 @@ pub struct InProcessSubscription {
 
 impl Drop for InProcessSubscription {
     fn drop(&mut self) {
-        self.route.canceled.store(true, Ordering::Release);
+        self.route.callback.cancel();
     }
 }
 
-/// `dbChannelIO::read`.
-fn read(channel: &LocalChannel, dbr_type: u16, count: u32) -> Result<Snapshot, String> {
-    channel
-        .read(dbr_type, count)
-        .ok_or_else(|| "dbChannel_get failed".to_string())
-}
+/// The context's way to its database's channels: no channel type reaches
+/// their put but through [`ContextChannel::run`].
+mod context_channel {
+    use super::*;
+    use crate::server::database::ca_link::LocalChannel;
+    use crate::server::database::channel_io::ChannelTarget;
 
-/// `dbChannelIO::subscribe` on `events`: the first event is queued, not
-/// delivered, and each reaches `callback` as `count` elements of
-/// `dbr_type`.
-fn subscribe(
-    channel: &LocalChannel,
-    events: &InProcessEvents,
-    dbr_type: u16,
-    count: u32,
-    mask: u16,
-    callback: Box<dyn Fn(Snapshot) + Send + Sync>,
-) -> Result<InProcessSubscription, String> {
-    let events = &events.0.0;
-    events.start()?;
-    let db = channel.db().ok_or("database gone")?;
-    let (pre_chain, notify) = channel.state_notify(dbr_type);
-    let route = Arc::new(Route {
-        notify,
-        count,
-        callback,
-        canceled: AtomicBool::new(false),
-    });
-    let context: DeliveryContext = route.clone();
-    let reader = channel
-        .add_event(&db, &events.user, mask, &context, pre_chain)
-        .map_err(|e| format!("{e:?}"))?;
-    Ok(InProcessSubscription {
-        _reader: reader,
-        route,
-    })
-}
+    /// `dbChannelIO` on its context's event context.
+    pub(super) struct ContextChannel {
+        channel: LocalChannel,
+        /// Its context's.
+        events: InProcessEvents,
+    }
 
-/// `value` as the channel's native type and element count.
-fn put_value(channel: &LocalChannel, value: EpicsValue) -> EpicsValue {
-    let mut value = value.into_type(channel.native_type());
-    value.truncate(channel.element_count() as usize);
-    value
+    impl ContextChannel {
+        /// `dbContext::createChannel`'s `dbChannel_create`: `None` when the
+        /// database does not serve `name`.
+        pub(super) async fn create(
+            db: &PvDatabase,
+            name: &str,
+            events: &InProcessEvents,
+        ) -> Option<Self> {
+            let channel = LocalChannel::create(db, name.as_bytes()).await?;
+            Some(Self {
+                channel,
+                events: events.clone(),
+            })
+        }
+
+        /// `dbChannelIO::nativeType`.
+        pub(super) fn native_type(&self) -> DbFieldType {
+            self.channel.native_type()
+        }
+
+        /// `dbChannelIO::nativeElementCount`.
+        pub(super) fn element_count(&self) -> u32 {
+            self.channel.element_count()
+        }
+
+        /// `dbChannelIO::read`.
+        pub(super) fn get(&self, dbr_type: u16, count: u32) -> Result<Snapshot, String> {
+            self.channel
+                .read(dbr_type, count)
+                .ok_or_else(|| "dbChannel_get failed".to_string())
+        }
+
+        /// `dbChannelIO::subscribe` on its context's event context: the
+        /// first event is queued, not delivered, and each reaches `callback`
+        /// as `count` elements of `dbr_type`.
+        pub(super) fn subscribe(
+            &self,
+            dbr_type: u16,
+            count: u32,
+            mask: u16,
+            callback: Box<dyn Fn(Snapshot) + Send + Sync>,
+        ) -> Result<InProcessSubscription, String> {
+            let events = &self.events.0.0;
+            events.start()?;
+            let db = self.channel.db().ok_or("database gone")?;
+            let (pre_chain, notify) = self.channel.state_notify(dbr_type);
+            let route = Arc::new(Route {
+                record: RecordKey::of(&self.channel),
+                notify,
+                count,
+                callback: Callback::new(callback),
+            });
+            let context: DeliveryContext = route.clone();
+            let reader = self
+                .channel
+                .add_event(&db, &events.user, mask, &context, pre_chain)
+                .map_err(|e| format!("{e:?}"))?;
+            Ok(InProcessSubscription {
+                _reader: reader,
+                route,
+            })
+        }
+
+        /// `dbChannelIO::write`, run as a put of its context: a plain put is
+        /// done when this returns (`None`); a put callback returns its
+        /// completion.
+        pub(super) async fn put(
+            &self,
+            value: EpicsValue,
+            callback: bool,
+        ) -> Result<Option<PutCompletion>, String> {
+            let value = self.put_value(value);
+            self.run(self.channel.issue_put(value, callback)).await
+        }
+
+        /// `dbChannelIO::write` with a notify, run as a put of its context,
+        /// `issued` taking its completion while the put still runs. `Err` is
+        /// `dbPutNotifyBlocker`'s wait for the put in flight running out.
+        pub(super) async fn put_callback<R>(
+            &self,
+            value: EpicsValue,
+            issued: impl FnOnce(PutCompletion) -> R,
+        ) -> Result<R, CaError> {
+            let value = self.put_value(value);
+            self.run(async { self.channel.put_callback(value).await.map(issued) })
+                .await
+        }
+
+        /// `put` as a put of the context, each poll of it a run.
+        async fn run<F: Future>(&self, put: F) -> F::Output {
+            let record = RecordKey::of(&self.channel);
+            self.events.0.0.running.run(record, put).await
+        }
+
+        /// `value` as the channel's native type and element count.
+        fn put_value(&self, value: EpicsValue) -> EpicsValue {
+            let mut value = value.into_type(self.channel.native_type());
+            value.truncate(self.channel.element_count() as usize);
+            value
+        }
+    }
+
+    impl RecordKey {
+        fn of(channel: &LocalChannel) -> Self {
+            let record = match channel.target() {
+                ChannelTarget::SimplePv(pv) => Arc::as_ptr(pv).cast::<()>(),
+                ChannelTarget::RecordField { record, .. } => Arc::as_ptr(record).cast::<()>(),
+            };
+            Self(record as usize)
+        }
+    }
 }
 
 /// An in-process channel: connected from creation, never disconnected,
 /// full access (`dbChannelIO`).
 struct LocalClientChannel {
-    channel: LocalChannel,
-    /// Its context's.
-    events: InProcessEvents,
+    chan: ContextChannel,
     announced: std::sync::atomic::AtomicBool,
 }
 
 #[async_trait::async_trait]
 impl ClientChannel for LocalClientChannel {
     fn native_type(&self) -> Option<DbFieldType> {
-        Some(self.channel.native_type())
+        Some(self.chan.native_type())
     }
 
     fn element_count(&self) -> Option<u32> {
-        Some(self.channel.element_count())
+        Some(self.chan.element_count())
     }
 
     fn access(&self) -> (bool, bool) {
@@ -605,7 +959,7 @@ impl ClientChannel for LocalClientChannel {
     }
 
     async fn get(&self, dbr_type: u16, count: u32) -> Result<Snapshot, String> {
-        read(&self.channel, dbr_type, count)
+        self.chan.get(dbr_type, count)
     }
 
     async fn subscribe(
@@ -615,7 +969,8 @@ impl ClientChannel for LocalClientChannel {
         mask: u16,
         callback: Box<dyn Fn(Snapshot) + Send + Sync>,
     ) -> Result<ClientSubscription, String> {
-        subscribe(&self.channel, &self.events, dbr_type, count, mask, callback)
+        self.chan
+            .subscribe(dbr_type, count, mask, callback)
             .map(ClientSubscription::new)
     }
 
@@ -624,8 +979,7 @@ impl ClientChannel for LocalClientChannel {
         value: EpicsValue,
         callback: bool,
     ) -> Result<Option<PutCompletion>, String> {
-        let value = put_value(&self.channel, value);
-        self.channel.issue_put(value, callback).await
+        self.chan.put(value, callback).await
     }
 }
 
@@ -635,12 +989,15 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    /// [`Running::wait`] on another thread; the receiver hears when it ends.
+    const RECORD: RecordKey = RecordKey(1);
+
+    /// [`Running::wait`] for [`RECORD`] on another thread; the receiver
+    /// hears when it ends.
     fn waiting(running: &Arc<Running>) -> mpsc::Receiver<()> {
         let (ended, waited) = mpsc::channel();
         let running = Arc::clone(running);
         std::thread::spawn(move || {
-            running.wait();
+            running.wait(RECORD);
             ended.send(()).unwrap();
         });
         waited
@@ -653,10 +1010,10 @@ mod tests {
     #[test]
     fn a_wait_is_for_the_runs_going_when_it_starts() {
         let running = Arc::new(Running::default());
-        let going = Run::start(&running);
+        let going = Run::start(&running, RECORD);
         let waited = waiting(&running);
         std::thread::sleep(SETTLE);
-        let later = Run::start(&running);
+        let later = Run::start(&running, RECORD);
         assert!(waited.recv_timeout(SETTLE).is_err(), "before the run ends");
         drop(going);
         waited.recv_timeout(fact_budget::FACT_BUDGET).unwrap();
@@ -668,7 +1025,7 @@ mod tests {
     #[test]
     fn a_put_parked_between_polls_is_no_run() {
         let running = Arc::new(Running::default());
-        let mut put = std::pin::pin!(running.run(std::future::pending::<()>()));
+        let mut put = std::pin::pin!(running.run(RECORD, std::future::pending::<()>()));
         let polled = put.as_mut().poll(&mut Context::from_waker(Waker::noop()));
         assert!(polled.is_pending());
         waiting(&running)

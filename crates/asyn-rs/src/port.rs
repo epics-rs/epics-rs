@@ -21,6 +21,7 @@ use std::time::{Duration, Instant, SystemTime};
 use std::any::Any;
 
 use epics_libcom_rs::cfmt::CFloat;
+use epics_libcom_rs::runtime::time::deadline_from_now;
 use parking_lot::Mutex;
 
 /// C `autoConnectDevice` reconnect throttle window (asynManager.c:715).
@@ -1465,7 +1466,7 @@ impl PortDriverBase {
             // auto-connect (asynManager.c:2183-2185), which is what makes the
             // reconnect *autonomous*: it does not wait for queued traffic.
             if self.is_auto_connect() {
-                self.connect_retry_at = Some(Instant::now() + CONNECT_RETRY_INITIAL);
+                self.connect_retry_at = Some(deadline_from_now(CONNECT_RETRY_INITIAL));
             }
         } else {
             // C `exceptionConnect` counts the connects it publishes
@@ -1535,7 +1536,7 @@ impl PortDriverBase {
         // C `exceptionDisconnect` restarts the PORT's connect timer for any
         // dpCommon while the port is down and auto-connect (asynManager.c:2182-2184).
         if !connected && !self.is_connected() && self.is_auto_connect() {
-            self.connect_retry_at = Some(Instant::now() + CONNECT_RETRY_INITIAL);
+            self.connect_retry_at = Some(deadline_from_now(CONNECT_RETRY_INITIAL));
         }
         self.announce_exception(AsynException::Connect, addr);
         true
@@ -1699,7 +1700,7 @@ impl PortDriverBase {
     pub(crate) fn start_owed_connect_timer(&mut self) {
         let owed = &self.shared.connect_timer_owed;
         if owed.load(Ordering::Acquire) && owed.swap(false, Ordering::AcqRel) {
-            self.connect_retry_at = Some(Instant::now() + CONNECT_RETRY_INITIAL);
+            self.connect_retry_at = Some(deadline_from_now(CONNECT_RETRY_INITIAL));
         }
     }
 
@@ -6153,11 +6154,20 @@ pub(crate) mod tests {
         // elapsed 0 < 2s => refused.
         assert!(!base.auto_connect_throttle_ok(-1, t0));
         // elapsed just under 2s => refused.
-        assert!(!base.auto_connect_throttle_ok(-1, t0 + Duration::from_millis(1999)));
+        assert!(!base.auto_connect_throttle_ok(
+            -1,
+            epics_libcom_rs::runtime::time::deadline_after(t0, Duration::from_millis(1999))
+        ));
         // elapsed exactly 2s => permitted (>=).
-        assert!(base.auto_connect_throttle_ok(-1, t0 + Duration::from_secs(2)));
+        assert!(base.auto_connect_throttle_ok(
+            -1,
+            epics_libcom_rs::runtime::time::deadline_after(t0, Duration::from_secs(2))
+        ));
         // elapsed well past => permitted.
-        assert!(base.auto_connect_throttle_ok(-1, t0 + Duration::from_secs(5)));
+        assert!(base.auto_connect_throttle_ok(
+            -1,
+            epics_libcom_rs::runtime::time::deadline_after(t0, Duration::from_secs(5))
+        ));
     }
 
     #[test]
@@ -6206,7 +6216,10 @@ pub(crate) mod tests {
         // Post-attempt stamp restarts addr 2's window.
         base.stamp_auto_connect_attempt(2, t0);
         assert!(!base.auto_connect_throttle_ok(2, t0));
-        assert!(base.auto_connect_throttle_ok(2, t0 + Duration::from_secs(2)));
+        assert!(base.auto_connect_throttle_ok(
+            2,
+            epics_libcom_rs::runtime::time::deadline_after(t0, Duration::from_secs(2))
+        ));
     }
 
     /// asynManager.c:2182-2184: a device's exceptionDisconnect restarts the
@@ -6227,7 +6240,7 @@ pub(crate) mod tests {
         assert!(base.connect_retry_at.is_none(), "the port is up");
 
         base.set_connected(false);
-        let backoff = Instant::now() + Duration::from_secs(20);
+        let backoff = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(20));
         base.connect_retry_at = Some(backoff);
         assert!(base.set_addr_connected(2, false));
         assert!(base.connect_retry_at.unwrap() < backoff);

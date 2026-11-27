@@ -117,38 +117,36 @@ impl PvDatabase {
             .is_some_and(|check| check.state.ca_links)
             && self.check_links(instance)
         {
-            self.arm_link_check(name, LINK_RECHECK);
+            self.arm_link_check(name, instance, LINK_RECHECK);
         }
     }
 
-    /// C `callbackRequestDelayed(&checkLinkCb, delay)`: after `delay`,
-    /// `dbScanLock`, clear `cbScheduled`, `checkLinks` — again every 0.5 s
-    /// while it re-arms.
-    fn arm_link_check(&self, name: &[u8], delay: Duration) {
+    /// C `callbackRequestDelayed(&checkLinkCb, delay)` on the record
+    /// `instance` holds, on the band its type's [`CheckBand`] reads now:
+    /// after `delay`, `dbScanLock`, clear `cbScheduled`, `checkLinks`, whose
+    /// re-arm is the next request.
+    ///
+    /// [`CheckBand`]: crate::server::records::link_status::CheckBand
+    fn arm_link_check(&self, name: &[u8], instance: &mut RecordInstance, delay: Duration) {
+        let Some(check) = instance.record.link_check() else {
+            return;
+        };
+        let prio = check.spec.band.priority(&instance.band);
         let db = self.clone();
         let name = crate::types::RecordName::from(name);
-        crate::runtime::task::spawn_background_after(
-            crate::runtime::task::CallbackPriority::Low,
-            delay,
-            async move {
-                loop {
-                    {
-                        let Some(rec) = db.get_record_no_resolve(&name) else {
-                            return;
-                        };
-                        let mut instance = rec.write();
-                        let Some(check) = instance.record.link_check() else {
-                            return;
-                        };
-                        check.state.scheduled = false;
-                        if !db.check_links(&mut instance) {
-                            return;
-                        }
-                    }
-                    crate::runtime::task::sleep_background(LINK_RECHECK).await;
-                }
-            },
-        );
+        self.spawn_callback_after(prio, delay, async move {
+            let Some(rec) = db.get_record_no_resolve(&name) else {
+                return;
+            };
+            let mut instance = rec.write();
+            let Some(check) = instance.record.link_check() else {
+                return;
+            };
+            check.state.scheduled = false;
+            if db.check_links(&mut instance) {
+                db.arm_link_check(&name, &mut instance, LINK_RECHECK);
+            }
+        });
     }
 
     /// sseq's `if (!pending_checkLinksCB) callbackRequestDelayed(..., 0.5)`
@@ -158,17 +156,14 @@ impl PvDatabase {
         let Some(rec) = self.get_record_no_resolve(record) else {
             return;
         };
-        let arm = {
-            let mut instance = rec.write();
-            let Some(check) = instance.record.link_check() else {
-                return;
-            };
-            let arm = !check.state.scheduled;
-            check.state.scheduled = true;
-            arm
+        let mut instance = rec.write();
+        let Some(check) = instance.record.link_check() else {
+            return;
         };
+        let arm = !check.state.scheduled;
+        check.state.scheduled = true;
         if arm {
-            self.arm_link_check(record, delay);
+            self.arm_link_check(record, &mut instance, delay);
         }
     }
 
@@ -176,7 +171,7 @@ impl PvDatabase {
     /// holds (throttle's SYNC arm, throttleRecord.c:376-389).
     pub(crate) fn link_check_held(&self, record: &[u8], instance: &mut RecordInstance) {
         if self.check_links(instance) {
-            self.arm_link_check(record, LINK_RECHECK);
+            self.arm_link_check(record, instance, LINK_RECHECK);
         }
     }
 
@@ -188,21 +183,18 @@ impl PvDatabase {
         let Some(rec) = self.get_record_no_resolve(record) else {
             return;
         };
-        let arm = {
-            let mut instance = rec.write();
-            let Some(check) = instance.record.link_check() else {
-                return;
-            };
-            if !check.statuses.contains(&LINK_EXT_NC) {
-                return;
-            }
-            check.state.ca_links = true;
-            let arm = recheck.is_some() && !check.state.scheduled;
-            check.state.scheduled |= arm;
-            arm
+        let mut instance = rec.write();
+        let Some(check) = instance.record.link_check() else {
+            return;
         };
+        if !check.statuses.contains(&LINK_EXT_NC) {
+            return;
+        }
+        check.state.ca_links = true;
+        let arm = recheck.is_some() && !check.state.scheduled;
+        check.state.scheduled |= arm;
         if let (true, Some(delay)) = (arm, recheck) {
-            self.arm_link_check(record, delay);
+            self.arm_link_check(record, &mut instance, delay);
         }
     }
 }

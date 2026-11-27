@@ -177,23 +177,26 @@ extern void *POSIX_Init(void *argument);
  * open files in system" (ENFILE). C is 3 lower at the same cap only because it
  * holds 3 more descriptors itself at idle, not because it serves worse.
  *
- * TWO WALLS, and 142 is not the memory one:
+ * TWO WALLS, and 141 is not the memory one:
  *
- *   fd wall     = MAXIMUM_FILE_DESCRIPTORS - 8 = 142   (unchanged by more RAM)
- *   memory wall = free heap / 1,589,000 B     = 151   (roughly doubles w/ RAM)
+ *   fd wall     = MAXIMUM_FILE_DESCRIPTORS - 8 - 1 = 141   (unchanged by more RAM)
+ *   memory wall = free heap / 1,589,000 B         = 151   (roughly doubles w/ RAM)
  *
  * The 8 is what the IOC itself holds at idle; the status PVs confirm it
  * (FD_CNT + FD_FREE = FD_MAX = 150 on every row, FD_FREE = 142 at zero
- * connections), and so does the errno being ENFILE rather than ENOMEM. The
- * effective ceiling is the LOWER of the two, so raising either one alone buys
- * almost nothing.
+ * connections), and so does the errno being ENFILE rather than ENOMEM. The 1
+ * is the socket the CA server has held since then to wake its accept, so the
+ * rows above, measured without it, show 142. CAS_CLIENT_POOL_CAPACITY in
+ * epics-ca-rs src/server/blocking.rs sums these terms. The effective ceiling
+ * is the LOWER of the two walls, so raising either one alone buys almost
+ * nothing.
  *
  * DO NOT RE-RUN THE 300-CONNECTION RAMP TO FIND THIS OUT: it was already run on
  * an image with this cap at 400, where the fd wall no longer binds. Memory then
  * binds at 151 served, with EAGAIN (thread creation) refusals instead of
  * ENFILE, by two independent derivations (300 attempted / 149 refused, and
  * (259,803,736 - 19,880,696)/1,589,000 = 150.99). So raising this cap buys
- * NINE connections, 142 -> 151, and then the 256 MB guest is out of heap.
+ * TEN connections, 141 -> 151, and then the 256 MB guest is out of heap.
  */
 #ifndef CONFIGURE_MAXIMUM_FILE_DESCRIPTORS
 #define CONFIGURE_MAXIMUM_FILE_DESCRIPTORS 150

@@ -33,6 +33,9 @@ default-members = [
     # And again: the production-slice rule every source guard in the workspace
     # runs on. Its own boundary tests are what keep a guard from going quiet.
     "crates/source-guard",
+    # And the counting allocator every crate's `alloc` test binary installs:
+    # its boundary tests are what keep a window from passing on nothing.
+    "crates/alloc-count",
     # Same reason again: the IOC-spawn census checks .config/nextest.toml
     # against the sources, so a new test binary that spawns an IOC without
     # being declared in a test-group is red on the commit that adds it.
@@ -52,12 +55,18 @@ default-members = [
     # Rust's `NaN` where the C IOC prints `nan` / `-nan`, and only a bare run
     # sees the file that adds one.
     "tools/cfloat-gate",
+    # The fixed-wait ratchet's boundary tests. The gate itself needs a merge
+    # base, so it is `cargo run -p fixed-wait-gate`, and CI's `fixed-wait` job.
+    "tools/fixed-wait-gate",
 ]
 resolver = "3"
 
-# cargo dylint --all: the lint crate builds on its own pinned nightly.
+# cargo dylint --all: each lint crate builds on its own pinned nightly.
 [workspace.metadata.dylint]
-libraries = [{ path = "lints/raw_float_format" }]
+libraries = [
+    { path = "lints/raw_float_format" },
+    { path = "lints/instant_add_duration" },
+]
 
 [workspace.package]
 edition = "2024"
@@ -114,6 +123,19 @@ codegen-units = 1
 [profile.release-embedded]
 inherits = "release"
 strip = "symbols"
+
+# No debuginfo, not even line tables: it is most of what a test build writes
+# (12059ffc07's all-features build: 109,470 MB with line tables, 48,809 MB
+# without). A panic keeps its file:line; backtrace frames and a debugger's
+# source view do not. For those, `--profile debugging` (nextest:
+# `--cargo-profile debugging`) builds into its own target/debugging, so
+# switching back and forth rebuilds neither.
+[profile.dev]
+debug = 0
+
+[profile.debugging]
+inherits = "dev"
+debug = true
 
 
 # RTEMS 6 (armv7-rtems-eabihf) needs libc definitions no published 0.2 release

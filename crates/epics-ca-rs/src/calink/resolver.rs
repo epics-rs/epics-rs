@@ -95,16 +95,20 @@ impl LinkEvents {
         self.string.lock().is_some()
     }
 
-    /// The string monitor open for `native`, else a new one from `spawn`,
-    /// replacing one opened for another description.
-    fn open_string(
+    /// The last value of the string monitor open for `native`. With none
+    /// open, `spawn` opens one, replacing one opened for another
+    /// description, and the read answers `None` whatever that monitor
+    /// delivers meanwhile: C decides `!gotInString` under `pca->lock` before
+    /// it queues `CA_MONITOR_STRING` (`dbCa.c:468-477`, `:526-528`), so the
+    /// read that adds the monitor fails.
+    fn read_string(
         &self,
         native: (DbFieldType, u32),
         spawn: impl FnOnce(std::sync::Weak<StringMonitor>) -> AbortOnDrop,
-    ) -> Arc<StringMonitor> {
+    ) -> Option<Arc<PvString>> {
         let mut slot = self.string.lock();
         if let Some(open) = slot.as_ref().filter(|m| m.native == native) {
-            return open.clone();
+            return open.value.load_full();
         }
         let monitor = Arc::new(StringMonitor {
             native,
@@ -112,10 +116,10 @@ impl LinkEvents {
             task: std::sync::OnceLock::new(),
         });
         let _ = monitor.task.set(spawn(Arc::downgrade(&monitor)));
-        let stale = slot.replace(monitor.clone());
+        let stale = slot.replace(monitor);
         drop(slot);
         drop(stale);
-        monitor
+        None
     }
 
     /// C `connectionCallback`'s size-or-type-change clear, string half
@@ -212,17 +216,15 @@ pub struct CaLink {
     /// (`dbCa.c:818-830`) — and a bare `AtomicBool` let three call sites
     /// do the first without the second (stage C6 criterion 4).
     connected: Arc<LinkConnState>,
-    /// Cached remote CTRL attributes (display/control/alarm limits,
-    /// precision, units) plus the channel's native DBF type and element
-    /// count. `None` until the first attribute fetch completes; the
-    /// connection-event watcher re-fetches on every (re)connection.
-    /// Mirrors C `dbCa.c`: `connectionCallback`
+    /// Remote CTRL attributes (display/control/alarm limits, precision,
+    /// units) plus the channel's native DBF type and element count, per
+    /// connection. Mirrors C `dbCa.c`: `connectionCallback`
     /// (`dbCa.c:880`) schedules `CA_GET_ATTRIBUTES` on connect, and
     /// `getAttribEventCallback` (`dbCa.c:1042-1091`) caches the
     /// `DBR_CTRL_DOUBLE` reply that `getControlLimits`/`getGraphicLimits`
     /// /`getAlarmLimits`/`getPrecision`/`getUnits` (`dbCa.c:697-772`) later
     /// serve.
-    meta: Arc<ArcSwap<Option<LinkMetadata>>>,
+    attributes: Arc<LinkAttributes>,
     /// The channel — kept alive so the monitor stays subscribed.
     /// Used by the OUT-link write path.
     channel: Arc<CaChannel>,
@@ -247,6 +249,56 @@ fn channel_native(channel: &CaChannel) -> Option<(DbFieldType, u32)> {
     match (channel.native_field_type(), channel.element_count()) {
         (Ok(native), Ok(count)) => Some((native, count)),
         _ => None,
+    }
+}
+
+/// C `gotAttributes` and the attributes `getAttribEventCallback` stores
+/// (`dbCa.c:1104-1155`), kept per connection: every connect gets an empty
+/// slot, as `connectionCallback` clears `gotAttributes` (`dbCa.c:925`), and
+/// only that connect's fetch can fill it. A read serves the slot of the
+/// channel's live connection alone, so through an outage and until the new
+/// reply lands it answers nothing, C's -1, and a reply of an older
+/// connection fills a slot no read reaches, whenever it lands.
+struct LinkAttributes(ArcSwap<ConnAttributes>);
+
+/// One connection's attribute slot.
+struct ConnAttributes {
+    /// Its connect, numbered from 1 as [`LinkConnState::sync`] counts them.
+    connect: u64,
+    meta: std::sync::OnceLock<LinkMetadata>,
+}
+
+impl ConnAttributes {
+    fn fill(&self, meta: LinkMetadata) {
+        let _ = self.meta.set(meta);
+    }
+}
+
+impl LinkAttributes {
+    fn new() -> Self {
+        Self(ArcSwap::from_pointee(ConnAttributes {
+            connect: 0,
+            meta: std::sync::OnceLock::new(),
+        }))
+    }
+
+    /// The empty slot of `connect`, for its fetch alone.
+    fn begin(&self, connect: u64) -> Arc<ConnAttributes> {
+        let slot = Arc::new(ConnAttributes {
+            connect,
+            meta: std::sync::OnceLock::new(),
+        });
+        self.0.store(slot.clone());
+        slot
+    }
+
+    /// The attributes of the connection `fold` holds live.
+    fn live(&self, fold: ConnFold) -> Option<LinkMetadata> {
+        let slot = self.0.load();
+        if !fold.connected || slot.connect != fold.outages + 1 {
+            return None;
+        }
+        slot.meta.get().cloned()
     }
 }
 
@@ -434,8 +486,9 @@ impl LinkConnState {
     /// `connectionCallback` reading `ca_read_access` (`dbCa.c:875-876`); a
     /// later change goes through [`Self::note_access_rights`]. The connect
     /// is counted, not read off `flag`, which a monitor event may set first.
-    /// Returns `true` when `fold` holds a connect not yet refetched for.
-    fn sync(&self, fold: ConnFold) -> bool {
+    /// Returns the connect, numbered from 1, when `fold` holds one not yet
+    /// refetched for.
+    fn sync(&self, fold: ConnFold) -> Option<u64> {
         for _ in self.disconnect_count()..fold.outages {
             self.mark_connected();
             self.mark_disconnected();
@@ -451,7 +504,7 @@ impl LinkConnState {
                 self.note_access_rights(fold.read, fold.write);
             }
         }
-        new_connect
+        new_connect.then_some(connects)
     }
 
     /// C `accessRightsCallback` (`dbCa.c:1014-1040`) as one owned
@@ -581,7 +634,7 @@ impl CaLink {
     pub fn init_ready(&self) -> bool {
         self.is_connected()
             && (self.monitor.get().is_none() || self.with_servable(|_| ()).is_some())
-            && self.meta.load().is_some()
+            && self.attributes.live(self.channel.conn_fold()).is_some()
     }
 
     /// Current cached value, or `None` when the link is not servable: no
@@ -663,18 +716,16 @@ impl CaLink {
         }
         // C `pvlOptInpString` with its `CA_MONITOR_STRING`
         // (`dbCa.c:1236-1248`).
-        let monitor = self.events.open_string(native, |monitor| {
-            AbortOnDrop(self.reactor.spawn(run_string_monitor(
-                self.channel.clone(),
-                self.events.clone(),
-                monitor,
-                self.connected.clone(),
-                self.pv_name.clone(),
-            )))
-        });
-        monitor
-            .value
-            .load_full()
+        self.events
+            .read_string(native, |monitor| {
+                AbortOnDrop(self.reactor.spawn(run_string_monitor(
+                    self.channel.clone(),
+                    self.events.clone(),
+                    monitor,
+                    self.connected.clone(),
+                    self.pv_name.clone(),
+                )))
+            })
             .map_or(EnumString::Pending, |s| EnumString::Got((*s).clone()))
     }
 
@@ -747,7 +798,8 @@ impl CaLink {
 
     /// Cached remote metadata (display/control/alarm limits, precision,
     /// units, DBF type, element count), or `None` when the link is not
-    /// connected. Gated on `connected` exactly like
+    /// connected or the live connection's CTRL reply is not in. Gated on
+    /// `connected` exactly like
     /// [`Self::value`]/[`Self::alarm_severity`] — C `pcaGetCheck`
     /// (`dbCa.c:621`) returns `-1` from every metadata getter while the
     /// CA link is disconnected, so the owning record keeps its local
@@ -756,7 +808,7 @@ impl CaLink {
         if !self.connected.is_set() {
             return None;
         }
-        self.meta.load().as_ref().clone()
+        self.attributes.live(self.channel.conn_fold())
     }
 
     /// C `getDBFtype` / `getElements` (`dbCa.c:666`, `:633`): the channel's
@@ -890,19 +942,18 @@ impl CaLinkResolver {
     fn start_net(&self, client: &CaClient, pv_name: RecordName, link: LinkRef<'_>) -> Arc<CaLink> {
         // The receiver is taken with the channel, before its search starts:
         // an `AccessRightsChanged` / `Connected` pair published ahead of the
-        // watcher is lost for good — `meta` stays empty and the write right
-        // stays at its default `true` (C `connectionCallback` scheduling
+        // watcher is lost for good — no attributes are fetched and the write
+        // right stays at its default `true` (C `connectionCallback` scheduling
         // `CA_GET_ATTRIBUTES` and reading `ca_write_access`).
         let (channel, conn_rx) = client.create_channel_with_events(&pv_name, 0);
         let channel = Arc::new(channel);
         let events = Arc::new(LinkEvents::new());
         let connected = Arc::new(LinkConnState::new(self.db.clone(), link));
-        let meta: Arc<ArcSwap<Option<LinkMetadata>>> = Arc::new(ArcSwap::from_pointee(None));
+        let attributes = Arc::new(LinkAttributes::new());
         // Connection-event watcher: keeps `connected` in sync with the
         // real circuit state so `is_connected()` reflects upstream
         // disconnects (mirrors `pvalink`'s `monitor_connected` flag), and
-        // re-fetches the remote CTRL attributes into `meta` on each
-        // connect.
+        // fetches each connect's remote CTRL attributes.
         let reactor = &self.reactor;
         let conn_task = reactor.spawn(run_connection_watcher(
             reactor.clone(),
@@ -910,7 +961,7 @@ impl CaLinkResolver {
             connected.clone(),
             channel.clone(),
             events.clone(),
-            meta.clone(),
+            attributes.clone(),
             pv_name.clone(),
         ));
         let process_task = self
@@ -921,7 +972,7 @@ impl CaLinkResolver {
         let opened = Arc::new(CaLink {
             events,
             connected,
-            meta,
+            attributes,
             channel,
             monitor: std::sync::OnceLock::new(),
             reactor: reactor.clone(),
@@ -1174,19 +1225,19 @@ async fn run_string_monitor(
 /// reflected by `CaLink::is_connected()`. Mirrors `dbCa.c`'s
 /// `connectionCallback` setting `pca->connected`.
 ///
-/// on every `Connected` the watcher also (re)fetches the
-/// remote CTRL attributes into `meta`, mirroring `connectionCallback`
-/// scheduling `CA_GET_ATTRIBUTES` (`dbCa.c:880`). The fetch is detached
-/// so a slow or hung CTRL get never delays the watcher from observing a
-/// later disconnect — the metadata is best-effort and the read path
-/// gates on `connected` regardless.
+/// on every `Connected` the watcher also fetches the remote CTRL
+/// attributes into that connect's slot of `attributes`, mirroring
+/// `connectionCallback` scheduling `CA_GET_ATTRIBUTES` (`dbCa.c:880`). The
+/// fetch is detached so a slow or hung CTRL get never delays the watcher
+/// from observing a later disconnect — the metadata is best-effort and the
+/// read path gates on `connected` regardless.
 async fn run_connection_watcher(
     reactor: epics_base_rs::runtime::task::Reactor,
     mut conn_rx: epics_base_rs::runtime::sync::broadcast::Receiver<crate::client::ConnectionEvent>,
     connected: Arc<LinkConnState>,
     channel: Arc<CaChannel>,
     events: Arc<LinkEvents>,
-    meta: Arc<ArcSwap<Option<LinkMetadata>>>,
+    attributes: Arc<LinkAttributes>,
     pv_name: RecordName,
 ) {
     loop {
@@ -1196,13 +1247,13 @@ async fn run_connection_watcher(
             WatchStep::Applied => {}
             // Detached so a hung CTRL get never stalls the watcher from
             // seeing a later disconnect.
-            WatchStep::Refetch => {
+            WatchStep::Refetch(connect) => {
                 if let Some(native) = channel_native(&channel) {
                     events.drop_stale_string(native);
                 }
                 reactor.spawn(fetch_link_metadata(
                     channel.clone(),
-                    meta.clone(),
+                    attributes.begin(connect),
                     pv_name.clone(),
                 ));
             }
@@ -1214,9 +1265,10 @@ async fn run_connection_watcher(
 #[derive(Debug, PartialEq, Eq)]
 enum WatchStep {
     Applied,
-    /// The link is (or may have become) newly connected: refetch the CTRL
-    /// attributes, C `connectionCallback` scheduling `CA_GET_ATTRIBUTES`.
-    Refetch,
+    /// The link is (or may have become) newly connected on this connect:
+    /// refetch the CTRL attributes, C `connectionCallback` scheduling
+    /// `CA_GET_ATTRIBUTES`.
+    Refetch(u64),
     /// The channel is gone; the watcher's job is done.
     Closed,
 }
@@ -1231,8 +1283,10 @@ async fn watch_step(
 ) -> WatchStep {
     use epics_base_rs::runtime::sync::broadcast::error::RecvError;
     match conn_rx.recv().await {
-        Ok(_) | Err(RecvError::Lagged(_)) if state.sync(fold()) => WatchStep::Refetch,
-        Ok(_) | Err(RecvError::Lagged(_)) => WatchStep::Applied,
+        Ok(_) | Err(RecvError::Lagged(_)) => match state.sync(fold()) {
+            Some(connect) => WatchStep::Refetch(connect),
+            None => WatchStep::Applied,
+        },
         Err(RecvError::Closed) => WatchStep::Closed,
     }
 }
@@ -1247,7 +1301,7 @@ async fn watch_step(
 /// still stored and the next reconnect retries the limits.
 async fn fetch_link_metadata(
     channel: Arc<CaChannel>,
-    meta: Arc<ArcSwap<Option<LinkMetadata>>>,
+    slot: Arc<ConnAttributes>,
     pv_name: RecordName,
 ) {
     // DBF type + element count from the channel's native description.
@@ -1284,11 +1338,11 @@ async fn fetch_link_metadata(
             }
         }
     };
-    meta.store(Arc::new(Some(LinkMetadata::from_ca_attributes(
+    slot.fill(LinkMetadata::from_ca_attributes(
         dbf,
         element_count,
         attrs.as_ref(),
-    ))));
+    ));
 }
 
 #[async_trait::async_trait]
@@ -1456,7 +1510,7 @@ impl LinkSet for CaLinkResolver {
         // ECA_BADCOUNT (`oldChannelNotify.cpp:512`). C reaches that only
         // from a direct client write, never from a link put — dbCa has
         // already clamped. Clamping the converted value keeps
-        // `validate_put_count` unreachable from this path by
+        // `admit_write`'s count refusal unreachable from this path by
         // construction rather than by a second bound inside the client.
         //
         // No native description: the channel is down, which `dbCaTask`
@@ -1634,35 +1688,60 @@ mod tests {
 
     /// BUG 1 regression: a disconnect MUST clear the flag — pre-fix
     /// `is_connected()` keyed off cache presence alone and stayed `true`
-    /// once any event had been cached. `sync` returns `true` for each
+    /// once any event had been cached. `sync` returns the number of each
     /// connect it has not refetched attributes for, the C
     /// `connectionCallback` scheduling `CA_GET_ATTRIBUTES` per connect, and
     /// that includes a connect `run_monitor` flagged first.
     #[test]
     fn bug1_connection_event_tracks_disconnect() {
         let connected = cp_link_state();
-        assert!(connected.sync(fold(true, RW, 0)));
+        assert_eq!(connected.sync(fold(true, RW, 0)), Some(1));
         assert!(connected.is_set());
-        assert!(
-            !connected.sync(fold(true, RW, 0)),
+        assert_eq!(
+            connected.sync(fold(true, RW, 0)),
+            None,
             "one refetch per connect"
         );
 
-        assert!(!connected.sync(fold(false, RW, 1)));
+        assert_eq!(connected.sync(fold(false, RW, 1)), None);
         assert!(!connected.is_set());
-        assert!(connected.sync(fold(true, RW, 1)));
+        assert_eq!(connected.sync(fold(true, RW, 1)), Some(2));
         assert!(connected.is_set());
 
         // A rights change leaves the flag set and closes the read gate.
-        assert!(!connected.sync(fold(true, (false, true), 1)));
+        assert_eq!(connected.sync(fold(true, (false, true), 1)), None);
         assert!(connected.is_set());
         assert!(!connected.has_read_access());
 
         let early = cp_link_state();
         early.mark_connected();
-        assert!(
+        assert_eq!(
             early.sync(fold(true, RW, 0)),
+            Some(1),
             "a monitor event that set the flag first does not eat the refetch"
+        );
+    }
+
+    /// A first connection's CTRL reply that lands after the second
+    /// connection's own is not what the link serves. The client fails a
+    /// pending get with ECA_DISCONN before it announces the outage, so this
+    /// order is only task scheduling and is driven here, not over a socket.
+    #[test]
+    fn an_older_connections_ctrl_reply_landing_late_is_not_served() {
+        let attributes = LinkAttributes::new();
+        let first = attributes.begin(1);
+        let second = attributes.begin(2);
+        let count = |n| LinkMetadata {
+            element_count: Some(n),
+            ..Default::default()
+        };
+        second.fill(count(8));
+        first.fill(count(16));
+        assert_eq!(
+            attributes
+                .live(fold(true, RW, 1))
+                .and_then(|m| m.element_count),
+            Some(8)
         );
     }
 
@@ -1974,6 +2053,29 @@ mod tests {
         assert_eq!(reads() - base, one, "both were taken");
     }
 
+    /// C fails the string read that adds the monitor (`dbCa.c:468-477`), and
+    /// still does when the monitor's first event lands before that read
+    /// returns; the next read serves the event.
+    #[cfg(tokio_backend)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_read_that_adds_the_string_monitor_fails_whatever_it_delivers() {
+        let reactor = task::Reactor::current().expect("test runtime");
+        let events = LinkEvents::new();
+        let native = (DbFieldType::Enum, 1);
+        let delivers_at_once = |monitor: std::sync::Weak<StringMonitor>| {
+            let monitor = monitor.upgrade().expect("the monitor being opened");
+            monitor.value.store(Some(Arc::new(PvString::from("one"))));
+            AbortOnDrop(reactor.spawn(std::future::pending::<()>()))
+        };
+
+        assert_eq!(events.read_string(native, delivers_at_once), None);
+        let next = events.read_string(native, |_| unreachable!("the monitor is open"));
+        assert_eq!(
+            next.as_deref().map(|s| s.as_str_lossy()),
+            Some("one".into())
+        );
+    }
+
     /// C `addAction` (`dbCa.c:132-161`) per boundary, with the processor
     /// stepped by hand: requests raised before it runs are one process, and
     /// one raised during the process is a second.
@@ -2051,7 +2153,7 @@ mod tests {
         let now = fold(true, RW, 1);
         assert_eq!(
             block(watch_step(&mut rx, &state, || now)),
-            WatchStep::Refetch
+            WatchStep::Refetch(2)
         );
         assert_eq!(state.disconnect_count(), 1);
         assert!(state.is_set());

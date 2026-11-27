@@ -943,9 +943,7 @@ fn trans(chars: &[u8], level: usize, ctx: &mut ExpandCtx, out: &mut Vec<u8>) {
 
         // Macro reference: `$` followed by `(` or `{`, and NOT inside
         // single quotes (C `macRef && quote != '\''`).
-        let mac_ref =
-            c == b'$' && i + 1 < chars.len() && (chars[i + 1] == b'(' || chars[i + 1] == b'{');
-        if mac_ref && quote != Some(b'\'') {
+        if opens_reference(chars, i) && quote != Some(b'\'') {
             i = refer(chars, i, level, ctx, out);
             continue;
         }
@@ -968,27 +966,7 @@ fn refer(
     ctx: &mut ExpandCtx,
     out: &mut Vec<u8>,
 ) -> usize {
-    let close = if chars[start + 1] == b'(' { b')' } else { b'}' };
-    // Find the matching close bracket, honoring nested `$(`/`${`.
-    let body_start = start + 2;
-    let mut depth = 1usize;
-    let mut j = body_start;
-    while j < chars.len() && depth > 0 {
-        if j + 1 < chars.len() && chars[j] == b'$' && (chars[j + 1] == b'(' || chars[j + 1] == b'{')
-        {
-            depth += 1;
-            j += 2;
-            continue;
-        }
-        if depth == 1 && chars[j] == close || depth > 1 && (chars[j] == b')' || chars[j] == b'}') {
-            depth -= 1;
-            if depth == 0 {
-                break;
-            }
-        }
-        j += 1;
-    }
-    if depth != 0 {
+    let Some(reference) = Reference::split(chars, start) else {
         // C `refer`'s first error arm (`macCore.c:862-875`): the closing
         // delimiter never matched the opener, so this is not a
         // reference. C rewinds the output pointer to where the reference
@@ -1006,8 +984,8 @@ fn refer(
         // unterminated reference's NAME and is not expanded a second
         // time. This port used to write `x$(A ZZZ y`.
         //
-        // The arm is reached from a pre-scan for the matching bracket,
-        // before any scoped definition in the body has been parsed,
+        // The arm is reached from [`Reference::split`], before any
+        // scoped definition in the body has been translated,
         // where C discovers the mismatch only after parsing them and
         // pushing a scope it then pops. Neither the text nor this notice
         // can see the difference; the one thing that can is that C
@@ -1038,18 +1016,8 @@ fn refer(
         }
         out.extend_from_slice(verbatim);
         return chars.len();
-    }
-    let body = &chars[body_start..j];
-    let after = j + 1;
-
-    // Split the body at the first top-level `=` or `,` (the C
-    // `macEnd` terminator set). Nested `$(...)` brackets are skipped
-    // so a `=`/`,` inside an inner reference does not terminate.
-    let split = top_level_terminator(body);
-    let (name_chars, rest) = match split {
-        Some(k) => (&body[..k], &body[k..]),
-        None => (body, &body[body.len()..]),
     };
+    let after = reference.close + 1;
 
     // The name itself may contain macro references — expand it, quietly.
     // C raises `FLAG_SUPPRESS_WARNINGS` for exactly this translation and
@@ -1058,28 +1026,9 @@ fn refer(
     // form and no notice is written for it. The fault still lands,
     // because C hands the name translation the caller's own seat.
     let mut name = Vec::new();
-    ctx.suppressing(|ctx| trans(name_chars, level + 1, ctx, &mut name));
+    ctx.suppressing(|ctx| trans(reference.name, level + 1, ctx, &mut name));
     // What a notice or a fault prints; the lookup keeps the bytes.
     let shown = String::from_utf8_lossy(&name).into_owned();
-
-    // Default value (`=...`) and scoped definitions (`,k=v`).
-    let mut default: Option<&[u8]> = None;
-    let mut scoped: Option<&[u8]> = None;
-    if let Some(first) = rest.first() {
-        if *first == b'=' {
-            // Default runs until the first top-level `,` or end.
-            let dflt = &rest[1..];
-            match top_level_comma(dflt) {
-                Some(k) => {
-                    default = Some(&dflt[..k]);
-                    scoped = Some(&dflt[k..]);
-                }
-                None => default = Some(dflt),
-            }
-        } else if *first == b',' {
-            scoped = Some(rest);
-        }
-    }
 
     // C pushes the scope only when a `,` list follows, and pops it at
     // the single exit (`macCore.c:822-830`, `:932-935`). The condition
@@ -1093,10 +1042,10 @@ fn refer(
     // definitions 1..N-1 visible, and only those: measured on `softIoc
     // R7.0.10` with an outer `A=outer`, `$(B,A=1,B=$(A))` is `1` while
     // the reverse `$(B,B=$(A),A=1)` is `outer`.
-    let pop = scoped.is_some();
-    if let Some(defs) = scoped {
+    let pop = !reference.scoped.is_empty();
+    if pop {
         ctx.table.push_scope();
-        parse_scoped(defs, level, ctx, &shown);
+        parse_scoped(&reference.scoped, level, ctx, &shown);
     }
 
     match ctx.table.lookup_or_env(&name) {
@@ -1162,7 +1111,7 @@ fn refer(
                 ctx.seat.faults.merge(&faults);
             }
         }
-        None => match default {
+        None => match reference.default {
             Some(def_chars) => {
                 // C `refer` translates the default at `level + 1`
                 // (`macCore.c:909`), so every quote in it is discarded —
@@ -1210,8 +1159,8 @@ fn refer(
     after
 }
 
-/// Parse a `,key=val,key2=val2,...` scoped-definition tail into the
-/// scope [`refer`] has already pushed. A bare `,key` with no `=`
+/// Define the scoped definitions [`Reference::split`] found, in order,
+/// in the scope [`refer`] has already pushed. A bare `,key` with no `=`
 /// defines nothing (C silently skips it).
 ///
 /// Each definition lands in the table as the loop reaches it, so a later
@@ -1226,30 +1175,13 @@ fn refer(
 /// a fault in a scoped name or value is neither warned about nor merged
 /// into the enclosing expansion. `refname` is the seat name C uses for
 /// the first half and the definition's own name the seat for the second.
-fn parse_scoped(rest: &[u8], level: usize, ctx: &mut ExpandCtx, refname: &str) {
-    let mut k = 0;
-    while k < rest.len() {
-        if rest[k] != b',' {
-            break;
-        }
-        k += 1; // step over ','
-        // Scoped name: up to next top-level `=` or `,`.
-        let seg = &rest[k..];
-        let (name_part, tail) = match top_level_terminator(seg) {
-            Some(t) => (&seg[..t], &seg[t..]),
-            None => (seg, &seg[seg.len()..]),
-        };
+fn parse_scoped(defs: &[ScopedDef<'_>], level: usize, ctx: &mut ExpandCtx, refname: &str) {
+    for &(name_part, value) in defs {
         let mut sname = Vec::new();
         ctx.detached(refname.to_string(), |ctx| {
             trans(name_part, level + 1, ctx, &mut sname);
         });
-        k += name_part.len();
-        if let Some(b'=') = tail.first() {
-            let valseg = &tail[1..];
-            let (val_part, _) = match top_level_comma(valseg) {
-                Some(t) => (&valseg[..t], &valseg[t..]),
-                None => (valseg, &valseg[valseg.len()..]),
-            };
+        if let Some(val_part) = value {
             let mut sval = Vec::new();
             ctx.detached(String::from_utf8_lossy(&sname).into_owned(), |ctx| {
                 trans(val_part, level + 1, ctx, &mut sval);
@@ -1258,52 +1190,91 @@ fn parse_scoped(rest: &[u8], level: usize, ctx: &mut ExpandCtx, refname: &str) {
             // here (`macCore.c:283`) — `"scoped macro"` is the seat the
             // definition was translated under, not the entry's own type.
             ctx.table.put(&sname, KIND_MACRO, sval);
-            k += 1 + val_part.len();
         }
         // else: bare `,name` — no value, defines nothing.
     }
 }
 
-/// Index of the first top-level `=` or `,` in `body`, skipping any
-/// `$(...)` / `${...}` nested reference.
-fn top_level_terminator(body: &[u8]) -> Option<usize> {
-    let mut depth = 0usize;
-    let mut i = 0;
-    while i < body.len() {
-        let c = body[i];
-        if c == b'$' && i + 1 < body.len() && (body[i + 1] == b'(' || body[i + 1] == b'{') {
-            depth += 1;
-            i += 2;
-            continue;
-        }
-        if (c == b')' || c == b'}') && depth > 0 {
-            depth -= 1;
-        } else if depth == 0 && (c == b'=' || c == b',') {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
+/// `$(` or `${` at `chars[i]`.
+fn opens_reference(chars: &[u8], i: usize) -> bool {
+    chars[i] == b'$' && matches!(chars.get(i + 1), Some(b'(' | b'{'))
 }
 
-/// Index of the first top-level `,` in `body` (used to split a
-/// default value from trailing scoped definitions).
-fn top_level_comma(body: &[u8]) -> Option<usize> {
-    let mut depth = 0usize;
-    let mut i = 0;
-    while i < body.len() {
-        let c = body[i];
-        if c == b'$' && i + 1 < body.len() && (body[i + 1] == b'(' || body[i + 1] == b'{') {
-            depth += 1;
-            i += 2;
-            continue;
+/// A scoped definition's raw name, and its raw value when it has an `=`.
+type ScopedDef<'a> = (&'a [u8], Option<&'a [u8]>);
+
+/// A reference's raw parts, cut where C `refer` cuts them
+/// (`macCore.c:777-862`).
+struct Reference<'a> {
+    name: &'a [u8],
+    default: Option<&'a [u8]>,
+    scoped: Vec<ScopedDef<'a>>,
+    /// Index of the bracket that closes the reference.
+    close: usize,
+}
+
+impl<'a> Reference<'a> {
+    /// Cut the reference whose `$` is `chars[start]`, or `None` when no
+    /// bracket of its own kind closes it.
+    fn split(chars: &'a [u8], start: usize) -> Option<Self> {
+        let close = if chars[start + 1] == b'(' { b')' } else { b'}' };
+        let name_end = [b'=', b',', close];
+        let value_end = [b',', close];
+        let piece = |from: usize, term: &[u8]| -> Option<(&'a [u8], usize)> {
+            piece_end(chars, from, term).map(|end| (&chars[from..end], end))
+        };
+        let (name, mut r) = piece(start + 2, &name_end)?;
+        let mut default = None;
+        if chars[r] == b'=' {
+            let (value, end) = piece(r + 1, &value_end)?;
+            default = Some(value);
+            r = end;
         }
-        if (c == b')' || c == b'}') && depth > 0 {
-            depth -= 1;
-        } else if depth == 0 && c == b',' {
+        let mut scoped = Vec::new();
+        while chars[r] == b',' {
+            let (sname, end) = piece(r + 1, &name_end)?;
+            r = end;
+            let mut value = None;
+            if chars[r] == b'=' {
+                let (sval, end) = piece(r + 1, &value_end)?;
+                value = Some(sval);
+                r = end;
+            }
+            scoped.push((sname, value));
+        }
+        Some(Self {
+            name,
+            default,
+            scoped,
+            close: r,
+        })
+    }
+}
+
+/// Index of the first byte of `term` at or after `i`, or `None` at the
+/// end of `chars`: C `trans`'s loop (`macCore.c:719-750`). The test runs
+/// on the raw byte before the quote branch, so a quote protects no
+/// terminator; an escaped byte and a nested reference are stepped over
+/// whole, and single quotes keep `$(` from opening one.
+fn piece_end(chars: &[u8], mut i: usize, term: &[u8]) -> Option<usize> {
+    let mut quote = None;
+    while i < chars.len() {
+        let c = chars[i];
+        if term.contains(&c) {
             return Some(i);
         }
-        i += 1;
+        match quote {
+            Some(q) if c == q => quote = None,
+            None if c == b'"' || c == b'\'' => quote = Some(c),
+            _ => {}
+        }
+        i = if opens_reference(chars, i) && quote != Some(b'\'') {
+            Reference::split(chars, i)?.close + 1
+        } else if c == b'\\' && i + 1 < chars.len() {
+            i + 2
+        } else {
+            i + 1
+        };
     }
     None
 }
@@ -1520,6 +1491,53 @@ mod tests {
         let r = expand_macros("$$100", &macros, MacroExpandOptions::default());
         assert_eq!(r.text, "$$100");
         assert!(r.faults.undefined.is_empty());
+    }
+
+    // Expected texts are `softIoc R7.0.10`'s `macExpandString` on the same
+    // input, except where a test says otherwise.
+    fn expand(src: &str) -> String {
+        substitute_macros(src, MacroDefs::new())
+    }
+
+    #[test]
+    fn an_escaped_terminator_in_a_reference_name_does_not_end_it() {
+        assert_eq!(expand(r"$(A\=B=x)"), "x");
+        assert_eq!(expand(r"$(A\,B=x)"), "x");
+        assert_eq!(expand(r"$(A\)B=x)"), "x");
+    }
+
+    #[test]
+    fn an_escaped_terminator_in_a_default_does_not_end_it() {
+        assert_eq!(expand(r"$(PARM=512\,1000)"), "512,1000");
+        // C writes `512)10001000)`: the scan that finds the default's end
+        // writes nothing, and C steps over an escaped char only when there
+        // is room to write it (`macCore.c:743`).
+        assert_eq!(expand(r"$(PARM=512\)1000)"), "512)1000");
+    }
+
+    #[test]
+    fn an_escaped_terminator_in_a_scoped_definition_does_not_end_it() {
+        assert_eq!(expand(r"$(X\=Y,X\=Y=v)"), "v");
+        assert_eq!(expand(r"$(X\,Y,X\,Y=v)"), "v");
+        assert_eq!(expand(r"$(X\)Y,X\)Y=v)"), "v");
+        assert_eq!(expand(r"$(X,X=a\,b)"), "a,b");
+        assert_eq!(expand(r"$(X,X=a\)b)"), "a)b");
+    }
+
+    #[test]
+    fn a_nested_reference_is_closed_by_its_own_bracket() {
+        assert_eq!(
+            expand("$(A=$(B}x)y)"),
+            "$(B}x,undefined)y",
+            "a `}}` inside a nested `$(` closed the outer reference"
+        );
+    }
+
+    #[test]
+    fn a_single_quoted_dollar_paren_in_a_reference_is_text() {
+        // Quotes do not protect a terminator, and single quotes keep
+        // `$(B` from opening a reference, so its `)` closes the outer one.
+        assert_eq!(expand("$(P='$(B)')"), "$(B')");
     }
 
     // `env_fallback` resolves an otherwise-unset name from the process

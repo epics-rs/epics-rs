@@ -2,9 +2,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use epics_base_rs::error::CaResult;
-use epics_base_rs::runtime::task::{
-    CallbackPriority, spawn_background_after, spawn_blocking_background,
-};
+use epics_base_rs::runtime::background::{CallbackBody, CallbackCell};
+use epics_base_rs::runtime::task::{CallbackPriority, request_cell};
+use epics_base_rs::server::database::RecordBand;
 use epics_base_rs::server::device_support::{
     DeviceInitOutcome, DevicePost, DeviceReadOutcome, DeviceSupport,
 };
@@ -508,10 +508,39 @@ pub struct CommandPort {
     trace: Arc<MotorTrace>,
     device_state: SharedDeviceState,
     io_intr_tx: mpsc::Sender<()>,
-    /// The record's `PRIO` band, C's `callbackSetPriority(pmr->prio, ...)`
-    /// for the settle delay (motorRecord.cc:634); LOW is PRIO's default.
-    prio: CallbackPriority,
+    /// The record's `PRIO` band, read at each request. C sets the settle
+    /// delay's band once, in `init_record` (motorRecord.cc:634).
+    band: RecordBand,
     build_trans: Option<Arc<dyn BuildTrans>>,
+    refused_moves: Arc<CallbackCell<RefusedMoves>>,
+}
+
+/// C `asynCallback` (devMotorAsyn.c:661-737) for the moves a missing axis
+/// refused, which C's port thread runs as for any write. Here it runs on the
+/// record's band, as a cell: a full band delays it, and DMOV still returns.
+struct RefusedMoves {
+    state: SharedDeviceState,
+    trace: Arc<MotorTrace>,
+    moves: Mutex<Vec<MotorCommand>>,
+}
+
+impl RefusedMoves {
+    fn cell(state: &SharedDeviceState, trace: &Arc<MotorTrace>) -> Arc<CallbackCell<Self>> {
+        CallbackCell::new(Self {
+            state: state.clone(),
+            trace: trace.clone(),
+            moves: Mutex::default(),
+        })
+    }
+}
+
+impl CallbackBody for RefusedMoves {
+    fn run(&self) {
+        let moves = self.moves.lock().map(|mut m| std::mem::take(&mut *m));
+        for command in moves.iter().flatten() {
+            async_callback(&self.state, self.trace.record(), command);
+        }
+    }
 }
 
 impl std::fmt::Debug for CommandPort {
@@ -578,11 +607,12 @@ impl MotorDeviceSupport {
     ) -> Self {
         Self {
             port: CommandPort {
+                refused_moves: RefusedMoves::cell(&device_state, &trace),
                 link,
                 trace,
                 device_state,
                 io_intr_tx,
-                prio: CallbackPriority::Low,
+                band: RecordBand::default(),
                 build_trans: None,
             },
             _timeout: timeout,
@@ -678,12 +708,14 @@ impl CommandPort {
     /// for a harness with no poller.
     pub fn capture() -> (Self, mpsc::UnboundedReceiver<ToAxis>) {
         let (motor_cmd_tx, motor_cmd_rx) = mpsc::unbounded_channel();
+        let (trace, device_state) = (Arc::default(), new_shared_state());
         let port = Self {
+            refused_moves: RefusedMoves::cell(&device_state, &trace),
             link: AxisLink::harness(mpsc::channel(1).0, motor_cmd_tx),
-            trace: Default::default(),
-            device_state: new_shared_state(),
+            trace,
+            device_state,
             io_intr_tx: mpsc::channel(1).0,
-            prio: CallbackPriority::Low,
+            band: RecordBand::default(),
             build_trans: None,
         };
         (port, motor_cmd_rx)
@@ -813,29 +845,31 @@ impl CommandPort {
             Err(Unreached::NoSignal(records)) => {
                 // The motor task's callbackRequest runs on the callback
                 // pool, which waits for the record this pass holds.
-                spawn_blocking_background(CallbackPriority::Medium, move |_| {
-                    let problem = MotorStatus {
-                        problem: true,
-                        ..MotorStatus::default()
-                    };
-                    for pulse in records.post(problem) {
-                        let _ = pulse.try_send(());
-                    }
-                });
+                request_callback_after(
+                    &self.device_state,
+                    CallbackPriority::Medium,
+                    Duration::ZERO,
+                    async move {
+                        let problem = MotorStatus {
+                            problem: true,
+                            ..MotorStatus::default()
+                        };
+                        for pulse in records.post(problem) {
+                            let _ = pulse.try_send(());
+                        }
+                    },
+                );
                 return EndTrans::Passed;
             }
         };
         crate::poll_loop::refuse_commands(&self.trace, missing, &commands);
         // asynCallback runs for a refused write as for any other, on the
         // port's thread, which waits for the record this pass holds.
-        let moves: Vec<_> = commands.into_iter().filter(|c| c.is_move()).collect();
-        if !moves.is_empty() {
-            let (state, trace) = (self.device_state.clone(), self.trace.clone());
-            spawn_blocking_background(self.prio, move |_| {
-                for command in &moves {
-                    async_callback(&state, trace.record(), command);
-                }
-            });
+        if moves > 0 {
+            if let Ok(mut refused) = self.refused_moves.body().moves.lock() {
+                refused.extend(commands.into_iter().filter(|c| c.is_move()));
+            }
+            let _ = request_cell(self.band.priority(), &self.refused_moves);
         }
         EndTrans::Passed
     }
@@ -898,12 +932,17 @@ impl CommandPort {
         let (id, duration) = (delay.id, delay.duration);
         let device_state = self.device_state.clone();
         let io_intr_tx = self.io_intr_tx.clone();
-        spawn_background_after(self.prio, duration, async move {
-            let pulse = device_state.lock().is_ok_and(|mut ds| ds.delay_expired(id));
-            if pulse {
-                let _ = io_intr_tx.send(()).await;
-            }
-        });
+        request_callback_after(
+            &self.device_state,
+            self.band.priority(),
+            duration,
+            async move {
+                let pulse = device_state.lock().is_ok_and(|mut ds| ds.delay_expired(id));
+                if pulse {
+                    let _ = io_intr_tx.send(()).await;
+                }
+            },
+        );
     }
 }
 
@@ -1119,8 +1158,8 @@ impl DeviceSupport for MotorDeviceSupport {
         self.port.trace.set_record(name);
     }
 
-    fn set_callback_priority(&mut self, prio: CallbackPriority) {
-        self.port.prio = prio;
+    fn set_record_band(&mut self, band: RecordBand) {
+        self.port.band = band;
     }
 
     /// The database devMotorAsyn's callbacks lock the record in.

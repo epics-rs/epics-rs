@@ -21,12 +21,12 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Instant;
 
 use epics_base_rs::error::{CaError, CaResult};
-use epics_base_rs::runtime::task::CallbackPriority;
-use epics_base_rs::server::database::AsyncDbHandle;
+use epics_base_rs::server::database::{AsyncDbHandle, RecordBand};
+use epics_base_rs::server::recgbl::simm::LinkFetch;
 use epics_base_rs::server::record::dbd_generated::DB_COMMON_FIELDS;
 use epics_base_rs::server::record::{
-    CycleHooks, DeclaredFields, EventMask, FieldDesc, FieldIx, FieldMetadataOverride,
-    InitLinkReads, OwnFrame, ProcessContext, ProcessOutcome, Record, ScanType, Special,
+    CycleHooks, DeclaredFields, EventMask, FieldDesc, FieldIx, FieldMetadataOverride, LinkReadAs,
+    OwnFrame, ProcessContext, ProcessOutcome, Record, ScanType, Special,
 };
 use epics_base_rs::types::{DbFieldType, EpicsValue, PvString, RecordName, WallTime};
 
@@ -638,7 +638,12 @@ pub struct SscanRecord {
     pub(crate) name: String,
     pub(crate) handle: Option<AsyncDbHandle>,
     pub(crate) inbox: std::sync::Arc<links::Inbox>,
-    pub(crate) prio: CallbackPriority,
+    pub(crate) link_events:
+        Option<std::sync::Arc<epics_base_rs::runtime::background::CallbackCell<links::LinkEvents>>>,
+    /// The band every callback request reads at the time it is made. C
+    /// sets it at `init_record` and on a `PRIO` special
+    /// (sscanRecord.c:872-876, :1628); here a `PRIO` put needs neither.
+    pub(crate) band: RecordBand,
     /// The record's TIME at the start of this pass (the scan's start stamp
     /// once a scan is running).
     pub(crate) time: WallTime,
@@ -746,7 +751,8 @@ impl Default for SscanRecord {
             name: String::new(),
             handle: None,
             inbox: Default::default(),
-            prio: CallbackPriority::Low,
+            link_events: None,
+            band: RecordBand::default(),
             time: WallTime::now(),
             dly_gen: 0,
             udf_clear: false,
@@ -1246,7 +1252,7 @@ impl SscanRecord {
             return;
         };
         let name = self.name.clone();
-        epics_base_rs::runtime::task::spawn_background(self.prio, async move {
+        h.clone().spawn_callback(self.band.priority(), async move {
             with_sscan(&h, &name, |s, _| f(s));
         });
     }
@@ -1266,13 +1272,14 @@ impl SscanRecord {
         };
         let name = self.name.clone();
         let wait = epics_base_rs::runtime::time::duration_from_secs(f64::from(secs));
-        epics_base_rs::runtime::task::spawn_background_after(self.prio, wait, async move {
-            with_sscan(&h, &name, |s, _| {
-                if s.dly_gen == generation {
-                    s.delay_callback();
-                }
+        h.clone()
+            .spawn_callback_after(self.band.priority(), wait, async move {
+                with_sscan(&h, &name, |s, _| {
+                    if s.dly_gen == generation {
+                        s.delay_callback();
+                    }
+                });
             });
-        });
     }
 
     /// C `epicsTimerCancel(precPvt->dlyCallback.timer)`.
@@ -1317,9 +1324,13 @@ impl Record for SscanRecord {
         Ok(())
     }
 
-    fn init_record_own(&mut self, _reads: &mut InitLinkReads, own: OwnFrame<'_>) -> CaResult<()> {
+    fn init_record_own(
+        &mut self,
+        _answer: Option<LinkFetch>,
+        own: OwnFrame<'_>,
+    ) -> CaResult<Option<(&'static str, LinkReadAs)>> {
         self.init_pass1(own);
-        Ok(())
+        Ok(None)
     }
 
     fn process_own(&mut self, own: OwnFrame<'_>) -> CaResult<ProcessOutcome> {
@@ -1400,11 +1411,15 @@ impl Record for SscanRecord {
 
     fn set_process_context(&mut self, ctx: &ProcessContext) {
         self.time = ctx.time;
-        self.prio = ctx.callback_priority;
+    }
+
+    fn set_record_band(&mut self, band: RecordBand) {
+        self.band = band;
     }
 
     fn set_async_context(&mut self, name: RecordName, db: AsyncDbHandle) {
         self.name = String::from_utf8_lossy(name.as_bytes()).into_owned();
+        self.link_events = Some(links::LinkEvents::cell(db.clone(), self.name.clone()));
         self.handle = Some(db);
     }
 

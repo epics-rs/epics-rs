@@ -8,8 +8,8 @@ use crate::server::record::{
 use crate::types::{DbfCode, EpicsValue, PvString};
 
 use super::link_status::{
-    LINK_CON, LINK_STATUS_CHOICES, LinkCheck, LinkCheckSpec, LinkCheckState, LinkRole, LinkRule,
-    LinkStatusGen, LinkStatusPosts, post_link_status,
+    CheckBand, LINK_CON, LINK_STATUS_CHOICES, LinkCheck, LinkCheckSpec, LinkCheckState, LinkRole,
+    LinkRule, LinkStatusGen, LinkStatusPosts, post_link_status,
 };
 use crate::calc::StringInputs;
 use crate::calc::engine::value::{SCALC_STRING_SIZE, ScalcString};
@@ -717,6 +717,7 @@ static SCALCOUT_LINK_CHECK: LinkCheckSpec = LinkCheckSpec {
     mask: crate::server::recgbl::EventMask::VALUE,
     repost_local: false,
     in_cycle: true,
+    band: CheckBand::Low,
 };
 
 /// INAV..INLV — numeric-input connection-status field names (channel A..L).
@@ -1653,7 +1654,8 @@ impl Record for ScalcoutRecord {
     }
 
     /// C `sCalcoutRecord.c::fetch_values` (890-941) — INAA..INLL → AA..LL, read
-    /// as DBR_STRING, outside the fetch gate.
+    /// as DBR_STRING once the numeric loop succeeded; its own failures do not
+    /// feed the fetch gate.
     fn string_input_links(&self) -> &'static [(&'static str, &'static str)] {
         SCALCOUT_STRING_INPUT_LINKS
     }
@@ -1680,7 +1682,7 @@ impl Record for ScalcoutRecord {
     ) -> Option<crate::server::record::LinkReadAs> {
         use crate::server::record::LinkReadAs;
         Some(match source.field_type {
-            Some(DbfCode::Char | DbfCode::UChar) if source.element_count > 1 => LinkReadAs::Native,
+            Some(DbfCode::Char | DbfCode::UChar) if source.no_elements > 1 => LinkReadAs::Native,
             _ => LinkReadAs::String,
         })
     }
@@ -1875,10 +1877,10 @@ impl Record for ScalcoutRecord {
                 | DbfCode::Outlink
                 | DbfCode::Fwdlink,
             ) => EpicsValue::String(self.osv.clone()),
-            Some(DbfCode::Char | DbfCode::UChar) if target.element_count > 1 => {
+            Some(DbfCode::Char | DbfCode::UChar) if target.no_elements > 1 => {
                 // `n_elements > sizeof(pscalcout->sval)` clamp — the C
                 // buffers are `char[SCALC_STRING_SIZE]` (40).
-                let n = target.element_count.min(SCALC_STRING_SIZE as i64) as usize;
+                let n = target.no_elements.min(SCALC_STRING_SIZE as i64) as usize;
                 // C puts `n` bytes straight out of the 40-byte field, so the
                 // string is NUL-padded out to the requested count.
                 let async_put = target.link_type == LinkType::Ca && self.wait != 0;
@@ -2469,16 +2471,13 @@ mod tests {
         rec
     }
 
-    /// A target as `PvDatabase::resolve_out_target` reports it.
-    fn out_target(
-        field_type: Option<DbfCode>,
-        element_count: i64,
-        link_type: LinkType,
-    ) -> OutTarget {
+    /// An unfiltered target as `PvDatabase::resolve_out_target` reports it.
+    fn out_target(field_type: Option<DbfCode>, no_elements: i64, link_type: LinkType) -> OutTarget {
         OutTarget {
             field_type,
-            dbr_field_type: field_type.and_then(DbfCode::served_type),
-            element_count,
+            final_field_type: field_type.and_then(DbfCode::served_type),
+            no_elements,
+            final_elements: no_elements,
             link_type,
             put_admitted: true,
         }

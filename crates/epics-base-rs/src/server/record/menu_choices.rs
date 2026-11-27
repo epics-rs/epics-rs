@@ -708,13 +708,13 @@ mod tests {
         assert_eq!(shared_menu_choices("OMSL"), Some(MENU_OMSL));
         assert_eq!(shared_menu_choices("IVOA"), Some(MENU_IVOA));
         assert_eq!(shared_menu_choices("LINR"), Some(MENU_CONVERT));
-        // SCAN/SSCN are the one pair whose answer is RUNTIME data — the
-        // loaded `menuScan`, which a site `.dbd` may replace — so the
-        // assertion is against `menu_scan()`, not against the generated
-        // constant it happens to equal in a process that loaded no site menu.
-        // Asserting the constant would let a compiled-in list back in without
-        // failing; `tests/menuscan_site_menu_is_runtime_data.rs` is the other
-        // half, in the process that does load one.
+        // SCAN/SSCN are the one pair whose answer is RUNTIME data — the loaded
+        // `menuScan`, which a site `.dbd` may replace — so the assertion is
+        // against `menu_scan()`, not against the generated constant it happens
+        // to equal in a process that loaded no site menu. Asserting the
+        // constant would let a compiled-in list back in without failing;
+        // `tests/integration/menuscan_site_menu_is_runtime_data.rs` is the
+        // other half, in the process that does load one.
         assert_eq!(
             shared_menu_choices("SSCN"),
             Some(crate::server::record::menu_scan().choices())

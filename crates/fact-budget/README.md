@@ -5,9 +5,10 @@ to happen, and `barrier`, the way a test claims that something did *not*
 happen. It ports no C module.
 
 Never published (`publish = false`). `epics-base-rs`, `epics-ca-rs`,
-`epics-pva-rs` and `epics-seq-rs` take it as a `path`-only dev-dependency,
-which `cargo package` drops from the uploaded manifest; the unpublished test
-helpers `raw-ca` and `c-ca-tools` take it as a plain one. No feature flags.
+`epics-pva-rs`, `epics-seq-rs` and `motor-rs` take it as a `path`-only
+dev-dependency, which `cargo package` drops from the uploaded manifest; the
+unpublished test helpers `raw-ca` and `c-ca-tools` take it as a plain one. No
+feature flags.
 
 ## `FACT_BUDGET`
 
@@ -29,7 +30,7 @@ one: one TCP stream and one server-side message thread deliver every frame the
 server was going to send earlier before its reply.
 
 ```rust
-// crates/epics-ca-rs/tests/absence_barrier.rs
+// crates/epics-ca-rs/tests/integration/absence_barrier.rs
 let mut src = vec!["hello", "world", "PROBE"].into_iter();
 let seen = fact_budget::barrier::until(
     "clean",
@@ -58,7 +59,7 @@ The crate has no tests of its own; `barrier`'s falsifiability cases live in
 `epics-ca-rs`:
 
 ```bash
-cargo nextest run -p epics-ca-rs --test absence_barrier
+cargo nextest run -p epics-ca-rs -E 'binary(integration) & test(/^absence_barrier::/)'
 ```
 
 ## License

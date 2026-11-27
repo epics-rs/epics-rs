@@ -561,11 +561,11 @@ mod tests {
     /// returning.
     async fn drain_until_closed(
         rx: &mut mpsc::Receiver<ChildEvent>,
-        deadline: tokio::time::Instant,
+        deadline: epics_base_rs::runtime::task::Instant,
     ) -> (Vec<u8>, bool) {
         let mut output = Vec::new();
         let mut exited = false;
-        while tokio::time::Instant::now() < deadline {
+        while epics_base_rs::runtime::task::Instant::now() < deadline {
             tokio::select! {
                 ev = rx.recv() => match ev {
                     Some(ChildEvent::Output(b)) => output.extend_from_slice(&b),
@@ -589,7 +589,7 @@ mod tests {
             child_exec: None,
         };
         let (handle, mut rx) = ChildHandle::spawn(&spec).expect("spawn");
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let deadline = epics_base_rs::runtime::task::deadline_from_now(Duration::from_secs(3));
         let (output, exited) = drain_until_closed(&mut rx, deadline).await;
 
         assert!(exited, "child should have exited");
@@ -603,10 +603,10 @@ mod tests {
     /// [`drain_until_closed`] but keeps the [`ChildExit`] value.
     async fn drain_for_exit(
         rx: &mut mpsc::Receiver<ChildEvent>,
-        deadline: tokio::time::Instant,
+        deadline: epics_base_rs::runtime::task::Instant,
     ) -> Option<ChildExit> {
         let mut exit = None;
-        while tokio::time::Instant::now() < deadline {
+        while epics_base_rs::runtime::task::Instant::now() < deadline {
             tokio::select! {
                 ev = rx.recv() => match ev {
                     Some(ChildEvent::Output(_)) => {}
@@ -643,7 +643,7 @@ mod tests {
             child_exec: None,
         };
         let (_handle, mut rx) = ChildHandle::spawn(&spec).expect("spawn");
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let deadline = epics_base_rs::runtime::task::deadline_from_now(Duration::from_secs(3));
         let (output, _exited) = drain_until_closed(&mut rx, deadline).await;
         let text = String::from_utf8_lossy(&output);
 
@@ -731,7 +731,7 @@ mod tests {
             child_exec: None,
         };
         let (_handle, mut rx) = ChildHandle::spawn(&spec).expect("spawn");
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let deadline = epics_base_rs::runtime::task::deadline_from_now(Duration::from_secs(3));
         let exit = drain_for_exit(&mut rx, deadline).await;
         assert_eq!(exit, Some(ChildExit::Exited(3)), "got: {exit:?}");
     }
@@ -753,7 +753,7 @@ mod tests {
         // Let the child reach its sleep, then SIGKILL its group.
         sleep(Duration::from_millis(150)).await;
         handle.signal(9).expect("signal");
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let deadline = epics_base_rs::runtime::task::deadline_from_now(Duration::from_secs(3));
         let exit = drain_for_exit(&mut rx, deadline).await;
         assert_eq!(exit, Some(ChildExit::Signaled(9)), "got: {exit:?}");
     }
@@ -782,7 +782,7 @@ mod tests {
         // Send EOF (Ctrl-D = 0x04) so cat exits cleanly.
         handle.write_stdin(&[0x04]).await.ok();
 
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let deadline = epics_base_rs::runtime::task::deadline_from_now(Duration::from_secs(3));
         let (output, _) = drain_until_closed(&mut rx, deadline).await;
 
         let text = String::from_utf8_lossy(&output);
@@ -816,7 +816,7 @@ mod tests {
             child_exec: None,
         };
         let (_handle, mut rx) = ChildHandle::spawn(&spec).expect("spawn");
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let deadline = epics_base_rs::runtime::task::deadline_from_now(Duration::from_secs(3));
         let (output, _exited) = drain_until_closed(&mut rx, deadline).await;
         let text = String::from_utf8_lossy(&output);
         let reported = text
@@ -861,7 +861,7 @@ mod tests {
             child_exec: Some(PathBuf::from("/bin/sh")),
         };
         let (_handle, mut rx) = ChildHandle::spawn(&spec).expect("spawn");
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let deadline = epics_base_rs::runtime::task::deadline_from_now(Duration::from_secs(3));
         let (output, _exited) = drain_until_closed(&mut rx, deadline).await;
         let text = String::from_utf8_lossy(&output);
         assert!(
@@ -877,9 +877,9 @@ mod tests {
     /// every client as `Normal exit status = 255`.
     async fn launch_failure_status(spec: &ChildSpec) -> ChildExit {
         let (_handle, mut rx) = ChildHandle::spawn(spec).expect("fork succeeds; the exec fails");
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let deadline = epics_base_rs::runtime::task::deadline_from_now(Duration::from_secs(3));
         let mut exit = ChildExit::Unknown;
-        while tokio::time::Instant::now() < deadline {
+        while epics_base_rs::runtime::task::Instant::now() < deadline {
             tokio::select! {
                 ev = rx.recv() => match ev {
                     Some(ChildEvent::Exited { exit: e }) => { exit = e; break }

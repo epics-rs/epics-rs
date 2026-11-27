@@ -303,18 +303,13 @@ const SEND_DONTWAIT: libc::c_int = 0x0080;
 #[cfg(all(unix, not(target_os = "rtems")))]
 const SEND_DONTWAIT: libc::c_int = libc::MSG_DONTWAIT;
 
-/// Wait until the socket will take bytes, or the poll interval expires
-/// (`Ok(false)`).
+/// Wait until the socket will take bytes, or `deadline` passes (`Ok(false)`,
+/// C's `asynTimeout`).
 ///
-/// `Ok(false)` is C's `asynTimeout`; it does NOT prove `deadline` has passed.
-/// The interval given to `poll` is [`socket::poll_ready`]'s whole
-/// milliseconds of the budget still left, so its sub-millisecond part
-/// truncates and the wait can end up to 1 ms early. That is C's own
-/// arithmetic — `writePollmsec = (int)(timeout * 1000.0)`
-/// (`drvAsynIPPort.c:662-664`) — and C likewise returns `asynTimeout`
-/// straight off `pollstatus == 0` without re-reading any deadline (`:697`).
-/// Reproducing the early edge is deliberate; a caller needing the deadline
-/// held exactly must re-check it, not this trait.
+/// [`socket::poll_ready`] ends only on the clock. C returns `asynTimeout`
+/// straight off `pollstatus == 0` (`drvAsynIPPort.c:697`) after truncating
+/// `writePollmsec = (int)(timeout * 1000.0)` (:662-664), so its wait ends up
+/// to 1 ms early.
 ///
 /// C parity, and why the write bound is not `SO_SNDTIMEO`: `drvAsynIPPort.c`
 /// compiles the `setsockopt(SO_SNDTIMEO)` block only under `USE_SOCKTIMEOUT`,
@@ -406,22 +401,17 @@ impl<T: socket::Pollable> BoundNextRead for T {
 
 impl<T: socket::Pollable> WaitWritable for T {
     fn wait_writable(&self, deadline: Option<std::time::Instant>) -> std::io::Result<bool> {
-        loop {
-            let remaining = match deadline {
-                Some(deadline) => {
-                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                    if remaining.is_zero() {
-                        return Ok(false);
-                    }
-                    Some(remaining)
+        let remaining = match deadline {
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return Ok(false);
                 }
-                None => None,
-            };
-            match socket::poll_ready(self, socket::Readiness::Writable, remaining) {
-                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
-                outcome => return outcome,
+                Some(remaining)
             }
-        }
+            None => None,
+        };
+        socket::poll_ready(self, socket::Readiness::Writable, remaining)
     }
 }
 
@@ -1376,7 +1366,6 @@ pub(crate) fn fill_until_refused(sock: &TcpStream) {
             ) {
                 Ok(false) => return,
                 Ok(true) => continue,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(e) => panic!("polling the filled socket failed: {e}"),
             }
         }
@@ -2690,6 +2679,64 @@ mod tests {
         }
     }
 
+    /// A signal does not cut a read short: C's `readIt` polls again after
+    /// `EINTR` (drvAsynIPPort.c:812-824), so the read still waits its timeout.
+    #[cfg(unix)]
+    #[test]
+    fn a_signal_during_a_read_does_not_shorten_its_timeout() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+        let (listener, port) = start_echo_server();
+        // The peer holds the connection open and silent until the test ends.
+        let (_hold, held) = std::sync::mpsc::channel::<()>();
+        let _handle = thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            let _ = held.recv();
+        });
+        let mut drv = DrvAsynIPPort::new("iptest", &format!("127.0.0.1:{port}")).unwrap();
+        drv.connect(&AsynUser::default()).unwrap();
+
+        static TAKEN: AtomicU32 = AtomicU32::new(0);
+        extern "C" fn take(_: libc::c_int) {
+            TAKEN.fetch_add(1, Ordering::SeqCst);
+        }
+        // SAFETY: a zeroed `sigaction` with a counting handler, no SA_RESTART.
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = take as extern "C" fn(libc::c_int) as usize;
+            assert_eq!(libc::sigaction(libc::SIGUSR2, &sa, std::ptr::null_mut()), 0);
+        }
+        // SAFETY: `pthread_self` has no preconditions.
+        let me = unsafe { libc::pthread_self() };
+        let done = Arc::new(AtomicBool::new(false));
+        let kicker = {
+            let done = Arc::clone(&done);
+            thread::spawn(move || {
+                while !done.load(Ordering::SeqCst) {
+                    thread::sleep(Duration::from_millis(20));
+                    // SAFETY: `me` is the test thread, alive until the join below.
+                    unsafe { libc::pthread_kill(me, libc::SIGUSR2) };
+                }
+            })
+        };
+        let timeout = Duration::from_millis(300);
+        let user = AsynUser::new(0).with_timeout(timeout);
+        let mut buf = [0u8; 32];
+        let before = TAKEN.load(Ordering::SeqCst);
+        let start = std::time::Instant::now();
+        let res = drv.io_read_octet(&user, &mut buf);
+        let elapsed = start.elapsed();
+        let during = TAKEN.load(Ordering::SeqCst) - before;
+        done.store(true, Ordering::SeqCst);
+        kicker.join().unwrap();
+
+        let err = res.unwrap_err();
+        assert_eq!(err.status(), AsynStatus::Timeout, "got {err:?}");
+        assert!(elapsed >= timeout, "a 300 ms read ended after {elapsed:?}");
+        assert!(during >= 1, "no signal reached the read");
+    }
+
     #[test]
     fn test_server_disconnect_eof() {
         let (listener, port) = start_echo_server();
@@ -3063,7 +3110,8 @@ mod tests {
                 stream
                     .set_read_timeout(Some(Duration::from_millis(100)))
                     .unwrap();
-                let deadline = std::time::Instant::now() + Duration::from_millis(2600);
+                let deadline =
+                    epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_millis(2600));
                 let mut scratch = [0u8; 64];
                 while std::time::Instant::now() < deadline {
                     match stream.read(&mut scratch) {
@@ -3562,7 +3610,10 @@ mod tests {
 
         let start = std::time::Instant::now();
         let ready = client
-            .wait_writable(Some(start + Duration::from_micros(900)))
+            .wait_writable(Some(epics_libcom_rs::runtime::time::deadline_after(
+                start,
+                Duration::from_micros(900),
+            )))
             .unwrap();
         let took = start.elapsed();
         assert!(!ready, "a filled socket must not turn writable");
@@ -3570,6 +3621,36 @@ mod tests {
             took >= Duration::from_millis(1),
             "a 900 us write deadline must poll, not probe: took {took:?}"
         );
+    }
+
+    /// A read bound and a write deadline end at their budget, not at the last
+    /// whole millisecond before it.
+    #[test]
+    fn a_fractional_millisecond_bound_is_waited_out() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let _accepted = listener.accept().unwrap();
+
+        let budget = Duration::from_micros(1900);
+        for _ in 0..20 {
+            let start = std::time::Instant::now();
+            client.bound_next_read(Some(budget));
+            let took = start.elapsed();
+            assert!(took >= budget, "a 1.9 ms read bound ended after {took:?}");
+        }
+
+        fill_until_refused(&client);
+        for _ in 0..20 {
+            let start = std::time::Instant::now();
+            let deadline = epics_libcom_rs::runtime::time::deadline_after(start, budget);
+            let ready = client.wait_writable(Some(deadline)).unwrap();
+            let took = start.elapsed();
+            assert!(!ready, "a filled socket must not turn writable");
+            assert!(
+                took >= budget,
+                "a 1.9 ms write deadline ended after {took:?}"
+            );
+        }
     }
 
     #[test]
@@ -3649,7 +3730,7 @@ mod tests {
 
     impl WaitWritable for DribblePeer {
         fn wait_writable(&self, deadline: Option<std::time::Instant>) -> std::io::Result<bool> {
-            let ready = std::time::Instant::now() + self.delay;
+            let ready = epics_libcom_rs::runtime::time::deadline_from_now(self.delay);
             if deadline.is_some_and(|d| ready > d) {
                 // What `poll` does when its interval expires first.
                 let deadline = deadline.expect("checked above");
@@ -3790,7 +3871,7 @@ mod tests {
             chunk: 1,
             delay: Duration::from_millis(20),
         };
-        let cap = std::time::Instant::now() + Duration::from_millis(50);
+        let cap = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_millis(50));
         let err = write_with_retry(&peer, b"abcdef", Some(Duration::from_millis(50)), Some(cap))
             .expect_err("the caller's budget bounds the whole call")
             .into_error();

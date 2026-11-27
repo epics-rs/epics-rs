@@ -1,0 +1,15 @@
+[package]
+name = "fixed-wait-gate"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "EPICS"
+description = "Dev-only: fails a change that adds a fixed sleep or a literal timeout wait to a test, measured against the merge base"
+
+[dependencies]
+# The test-code rule (cfg(test) items, test attributes) every source guard in
+# the workspace reads.
+source-guard = { path = "../../crates/source-guard" }
+
+[dev-dependencies]
+tempfile = "3"

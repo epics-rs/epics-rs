@@ -77,7 +77,7 @@ impl Default for CasUdpConfig {
 /// so each diagnostic below is printed exactly once by a C IOC. The port calls
 /// this from three points in server startup (`bind_tcp_listeners`,
 /// `bind_sockets`, `CaServer::run`), which tripled every one of them: the
-/// compiled `softIoc` prints "float fetch failed" once for a bad beacon period,
+/// compiled `softIoc` prints "was not a positive real number" once for a bad beacon period,
 /// this printed it three times. Memoizing the whole resolution — not just the
 /// beacon period — also stops the interface discovery and the empty-list
 /// warning from repeating, and is what `EPICS_CA_*` client-side resolution
@@ -269,25 +269,23 @@ fn resolve_from_env() -> CaResult<CasUdpConfig> {
     // doesn't silently revert to the default 15s when only the legacy
     // var is in their environment.
     //
-    // C parity for invalid values (`online_notify.c:58-64`):
-    //   if (longStatus || maxPeriod <= 0.0) { maxPeriod = 15.0; }
-    // i.e. parse failure OR `<= 0` falls back to the default 15s
+    // C parity for invalid values (`online_notify.c:59-65`):
+    //   if (longStatus || !finite(maxPeriod) || maxPeriod<=0.0) { maxPeriod = 15.0; }
+    // i.e. parse failure, `nan`, `inf` or `<= 0` falls back to the default 15s
     // (not to a synthetic 0.1s floor). A previous Rust revision
     // clamped via `period.max(0.1)`, which silently coerced both
     // 0/negative and tiny-positive values to 100ms. That diverges
     // in two directions: an explicit `0` no longer behaves like
     // "use default", and a deliberately tiny positive (e.g. 0.05
     // in a soak test) gets raised against the operator's wishes.
-    // Match C: accept any strictly-positive parsed value as-is;
-    // fall back to default for parse-failure or non-positive.
+    // Match C: accept any finite strictly-positive parsed value as-is.
     //
     // The fallback is C's `envGetConfigParamPtr` PRESENCE test, not a
     // parse-success test: an invalid `EPICS_CAS_BEACON_PERIOD` does not
-    // silently promote the legacy var. Parsing and the `Duration`
-    // conversion are `crate::estdlib` (C `epicsScanDouble`), so `inf` is
-    // an accepted — never-firing — period rather than a panic, and NaN
-    // (which fails `> 0.0`, like every C comparison against it) keeps
-    // the default.
+    // silently promote the legacy var. Parsing is `crate::estdlib`
+    // (C `epicsScanDouble`), which takes `nan` and `inf` as numbers, so
+    // only the `is_finite` gate keeps an infinite period from silencing
+    // the beacons.
     use epics_base_rs::runtime::env_table::{EPICS_CA_BEACON_PERIOD, EPICS_CAS_BEACON_PERIOD};
     let param = if EPICS_CAS_BEACON_PERIOD.get().is_some() {
         EPICS_CAS_BEACON_PERIOD
@@ -295,18 +293,17 @@ fn resolve_from_env() -> CaResult<CasUdpConfig> {
         EPICS_CA_BEACON_PERIOD
     };
     match param.double() {
-        Ok(period) if period > 0.0 => {
+        Ok(period) if period.is_finite() && period > 0.0 => {
             cfg.beacon_period = crate::estdlib::duration_from_secs(period);
         }
         // Unresolvable: C reads the compiled "15.0" default of the legacy var,
         // silently. Keep the default period, print nothing.
         Err(epics_base_rs::runtime::env::EnvDoubleError::Unresolvable) => {}
-        // Parse failure OR `<= 0.0` — C `online_notify.c:58-64`. C names
-        // EPICS_CAS_BEACON_PERIOD in both lines even when the value it
-        // fetched came from the deprecated var, so this does too.
+        // C names EPICS_CAS_BEACON_PERIOD in both lines even when the value
+        // it fetched came from the deprecated var, so this does too.
         _ => {
             epics_libcom_rs::stderr_println!(
-                "EPICS \"EPICS_CAS_BEACON_PERIOD\" float fetch failed"
+                "EPICS \"EPICS_CAS_BEACON_PERIOD\" was not a positive real number"
             );
             epics_libcom_rs::stderr_println!(
                 "Setting \"EPICS_CAS_BEACON_PERIOD\" = {:.6}",
@@ -545,11 +542,11 @@ mod tests {
         }
     }
 
-    /// C `online_notify.c:58-64` parity for `EPICS_CAS_BEACON_PERIOD`:
-    /// any value `<= 0.0` (and parse-failure) falls back to the 15s
+    /// C `online_notify.c:59-65` parity for `EPICS_CAS_BEACON_PERIOD`:
+    /// any value `<= 0.0`, non-finite or unparsable falls back to the 15s
     /// default — there is no 100ms floor. Verify that explicit 0,
-    /// negatives, and parse failures all keep the default; tiny
-    /// positives are accepted verbatim.
+    /// negatives, `nan`, `inf` and parse failures all keep the default;
+    /// tiny positives are accepted verbatim.
     #[test]
     #[serial_test::serial]
     fn from_env_beacon_period_matches_c_default_on_nonpositive() {
@@ -590,6 +587,21 @@ mod tests {
             Duration::from_secs(15),
             "parse failure must keep default"
         );
+
+        // C's `!finite(maxPeriod)` (`online_notify.c:59`): `nan` and `inf`
+        // parse but are not a period.
+        for value in ["nan", "inf"] {
+            // SAFETY: serial_test::serial.
+            unsafe {
+                std::env::set_var("EPICS_CAS_BEACON_PERIOD", value);
+            }
+            let cfg = resolve_from_env().expect("resolve_from_env in test");
+            assert_eq!(
+                cfg.beacon_period,
+                Duration::from_secs(15),
+                "{value} must fall back to the 15s default"
+            );
+        }
 
         // Tiny positive: accepted verbatim (no 0.1 floor).
         // SAFETY: serial_test::serial.

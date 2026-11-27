@@ -302,10 +302,15 @@ pub fn dial_pool_probe() -> (usize, usize, usize, usize) {
 /// names differ across unixes (`TCP_KEEPIDLE` on Linux and the BSDs,
 /// `TCP_KEEPALIVE` on Darwin) and `libc` does not define the Darwin spelling
 /// at all, so hand-rolling it here would trade one working call for a per-OS
-/// table. See [`set_circuit_keepalive`]'s RTEMS sibling for the one target
-/// where `socket2` is not in the dependency graph.
-#[cfg(not(any(exec_backend, ca_blocking_client)))]
-fn set_circuit_keepalive(stream: &TcpStream) {
+/// table. Generic so both transports' streams reach it: the choice of
+/// syscall follows the target, never the backend. See
+/// [`set_circuit_keepalive`]'s RTEMS sibling for the one target where
+/// `socket2` is not in the dependency graph.
+#[cfg(not(target_os = "rtems"))]
+fn set_circuit_keepalive<'s, S>(stream: &'s S)
+where
+    socket2::SockRef<'s>: From<&'s S>,
+{
     let sock = socket2::SockRef::from(stream);
     let keepalive = socket2::TcpKeepalive::new()
         .with_time(CIRCUIT_KEEPALIVE_IDLE)
@@ -314,20 +319,19 @@ fn set_circuit_keepalive(stream: &TcpStream) {
     let _ = sock.set_tcp_keepalive(&keepalive);
 }
 
-/// The same ladder through raw `libc`, for the transport `socket2` cannot
-/// reach.
+/// The same ladder through raw `libc`, for the target `socket2` cannot reach.
 ///
 /// `socket2` is host-only in this crate's manifest (it does not build for
-/// `armv7-rtems-eabihf`), so the blocking transport sets the three options
-/// itself — the shape `server/blocking.rs:551` already uses for the server's
-/// listening sockets. RTEMS's stack is FreeBSD's (`libbsd`), so the constants
-/// are the BSD ones (`TCP_KEEPIDLE` = 256, `TCP_KEEPINTVL` = 512), supplied by
-/// `libc` for the target.
+/// `armv7-rtems-eabihf`), so RTEMS sets the three options itself — the shape
+/// `server/blocking.rs:551` already uses for the server's listening sockets.
+/// RTEMS's stack is FreeBSD's (`libbsd`), so the constants are the BSD ones
+/// (`TCP_KEEPIDLE` = 256, `TCP_KEEPINTVL` = 512), supplied by `libc` for the
+/// target.
 ///
 /// Failures are ignored, exactly as on the `socket2` path: keepalive is a
 /// backstop under CA's own echo watchdog (`ECHO_TIMEOUT_SECS`), not the
 /// mechanism that detects a dead circuit.
-#[cfg(all(unix, any(exec_backend, ca_blocking_client)))]
+#[cfg(target_os = "rtems")]
 fn set_circuit_keepalive(stream: &std::net::TcpStream) {
     use std::os::fd::AsRawFd;
 
@@ -1240,8 +1244,8 @@ fn recv_queue_probe_for<S>(_sock: &S) -> OsRecvQueueProbe {
 ///
 /// Parsing is C's `envGetDoubleConfigParam` → `epicsScanDouble`
 /// (`crate::estdlib`), so `0x10` is 16 s and `1e400` is an ERANGE
-/// failure, and the conversion is the saturating one — an explicit
-/// `inf` is C's never-expiring deadline, not a panic.
+/// failure, and the conversion is the saturating one — a huge finite
+/// value is `FAR_FUTURE`, not a panic.
 ///
 /// Resolved ONCE per process, as C resolves it once in the `cac`
 /// constructor and stores it in `cac::connTMO`: re-reading `getenv` on
@@ -1276,10 +1280,9 @@ fn resolve_connection_timeout() -> Duration {
     // lines on top of whatever `envGetDoubleConfigParam` printed. Before it, C
     // stored a non-positive period and its connection watchdog fired on every
     // check: the compiled `camonitor` wrote 177_182 stderr lines in 3 s with
-    // `=-5`. A huge finite period such as `1e300` is obeyed, as in C; it is
-    // `Duration::MAX` here, which is why every deadline built from it goes
-    // through `runtime::task::deadline_from_now` rather than a bare
-    // `Instant + Duration`, which panics instead of never firing.
+    // `=-5`. A huge finite period such as `1e300` is accepted, as in C; C's
+    // epicsTimer wraps it in `epicsTimeAddSeconds` and fires the watchdog at
+    // once, while Rust saturates it to `FAR_FUTURE` and waits.
     match EPICS_CA_CONN_TMO.double() {
         Ok(secs) if secs > 0.0 && secs.is_finite() => crate::estdlib::duration_from_secs(secs),
         _ => {
@@ -1718,6 +1721,11 @@ fn cmd_circuit_key(cmd: &TransportCommand) -> Option<CircuitKey> {
             priority,
             ..
         }
+        | TransportCommand::SubscriptionUpdate {
+            server_addr,
+            priority,
+            ..
+        }
         | TransportCommand::Write {
             server_addr,
             priority,
@@ -1787,6 +1795,32 @@ fn process_command(
         }
         TransportCommand::ReadNotify {
             sid,
+            admit,
+            ioid,
+            server_addr,
+            priority,
+        } => {
+            let peer_minor = peer_minor_of(connections, (server_addr, priority));
+            let Some(frame) =
+                read_notify_frame(sid, admit.data_type(), admit.count(), ioid, peer_minor)
+            else {
+                dispatch_read_error(
+                    in_flight,
+                    ioid,
+                    Answer::local(Err(epics_base_rs::error::CaError::BadCount)),
+                );
+                return;
+            };
+            send_frame(
+                connections,
+                server_writers,
+                (server_addr, priority),
+                frame,
+                event_tx,
+            );
+        }
+        TransportCommand::SubscriptionUpdate {
+            sid,
             data_type,
             count,
             ioid,
@@ -1794,30 +1828,19 @@ fn process_command(
             priority,
         } => {
             let peer_minor = peer_minor_of(connections, (server_addr, priority));
-            let mut hdr = CaHeader::new(CA_PROTO_READ_NOTIFY);
-            hdr.data_type = data_type;
-            hdr.cid = sid;
-            hdr.available = ioid;
-            // C parity (`comQueSend.cpp:285`): extended form for
-            // `nElem >= 0xffff`. See `build_read_notify_frame` in
-            // client/mod.rs for the same boundary in the fast path.
-            if count >= 0xFFFF {
-                if hdr.set_payload_size(0, count, peer_minor).is_err() {
-                    dispatch_read_error(
-                        in_flight,
-                        ioid,
-                        Answer::local(Err(epics_base_rs::error::CaError::BadCount)),
-                    );
-                    return;
-                }
-            } else {
-                hdr.count = count as u16;
-            }
+            let Some(frame) = read_notify_frame(sid, data_type, count, ioid, peer_minor) else {
+                dispatch_read_error(
+                    in_flight,
+                    ioid,
+                    Answer::local(Err(epics_base_rs::error::CaError::BadCount)),
+                );
+                return;
+            };
             send_frame(
                 connections,
                 server_writers,
                 (server_addr, priority),
-                hdr.to_bytes_extended().to_vec(),
+                frame,
                 event_tx,
             );
         }
@@ -1825,12 +1848,12 @@ fn process_command(
             sid,
             cid,
             data_type,
-            count,
-            payload,
+            admit,
             server_addr,
             priority,
         } => {
             let peer_minor = peer_minor_of(connections, (server_addr, priority));
+            let (count, payload) = admit.into_parts();
             // Same framing owner as the direct-writer path
             // (`CaChannel::build_write_frame`): C
             // `comQueSend::insertRequestWithPayLoad`.
@@ -1869,13 +1892,13 @@ fn process_command(
         TransportCommand::WriteNotify {
             sid,
             data_type,
-            count,
             ioid,
-            payload,
+            admit,
             server_addr,
             priority,
         } => {
             let peer_minor = peer_minor_of(connections, (server_addr, priority));
+            let (count, payload) = admit.into_parts();
             let Ok(frame) = crate::protocol::build_put_frame(
                 CA_PROTO_WRITE_NOTIFY,
                 sid,
@@ -2065,6 +2088,28 @@ fn send_frame(
 /// Single reader of the per-circuit version published by `read_loop`, so
 /// every request framed by [`process_command`] gates the extended header
 /// on the same value libca feeds `insertRequestHeader` as `v49Ok`.
+/// A `CA_PROTO_READ_NOTIFY` header, in the extended form for
+/// `nElem >= 0xffff` (`comQueSend.cpp:285`), as `build_read_notify_frame` in
+/// client/mod.rs frames the fast path; `None` when the peer predates it.
+fn read_notify_frame(
+    sid: u32,
+    data_type: u16,
+    count: u32,
+    ioid: u32,
+    peer_minor: u16,
+) -> Option<Vec<u8>> {
+    let mut hdr = CaHeader::new(CA_PROTO_READ_NOTIFY);
+    hdr.data_type = data_type;
+    hdr.cid = sid;
+    hdr.available = ioid;
+    if count >= 0xFFFF {
+        hdr.set_payload_size(0, count, peer_minor).ok()?;
+    } else {
+        hdr.count = count as u16;
+    }
+    Some(hdr.to_bytes_extended().to_vec())
+}
+
 fn peer_minor_of(connections: &HashMap<CircuitKey, ServerConnection>, circuit: CircuitKey) -> u16 {
     connections
         .get(&circuit)
@@ -3023,20 +3068,34 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                     let access = pending_access
                         .remove(&hdr.cid)
                         .unwrap_or(AccessRights::from_u32(0));
-                    // now that the server has named this cid,
-                    // subsequent ACCESS_RIGHTS frames for it are
-                    // legitimate post-create updates that must fire
-                    // AccessRightsChanged.
-                    known_cids.insert(hdr.cid);
-                    let _ = event_tx.send(TransportEvent::ChannelCreated {
-                        cid: hdr.cid,
-                        sid: hdr.available,
-                        data_type: hdr.data_type,
-                        element_count: hdr.actual_count(),
-                        access,
-                        server_addr,
-                        priority,
-                    });
+                    // C `nciu::connect` refuses a type outside
+                    // `dbf_type_is_valid` (`nciu.cpp:120-122`).
+                    let event = match DbFieldType::from_u16(hdr.data_type) {
+                        Ok(native_type) => {
+                            // now that the server has named this cid,
+                            // subsequent ACCESS_RIGHTS frames for it are
+                            // legitimate post-create updates that must fire
+                            // AccessRightsChanged.
+                            known_cids.insert(hdr.cid);
+                            TransportEvent::ChannelCreated {
+                                cid: hdr.cid,
+                                sid: hdr.available,
+                                native_type,
+                                element_count: hdr.actual_count(),
+                                access,
+                                server_addr,
+                                priority,
+                            }
+                        }
+                        Err(_) => TransportEvent::ChannelRefused {
+                            cid: hdr.cid,
+                            sid: hdr.available,
+                            data_type: hdr.data_type,
+                            server_addr,
+                            priority,
+                        },
+                    };
+                    let _ = event_tx.send(event);
                 }
                 CA_PROTO_READ_NOTIFY => {
                     // Direct dispatch to the in-flight read registry
@@ -4436,9 +4495,9 @@ mod error_echo_dispatch_tests {
         // dispatcher's `_ => {}` arm swallowed it and only the global
         // `ServerError` hook fired.
         let mut saw_status_error = false;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        while tokio::time::Instant::now() < deadline && !saw_status_error {
-            match tokio::time::timeout_at(deadline, event_rx.recv()).await {
+        let deadline = epics_libcom_rs::runtime::task::deadline_from_now(Duration::from_secs(2));
+        while epics_libcom_rs::runtime::task::Instant::now() < deadline && !saw_status_error {
+            match epics_libcom_rs::runtime::task::timeout_at(deadline, event_rx.recv()).await {
                 Ok(Some(TransportEvent::MonitorStatusError {
                     subid, eca_status, ..
                 })) => {
@@ -5791,6 +5850,59 @@ mod connect_deadline_tests {
     }
 }
 
+/// A dialed circuit carries the keepalive ladder on whichever transport the
+/// build selected; Linux-only because the client's socket is found through
+/// `/proc/self/fd`.
+#[cfg(all(test, target_os = "linux"))]
+mod circuit_keepalive_tests {
+    use super::*;
+    use std::os::fd::BorrowedFd;
+
+    /// `(SO_KEEPALIVE, idle, interval)` of the open socket connecting `local`
+    /// to `peer`, read back from the OS.
+    fn keepalive_of(local: SocketAddr, peer: SocketAddr) -> (bool, Duration, Duration) {
+        for entry in std::fs::read_dir("/proc/self/fd").expect("read /proc/self/fd") {
+            let name = entry.expect("fd entry").file_name();
+            let Ok(raw) = name.to_string_lossy().parse::<std::os::fd::RawFd>() else {
+                continue;
+            };
+            // SAFETY: only getsockname/getpeername/getsockopt are issued; an
+            // fd closed during the scan fails them with EBADF, and a reused
+            // one fails the address match.
+            let fd = unsafe { BorrowedFd::borrow_raw(raw) };
+            let sock = socket2::SockRef::from(&fd);
+            let ends = (
+                sock.local_addr().ok().and_then(|a| a.as_socket()),
+                sock.peer_addr().ok().and_then(|a| a.as_socket()),
+            );
+            if ends == (Some(local), Some(peer)) {
+                return (
+                    sock.keepalive().expect("SO_KEEPALIVE"),
+                    sock.keepalive_time().expect("TCP_KEEPIDLE"),
+                    sock.keepalive_interval().expect("TCP_KEEPINTVL"),
+                );
+            }
+        }
+        panic!("no socket in this process connects {local} to {peer}");
+    }
+
+    #[epics_macros_rs::epics_test]
+    async fn a_dialed_circuit_probes_after_15_s_idle_then_every_5_s() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let server = listener.local_addr().expect("local_addr");
+        let circuit = dial_ca(server).await.expect("dial a live listener");
+        let (_server_end, client) = listener.accept().expect("accept");
+
+        assert_eq!(
+            keepalive_of(client, server),
+            (true, Duration::from_secs(15), Duration::from_secs(5)),
+            "the circuit's socket must have SO_KEEPALIVE on with 15 s idle \
+             and 5 s between probes"
+        );
+        drop(circuit);
+    }
+}
+
 /// The dial seam borrows its thread from a bounded pool rather than creating
 /// one per attempt.
 ///
@@ -6298,7 +6410,7 @@ mod priority_circuit_tests {
     // Only the gated async circuit tests use this.
     #[cfg(tokio_backend)]
     async fn wait_for_writers(sw: &DirectServerWriters, n: usize) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = epics_libcom_rs::runtime::task::deadline_from_now(Duration::from_secs(5));
         while sw.len() < n {
             assert!(
                 tokio::time::Instant::now() < deadline,
@@ -6433,7 +6545,7 @@ mod priority_circuit_tests {
         // The client must report TcpClosed for priority 0 — and NEVER for
         // priority 5.
         let mut saw_zero_closed = false;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = epics_libcom_rs::runtime::task::deadline_from_now(Duration::from_secs(5));
         while tokio::time::Instant::now() < deadline && !saw_zero_closed {
             match tokio::time::timeout(Duration::from_millis(200), event_rx.recv()).await {
                 Ok(Some(TransportEvent::TcpClosed {
@@ -6613,7 +6725,7 @@ mod circuit_retirement_tests {
     ) -> (bool, bool, bool) {
         let mut established = false;
         let mut saw_closed = false;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        let deadline = epics_libcom_rs::runtime::task::deadline_from_now(Duration::from_secs(15));
         while tokio::time::Instant::now() < deadline && !(established && saw_closed) {
             match tokio::time::timeout(Duration::from_millis(200), event_rx.recv()).await {
                 Ok(Some(TransportEvent::ServerConnected { .. })) => established = true,
@@ -6628,7 +6740,7 @@ mod circuit_retirement_tests {
         // CreateChannel (which a prolonged outage never delivers) → this poll
         // times out and `retired` stays false → the test fails, as it must on
         // the pre-fix commit.
-        let retire_by = tokio::time::Instant::now() + Duration::from_secs(5);
+        let retire_by = epics_libcom_rs::runtime::task::deadline_from_now(Duration::from_secs(5));
         while tokio::time::Instant::now() < retire_by && sw.contains_key(&circuit) {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -6774,9 +6886,9 @@ mod conn_tmo_env_tests {
             // `finite()` guard since `a8180003e`, so it defaults.
             (Some("inf"), default),
             (Some("-inf"), default),
-            // Finite and enormous passes `finite()`, so C obeys it and so
-            // do we: a deadline that never fires, i.e. `Duration::MAX`.
-            (Some("1e300"), Duration::MAX),
+            // Finite and enormous passes `finite()`, so C accepts it; its
+            // epicsTimer wraps the delay and fires at once, Rust waits.
+            (Some("1e300"), epics_base_rs::runtime::time::FAR_FUTURE),
             // ERANGE / no-conversion / extraneous → C's default branch.
             (Some("1e400"), default),
             (Some("abc"), default),
@@ -6800,12 +6912,10 @@ mod conn_tmo_env_tests {
         }
     }
 
-    /// The obeyed-but-enormous period is `Duration::MAX`, and
-    /// `echo_idle_secs` widens it to `u64::MAX` seconds. Every deadline
-    /// the circuit watchdog builds from it must saturate: `Instant +
-    /// Duration::MAX` panics with "overflow when adding duration to
-    /// instant", which killed the client task outright where C simply
-    /// never fires the watchdog.
+    /// A watchdog deadline built from an idle of `u64::MAX` seconds must
+    /// saturate: `Instant + Duration::MAX` panics with "overflow when
+    /// adding duration to instant", which killed the client task outright;
+    /// C's epicsTimer wraps such a delay and fires the watchdog at once.
     #[test]
     fn a_never_firing_period_saturates_instead_of_panicking() {
         let idle = Duration::from_secs(Duration::MAX.as_secs().max(1));
@@ -7179,7 +7289,7 @@ mod write_failed_status_passthrough_tests {
     //! `CaError::WriteFailed` returns whatever status it was given, and that
     //! `eca_message` spells it as C does. The decode itself — the reply path
     //! that produces the `CaError` — is covered by the frame-level tests in
-    //! `tests/protocol_tests.rs` and `server/blocking.rs`.
+    //! `tests/integration/protocol_tests.rs` and `server/blocking.rs`.
     use crate::protocol::{ECA_PUTCBINPROG, eca_message};
     use epics_base_rs::error::{CaError, CaOp};
 

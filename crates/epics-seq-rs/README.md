@@ -21,10 +21,10 @@ any other goes out on the network client `epics-ca-rs` registers.
 
 ```toml
 [dependencies]
-epics-seq-rs = "0.34"
+epics-seq-rs = "0.35"
 
 [build-dependencies]
-epics-seq-rs = { version = "0.34", default-features = false, features = ["snc"] }
+epics-seq-rs = { version = "0.35", default-features = false, features = ["snc"] }
 ```
 
 ```rust

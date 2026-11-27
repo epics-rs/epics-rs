@@ -23,7 +23,8 @@ one: c47da8c0e slept 800 ms in `crates/motor-rs/tests/dol_at_init.rs` until
 
 The gate counts as a fixed wait a call to `sleep` or `sleep_*`; a call whose
 name has a `timeout`, `deadline`, `wait` or `until` segment and takes a
-`Duration::from_*(<number>)`; `now() + Duration::from_*(<number>)`; and,
+`Duration::from_*(<number>)`; `now() + Duration::from_*(<number>)`, which
+`deadline_from_now(d)` and `deadline_after(now(), d)` are too; and,
 inside a `loop` or `while`, `elapsed()` compared with such a duration.
 Comments and string literals are skipped.
 
@@ -78,8 +79,8 @@ Both marks need a reason.
 
 A duration held in a named constant (`timeout(SHORT, ..)`), a wait helper whose
 name has none of the four segments, a deadline built from a variable start
-(`t0 + Duration::from_secs(5)`), and an `elapsed()` bound outside a loop, which
-is an assertion rather than a wait.
+(`t0 + Duration::from_secs(5)`, `deadline_after(t0, ..)`), and an `elapsed()`
+bound outside a loop, which is an assertion rather than a wait.
 
 A timeout's result is followed through three `let` bindings and same-file
 helpers in all. A helper in another file is not followed: finding it needs name

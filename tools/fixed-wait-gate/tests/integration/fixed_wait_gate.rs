@@ -596,14 +596,23 @@ fn a_deadline_built_from_a_number_is_a_fixed_wait() {
 let a = Instant::now() + Duration::from_secs(10);
 let b = std::time::Instant::now() + FACT_BUDGET;
 let c = deadline_after(Instant::now(), Duration::from_secs(10));
+let d = time::deadline_from_now(Duration::from_secs(10));
+let e = deadline_after(t0, Duration::from_secs(10));
+let f = t0 + Duration::from_secs(10);
 "#;
-    assert_eq!(
-        keys(src),
-        [
-            "now()+Duration::from_secs(10)",
-            "deadline_after(Duration::from_secs(10))",
-        ]
+    assert_eq!(keys(src), ["now()+Duration::from_secs(10)"; 3]);
+}
+
+#[test]
+fn a_sum_rewritten_as_its_deadline_helper_adds_no_wait() {
+    let base = "fn t() {\n    let a = Instant::now() + Duration::from_secs(5);\n    let b = t0 + Duration::from_secs(5);\n}\n";
+    let now = "fn t() {\n    let a = deadline_from_now(Duration::from_secs(5));\n    let b = deadline_after(t0, Duration::from_secs(5));\n}\n";
+    assert_eq!(added(&[change("t/tests/a.rs", base, now)]), []);
+    let other = now.replace(
+        "from_now(Duration::from_secs(5))",
+        "from_now(Duration::from_secs(6))",
     );
+    assert_eq!(added(&[change("t/tests/a.rs", base, &other)]).len(), 1);
 }
 
 #[test]

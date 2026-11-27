@@ -12,8 +12,9 @@
 //!
 //! A *fixed wait* is a call to `sleep` or `sleep_*`; a call whose name has a
 //! `timeout`, `deadline`, `wait` or `until` segment and takes a duration
-//! written `Duration::from_*(<number>)`; `now() + Duration::from_*(<number>)`;
-//! and, in a `loop` or `while`, `elapsed()` compared with such a duration. A
+//! written `Duration::from_*(<number>)`; `now() + Duration::from_*(<number>)`,
+//! which `deadline_from_now(d)` and `deadline_after(now(), d)` are too; and,
+//! in a `loop` or `while`, `elapsed()` compared with such a duration. A
 //! sleep or a timeout on each attempt inside a `loop` or `while` body is its
 //! poll interval, and the loop's bound is what decides the test, so the bound
 //! (a `while` head included) is what gets checked. A timeout there whose
@@ -1171,6 +1172,13 @@ fn fixed_wait(c: &[u8], name: &str, end: usize, ctx: Ctx, timer: bool) -> Option
     let no_args = args.iter().all(u8::is_ascii_whitespace);
     let after = skip_ws(c, close + 1);
     let polling = matches!(ctx, Ctx::PollHead | Ctx::PollBody { .. });
+    // The runtime's saturating deadline helpers are the sum they replace, so
+    // swapping one for the other neither adds a wait nor hides one.
+    if matches!(name, "deadline_from_now" | "deadline_after") {
+        return added_to_now(c, name, open, close)
+            .and_then(|d| literal_duration_at(c, skip_ws(c, d)))
+            .map(|(_, d)| (format!("now()+{d}"), Kind::Fixed));
+    }
     if is_sleep(name) && !timer {
         let kind = match ctx {
             Ctx::PollHead | Ctx::PollBody { .. } => return None,
@@ -1206,6 +1214,23 @@ fn fixed_wait(c: &[u8], name: &str, end: usize, ctx: Ctx, timer: bool) -> Option
     } else {
         None
     }
+}
+
+/// Where the duration starts that `deadline_from_now(d)`, or
+/// `deadline_after(base, d)` with a `now()` call for `base`, adds to now.
+/// `deadline_after(t0, d)` is `t0 + d`, which is not seen either.
+fn added_to_now(c: &[u8], name: &str, open: usize, close: usize) -> Option<usize> {
+    if name == "deadline_from_now" {
+        return Some(open + 1);
+    }
+    let parts = split_top(&c[open + 1..close], b',');
+    let [base, _, ..] = parts.as_slice() else {
+        return None;
+    };
+    let call = squeeze(base);
+    let path = call.strip_suffix("now()")?;
+    (path.is_empty() || path.ends_with("::") || path.ends_with('.'))
+        .then_some(open + 1 + base.len() + 1)
 }
 
 /// The waits `changes` add: every key the changed files hold more of now than

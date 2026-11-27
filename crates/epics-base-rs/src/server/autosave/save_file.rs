@@ -76,15 +76,13 @@ impl ErrorMessageLine {
         crate::types::c_parse::atoi(&self.text.as_bytes()[1..])
     }
 
-    /// The count `do_manual_restore` reads: the digits after the `!`.
+    /// `do_manual_restore`'s `atoi(value_string)` (save_restore.c:3427):
+    /// the text after the line's first word, as `%s%c%[^\n]` splits it
+    /// (:3322), so `!7` counts 0.
     pub fn manual_count(&self) -> i32 {
-        let rest = self.text.trim_start().strip_prefix('!').unwrap_or("");
-        let digits: String = rest
-            .trim_start()
-            .chars()
-            .take_while(char::is_ascii_digit)
-            .collect();
-        digits.parse().unwrap_or(0)
+        use crate::runtime::stdlib::c_isspace;
+        let word = self.text.trim_start_matches(c_isspace);
+        crate::types::c_parse::atoi(word.trim_start_matches(|c| !c_isspace(c)))
     }
 }
 

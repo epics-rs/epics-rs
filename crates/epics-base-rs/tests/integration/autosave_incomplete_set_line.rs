@@ -211,3 +211,48 @@ async fn a_boot_restore_counts_the_line_as_c_atol() {
         .collect();
     assert_eq!(counted, want);
 }
+
+/// `fdbrestore` counts the line as `atoi` of the text after its first word
+/// (save_restore.c:3322, :3427), and returns the count as its status. The
+/// counts are the C oracle IOC's for each line; the 32-bit rows derived.
+#[epics_macros_rs::epics_test]
+async fn a_manual_restore_counts_the_line_as_c_atoi() {
+    use epics_base_rs::server::autosave::manager::AutosaveBuilder;
+    use epics_base_rs::server::autosave::save_set::{ManualSource, do_manual_restore};
+    use epics_base_rs::server::autosave::settings::SrSettings;
+
+    let settings = SrSettings::default();
+    settings.set_incomplete_sets_ok(1);
+    let mgr = AutosaveBuilder::new()
+        .settings(std::sync::Arc::new(settings))
+        .build()
+        .await;
+    let lp64 = std::ffi::c_long::BITS == 64;
+    let cases = [
+        ("! -3 x", -3),
+        ("!+4", 0),
+        ("! +5 x", 5),
+        ("!7 x", 0),
+        ("!  8", 8),
+        ("! 99999999999 x", if lp64 { 1215752191 } else { i32::MAX }),
+        ("! 99999999999999999999 x", if lp64 { -1 } else { i32::MAX }),
+        ("!\t9", 9),
+        ("  ! 10", 10),
+        ("! 0x11", 0),
+        ("!", 0),
+        ("! ", 0),
+        ("!\u{0b}12", 12),
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("m.sav");
+    let db = PvDatabase::new();
+    let mut counted = Vec::new();
+    for (line, _) in cases {
+        epics_base_rs::runtime::fs::write(&path, format!("# h\n{line}\n<END>\n"))
+            .await
+            .unwrap();
+        let status = do_manual_restore(&db, &mgr, "m.sav", &path, ManualSource::SaveFile, "").await;
+        counted.push((line, status));
+    }
+    assert_eq!(counted, cases);
+}

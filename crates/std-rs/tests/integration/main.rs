@@ -16,6 +16,7 @@ mod epid_monitor_posts_against_its_own_copies;
 mod epid_rset_metadata;
 mod epid_secondary_monitor_mask;
 mod epid_tests;
+mod fast_epid_db_runs_the_loop;
 mod integration_tests;
 mod nomod_fields_refused_by_the_gate;
 mod one_declaration_per_record_type;

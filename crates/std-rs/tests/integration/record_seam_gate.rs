@@ -9,19 +9,8 @@
 //! under the two roots, so a new record or device support was outside the
 //! census until someone remembered to add it. The walk covers it on creation.
 
-/// The one source under the roots that may name the ambient seam.
-///
-/// `device_support/epid_fast.rs`'s three `tokio::spawn`s start the fast-EPID
-/// interrupt loop, a long-lived task the caller starts from its own runtime
-/// through the public `start_callback_loop*` entries — never from a `Record`
-/// or `DeviceSupport` method. Moving that loop to the background executor
-/// would pin a callback-pool worker for the life of the IOC, which is the
-/// opposite of the fix.
-const EXEMPT: &[(&str, &str)] = &[(
-    "src/device_support/epid_fast.rs",
-    "long-lived fast-EPID interrupt loop, started by the caller from its own \
-     runtime via start_callback_loop*, never from a record callback",
-)];
+/// No source under the roots may name the ambient seam.
+const EXEMPT: &[(&str, &str)] = &[];
 
 #[test]
 fn a_record_support_tail_never_uses_the_ambient_seam() {

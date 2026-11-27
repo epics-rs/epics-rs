@@ -181,8 +181,9 @@ pub struct RestoreResult {
     /// The count the file's own `!` line declared, which for a C-written
     /// `.sav` is the only record that the save set was incomplete —
     /// `disconnected_skipped` can only list the PVs a per-PV marker
-    /// named. 0 when the file carried no such line.
-    pub not_connected_at_save: usize,
+    /// named. 0 when the file carried no such line; a C `int`, which a
+    /// sign or an overflow can make negative.
+    pub not_connected_at_save: i32,
     /// The restore read a `!` line. C's `reboot_restore` marks the set
     /// WARN on reading one, whatever count it states (dbrestore.c:1001).
     pub error_message_line: bool,
@@ -219,7 +220,9 @@ impl RestoreResult {
         self.parse_failed.extend(r.parse_failed);
         self.not_found.extend(r.not_found);
         self.disconnected_skipped.extend(r.disconnected_skipped);
-        self.not_connected_at_save += r.not_connected_at_save;
+        self.not_connected_at_save = self
+            .not_connected_at_save
+            .wrapping_add(r.not_connected_at_save);
         self.error_message_line |= r.error_message_line;
         self.malformed_lines
             .extend(r.malformed_lines.into_iter().map(|m| MalformedLine {
@@ -1589,8 +1592,8 @@ pub async fn do_manual_restore(
             );
         }
     }
-    (r.failed_puts.len() + r.not_found.len() + r.parse_failed.len() + r.not_connected_at_save)
-        as i32
+    ((r.failed_puts.len() + r.not_found.len() + r.parse_failed.len()) as i32)
+        .wrapping_add(r.not_connected_at_save)
 }
 
 /// C `reboot_restore`'s read of the file `fopen_and_check` chose
@@ -1692,7 +1695,6 @@ async fn restore_contents(
     input: &mut SavInput<'_>,
 ) -> RestoreResult {
     let mut result = RestoreResult {
-        not_connected_at_save: contents.not_connected,
         malformed_lines: contents.malformed.clone(),
         ..RestoreResult::of(path)
     };
@@ -1702,9 +1704,13 @@ async fn restore_contents(
     // the set WARN (`dbrestore.c:994-1002`, save_restore.c:3426-3429), and
     // either stops there when the site has cleared
     // `save_restoreIncompleteSetsOk`.
-    let incomplete = |result: &mut RestoreResult| {
+    let incomplete = |result: &mut RestoreResult, line: &save_file::ErrorMessageLine| {
+        let n = match boot {
+            true => line.boot_count(),
+            false => line.manual_count(),
+        };
+        result.not_connected_at_save = n;
         result.error_message_line = true;
-        let n = result.not_connected_at_save;
         if boot {
             crate::runtime::log::errlog_vprintf(format_args!(
                 "../dbrestore.c:reboot_restore {n} {} had no saved value.\n",
@@ -1728,9 +1734,11 @@ async fn restore_contents(
         }
     };
 
+    let error_message_at = |index| contents.error_message.as_ref().filter(|e| e.at == index);
+
     for (index, entry) in contents.entries.iter().enumerate() {
-        if contents.incomplete_at == Some(index) {
-            incomplete(&mut result);
+        if let Some(line) = error_message_at(index) {
+            incomplete(&mut result, line);
             if result.aborted {
                 return result;
             }
@@ -1936,8 +1944,8 @@ async fn restore_contents(
             }
         }
     }
-    if contents.incomplete_at == Some(contents.entries.len()) {
-        incomplete(&mut result);
+    if let Some(line) = error_message_at(contents.entries.len()) {
+        incomplete(&mut result, line);
     }
 
     result

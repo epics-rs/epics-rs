@@ -84,7 +84,8 @@ async fn a_c_written_incomplete_file_keeps_its_count_and_names_no_pv() {
     .unwrap();
 
     let contents = read_save_file(&path).await.unwrap().expect("has <END>");
-    assert_eq!(contents.not_connected, 7);
+    let line = contents.error_message.as_ref().expect("the `!` line");
+    assert_eq!(line.boot_count(), 7);
     assert!(
         !contents.entries.iter().any(|e| e.pv_name == "!"),
         "the declaration must not become a PV: {:?}",
@@ -115,7 +116,8 @@ async fn the_declaration_round_trips() {
         .unwrap();
 
     let contents = read_save_file(&path).await.unwrap().expect("has <END>");
-    assert_eq!(contents.not_connected, 1);
+    let line = contents.error_message.as_ref().expect("the `!` line");
+    assert_eq!(line.boot_count(), 1);
     assert_eq!(
         contents.entries.iter().filter(|e| !e.connected).count(),
         1,
@@ -152,4 +154,60 @@ async fn restore_reports_what_the_file_could_not_save() {
         "the declaration must not be looked up as a PV: {:?}",
         result.not_found
     );
+}
+
+/// The boot restore's count is `(int)atol(&bp[1])` on the whole line
+/// (dbrestore.c:999): a sign is read, an indented line counts 0. The
+/// counts are the C oracle IOC's `reboot_restore` lines for this file;
+/// past `LONG_MAX` the 64-bit row is the oracle's, the 32-bit one derived.
+#[epics_macros_rs::epics_test]
+async fn a_boot_restore_counts_the_line_as_c_atol() {
+    use epics_base_rs::runtime::log::{errlog_add_listener, errlog_flush};
+    use epics_base_rs::server::autosave::save_set::{RestorePass, restore_boot_file};
+    use epics_base_rs::server::autosave::settings::SrSettings;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("b.sav");
+    epics_base_rs::runtime::fs::write(
+        &path,
+        "# save/restore V5.1\tgenerated\n\
+         ! -3 channel(s) neg\n\
+         !+4 plus\n  \
+         ! 7 indented\n\
+         !7 nospace\n\
+         ! 99999999999999999999 big\n\
+         ! 0x10 hex\n\
+         !x none\n\
+         \t!5 tab\n\
+         <END>\n",
+    )
+    .await
+    .unwrap();
+    let heard = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let sink = heard.clone();
+    errlog_add_listener(move |m| sink.lock().unwrap().push(m.trim_end().to_string()));
+
+    let db = PvDatabase::new();
+    restore_boot_file(&db, &path, RestorePass::One, "", &SrSettings::default())
+        .await
+        .unwrap();
+    errlog_flush();
+
+    let big = if std::ffi::c_long::BITS == 64 {
+        "-1"
+    } else {
+        "2147483647"
+    };
+    let counted: Vec<String> = heard
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|l| l.ends_with("had no saved value."))
+        .cloned()
+        .collect();
+    let want: Vec<String> = ["-3", "4", "0", "7", big, "0", "0", "0"]
+        .iter()
+        .map(|n| format!("../dbrestore.c:reboot_restore {n} PVs had no saved value."))
+        .collect();
+    assert_eq!(counted, want);
 }

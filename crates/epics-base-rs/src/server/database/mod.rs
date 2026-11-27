@@ -1052,6 +1052,10 @@ struct PvDatabaseInner {
     record_attributes: ArcSwap<RecordAttributes>,
     /// Unlisted: C's `attributeList` is written without a lock.
     record_attributes_write: crate::runtime::sync::UnlistedPriorityInheritanceMutex<()>,
+    /// Moved by every attribute name [`Self::record_attributes`] gains, after
+    /// the snapshot naming it is published: an attribute answers a field
+    /// name, so it is part of the link name revision.
+    record_attribute_names_revision: std::sync::atomic::AtomicU64,
     /// Subroutine functions by name, retained at runtime so the processing
     /// path can re-resolve an aSub's subroutine when its name changes
     /// (C `aSubRecord.c::fetch_values` `registryFunctionFind`, LFLG=READ /
@@ -1648,6 +1652,7 @@ impl PvDatabase {
                     record_attributes: ArcSwap::from_pointee(RecordAttributes::new()),
                     record_attributes_write:
                         crate::runtime::sync::UnlistedPriorityInheritanceMutex::new(()),
+                    record_attribute_names_revision: std::sync::atomic::AtomicU64::new(0),
                     subroutine_registry: ArcSwap::from_pointee(HashMap::new()),
                     device_support_resolver: ArcSwapOption::empty(),
                     breaktable_registry: SnapshotCell::new(
@@ -1697,10 +1702,19 @@ impl PvDatabase {
         let truncated: String = value.chars().take(MAX_ATTRIBUTE_LEN).collect();
         let _write = self.inner.record_attributes_write.lock();
         let mut next = RecordAttributes::clone(&self.inner.record_attributes.load());
-        next.entry(record_type.to_string())
+        let created = next
+            .entry(record_type.to_string())
             .or_insert_with(|| seeded_record_attributes(record_type))
-            .insert(name.to_string(), truncated);
+            .insert(name.to_string(), truncated)
+            .is_none();
         self.inner.record_attributes.store(Arc::new(next));
+        if created {
+            // After the store: a link resolved under the old revision may have
+            // missed the name, never one resolved under the new.
+            self.inner
+                .record_attribute_names_revision
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
         Ok(())
     }
 

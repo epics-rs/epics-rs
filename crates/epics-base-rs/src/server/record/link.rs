@@ -1513,7 +1513,8 @@ pub(crate) struct ShadowedField {
 
 /// The settled [`DbLinkAnswer`] of a [`DbLink`], stamped with the name-map
 /// revision it was resolved under and re-resolved once that moves (records,
-/// aliases and simple PVs can come and go after `iocInit` here, unlike C).
+/// aliases and simple PVs can come and go after `iocInit` here, unlike C,
+/// and a record attribute can be added).
 /// A re-resolve that lands on the target already cached keeps the cached
 /// answer: C's `dbChannelOpen` settles a link's type and count once, so a
 /// target retyped since (an mbbo `VAL` once its states are defined) is still

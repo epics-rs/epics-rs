@@ -7378,7 +7378,13 @@ mod no_reactor_gate_tests {
 impl crate::server::record::record_instance::LinkTargetResolver for PvDatabase {
     fn name_revision(&self) -> u64 {
         // Monotonic counters, so their sum changes whenever any does.
-        self.inner.records.revision() + self.inner.aliases.revision() + self.simple_pvs_revision()
+        self.inner.records.revision()
+            + self.inner.aliases.revision()
+            + self.simple_pvs_revision()
+            + self
+                .inner
+                .record_attribute_names_revision
+                .load(std::sync::atomic::Ordering::Acquire)
     }
 
     fn local_target(

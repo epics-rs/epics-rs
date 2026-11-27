@@ -22,6 +22,7 @@ record(calc, "DESC") {
     field(INPA, "AI.DESC")
     field(CALC, "A")
 }
+record(stringin, "LATE") { field(INP, "AI.LATE") }
 "#;
 
 async fn ioc() -> Arc<PvDatabase> {
@@ -102,4 +103,25 @@ async fn a_numeric_link_read_of_an_attribute_raises_link_invalid() {
     db.process_record("DESC").await.unwrap();
     assert_eq!(alarm(&db, "DESC"), (AlarmSeverity::NoAlarm, 0));
     assert_eq!(db.get_pv("DESC.VAL").unwrap(), EpicsValue::Double(7.0));
+}
+
+/// A link whose name no field or attribute answers at `iocInit` is a CA
+/// link in C (`dbLink.c:118-130`), and rsrv's search re-runs
+/// `dbGetAttributePart` (`camessage.c:2221`, `dbChannel.c:326`), so the
+/// link reads an attribute `dbPutAttribute` adds later.
+#[epics_macros_rs::epics_test]
+async fn a_link_reads_an_attribute_added_after_it_resolved() {
+    let db = ioc().await;
+    // Unread, the link fails `readValue`.
+    let _ = db.process_record("LATE").await;
+    assert_eq!(alarm(&db, "LATE"), (AlarmSeverity::Invalid, LINK_ALARM));
+
+    db.put_record_type_attribute("ai", Some("LATE"), Some("late"))
+        .unwrap();
+    db.process_record("LATE").await.unwrap();
+    assert_eq!(
+        db.get_pv("LATE.VAL").unwrap(),
+        EpicsValue::String("late".into())
+    );
+    assert_eq!(alarm(&db, "LATE"), (AlarmSeverity::NoAlarm, 0));
 }

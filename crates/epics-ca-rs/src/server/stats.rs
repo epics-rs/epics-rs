@@ -15,9 +15,9 @@ pub struct ServerStats {
     pub connects_total: std::sync::atomic::AtomicU64,
     pub disconnects_total: std::sync::atomic::AtomicU64,
     pub started_at: std::sync::OnceLock<std::time::Instant>,
-    /// Total bytes received from clients since startup. Incremented
-    /// by `handle_client` on every TCP read. Mirrors the
-    /// `caServerBytes_in` counter from PR #592's `dbServerStats`.
+    /// Total bytes received from clients since startup, counted on every
+    /// TCP read by the circuit's `CircuitActivity` on both drivers. Mirrors
+    /// the `caServerBytes_in` counter from PR #592's `dbServerStats`.
     pub bytes_in: std::sync::atomic::AtomicU64,
     /// Total bytes sent to clients since startup. Mirrors
     /// `caServerBytes_out`. Updated by each write to a client socket;

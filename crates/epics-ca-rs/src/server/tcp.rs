@@ -63,28 +63,52 @@ fn resolve_inactivity_timeout() -> Option<Duration> {
     }
 }
 
-/// When a circuit last moved a byte either way, which is what
-/// [`inactivity_timeout`] measures idleness from on both drivers: rsrv keeps
-/// the same pair, `time_at_last_send` and `time_at_last_recv`
-/// (`caserverio.c:72`, `camsgtask.c:113`).
+/// The one place both drivers report a circuit's reads and writes: it keeps
+/// when a byte last moved either way, which is what [`inactivity_timeout`]
+/// measures idleness from, and counts the bytes into
+/// `ServerStats::bytes_in` / `bytes_out`. rsrv stamps `time_at_last_send` and
+/// `time_at_last_recv` at the same two sites (`caserverio.c:72`,
+/// `camsgtask.c:113`).
 pub(crate) struct CircuitActivity {
     since: std::time::Instant,
     /// Nanoseconds from `since` to the latest byte read or written.
     last: std::sync::atomic::AtomicU64,
+    /// `None` counts nothing (dispatch fixtures without a server).
+    stats: Option<Arc<super::stats::ServerStats>>,
 }
 
 impl CircuitActivity {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(stats: Option<Arc<super::stats::ServerStats>>) -> Self {
         Self {
             since: std::time::Instant::now(),
             last: std::sync::atomic::AtomicU64::new(0),
+            stats,
         }
     }
 
-    /// Bytes moved just now.
-    pub(crate) fn touch(&self) {
+    /// A read took `n` bytes off the circuit.
+    pub(crate) fn received(&self, n: usize) {
+        self.moved(n, |s| &s.bytes_in);
+    }
+
+    /// A write put `n` bytes on the circuit.
+    pub(crate) fn sent(&self, n: usize) {
+        self.moved(n, |s| &s.bytes_out);
+    }
+
+    fn moved(
+        &self,
+        n: usize,
+        counter: impl FnOnce(&super::stats::ServerStats) -> &std::sync::atomic::AtomicU64,
+    ) {
+        if n == 0 {
+            return;
+        }
         let at = u64::try_from(self.since.elapsed().as_nanos()).unwrap_or(u64::MAX);
         self.last.fetch_max(at, Ordering::Relaxed);
+        if let Some(stats) = &self.stats {
+            counter(stats).fetch_add(n as u64, Ordering::Relaxed);
+        }
     }
 
     /// What is left of `cap` since bytes last moved; `None` once it has run out.
@@ -126,8 +150,8 @@ async fn read_with_optional_timeout<R: tokio::io::AsyncReadExt + Unpin>(
             () = activity.idle_for(d) => return Err(d),
         },
     };
-    if matches!(read, Ok(n) if n > 0) {
-        activity.touch();
+    if let Ok(n) = read {
+        activity.received(n);
     }
     Ok(read)
 }
@@ -2312,14 +2336,12 @@ async fn run_circuit_writer<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-/// The circuit's socket write half, counting into `ServerStats::bytes_out`
-/// and the circuit's [`CircuitActivity`] what each write puts on the wire, so
-/// a write cut off by an abort or an error still counts the part that went
-/// out.
+/// The circuit's socket write half, reporting to the circuit's
+/// [`CircuitActivity`] what each write puts on the wire, so a write cut off
+/// by an abort or an error still counts the part that went out.
 #[cfg(tokio_backend)]
 struct CountedWrites<W> {
     inner: W,
-    stats: Option<Arc<super::stats::ServerStats>>,
     activity: Arc<CircuitActivity>,
 }
 
@@ -2332,11 +2354,8 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for CountedWrites<W> {
     ) -> std::task::Poll<std::io::Result<usize>> {
         let me = self.get_mut();
         let written = std::pin::Pin::new(&mut me.inner).poll_write(cx, buf);
-        if let std::task::Poll::Ready(Ok(n @ 1..)) = written {
-            me.activity.touch();
-            if let Some(stats) = &me.stats {
-                stats.bytes_out.fetch_add(n as u64, Ordering::Relaxed);
-            }
+        if let std::task::Poll::Ready(Ok(n)) = written {
+            me.activity.sent(n);
         }
         written
     }
@@ -2477,9 +2496,8 @@ async fn handle_client<S>(
     tls_authority: Option<String>,
     audit: Option<crate::audit::AuditLogger>,
     conn_events: Option<broadcast::Sender<ServerConnectionEvent>>,
-    // PR #592 dbServerStats: bytes_in/bytes_out counters. Incremented
-    // post-read (per accepted UDP/TCP buffer) and per socket write
-    // (`CountedWrites`).
+    // PR #592 dbServerStats: bytes_in/bytes_out counters, counted by the
+    // circuit's `CircuitActivity` on every read and write.
     // `None` skips all counter bookkeeping — used by the unit-test
     // dispatch fixtures that don't spin up a full CaServer.
     stats: Option<Arc<super::stats::ServerStats>>,
@@ -2525,12 +2543,11 @@ where
     // `ENOBUFS` burst parks this circuit for 15 s and retries, where the bare
     // `write_all` used to return `Err` and `?` used to disconnect the client.
     // See `crate::server::send`.
-    let activity = Arc::new(CircuitActivity::new());
+    let activity = Arc::new(CircuitActivity::new(stats.clone()));
     let mut sock = BufWriter::with_capacity(
         64 * 1024,
         crate::server::send::RetryTransientAsync::new(CountedWrites {
             inner: write_half,
-            stats: stats.clone(),
             activity: activity.clone(),
         }),
     );
@@ -2755,15 +2772,6 @@ where
             if let Some(n) = read {
                 if n == 0 {
                     break 'client_loop Ok(());
-                }
-
-                // PR #592 dbServerStats: bytes_in mirrors RSRV's
-                // `caServerBytes_in`. Counted on every successful read of `n`
-                // wire bytes, regardless of whether the inner dispatch
-                // accepts or rejects the message.
-                if let Some(ref s) = stats {
-                    s.bytes_in
-                        .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
                 }
 
                 // Chaos: optional stall + simulated read drop. Compiles to a

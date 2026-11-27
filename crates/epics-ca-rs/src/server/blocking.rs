@@ -685,7 +685,7 @@ impl BlockingCaServer {
         // this read and the `accept` itself still relies on the dial.
         while !self.run.state().is_stopped() {
             match self.listener.accept() {
-                Ok((mut stream, _)) => {
+                Ok((stream, _)) => {
                     backoff.accepted();
                     // A `shutdown()` wakes the blocking accept by dialing our
                     // own socket; the throwaway connection, or the queued
@@ -729,10 +729,7 @@ impl BlockingCaServer {
                         Ok(set) => set,
                         Err(e) => {
                             refuse_client(peer, &e, |frame| {
-                                use std::io::Write;
-                                let _ = stream.write_all(frame);
-                                let _ = stream.flush();
-                                let _ = stream.shutdown(std::net::Shutdown::Both);
+                                send_refusal(&stream, stats.clone(), frame)
                             });
                             continue;
                         }
@@ -753,10 +750,16 @@ impl BlockingCaServer {
                         let _lease = lease;
                         // Held for the whole client: its `Drop` returns the
                         // slot however this job ends, panic included.
-                        let _slot = ClientSlot::take(stats);
-                        if let Err(e) =
-                            handle_client_blocking(event_worker, stream, peer, db, acf, tcp_port)
-                        {
+                        let _slot = ClientSlot::take(stats.clone());
+                        if let Err(e) = handle_client_blocking(
+                            event_worker,
+                            stream,
+                            peer,
+                            db,
+                            acf,
+                            tcp_port,
+                            stats,
+                        ) {
                             tracing::debug!(
                                 target: "epics_ca_rs::server::blocking",
                                 %peer, error = %e,
@@ -1012,6 +1015,20 @@ fn refuse_client(peer: SocketAddr, cause: &AcquireError, send: impl FnOnce(&[u8]
         epics_base_rs::runtime::log::ErrlogSevEnum::Major,
         format_args!("{reason} — refused {peer} (refusal #{nth})\n"),
     );
+}
+
+/// The refusal's wire leg. The socket never becomes a circuit, but its frame
+/// is server output all the same, so it goes through the `bytes_out` owner.
+fn send_refusal(stream: &TcpStream, stats: Arc<ServerStats>, frame: &[u8]) {
+    use std::io::Write;
+    let activity = CircuitActivity::new(Some(stats));
+    let mut wire = MarkingWrites {
+        sock: stream,
+        activity: &activity,
+    };
+    let _ = wire.write_all(frame);
+    let _ = wire.flush();
+    let _ = stream.shutdown(std::net::Shutdown::Both);
 }
 
 /// Bind a blocking UDP name-search responder socket. Raw `libc` throughout
@@ -1311,7 +1328,8 @@ pub(crate) struct SendBuf<W = TcpStream> {
     buf: Vec<u8>,
 }
 
-/// A circuit write that marks the circuit active once a byte has gone out.
+/// A circuit write that reports what went out to the circuit's
+/// [`CircuitActivity`].
 struct MarkingWrites<'a, W> {
     sock: W,
     activity: &'a CircuitActivity,
@@ -1320,9 +1338,7 @@ struct MarkingWrites<'a, W> {
 impl<W: Write> Write for MarkingWrites<'_, W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let n = self.sock.write(buf)?;
-        if n > 0 {
-            self.activity.touch();
-        }
+        self.activity.sent(n);
         Ok(n)
     }
 
@@ -1616,6 +1632,7 @@ fn handle_client_blocking(
     db: Arc<PvDatabase>,
     acf: SharedAcf,
     tcp_port: u16,
+    stats: Arc<ServerStats>,
 ) -> CaResult<()> {
     // C `create_client` sets both of these and refuses the client —
     // `destroy_client`, `return NULL` — when either `setsockopt` fails
@@ -1715,7 +1732,7 @@ fn handle_client_blocking(
 
     let stream = Arc::new(stream);
     let mut reader: &TcpStream = &stream;
-    let activity = Arc::new(CircuitActivity::new());
+    let activity = Arc::new(CircuitActivity::new(Some(stats)));
     let send_lock = Arc::new(Mutex::new(SendBuf::new(stream.clone(), activity.clone())));
 
     let (outbox, drain) = outbox::channel();
@@ -1819,7 +1836,7 @@ fn handle_client_blocking(
             let n = match reader.read(&mut buf) {
                 Ok(0) => break, // graceful EOF
                 Ok(n) => {
-                    activity.touch();
+                    activity.received(n);
                     n
                 }
                 // Peer vanished mid-session (RST / broken pipe / truncated) is a
@@ -2260,6 +2277,34 @@ mod tests {
             text.contains("no resources for a new client"),
             "the diagnostic string must reach the client: {text:?}"
         );
+    }
+
+    /// The refusal frame is counted in `bytes_out` like any circuit's bytes.
+    #[test]
+    fn a_refusal_counts_its_frame_in_bytes_out() {
+        use std::io::Read;
+        use std::net::{Ipv4Addr, TcpListener as StdTcpListener};
+
+        let listener = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind loopback");
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).expect("connect");
+        client
+            .set_read_timeout(Some(fact_budget::FACT_BUDGET))
+            .expect("client read timeout");
+        let (server, peer) = listener.accept().expect("accept");
+        let stats = Arc::new(ServerStats::default());
+
+        refuse_client(
+            peer,
+            &AcquireError::AtCapacity {
+                capacity: CAS_CLIENT_POOL_CAPACITY,
+            },
+            |frame| send_refusal(&server, stats.clone(), frame),
+        );
+
+        let mut got = Vec::new();
+        client.read_to_end(&mut got).expect("read the refusal");
+        assert!(!got.is_empty(), "the refusal frame reached the client");
+        assert_eq!(stats.bytes_out.load(Ordering::Relaxed), got.len() as u64);
     }
 
     /// The diagnostic string of a refusal frame, as a client reads it.
@@ -2808,8 +2853,15 @@ mod tests {
             let db = db.clone();
             let job = client_worker.run(move || {
                 let _lease = lease;
-                let _ =
-                    handle_client_blocking(event_worker, server_sock, peer, db, new_acf(), 5064);
+                let _ = handle_client_blocking(
+                    event_worker,
+                    server_sock,
+                    peer,
+                    db,
+                    new_acf(),
+                    5064,
+                    Arc::new(ServerStats::default()),
+                );
             });
             // EOF ends the client body, which drops the control sender and
             // joins the event job.
@@ -3332,6 +3384,63 @@ mod tests {
             reply, reference,
             "blocking driver must ship the shared dispatch handler's exact bytes"
         );
+
+        server.shutdown();
+        accept.join().unwrap();
+    }
+
+    /// `bytes_in` / `bytes_out` count this driver's circuit, as they do the
+    /// async one's: once a READ_NOTIFY is answered, `bytes_in` is every byte
+    /// the client sent and `bytes_out` every byte it has read.
+    #[test]
+    fn byte_counters_move_with_a_request_and_its_reply() {
+        let db = seed_db(&[("BLK:BYTES", EpicsValue::Double(1.0))]);
+        let server =
+            Arc::new(BlockingCaServer::bind("127.0.0.1:0", db.clone(), new_acf()).unwrap());
+        let stats = server.stats();
+        let addr = server.local_addr().unwrap();
+        let srv = server.clone();
+        let accept = thread::spawn(move || srv.serve());
+
+        let mut c = TcpStream::connect(addr).unwrap();
+        c.set_read_timeout(Some(fact_budget::FACT_BUDGET)).unwrap();
+        let mut received = read_until_cmmd(&mut c, CA_PROTO_VERSION).len();
+        let mut sent = 0;
+        let mut send = |c: &mut TcpStream, frame: Vec<u8>| {
+            c.write_all(&frame).unwrap();
+            sent += frame.len();
+        };
+        send(&mut c, version_frame());
+        send(&mut c, create_chan_frame(1, "BLK:BYTES"));
+        let cc = loop {
+            let frame = read_one_frame(&mut c);
+            received += frame.len();
+            if u16::from_be_bytes([frame[0], frame[1]]) == CA_PROTO_CREATE_CHAN {
+                break frame;
+            }
+        };
+        let sid = u32::from_be_bytes([cc[12], cc[13], cc[14], cc[15]]);
+        send(&mut c, read_notify_frame(sid, 7, 6));
+        let reply = read_one_frame(&mut c);
+        assert_eq!(
+            u16::from_be_bytes([reply[0], reply[1]]),
+            CA_PROTO_READ_NOTIFY
+        );
+        received += reply.len();
+
+        // The server counts after each read or write returns, so the client
+        // can see the reply a moment before the count does.
+        let counts = || {
+            (
+                stats.bytes_in.load(Ordering::Relaxed) as usize,
+                stats.bytes_out.load(Ordering::Relaxed) as usize,
+            )
+        };
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
+        while counts() != (sent, received) && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(counts(), (sent, received), "(bytes_in, bytes_out)");
 
         server.shutdown();
         accept.join().unwrap();

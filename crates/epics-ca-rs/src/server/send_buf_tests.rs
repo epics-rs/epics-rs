@@ -46,7 +46,7 @@ fn send_buf() -> (Arc<Wire>, SendBuf<Wire>) {
     let wire = Arc::new(Wire::default());
     (
         wire.clone(),
-        SendBuf::new(wire, Arc::new(CircuitActivity::new())),
+        SendBuf::new(wire, Arc::new(CircuitActivity::new(None))),
     )
 }
 
@@ -177,7 +177,7 @@ fn updates_built_in_place_are_the_frames_built_apart() {
     run(&mut |user, ctl_rx, pvs| {
         let sink = EventSendBuf(Arc::new(Mutex::new(SendBuf::new(
             wire.clone(),
-            Arc::new(CircuitActivity::new()),
+            Arc::new(CircuitActivity::new(None)),
         ))));
         let mut task = pin!(run_event_task(
             user,
@@ -277,7 +277,7 @@ fn retirements_swept_together_reach_the_wire_in_one_write() {
         let wire = Arc::new(Wire::default());
         let sink = EventSendBuf(Arc::new(Mutex::new(SendBuf::new(
             wire.clone(),
-            Arc::new(CircuitActivity::new()),
+            Arc::new(CircuitActivity::new(None)),
         ))));
         let mut task = pin!(run_event_task(
             user,
@@ -313,7 +313,7 @@ fn streams_ended_together_leave_their_channels_to_the_sweep() {
         let wire = Arc::new(Wire::default());
         let sink = EventSendBuf(Arc::new(Mutex::new(SendBuf::new(
             wire.clone(),
-            Arc::new(CircuitActivity::new()),
+            Arc::new(CircuitActivity::new(None)),
         ))));
         let mut task = pin!(run_event_task(
             user,
@@ -439,7 +439,7 @@ fn updates_ready_together_reach_the_wire_in_one_write() {
     let wire = Arc::new(Wire::default());
     let sink = EventSendBuf(Arc::new(Mutex::new(SendBuf::new(
         wire.clone(),
-        Arc::new(CircuitActivity::new()),
+        Arc::new(CircuitActivity::new(None)),
     ))));
     let mut task = pin!(run_event_task(
         user,
@@ -646,7 +646,7 @@ fn a_failed_send_before_waiting_ends_the_task() {
     wire.broken.store(true, Ordering::Relaxed);
     let sink = EventSendBuf(Arc::new(Mutex::new(SendBuf::new(
         wire.clone(),
-        Arc::new(CircuitActivity::new()),
+        Arc::new(CircuitActivity::new(None)),
     ))));
     let mut task = pin!(run_event_task(
         user,
@@ -673,7 +673,7 @@ fn delivering_events_through_the_real_sink_allocates_nothing() {
     let wire = Arc::new(CountWire::default());
     let sink = EventSendBuf(Arc::new(Mutex::new(SendBuf::new(
         wire.clone(),
-        Arc::new(CircuitActivity::new()),
+        Arc::new(CircuitActivity::new(None)),
     ))));
     let mut task = pin!(run_event_task(
         user,

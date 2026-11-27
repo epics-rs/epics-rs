@@ -1,5 +1,118 @@
 # Changelog
 
+## v0.35.0 — 2026-11-27
+
+Minor release; the pinned toolchain stays at 1.99.1. Callback work
+requested after scanStop no longer runs, CA link callbacks no longer
+deadlock, and every PVA `pvmonitor*` callback must be `'static`.
+
+### Breaking
+
+- PVA client: the callback of every `PvaClient::pvmonitor*` method and of the `client_native::ops_v2::op_monitor*` functions must be `'static`, since callbacks now run on a client-owned task.
+- PVA server: `PvaServerDriver::serve`, `BlockingPvaServer::serve` and `ReactorPvaServer::serve` take a `started` closure, run once every accept thread exists and letting the listeners accept only if it returns `true`, and return `io::Result<()>`.
+- base: `InProcessEvents::deliver` returns `Result<(), EvDisallow>` and refuses a call made inside a subscription callback, as libca refuses `ca_pend_event` there with ECA_EVDISALLOW.
+- base: `CaClientService::create_channel` takes the context's `&InProcessEvents`.
+- base: `DeviceDone::complete`, `DeviceDone::reprocess` and `ProcessCallback::request` return nothing; a full callback band queues the request instead of refusing it.
+- base: `DeviceSupport::set_callback_priority` and `ProcessContext::callback_priority` removed; device support and records get the record's shared `RecordBand` through `set_record_band` and read the band at each request.
+- base: `Record::init_link_reads`, `Record::init_record_with_links` and `InitLinkReads` removed; a record names its init links one at a time through `Record::init_record_step`, and `init_record_own` takes the last link's `Option<LinkFetch>` and returns the next link to read.
+- base: `OutTarget::dbr_field_type` is now `final_field_type`, the link's filtered type, and `element_count` splits into `no_elements` and `final_elements`, the counts before and after the link's filters.
+- base: `char_view::posted_char_view`, `CharView::nul_at_count`, `dbr_delivery::apply_long_string` and `apply_long_string_mode` removed; `LongStringMode::DollarChar` keeps only `view`, `DollarView::read_request` and `PostStage::read_request` take the reader's `DbFieldType`, and `InputLinkRequest` gains `FromEarlierLinks`.
+- base: `LinkCheckSpec` gains a pub `band: CheckBand` field.
+- base: `ScanControl` is no longer `UnwindSafe` or `RefUnwindSafe`.
+- autosave: `SaveFileContents::not_connected` and `incomplete_at` are replaced by `error_message: Option<ErrorMessageLine>`, `RestoreResult::not_connected_at_save` is an `i32`, and `RestoreResult` gains `error_message_line`.
+- libcom: `runtime::background::spawn_future_after` takes an `admit` closure before the future, asked when the delay fires; a `false` cancels the task unrun.
+- areaDetector: `PvAttrDbrType::publish` removed, and `PvAttrDbrType` gains `Enum`, requested as DBR_ENUM and published as `NDAttrInt16`.
+
+### New
+
+- CA client: `CaChannel::subscribe_with_mask_dbr_type` subscribes in a `DbrType` the caller picks, and the server converts each event to it, as `ca_create_subscription` does; the type is kept across reconnects.
+- base: `QueuedSubscription` and `SubscriptionQueue` give a CA monitor a bounded queue whose drop ends the handler's wait for room, so the thread that drops it may be the queue's only reader; sscan and motor use them.
+- base: `DeviceDone::reprocess_now` completes a read on the calling thread, as C devMcaAsyn's port-thread callback does, so a full callback band cannot strand it.
+- base: `AsyncDbHandle::spawn_callback`, `spawn_callback_after` and `request_callback` queue callback work that a request made after scanStop does not run.
+- libcom: `runtime::socket::AcceptWaker` opens and binds its wake socket when serving starts, dialling loopback for a wildcard listener, so a stop wakes a parked accept even when the process is out of descriptors.
+- libcom: `runtime::time::FAR_FUTURE`, thirty years, is the one cap every runtime wait takes.
+- libcom: `runtime::task::spawn_background_after_admitted` is `spawn_background_after` with an `admit` closure asked when the delay expires.
+- libcom: `ScanOnceQueue::scan_once_record` and `runtime::task::background_scan_once_record` queue a record's scanOnce in C's onceQ order without ever refusing it.
+- asyn: `alarm::status_to_alarm` (C `asynStatusToEpicsAlarm`), `READ_ALARM` and `WRITE_ALARM` are public and build without the `epics` feature.
+- asyn: `InterruptManager::notify_admitted` delivers a value only to the receivers its `admit` closure accepts, asked once per receiver.
+- build: the `debugging` profile keeps full debuginfo in `target/debugging`; `profile.dev` builds without debuginfo, as CI already did.
+
+### Fixed
+
+- PVA client: a `pvput` awaited beside an unpolled `pvmonitor*` future no longer times out; monitor callbacks drain on a client-owned task.
+- PVA server: a start that fails leaves no listener bound or serving, and a stop before or during serve opens no search or beacon; accept, search and beacons open together once every thread exists, as pvxs's start enables them.
+- PVA server: a stop wakes each parked accept through its `AcceptWaker`, so a full backlog, EMFILE or a wildcard address on Windows no longer leaves the accept parked and the port bound.
+- PVA server: the blocking server no longer closes a connection after a pause in its reads, which left requests sent meanwhile unanswered; pvxs bounds only a read in progress.
+- PVA: pvalink connection and open-failure lines go through errlog, as pvxs posts them, so `eltc 0` silences them and an iocLog server receives them.
+- libcom: a huge timeout (`EPICS_CA_CONN_TMO=1e300`, `pvget -w 1e19`, `EPICS_CAS_BEACON_PERIOD=1e300`) no longer panics; every wait is capped at thirty years, where C caps event waits at ten and fires a huge epicsTimer delay at once.
+- libcom: `wait_readable` and `wait_writable` end at their deadline; they ended up to 1 ms early, and a deadline past 24.8 days expired at 24.8 days.
+- libcom: a signal during a socket wait retries with the time left, where a read timed out early and a connect failed with EINTR; C's asyn re-polls the full interval, and its connect fails there.
+- libcom: a callback request no longer waits on a preempted thread growing the task pool, since the pool publishes its chunks by CAS; C allocates the queue once in `callbackInit`.
+- libcom: a macro reference whose name, default or scoped definition holds an escaped `=`, `,` or `)` expands as C macCore expands it.
+- asyn: a serial or IP transfer no longer times out before its deadline; the time left rounds up, so Windows `SetCommTimeouts` takes 1.5 ms as 2 ms where C truncates it to 1.
+- asyn: the port takes requests in C portThread's order: a disabled device's request is passed over before any autoconnect, the request taken at a holder's release is the first eligible one and runs ahead of a due connect retry with no cancel or queue timeout able to drop it, and a Connect-priority request runs with no connect attempt, so one queued while the port was up still answers once it drops.
+- asyn: `RequestCell::cancel` waits for the cell's running callback, as C `cancelRequest` does, so its caller may free what the callback uses; unlike C it does not wait on a callback the calling thread is inside.
+- StreamDevice: replacing a bus through `attach_bus` after `reinit_record` no longer deadlocks; the old bus drops at the end of init, once the record is let go, and cancels its interrupts first, as AsynDriverInterface's release does.
+- base: after iocShutdown's scanStop, callback work requested later is refused and work requested earlier still runs, as C's callbackStop does: seq DLYn groups, throttle, the histogram watchdog, checkLinks, dbNotify restarts, swait and sscan callbacks, motor DLY and motordevCom posts, with a delay judged at its expiry; `scan_once` refuses requests after scanStop, as dbScan does.
+- base: a DeviceDone or ProcessCallback completion, an asyn record's special, a refused motor move and swait or sscan link events wait on a full callback band instead of being lost, which left the record PACT, the special draining or the move pending; C loses a full ring's `callbackRequest` and runs the others on the port or recDynLink thread.
+- base: an I/O Intr wake is judged when it is sent, as C `scanIoRequest` judges it, so one sent while running still runs after a pause or stop and one sent while paused no longer runs after `run`.
+- base: a record asked to scanOnce faster than the once task runs it no longer crowds out other records' requests; its waiting request absorbs the next, where C drops requests once onceQ is full.
+- base: every callback request reads the record's band from PRIO when it is made, so after a PRIO put sscan, asyn, sseq, swait and I/O Intr wakes queue on the new band, as C's asynRecord and per-PRIO ioscan lists do; C's sscan, swait and sseq fix the band at init or in a PRIO special.
+- base: the histogram SDEL watchdog runs on the low band as C's `wdogInit` pins it, and throttle, sseq and transform checkLinks run on PRIO's band as C sets them; only the calcouts stay low.
+- base: a refused `read_begin` ends its pass with READ/INVALID and keeps VAL, as C aiRecord and devAsynInt32 do; it converted the stale RVAL and raised nothing.
+- base: a CA link's network monitors arrive on a CAC-callback thread of the link's context, as libca's receive thread calls them, so on the thread backend a callback waiting for queue room (motorUtil, saveData) no longer drops values.
+- base: a CA link subscribes in the caller's DBR type and the server converts, so a DBR_STRING monitor of an enum gets the state string, as seq and saveData get it from `ca_create_subscription`.
+- base: a client context's monitor waits only for in-flight puts to its own record, so a put stuck in one record no longer delays monitors of others, and a context put no longer hands its record's monitor the value while still processing.
+- base: CA link callbacks no longer deadlock when a put callback's completion delivers events, or when two contexts' callbacks drop or deliver each other's subscriptions, where C deadlocks on the drop; a subscription's drop waits for its running callback except inside a callback, as `db_cancel_event` waits except on its own event task, and a route's last owner no longer drops under the delivery lock, which held off every other delivery.
+- base: each dbNotify restart runs in its own low-band callback, as C's `restartCheck` queues one per restart; the whole list ran in one callback ahead of other records.
+- base: `CaLink::link_metadata` answers from the live connection's CTRL reply, as C's `connectionCallback` clears `gotAttributes`, so a reconnect no longer serves the old limits, units and count, and the getters answer -1 until the new reply lands.
+- base: the read that opens `CaLink::enum_string`'s string monitor reports no value, as C's dbCa decides under the link lock; a first DBR_STRING event landing mid-read made it answer with one.
+- base: init links are read one at a time inside init_record, as C reads them, so a PP link C skips no longer processes its target and a self-link no longer reads values from before pass 1.
+- base: a record attribute such as `ai.NUM` reads as text through DBR_CHAR or DBR_UCHAR, with or without `$`, and refuses a numeric read with S_db_badDbrtype, as C's `getAttrValue` does; a DB link to one raises LINK/INVALID where it read 5.0, and a link resolved before its attribute existed reads it once added.
+- base: a one-element DB link read of a bare link field is refused, as C's fast convert has no link-type row, and compress reads INP at the count `dbGetNelements` gave, so a compress whose INP names `calc.INPB` raises LINK/INVALID, as C does, where it read NaN.
+- base: a DBR_CHAR or DBR_UCHAR read of a DBF_STRING field ends with its NUL at the reader's count, as C's getCharChar ends it, and a `$` link reads the zero-padded value C reads.
+- base: scalcout's AA..LL keep their values when a numeric input read fails, and aSub reads no input after its SUBL read fails or names an unregistered routine, as C's fetch_values return first.
+- sseq: an ABORT = 0 put during a DLYn delay no longer panics the record, an ABORT no longer starts a second sequence behind a queued DLYn fire, and ABORT and ABORTING post whenever C's asyncFinish posts them.
+- sseq: a number DOLn with an empty LNKn makes no step, as C tests the link types; a `.db` DOn or STRn loads as written, and DOn takes STRn's strtod prefix, so "12abc" is 12 as with C's atof.
+- sseq: a DLYn put is rounded and posted, where C rounds and posts DLY1 instead.
+- sseq: DOLn and LNKn reads and writes take the link's filtered type and count, as C's `dbGetLinkDBFtype` and `dbGetNelements` give them, and DTn/LTn report the type opened at iocInit or by the link put, where C reports the unfiltered type, or -1, until checkLinks runs.
+- sscan, motor: saveData and motorUtil no longer deadlock dropping a monitor whose callback waits for room in a queue only they read, where C deadlocks.
+- sscan: a `.CPT` value the full queue drops under saveData_MessagePolicy 2 no longer holds back later values for cpt_wait_time; C stamps the dropped value too.
+- sscan: a PV-name put waiting for its connect returns as the connect lands, where it waited to the end of that second; C polls in whole-second sleeps.
+- motor: LVIO is evaluated once per pass, at the point where C's process checks the soft limits, so stopped-status passes take the check and a put riding a status pass no longer re-runs it.
+- CA server: draining keeps connected clients through `EPICS_CAS_DRAIN_GRACE_SECS`, where the first accept after drain aborted every one; drain only refuses new connections.
+- CA server: the blocking driver re-evaluates channel access on an ACF reload, as C's `casAccessRightsCB` does; its channels kept their old rights.
+- CA server: a revoked right takes effect at once: a put checks the live access, and a monitor update posted after a revoke is refused, as C's `asCheckPut` and `read_reply`'s per-event `asCheckGet` do.
+- CA server: a blocking server whose start fails shows clients nothing, joins the threads it started and no longer dials a listener that never accepted; C's start cannot fail there.
+- CA server: a stop wakes each parked accept through an `AcceptWaker` opened at start and the accept loop reads the run state before every accept, as C's `req_server` does, so a full backlog or EMFILE no longer leaves the port bound.
+- CA server: a put-callback reply no longer waits behind a later put still in record processing; a circuit writer task flushes completions, as rsrv's event task does.
+- CA server: a circuit that only receives monitor updates is no longer closed as idle, since `EPICS_CAS_INACTIVITY_TMO` restarts on any byte read or written, and an unset or unreadable value defaults to the documented 600 s; C rsrv has no such cap.
+- CA server: the blocking driver counts `bytes_in`, `bytes_out`, channels and subscriptions, which read 0 on RTEMS and realtime-ca-ioc.
+- CA server, CA client: a NaN or infinite `EPICS_CAS_BEACON_PERIOD` resets to 15 s, and a NaN, infinite, zero or negative `EPICS_CA_MAX_SEARCH_PERIOD` to 300 s, as C does.
+- CA client: a read or write is checked for access rights first and then answers ECA_NORDACCESS or ECA_NOWTACCESS, ECA_BADCOUNT for a bad count and ECA_BADSTR for a long string, as libca's nciu does; they answered ECA_GETFAIL or ECA_PUTFAIL, and `get_many` skipped the rights check.
+- CA client: `caput-rs` prints C's "ERROR from put operation:", "ERROR occurred writing data:" and "Write callback operation timed out" lines; after a put-callback timeout it exits 1, where C exits 0.
+- CA client: the repeater daemon no longer inherits a client's SCHED_FIFO, as C resets it before exec, and the in-process fallback runs as CAC-repeater at the low band, as C creates it; the spawn no longer stalls the client's runtime for about 128 ms.
+- CA client: a CREATE_CHAN reply with a bad DBF type refuses and re-searches that channel, where a later subscribe panicked; libca drops the whole circuit.
+- CA client: a refused channel searches again on the 10 s governor tick, as C's disconnectGovernorTimer holds it, where a beacon poke re-searched it five times a second.
+- CA client: the beacon monitor binds one INADDR_ANY socket, as libca does, so caRepeater no longer reaps a live client and cuts its beacons.
+- CA client: circuit keepalive builds on macOS with the thread backend and on Windows with `ca_blocking_client`.
+- CA gateway: a put to a stat PV is refused with ECA_PUTFAIL, as C's gateway refuses it; it succeeded and was overwritten at the next refresh.
+- areaDetector: an `EPICS_PV` attribute subscribes in C's DBR type with DBE_VALUE only and the IOC converts each event, as PVAttribute does: DBR_STRING on a CHAR array gives text, a native ENUM is `NDAttrInt16`, a change inside MDEL leaves it, and a disconnect no longer ends it; a native CHAR reads as DBR_SHORT into `NDAttrInt16`, where C's `NDAttrInt8` reads a UCHAR 200 as -56.
+- areaDetector: an `EPICS_PV` attribute reads Undefined from a disconnect until the next value, written as NaN in a float HDF5 or NetCDF dataset, where C keeps the value from before the outage.
+- areaDetector: an `EPICS_PV` attribute's connect, monitor and disconnect lines print on the global asyn trace mask, as C's PVAttribute prints them.
+- areaDetector: NDPluginStdArrays posts each waveform as its frame is processed, with the frame's own timestamp, as C does; frames drained from the sort queue were posted late under the port's last stamp.
+- areaDetector: NDPluginStdArrays charges its throttle per receiver it delivers to, as C does; unlike C, a record not accepting interrupts is not charged.
+- areaDetector: the NeXus writer writes only the template's Attr nodes, in the attribute's own type on the node that holds them, and writes CONST nodes in their outtype, as NDFileNexus does; every attribute was a vlen string on the data dataset.
+- areaDetector: a NeXus template that cannot be read or parsed keeps the last good one, as NDFileNexus does, where the next file fell back to the built-in layout.
+- areaDetector: HDF5 chunks every frame dimension by its `HDF5_chunkSize` param and gives a multi-frame file at least one frame per chunk, raising `flushNthFrame` to `nFramesChunks`, as C's configureDims does, so a default SWMR stream flushes every frame.
+- areaDetector: HDF5 fixes the chunk layout, attribute chunk and extra dims at open, so a change made mid-capture no longer fails the close and frames stay on the file's axes, and a Single file opens with no extra dims, as C opens it.
+- areaDetector: `ad-plugins-rs` requires rust-hdf5 0.7.16, so a dataset written with NDFileHDF5's N-bit compression reads as values instead of failing with TypeMismatch, and each virtual dataset source converts from its own datatype.
+- autosave: a `.sav` file holding any `!` line restores with WARN, as C's reboot_restore sets it whatever count the line states; `! 0` restored as OK.
+- autosave: the `!` count reads as C's atoi and atol read it, at boot and on manual restore: a sign is read, an indented line at boot or `!7` on manual restore counts 0, and an out-of-range count wraps as C's does.
+- autosave: a `.sav` line splits at C's isspace, so a `\v` ends the PV name as C's `%s` ends it.
+- std: a "Fast Epid" record from fast_pid_control.db gets its device support, `fast_epid_device_factory`, which splits INP and DESC and connects both ports as devEpidFast.c does; unlike C, a failed connect also sets LINK/INVALID.
+- build: touching a test file no longer recompiles every dependent of `epics-base-rs` or `epics-seq-rs`, whose build scripts now watch only src/, build.rs and Cargo.toml.
+
 ## v0.34.2 — 2026-11-13
 
 Patch release; the pinned toolchain stays at 1.99.1. IOC threads run at

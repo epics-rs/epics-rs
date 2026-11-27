@@ -64,7 +64,7 @@ async fn the_ioc_init_caller_flushes_its_own_errlog_lines() {
 
     release.send(()).unwrap();
     let mut at_return = None;
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while std::time::Instant::now() < deadline {
         if let Ok(text) = done.try_recv() {
             at_return = Some(text);

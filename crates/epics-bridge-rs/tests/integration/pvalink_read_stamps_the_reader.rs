@@ -69,7 +69,7 @@ async fn dbpf(db: &PvDatabase, rec: &str, field: &str, value: EpicsValue) {
 
 /// Processes `rec` until it reads without an alarm.
 async fn until_clean(db: &PvDatabase, rec: &str) -> (WallTime, u64) {
-    let deadline = Instant::now() + FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(FACT_BUDGET);
     loop {
         let (time, utag, sevr) = process(db, rec).await;
         if sevr == AlarmSeverity::NoAlarm {

@@ -66,7 +66,7 @@ async fn put(db: &PvDatabase, rec: &str, field: &str, v: &str) {
 /// Process `rec` until `done`: an input's value lands on the link's first
 /// monitor, after its status reads PV OK.
 async fn process_until(db: &PvDatabase, rec: &str, done: impl Fn(&PvDatabase) -> bool) {
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while std::time::Instant::now() < deadline {
         put(db, rec, "PROC", "1").await;
         epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;
@@ -77,7 +77,7 @@ async fn process_until(db: &PvDatabase, rec: &str, done: impl Fn(&PvDatabase) ->
 }
 
 async fn settle(db: &PvDatabase, done: impl Fn(&PvDatabase) -> bool) {
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while std::time::Instant::now() < deadline {
         if done(db) {
             return;

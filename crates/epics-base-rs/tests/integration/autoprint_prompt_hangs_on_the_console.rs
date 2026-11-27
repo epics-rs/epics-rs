@@ -75,7 +75,7 @@ fn the_autoprint_prompt_hangs_on_the_console() {
             let _ = tx.send(buf[..n].to_vec());
         }
     });
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(Duration::from_secs(60));
     let mut console = Vec::new();
     let mut read_until = |done: &dyn Fn(&str) -> bool| loop {
         let text = String::from_utf8_lossy(&console).replace(PROMPT, "");

@@ -1984,7 +1984,8 @@ async fn mr_r7_rejected_queued_datagram_does_not_reparse_stale_buffer() {
 
         // Collect this round's replies for up to ~1.5s, walking each
         // 16-byte header and counting SEARCH replies per echoed cid.
-        let deadline = std::time::Instant::now() + Duration::from_millis(1500);
+        let deadline =
+            epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_millis(1500));
         while std::time::Instant::now() < deadline {
             match tokio::time::timeout(Duration::from_millis(200), peer.recv_from(&mut rbuf)).await
             {

@@ -63,7 +63,7 @@ async fn two_links_on_one_remote_name_open_two_channels() {
     db.scan_control().run();
     db.process_cp_links_on_connect().await;
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(10));
     while (stats.active_channels(), monitors(&sdb)) != (2, 2) && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }

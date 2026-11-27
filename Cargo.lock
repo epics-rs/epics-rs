@@ -100,6 +100,7 @@ dependencies = [
 name = "alloc-count"
 version = "0.34.2"
 dependencies = [
+ "epics-libcom-rs",
  "fact-budget",
 ]
 
@@ -3092,6 +3093,7 @@ dependencies = [
  "epics-base-rs",
  "epics-bridge-rs",
  "epics-ca-rs",
+ "epics-libcom-rs",
  "epics-pva-rs",
  "named-port",
  "tempfile",

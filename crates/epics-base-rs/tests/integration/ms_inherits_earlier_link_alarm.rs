@@ -51,7 +51,7 @@ async fn a_later_ms_link_inherits_an_earlier_links_failure() {
         .await
         .unwrap();
     // seq writes its links from a callback, after the put returns.
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while std::time::Instant::now() < deadline {
         if db.get_pv("SQ.PACT").unwrap().to_f64() == Some(0.0) && alarm("SQ") == LINK_INVALID {
             break;

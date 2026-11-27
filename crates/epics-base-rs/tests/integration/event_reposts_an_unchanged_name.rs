@@ -42,7 +42,7 @@ fn value_posts(rx: &mut EventReader) -> usize {
 /// settle window so a spurious extra post would land before the assert.
 async fn counters(db: &PvDatabase, want: [f64; 3]) {
     let read = || ["CA", "C7", "C1"].map(|r| num(db, r));
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while std::time::Instant::now() < deadline {
         if read() == want {
             break;

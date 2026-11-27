@@ -161,7 +161,7 @@ fn a_ca_link_resolves_end_to_end_on_the_exec_backend() {
     })
     .expect("no async runtime entered on this test thread");
 
-    let deadline = Instant::now() + RESOLVE_BUDGET;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(RESOLVE_BUDGET);
 
     // Stage 1 — the link registers. `setup_cp_links` only STAGES the open;
     // the registration lands after a real subscribe round-trip to the

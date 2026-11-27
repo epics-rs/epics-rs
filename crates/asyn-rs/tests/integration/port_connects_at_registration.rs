@@ -63,7 +63,7 @@ fn an_auto_connect_port_is_up_the_moment_it_is_created() {
     // the kernel accept queue, but the accepting thread is a separate schedule.
     // Reading the counter with zero tolerance for that gap is a test-side race
     // (it flaked under load); wait a bounded moment for the accept to land.
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(5));
     while accepted.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(5));
     }

@@ -106,7 +106,7 @@ async fn an_async_soft_input_completes_on_the_band_its_prio_names_now() {
         .join()
         .unwrap();
 
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while std::time::Instant::now() < deadline {
         if !db.get_record("AI").unwrap().read().is_processing() {
             break;

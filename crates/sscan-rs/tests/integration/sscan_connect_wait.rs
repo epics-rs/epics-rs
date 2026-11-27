@@ -81,7 +81,7 @@ async fn put_t1pv(db: &PvDatabase, pv: &str) {
 }
 
 async fn until_t1_connects(db: &PvDatabase) {
-    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while db.get_pv("S.T1NV").unwrap().to_f64().unwrap() != 0.0 {
         assert!(Instant::now() < deadline, "S.T1NV never reached PV OK");
         sleep(Duration::from_millis(5)).await;

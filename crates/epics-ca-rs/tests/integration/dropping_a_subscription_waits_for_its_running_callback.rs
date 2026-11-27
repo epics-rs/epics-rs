@@ -528,7 +528,8 @@ impl Caller {
         let thread = thread::Builder::new()
             .name(name.into())
             .spawn(move || {
-                let end = Instant::now() + fact_budget::FACT_BUDGET;
+                let end =
+                    epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
                 let mut v = 0.0;
                 while !posted.load(Ordering::SeqCst) && Instant::now() < end {
                     v += 1.0;

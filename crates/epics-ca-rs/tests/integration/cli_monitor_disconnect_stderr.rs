@@ -52,7 +52,7 @@ fn start_ioc() -> (Reaped, u16) {
     // "CA server: UDP search on port 41234, TCP on port 41235, beacons → …"
     let stderr = ioc.0.stderr.take().expect("piped stderr");
     let mut reader = BufReader::new(stderr);
-    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     let mut line = String::new();
     loop {
         assert!(

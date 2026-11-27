@@ -63,7 +63,8 @@ async fn ss(db: &PvDatabase) -> i16 {
 /// thread, which must first take the `dbScanLock` the putter holds): SS once
 /// it counts, or what it reads after 10 s.
 async fn counting(db: &PvDatabase) -> i16 {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline =
+        epics_base_rs::runtime::time::deadline_from_now(std::time::Duration::from_secs(10));
     loop {
         let ss = ss(db).await;
         if ss == SCALER_STATE_COUNTING || std::time::Instant::now() >= deadline {

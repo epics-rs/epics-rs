@@ -63,7 +63,7 @@ async fn until_count(db: &PvDatabase, rec: &str, count: i64) {
         .find(|(field, _, _)| field == "INP")
         .unwrap();
     let inp = inp.external().expect("a PVA link");
-    let deadline = Instant::now() + FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(FACT_BUDGET);
     while db.external_link_metadata(inp).and_then(|m| m.element_count) != Some(count) {
         assert!(Instant::now() < deadline, "{rec}.INP never counted {count}");
         tokio::time::sleep(Duration::from_millis(20)).await;

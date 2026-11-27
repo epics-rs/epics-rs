@@ -743,7 +743,9 @@ mod tests {
                     // not turn into a flake.
                     let mut confirm = tokio::task::spawn_blocking(move || {
                         let register = CaHeader::new(CA_PROTO_REPEATER_REGISTER).to_bytes();
-                        let deadline = Instant::now() + Duration::from_secs(5);
+                        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(
+                            Duration::from_secs(5),
+                        );
                         let mut buf = [0u8; 64];
                         while Instant::now() < deadline && !stopped.load(Ordering::Relaxed) {
                             let _ = client.send_to(&register, ("127.0.0.1", free_port));
@@ -910,7 +912,8 @@ mod tests {
 
             rt.block_on(ensure_repeater(port));
 
-            let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+            let deadline =
+                epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
             while Instant::now() < deadline {
                 if let Some(row) = epics_base_rs::runtime::task::thread_by_name("CAC-repeater")
                     && rt.block_on(try_register(port)).is_ok()
@@ -963,7 +966,7 @@ mod tests {
         );
         assert!(spawned);
 
-        let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
         let policy = loop {
             if let Ok(policy) = std::fs::read_to_string(&out) {
                 break policy;
@@ -1050,7 +1053,8 @@ mod tests {
         let started = dir.join("started");
         let longest = rt.block_on(async {
             let _client = crate::client::CaClient::new().await.expect("CA client");
-            let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+            let deadline =
+                epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
             let mut longest = Duration::ZERO;
             let mut last = Instant::now();
             loop {

@@ -133,7 +133,7 @@ async fn a_failed_write_on_a_blocking_port_returns_zero_at_put_time() {
         "the write is still queued when the put returns"
     );
     gate.open();
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(10));
     while processing() {
         assert!(
             std::time::Instant::now() < deadline,

@@ -113,7 +113,7 @@ async fn until(
     seen: &mut [Vec<(String, u16)>],
     done: impl Fn(&[Vec<(String, u16)>]) -> bool,
 ) {
-    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     loop {
         for ((name, rx), seen) in names.iter().zip(rx.iter_mut()).zip(seen.iter_mut()) {
             seen.extend(posts(db, name, rx));

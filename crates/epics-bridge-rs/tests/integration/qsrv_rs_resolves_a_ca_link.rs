@@ -73,7 +73,7 @@ async fn qsrv_rs_resolves_a_ca_link_as_soft_ioc() {
                 // not-a-wait: a timed-out get reads as None and the FACT_BUDGET poll retries it.
                 .timeout(Duration::from_secs(2))
                 .build();
-            let deadline = Instant::now() + FACT_BUDGET;
+            let deadline = epics_base_rs::runtime::time::deadline_from_now(FACT_BUDGET);
             while Instant::now() < deadline {
                 if let got @ Some((5.0, 0)) = value_and_severity(&client, "DST").await {
                     return got;

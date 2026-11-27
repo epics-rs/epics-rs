@@ -71,7 +71,7 @@ record(mca, "MA") {
     db.setup_external_link_opens().await;
     db.process_cp_links_on_connect().await;
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(10));
     loop {
         let report = resolver.link_report();
         if report == [("RSM".to_string(), true)] {

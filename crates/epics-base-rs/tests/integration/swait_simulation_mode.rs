@@ -89,7 +89,7 @@ async fn sim_db(siml: &str, simm: i16, sims: i16, siol: &str) -> PvDatabase {
 /// SRC's value reaches it on the link's first monitor, which only a fetching
 /// cycle shows — OUTV reading PV OK says nothing about either.
 async fn process_until_a(db: &PvDatabase, want: f64) {
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while std::time::Instant::now() < deadline {
         process(db).await;
         if field(db, "W", "A").await == want {
@@ -103,7 +103,7 @@ async fn process_until_a(db: &PvDatabase, want: f64) {
 /// Wait until `rec.f` reads `want` — OUTV connects and the OUT write lands
 /// over CA.
 async fn settle(db: &PvDatabase, rec: &str, f: &str, want: f64) {
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while std::time::Instant::now() < deadline {
         if field(db, rec, f).await == want {
             return;

@@ -6,7 +6,8 @@ use sim_detector::create_sim_detector;
 /// Frames come on the driver's clock, which no fixed sleep bounds: Windows
 /// rounds each 1 ms exposure and period wait up to its ~15.6 ms timer tick.
 fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline =
+        epics_libcom_rs::runtime::time::deadline_from_now(std::time::Duration::from_secs(10));
     while !cond() {
         assert!(
             std::time::Instant::now() < deadline,

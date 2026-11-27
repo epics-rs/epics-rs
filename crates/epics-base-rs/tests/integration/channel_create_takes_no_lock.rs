@@ -42,7 +42,7 @@ fn create(
 }
 
 async fn join_within<T>(thread: &std::thread::JoinHandle<T>, what: &str) {
-    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while !thread.is_finished() {
         assert!(Instant::now() < deadline, "{what}");
         epics_base_rs::runtime::task::sleep(Duration::from_millis(10)).await;

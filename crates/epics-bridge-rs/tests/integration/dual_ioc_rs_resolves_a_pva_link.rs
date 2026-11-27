@@ -97,7 +97,7 @@ async fn dual_ioc_rs_resolves_a_pva_link_as_soft_ioc_pva() {
         // `tcpNSCheckInterval`).
         let client = client_at(tcp);
         let mut got = None;
-        let deadline = Instant::now() + FACT_BUDGET;
+        let deadline = epics_base_rs::runtime::time::deadline_from_now(FACT_BUDGET);
         while got.is_none() && Instant::now() < deadline && child.try_wait().unwrap().is_none() {
             got = value_and_severity(&client, "DST")
                 .await

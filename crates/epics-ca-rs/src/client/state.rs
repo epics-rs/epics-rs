@@ -419,7 +419,8 @@ mod announce_tests {
             let snapshots = snapshots.clone();
             move || announce(&mut ch, &snapshots)
         });
-        let deadline = Instant::now() + Duration::from_millis(200);
+        let deadline =
+            epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_millis(200));
         let (mut event, mut waiter_woke) = (None, false);
         while event.is_none() && !waiter_woke && Instant::now() < deadline {
             event = rx.try_recv().ok();

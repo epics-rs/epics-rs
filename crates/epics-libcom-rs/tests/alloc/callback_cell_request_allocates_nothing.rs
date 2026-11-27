@@ -36,7 +36,7 @@ fn a_cell_request_and_its_run_allocate_nothing() {
         runs: AtomicUsize::new(0),
     });
     let wait_runs = |n: usize| {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(5));
         while cell.body().runs.load(Ordering::Acquire) < n {
             assert!(std::time::Instant::now() < deadline, "run {n} never came");
             std::thread::yield_now();

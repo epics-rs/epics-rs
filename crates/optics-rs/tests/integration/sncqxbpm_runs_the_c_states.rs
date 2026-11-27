@@ -141,7 +141,7 @@ fn assert_near(ioc: &Ioc, pv: &str, want: f64) {
 
 /// Up to 20 s, the longest being set_offsets' sweep of about 7 s.
 async fn wait_for(ioc: &Ioc, pv: &str, want: f64) {
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(20));
     while f64_of(ioc, pv) != want && Instant::now() < deadline {
         task::sleep(Duration::from_millis(20)).await;
     }
@@ -156,7 +156,7 @@ fn read_count(ioc: &Ioc) -> usize {
 /// so the second has gone out only once the first's posts are done.
 async fn reads(ioc: &Ioc, n: usize) {
     let want = read_count(ioc) + n;
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(10));
     while read_count(ioc) < want && Instant::now() < deadline {
         task::sleep(Duration::from_millis(20)).await;
     }
@@ -182,7 +182,7 @@ fn commands(ioc: &Ioc) -> Vec<String> {
 /// Wait until [`commands`] is `want`, then for two more reads, and check
 /// nothing followed.
 async fn expect_commands(ioc: &Ioc, want: &[&str]) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(10));
     while commands(ioc) != want && Instant::now() < deadline {
         task::sleep(Duration::from_millis(20)).await;
     }
@@ -346,7 +346,7 @@ async fn a_comm_error_holds_until_init_reads_again() {
     ioc.bpm.set_silent(true);
     wait_for(&ioc, "T:error.RVAL", 2.0).await;
     // idle puts errMsg after error (sncqxbpm.st:429-433).
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(20));
     while string_of(&ioc, "T:errMsg") != "communications error: 2" && Instant::now() < deadline {
         task::sleep(Duration::from_millis(20)).await;
     }

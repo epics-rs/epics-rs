@@ -97,7 +97,7 @@ pub(super) fn on_pvxs(commands: &[Command]) -> (Vec<u8>, SocketAddr, String) {
     let (_ioc, addr) = start_pvxs(&logs, build, ioc_ready).unwrap_or_else(|e| panic!("{e}"));
     let (replies, me) = replies_to_inits(addr, commands);
     let line = ignore_line(me, Command::Array);
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(5));
     let err = loop {
         let err = std::fs::read_to_string(&logs.err).unwrap_or_default();
         if err.contains(&line) || std::time::Instant::now() > deadline {

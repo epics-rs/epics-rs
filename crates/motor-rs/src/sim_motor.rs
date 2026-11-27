@@ -442,7 +442,7 @@ mod tests {
 
     /// Run `motor` `n` steps of `motorSimTask` on.
     fn step(motor: &mut SimMotor, n: u32) -> MotorStatus {
-        let now = motor.last_step + PERIOD * n;
+        let now = epics_libcom_rs::runtime::time::deadline_after(motor.last_step, PERIOD * n);
         motor.advance_to(now);
         motor.posted.clone()
     }

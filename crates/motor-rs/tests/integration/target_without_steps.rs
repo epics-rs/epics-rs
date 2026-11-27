@@ -107,7 +107,7 @@ async fn a_target_without_a_step_count_is_refused_before_the_move_block() {
     let hour = Duration::from_secs(3600);
     let first = controller.axes();
     let poller = controller.build(hour, hour, 0).start();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(5));
     while first.first_polls_pending() > 0 {
         assert!(Instant::now() < deadline, "the startup pass never ended");
         tokio::time::sleep(Duration::from_millis(1)).await;

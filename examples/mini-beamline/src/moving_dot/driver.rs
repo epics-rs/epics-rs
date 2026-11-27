@@ -362,7 +362,8 @@ mod tests {
             .unwrap();
         h.write_float64_blocking(p.acquire_time, 0, 0.001).unwrap();
         h.write_int32_blocking(p.acquire, 0, 1).unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline =
+            epics_libcom_rs::runtime::time::deadline_from_now(std::time::Duration::from_secs(5));
         while h.read_int32_blocking(p.base.array_counter, 0).unwrap() < 1
             || h.read_int32_blocking(p.acquire, 0).unwrap() != 0
         {
@@ -399,7 +400,8 @@ mod tests {
         h.write_float64_blocking(p.acquire_time, 0, 0.0).unwrap();
         h.write_int32_blocking(p.acquire, 0, 1).unwrap();
         let owner = rt.pool().owner();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let deadline =
+            epics_libcom_rs::runtime::time::deadline_from_now(std::time::Duration::from_secs(60));
         while owner.array(0).is_none() {
             assert!(std::time::Instant::now() < deadline, "no image");
             std::thread::yield_now();
@@ -439,7 +441,8 @@ mod tests {
             .unwrap();
         h.write_float64_blocking(p.acquire_time, 0, 1.0).unwrap();
         h.write_int32_blocking(p.acquire, 0, 1).unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline =
+            epics_libcom_rs::runtime::time::deadline_from_now(std::time::Duration::from_secs(5));
         while h.read_int32_blocking(p.base.array_counter, 0).unwrap() < 1 {
             assert!(std::time::Instant::now() < deadline, "no image");
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -482,7 +485,8 @@ mod tests {
         handle
             .write_int32_blocking(rt.ad_params.acquire, 0, 1)
             .unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline =
+            epics_libcom_rs::runtime::time::deadline_from_now(std::time::Duration::from_secs(5));
         while handle.read_int32_blocking(rt.ad_params.acquire, 0).unwrap() != 0 {
             assert!(
                 std::time::Instant::now() < deadline,

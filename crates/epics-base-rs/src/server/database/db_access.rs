@@ -1598,7 +1598,7 @@ mod tests {
     }
 
     fn wait_until(what: &str, done: impl Fn() -> bool) {
-        let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+        let deadline = crate::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
         while !done() {
             assert!(Instant::now() < deadline, "timed out waiting for {what}");
             std::thread::sleep(Duration::from_millis(1));

@@ -93,7 +93,7 @@ fn sig_bit(child: &Child, field: &str, sig: i32) -> bool {
 
 /// Wait until the child catches `sig`.
 fn wait_caught(child: &Child, sig: i32) {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(30));
     while !sig_bit(child, "SigCgt", sig) {
         assert!(Instant::now() < deadline, "the child never caught {sig}");
         std::thread::sleep(Duration::from_millis(10));
@@ -107,7 +107,7 @@ fn kill(child: &Child, sig: i32) {
 
 /// The child's status if it ends within `within`.
 fn ended(child: &mut Child, within: Duration) -> Option<ExitStatus> {
-    let deadline = Instant::now() + within;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(within);
     while Instant::now() < deadline {
         if let Some(st) = child.try_wait().unwrap() {
             return Some(st);

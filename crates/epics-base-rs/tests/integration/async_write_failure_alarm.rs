@@ -98,7 +98,7 @@ async fn put_and_complete(db: &PvDatabase) -> (u16, AlarmSeverity) {
     let _ = db
         .put_record_field_from_ca_no_notify("AO", "VAL", EpicsValue::Double(1.0))
         .await;
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while std::time::Instant::now() < deadline {
         {
             let rec = db.get_record("AO").unwrap();

@@ -35,7 +35,7 @@ fn attribute_value(drv: &NDArrayDriverBase) -> NDAttrValue {
 /// The attribute's value once it is no longer `old`. The budget covers the
 /// client's re-search after an outage, which alone takes about 10 s.
 async fn value_other_than(drv: &NDArrayDriverBase, old: &NDAttrValue) -> NDAttrValue {
-    let deadline = Instant::now() + FACT_BUDGET;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(FACT_BUDGET);
     loop {
         let value = attribute_value(drv);
         if value != *old {

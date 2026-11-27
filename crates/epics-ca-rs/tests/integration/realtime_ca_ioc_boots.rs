@@ -139,7 +139,7 @@ mod exec_model {
                 port,
             };
 
-            let deadline = Instant::now() + INIT_BUDGET;
+            let deadline = epics_libcom_rs::runtime::time::deadline_from_now(INIT_BUDGET);
             loop {
                 let console = booted.console();
                 // The warning precedes the boot report on the one console file.
@@ -360,7 +360,7 @@ mod exec_model {
                     .spawn()
                     .expect("spawn realtime-ca-ioc"),
             );
-            let deadline = Instant::now() + INIT_BUDGET;
+            let deadline = epics_libcom_rs::runtime::time::deadline_from_now(INIT_BUDGET);
             let status = loop {
                 if let Some(status) = child.0.try_wait().expect("poll the child") {
                     break status;
@@ -430,7 +430,7 @@ mod exec_model {
         // the evidence that the client got that far; waiting for it rather than
         // for a timer means a future change that stops the client short of the
         // seam cannot pass this test by simply not panicking.
-        let deadline = Instant::now() + DIAL_BUDGET;
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(DIAL_BUDGET);
         while !console.contains("TCP connect failed") {
             assert!(
                 !console.contains("panic"),
@@ -467,7 +467,8 @@ mod exec_model {
         // race.
         #[cfg(feature = "bringup-probes")]
         {
-            let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+            let deadline =
+                epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
             while !console.contains("C6 probe") {
                 assert!(
                     Instant::now() < deadline,
@@ -733,7 +734,7 @@ mod exec_model {
             .expect("the server closes the circuit");
 
         let disconnect = format!("CAS: forcing disconnect from {peer}\n");
-        let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
         let console = loop {
             let console = booted.console();
             if console.contains(&disconnect) {
@@ -795,7 +796,7 @@ mod exec_model {
         drop(c);
 
         let last = format!("CAS: Request from {peer} =>   available=0x55 \tN=0 paddr=(nil)\n");
-        let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
         let console = loop {
             let console = booted.console();
             if console.contains(&last) {
@@ -914,7 +915,7 @@ mod exec_model {
                 !rec.field_subscribers().is_empty(),
             )
         };
-        let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
         // The first monitor event can process DOWN:CP before its OUT link has
         // connected, which C drops too; each new CP value is another event.
         let mut sent = 42.5;

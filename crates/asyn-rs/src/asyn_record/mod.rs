@@ -9997,7 +9997,8 @@ mod tests {
         assert!(port.waits_cell.cancel(), "wasQueued");
         assert_eq!(*port.waits.0.lock().unwrap(), ["canceled"]);
         assert!(!port.waits_cell.is_outstanding());
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let deadline =
+            epics_libcom_rs::runtime::time::deadline_from_now(std::time::Duration::from_secs(2));
         while Arc::strong_count(&port.waits_cell) != 1 {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -12023,10 +12024,11 @@ A.TMSK 1
 
         // A step's posts, then a settle window for any repeat.
         async fn settle(stream: &std::sync::Mutex<String>, lines: usize) {
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            let deadline =
+                epics_libcom_rs::runtime::task::deadline_from_now(Duration::from_secs(10));
             while stream.lock().unwrap().lines().count() < lines {
                 assert!(
-                    tokio::time::Instant::now() < deadline,
+                    epics_libcom_rs::runtime::task::Instant::now() < deadline,
                     "the step's posts arrive:\n{}",
                     stream.lock().unwrap()
                 );
@@ -12271,7 +12273,8 @@ A.OEOS
             let cell = db.get_record("A").unwrap();
             // The record's special requests have all completed.
             let settled = || async {
-                let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                let deadline =
+                    epics_libcom_rs::runtime::task::deadline_from_now(Duration::from_secs(10));
                 loop {
                     let idle = {
                         let mut inst = cell.write();
@@ -12285,7 +12288,10 @@ A.OEOS
                     if idle {
                         return;
                     }
-                    assert!(tokio::time::Instant::now() < deadline, "the lane drains");
+                    assert!(
+                        epics_libcom_rs::runtime::task::Instant::now() < deadline,
+                        "the lane drains"
+                    );
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
             };
@@ -12440,7 +12446,8 @@ A.OEOS
             .unwrap();
         let cell = db.get_record("A").unwrap();
         let settled = || async {
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            let deadline =
+                epics_libcom_rs::runtime::task::deadline_from_now(Duration::from_secs(10));
             loop {
                 let idle = {
                     let mut inst = cell.write();
@@ -12454,7 +12461,10 @@ A.OEOS
                 if idle {
                     return;
                 }
-                assert!(tokio::time::Instant::now() < deadline, "the lane drains");
+                assert!(
+                    epics_libcom_rs::runtime::task::Instant::now() < deadline,
+                    "the lane drains"
+                );
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         };

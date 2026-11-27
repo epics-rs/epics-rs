@@ -101,7 +101,7 @@ fn an_iocsh_configured_server_port_accepts_a_client() {
     // The server owns the bind now (configure bound it synchronously before
     // registering), so the client connect is deterministic — but keep the wait
     // loop against listener-thread scheduling.
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(5));
     let mut client = loop {
         match std::net::TcpStream::connect(("127.0.0.1", port)) {
             Ok(c) => break c,
@@ -127,7 +127,7 @@ fn an_iocsh_configured_server_port_accepts_a_client() {
     )
     .unwrap();
     let mut got: Vec<u8> = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(5));
     while got.is_empty() {
         assert!(
             Instant::now() < deadline,

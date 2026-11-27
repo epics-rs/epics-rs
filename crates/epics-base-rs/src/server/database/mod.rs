@@ -5856,7 +5856,7 @@ mod tests {
         let db = PvDatabase::new();
         db.ioc_init().await;
 
-        let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+        let deadline = crate::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
         while !table().contains("dbCaLink") {
             assert!(
                 std::time::Instant::now() < deadline,

@@ -49,7 +49,7 @@ fn traced(log: &std::path::Path) -> Vec<String> {
 
 /// Wait until a traced line satisfies `want`, and return it.
 async fn line(log: &std::path::Path, want: impl Fn(&str) -> bool) -> String {
-    let deadline = Instant::now() + FACT_BUDGET;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(FACT_BUDGET);
     loop {
         if let Some(l) = traced(log).into_iter().find(|l| want(l)) {
             return l;
@@ -198,7 +198,7 @@ async fn an_epics_pv_attribute_traces_connect_monitor_and_disconnect_on_the_glob
     })
     .await;
     assert_eq!(chan_id(&disconnect), chan_id(&connect));
-    let deadline = Instant::now() + FACT_BUDGET;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(FACT_BUDGET);
     while attribute_value(&drv, "Value") != NDAttrValue::Undefined {
         assert!(
             Instant::now() < deadline,

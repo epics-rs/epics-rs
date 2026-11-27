@@ -15,6 +15,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use epics_base_rs::runtime::task::Instant;
 use epics_tools_rs::procserv::{
     ProcServ, ProcServConfig,
     config::{ChildConfig, KeyBindings, ListenConfig, LoggingConfig},
@@ -24,7 +25,7 @@ use epics_tools_rs::procserv::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::time::{Instant, sleep, timeout};
+use tokio::time::{sleep, timeout};
 
 /// How long `connect` may keep being refused before the console listener is
 /// called missing rather than slow.
@@ -109,7 +110,7 @@ async fn spawn_bound(cfg: ProcServConfig) -> (ProcServ, Vec<u16>) {
 
 /// Read up to `deadline` and return everything that arrived.
 async fn read_for(stream: &mut TcpStream, dur: Duration) -> Vec<u8> {
-    let deadline = Instant::now() + dur;
+    let deadline = epics_base_rs::runtime::task::deadline_from_now(dur);
     let mut buf = Vec::new();
     let mut tmp = vec![0u8; 1024];
     while Instant::now() < deadline {
@@ -232,7 +233,7 @@ async fn cat_round_trip_via_tcp_console() {
     // Connect to the supervisor's TCP console.
     let mut conn = {
         // Listener is set up async; retry briefly.
-        let deadline = Instant::now() + CONNECT_RETRY;
+        let deadline = epics_base_rs::runtime::task::deadline_from_now(CONNECT_RETRY);
         loop {
             match TcpStream::connect(("127.0.0.1", port)).await {
                 Ok(s) => break s,
@@ -334,7 +335,7 @@ async fn unwritable_pid_and_log_paths_do_not_abort_startup() {
     });
 
     let mut conn = {
-        let deadline = Instant::now() + CONNECT_RETRY;
+        let deadline = epics_base_rs::runtime::task::deadline_from_now(CONNECT_RETRY);
         loop {
             match TcpStream::connect(("127.0.0.1", port)).await {
                 Ok(s) => break s,
@@ -372,7 +373,7 @@ async fn kill_keystroke_signals_child() {
     });
 
     let mut conn = {
-        let deadline = Instant::now() + CONNECT_RETRY;
+        let deadline = epics_base_rs::runtime::task::deadline_from_now(CONNECT_RETRY);
         loop {
             match TcpStream::connect(("127.0.0.1", port)).await {
                 Ok(s) => break s,
@@ -435,7 +436,7 @@ async fn kill_key_on_a_dead_child_restarts_it_and_still_broadcasts() {
     });
 
     let mut conn = {
-        let deadline = Instant::now() + CONNECT_RETRY;
+        let deadline = epics_base_rs::runtime::task::deadline_from_now(CONNECT_RETRY);
         loop {
             match TcpStream::connect(("127.0.0.1", port)).await {
                 Ok(s) => break s,
@@ -536,7 +537,7 @@ async fn log_port_client_is_readonly_but_receives_output() {
 
     // Connect a control (read/write) client and a log (read-only) client.
     let connect = |port: u16| async move {
-        let deadline = Instant::now() + CONNECT_RETRY;
+        let deadline = epics_base_rs::runtime::task::deadline_from_now(CONNECT_RETRY);
         loop {
             match TcpStream::connect(("127.0.0.1", port)).await {
                 Ok(s) => break s,
@@ -605,7 +606,7 @@ async fn logstamp_prefixes_logger_client_stream_not_control() {
     });
 
     let connect = |port: u16| async move {
-        let deadline = Instant::now() + CONNECT_RETRY;
+        let deadline = epics_base_rs::runtime::task::deadline_from_now(CONNECT_RETRY);
         loop {
             match TcpStream::connect(("127.0.0.1", port)).await {
                 Ok(s) => break s,
@@ -660,7 +661,7 @@ async fn timefmt_controls_banner_timestamp_format() {
     });
 
     let mut conn = {
-        let deadline = Instant::now() + CONNECT_RETRY;
+        let deadline = epics_base_rs::runtime::task::deadline_from_now(CONNECT_RETRY);
         loop {
             match TcpStream::connect(("127.0.0.1", port)).await {
                 Ok(s) => break s,
@@ -702,7 +703,7 @@ async fn manual_restart_preempts_active_holdoff() {
     });
 
     let mut conn = {
-        let deadline = Instant::now() + CONNECT_RETRY;
+        let deadline = epics_base_rs::runtime::task::deadline_from_now(CONNECT_RETRY);
         loop {
             match TcpStream::connect(("127.0.0.1", port)).await {
                 Ok(s) => break s,
@@ -758,7 +759,7 @@ async fn two_clients_share_same_party_line() {
 
     // Connect client A.
     let mut a = {
-        let deadline = Instant::now() + CONNECT_RETRY;
+        let deadline = epics_base_rs::runtime::task::deadline_from_now(CONNECT_RETRY);
         loop {
             match TcpStream::connect(("127.0.0.1", port)).await {
                 Ok(s) => break s,
@@ -836,7 +837,7 @@ async fn client_keystrokes_are_not_forwarded_to_other_clients() {
 
     // Connect A (with retry while the listener comes up) and B.
     let mut a = {
-        let deadline = Instant::now() + CONNECT_RETRY;
+        let deadline = epics_base_rs::runtime::task::deadline_from_now(CONNECT_RETRY);
         loop {
             match TcpStream::connect(("127.0.0.1", port)).await {
                 Ok(s) => break s,
@@ -886,7 +887,7 @@ async fn ignored_chars_are_stripped_from_child_stdin() {
     });
 
     let mut c = {
-        let deadline = Instant::now() + CONNECT_RETRY;
+        let deadline = epics_base_rs::runtime::task::deadline_from_now(CONNECT_RETRY);
         loop {
             match TcpStream::connect(("127.0.0.1", port)).await {
                 Ok(s) => break s,
@@ -1033,7 +1034,7 @@ async fn norestart_keeps_server_alive_after_child_exit() {
     // the invariant this test targets) and needlessly slow the fast path.
     wait_for(|| marker.exists().then_some(())).await;
     let mut conn = {
-        let deadline = Instant::now() + CONNECT_RETRY;
+        let deadline = epics_base_rs::runtime::task::deadline_from_now(CONNECT_RETRY);
         loop {
             match TcpStream::connect(("127.0.0.1", port)).await {
                 Ok(s) => break s,
@@ -1089,7 +1090,7 @@ async fn toggle_into_oneshot_grants_one_more_run() {
     });
 
     let mut conn = {
-        let deadline = Instant::now() + CONNECT_RETRY;
+        let deadline = epics_base_rs::runtime::task::deadline_from_now(CONNECT_RETRY);
         loop {
             match TcpStream::connect(("127.0.0.1", port)).await {
                 Ok(s) => break s,
@@ -1156,7 +1157,7 @@ async fn banner_precedes_telnet_negotiation() {
     });
 
     let mut conn = {
-        let deadline = Instant::now() + CONNECT_RETRY;
+        let deadline = epics_base_rs::runtime::task::deadline_from_now(CONNECT_RETRY);
         loop {
             match TcpStream::connect(("127.0.0.1", port)).await {
                 Ok(s) => break s,
@@ -1246,7 +1247,7 @@ async fn info_file_is_published_at_startup_even_under_wait_for_manual_start() {
     // The control port is up (the manager's other discovery path), so the
     // info file must already be there — that is the whole point of writing
     // it before the main loop.
-    let deadline = Instant::now() + CONNECT_RETRY;
+    let deadline = epics_base_rs::runtime::task::deadline_from_now(CONNECT_RETRY);
     loop {
         match TcpStream::connect(("127.0.0.1", port)).await {
             Ok(_) => break,
@@ -1321,7 +1322,7 @@ async fn info_file_reports_the_kernel_assigned_port_for_a_port_zero_config() {
 
     // The published port must be the live listener, not a guess: a client
     // that reads the info file (manage-procs) can connect to it.
-    let deadline = Instant::now() + CONNECT_RETRY;
+    let deadline = epics_base_rs::runtime::task::deadline_from_now(CONNECT_RETRY);
     loop {
         match TcpStream::connect(("127.0.0.1", port)).await {
             Ok(_) => break,

@@ -82,7 +82,7 @@ fn set_config(save_path: PathBuf) -> SaveSetConfig {
 }
 
 async fn first_post(db: &PvDatabase, name: &str, rx: &mut EventReader) -> (EpicsValue, u16, u16) {
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while std::time::Instant::now() < deadline {
         if let Ok(e) = rx.try_recv() {
             return (

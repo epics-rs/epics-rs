@@ -127,7 +127,7 @@ mod tests {
             .unwrap()
             .0;
         db.scan_once(b"ONCE");
-        let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+        let deadline = crate::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
         while std::time::Instant::now() < deadline {
             if !RAN_ON.lock().unwrap().is_empty() {
                 break;

@@ -79,7 +79,7 @@ async fn first_pass_of(loading: bool, pvs: &[&str]) {
     // Detached; `shutdown` ends the task.
     drop(mgr.clone().start(db.clone()));
     let set = mgr.sets()[0].0.clone();
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while std::time::Instant::now() < deadline {
         if set.list_status().text == "Enabling list..." {
             break;
@@ -215,7 +215,7 @@ async fn early_list_of(
 async fn a_list_made_before_ioc_init_counts_every_member_unconnected() {
     let (mgr, task, _dir) = early_list(Arc::default()).await;
     let set = mgr.sets()[0].0.clone();
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while std::time::Instant::now() < deadline {
         if set.not_connected() > 0 {
             break;
@@ -242,7 +242,7 @@ async fn child_reconnect() {
     let (mgr, task, db, _dir) = early_list_of(settings, &["TEMP", "LATE"]).await;
     let set = mgr.sets()[0].0.clone();
     let wait_for = async |n: i32, within: Duration| {
-        let deadline = std::time::Instant::now() + within;
+        let deadline = epics_base_rs::runtime::time::deadline_from_now(within);
         while set.not_connected() != n && std::time::Instant::now() < deadline {
             epics_base_rs::runtime::task::sleep(Duration::from_millis(100)).await;
         }
@@ -318,7 +318,8 @@ async fn child_ioc() {
         .run_outcome(|config| async move {
             let mgr = config.autosave_manager.unwrap();
             let set = mgr.sets()[0].0.clone();
-            let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+            let deadline =
+                epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
             while std::time::Instant::now() < deadline {
                 if set.not_connected() > 0 {
                     break;

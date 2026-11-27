@@ -42,7 +42,7 @@ impl CounterLset {
 
 /// Spin until `done`, failing after the fact budget.
 fn until(done: impl Fn() -> bool, what: &str) {
-    let end = Instant::now() + fact_budget::FACT_BUDGET;
+    let end = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while !done() {
         assert!(Instant::now() < end, "timed out waiting until {what}");
         std::thread::yield_now();

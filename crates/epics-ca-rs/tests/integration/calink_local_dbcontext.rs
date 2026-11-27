@@ -80,7 +80,7 @@ fn held(db: &PvDatabase, record: &str, field: &str) -> ParsedLink {
 }
 
 async fn until(what: &str, mut done: impl FnMut() -> bool) {
-    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while !done() {
         assert!(Instant::now() < deadline, "{what}");
         epics_base_rs::runtime::task::sleep(Duration::from_millis(10)).await;

@@ -94,7 +94,7 @@ async fn failed_write(port: &str, can_block: bool, record_type: &str) -> (u16, A
         )
         .await;
     let rec = db.get_record("A:ARR").unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(10));
     while rec.read().is_processing() {
         assert!(
             std::time::Instant::now() < deadline,

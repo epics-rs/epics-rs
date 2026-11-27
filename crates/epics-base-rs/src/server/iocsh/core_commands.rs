@@ -1644,7 +1644,7 @@ mod tests {
                 })
                 .unwrap();
             let id = id_rx.recv().unwrap();
-            let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+            let deadline = crate::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
             while std::time::Instant::now() < deadline {
                 if crate::runtime::task::thread_by_id(id).is_some_and(|t| t.is_suspended()) {
                     break;

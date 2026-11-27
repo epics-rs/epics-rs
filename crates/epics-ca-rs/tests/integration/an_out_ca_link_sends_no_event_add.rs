@@ -76,7 +76,7 @@ async fn an_out_link_is_monitored_only_from_its_first_read() {
     );
 
     assert_eq!(LinkSet::get_cached_value(&resolver, out_link), None);
-    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while LinkSet::get_cached_value(&resolver, out_link).is_none() {
         assert!(
             Instant::now() < deadline,

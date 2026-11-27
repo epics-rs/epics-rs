@@ -61,7 +61,7 @@ const BUDGET: Duration = Duration::from_secs(10);
 
 /// Wait until `done`, failing after [`BUDGET`].
 async fn until(what: &str, done: impl Fn() -> bool) {
-    let deadline = Instant::now() + BUDGET;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(BUDGET);
     while !done() {
         assert!(Instant::now() < deadline, "timed out waiting until {what}");
         epics_base_rs::runtime::task::sleep(Duration::from_millis(2)).await;

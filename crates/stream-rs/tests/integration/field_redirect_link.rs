@@ -40,7 +40,7 @@ fn link(db: &PvDatabase, pv: &str) -> String {
 
 /// `pv` once it is `want`, or after two seconds.
 async fn settled(db: &PvDatabase, pv: &str, want: &str) -> String {
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(2));
     while get(db, pv).text_g() != want && Instant::now() < deadline {
         sleep(Duration::from_millis(5)).await;
     }
@@ -49,7 +49,7 @@ async fn settled(db: &PvDatabase, pv: &str, want: &str) -> String {
 
 /// What `capture` took until `done` holds of it, or two seconds.
 async fn printed(capture: &ProcessCapture, done: impl Fn(&str) -> bool) -> String {
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(2));
     let mut printed = String::new();
     while !done(&printed) && Instant::now() < deadline {
         printed.push_str(&String::from_utf8_lossy(&capture.take()));
@@ -304,7 +304,7 @@ record(ai, "il") { field(DTYP, "stream") field(INP, "@redirect.proto intr_link R
 "#)
         .await;
         assert_eq!(settled(&db, "lk.OUT", "t3 NPP NMS").await, "t3 NPP NMS");
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(2));
         while WRITES.lock().len() < 2 && Instant::now() < deadline {
             sleep(Duration::from_millis(5)).await;
         }

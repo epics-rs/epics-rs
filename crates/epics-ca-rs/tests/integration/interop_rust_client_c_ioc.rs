@@ -136,8 +136,8 @@ async fn rust_client_monitors_softioc_changes() {
     });
 
     let mut last_seen = 0;
-    let deadline = tokio::time::Instant::now() + fact_budget::FACT_BUDGET;
-    while tokio::time::Instant::now() < deadline {
+    let deadline = epics_libcom_rs::runtime::task::deadline_from_now(fact_budget::FACT_BUDGET);
+    while epics_libcom_rs::runtime::task::Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_millis(500), monitor.recv()).await {
             Ok(Some(Ok(snap))) => {
                 last_seen = snap.value.to_f64().unwrap_or(0.0) as i64;
@@ -353,9 +353,9 @@ async fn a_monitor_spans_an_unresponsive_window(subscribe_during: bool) {
     });
     assert!(put.await.expect("caput task"), "caput after recovery");
     let mut monitor = monitor.expect("subscribed");
-    let deadline = tokio::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_libcom_rs::runtime::task::deadline_from_now(fact_budget::FACT_BUDGET);
     loop {
-        let snap = tokio::time::timeout_at(deadline, monitor.recv())
+        let snap = epics_libcom_rs::runtime::task::timeout_at(deadline, monitor.recv())
             .await
             .expect("the post-recovery caput reaches the monitor")
             .expect("monitor open");

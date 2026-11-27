@@ -97,7 +97,7 @@ record(sseq, "S") { field(PRIO, "HIGH") field(LNK1, "T") }
     db.put_record_field_from_ca("S", "WAIT1", EpicsValue::Short(1))
         .await
         .unwrap();
-    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while werr1() != Some(1.0) {
         assert!(
             Instant::now() < deadline,

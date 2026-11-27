@@ -62,7 +62,7 @@ fn target(db: &PvDatabase, rec: &str) -> (f64, f64, f64) {
 /// Process `rec` until `done`: DOL's value lands on the link's first
 /// monitor, after DOLV reads PV OK, and shows only on OUT.
 async fn process_until(db: &PvDatabase, rec: &str, done: impl Fn(&PvDatabase) -> bool) {
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while std::time::Instant::now() < deadline {
         db.put_record_field_from_ca(rec, "PROC", EpicsValue::String("1".into()))
             .await
@@ -75,7 +75,7 @@ async fn process_until(db: &PvDatabase, rec: &str, done: impl Fn(&PvDatabase) ->
 }
 
 async fn settle(db: &PvDatabase, done: impl Fn(&PvDatabase) -> bool) {
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while std::time::Instant::now() < deadline {
         if done(db) {
             return;

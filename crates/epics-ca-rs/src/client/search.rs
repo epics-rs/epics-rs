@@ -2699,7 +2699,7 @@ mod tests {
         state.penalty.insert(
             server,
             PenaltyEntry {
-                until: Instant::now() + Duration::from_secs(60),
+                until: epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(60)),
             },
         );
         handle_request(

@@ -363,7 +363,7 @@ record(compress, "CCS") { field(INP, "CS8 CA") field(ALG, "Circular Buffer") fie
             .find(|(field, _, _)| field == "INP")
             .unwrap();
         let inp = inp.external().expect("a CA link");
-        let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+        let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
         while db.external_link_metadata(inp).is_none()
             || lset
                 .get_cached_value(LinkRef::new(inp.name, inp.open))

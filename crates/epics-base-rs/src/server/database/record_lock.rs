@@ -3205,7 +3205,7 @@ mod tests {
             })
             .collect();
 
-        let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+        let deadline = crate::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
         while done.load(Ordering::SeqCst) < 2 {
             assert!(
                 std::time::Instant::now() < deadline,

@@ -51,7 +51,7 @@ fn hold_scan_once() -> Sender<()> {
 }
 
 async fn until(what: &str, done: impl Fn() -> bool) {
-    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while !done() {
         assert!(Instant::now() < deadline, "{what}");
         sleep(Duration::from_millis(5)).await;
@@ -61,7 +61,7 @@ async fn until(what: &str, done: impl Fn() -> bool) {
 /// Everything on the ring before this has run. The ring may still be full.
 async fn ring_drained() {
     let ran = Arc::new(AtomicBool::new(false));
-    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     loop {
         let flag = ran.clone();
         let sentinel = Box::new(move || flag.store(true, Ordering::Release));

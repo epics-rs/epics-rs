@@ -82,7 +82,7 @@ record(ao, "OUT") {
         .unwrap();
     let out = db.get_record("OUT").unwrap();
     // Well inside the hold, which a wait on the low band would outlast.
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(5));
     while out.read().is_processing() && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }

@@ -238,7 +238,7 @@ async fn a_method_added_to_a_running_set_starts_its_task() {
 
     let sav = dir.path().join("settings.sav");
     // The trigger's first monitor event, its value at enable, saves.
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while std::time::Instant::now() < deadline {
         if sav.exists() {
             break;
@@ -254,7 +254,7 @@ async fn a_method_added_to_a_running_set_starts_its_task() {
     )
     .await
     .unwrap();
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while std::time::Instant::now() < deadline {
         if sav.exists() {
             break;

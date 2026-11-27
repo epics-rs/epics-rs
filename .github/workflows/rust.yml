@@ -624,11 +624,11 @@ jobs:
       working-directory: lints/instant_add_duration
       run: cargo test
     - name: dylint lints
-      run: cargo dylint --all --workspace -- --all-features --keep-going
+      run: cargo dylint --all --workspace -- --all-features --all-targets --keep-going
     - name: dylint lints (thread backend)
       env:
         EPICS_RS_BUILD_EXEC_BACKEND: thread
-      run: cargo dylint --all --workspace -- --all-features --keep-going
+      run: cargo dylint --all --workspace -- --all-features --all-targets --keep-going
 
   # A fixed sleep or a literal timeout in a test is a bet on the runner's
   # speed. Test code held 2823 of them at 451531667, so the gate counts only

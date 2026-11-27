@@ -524,7 +524,7 @@ mod tests {
         .expect("registration");
         drop(handle);
 
-        let deadline = std::time::Instant::now() + PUSH_INTERVAL * 4;
+        let deadline = crate::runtime::time::deadline_from_now(PUSH_INTERVAL * 4);
         while ticks.load(Ordering::Relaxed) < 3 && std::time::Instant::now() < deadline {
             thread::sleep(Duration::from_millis(20));
         }

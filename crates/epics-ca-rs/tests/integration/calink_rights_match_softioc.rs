@@ -78,7 +78,7 @@ impl LinkHolder {
     }
 
     fn until(&mut self, field: &str, want: &str) -> String {
-        let end = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+        let end = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
         loop {
             let got = self.dbgf(field);
             if got == want || std::time::Instant::now() >= end {
@@ -130,7 +130,7 @@ fn a_read_only_connect_processes_the_cp_holder_as_softioc_does() {
         c_ca_tools::run_caget(&server.ca_addr_list(), server.udp_port, "UP")
             .is_some_and(|v| !v.contains("no read access"))
     };
-    let end = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let end = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while !readable() && std::time::Instant::now() < end {
         std::thread::sleep(Duration::from_millis(50));
     }

@@ -142,7 +142,7 @@ fn a_refused_pva_link_put_prints_the_pvxs_line() {
 /// The IOC's log client, connected within [`FACT_BUDGET`].
 fn accept_within_budget(server: &TcpListener) -> TcpStream {
     server.set_nonblocking(true).unwrap();
-    let deadline = Instant::now() + FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(FACT_BUDGET);
     loop {
         match server.accept() {
             Ok((peer, _)) => {
@@ -163,7 +163,7 @@ fn accept_within_budget(server: &TcpListener) -> TcpStream {
 
 /// The lines `log` gets before `end`, which must arrive within [`FACT_BUDGET`].
 fn lines_before(log: &mut BufReader<TcpStream>, end: &str) -> Vec<String> {
-    let deadline = Instant::now() + FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(FACT_BUDGET);
     let mut lines = Vec::new();
     loop {
         let left = deadline.saturating_duration_since(Instant::now());

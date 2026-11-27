@@ -191,7 +191,7 @@ fn put_and_await_reentry(db: &Arc<PvDatabase>, processes: &Arc<AtomicUsize>) {
         1,
         "the put must have processed the record once"
     );
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while processes.load(Ordering::SeqCst) < 2 && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -359,7 +359,7 @@ fn blocking_write_notify_to_a_reprocessing_record_answers_the_client() {
     );
 
     // The delayed re-process must land, which is the half `task::spawn` owns.
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while processes.load(Ordering::SeqCst) < 2 && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -414,7 +414,7 @@ async fn the_same_put_under_a_runtime_reprocesses() {
     db.put_record_field_from_ca(PV, "VAL", EpicsValue::Double(2.5))
         .await
         .expect("the put itself must not error");
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while processes.load(Ordering::SeqCst) < 2 && std::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }

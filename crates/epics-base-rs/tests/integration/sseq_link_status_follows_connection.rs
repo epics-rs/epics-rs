@@ -88,7 +88,7 @@ fn read(db: &PvDatabase, pv: &str) -> i16 {
 }
 
 async fn settled(db: &PvDatabase, pv: &str, want: i16) {
-    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while Instant::now() < deadline {
         if db.get_pv(pv).ok().and_then(|v| v.to_f64()) == Some(f64::from(want)) {
             return;
@@ -153,7 +153,10 @@ fn posts_then_600_ms(
 /// `armed` + 1 s + (k - 1) × 0.5 s. `seen[i]` is pass i + 1 or a later one.
 fn assert_no_pass_early(armed: Instant, seen: &[Instant]) {
     for (i, &at) in seen.iter().enumerate() {
-        let due = armed + Duration::from_secs(1) + Duration::from_millis(500) * i as u32;
+        let due = epics_base_rs::runtime::time::deadline_after(
+            epics_base_rs::runtime::time::deadline_after(armed, Duration::from_secs(1)),
+            Duration::from_millis(500) * i as u32,
+        );
         assert!(at >= due, "pass {} posted {:?} early", i + 1, due - at);
     }
 }

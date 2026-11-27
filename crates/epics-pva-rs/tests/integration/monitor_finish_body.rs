@@ -270,7 +270,7 @@ async fn typed_monitor_delivers_the_update_carried_on_the_finish_frame() {
 
     // The update rides on the FINISH frame, so it lands once and the stream
     // then ends; poll briefly rather than assuming callback timing.
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(5));
     loop {
         if !seen.lock().expect("sink").is_empty() {
             break;
@@ -317,7 +317,7 @@ async fn raw_monitor_forwards_the_body_carried_on_the_finish_frame() {
     .expect("raw monitor setup timed out")
     .expect("raw monitor must start");
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(5));
     loop {
         if !bodies.lock().expect("sink").is_empty() {
             break;

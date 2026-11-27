@@ -38,7 +38,7 @@ fn val(db: &PvDatabase) -> u64 {
 }
 
 fn wait_val(db: &PvDatabase, want: u64) {
-    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while val(db) < want {
         assert!(Instant::now() < deadline, "C never reached {want}");
         std::thread::yield_now();

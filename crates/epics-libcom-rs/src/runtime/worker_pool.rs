@@ -1493,7 +1493,7 @@ mod tests {
             drop(lease);
             // The set is freed by the last job's completion / the lease drop,
             // both of which may still be settling; wait for the return.
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = crate::runtime::time::deadline_from_now(Duration::from_secs(5));
             while pool.set_usage().0 != 0 {
                 assert!(Instant::now() < deadline, "set never returned to idle");
                 thread::yield_now();
@@ -1544,7 +1544,7 @@ mod tests {
             cv.notify_all();
         }
         assert!(blocking.join().is_ok());
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = crate::runtime::time::deadline_from_now(Duration::from_secs(5));
         while pool.set_usage().0 != 0 {
             assert!(
                 Instant::now() < deadline,
@@ -1663,7 +1663,7 @@ mod tests {
         assert!(boom.join().is_err(), "the panic must reach the joiner");
         assert!(ok.join().is_ok());
         drop(lease);
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = crate::runtime::time::deadline_from_now(Duration::from_secs(5));
         while pool.set_usage().0 != 0 {
             assert!(Instant::now() < deadline, "panicked set never returned");
             thread::yield_now();
@@ -1694,7 +1694,7 @@ mod tests {
         let done = writer.run(|| {});
         assert!(done.join().is_ok());
         drop(lease);
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = crate::runtime::time::deadline_from_now(Duration::from_secs(5));
         while pool.set_usage().0 != 0 {
             assert!(Instant::now() < deadline, "detached set never returned");
             thread::yield_now();
@@ -1748,7 +1748,7 @@ mod tests {
         go.send(()).expect("the worker is waiting on this");
         drop(go);
 
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = crate::runtime::time::deadline_from_now(Duration::from_secs(10));
         loop {
             let (busy, created, _cap) = pool.set_usage();
             if busy == 0 {
@@ -1798,7 +1798,7 @@ mod tests {
         go.send(()).expect("the worker is waiting on this");
         drop(go);
 
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = crate::runtime::time::deadline_from_now(Duration::from_secs(10));
         while pool.set_usage().1 != 0 {
             assert!(
                 Instant::now() < deadline,
@@ -1836,7 +1836,7 @@ mod tests {
         assert!(writer.run(|| {}).join().is_ok());
         drop(lease);
         // Give the set time to return so `drop` finds the workers idle.
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = crate::runtime::time::deadline_from_now(Duration::from_secs(5));
         while pool.set_usage().0 != 0 {
             assert!(Instant::now() < deadline, "set never returned before drop");
             thread::yield_now();
@@ -1934,7 +1934,7 @@ mod tests {
         go.send(()).expect("the worker is waiting on this");
         drop(go);
 
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = crate::runtime::time::deadline_from_now(Duration::from_secs(10));
         while ONE_SET.held.load(Ordering::SeqCst) != 0 {
             assert!(
                 Instant::now() < deadline,
@@ -1985,7 +1985,7 @@ mod tests {
         go.send(()).expect("the worker is waiting on this");
         drop(go);
 
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = crate::runtime::time::deadline_from_now(Duration::from_secs(10));
         while pool.set_usage().1 != 0 {
             assert!(
                 Instant::now() < deadline,

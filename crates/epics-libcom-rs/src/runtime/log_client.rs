@@ -464,7 +464,7 @@ mod tests {
     /// fixes, which is a thing a test should be able to report.
     fn accept_within(server: &TcpListener, within: Duration) -> std::net::TcpStream {
         server.set_nonblocking(true).expect("non-blocking listener");
-        let deadline = std::time::Instant::now() + within;
+        let deadline = crate::runtime::time::deadline_from_now(within);
         loop {
             match server.accept() {
                 Ok((peer, _)) => {

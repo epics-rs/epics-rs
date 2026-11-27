@@ -102,7 +102,7 @@ async fn run_do(db: &PvDatabase, name: &str, save: bool, req: &str) {
     assert_eq!(get(db, "DO", "B"), Some(EpicsValue::Long(0)), "queued");
     // The second process runs with the busy record no longer "Done".
     put(db, "DO", "C", s("Loading"));
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while std::time::Instant::now() < deadline {
         if get(db, "DO", "VALA") == Some(EpicsValue::Long(0)) {
             return;

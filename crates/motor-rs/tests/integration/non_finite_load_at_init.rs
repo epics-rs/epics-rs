@@ -91,7 +91,7 @@ async fn a_loaded_coordinate_that_is_not_finite_is_replaced_at_init() {
     let hour = Duration::from_secs(3600);
     let first = controller.axes();
     let poller = controller.build(hour, hour, 0).start();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(5));
     while first.first_polls_pending() > 0 {
         assert!(Instant::now() < deadline, "the startup pass never ended");
         tokio::time::sleep(Duration::from_millis(1)).await;

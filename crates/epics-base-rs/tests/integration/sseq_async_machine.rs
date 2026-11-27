@@ -233,7 +233,7 @@ async fn kick(db: &PvDatabase, name: &str) {
 
 /// Poll a `DBF_SHORT` status field until it equals `want`.
 async fn poll_short(db: &PvDatabase, pv: &str, want: i16, label: &str) {
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while std::time::Instant::now() < deadline {
         if let Ok(EpicsValue::Short(v)) = db.get_pv(pv) {
             if v == want {
@@ -253,7 +253,7 @@ async fn poll_short(db: &PvDatabase, pv: &str, want: i16, label: &str) {
 /// `to_f64` so it handles both `Short` (DTn/LTn/WERRn) and `Enum`
 /// (DOLnV/LNKnV) without caring which the field uses.
 async fn poll_i16(db: &PvDatabase, pv: &str, want: i16, label: &str) {
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while std::time::Instant::now() < deadline {
         if let Ok(v) = db.get_pv(pv) {
             if v.to_f64().map(|f| f as i16) == Some(want) {
@@ -279,7 +279,7 @@ async fn read_i16(db: &PvDatabase, pv: &str) -> i16 {
 
 /// Poll a `DBF_DOUBLE` PV until it equals `want`.
 async fn poll_double(db: &PvDatabase, pv: &str, want: f64, label: &str) {
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while std::time::Instant::now() < deadline {
         if let Ok(EpicsValue::Double(v)) = db.get_pv(pv) {
             if (v - want).abs() < 1e-10 {
@@ -297,7 +297,7 @@ async fn poll_double(db: &PvDatabase, pv: &str, want: f64, label: &str) {
 /// Wait for a `CountingTarget` to have been processed `want` times — the fact
 /// a dispatch-count assertion needs, as [`poll_double`] is for a target value.
 async fn poll_count(counter: &Arc<AtomicU32>, want: u32, label: &str) {
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while std::time::Instant::now() < deadline {
         if counter.load(Ordering::SeqCst) >= want {
             return;

@@ -537,7 +537,7 @@ async fn allconst_group_subscribe_stays_open_then_tears_down_on_cancel() {
     // it forever.
     drop(rx);
     let mut returned = false;
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while std::time::Instant::now() < deadline {
         if Arc::strong_count(&db) == baseline {
             returned = true;

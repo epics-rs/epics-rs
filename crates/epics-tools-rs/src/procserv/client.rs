@@ -604,9 +604,9 @@ mod tests {
         // already delivered are still queued), but writing to a socket whose
         // peer has closed fails — whereas a surviving read task would go on
         // consuming these single bytes for as long as the test waits.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let deadline = epics_base_rs::runtime::task::deadline_from_now(Duration::from_secs(3));
         let mut closed = false;
-        while tokio::time::Instant::now() < deadline {
+        while epics_base_rs::runtime::task::Instant::now() < deadline {
             if peer.write_all(b"x").await.is_err() {
                 closed = true;
                 break;

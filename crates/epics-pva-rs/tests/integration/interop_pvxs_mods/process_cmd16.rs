@@ -157,7 +157,7 @@ fn pvxs_ignores_a_process_request() {
     let (replies, me) = replies_to_cmd16(addr);
     assert_eq!(replies, Vec::<u8>::new());
     let lines = ignore_lines(me);
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(5));
     let err = loop {
         let err = std::fs::read_to_string(&logs.err).unwrap_or_default();
         if lines.iter().all(|l| err.contains(l)) || std::time::Instant::now() > deadline {

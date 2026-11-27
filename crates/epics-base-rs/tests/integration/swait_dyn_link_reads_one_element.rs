@@ -48,7 +48,7 @@ async fn phase(db: &PvDatabase, we: Vec<f64>, want: f64) -> [f64; 4] {
     db.put_record_field_from_ca_no_notify("WE", "VAL", EpicsValue::DoubleArray(we.into()))
         .await
         .unwrap();
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while std::time::Instant::now() < deadline {
         for rec in ["SW", "SWD"] {
             let mut visited = epics_base_rs::server::database::ProcStack::new();
@@ -77,7 +77,7 @@ async fn swait_reads_element_0_and_the_zero_fill_of_an_empty_source() {
         .await
         .unwrap();
     let statuses = [("SW", "INAV"), ("SWD", "DOLV"), ("SWD", "OUTV")];
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while statuses.iter().any(|(r, f)| field(&db, r, f) != PV_OK)
         && std::time::Instant::now() < deadline
     {

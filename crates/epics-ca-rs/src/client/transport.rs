@@ -4495,9 +4495,9 @@ mod error_echo_dispatch_tests {
         // dispatcher's `_ => {}` arm swallowed it and only the global
         // `ServerError` hook fired.
         let mut saw_status_error = false;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        while tokio::time::Instant::now() < deadline && !saw_status_error {
-            match tokio::time::timeout_at(deadline, event_rx.recv()).await {
+        let deadline = epics_libcom_rs::runtime::task::deadline_from_now(Duration::from_secs(2));
+        while epics_libcom_rs::runtime::task::Instant::now() < deadline && !saw_status_error {
+            match epics_libcom_rs::runtime::task::timeout_at(deadline, event_rx.recv()).await {
                 Ok(Some(TransportEvent::MonitorStatusError {
                     subid, eca_status, ..
                 })) => {
@@ -6410,7 +6410,7 @@ mod priority_circuit_tests {
     // Only the gated async circuit tests use this.
     #[cfg(tokio_backend)]
     async fn wait_for_writers(sw: &DirectServerWriters, n: usize) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = epics_libcom_rs::runtime::task::deadline_from_now(Duration::from_secs(5));
         while sw.len() < n {
             assert!(
                 tokio::time::Instant::now() < deadline,
@@ -6545,7 +6545,7 @@ mod priority_circuit_tests {
         // The client must report TcpClosed for priority 0 — and NEVER for
         // priority 5.
         let mut saw_zero_closed = false;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = epics_libcom_rs::runtime::task::deadline_from_now(Duration::from_secs(5));
         while tokio::time::Instant::now() < deadline && !saw_zero_closed {
             match tokio::time::timeout(Duration::from_millis(200), event_rx.recv()).await {
                 Ok(Some(TransportEvent::TcpClosed {
@@ -6725,7 +6725,7 @@ mod circuit_retirement_tests {
     ) -> (bool, bool, bool) {
         let mut established = false;
         let mut saw_closed = false;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        let deadline = epics_libcom_rs::runtime::task::deadline_from_now(Duration::from_secs(15));
         while tokio::time::Instant::now() < deadline && !(established && saw_closed) {
             match tokio::time::timeout(Duration::from_millis(200), event_rx.recv()).await {
                 Ok(Some(TransportEvent::ServerConnected { .. })) => established = true,
@@ -6740,7 +6740,7 @@ mod circuit_retirement_tests {
         // CreateChannel (which a prolonged outage never delivers) → this poll
         // times out and `retired` stays false → the test fails, as it must on
         // the pre-fix commit.
-        let retire_by = tokio::time::Instant::now() + Duration::from_secs(5);
+        let retire_by = epics_libcom_rs::runtime::task::deadline_from_now(Duration::from_secs(5));
         while tokio::time::Instant::now() < retire_by && sw.contains_key(&circuit) {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }

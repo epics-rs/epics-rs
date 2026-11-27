@@ -160,8 +160,8 @@ async fn monitor_keeps_up_with_high_update_rate() {
 
     // Drain monitor until we see the final value or timeout.
     let mut last: i64 = -1;
-    let deadline = tokio::time::Instant::now() + fact_budget::FACT_BUDGET;
-    while tokio::time::Instant::now() < deadline {
+    let deadline = epics_libcom_rs::runtime::task::deadline_from_now(fact_budget::FACT_BUDGET);
+    while epics_libcom_rs::runtime::task::Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_millis(500), monitor.recv()).await {
             Ok(Some(Ok(snap))) => {
                 last = snap.value.to_f64().unwrap_or(0.0) as i64;

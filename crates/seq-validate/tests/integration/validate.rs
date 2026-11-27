@@ -139,7 +139,7 @@ async fn validate<V: ProgramVars>(
 
 /// The report once the program has ended the process.
 async fn wait_for_exit(stem: &str, timeout: Duration) -> Report {
-    let deadline = Instant::now() + timeout;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(timeout);
     loop {
         if let Some(report) = exited() {
             return report;

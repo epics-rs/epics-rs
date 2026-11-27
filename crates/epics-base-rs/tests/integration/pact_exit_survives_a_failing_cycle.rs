@@ -87,7 +87,7 @@ fn pact(db: &Db, rec: &str) -> u8 {
 async fn settled(rx: epics_base_rs::runtime::sync::oneshot::Receiver<()>) -> bool {
     use epics_base_rs::runtime::sync::oneshot::error::TryRecvError;
     let mut rx = rx;
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while std::time::Instant::now() < deadline {
         match rx.try_recv() {
             Ok(()) => return true,

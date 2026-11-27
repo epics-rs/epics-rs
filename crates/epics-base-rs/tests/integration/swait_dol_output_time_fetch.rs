@@ -47,7 +47,7 @@ async fn wait(ms: u64) {
 
 /// Wait until `pv` reads `want`, and fail naming it if it never does.
 async fn settle(db: &PvDatabase, pv: &str, want: f64) {
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while std::time::Instant::now() < deadline {
         if num(db, pv) == want {
             return;
@@ -65,7 +65,7 @@ async fn monitor_lands() {
 
 /// Process W until `pv` reads `want`: what DOL carries shows only on OUT.
 async fn process_until(db: &PvDatabase, pv: &str, want: f64) {
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while std::time::Instant::now() < deadline {
         let mut v = epics_base_rs::server::database::ProcStack::new();
         db.process_record_with_links("W", &mut v).await.unwrap();

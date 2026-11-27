@@ -115,7 +115,7 @@ fn homing_axis(port: &str, thread: bool) -> Seen {
 }
 
 fn eventually(mut f: impl FnMut() -> bool) -> bool {
-    let until = Instant::now() + Duration::from_secs(5);
+    let until = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(5));
     while Instant::now() < until {
         if f() {
             return true;

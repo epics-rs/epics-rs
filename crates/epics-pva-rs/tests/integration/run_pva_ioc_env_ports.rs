@@ -83,7 +83,7 @@ fn serves_on_the_env_ports(db: &std::path::Path, tcp: u16) -> Option<()> {
     let by_search = epics_pva_rs::client::PvaClient::builder()
         .timeout(Duration::from_secs(2))
         .build();
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(30));
     let mut got = Vec::new();
     for client in [&by_tcp, &by_search] {
         let v = loop {
@@ -176,7 +176,7 @@ fn a_held_search_port_is_printed_and_the_shell_survives() {
     let alive = child.try_wait().unwrap().is_none();
     let _ = stdin.write_all(b"exit\n");
     drop(stdin);
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(30));
     let status = loop {
         if let Some(s) = child.try_wait().unwrap() {
             break Some(s);
@@ -227,7 +227,7 @@ fn pvxsr_at_the_first_prompt_reports_the_bound_server() {
     let mut stdin = child.stdin.take().unwrap();
     let _ = stdin.write_all(b"pvxsr\nexit\n");
     drop(stdin);
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(30));
     let status = loop {
         if let Some(s) = child.try_wait().unwrap() {
             break Some(s);

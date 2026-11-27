@@ -133,7 +133,7 @@ fn connected_pva_link_lset_calls_allocate_nothing() {
                     let open = OpenLatch::default();
                     let link = LinkRef::new(name.as_bytes(), &open);
                     resolver.connect_link(link, None).await;
-                    let deadline = Instant::now() + FACT_BUDGET;
+                    let deadline = epics_base_rs::runtime::time::deadline_from_now(FACT_BUDGET);
                     while !(resolver.is_connected(link)
                         && resolver.get_cached_value(link).is_some())
                     {

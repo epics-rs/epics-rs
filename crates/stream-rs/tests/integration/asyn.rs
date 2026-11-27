@@ -316,7 +316,7 @@ fn all_threads_through<T>(last: &str, f: impl FnOnce() -> T) -> (T, Vec<String>)
     let capture = capture_process_stderr();
     set_stream_debug(1);
     let out = f();
-    let deadline = std::time::Instant::now() + WAIT;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(WAIT);
     let mut bytes = capture.take();
     while !bus_lines(&bytes).iter().any(|l| l.starts_with(last))
         && std::time::Instant::now() < deadline
@@ -1158,7 +1158,7 @@ fn scripted_write(
     let (bus, calls, _client) = locked(name, None);
     let (ended, lines) = all_threads(|| {
         assert!(bus.bus().write_request(output, 100));
-        let deadline = std::time::Instant::now() + WAIT;
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(WAIT);
         loop {
             if let Ok(status) = calls.writes.try_recv() {
                 break Ended::Write(status);

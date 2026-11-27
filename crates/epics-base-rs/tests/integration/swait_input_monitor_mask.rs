@@ -71,7 +71,7 @@ async fn process(db: &PvDatabase, rec: &str) {
 /// on its monitor, which nothing on the record shows until a cycle fetches
 /// it; a cycle that leaves A alone posts nothing on A.
 async fn process_until_a(db: &PvDatabase, rec: &str, want: f64) {
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while std::time::Instant::now() < deadline {
         process(db, rec).await;
         let a = db.get_record(rec).unwrap().read().record.get_field("A");

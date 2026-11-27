@@ -281,7 +281,7 @@ async fn gateway_155_monitor_seeds_current_value_once() {
     });
 
     // Wait until the seed has arrived.
-    let deadline = tokio::time::Instant::now() + FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::task::deadline_from_now(FACT_BUDGET);
     while received.lock().unwrap().is_empty() && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -296,7 +296,7 @@ async fn gateway_155_monitor_seeds_current_value_once() {
 
     // One real upstream post delivers exactly one more frame.
     us_pv.try_post(nt_double_value(8.0));
-    let deadline = tokio::time::Instant::now() + FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::task::deadline_from_now(FACT_BUDGET);
     while received.lock().unwrap().len() < 2 && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -331,7 +331,7 @@ async fn recv_within(rx: &mut tokio::sync::mpsc::Receiver<f64>, timeout: Duratio
 
 /// Poll `cond` until it holds; fail with `what` after [`FACT_BUDGET`].
 async fn wait_until(what: &str, cond: impl Fn() -> bool) {
-    let deadline = tokio::time::Instant::now() + FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::task::deadline_from_now(FACT_BUDGET);
     while !cond() {
         assert!(tokio::time::Instant::now() < deadline, "{what}");
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -973,7 +973,7 @@ async fn br_r41_typed_subscribe_delivers_updates() {
     // carries no connect-time 1.0, so 42.0 is the first (and only) item.
     // Pre-fix: tx_inner was dropped → broadcast permanently empty → this
     // loop times out.
-    let deadline = tokio::time::Instant::now() + FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::task::deadline_from_now(FACT_BUDGET);
     let update = loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         let v = tokio::time::timeout(remaining, rx.recv())

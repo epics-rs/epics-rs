@@ -1760,7 +1760,7 @@ impl PvaLink {
     /// a write with no waiter returns before it does.
     #[cfg(test)]
     pub(crate) async fn put_landed(&self) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(5));
         while self.put_in_flight() {
             assert!(std::time::Instant::now() < deadline, "the put never ended");
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -4739,7 +4739,8 @@ mod tests {
         let wait_for = |n: usize| {
             let seen = seen.clone();
             async move {
-                let deadline = std::time::Instant::now() + Duration::from_secs(3);
+                let deadline =
+                    epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(3));
                 while seen.lock().unwrap().len() < n && std::time::Instant::now() < deadline {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
@@ -4878,7 +4879,7 @@ mod tests {
     /// Wait for `SLOW:PV`'s server to see `n` puts.
     #[cfg(tokio_backend)]
     async fn wait_for_puts(seen: &std::sync::Mutex<Vec<f64>>, n: usize) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(5));
         while seen.lock().unwrap().len() < n {
             assert!(std::time::Instant::now() < deadline, "put {n} never came");
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -5074,7 +5075,7 @@ mod tests {
         .unwrap();
         source.add("RETRY:PV", pv.clone());
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(20));
         while pv.current() != Some(PvField::Scalar(ScalarValue::Double(42.0))) {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -5106,7 +5107,7 @@ mod tests {
         let cfg = PvaLinkConfig::defaults_for("TYPE:PV", LinkDirection::Inp);
         let link = PvaLink::open(cfg, client.clone()).await.expect("open");
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(20));
         while client.report().channels_active == 0 {
             assert!(
                 std::time::Instant::now() < deadline,

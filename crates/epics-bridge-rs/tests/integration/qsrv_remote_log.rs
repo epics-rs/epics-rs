@@ -90,7 +90,7 @@ impl FrameReader {
         sock.set_nodelay(true).ok();
 
         let mut prelude = Vec::new();
-        let deadline = std::time::Instant::now() + FACT_BUDGET;
+        let deadline = epics_base_rs::runtime::time::deadline_from_now(FACT_BUDGET);
         while std::time::Instant::now() < deadline && prelude.len() < 16 {
             let mut chunk = [0u8; 256];
             match sock.read(&mut chunk) {
@@ -153,7 +153,7 @@ impl FrameReader {
     fn read_or_closed(&mut self) -> Option<Frame> {
         use epics_pva_rs::client_native::decode::try_parse_frame;
         use std::io::Read;
-        let deadline = std::time::Instant::now() + FACT_BUDGET;
+        let deadline = epics_base_rs::runtime::time::deadline_from_now(FACT_BUDGET);
         loop {
             if let Ok(Some((frame, n))) = try_parse_frame(&self.buf) {
                 self.buf.drain(..n);

@@ -214,7 +214,7 @@ async fn a_bad_native_type_refuses_its_channel_and_spares_the_circuit() {
 
     let bad = client.create_channel(BAD);
     let mut events = bad.connection_events();
-    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while retype.sent.load(Ordering::SeqCst) == 0 {
         assert!(Instant::now() < deadline, "the server never answered {BAD}");
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -333,7 +333,7 @@ fn assert_on_governor_ticks(at: &[Instant]) {
 
 /// When the proxy retyped its `n`th reply, once it has.
 async fn nth_refusal(retype: &Retype, n: usize) -> Instant {
-    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     loop {
         let at = retype.at.lock().unwrap().get(n - 1).copied();
         if let Some(at) = at {

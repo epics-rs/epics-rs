@@ -31,7 +31,7 @@ async fn ioc(db: &str) -> Arc<PvDatabase> {
 }
 
 async fn join_within<T>(thread: &std::thread::JoinHandle<T>, what: &str) {
-    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while !thread.is_finished() {
         assert!(Instant::now() < deadline, "{what}");
         epics_base_rs::runtime::task::sleep(Duration::from_millis(10)).await;
@@ -96,7 +96,7 @@ async fn a_repointed_link_is_classified_while_its_target_is_held() {
     db.put_record_field_from_ca_no_notify("S", "INPA", EpicsValue::String("T CA".into()))
         .await
         .unwrap();
-    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     let mut status = None;
     while Instant::now() < deadline {
         status = db.get_pv("S.INAV").ok().and_then(|v| v.to_f64());

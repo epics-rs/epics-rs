@@ -31,7 +31,7 @@ fn prints(record: &str, query: &'static str, reply: &'static str, line: &str) {
         let db = ioc(DB).await;
         let capture = capture_process_stderr();
         assert_eq!(process(&db, record, 1).await, [query]);
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(2));
         let mut printed = String::new();
         while !printed.contains(line) && Instant::now() < deadline {
             printed.push_str(&String::from_utf8_lossy(&capture.take()));

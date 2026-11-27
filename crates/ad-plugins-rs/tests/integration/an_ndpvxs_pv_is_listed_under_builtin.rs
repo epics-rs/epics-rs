@@ -73,7 +73,7 @@ fn run_ioc(script: &str, input: &[u8], ca_only: bool) -> (String, String) {
     let mut stdin = child.stdin.take().unwrap();
     let _ = stdin.write_all(input);
     drop(stdin);
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(30));
     while child.try_wait().unwrap().is_none() {
         if Instant::now() > deadline {
             let _ = child.kill();

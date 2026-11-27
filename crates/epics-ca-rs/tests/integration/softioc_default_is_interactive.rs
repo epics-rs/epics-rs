@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 /// Returns `None` on the kill, which is the assertion that matters: an IOC
 /// that is still serving has NOT taken C's interactive exit.
 fn wait_for_exit(mut child: std::process::Child, budget: Duration) -> Option<i32> {
-    let deadline = Instant::now() + budget;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(budget);
     loop {
         match child.try_wait().expect("poll the IOC") {
             Some(status) => return status.code(),
@@ -100,7 +100,7 @@ fn dash_s_keeps_serving_after_stdin_is_closed() {
         .expect("spawn softioc-rs");
 
     let mut stderr = BufReader::new(child.stderr.take().expect("piped stderr"));
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(60));
     let mut port = None;
     while Instant::now() < deadline {
         let mut line = String::new();

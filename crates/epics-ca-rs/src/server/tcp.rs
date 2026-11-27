@@ -11953,7 +11953,7 @@ mod non_graceful_disconnect_teardown_tests {
         timeout: Duration,
         mut pred: impl FnMut(&ServerConnectionEvent) -> bool,
     ) -> Option<ServerConnectionEvent> {
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = epics_libcom_rs::runtime::task::deadline_from_now(timeout);
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
@@ -11981,7 +11981,7 @@ mod non_graceful_disconnect_teardown_tests {
     ) -> u32 {
         let mut acc: Vec<u8> = Vec::new();
         let mut buf = [0u8; 512];
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = epics_libcom_rs::runtime::task::deadline_from_now(timeout);
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             assert!(
@@ -12019,7 +12019,7 @@ mod non_graceful_disconnect_teardown_tests {
     ) -> CaHeader {
         let mut acc: Vec<u8> = Vec::new();
         let mut buf = [0u8; 512];
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = epics_libcom_rs::runtime::task::deadline_from_now(timeout);
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             assert!(
@@ -12780,7 +12780,7 @@ mod write_gate_order_tests {
     ) -> CaHeader {
         let mut acc: Vec<u8> = Vec::new();
         let mut buf = [0u8; 512];
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = epics_libcom_rs::runtime::task::deadline_from_now(timeout);
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             assert!(
@@ -12997,7 +12997,7 @@ mod deprecated_read_autosize_tests {
     ) -> CaHeader {
         let mut acc: Vec<u8> = Vec::new();
         let mut buf = [0u8; 512];
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = epics_libcom_rs::runtime::task::deadline_from_now(timeout);
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             assert!(
@@ -13825,7 +13825,7 @@ mod bfr7_event_context_filter_tests {
         let mut acc: Vec<u8> = Vec::new();
         let mut frames: Vec<(u16, usize)> = Vec::new();
         let mut buf = [0u8; 512];
-        let deadline = tokio::time::Instant::now() + window;
+        let deadline = epics_libcom_rs::runtime::task::deadline_from_now(window);
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
@@ -14121,7 +14121,7 @@ mod r46_zero_mask_event_add_tests {
         // frame before the connection closes.
         let mut acc: Vec<u8> = Vec::new();
         let mut buf = [0u8; 256];
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let deadline = epics_libcom_rs::runtime::task::deadline_from_now(Duration::from_secs(3));
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             assert!(
@@ -14249,7 +14249,7 @@ mod r46_zero_mask_event_add_tests {
 
         let mut acc: Vec<u8> = Vec::new();
         let mut buf = [0u8; 256];
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let deadline = epics_libcom_rs::runtime::task::deadline_from_now(Duration::from_secs(3));
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             assert!(
@@ -14427,7 +14427,7 @@ mod r46_zero_mask_event_add_tests {
     ) -> Vec<u8> {
         let mut acc: Vec<u8> = Vec::new();
         let mut buf = [0u8; 256];
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = epics_libcom_rs::runtime::task::deadline_from_now(timeout);
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             assert!(
@@ -15074,7 +15074,7 @@ mod destroyed_channel_teardown_tests {
     ) -> CaHeader {
         let mut acc: Vec<u8> = Vec::new();
         let mut buf = [0u8; 1024];
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = epics_libcom_rs::runtime::task::deadline_from_now(timeout);
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             assert!(!remaining.is_zero(), "timed out waiting for command {cmmd}");
@@ -17553,7 +17553,8 @@ mod cancel_confirmation_ordering_tests {
             // stream has gone quiet, so a late frame has had its chance.
             let mut acc: Vec<u8> = Vec::new();
             let mut buf = [0u8; 8192];
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            let deadline =
+                epics_libcom_rs::runtime::task::deadline_from_now(Duration::from_secs(5));
             loop {
                 let seen = frames(&acc);
                 let confirmed = seen
@@ -19345,7 +19346,7 @@ mod access_change_tests {
         let posted = stats.subscription_events_posted.load(Ordering::Relaxed);
         pv.set(EpicsValue::Double(2.0));
         // The delivery counts the post right before it checks read access.
-        let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
         while stats.subscription_events_posted.load(Ordering::Relaxed) == posted {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -19439,7 +19440,7 @@ mod access_change_tests {
         // The watcher takes the value on its own task, so post until an
         // update carries the denial.
         let pv = db.find_pv("AR:LIVE").unwrap();
-        let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
         for value in 2.. {
             assert!(
                 std::time::Instant::now() < deadline,

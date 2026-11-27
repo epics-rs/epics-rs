@@ -14,7 +14,7 @@ record(calc, "LB:H") { field(INPA, "LB:SRC CP") field(CALC, "A") }
 "#;
 
 async fn until(db: &PvDatabase, pv: &str, want: f64) {
-    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while db.get_pv(pv).unwrap().to_f64() != Some(want) {
         assert!(Instant::now() < deadline, "{pv} never reached {want}");
         epics_base_rs::runtime::task::sleep(Duration::from_millis(10)).await;

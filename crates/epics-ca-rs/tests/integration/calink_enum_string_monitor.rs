@@ -103,7 +103,7 @@ async fn a_ca_link_reads_an_unnamed_mbbi_state_as_its_empty_string() {
     assert_eq!(num(&db, "S.STAT"), 14.0, "LINK");
     assert_eq!(num(&db, "S.SEVR"), 3.0, "INVALID");
 
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     loop {
         process(&db, "S").await;
         if num(&db, "S.SEVR") == 0.0 || std::time::Instant::now() > deadline {
@@ -116,7 +116,7 @@ async fn a_ca_link_reads_an_unnamed_mbbi_state_as_its_empty_string() {
 }
 
 async fn until(mut done: impl FnMut() -> bool) -> bool {
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while !done() {
         if std::time::Instant::now() >= deadline {
             return false;

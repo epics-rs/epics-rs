@@ -46,7 +46,7 @@ fn no_simulator_leaves_demo_ai_at_its_database_value() {
     );
 
     let mut stderr = BufReader::new(ioc.0.stderr.take().unwrap());
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(30));
     let mut line = String::new();
     while !line.contains("PVA port: ") {
         assert!(Instant::now() < deadline, "qsrv-ioc never came up");

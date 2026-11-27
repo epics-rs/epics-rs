@@ -81,7 +81,7 @@ fn boot_stderr(mut child: Child, dir: &std::path::Path, settle: Duration) -> Str
             .unwrap();
         s
     };
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(30));
     while !read().contains("iocRun: All initialization complete\n") {
         if Instant::now() > deadline || child.try_wait().unwrap().is_some() {
             break;

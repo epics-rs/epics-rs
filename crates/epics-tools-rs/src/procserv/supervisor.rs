@@ -1445,7 +1445,7 @@ mod tests {
     /// restart.
     #[tokio::test]
     async fn an_unbounded_holdoff_schedules_without_overflow() {
-        use epics_base_rs::runtime::task::Instant;
+        use epics_base_rs::runtime::task::deadline_from_now;
         let mut cfg = min_config();
         cfg.holdoff = Duration::from_secs(u64::MAX);
         let mut state = SupervisorState::for_test(cfg);
@@ -1456,7 +1456,7 @@ mod tests {
             .expect("scheduled")
             .due
             .deadline();
-        assert!(due > Instant::now() + Duration::from_secs(365 * 86_400));
+        assert!(due > deadline_from_now(Duration::from_secs(365 * 86_400)));
     }
 
     #[tokio::test]
@@ -1494,7 +1494,7 @@ mod tests {
     fn a_pass_that_keeps_the_holdoff_arms_no_timer() {
         use super::PendingRestart;
         use crate::procserv::client::{ClientId, InboundEvent};
-        use epics_base_rs::runtime::task::{self, Instant, Sleep};
+        use epics_base_rs::runtime::task::{self, Sleep};
 
         // Only `for_test`'s SIGHUP registration needs a runtime.
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -1513,7 +1513,7 @@ mod tests {
         let supervisor = std::thread::spawn(move || {
             task::block_on_sync(async move {
                 state.pending_restart = Some(PendingRestart {
-                    due: Sleep::until(Instant::now() + Duration::from_secs(3600)),
+                    due: Sleep::until(task::deadline_from_now(Duration::from_secs(3600))),
                 });
                 state.event_loop().await
             })

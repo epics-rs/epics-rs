@@ -157,7 +157,7 @@ async fn a_move_refused_on_a_full_band_still_ends() {
             .unwrap()
             .unwrap();
     register_axis(axis).unwrap();
-    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while db.get_pv("M.DRBV").unwrap() != EpicsValue::Double(5000.0) {
         assert!(
             Instant::now() < deadline,

@@ -3110,7 +3110,8 @@ mod tests {
                 stream
                     .set_read_timeout(Some(Duration::from_millis(100)))
                     .unwrap();
-                let deadline = std::time::Instant::now() + Duration::from_millis(2600);
+                let deadline =
+                    epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_millis(2600));
                 let mut scratch = [0u8; 64];
                 while std::time::Instant::now() < deadline {
                     match stream.read(&mut scratch) {
@@ -3609,7 +3610,10 @@ mod tests {
 
         let start = std::time::Instant::now();
         let ready = client
-            .wait_writable(Some(start + Duration::from_micros(900)))
+            .wait_writable(Some(epics_libcom_rs::runtime::time::deadline_after(
+                start,
+                Duration::from_micros(900),
+            )))
             .unwrap();
         let took = start.elapsed();
         assert!(!ready, "a filled socket must not turn writable");
@@ -3726,7 +3730,7 @@ mod tests {
 
     impl WaitWritable for DribblePeer {
         fn wait_writable(&self, deadline: Option<std::time::Instant>) -> std::io::Result<bool> {
-            let ready = std::time::Instant::now() + self.delay;
+            let ready = epics_libcom_rs::runtime::time::deadline_from_now(self.delay);
             if deadline.is_some_and(|d| ready > d) {
                 // What `poll` does when its interval expires first.
                 let deadline = deadline.expect("checked above");
@@ -3867,7 +3871,7 @@ mod tests {
             chunk: 1,
             delay: Duration::from_millis(20),
         };
-        let cap = std::time::Instant::now() + Duration::from_millis(50);
+        let cap = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_millis(50));
         let err = write_with_retry(&peer, b"abcdef", Some(Duration::from_millis(50)), Some(cap))
             .expect_err("the caller's budget bounds the whole call")
             .into_error();

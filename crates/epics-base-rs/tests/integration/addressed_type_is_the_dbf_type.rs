@@ -37,7 +37,7 @@ async fn ioc(db: &str) -> Arc<PvDatabase> {
 /// Runs one cycle of `rec` and waits until `done` holds.
 async fn run(db: &PvDatabase, rec: &str, done: impl Fn(&PvDatabase) -> bool) {
     db.process_record(rec).await.unwrap();
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while std::time::Instant::now() < deadline {
         if done(db) {
             return;

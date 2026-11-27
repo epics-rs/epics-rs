@@ -43,7 +43,7 @@ async fn a_string_read_caps_at_39_and_a_dollar_source_reads_its_whole_text() {
             .await
             .unwrap();
     }
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while std::time::Instant::now() < deadline {
         if text(&db, "T") == "abc" {
             break;

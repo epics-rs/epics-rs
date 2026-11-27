@@ -58,7 +58,7 @@ async fn a_put_moving_the_last_link_off_a_channel_closes_it() {
     .await
     .unwrap();
     // The new channel opens on the reactor.
-    let deadline = Instant::now() + FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(FACT_BUDGET);
     while !channels().iter().any(|pv| pv == "T:NEW") {
         assert!(Instant::now() < deadline, "T:NEW never opened");
         tokio::time::sleep(Duration::from_millis(20)).await;

@@ -65,7 +65,7 @@ fn the_boot_flush_posts_a_seeded_scalar_and_no_seeded_array() {
     let gate = InterruptGate::new();
     asyn_rs::registry::register_port("BOOTARR", rt.port_handle().clone(), &gate).unwrap();
     gate.set(true);
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(5));
     while seen.lock().unwrap().is_empty() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }

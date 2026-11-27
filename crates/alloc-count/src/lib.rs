@@ -310,7 +310,8 @@ pub mod named {
                 let _second = open(&[Name::Exact("ac-second")]);
                 OPENED.store(true, Ordering::Release);
             });
-            let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+            let deadline =
+                epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
             while WAITING.load(Ordering::Acquire) == 0 {
                 assert!(!OPENED.load(Ordering::Acquire), "opened beside the first");
                 assert!(Instant::now() < deadline, "the second open never waited");

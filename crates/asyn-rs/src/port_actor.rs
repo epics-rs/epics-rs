@@ -4310,7 +4310,7 @@ mod tests {
             |e| *e != "probe timed out",
             |e| *e == "probe timed out",
             |remaining| {
-                let until = Instant::now() + remaining;
+                let until = epics_libcom_rs::runtime::time::deadline_from_now(remaining);
                 loop {
                     if let Some(e) = seen.lock().get(read).copied() {
                         read += 1;
@@ -4400,7 +4400,7 @@ mod tests {
             })
             .unwrap();
 
-        let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
         while !seen.lock().contains(&"ran") {
             assert!(Instant::now() < deadline, "never ran: {:?}", seen.lock());
             std::thread::sleep(Duration::from_millis(5));
@@ -5855,7 +5855,7 @@ mod tests {
         // A direct call outranks every band (`Rank::Direct`), so a probe that
         // lands in the same drain as the read is answered before it: wait for
         // the port attempt, then probe to let the pass it ran in finish.
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(5));
         while calls.lock().is_empty() {
             assert!(Instant::now() < deadline, "no port connect was attempted");
             std::thread::sleep(Duration::from_millis(1));
@@ -5962,7 +5962,7 @@ mod tests {
 
         // Wait for the autonomous retries: .01 s (fails) then 30 ms (succeeds).
         // Not one request is submitted in this loop.
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(2));
         while std::time::Instant::now() < deadline && !link_up.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -6453,7 +6453,7 @@ mod tests {
             .with_addr(1)
             .with_priority(QueuePriority::Connect);
         let mut reply = send(&tx, RequestOp::Int32Read, read);
-        let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
         let r = loop {
             match reply.try_recv() {
                 Ok(r) => break r.expect("the read succeeds"),
@@ -6523,7 +6523,7 @@ mod tests {
 
         let read = send(&tx, RequestOp::Int32Read, AsynUser::new(0).with_addr(0));
         let mut connect = send(&tx, RequestOp::ConnectAddr, AsynUser::new(0).with_addr(1));
-        let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
         let err = loop {
             match connect.try_recv() {
                 Ok(r) => break r.expect_err("the device connect fails on a down port"),

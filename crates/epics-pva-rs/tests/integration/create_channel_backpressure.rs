@@ -151,7 +151,7 @@ async fn wait_for_read_pause(
     server: &PvaServer,
     peer: std::net::SocketAddr,
 ) -> u64 {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = epics_libcom_rs::runtime::task::deadline_from_now(Duration::from_secs(5));
     while source.entered.load(Ordering::SeqCst) == 0 {
         assert!(
             tokio::time::Instant::now() < deadline,
@@ -161,7 +161,7 @@ async fn wait_for_read_pause(
     }
     let mut last = bytes_in(server, peer);
     let mut stable_since = tokio::time::Instant::now();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = epics_libcom_rs::runtime::task::deadline_from_now(Duration::from_secs(5));
     loop {
         tokio::time::sleep(Duration::from_millis(20)).await;
         let now = bytes_in(server, peer);
@@ -319,7 +319,7 @@ async fn stall_watchdog_skips_a_resolver_pause_and_runs_once_reads_resume() {
     source.gate.send_replace(true);
     let mut sink = [0u8; 4096];
     let mut seen = source.entered.load(Ordering::SeqCst);
-    let mut bound = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut bound = epics_libcom_rs::runtime::task::deadline_from_now(Duration::from_secs(60));
     loop {
         let read = tokio::time::timeout(Duration::from_millis(100), sock.read(&mut sink)).await;
         if let Ok(Ok(0) | Err(_)) = read {
@@ -328,7 +328,7 @@ async fn stall_watchdog_skips_a_resolver_pause_and_runs_once_reads_resume() {
         let now = source.entered.load(Ordering::SeqCst);
         if now != seen {
             seen = now;
-            bound = tokio::time::Instant::now() + Duration::from_secs(60);
+            bound = epics_libcom_rs::runtime::task::deadline_from_now(Duration::from_secs(60));
         }
         assert!(
             tokio::time::Instant::now() < bound,

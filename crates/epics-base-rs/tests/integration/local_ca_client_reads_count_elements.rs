@@ -118,7 +118,7 @@ async fn a_counted_request_is_truncated_or_zero_padded() {
         .find(|(f, _, _)| f == "INPA")
         .unwrap();
     let link = link.external().unwrap();
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while db.external_link_metadata(link).is_none() && std::time::Instant::now() < deadline {
         epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;
     }

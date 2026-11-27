@@ -27,7 +27,7 @@ impl Reads {
 
     /// The processes so far, waiting up to `within` for one.
     pub async fn wait(&self, within: std::time::Duration) -> Vec<Option<MotorStatus>> {
-        let until = std::time::Instant::now() + within;
+        let until = epics_libcom_rs::runtime::time::deadline_from_now(within);
         loop {
             let read = self.take();
             if !read.is_empty() || std::time::Instant::now() >= until {

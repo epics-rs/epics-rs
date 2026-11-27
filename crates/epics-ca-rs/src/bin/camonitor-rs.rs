@@ -1301,7 +1301,7 @@ mod tests {
             Default::default(),
             Default::default(),
         ));
-        let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
         while !flag.load(Ordering::Acquire) {
             assert!(
                 std::time::Instant::now() < deadline,

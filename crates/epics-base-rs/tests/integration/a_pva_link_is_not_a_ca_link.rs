@@ -104,7 +104,7 @@ async fn the_put(db: &PvDatabase, puts: &Puts, rec: &str) -> (EpicsValue, LinkPu
     db.process_record_with_links(rec, &mut ProcStack::new())
         .await
         .unwrap();
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while std::time::Instant::now() < deadline {
         if let Some(put) = puts.lock().unwrap().first() {
             return put.clone();

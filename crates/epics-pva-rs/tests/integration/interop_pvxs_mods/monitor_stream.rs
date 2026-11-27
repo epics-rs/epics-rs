@@ -191,7 +191,7 @@ async fn interop_monitor_b_rust_client_streams_from_pvxs_server() {
 
     // `pvmonitor_handle` returns before the subscription exists; a put
     // ahead of the first update is lost to the stream.
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(5));
     while received.lock().unwrap().is_empty() {
         assert!(
             std::time::Instant::now() < deadline,

@@ -244,7 +244,8 @@ mod tests {
         // A port no other test warms, so this exercises a genuine cache miss.
         let a: SocketAddr = "127.0.0.1:5199".parse().unwrap();
         warm(a);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline =
+            epics_libcom_rs::runtime::time::deadline_from_now(std::time::Duration::from_secs(5));
         while cache().get(&a).is_none() && std::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
@@ -402,7 +403,8 @@ mod tests {
         // A port no other case in this module warms, so this is a real miss.
         let a: SocketAddr = "127.0.0.1:5197".parse().unwrap();
         warm(a);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline =
+            epics_libcom_rs::runtime::time::deadline_from_now(std::time::Duration::from_secs(5));
         while cache().get(&a).is_none() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }

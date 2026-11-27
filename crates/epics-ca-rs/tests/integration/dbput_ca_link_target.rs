@@ -44,7 +44,7 @@ fn text(db: &PvDatabase, pv: &str) -> String {
 
 /// Retries the put until the link is up, then waits for `want` on `pv`.
 async fn put_until(db: &PvDatabase, src: &str, v: f64, pv: &str, want: f64) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(10));
     loop {
         let _ = db
             .put_record_field_from_ca(src, "VAL", EpicsValue::Double(v))
@@ -97,7 +97,7 @@ async fn a_ca_out_link_writes_a_local_target_and_alarms_on_an_unresolved_one() {
     assert_eq!(alarm(&db, "TT"), (3.0, 2.0), "TT's own HIHI/MAJOR");
     assert_eq!(alarm(&db, "SC"), (0.0, 0.0));
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(10));
     // TT is served by the database's own `ca` entry; only NOPE and NOPE2
     // reach the network half.
     while resolver.link_count() < 2 {

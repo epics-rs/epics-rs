@@ -127,7 +127,7 @@ async fn process(db: &epics_base_rs::server::database::PvDatabase, rec: &str) {
 /// (`seqRecord.c:143`, `:210-215`), so the DOLn read, its LINK alarm and
 /// `asyncFinish`'s commit (`:219-241`) all land after `process` returns.
 async fn settle(db: &epics_base_rs::server::database::PvDatabase, rec: &str) {
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while std::time::Instant::now() < deadline {
         if !db.get_record(rec).unwrap().read().is_processing() {
             return;

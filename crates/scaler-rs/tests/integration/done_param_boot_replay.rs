@@ -103,7 +103,7 @@ async fn settle() {
 /// fields precede: the port's callback thread runs when the host schedules
 /// it, so a presence check waits on it and only absence checks `settle`.
 async fn scf_reaches(db: &PvDatabase, want: f64) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(Duration::from_secs(10));
     while field(db, "SCF", "VAL").await < want && std::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }

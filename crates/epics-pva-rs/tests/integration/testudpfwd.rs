@@ -123,7 +123,7 @@ fn forwards_via(bin: &str, listen_port: u16) -> Option<()> {
     // Try sending a few times — mshim-rs may not be listening yet. Verify
     // a recognizable SEARCH (not the raw bytes) arrives at the forward
     // port, carrying the original query.
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(3));
     let mut received = false;
     while Instant::now() < deadline {
         if mshim.lost_its_port() {
@@ -218,7 +218,7 @@ fn chained_via(bin: &str, listen_port: u16) -> Option<()> {
     // on every arrival that B's seq was NOT forwarded. With the fix only
     // A is ever forwarded; pre-fix a B-seq datagram arrives and trips the
     // assertion. The deadline tolerates the bind/scheduling window.
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(3));
     let mut saw_a = false;
     while Instant::now() < deadline && !saw_a {
         if mshim.lost_its_port() {
@@ -250,7 +250,7 @@ fn chained_via(bin: &str, listen_port: u16) -> Option<()> {
 
     // Final drain: after A is seen, give a B datagram a chance to surface
     // (pre-fix it trails A) and assert it never does.
-    let drain_until = Instant::now() + Duration::from_millis(600);
+    let drain_until = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_millis(600));
     let mut buf = [0u8; 256];
     while Instant::now() < drain_until {
         match mshim.receiver.recv_from(&mut buf) {

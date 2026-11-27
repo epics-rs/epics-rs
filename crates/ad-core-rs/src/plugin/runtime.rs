@@ -5309,7 +5309,8 @@ mod tests {
     /// state itself instead of sleeping a guessed duration, so a loaded
     /// machine cannot flake the test.
     fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline =
+            epics_libcom_rs::runtime::time::deadline_from_now(std::time::Duration::from_secs(10));
         while !cond() {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -6289,7 +6290,8 @@ mod tests {
         );
         // The frame's batch, ArrayCounter with the refused STAMP, lands after
         // its delivery.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline =
+            epics_libcom_rs::runtime::time::deadline_from_now(std::time::Duration::from_secs(5));
         while port
             .read_int32_blocking(handle.ndarray_params.array_counter, 0)
             .unwrap()
@@ -6524,7 +6526,8 @@ mod tests {
         let input = arr.timestamp.to_system_time();
         send_array(handle.array_sender(), published(Arc::new(arr)));
         let counter = handle.ndarray_params.array_counter;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline =
+            epics_libcom_rs::runtime::time::deadline_from_now(std::time::Duration::from_secs(10));
         while port.read_int32_blocking(counter, 0).unwrap() != 1 {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -9692,11 +9695,18 @@ mod tests {
         let deadline = std::time::Duration::from_secs_f64(SORT_TIME);
         for held in [deadline / 2, deadline - deadline / 100, deadline] {
             assert!(
-                buf.drain_ready(SORT_TIME, inserted + held).is_empty(),
+                buf.drain_ready(
+                    SORT_TIME,
+                    epics_libcom_rs::runtime::time::deadline_after(inserted, held)
+                )
+                .is_empty(),
                 "held at {held:?} of {deadline:?}"
             );
         }
-        let past = inserted + deadline + std::time::Duration::from_nanos(1);
+        let past = epics_libcom_rs::runtime::time::deadline_after(
+            epics_libcom_rs::runtime::time::deadline_after(inserted, deadline),
+            std::time::Duration::from_nanos(1),
+        );
         let ids: Vec<i32> = buf
             .drain_ready(SORT_TIME, past)
             .iter()
@@ -9858,7 +9868,7 @@ mod tests {
                 // Wait on the *peak*, not on the live count: it only ever
                 // rises, so a frame that returns before its neighbours wake
                 // cannot re-park them.
-                let deadline = std::time::Instant::now() + self.budget;
+                let deadline = epics_libcom_rs::runtime::time::deadline_from_now(self.budget);
                 while self.probe.peak.load(Ordering::Acquire) < self.want
                     && std::time::Instant::now() < deadline
                 {
@@ -10073,7 +10083,9 @@ mod tests {
         }
         // A thread registers in its own prologue, after the spawn returns.
         let osipri = |name: &str| -> Vec<u32> {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let deadline = epics_libcom_rs::runtime::time::deadline_from_now(
+                std::time::Duration::from_secs(10),
+            );
             loop {
                 let rows: Vec<u32> = epics_libcom_rs::runtime::task::thread_report()
                     .iter()
@@ -10666,7 +10678,8 @@ mod tests {
             .port_handle()
             .write_int32_blocking(handle.plugin_params.process_plugin, 0, 0)
             .unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let deadline =
+            epics_libcom_rs::runtime::time::deadline_from_now(std::time::Duration::from_secs(2));
         let reprocessed = loop {
             if let Some(msg) = downstream_rx.try_recv_msg() {
                 break msg;
@@ -11416,7 +11429,8 @@ mod tests {
 
         // Let the backlog drain, then count. A frame the queue refused never
         // reaches `process_array` at all.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline =
+            epics_libcom_rs::runtime::time::deadline_from_now(std::time::Duration::from_secs(5));
         while gated.processed().len() < OFFERED && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(2));
         }

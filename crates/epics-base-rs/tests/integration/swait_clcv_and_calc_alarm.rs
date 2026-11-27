@@ -171,7 +171,7 @@ async fn r10_67_a_gated_cycle_does_not_inherit_the_previous_calc_alarm() {
         .unwrap();
     db.add_record("W", Box::new(w)).await.unwrap();
     // INAV reads PV OK once INAN's search connects.
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while std::time::Instant::now() < deadline {
         if field(&db, "W", "INAV").await == EpicsValue::Enum(0) {
             break;

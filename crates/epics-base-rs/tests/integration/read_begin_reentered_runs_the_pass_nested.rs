@@ -225,7 +225,7 @@ async fn a_reentered_pass_then_pending_leaves_the_record_pact() {
     std::thread::spawn(move || done.reprocess(band))
         .join()
         .unwrap();
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while std::time::Instant::now() < deadline {
         if !processing(&ioc.db) {
             break;

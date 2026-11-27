@@ -122,7 +122,7 @@ record(calc, "HOLD") {
 
 /// Wait up to the fact budget for `pv` to read `want`.
 async fn reads_within(db: &PvDatabase, pv: &str, want: f64) -> bool {
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while num(db, pv) != want {
         if std::time::Instant::now() >= deadline {
             return false;

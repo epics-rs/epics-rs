@@ -80,7 +80,7 @@ async fn put_field(db: &PvDatabase, scan: &str, field: &str, v: EpicsValue) {
 }
 
 async fn until(what: &str, fact: impl Fn() -> bool) {
-    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while !fact() {
         assert!(Instant::now() < deadline, "{what}");
         sleep(Duration::from_millis(5)).await;

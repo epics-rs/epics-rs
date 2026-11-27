@@ -165,7 +165,7 @@ async fn a_remote_cp_holder_processes_on_dbcalink() {
         .put("REMOTE:SRC", EpicsValue::Double(1.0))
         .await
         .expect("post the remote change");
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while RAN_ON.lock().unwrap().len() < 2 && std::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }

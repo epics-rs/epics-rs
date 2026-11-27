@@ -89,7 +89,7 @@ async fn readback_becomes(client: &CaClient, pv: &str, want: EpicsValue) {
     ch.wait_connected(fact_budget::FACT_BUDGET)
         .await
         .expect("readback channel");
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     loop {
         let got = ch
             .get_with_timeout_count(fact_budget::FACT_BUDGET, 0)

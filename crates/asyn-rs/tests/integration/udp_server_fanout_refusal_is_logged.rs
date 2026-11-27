@@ -67,7 +67,7 @@ fn a_refused_fanout_option_is_logged_and_the_udp_server_still_binds() {
     let client = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     client.send_to(b"alpha", ("127.0.0.1", port)).unwrap();
     let user = AsynUser::default().with_timeout(Duration::from_secs(2));
-    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(3));
     let mut buf = [0u8; 16];
     let n = loop {
         let read = srv.io_read_octet(&user, &mut buf);

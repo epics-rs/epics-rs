@@ -83,7 +83,7 @@ impl Ioc {
                 let _ = tx.send(line);
             }
         });
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(30));
         let mut console = Vec::new();
         loop {
             let Ok(line) = lines.recv_timeout(deadline.saturating_duration_since(Instant::now()))
@@ -131,7 +131,7 @@ impl Ioc {
     /// it lost its port meanwhile.
     fn read_until(&mut self, until: &str) -> Option<Vec<String>> {
         let mut heard = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(10));
         while let Ok(line) = self
             .lines
             .recv_timeout(deadline.saturating_duration_since(Instant::now()))
@@ -156,7 +156,7 @@ impl Ioc {
     fn finish(mut self) -> Option<Vec<String>> {
         let _ = writeln!(self.stdin, "exit");
         let mut heard = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(10));
         while let Ok(line) = self
             .lines
             .recv_timeout(deadline.saturating_duration_since(Instant::now()))

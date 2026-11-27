@@ -63,7 +63,8 @@ fn first_leaves(pvxmonitor: &Path, tcp: u16, dir: &Path, n: usize) -> BTreeSet<S
                 .spawn()
                 .expect("spawn pvxmonitor");
             let _mon = DropChild { child };
-            let deadline = Instant::now() + Duration::from_secs(8);
+            let deadline =
+                epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(8));
             while !read().lines().any(|l| l.starts_with("    ")) && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(50));
             }

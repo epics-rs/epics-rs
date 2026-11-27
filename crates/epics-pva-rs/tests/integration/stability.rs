@@ -1759,7 +1759,7 @@ fn read_handshake_prelude(server_addr: std::net::SocketAddr) -> std::net::TcpStr
         .unwrap();
     sock.set_nodelay(true).ok();
     let mut prelude = Vec::new();
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(2));
     // The server emits 8B SetByteOrder control frame + a CONN_VALID
     // request frame whose total length depends on the advertised
     // auth method list (~50 B for ["ca","anonymous"]). Keep reading
@@ -1807,7 +1807,7 @@ impl FrameReader {
         use epics_pva_rs::client_native::decode::try_parse_frame;
         use std::io::Read;
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(2));
         loop {
             if let Ok(Some((frame, n))) = try_parse_frame(&self.buf) {
                 self.buf.drain(..n);
@@ -2556,7 +2556,7 @@ async fn r12_33_stalled_pipeline_squashes_at_the_negotiated_limit() {
 
     let mut values: Vec<f64> = Vec::new();
     let mut buf: Vec<u8> = Vec::new();
-    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(3));
     let mut idle_since = std::time::Instant::now();
     while std::time::Instant::now() < deadline {
         use epics_pva_rs::client_native::decode::try_parse_frame;
@@ -2866,7 +2866,7 @@ async fn monitors_on_one_channel_are_not_capped() {
             .filter(|&i| !delivered[i].load(Ordering::SeqCst))
             .collect()
     };
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = epics_libcom_rs::runtime::task::deadline_from_now(Duration::from_secs(10));
     while !missing(&delivered).is_empty() && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

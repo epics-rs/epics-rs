@@ -50,7 +50,7 @@ async fn a_link_to_an_attribute_is_a_string_link() {
     assert_eq!(db.get_pv("SQ.DOL1V").unwrap(), EpicsValue::Enum(2));
     db.process_record("SQ").await.unwrap();
     let text = |pv| db.get_pv(pv).unwrap();
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while std::time::Instant::now() < deadline {
         if text("SI.DESC") != EpicsValue::String("".into()) {
             break;

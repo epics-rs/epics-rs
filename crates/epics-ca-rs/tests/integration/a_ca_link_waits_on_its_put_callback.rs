@@ -35,7 +35,7 @@ fn number(db: &PvDatabase, name: &str) -> f64 {
 }
 
 async fn wait_for(db: &PvDatabase, name: &str, want: f64, within: Duration) {
-    let deadline = Instant::now() + within;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(within);
     while number(db, name) != want {
         assert!(
             Instant::now() < deadline,

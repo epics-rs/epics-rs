@@ -110,7 +110,7 @@ async fn write_bit(ch: &CaChannel) -> bool {
 
 /// Wait for the wire to carry the expected transition.
 async fn await_write_bit(ch: &CaChannel, want: bool, what: &str) {
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     loop {
         if write_bit(ch).await == want {
             return;

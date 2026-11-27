@@ -136,7 +136,7 @@ async fn an_epics_pv_attribute_is_fed_from_the_installed_ca_client() {
     load_attributes(&mut drv, &xml).expect("a fed EPICS_PV attribute loads clean");
     assert_eq!(status(&drv), ATTR_STATUS_OK);
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(5));
     loop {
         match attribute_value(&drv, "Temp") {
             NDAttrValue::Float64(v) => {

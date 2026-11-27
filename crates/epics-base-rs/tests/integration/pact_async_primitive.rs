@@ -297,7 +297,7 @@ async fn reprocess_on_notify_with_cancelled_token_is_noop() {
 /// is driven by a detached `reprocess_on_notify` task whose handle the arm
 /// drops, so the test cannot join it directly.
 async fn poll_until<F: Fn() -> bool>(label: &str, pred: F) {
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while std::time::Instant::now() < deadline {
         if pred() {
             return;

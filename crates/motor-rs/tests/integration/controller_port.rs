@@ -2090,7 +2090,7 @@ fn a_driver_write_overlapping_a_record_move_does_not_deadlock() {
         std::thread::spawn(move || port.write_int32_blocking(reason, 0, 1))
     };
     // The move below runs while the write holds the axis.
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(10));
     while !entered.load(std::sync::atomic::Ordering::SeqCst) {
         assert!(std::time::Instant::now() < deadline, "the write never ran");
         std::thread::sleep(Duration::from_millis(1));
@@ -2114,7 +2114,7 @@ fn a_driver_write_overlapping_a_record_move_does_not_deadlock() {
         poll_loop.run_queued_commands();
         poll_loop
     });
-    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(3));
     while !(write.is_finished() && poller.is_finished()) {
         assert!(
             std::time::Instant::now() < deadline,

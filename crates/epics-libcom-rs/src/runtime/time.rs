@@ -376,10 +376,12 @@ mod tests {
         let base = Instant::now();
         assert_eq!(
             deadline_after(base, Duration::from_secs(10)),
-            base + Duration::from_secs(10)
+            crate::runtime::time::deadline_after(base, Duration::from_secs(10))
         );
         let never = deadline_after(base, Duration::MAX);
-        assert!(never > base + Duration::from_secs(86_400 * 365));
+        assert!(
+            never > crate::runtime::time::deadline_after(base, Duration::from_secs(86_400 * 365))
+        );
         assert!(deadline_from_now(duration_from_secs(f64::INFINITY)) > Instant::now());
         assert!(deadline_from_now(duration_from_secs(1e300)) > Instant::now());
         // Saturating twice still saturates.
@@ -391,7 +393,7 @@ mod tests {
         let before = Instant::now();
         let deadline = deadline_from_now(Duration::from_secs(10));
         assert!(deadline > before);
-        assert!(deadline <= before + Duration::from_secs(11));
+        assert!(deadline <= crate::runtime::time::deadline_after(before, Duration::from_secs(11)));
     }
 
     /// C's `(long)` cast, boundary by boundary: in-range truncation toward

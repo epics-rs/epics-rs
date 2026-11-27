@@ -35,7 +35,7 @@ fn num(db: &PvDatabase, pv: &str) -> f64 {
 }
 
 async fn sleep_until(t0: Instant, secs: f64) {
-    let at = t0 + Duration::from_secs_f64(secs);
+    let at = epics_libcom_rs::runtime::time::deadline_after(t0, Duration::from_secs_f64(secs));
     if let Some(left) = at.checked_duration_since(Instant::now()) {
         tokio::time::sleep(left).await;
     }

@@ -112,7 +112,7 @@ async fn busy_is_still_set_while_the_step_write_is_being_made() {
         .await
         .unwrap();
 
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while std::time::Instant::now() < deadline {
         if matches!(db.get_pv("SS_ORD.BUSY"), Ok(EpicsValue::Short(0))) {
             break;

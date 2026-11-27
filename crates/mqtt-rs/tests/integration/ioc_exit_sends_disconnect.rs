@@ -92,7 +92,7 @@ fn be_the_broker() {
             .spawn()
             .expect("spawn the IOC child");
 
-    let deadline = Instant::now() + DEADLINE;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(DEADLINE);
     let outcome = broker_session(&broker, &ready, deadline);
 
     // Let the child end by itself. The question is what an *exiting* process

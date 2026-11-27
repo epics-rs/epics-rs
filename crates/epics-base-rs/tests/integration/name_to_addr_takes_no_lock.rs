@@ -151,7 +151,7 @@ async fn name(db: &PvDatabase, field: &str, pv: &str) {
 }
 
 async fn join_within_a_minute(threads: Vec<std::thread::JoinHandle<()>>) {
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(Duration::from_secs(60));
     while !threads.iter().all(|t| t.is_finished()) {
         assert!(Instant::now() < deadline, "the threads deadlocked");
         epics_base_rs::runtime::task::sleep(Duration::from_millis(10)).await;

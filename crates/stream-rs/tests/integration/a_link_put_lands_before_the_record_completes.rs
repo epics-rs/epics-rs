@@ -64,7 +64,8 @@ record(ai, "by") {{ field(DTYP, "stream") field(INP, "@{0} y R") }}
                     .await
                     .unwrap();
             }
-            let deadline = Instant::now() + Duration::from_secs(10);
+            let deadline =
+                epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(10));
             while WRITES.lock().len() < before + 2
                 || ["ax", "by"]
                     .iter()

@@ -84,7 +84,7 @@ async fn special_puts_behind_a_blocked_read_are_never_refused() {
 
     // A put after the read has completed ends every interleaving on the
     // option's error, so the queued specials have all run.
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(15));
     while cell.read().is_processing() && Instant::now() < deadline {
         epics_base_rs::runtime::task::sleep(Duration::from_millis(10)).await;
     }

@@ -2446,7 +2446,7 @@ mod tests {
     #[test]
     fn a_request_behind_the_holder_of_an_idle_port_runs_at_its_release() {
         let handle = make_handle(TestDriver::new());
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(5));
         while handle.lend.state() != "idle" {
             assert!(Instant::now() < deadline, "the actor never went idle");
             std::thread::yield_now();

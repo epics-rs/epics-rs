@@ -2864,7 +2864,8 @@ mod tests {
             // The set re-idles a moment after the job's result is handed to the
             // joiner (the worker loop's return step runs next), so wait for the
             // accounting rather than racing it.
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let deadline =
+                epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(5));
             while pool.set_usage().0 != 0 && std::time::Instant::now() < deadline {
                 thread::sleep(Duration::from_millis(5));
             }
@@ -3131,7 +3132,7 @@ mod tests {
         );
 
         drop(c);
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(5));
         while server.active_connections() != 0 && std::time::Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
         }
@@ -4277,7 +4278,7 @@ mod tests {
                 handle_udp_search_blocking(&resp, &reply, "CAS-UDP", &[], db, 5064, &ctl)
             })
         });
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(5));
         while errors.load(Ordering::Relaxed) == 0 {
             assert!(
                 std::time::Instant::now() < deadline,

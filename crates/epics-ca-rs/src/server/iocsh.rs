@@ -654,7 +654,8 @@ mod tests {
         let _client =
             std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, serving.tcp_port()))
                 .expect("connect");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline =
+            epics_libcom_rs::runtime::time::deadline_from_now(std::time::Duration::from_secs(5));
         while serving.active_connections() == 0 && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }

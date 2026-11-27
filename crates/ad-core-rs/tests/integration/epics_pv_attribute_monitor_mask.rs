@@ -39,7 +39,7 @@ fn attribute_value(drv: &NDArrayDriverBase, name: &str) -> NDAttrValue {
 }
 
 async fn wait_for(drv: &NDArrayDriverBase, name: &str, want: NDAttrValue) {
-    let deadline = Instant::now() + FACT_BUDGET;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(FACT_BUDGET);
     loop {
         let got = attribute_value(drv, name);
         if got == want {

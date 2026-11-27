@@ -3921,7 +3921,8 @@ mod tests {
 
         // Wait on the observable itself — the stats land when the data thread
         // processes the array; a fixed sleep is a race on a loaded machine.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline =
+            epics_libcom_rs::runtime::time::deadline_from_now(std::time::Duration::from_secs(10));
         while stats.lock().num_elements != 16 {
             assert!(
                 std::time::Instant::now() < deadline,

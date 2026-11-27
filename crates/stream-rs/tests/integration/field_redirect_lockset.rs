@@ -79,7 +79,8 @@ record(ai, "cy") { field(DTYP, "stream") field(INP, "@redirect.proto cross_y R")
             let before = WRITES.lock().len();
             put_proc(&db, "cx").await;
             put_proc(&db, "cy").await;
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline =
+                epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(5));
             while WRITES.lock().len() < before + 2 || processing(&db, "cx") || processing(&db, "cy")
             {
                 assert!(Instant::now() < deadline, "round {round}: still processing");
@@ -106,7 +107,7 @@ record(ai, "ia") { field(DTYP, "stream") field(INP, "@redirect.proto intr_feed R
 "#)
         .await;
         assert!(same_set(&db, "ia", "it"));
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(20));
         let mut puts = 0;
         while ASYNC_FED.load(Ordering::Acquire) < INPUTS {
             assert!(Instant::now() < deadline, "{puts} puts, input stalled");

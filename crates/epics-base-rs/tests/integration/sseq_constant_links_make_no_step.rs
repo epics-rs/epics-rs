@@ -56,7 +56,7 @@ fn read(db: &PvDatabase, pv: &str) -> f64 {
 }
 
 async fn until(what: &str, done: impl Fn() -> bool) {
-    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while !done() {
         assert!(Instant::now() < deadline, "{what} never happened");
         epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;

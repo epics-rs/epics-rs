@@ -756,7 +756,7 @@ async fn sdly_input_record() -> PvDatabase {
 
 /// Wait for the queued replay (C's restart callback) to land its value.
 async fn await_replayed_value(db: &PvDatabase, name: &str, want: f64) {
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while std::time::Instant::now() < deadline {
         if let Ok(EpicsValue::Double(v)) = db.get_pv(name)
             && (v - want).abs() < 1e-10

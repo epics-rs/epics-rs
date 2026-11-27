@@ -106,7 +106,7 @@ async fn completes_on(prio: i16) -> Vec<String> {
         .join()
         .unwrap();
 
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while std::time::Instant::now() < deadline {
         if !db.get_record("AO").unwrap().read().is_processing() {
             break;

@@ -75,7 +75,7 @@ async fn boot(port: &str, motors: &[(&str, &str)], check: impl AsyncFnOnce(&PvDa
     let hour = Duration::from_secs(3600);
     let first = controller.axes();
     let poller = controller.build(hour, hour, 0).start();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(5));
     while first.first_polls_pending() > 0 {
         assert!(Instant::now() < deadline, "the startup pass never ended");
         tokio::time::sleep(Duration::from_millis(1)).await;
@@ -105,7 +105,7 @@ async fn boot(port: &str, motors: &[(&str, &str)], check: impl AsyncFnOnce(&PvDa
     for tx in &polls {
         tx.send(PollCommand::ForcePoll(None)).await.unwrap();
     }
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(10));
     for rec in motors.iter().map(|(name, _)| name) {
         while num(&db, &format!("{rec}.RBV")) != 3.0 {
             assert!(Instant::now() < deadline, "{rec} never processed");

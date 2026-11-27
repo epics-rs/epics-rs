@@ -115,7 +115,7 @@ impl Rig {
 /// Polls `done` until it holds, failing with `msg` at a deadline no timer
 /// coalescing reaches.
 async fn until(done: impl Fn() -> bool, msg: &str) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(Duration::from_secs(10));
     while !done() {
         assert!(Instant::now() < deadline, "{msg}");
         epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;

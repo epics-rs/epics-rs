@@ -45,7 +45,7 @@ fn attribute_value(drv: &NDArrayDriverBase, name: &str) -> NDAttrValue {
 /// outage leaves. The budget is the workspace's `FACT_BUDGET`: the client's
 /// re-search after an outage alone takes about 10 s.
 async fn value_other_than(drv: &NDArrayDriverBase, name: &str, old: &NDAttrValue) -> NDAttrValue {
-    let deadline = Instant::now() + FACT_BUDGET;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(FACT_BUDGET);
     loop {
         let value = attribute_value(drv, name);
         if value != *old && value != NDAttrValue::Undefined {
@@ -171,7 +171,7 @@ async fn epics_pv_attributes_request_c_dbr_type_fixed_at_first_connect() {
     sdb.remove_simple_pv(RETYPE_PV)
         .await
         .expect("the PV was served");
-    let deadline = Instant::now() + FACT_BUDGET;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(FACT_BUDGET);
     while probe.info().await.is_ok() {
         assert!(Instant::now() < deadline, "the client sees the outage");
         tokio::time::sleep(Duration::from_millis(20)).await;

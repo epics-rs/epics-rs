@@ -33,7 +33,7 @@ fn num(db: &PvDatabase, pv: &str) -> f64 {
 }
 
 async fn settle(db: &PvDatabase, done: impl Fn(&PvDatabase) -> bool) {
-    let deadline = tokio::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_libcom_rs::runtime::task::deadline_from_now(fact_budget::FACT_BUDGET);
     while !done(db) && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
@@ -87,7 +87,7 @@ async fn a_name_another_ioc_serves_is_an_input() {
         "INAV, OUTV, SEVR before RM:W processes"
     );
     // RM:X's value lands on the link's first monitor, after INAV reads PV OK.
-    let deadline = tokio::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_libcom_rs::runtime::task::deadline_from_now(fact_budget::FACT_BUDGET);
     while num(&db, "RM:W.VAL") != 11.0 && tokio::time::Instant::now() < deadline {
         db.put_record_field_from_ca("RM:W", "PROC", EpicsValue::String("1".into()))
             .await
@@ -96,7 +96,7 @@ async fn a_name_another_ioc_serves_is_an_input() {
     }
     let y = db.ca_client().create_channel("RM:Y").await.expect("RM:Y");
     let mut y_val = f64::NAN;
-    let deadline = tokio::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_libcom_rs::runtime::task::deadline_from_now(fact_budget::FACT_BUDGET);
     while y_val != 11.0 && tokio::time::Instant::now() < deadline {
         if let Ok(got) = y.get(DBR_DOUBLE, 1).await {
             y_val = got.value.to_f64().unwrap();

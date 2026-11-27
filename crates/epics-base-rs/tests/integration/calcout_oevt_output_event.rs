@@ -75,7 +75,7 @@ async fn add_event_sibling(db: &PvDatabase, name: &str, evnt: &str, counter: Arc
 /// returns — then a short settle window so a spurious second post would also
 /// have landed before we assert the exact count.
 async fn settle(cond: impl Fn() -> bool) {
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while std::time::Instant::now() < deadline {
         if cond() {
             epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(20)).await;

@@ -123,7 +123,7 @@ fn serves_on(db: &std::path::Path, port: u16) -> Option<()> {
         }
         std::env::remove_var("EPICS_CA_NAME_SERVERS");
     }
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(30));
     let got = test_block_on(async {
         let client = epics_ca_rs::client::CaClient::new()
             .await

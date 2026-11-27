@@ -41,7 +41,7 @@ fn load(dir: &std::path::Path, name: &str) -> (Option<i32>, String) {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn oracle-ioc");
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(30));
     while child.try_wait().expect("poll oracle-ioc").is_none() {
         if Instant::now() > deadline {
             child.kill().expect("kill oracle-ioc");

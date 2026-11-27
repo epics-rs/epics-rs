@@ -131,7 +131,7 @@ record(seq, "SQ") {
             .unwrap();
         // seq writes its links from a callback, after the put returns.
         let mut said = heard();
-        let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+        let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
         while std::time::Instant::now() < deadline {
             if said.len() >= 2 {
                 break;

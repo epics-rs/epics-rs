@@ -126,7 +126,7 @@ async fn two_completions_queued_back_to_back_run_two_passes() {
         "read 2",
         "flnk",
     ];
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while std::time::Instant::now() < deadline {
         if log.lock().unwrap().len() >= want.len() {
             break;

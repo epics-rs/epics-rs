@@ -81,7 +81,7 @@ async fn the_set_saves_every_period() {
     let sav = dir.path().join("settings.sav");
     let mut saves = 0;
     let mut last = None;
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while std::time::Instant::now() < deadline {
         let now = std::fs::metadata(&sav).and_then(|m| m.modified()).ok();
         if now.is_some() && now != last {

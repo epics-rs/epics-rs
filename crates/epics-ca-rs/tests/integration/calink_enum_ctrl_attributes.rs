@@ -66,7 +66,7 @@ async fn metadata_when(
             .await,
         "CA link must connect to the upstream CA server"
     );
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     loop {
         if let Some(md) = LinkSet::link_metadata(resolver, link)
             && ready(&md)

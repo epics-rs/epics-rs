@@ -149,7 +149,7 @@ async fn a_read_completion_on_a_full_band_ends_the_cycle() {
     let (db, done, reads, full) = queued_read().await;
     done.reprocess(CallbackPriority::Low);
     drop(full);
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while db.get_record("AI").unwrap().read().is_processing() {
         assert!(
             std::time::Instant::now() < deadline,

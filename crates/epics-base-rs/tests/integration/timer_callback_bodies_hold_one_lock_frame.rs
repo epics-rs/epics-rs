@@ -94,7 +94,7 @@ fn read(db: &PvDatabase, pv: &str) -> f64 {
 }
 
 async fn wait_for(db: &PvDatabase, pv: &str, want: f64) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(Duration::from_secs(5));
     while read(db, pv) != want {
         assert!(Instant::now() < deadline, "{pv} never read {want}");
         epics_base_rs::runtime::task::sleep(Duration::from_millis(1)).await;

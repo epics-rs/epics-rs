@@ -95,7 +95,7 @@ async fn a_network_ca_inp_count_allocates_nothing() {
         .find_map(|(field, _, link)| (field == "INP").then_some(link))
         .unwrap();
     let link = link.external().expect("a CA link");
-    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while db.external_link_metadata(link).is_none() {
         assert!(Instant::now() < deadline, "CN.INP has no metadata");
         tokio::time::sleep(Duration::from_millis(5)).await;

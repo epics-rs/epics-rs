@@ -176,14 +176,26 @@ mod tests {
         let nfs = NfsHost::default();
         let start = Instant::now();
         let mut last = start;
-        assert!(nfs.restore_mount(&mut last, start + REMOUNT_CHECK_INTERVAL));
-        let tried = start + REMOUNT_CHECK_INTERVAL + Duration::from_secs(1);
+        assert!(nfs.restore_mount(
+            &mut last,
+            crate::runtime::time::deadline_after(start, REMOUNT_CHECK_INTERVAL)
+        ));
+        let tried = crate::runtime::time::deadline_after(
+            crate::runtime::time::deadline_after(start, REMOUNT_CHECK_INTERVAL),
+            Duration::from_secs(1),
+        );
         assert!(!nfs.restore_mount(&mut last, tried));
         assert_eq!(last, tried);
-        assert!(nfs.restore_mount(&mut last, tried + Duration::from_secs(1)));
+        assert!(nfs.restore_mount(
+            &mut last,
+            crate::runtime::time::deadline_after(tried, Duration::from_secs(1))
+        ));
         assert!(!nfs.restore_mount(
             &mut last,
-            tried + REMOUNT_CHECK_INTERVAL + Duration::from_secs(1)
+            crate::runtime::time::deadline_after(
+                crate::runtime::time::deadline_after(tried, REMOUNT_CHECK_INTERVAL),
+                Duration::from_secs(1)
+            )
         ));
     }
 }

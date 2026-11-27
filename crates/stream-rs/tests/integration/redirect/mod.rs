@@ -183,7 +183,7 @@ pub async fn process(db: &PvDatabase, record: &str, n: usize) -> Vec<String> {
     db.put_record_field_from_ca_no_notify(record, "PROC", EpicsValue::Long(1))
         .await
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(2));
     while WRITES.lock().len() < before + n && Instant::now() < deadline {
         epics_base_rs::runtime::task::sleep(Duration::from_millis(10)).await;
     }

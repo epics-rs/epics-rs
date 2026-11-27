@@ -884,7 +884,7 @@ mod tests {
         }
         const N: usize = 50;
         let pool = CallbackPool::with_config(1024, 1);
-        let budget = Instant::now() + Duration::from_secs(2);
+        let budget = crate::runtime::time::deadline_from_now(Duration::from_secs(2));
         let (mut trials, mut lost) = (0usize, 0usize);
         while Instant::now() < budget {
             let p = Arc::new(Probe {
@@ -903,7 +903,7 @@ mod tests {
                 p.latest.store(i, Ordering::Release);
                 waker.wake_by_ref();
             }
-            let deadline = Instant::now() + Duration::from_secs(1);
+            let deadline = crate::runtime::time::deadline_from_now(Duration::from_secs(1));
             while !p.done.load(Ordering::Acquire) && Instant::now() < deadline {
                 std::thread::yield_now();
             }

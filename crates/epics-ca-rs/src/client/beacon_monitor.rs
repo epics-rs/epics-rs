@@ -996,7 +996,7 @@ mod repeater_registration_tests {
         let mut buf = [0u8; 64];
         let mut registers = 0usize;
         let mut client = None;
-        let deadline = tokio::time::Instant::now() + window;
+        let deadline = epics_libcom_rs::runtime::task::deadline_from_now(window);
         loop {
             match tokio::time::timeout_at(deadline, repeater.recv_from(&mut buf)).await {
                 Ok(Ok((n, src))) if n >= CaHeader::SIZE => {
@@ -1084,7 +1084,7 @@ mod repeater_registration_tests {
             |(src, _): &(SocketAddr, usize)| src.port() == client.port() && pacer_ticks.get() >= 2,
             |(src, _): &(SocketAddr, usize)| src.port() != client.port() && pacer_ticks.get() >= 4,
             async |remaining| {
-                let deadline = tokio::time::Instant::now() + remaining;
+                let deadline = epics_libcom_rs::runtime::task::deadline_from_now(remaining);
                 let mut buf = [0u8; 64];
                 loop {
                     let (n, src) = tokio::time::timeout_at(deadline, repeater.recv_from(&mut buf))
@@ -1157,7 +1157,8 @@ mod repeater_registration_tests {
         // Attempts 0..=3 at ~1 s apart (the repeater never CONFIRMs).
         let mut announced: Vec<Ipv4Addr> = Vec::new();
         let mut buf = [0u8; 64];
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(3600);
+        let deadline =
+            epics_libcom_rs::runtime::task::deadline_from_now(Duration::from_millis(3600));
         while announced.len() < 4 {
             match tokio::time::timeout_at(deadline, repeater.recv_from(&mut buf)).await {
                 Ok(Ok((n, _src))) if n >= CaHeader::SIZE => {
@@ -1822,7 +1823,7 @@ mod tests {
         // `last_seen` values below subtract without underflowing Instant on
         // Windows (QPC-since-boot, where uptime may be shorter than the span).
         let base = Instant::now();
-        let now = base + Duration::from_secs(300);
+        let now = epics_libcom_rs::runtime::time::deadline_after(base, Duration::from_secs(300));
         let mut servers: HashMap<SocketAddr, BeaconState> = HashMap::new();
         let fresh: SocketAddr = "127.0.0.1:5064".parse().unwrap();
         let stale: SocketAddr = "127.0.0.1:5065".parse().unwrap();

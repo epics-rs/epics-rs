@@ -173,7 +173,7 @@ impl Rig {
 }
 
 async fn next_post(db: &PvDatabase, name: &str, rx: &mut EventReader) -> (f64, u16, u16) {
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while std::time::Instant::now() < deadline {
         if let Ok(e) = rx.try_recv() {
             let v = e

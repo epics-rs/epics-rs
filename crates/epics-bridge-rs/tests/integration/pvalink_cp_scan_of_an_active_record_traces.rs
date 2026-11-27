@@ -60,7 +60,7 @@ async fn a_cp_update_of_an_active_record_prints_the_tpro_line() {
     db.process_cp_links_on_connect().await;
 
     let t = db.get_record("T").unwrap();
-    let deadline = Instant::now() + FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(FACT_BUDGET);
     while t.read().common.sevr != AlarmSeverity::NoAlarm {
         assert!(Instant::now() < deadline, "T never read SRC");
         tokio::time::sleep(Duration::from_millis(20)).await;

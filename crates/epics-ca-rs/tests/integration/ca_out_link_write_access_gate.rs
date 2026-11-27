@@ -142,7 +142,7 @@ async fn admission_settling_to(
     link: LinkRef<'_>,
     want: PutAdmission,
 ) -> PutAdmission {
-    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     loop {
         let got = LinkSet::put_admission(resolver, link);
         if got == want || Instant::now() >= deadline {
@@ -334,7 +334,7 @@ async fn a_fully_granted_link_is_still_admitted_and_written() {
     .await
     .expect("an admitted write must reach the wire");
 
-    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     loop {
         if LinkSet::get_value(&resolver, link())
             .await

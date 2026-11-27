@@ -41,7 +41,7 @@ fn attribute_value(drv: &NDArrayDriverBase, name: &str) -> NDAttrValue {
 }
 
 async fn first_value(drv: &NDArrayDriverBase, name: &str) -> NDAttrValue {
-    let deadline = Instant::now() + FACT_BUDGET;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(FACT_BUDGET);
     loop {
         match attribute_value(drv, name) {
             NDAttrValue::Undefined => {

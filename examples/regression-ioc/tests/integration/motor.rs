@@ -33,7 +33,7 @@ async fn await_value(
     tol: f64,
     ms: u64,
 ) -> f64 {
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(ms);
+    let deadline = epics_base_rs::runtime::task::deadline_from_now(Duration::from_millis(ms));
     let mut last = f64::NAN;
     loop {
         if let Ok((_t, v)) = ca.caget(pv).await

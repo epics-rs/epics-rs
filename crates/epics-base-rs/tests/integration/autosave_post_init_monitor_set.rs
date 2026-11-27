@@ -67,7 +67,7 @@ fn create_monitor_set_after_ioc_init_starts_a_saving_set() {
     // The set's task ticks on its own; C's `create_data_set` starts the
     // save task the same way.
     let sav = dir.path().join("settings.sav");
-    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while !sav.exists() {
         assert!(
             Instant::now() < deadline,

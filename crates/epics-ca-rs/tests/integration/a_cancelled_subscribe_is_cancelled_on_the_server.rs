@@ -74,7 +74,7 @@ async fn a_cancelled_subscribe_is_cancelled_on_the_server() {
         .expect("open")
         .expect("value");
 
-    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while monitors_on_val(&db) != 1 {
         assert!(
             Instant::now() < deadline,

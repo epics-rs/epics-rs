@@ -219,7 +219,8 @@ async fn a_waiting_restart_posts_freq_once_with_the_committed_alarm() {
     assert_eq!(*lines.lock().unwrap(), [] as [String; 0], "no restart yet");
     // The restart, however late a slow host fires DLY1, then 0.4 s for a
     // second post.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline =
+        epics_base_rs::runtime::time::deadline_from_now(std::time::Duration::from_secs(10));
     while lines.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }

@@ -72,7 +72,7 @@ impl LinkSet for Held {
 }
 
 async fn until(budget: Duration, mut done: impl FnMut() -> bool) -> bool {
-    let deadline = Instant::now() + budget;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(budget);
     while !done() {
         if Instant::now() >= deadline {
             return false;

@@ -42,7 +42,7 @@ async fn a_second_links_put_callback_restarts_the_target_past_the_blocker_timeou
         .await
         .unwrap();
     let tgt = db.get_record("TGT").unwrap();
-    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while !tgt.read().is_processing() && Instant::now() < deadline {
         epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;
     }
@@ -56,7 +56,7 @@ async fn a_second_links_put_callback_restarts_the_target_past_the_blocker_timeou
         db.get_record("OUT1").unwrap(),
         db.get_record("OUT2").unwrap(),
     );
-    let deadline = first + Duration::from_secs(40);
+    let deadline = epics_base_rs::runtime::time::deadline_after(first, Duration::from_secs(40));
     while out1.read().is_processing() && Instant::now() < deadline {
         epics_base_rs::runtime::task::sleep(Duration::from_millis(20)).await;
     }
@@ -83,7 +83,8 @@ async fn open_links(db: &epics_base_rs::server::database::PvDatabase) {
             let Some(link) = link.external() else {
                 continue;
             };
-            let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+            let deadline =
+                epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
             while db.external_link_metadata(link).is_none() {
                 assert!(
                     std::time::Instant::now() < deadline,

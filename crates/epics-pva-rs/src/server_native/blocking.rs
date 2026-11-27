@@ -2765,7 +2765,7 @@ pub(super) mod tests {
             peer.clone(),
         );
         let within = |what: String, done: &dyn Fn() -> bool| {
-            let deadline = Instant::now() + RETIRE_BOUND;
+            let deadline = epics_libcom_rs::runtime::time::deadline_from_now(RETIRE_BOUND);
             while !done() {
                 assert!(Instant::now() < deadline, "{what}");
                 thread::sleep(Duration::from_millis(1));
@@ -2844,7 +2844,7 @@ pub(super) mod tests {
             peer.clone(),
         );
         let within = |what: &str, done: &dyn Fn() -> bool| {
-            let deadline = Instant::now() + RETIRE_BOUND;
+            let deadline = epics_libcom_rs::runtime::time::deadline_from_now(RETIRE_BOUND);
             while !done() {
                 assert!(Instant::now() < deadline, "{what}");
                 thread::sleep(Duration::from_millis(1));

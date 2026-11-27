@@ -63,7 +63,7 @@ async fn a_pva_link_loads_and_reads_through_the_builder() {
         .await
         .expect("the builder loads a {pva:} link");
     let db = ioc.database();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(10));
     loop {
         // Until the channel connects the read fails, as C `dbGetLink` does on
         // a disconnected pva link, and the record is LINK/INVALID.

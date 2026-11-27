@@ -109,7 +109,7 @@ async fn a_port_write_waits_out_the_poller_s_pass() {
     let during = done_rx.recv_timeout(Duration::from_millis(300)).ok();
     seen.lock().unwrap().clear();
     release_tx.send(()).unwrap();
-    let until = Instant::now() + Duration::from_secs(5);
+    let until = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(5));
     while seen.lock().unwrap().is_empty() && Instant::now() < until {
         tokio::time::sleep(Duration::from_millis(1)).await;
     }

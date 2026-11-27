@@ -26,7 +26,7 @@ fn polled(
 
 /// Eventual assertion — polls condition with timeout.
 async fn wait_until(timeout: Duration, mut f: impl FnMut() -> bool) -> bool {
-    let deadline = Instant::now() + timeout;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(timeout);
     while Instant::now() < deadline {
         if f() {
             return true;
@@ -1353,7 +1353,7 @@ async fn a_poller_started_from_the_shell_runs_while_the_runtime_blocks() {
         .await
         .unwrap();
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(5));
     while (!seen.moved.load(Ordering::SeqCst) || seen.polls.load(Ordering::SeqCst) < 5)
         && Instant::now() < deadline
     {

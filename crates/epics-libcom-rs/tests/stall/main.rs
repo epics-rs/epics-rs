@@ -42,7 +42,7 @@ impl Gate {
     }
 
     fn wait_stalled(&self, never: &str) {
-        let deadline = Instant::now() + FACT_BUDGET;
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(FACT_BUDGET);
         while !self.stalled.load(Ordering::Acquire) {
             assert!(Instant::now() < deadline, "{never}");
             std::thread::sleep(Duration::from_millis(1));

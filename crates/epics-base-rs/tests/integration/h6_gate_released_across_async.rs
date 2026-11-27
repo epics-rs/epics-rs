@@ -242,7 +242,7 @@ async fn seq_delay_runs_outside_the_gate_and_fires_after_release() {
         .expect("the gate must be free while the seq DLYn delay is pending");
 
     // After the delay the group runs and the chain completes the cycle.
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while std::time::Instant::now() < deadline {
         if db
             .get_record("H6:SEQTGT")
@@ -266,7 +266,7 @@ async fn seq_delay_runs_outside_the_gate_and_fires_after_release() {
         "LNK0 must be driven once DLY0 elapsed"
     );
     // `asyncFinish` cleared PACT (`seqRecord.c:238`).
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while std::time::Instant::now() < deadline {
         if !db.get_record("H6:SEQ").unwrap().read().is_processing() {
             break;
@@ -404,7 +404,7 @@ async fn seq_with_every_delay_zero_still_runs_on_the_callback_task() {
         .expect("the seq gate must be free while the group chain runs");
 
     // The chain finishes on its own and `asyncFinish` clears PACT (`:238`).
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while std::time::Instant::now() < deadline {
         if !db.get_record("UI81:SEQ").unwrap().read().is_processing() {
             break;

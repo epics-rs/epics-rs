@@ -57,7 +57,7 @@ async fn cycle(db: &PvDatabase, n: i32) {
     db.put_record_field_from_ca_no_notify("A", "PROC", EpicsValue::Short(1))
         .await
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(5));
     while state(db) != (Some(EpicsValue::Long(n)), false) {
         assert!(Instant::now() < deadline, "cycle {n} never completed");
         std::thread::yield_now();

@@ -45,7 +45,8 @@ async fn ioc() -> Arc<PvDatabase> {
             let Some(link) = link.external() else {
                 continue;
             };
-            let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+            let deadline =
+                epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
             while db.external_link_metadata(link).is_none() {
                 assert!(Instant::now() < deadline, "{record}.{field} connects");
                 epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;

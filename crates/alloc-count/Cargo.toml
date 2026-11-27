@@ -13,3 +13,6 @@ publish = false
 
 [dev-dependencies]
 fact-budget = { path = "../fact-budget" }
+# The test's deadline_from_now. epics-libcom-rs takes this crate only as a
+# dev-dependency, so the edge back is not a cycle.
+epics-libcom-rs = { path = "../epics-libcom-rs" }

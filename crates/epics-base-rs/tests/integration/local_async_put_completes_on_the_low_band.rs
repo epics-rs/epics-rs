@@ -53,7 +53,7 @@ async fn the_completing_pass_does_not_wait_for_the_records_band() {
         .await
         .unwrap();
     let out = db.get_record("OUT").unwrap();
-    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while out.read().is_processing() && Instant::now() < deadline {
         epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;
     }
@@ -91,7 +91,7 @@ async fn the_completing_pass_waits_for_the_low_band() {
     db.put_record_field_from_ca("OUT", "VAL", EpicsValue::Double(4.0))
         .await
         .unwrap();
-    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while db.get_pv("TGT").unwrap().to_f64() != Some(4.0) && Instant::now() < deadline {
         epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;
     }
@@ -101,7 +101,7 @@ async fn the_completing_pass_waits_for_the_low_band() {
     let waited = out.read().is_processing();
     let _ = release.send(());
     let _ = hold.await;
-    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while out.read().is_processing() && Instant::now() < deadline {
         epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;
     }
@@ -143,7 +143,7 @@ record(ao, "TGT") { field(SCAN, "Event") field(EVNT, "117") }
         .await
         .unwrap();
     let out = db.get_record("OUT").unwrap();
-    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while out.read().is_processing() && Instant::now() < deadline {
         epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;
     }
@@ -226,7 +226,7 @@ async fn a_refused_put_that_processes_waits_for_the_low_band() {
     db.put_record_field_from_ca("OUT", "VAL", EpicsValue::String("A+".into()))
         .await
         .unwrap();
-    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while tgt_stat(&db) != CALC_ALARM && Instant::now() < deadline {
         epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;
     }
@@ -238,7 +238,7 @@ async fn a_refused_put_that_processes_waits_for_the_low_band() {
     for hold in holds {
         let _ = hold.await;
     }
-    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while out.read().is_processing() && Instant::now() < deadline {
         epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;
     }
@@ -260,7 +260,7 @@ async fn a_refused_put_that_does_not_process_completes_on_the_medium_band() {
         .await
         .unwrap();
     let out = db.get_record("OUT").unwrap();
-    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while out.read().is_processing() && Instant::now() < deadline {
         epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;
     }
@@ -306,14 +306,14 @@ record(calcout, "DLY") { field(CALC, "1") field(ODLY, "0.5") }
         .await
         .unwrap();
     let (out, dly) = (db.get_record("OUT").unwrap(), db.get_record("DLY").unwrap());
-    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while !dly.read().is_processing() && Instant::now() < deadline {
         epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;
     }
     let delayed = tgt_stat(&db) == CALC_ALARM && dly.read().is_processing();
     epics_base_rs::runtime::task::sleep(Duration::from_millis(200)).await;
     let waited = out.read().is_processing() && dly.read().is_processing();
-    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while out.read().is_processing() && Instant::now() < deadline {
         epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;
     }
@@ -335,7 +335,8 @@ async fn open_links(db: &epics_base_rs::server::database::PvDatabase) {
             let Some(link) = link.external() else {
                 continue;
             };
-            let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+            let deadline =
+                epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
             while db.external_link_metadata(link).is_none() {
                 assert!(
                     std::time::Instant::now() < deadline,

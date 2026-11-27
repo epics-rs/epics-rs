@@ -57,7 +57,7 @@ fn pva_port_with(env: &[(&str, &str)]) -> u16 {
 
     let stderr = ioc.0.stderr.take().expect("piped stderr");
     let mut reader = BufReader::new(stderr);
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(30));
     let mut line = String::new();
     loop {
         assert!(

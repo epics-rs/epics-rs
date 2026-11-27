@@ -57,7 +57,7 @@ impl PortDriver for Failing {
 
 async fn settled(db: &PvDatabase) -> (u16, AlarmSeverity) {
     let rec = db.get_record("A:R").unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(10));
     while rec.read().is_processing() {
         assert!(
             std::time::Instant::now() < deadline,
@@ -141,7 +141,7 @@ async fn failed_then_refused(case: Case) -> [(u16, AlarmSeverity); 2] {
         .await;
     let failed = settled(&db).await;
     runtime.port_handle().exception_disconnect(0).unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(10));
     while runtime.port_handle().is_connected(0).await.unwrap() {
         assert!(
             std::time::Instant::now() < deadline,

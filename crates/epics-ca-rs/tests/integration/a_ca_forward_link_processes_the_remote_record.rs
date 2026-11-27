@@ -66,7 +66,7 @@ impl Ioc {
         // Only the readers send, so a child that exits ends the wait at once.
         drop(tx);
         let mut boot = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(30));
         while let Ok(line) = lines.recv_timeout(deadline.saturating_duration_since(Instant::now()))
         {
             let up = line.contains("iocRun: All initialization complete");
@@ -91,7 +91,7 @@ impl Ioc {
 
     /// Lines up to the first one `done` accepts, or `None` at the deadline.
     fn until(&mut self, done: impl Fn(&str) -> bool) -> Option<String> {
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(30));
         while let Ok(line) = self
             .lines
             .recv_timeout(deadline.saturating_duration_since(Instant::now()))
@@ -233,7 +233,7 @@ fn forward_links_on(tgt: &std::path::Path, src: &std::path::Path, a_port: u16) -
     // softIoc's CA links connect while iocInit finishes; the port's open on
     // first use, so the first source process must not race the connect.
     // Process until the targets answer, then count three more from there.
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(20));
     loop {
         b.dbpf("FO.PROC", "1");
         b.dbpf("FL.PROC", "1");

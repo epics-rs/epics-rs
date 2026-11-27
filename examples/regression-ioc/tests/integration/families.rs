@@ -91,7 +91,7 @@ fn val_is(want: f64) -> impl Fn(&Snapshot) -> bool {
 
 /// Poll `caget` until the numeric VAL equals `want` (±eps) or `ms` elapses.
 async fn caget_num_eq(ca: &epics_ca_rs::client::CaClient, pv: &str, want: f64, ms: u64) -> bool {
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(ms);
+    let deadline = epics_base_rs::runtime::task::deadline_from_now(Duration::from_millis(ms));
     loop {
         if let Ok((_t, v)) = ca.caget(pv).await
             && as_f64(&v).is_some_and(|x| (x - want).abs() < 1e-9)

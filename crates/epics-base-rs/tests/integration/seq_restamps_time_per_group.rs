@@ -73,7 +73,7 @@ async fn run_chain(db: &PvDatabase, rec: &str) {
     db.process_record_with_links(rec, &mut visited)
         .await
         .unwrap();
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while std::time::Instant::now() < deadline {
         if !db.get_record(rec).unwrap().read().is_processing() {
             return;

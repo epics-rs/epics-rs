@@ -119,7 +119,7 @@ async fn interop_r1_pipeline_option_visible_to_pvxs_server() {
 
     // Wait for the negotiation + at least 2 events (which proves the
     // INIT round-trip completed). 3s max budget — SCAN is 0.1s.
-    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(3));
     while std::time::Instant::now() < deadline
         && events.load(std::sync::atomic::Ordering::Relaxed) < 2
     {

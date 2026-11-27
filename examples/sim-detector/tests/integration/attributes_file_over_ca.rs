@@ -99,7 +99,7 @@ iocInit()
             .expect("spawn sim-ioc"),
     );
 
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(60));
     while !clients
         .run("caget", &["-w", "1", "T:cam1:Acquire"])
         .status

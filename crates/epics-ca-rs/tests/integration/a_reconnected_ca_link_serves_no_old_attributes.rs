@@ -228,7 +228,7 @@ impl Proxy {
 }
 
 async fn until(what: &str, mut fact: impl FnMut() -> bool) {
-    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while !fact() {
         assert!(Instant::now() < deadline, "{what}");
         tokio::time::sleep(Duration::from_millis(5)).await;

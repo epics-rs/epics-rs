@@ -1355,7 +1355,7 @@ mod tests {
 
     /// Until `landed` reaches `n`, or the budget runs out.
     fn until_landed(landed: &AtomicU32, n: u32) {
-        let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
         while landed.load(Ordering::SeqCst) < n {
             assert!(std::time::Instant::now() < deadline, "event {n}");
             std::thread::sleep(Duration::from_millis(1));
@@ -1508,7 +1508,7 @@ mod tests {
 
     /// Until `fact` holds, or the budget runs out.
     fn until(what: &str, fact: impl Fn() -> bool) {
-        let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
         while !fact() {
             assert!(std::time::Instant::now() < deadline, "{what}");
             std::thread::yield_now();
@@ -1518,7 +1518,7 @@ mod tests {
     /// The statuses of `calls`, `None` for one not back within the budget,
     /// leaking `held` then, as nothing may join the threads stuck.
     fn returned<T>(calls: Vec<std::sync::mpsc::Receiver<PvStat>>, held: T) -> Vec<Option<PvStat>> {
-        let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
         let statuses: Vec<_> = calls
             .iter()
             .map(|call| {

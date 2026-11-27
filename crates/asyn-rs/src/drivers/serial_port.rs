@@ -3464,7 +3464,9 @@ mod tests {
         let err = read_until(
             &fd,
             &mut buf,
-            Some(Instant::now() + Duration::from_secs(30)),
+            Some(epics_libcom_rs::runtime::time::deadline_from_now(
+                Duration::from_secs(30),
+            )),
         )
         .expect_err("a latched POLLERR with EAGAIN must not read successfully");
         assert_eq!(err.status(), AsynStatus::Disconnected, "got {err:?}");
@@ -3486,7 +3488,9 @@ mod tests {
         let err = write_until(
             &fd,
             b"hello",
-            Some(Instant::now() + Duration::from_secs(30)),
+            Some(epics_libcom_rs::runtime::time::deadline_from_now(
+                Duration::from_secs(30),
+            )),
             &mut sent,
         )
         .expect_err("a latched POLLERR with EAGAIN must not write successfully");
@@ -3547,8 +3551,15 @@ mod tests {
         let fd = FakeFd::new(libc::POLLIN, u32::MAX);
         let mut buf = [0u8; 8];
         let start = Instant::now();
-        let err = read_until(&fd, &mut buf, Some(start + Duration::from_millis(50)))
-            .expect_err("a descriptor that never delivers must time out");
+        let err = read_until(
+            &fd,
+            &mut buf,
+            Some(epics_libcom_rs::runtime::time::deadline_after(
+                start,
+                Duration::from_millis(50),
+            )),
+        )
+        .expect_err("a descriptor that never delivers must time out");
         assert_eq!(err.status(), AsynStatus::Timeout, "got {err:?}");
         assert!(
             start.elapsed() < Duration::from_secs(5),

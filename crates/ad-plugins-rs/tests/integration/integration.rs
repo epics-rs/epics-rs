@@ -32,7 +32,8 @@ fn params_applied(handle: &PluginRuntimeHandle) {
 }
 
 fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline =
+        epics_libcom_rs::runtime::time::deadline_from_now(std::time::Duration::from_secs(10));
     while !cond() {
         assert!(
             std::time::Instant::now() < deadline,

@@ -296,8 +296,10 @@ async fn rrbv_after_a_model1_post(stop: bool) -> EpicsValue {
         tokio::time::sleep(Duration::from_millis(600)).await;
     } else {
         rig.post(at(5.0));
-        let deadline = tokio::time::Instant::now() + fact_budget::FACT_BUDGET;
-        while rig.field("RRBV") == EpicsValue::Long(0) && tokio::time::Instant::now() < deadline {
+        let deadline = epics_libcom_rs::runtime::task::deadline_from_now(fact_budget::FACT_BUDGET);
+        while rig.field("RRBV") == EpicsValue::Long(0)
+            && epics_libcom_rs::runtime::task::Instant::now() < deadline
+        {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }

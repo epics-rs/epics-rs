@@ -17,7 +17,8 @@ use std::collections::HashMap;
 /// `pv` once it reads `want`, or what it reads after 10 s: a slow host fires
 /// the DLY timer late, not never.
 async fn reaches(server: &epics_ca_rs::server::CaServer, pv: &str, want: EpicsValue) -> EpicsValue {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline =
+        epics_base_rs::runtime::time::deadline_from_now(std::time::Duration::from_secs(10));
     loop {
         let v = server.get(pv).await.unwrap();
         if v == want || std::time::Instant::now() >= deadline {

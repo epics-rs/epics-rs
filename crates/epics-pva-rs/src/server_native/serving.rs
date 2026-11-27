@@ -647,7 +647,7 @@ mod tests {
         assert_eq!(handle.bound_tcp_port(), port);
 
         let _client = std::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port)).expect("connect");
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(5));
         while handle.report().peer_count == 0 && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
         }
@@ -659,7 +659,7 @@ mod tests {
 
         // Dropping the serving shuts it down: both loops report down.
         drop(serving);
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(5));
         while (handle.report().tcp_alive || handle.report().udp_alive) && Instant::now() < deadline
         {
             thread::sleep(Duration::from_millis(10));
@@ -969,7 +969,7 @@ mod tests {
             .expect("serve");
         let handle = serving.report_handle();
         serving.server().shutdown();
-        let deadline = Instant::now() + FACT_BUDGET;
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(FACT_BUDGET);
         while handle.report().tcp_alive {
             assert!(
                 Instant::now() < deadline,
@@ -1034,7 +1034,7 @@ mod tests {
         });
 
         let _occupant = std::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
-        let deadline = Instant::now() + FACT_BUDGET;
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(FACT_BUDGET);
         while server.active_connections() == 0 {
             assert!(
                 Instant::now() < deadline,
@@ -1114,7 +1114,7 @@ mod tests {
             let serving = thread::spawn(move || srv.serve(&reactor, Box::new(|| true)));
             // A client served shows the accept loop running; it parks again.
             let _client = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
-            let deadline = Instant::now() + FACT_BUDGET;
+            let deadline = epics_libcom_rs::runtime::time::deadline_from_now(FACT_BUDGET);
             while server.active_connections() == 0 {
                 assert!(
                     Instant::now() < deadline,
@@ -1140,7 +1140,7 @@ mod tests {
             set_limit(&limit);
             drop(server);
 
-            let deadline = Instant::now() + FACT_BUDGET;
+            let deadline = epics_libcom_rs::runtime::time::deadline_from_now(FACT_BUDGET);
             while let Err(e) = TcpListener::bind((Ipv4Addr::LOCALHOST, port)) {
                 assert!(
                     Instant::now() < deadline,
@@ -1348,7 +1348,7 @@ mod tests {
                 assert!(!answered(3), "{kind:?} {stop:?}: a SEARCH answered");
                 // The accept and beacon threads both end at the stop, so
                 // no beacon follows.
-                let deadline = Instant::now() + FACT_BUDGET;
+                let deadline = epics_libcom_rs::runtime::time::deadline_from_now(FACT_BUDGET);
                 for _ in 0..2 {
                     loop {
                         if let Ok(ended) = serving.ended.try_recv() {

@@ -94,7 +94,10 @@ async fn replies_to_one_search(port: u16) -> usize {
             .unwrap();
         s.send_to(&search_datagram("LOOP:A"), ("127.0.0.1", port))
             .unwrap();
-        let (mut n, until) = (0, Instant::now() + Duration::from_millis(1500));
+        let (mut n, until) = (
+            0,
+            epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_millis(1500)),
+        );
         let mut buf = [0u8; 2048];
         while Instant::now() < until {
             if s.recv(&mut buf).is_ok() {

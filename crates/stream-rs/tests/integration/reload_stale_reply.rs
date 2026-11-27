@@ -35,7 +35,9 @@ struct Device {
 impl Device {
     /// Up to `buf.len()` bytes of the landed input, or None at the deadline.
     fn take(&self, user: &AsynUser, buf: &mut [u8]) -> Option<usize> {
-        let deadline = Instant::now() + user.timeout.unwrap_or(Duration::from_secs(1));
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(
+            user.timeout.unwrap_or(Duration::from_secs(1)),
+        );
         loop {
             let now = Instant::now();
             {

@@ -39,7 +39,7 @@ async fn cp_update_claims_putf_under_the_scan_lock() {
             }
         })
     };
-    let end = Instant::now() + Duration::from_secs(2);
+    let end = epics_base_rs::runtime::time::deadline_from_now(Duration::from_secs(2));
     let mut v = 0.0;
     while Instant::now() < end {
         v += 1.0;

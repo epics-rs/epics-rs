@@ -102,7 +102,7 @@ impl Ioc {
     }
 
     fn until(&mut self, field: &str, want: &str) {
-        let end = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+        let end = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
         loop {
             let got = self.dbgf(field);
             if got == want {

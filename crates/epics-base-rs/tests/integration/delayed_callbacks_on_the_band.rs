@@ -45,7 +45,7 @@ record(seq, "S") { field(SELM, "All") field(LNK0, "T.PROC") }
         .await
         .unwrap();
 
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while val(&db, "T") != Some(1.0) {
         assert!(
             std::time::Instant::now() < deadline,

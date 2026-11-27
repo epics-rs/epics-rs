@@ -77,7 +77,7 @@ fn a_taken_tcp_port_makes_the_server_print_cs_five_warning_lines() {
     );
 
     let rx = stderr_lines(ioc.0.stderr.take().expect("piped stderr"));
-    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     let mut seen: Vec<String> = Vec::new();
     // Read until the block under test is complete — NOT until some later
     // startup milestone. The five lines are written by `bind_tcp_listeners`,
@@ -175,7 +175,7 @@ fn a_free_tcp_port_is_silent() {
         );
 
         let rx = stderr_lines(ioc.0.stderr.take().expect("piped stderr"));
-        let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
         let mut seen: Vec<String> = Vec::new();
         // C prints nothing for a configured port, so the only milestone is the
         // listener itself: a connect to the port succeeds once the TCP bind is

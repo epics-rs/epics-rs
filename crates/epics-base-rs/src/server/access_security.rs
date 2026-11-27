@@ -5950,7 +5950,7 @@ mod as_ca_task_tests {
 
     /// Poll `DEFAULT`'s published state until `done` holds.
     async fn wait_state(cell: &AcfCell, done: impl Fn(&AsgState) -> bool) -> Arc<AsgState> {
-        let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+        let deadline = crate::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
         loop {
             let state = cell.load_full().unwrap().asg[b"DEFAULT".as_slice()].state();
             if done(&state) {
@@ -6361,7 +6361,7 @@ mod as_ca_task_tests {
             out.into_inner()
         }
         async fn wait_until(want: bool) {
-            let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+            let deadline = crate::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
             while table().contains("asCaTask") != want {
                 assert!(
                     std::time::Instant::now() < deadline,

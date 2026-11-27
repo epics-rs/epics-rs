@@ -46,7 +46,7 @@ fn every_listener_line_is_c_s_text() {
 
     let log = || std::fs::read_to_string(&path).unwrap();
     let wait_for = |text: &str| {
-        let until = Instant::now() + Duration::from_secs(5);
+        let until = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(5));
         while !log().contains(text) {
             assert!(Instant::now() < until, "{text:?} never printed:\n{}", log());
             std::thread::sleep(Duration::from_millis(10));

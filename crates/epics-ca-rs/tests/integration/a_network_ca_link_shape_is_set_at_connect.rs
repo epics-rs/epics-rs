@@ -218,7 +218,7 @@ async fn a_network_ca_link_shape_is_set_at_connect() {
             .await,
         "{SRC} never connected"
     );
-    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while held.load(Ordering::SeqCst) == 0 {
         assert!(Instant::now() < deadline, "the CTRL get never went out");
         tokio::time::sleep(Duration::from_millis(5)).await;
@@ -242,7 +242,7 @@ async fn a_network_ca_link_shape_is_set_at_connect() {
     assert_eq!(resolver.link_shape(lref), served);
 
     release.send(()).unwrap();
-    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while resolver.link_metadata(lref).is_none() {
         assert!(
             Instant::now() < deadline,
@@ -285,7 +285,7 @@ async fn a_cp_compress_latches_the_count_before_the_ctrl_reply() {
     db.scan_control().run();
     db.process_cp_links_on_connect().await;
     let num = |pv: &str| db.get_pv(pv).unwrap().to_f64().unwrap();
-    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while num("CC.UDF") != 0.0 {
         assert!(Instant::now() < deadline, "CC never processed on connect");
         tokio::time::sleep(Duration::from_millis(5)).await;

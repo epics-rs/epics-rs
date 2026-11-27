@@ -181,7 +181,7 @@ record(bo, "AB") {
         .unwrap();
     assert_eq!(db.get_pv("AT").unwrap(), EpicsValue::Long(1));
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(Duration::from_secs(5));
     while db.get_pv("AB").unwrap() != EpicsValue::Enum(0) {
         assert!(
             std::time::Instant::now() < deadline,

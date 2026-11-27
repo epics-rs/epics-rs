@@ -54,7 +54,7 @@ fn drain(rx: &mut EventReader) -> Vec<f64> {
 }
 
 async fn wait_idle(db: &PvDatabase, rec: &str) {
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while std::time::Instant::now() < deadline {
         epics_base_rs::runtime::task::sleep(Duration::from_millis(50)).await;
         if num(db, &format!("{rec}.PACT")) == 0.0 {

@@ -3108,13 +3108,34 @@ mod tests {
         let t0 = Instant::now();
         let mut b = Backoff::new(t0);
         let s = Duration::from_secs;
-        assert_eq!(b.lost(t0 + Duration::from_millis(100)), t0 + s(3));
-        assert_eq!(b.lost(t0 + s(3)), t0 + s(6));
+        assert_eq!(
+            b.lost(epics_libcom_rs::runtime::task::deadline_after(
+                t0,
+                Duration::from_millis(100)
+            )),
+            epics_libcom_rs::runtime::task::deadline_after(t0, s(3))
+        );
+        assert_eq!(
+            b.lost(epics_libcom_rs::runtime::task::deadline_after(t0, s(3))),
+            epics_libcom_rs::runtime::task::deadline_after(t0, s(6))
+        );
         // Base 4 after the loss: an interval of 3 or 4 s.
-        let at = b.failed(t0 + Duration::from_millis(3500)) - t0;
+        let at = b.failed(epics_libcom_rs::runtime::task::deadline_after(
+            t0,
+            Duration::from_millis(3500),
+        )) - t0;
         assert!(at == s(9), "{at:?}");
-        assert_eq!(b.tick_after(t0), t0 + s(3));
-        assert_eq!(b.tick_after(t0 + Duration::from_millis(2999)), t0 + s(3));
+        assert_eq!(
+            b.tick_after(t0),
+            epics_libcom_rs::runtime::task::deadline_after(t0, s(3))
+        );
+        assert_eq!(
+            b.tick_after(epics_libcom_rs::runtime::task::deadline_after(
+                t0,
+                Duration::from_millis(2999)
+            )),
+            epics_libcom_rs::runtime::task::deadline_after(t0, s(3))
+        );
     }
 
     /// Each PUBLISH prints from its own ack, whatever order the acks come in.

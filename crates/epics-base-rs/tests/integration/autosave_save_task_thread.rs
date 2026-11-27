@@ -12,7 +12,7 @@ use epics_base_rs::server::ioc_app::{IocApplication, RunOutcome};
 /// The save_restore thread's priority once it is `want`, or the last one
 /// seen within the fact budget.
 async fn priority_reaching(want: u32) -> Option<u32> {
-    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     loop {
         let seen = thread_by_name("save_restore").map(|t| t.epics_priority());
         if seen == Some(want) || Instant::now() > deadline {

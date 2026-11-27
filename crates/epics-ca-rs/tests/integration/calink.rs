@@ -232,7 +232,7 @@ async fn ca_link_init_ready_flips_after_metadata_fetch() {
     // The attribute fetch is detached from the monitor path, so poll
     // for the flip; a connected link whose fetch never completes would
     // hold iocInit, and this assert names that failure.
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while !LinkSet::init_ready(&resolver, link) {
         assert!(
             std::time::Instant::now() < deadline,
@@ -387,7 +387,7 @@ async fn ca_cp_holder_processes_on_remote_change() {
     // (1) The warm's first monitor event must drive the holder to process
     // and read the remote value (5.0) into VAL — with NO explicit
     // process_record call anywhere in this test.
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     loop {
         let v = {
             let rec = db.get_record("CALINK:CP:HOLDER").unwrap();
@@ -417,7 +417,7 @@ async fn ca_cp_holder_processes_on_remote_change() {
         .await
         .expect("remote write to source");
 
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     loop {
         let v = {
             let rec = db.get_record("CALINK:CP:HOLDER").unwrap();
@@ -479,7 +479,7 @@ async fn ca_link_out_write_updates_remote_pv() {
 
     // The resolver's monitor sees the server-side change — poll the
     // monitor-backed cache until the write propagates back.
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     loop {
         if LinkSet::get_value(&resolver, link)
             .await
@@ -611,7 +611,7 @@ async fn ca_link_exposes_remote_metadata() {
 
     // The CTRL attribute fetch is detached after the `Connected` event,
     // so poll until the cached metadata lands.
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     let md = loop {
         if let Some(md) = LinkSet::link_metadata(&resolver, link) {
             // Wait for the CTRL get to fill the limits, not just the
@@ -764,7 +764,8 @@ async fn calink_warms_cp_holder_via_iocapplication_run_seam() {
             // external-link wait. Poll the holder until the warm's monitor
             // event drives VAL to the source's 5.0 — with NO explicit
             // process call anywhere in this test.
-            let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+            let deadline =
+                epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
             loop {
                 let v = {
                     let rec = config

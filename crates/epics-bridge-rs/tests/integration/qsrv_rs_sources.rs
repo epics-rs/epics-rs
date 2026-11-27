@@ -60,7 +60,7 @@ async fn a_single_record_and_a_group_answer_as_softiocpvx() {
                 // not-a-wait: a timed-out get errs and the FACT_BUDGET loop retries it.
                 .timeout(Duration::from_secs(2))
                 .build();
-            let deadline = std::time::Instant::now() + FACT_BUDGET;
+            let deadline = epics_base_rs::runtime::time::deadline_from_now(FACT_BUDGET);
             let group = loop {
                 match client.pvget_from("G", server).await {
                     Ok(v) => break v,

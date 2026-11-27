@@ -55,14 +55,14 @@ fn idle(db: &PvDatabase, rec: &str) -> bool {
 }
 
 async fn settle(db: &PvDatabase, done: impl Fn(&PvDatabase) -> bool) {
-    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while !done(db) && Instant::now() < deadline {
         epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;
     }
 }
 
 async fn sleep_until(t0: Instant, secs: f64) {
-    let at = t0 + Duration::from_secs_f64(secs);
+    let at = epics_base_rs::runtime::time::deadline_after(t0, Duration::from_secs_f64(secs));
     if let Some(left) = at.checked_duration_since(Instant::now()) {
         epics_base_rs::runtime::task::sleep(left).await;
     }

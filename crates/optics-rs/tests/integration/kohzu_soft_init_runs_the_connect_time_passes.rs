@@ -794,7 +794,7 @@ async fn a_late_use_set_echo_is_not_mirrored_back_to_the_motor_set() {
 
 /// Fail on an event of `sub` other than `want` for three seconds.
 async fn stays(sub: &mut DbSubscription, want: f64) {
-    let end = std::time::Instant::now() + Duration::from_secs(3);
+    let end = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(3));
     while let Ok(got) = task::timeout(
         end.saturating_duration_since(std::time::Instant::now()),
         sub.recv_f64(),

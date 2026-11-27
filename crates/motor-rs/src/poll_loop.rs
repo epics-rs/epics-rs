@@ -6638,7 +6638,10 @@ mod tests {
         let tick = Instant::now();
         let stale = now(poll_loop.query_task(tick));
         send_move(&mut poll_loop);
-        assert_eq!(poll_loop.task_due(tick, stale), Some(tick + SCAN));
+        assert_eq!(
+            poll_loop.task_due(tick, stale),
+            Some(epics_libcom_rs::runtime::time::deadline_after(tick, SCAN))
+        );
         assert_eq!(script.lock().unwrap().0.len(), 1);
         assert_eq!(held(&poll_loop).map(|held| held.count), Some(0));
     }
@@ -6838,7 +6841,7 @@ mod tests {
         send_at(
             &mut poll_loop,
             MotorCommand::Stop { acceleration: 1.0 },
-            sent + UPDATE_DELAY / 2,
+            epics_libcom_rs::runtime::time::deadline_after(sent, UPDATE_DELAY / 2),
         );
         assert_eq!(status_delay(&poll_loop).sent, Some(sent));
     }
@@ -6859,7 +6862,7 @@ mod tests {
         send_at(
             &mut poll_loop,
             MotorCommand::Poll,
-            sent + UPDATE_DELAY - left,
+            epics_libcom_rs::runtime::time::deadline_after(sent, UPDATE_DELAY) - left,
         );
         let waited = started.elapsed();
         assert!(waited >= left, "{waited:?}");
@@ -6884,12 +6887,18 @@ mod tests {
             },
             sent,
         );
-        let early = sent + SCAN / 4;
+        let early = epics_libcom_rs::runtime::time::deadline_after(sent, SCAN / 4);
         let stale = now(poll_loop.query_task(early));
         assert_eq!(stale, UPDATE_DELAY - SCAN / 4);
-        assert_eq!(poll_loop.task_due(early, stale), Some(sent + UPDATE_DELAY));
+        assert_eq!(
+            poll_loop.task_due(early, stale),
+            Some(epics_libcom_rs::runtime::time::deadline_after(
+                sent,
+                UPDATE_DELAY
+            ))
+        );
         assert_eq!(polls_left(&card), 1);
-        let due = sent + UPDATE_DELAY;
+        let due = epics_libcom_rs::runtime::time::deadline_after(sent, UPDATE_DELAY);
         assert_eq!(now(poll_loop.query_task(due)), Duration::ZERO);
         assert_eq!(polls_left(&card), 0);
         assert_eq!(poll_loop.axes[0].last_status(), at(1.0));
@@ -7106,7 +7115,11 @@ mod tests {
         };
         let seq = poll_loop.axes[0].places[0].records().stamp();
         let tick = Instant::now();
-        assert!(now(poll_loop.timed_pass()).is_some_and(|due| due >= tick + SCAN));
+        assert!(
+            now(poll_loop.timed_pass()).is_some_and(
+                |due| due >= epics_libcom_rs::runtime::time::deadline_after(tick, SCAN)
+            )
+        );
         assert_eq!(
             poll_loop.axes[0].places[0].records().stamp(),
             seq,

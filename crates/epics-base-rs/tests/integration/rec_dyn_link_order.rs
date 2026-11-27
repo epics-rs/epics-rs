@@ -96,7 +96,7 @@ fn deliver(
 /// Hold the calling thread until `done`, for at most a fifth of a second:
 /// long enough for any other thread to overtake.
 fn hold_until(done: impl Fn() -> bool) {
-    let deadline = Instant::now() + Duration::from_millis(200);
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(Duration::from_millis(200));
     while !done() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(1));
     }
@@ -132,7 +132,7 @@ fn add_both(db: &Arc<PvDatabase>, hold: impl Fn(&LinkEvent) + Send + Sync + 'sta
 }
 
 async fn wait_for(db: &PvDatabase, cb: Cb, count: usize) {
-    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while logged(db, cb).len() < count {
         assert!(
             Instant::now() < deadline,
@@ -198,7 +198,7 @@ async fn a_put_queued_before_the_clear_is_made() {
         t.links[1].clear();
     });
     drop(held);
-    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while db.get_pv("M2").unwrap() != EpicsValue::Double(5.0) && Instant::now() < deadline {
         sleep(Duration::from_millis(5)).await;
     }

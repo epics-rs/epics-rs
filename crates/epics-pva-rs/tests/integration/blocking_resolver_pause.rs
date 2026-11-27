@@ -152,7 +152,7 @@ async fn a_resolver_pause_longer_than_op_timeout_leaves_the_connection_serving()
     let me = peer.local_addr().expect("peer addr");
     let burst: Vec<u8> = (0..PAUSING_FRAMES).flat_map(create_channel_frame).collect();
     peer.write_all(&burst).expect("write the pausing burst");
-    let deadline = Instant::now() + FACT_BUDGET;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(FACT_BUDGET);
     while bytes_in(&server, me) != burst.len() as u64 {
         assert!(Instant::now() < deadline, "the server never read the burst");
         std::thread::sleep(Duration::from_millis(5));

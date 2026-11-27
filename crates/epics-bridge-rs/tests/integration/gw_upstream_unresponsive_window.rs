@@ -219,7 +219,7 @@ impl StallRig {
             accepted,
             proxy,
         };
-        let deadline = std::time::Instant::now() + FACT_BUDGET;
+        let deadline = epics_base_rs::runtime::time::deadline_from_now(FACT_BUDGET);
         while tokio::net::TcpStream::connect(upstream).await.is_err() {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -331,7 +331,7 @@ async fn until<F: std::future::Future<Output = bool>>(
     what: &str,
     mut check: impl FnMut() -> F,
 ) {
-    let deadline = std::time::Instant::now() + bound;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(bound);
     while !check().await {
         assert!(std::time::Instant::now() < deadline, "{what}");
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -415,7 +415,7 @@ async fn after_an_unresponsive_window(
     })
     .await;
     rig.freeze(false);
-    let deadline = std::time::Instant::now() + bound;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(bound);
     // No sleep: the first appearance is what is asserted, and a PV that
     // shows stale rights for a moment must not be missed between polls.
     let back = loop {

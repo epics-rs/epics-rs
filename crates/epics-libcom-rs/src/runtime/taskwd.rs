@@ -620,7 +620,10 @@ mod tests {
         let start = Instant::now();
 
         task.check_in();
-        twd.scan(start + Duration::from_secs(2));
+        twd.scan(crate::runtime::time::deadline_after(
+            start,
+            Duration::from_secs(2),
+        ));
 
         assert!(
             state_of(&twd, "keeps-up").contains("Ok"),
@@ -651,18 +654,27 @@ mod tests {
         let start = Instant::now();
         let _ = recorder.taken();
 
-        twd.scan(start + Duration::from_millis(999));
+        twd.scan(crate::runtime::time::deadline_after(
+            start,
+            Duration::from_millis(999),
+        ));
         assert_eq!(fired.load(Ordering::Relaxed), 0, "below its deadline");
         assert!(recorder.taken().is_empty(), "nothing to notify below it");
 
-        twd.scan(start + Duration::from_secs(1));
+        twd.scan(crate::runtime::time::deadline_after(
+            start,
+            Duration::from_secs(1),
+        ));
         assert_eq!(fired.load(Ordering::Relaxed), 1, "at its deadline");
         assert_eq!(recorder.taken(), vec!["notify wedged suspended=true"]);
         assert!(state_of(&twd, "wedged").contains("Suspended"));
 
         // C reports the transition, not the level: a second pass with the task
         // still stuck says nothing more (`taskwd.c:100`).
-        twd.scan(start + Duration::from_secs(30));
+        twd.scan(crate::runtime::time::deadline_after(
+            start,
+            Duration::from_secs(30),
+        ));
         assert_eq!(fired.load(Ordering::Relaxed), 1, "the transition, once");
         assert!(recorder.taken().is_empty());
     }
@@ -675,11 +687,17 @@ mod tests {
 
         let task = twd.insert("recovers", CheckIn::Every(Duration::from_secs(1)), None);
         let start = Instant::now();
-        twd.scan(start + Duration::from_secs(1));
+        twd.scan(crate::runtime::time::deadline_after(
+            start,
+            Duration::from_secs(1),
+        ));
         let _ = recorder.taken();
 
         task.check_in();
-        twd.scan(start + Duration::from_secs(2));
+        twd.scan(crate::runtime::time::deadline_after(
+            start,
+            Duration::from_secs(2),
+        ));
 
         assert_eq!(recorder.taken(), vec!["notify recovers suspended=false"]);
         assert!(state_of(&twd, "recovers").contains("Ok"));
@@ -697,7 +715,10 @@ mod tests {
         let start = Instant::now();
         let _ = recorder.taken();
 
-        twd.scan(start + Duration::from_secs(86_400));
+        twd.scan(crate::runtime::time::deadline_after(
+            start,
+            Duration::from_secs(86_400),
+        ));
 
         assert!(
             recorder.taken().is_empty(),

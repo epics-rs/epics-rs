@@ -60,7 +60,7 @@ fn member_name(i: usize) -> String {
 /// the test task observes cross-thread progress without coupling to the
 /// callback's execution context.
 async fn wait_for(cond: impl Fn() -> bool, what: &str) {
-    let end = Instant::now() + FACT_BUDGET;
+    let end = epics_base_rs::runtime::time::deadline_from_now(FACT_BUDGET);
     while !cond() {
         assert!(Instant::now() < end, "timed out waiting for: {what}");
         tokio::time::sleep(Duration::from_millis(10)).await;

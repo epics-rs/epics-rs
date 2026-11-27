@@ -21,7 +21,7 @@ const PERIOD: Duration = Duration::from_millis(5);
 
 /// Waits for `done`: a slow host's timers reach it late, never not at all.
 async fn until(what: &str, mut done: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(10));
     while !done() {
         assert!(Instant::now() < deadline, "{what}");
         tokio::time::sleep(Duration::from_millis(1)).await;
@@ -30,7 +30,7 @@ async fn until(what: &str, mut done: impl FnMut() -> bool) {
 
 /// [`until`] on a thread that may block.
 fn until_blocking(what: &str, mut done: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(10));
     while !done() {
         assert!(Instant::now() < deadline, "{what}");
         std::thread::sleep(Duration::from_millis(1));
@@ -140,7 +140,7 @@ async fn a_slow_axis_delays_the_axes_after_it() {
     assert!(axis1.len() >= 2, "{log:?}");
     for (a0, a1) in axis0.iter().zip(&axis1) {
         assert!(
-            *a1 >= *a0 + SLOW,
+            *a1 >= epics_libcom_rs::runtime::time::deadline_after(*a0, SLOW),
             "axis 1 polled {:?} after axis 0",
             *a1 - *a0
         );

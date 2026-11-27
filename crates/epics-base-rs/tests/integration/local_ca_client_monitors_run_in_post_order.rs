@@ -81,7 +81,7 @@ async fn subscribe(ctx: &CaClientContext, name: char, log: &Arc<Log>) -> ClientS
 
 /// Until `log` holds each of `steps`.
 async fn until(log: &Log, steps: &[Step]) {
-    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     loop {
         let logged = log.steps.lock().unwrap().clone();
         if steps.iter().all(|step| logged.contains(step)) {

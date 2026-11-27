@@ -9450,7 +9450,7 @@ record(lso, "SOD") { field(SIZV, "128") }
 
         // The event record's post runs on a callback task.
         run_cmd(&ctx, "dbpf", &["EP.PROC", "1"]);
-        let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+        let deadline = crate::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
         while std::time::Instant::now() < deadline {
             if headers(&ctx).len() == 4 {
                 break;
@@ -12298,7 +12298,7 @@ record(ai, "AR") { field(DTYP, "Async Soft Channel") field(INP, "S2") }"#,
         const ZERO: &str = "DBF_UCHAR:          0 = 0x0";
         // A notify completes from a callback, after the put returned.
         let idle = |rec: &str| {
-            let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+            let deadline = crate::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
             while gf(&format!("{rec}.PACT")) != ZERO {
                 assert!(
                     std::time::Instant::now() < deadline,
@@ -12375,7 +12375,7 @@ record(ai, "AC") { field(DTYP, "Async Soft Channel") field(INP, "CNT2 CA") }"#,
             );
             run_cmd(&ctx, "dbpf", &[&format!("{rec}.PROC"), "1"]);
             // The notify completes from a callback, after the put returned.
-            let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+            let deadline = crate::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
             while gf(&format!("{rec}.PACT")) != "DBF_UCHAR:          0 = 0x0" {
                 assert!(
                     std::time::Instant::now() < deadline,
@@ -12424,7 +12424,7 @@ record(ai, "AE") { field(DTYP, "Async Soft Channel") field(INP, "EQ.DO1") }"#,
         let sleep = |ms| std::thread::sleep(std::time::Duration::from_millis(ms));
         // The DLY1 windows end on the delay thread's clock, not this one's.
         let settle = |pv: &str, want: &str| {
-            let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+            let deadline = crate::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
             while std::time::Instant::now() < deadline {
                 if gf(pv) == want {
                     return;

@@ -65,7 +65,7 @@ fn a_piped_shell_command_reads_the_next_script_line() {
         .unwrap();
     drop(stdin);
 
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(Duration::from_secs(60));
     while child.try_wait().unwrap().is_none() {
         if Instant::now() > deadline {
             child.kill().unwrap();

@@ -16,7 +16,7 @@ const C_OUT: &str = include_str!("../fixtures/softioc/simm_sval.out");
 
 /// Until no record is in PACT, from the shell's own thread.
 fn idle(db: &PvDatabase) {
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     for name in db.all_record_names() {
         let cell = db.get_record(&name).unwrap();
         while cell.read().is_processing() {

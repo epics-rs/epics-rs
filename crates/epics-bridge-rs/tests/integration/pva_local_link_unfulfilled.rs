@@ -36,7 +36,7 @@ async fn stderr_of<T>(lines: usize, f: impl Future<Output = T>) -> (T, String) {
     };
     let out = f.await;
     let read = || std::fs::read_to_string(sink.path()).expect("stderr capture");
-    let deadline = Instant::now() + FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(FACT_BUDGET);
     while read().lines().count() < lines && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }

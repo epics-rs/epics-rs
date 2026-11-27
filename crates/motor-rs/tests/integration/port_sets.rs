@@ -295,7 +295,7 @@ fn pi_axis(rt: &tokio::runtime::Runtime, port: &str, addr: i32, motor: Pi) {
 }
 
 fn eventually(mut f: impl FnMut() -> bool) -> bool {
-    let until = Instant::now() + Duration::from_secs(5);
+    let until = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(5));
     while Instant::now() < until {
         if f() {
             return true;

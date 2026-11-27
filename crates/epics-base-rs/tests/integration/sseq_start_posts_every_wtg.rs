@@ -32,7 +32,7 @@ async fn each_start_posts_wtg_zero_on_an_unused_step() {
             .await
             .unwrap();
         // A start while BUSY is still 1 is not a start.
-        let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+        let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
         while std::time::Instant::now() < deadline {
             if db.get_pv("SQ.BUSY").unwrap() == EpicsValue::Short(0) {
                 break;

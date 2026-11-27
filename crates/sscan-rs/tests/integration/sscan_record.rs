@@ -1207,7 +1207,7 @@ async fn wtng_after_a_wait_put_in_pdly(stop: bool) -> f64 {
         // absence-window: an expiry refused after the stop holds no point.
         sleep(Duration::from_millis(600)).await;
     } else {
-        let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
         while f64_of(&db, "S.WTNG") != 1.0 && std::time::Instant::now() < deadline {
             sleep(Duration::from_millis(5)).await;
         }

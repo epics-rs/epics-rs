@@ -55,7 +55,7 @@ async fn an_aborted_run_task_releases_both_ports() {
     let _ = run.await;
     // The listener tasks are cancelled at their next poll, not inside
     // `abort`; give them a bounded time to drop their sockets.
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(5));
     while tcp_is_held(tcp) || udp_is_held(udp) {
         assert!(
             Instant::now() < deadline,

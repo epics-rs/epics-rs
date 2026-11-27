@@ -2450,7 +2450,8 @@ pub(crate) mod tests {
         assert!(seen.lock().is_empty(), "{:?}", seen.lock());
 
         queued.increment();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline =
+            epics_libcom_rs::runtime::time::deadline_from_now(std::time::Duration::from_secs(5));
         while !seen.lock().contains(&num_queued_arrays) && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
@@ -2506,7 +2507,9 @@ pub(crate) mod tests {
                 .unwrap()
         };
         let settle = |reason: usize, want: i32| {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let deadline = epics_libcom_rs::runtime::time::deadline_from_now(
+                std::time::Duration::from_secs(5),
+            );
             while read(reason) != want && std::time::Instant::now() < deadline {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
@@ -2563,7 +2566,9 @@ pub(crate) mod tests {
             let (runtime, _actor) = create_port_runtime(&claim, Port(drv), config).unwrap();
             // The thread lists itself once it runs.
             let name = format!("{port}_updateQueuedArrayCount");
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let deadline = epics_libcom_rs::runtime::time::deadline_from_now(
+                std::time::Duration::from_secs(5),
+            );
             let row = loop {
                 match epics_libcom_rs::runtime::task::thread_by_name(&name) {
                     Some(row) => break row,
@@ -2668,7 +2673,8 @@ pub(crate) mod tests {
         );
         drop(runtime);
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline =
+            epics_libcom_rs::runtime::time::deadline_from_now(std::time::Duration::from_secs(5));
         while !actor.is_finished() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }

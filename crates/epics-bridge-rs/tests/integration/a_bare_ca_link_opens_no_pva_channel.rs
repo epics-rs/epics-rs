@@ -53,7 +53,7 @@ async fn a_down_ca_link_opens_no_pva_channel() {
             .map(|d| format!("{d:?}"))
             .collect()
     };
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while !diags().iter().any(|d| d.contains("PROBE:NOWHERE:P")) {
         assert!(
             std::time::Instant::now() < deadline,

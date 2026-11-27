@@ -182,7 +182,7 @@ record(stringout, "R1") {{ {dtyp}field(OUT, "R2.CALC CA") }}
         .find(|(field, _, _)| *field == "OUT")
         .unwrap();
     let out = out.external().unwrap();
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while db.external_link_metadata(out).is_none() {
         assert!(std::time::Instant::now() < deadline, "R1.OUT connects");
         epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(5)).await;

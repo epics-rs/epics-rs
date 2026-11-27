@@ -225,7 +225,7 @@ mod exec_model {
         // Phase 1 — reach the end of init. "pvalink resolver installed" is printed
         // after the database is loaded, the PVA server is up and the resolver has
         // been handed its client.
-        let deadline = Instant::now() + INIT_BUDGET;
+        let deadline = epics_base_rs::runtime::time::deadline_from_now(INIT_BUDGET);
         let mut console = read_log();
         while !console.contains("pvalink resolver installed") {
             assert!(
@@ -266,7 +266,7 @@ mod exec_model {
         // why the exec-backend gate runs both configurations.
         #[cfg(feature = "bringup-probes")]
         {
-            let deadline = Instant::now() + SEARCH_BUDGET;
+            let deadline = epics_base_rs::runtime::time::deadline_from_now(SEARCH_BUDGET);
             while !console.contains("searching=1") {
                 assert!(
                     !console.contains("panic"),
@@ -379,7 +379,7 @@ mod exec_model {
                     .expect("read the console log");
                 s
             };
-            let deadline = Instant::now() + INIT_BUDGET;
+            let deadline = epics_base_rs::runtime::time::deadline_from_now(INIT_BUDGET);
             let mut console = read_log();
             while record_report(&console).is_none() {
                 assert!(
@@ -496,7 +496,7 @@ mod exec_model {
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         };
         let mut back_reaches = |want: &str| {
-            let deadline = Instant::now() + INIT_BUDGET;
+            let deadline = epics_base_rs::runtime::time::deadline_from_now(INIT_BUDGET);
             loop {
                 let got = ca_tool("caget", &["-t", "-w", "1", "REMOTE:BACK"]);
                 if got == want {

@@ -81,7 +81,7 @@ fn process(db: &Arc<PvDatabase>, name: &'static str) -> std::thread::JoinHandle<
 }
 
 async fn join_within(threads: Vec<std::thread::JoinHandle<()>>, secs: u64) {
-    let deadline = Instant::now() + Duration::from_secs(secs);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(secs));
     while !threads.iter().all(|t| t.is_finished()) {
         assert!(Instant::now() < deadline, "the threads deadlocked");
         epics_base_rs::runtime::task::sleep(Duration::from_millis(10)).await;

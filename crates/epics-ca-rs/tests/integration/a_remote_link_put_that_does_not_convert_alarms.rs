@@ -79,7 +79,7 @@ async fn a_string_that_is_not_a_number_alarms_and_sends_nothing() {
         .await
         .unwrap();
     assert_eq!(num(&db, "SRC.SEVR"), 0.0);
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(10));
     while num(&sdb, "RMT") != 12.5 && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }

@@ -2627,7 +2627,7 @@ mod tests {
         for _ in 0..2 {
             pool.request_cell(CallbackPriority::Low, &cell).unwrap();
             rx.recv_timeout(T).unwrap();
-            let deadline = Instant::now() + T;
+            let deadline = crate::runtime::time::deadline_from_now(T);
             while cell.is_queued() {
                 assert!(Instant::now() < deadline, "the cell stayed queued");
                 std::thread::yield_now();
@@ -2654,7 +2654,7 @@ mod tests {
         }
         const N: usize = 50;
         let mut pool = CallbackPool::with_config(1024, 1);
-        let budget = Instant::now() + Duration::from_secs(2);
+        let budget = crate::runtime::time::deadline_from_now(Duration::from_secs(2));
         let (mut trials, mut lost) = (0usize, 0usize);
         while Instant::now() < budget {
             let cell = CallbackCell::new(Latest {
@@ -2665,7 +2665,7 @@ mod tests {
                 cell.body().latest.store(i, Ordering::Release);
                 pool.request_cell(CallbackPriority::Low, &cell).unwrap();
             }
-            let deadline = Instant::now() + T;
+            let deadline = crate::runtime::time::deadline_from_now(T);
             while cell.body().seen.load(Ordering::Acquire) != N && Instant::now() < deadline {
                 std::thread::yield_now();
             }
@@ -2791,7 +2791,7 @@ mod tests {
                 t.join().expect("a requester thread");
             }
 
-            let deadline = Instant::now() + T;
+            let deadline = crate::runtime::time::deadline_from_now(T);
             while !pool.is_idle() {
                 assert!(
                     Instant::now() < deadline,
@@ -2981,7 +2981,7 @@ mod tests {
             let pool = Arc::clone(&pool);
             std::thread::spawn(move || pool.stop())
         };
-        let deadline = std::time::Instant::now() + T;
+        let deadline = crate::runtime::time::deadline_from_now(T);
         while medium.state() != band_state::STOPPED {
             assert!(
                 std::time::Instant::now() < deadline,

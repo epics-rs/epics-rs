@@ -76,7 +76,7 @@ fn puts_past_a_stalled_console(
         let ch = client.create_channel("LS");
         ch.wait_connected(Duration::from_secs(5)).await.ok()?;
 
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(20));
         let mut done = 0;
         while done < PUTS && Instant::now() < deadline {
             let value = EpicsValue::String(format!("put {done:04} {:-<30}", "").into());

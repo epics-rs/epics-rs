@@ -1035,7 +1035,7 @@ mod tests {
             0,
             "StreamInner::drop must clear the armed set at once"
         );
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = crate::runtime::time::deadline_from_now(std::time::Duration::from_secs(2));
         while is_open(fd) {
             assert!(
                 std::time::Instant::now() < deadline,

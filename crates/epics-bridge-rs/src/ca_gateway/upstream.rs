@@ -3244,7 +3244,7 @@ ASG(NewGroup) {
 
         std::fs::write(&acf, "ASG(DEFAULT) {\n RULE(1, READ)\n}\n").expect("rewrite acf");
         server.reload_acf().await.expect("reload acf");
-        let deadline = std::time::Instant::now() + bound;
+        let deadline = epics_base_rs::runtime::time::deadline_from_now(bound);
         while channel.info().await.expect("connected").access_rights.write {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -3259,7 +3259,7 @@ ASG(NewGroup) {
             .expect("join")
             .expect("ensure_subscribed connects to the hosted upstream");
 
-        let deadline = std::time::Instant::now() + bound;
+        let deadline = epics_base_rs::runtime::time::deadline_from_now(bound);
         while hook(b"alice", b"host1").write {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -3942,7 +3942,7 @@ ASG(NewGroup) {
 
         // Wait on the observable, not on a fixed sleep: the shadow PV is
         // gone AND the object the downstream channels hold is destroyed.
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = epics_base_rs::runtime::time::deadline_from_now(Duration::from_secs(10));
         loop {
             if db.find_pv(name).is_none() {
                 break;
@@ -3971,7 +3971,7 @@ ASG(NewGroup) {
             .add_pv(name, EpicsValue::Double(7.0))
             .await
             .expect("upstream PV comes back");
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let deadline = epics_base_rs::runtime::time::deadline_from_now(Duration::from_secs(30));
         let revived = loop {
             if let Some(pv) = db.find_pv(name) {
                 break pv;
@@ -4033,7 +4033,7 @@ ASG(NewGroup) {
 
         // With a monitor that is released while the PV is dead.
         mgr.ensure_monitor(name.as_bytes());
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = epics_base_rs::runtime::time::deadline_from_now(Duration::from_secs(10));
         while upstream.subscriber_count() == 0 {
             assert!(std::time::Instant::now() < deadline, "value monitor");
             epics_base_rs::runtime::task::sleep(Duration::from_millis(20)).await;
@@ -4041,7 +4041,8 @@ ASG(NewGroup) {
         let wait_for = |live: bool, what: &'static str| {
             let db = db.clone();
             async move {
-                let deadline = std::time::Instant::now() + Duration::from_secs(15);
+                let deadline =
+                    epics_base_rs::runtime::time::deadline_from_now(Duration::from_secs(15));
                 while db.find_pv(name).is_some() != live {
                     assert!(std::time::Instant::now() < deadline, "{what}");
                     epics_base_rs::runtime::task::sleep(Duration::from_millis(20)).await;
@@ -4167,7 +4168,7 @@ ASG(NewGroup) {
         mgr.ensure_prop_monitor(name.as_bytes());
         if !start_late {
             let first = upstream_db.find_pv(name).expect("upstream PV");
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let deadline = epics_base_rs::runtime::time::deadline_from_now(Duration::from_secs(10));
             while first.subscriber_count() < armed {
                 assert!(
                     std::time::Instant::now() < deadline,
@@ -4181,7 +4182,7 @@ ASG(NewGroup) {
             .remove_simple_pv(name)
             .await
             .expect("upstream PV");
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = epics_base_rs::runtime::time::deadline_from_now(Duration::from_secs(10));
         while db.find_pv(name).is_some() {
             assert!(std::time::Instant::now() < deadline, "upstream death");
             epics_base_rs::runtime::task::sleep(Duration::from_millis(20)).await;
@@ -4215,7 +4216,7 @@ ASG(NewGroup) {
         );
         drop(hold);
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = epics_base_rs::runtime::time::deadline_from_now(Duration::from_secs(10));
         while shadow_units(db.clone()).await.as_deref() != Some("cm") {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -4255,7 +4256,7 @@ ASG(NewGroup) {
         let monitors = |want: usize, what: &'static str| {
             let pv = upstream_pv.clone();
             async move {
-                let deadline = std::time::Instant::now() + bound;
+                let deadline = epics_base_rs::runtime::time::deadline_from_now(bound);
                 while pv.subscriber_count() != want {
                     assert!(std::time::Instant::now() < deadline, "{what}");
                     tokio::time::sleep(Duration::from_millis(20)).await;
@@ -4636,7 +4637,7 @@ ASG(NewGroup) {
             .await
             .expect("upstream connects");
         assert!(db.find_pv(name).is_some());
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = epics_base_rs::runtime::time::deadline_from_now(Duration::from_secs(10));
         while upstream.subscriber_count() < 2 {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -4932,7 +4933,7 @@ ASG(NewGroup) {
         // window between the set and the read below. Upstream never changes
         // value again and the property task writes metadata only, so no later
         // event can reach the value cell.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = epics_base_rs::runtime::time::deadline_from_now(Duration::from_secs(5));
         while pv.is_pending() {
             assert!(
                 std::time::Instant::now() < deadline,

@@ -143,7 +143,7 @@ fn drain(rx: &mut EventReader) -> Vec<i32> {
 
 /// Process `rec` and wait out its PACT (seq is asynchronous).
 async fn settle(db: &PvDatabase, rec: &str) {
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while std::time::Instant::now() < deadline {
         if !db.get_record(rec).unwrap().read().is_processing() {
             return;

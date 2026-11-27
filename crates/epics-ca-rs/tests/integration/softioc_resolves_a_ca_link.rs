@@ -54,7 +54,7 @@ fn read_h_over_ca(db: &std::path::Path, port: u16) -> Attempt {
     let mut heard = Vec::new();
     let mut read = None;
     // Both pipes close when the child exits, which ends either wait.
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(30));
     let mut ready = false;
     while let Ok(line) = rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
         ready = line.contains("iocRun: All initialization complete");

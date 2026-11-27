@@ -60,7 +60,7 @@ async fn test_periodic_save_set() {
     let handle = mgr.clone().start(db.clone()).unwrap();
 
     // The first pass arms the timer; the next, a MIN_DELAY later, saves.
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while std::time::Instant::now() < deadline {
         if sav_path.exists() {
             break;

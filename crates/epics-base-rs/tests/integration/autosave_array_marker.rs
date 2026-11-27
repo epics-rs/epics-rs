@@ -38,7 +38,8 @@ async fn child_marker() {
         .run_outcome(|config| async move {
             let db = config.db.clone();
             epics_base_rs::server::db_server::announce_serving("probe");
-            let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+            let deadline =
+                epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
             while db.get_pv("A").unwrap().to_f64() != Some(3.0) {
                 assert!(Instant::now() < deadline, "A never restored");
                 sleep(Duration::from_millis(20)).await;

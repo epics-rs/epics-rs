@@ -59,7 +59,7 @@ fn queued(
 /// thread does, and wait for that call to return: the finish it makes is
 /// requested by then.
 async fn answer() {
-    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     let client = loop {
         if let Some(c) = WAITING.lock().unwrap().take().and_then(|c| c.upgrade()) {
             break c;
@@ -167,7 +167,7 @@ async fn low_band_drained() {
         &CallbackCell::new(Holder(shared.clone())),
     )
     .unwrap();
-    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while !shared.0.lock().unwrap().running {
         assert!(Instant::now() < deadline, "the low band never drained");
         sleep(Duration::from_millis(5)).await;
@@ -183,7 +183,7 @@ fn a_finish_requested_before_the_scan_stopped_ends_the_cycle() {
         answer().await;
         db.scan_control().stop();
         drop(busy);
-        let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
         while f(&db, "r.PACT") != 0.0 {
             assert!(Instant::now() < deadline, "the cycle never ended");
             sleep(Duration::from_millis(5)).await;

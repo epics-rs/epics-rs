@@ -80,7 +80,7 @@ fn wait_ready(child: &mut Child) -> std::sync::mpsc::Receiver<String> {
     }
     forward(child.stdout.take().unwrap(), tx.clone());
     forward(child.stderr.take().unwrap(), tx);
-    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     loop {
         let line = rx
             .recv_timeout(deadline.saturating_duration_since(Instant::now()))
@@ -104,7 +104,7 @@ fn sig_bit(child: &Child, field: &str, sig: i32) -> bool {
 /// Wait until the child catches `sig`: the handler is installed when the
 /// post-init wait first polls, after iocInit has reported.
 fn wait_caught(child: &Child, sig: i32) {
-    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while !sig_bit(child, "SigCgt", sig) {
         assert!(Instant::now() < deadline, "the child never caught {sig}");
         std::thread::sleep(Duration::from_millis(10));
@@ -118,7 +118,7 @@ fn kill(child: &Child, sig: i32) {
 
 /// The child's status if it ends within `within`.
 fn ended(child: &mut Child, within: Duration) -> Option<ExitStatus> {
-    let deadline = Instant::now() + within;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(within);
     while Instant::now() < deadline {
         if let Some(st) = child.try_wait().unwrap() {
             return Some(st);

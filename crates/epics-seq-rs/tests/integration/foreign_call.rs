@@ -64,7 +64,7 @@ fn end_trajectory() {
 }
 
 async fn until(what: &str, done: impl Fn() -> bool) {
-    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while !done() {
         assert!(Instant::now() < deadline, "{what}");
         task::sleep(std::time::Duration::from_millis(10)).await;

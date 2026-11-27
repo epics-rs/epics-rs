@@ -21,7 +21,7 @@ fn num(db: &PvDatabase, pv: &str) -> f64 {
 }
 
 async fn until_rmt(sdb: &PvDatabase, want: f64) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(10));
     while num(sdb, "RMT") != want {
         if Instant::now() >= deadline {
             return false;

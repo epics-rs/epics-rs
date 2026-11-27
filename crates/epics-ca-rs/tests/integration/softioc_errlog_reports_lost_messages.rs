@@ -113,7 +113,7 @@ fn console_of_a_stalled_pass(path: &std::path::Path, port: u16) -> Option<String
             }
         }
     });
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(20));
     while Instant::now() < deadline {
         let (printed, lost, _) = tally(&String::from_utf8_lossy(&seen));
         if printed + lost >= BURST {

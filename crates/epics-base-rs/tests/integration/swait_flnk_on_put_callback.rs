@@ -58,7 +58,7 @@ async fn put(db: &PvDatabase, rec: &str, field: &str, v: f64) -> ProcessCompleti
 }
 
 async fn settle(db: &PvDatabase, done: impl Fn(&PvDatabase) -> bool) {
-    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_base_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while !done(db) && std::time::Instant::now() < deadline {
         epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;
     }

@@ -55,7 +55,7 @@ fn context() -> CommandContext {
 /// makes one, the wakeup's, in the 10 s this allows.
 fn ten_after(port: &str, cmd: CommandDef, count: &AtomicUsize) {
     let reach = |n: usize, what: &str| {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = epics_libcom_rs::runtime::time::deadline_from_now(Duration::from_secs(10));
         while count.load(Ordering::Relaxed) < n {
             assert!(
                 Instant::now() < deadline,
@@ -174,7 +174,7 @@ fn an_unbounded_poll_period_leaves_the_poller_running() {
     let _rt = rt.enter();
     rt.spawn(controller.build(hour, hour, 0).start());
 
-    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     while polls.load(Ordering::Relaxed) < 1 {
         assert!(Instant::now() < deadline, "no startup pass");
         std::thread::sleep(Duration::from_millis(1));

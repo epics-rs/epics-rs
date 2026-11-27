@@ -757,7 +757,8 @@ pub(crate) mod passes {
         /// [`Self::take`] once `n` processes have run on a callback band,
         /// or after [`fact_budget::FACT_BUDGET`].
         pub(crate) fn take_after(&self, n: usize) -> Vec<Option<MotorStatus>> {
-            let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
+            let deadline =
+                epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
             while self.0.lock().unwrap().len() < n && std::time::Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(1));
             }

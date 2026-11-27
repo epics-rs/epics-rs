@@ -123,7 +123,7 @@ async fn nowait_long_put_on_enum_native_converts() {
     let (_client, ch) = server_with_bi("PNC:BI:NOWAIT").await;
     ch.put_nowait(&EpicsValue::Long(1)).await.expect("put");
 
-    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+    let deadline = epics_libcom_rs::runtime::time::deadline_from_now(fact_budget::FACT_BUDGET);
     loop {
         if read_index(&ch).await == 1 {
             break;

@@ -380,11 +380,7 @@ record(stringout, "{writer}") {{ field(OUT, "{rec} NPP") }}"#
 /// ```
 #[epics_macros_rs::epics_test]
 async fn swait_calc_posts_match_oracle() {
-    let heard = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let sink = std::sync::Arc::clone(&heard);
-    epics_base_rs::runtime::log::errlog_add_listener(move |m| {
-        sink.lock().unwrap().push(m.to_string());
-    });
+    let mut capture = epics_base_rs::runtime::log::ErrlogCapture::start();
     let mut cam = Cam::new(
         r#"
 record(ao, "SWIN") { field(VAL, "3") }
@@ -393,10 +389,7 @@ record(swait, "SW") { field(INAN, "SWIN") field(CALC, "A") }
         &["SW.CLCV", "SW.CALC"],
     )
     .await;
-    let errlog = || {
-        epics_base_rs::runtime::log::errlog_flush();
-        std::mem::take(&mut *heard.lock().unwrap())
-    };
+    let mut errlog = || capture.take();
     assert_eq!(errlog(), Vec::<String>::new());
     assert_eq!(
         cam.put("SW.CALC", "A+1").await,
@@ -431,16 +424,12 @@ record(swait, "SW") { field(INAN, "SWIN") field(CALC, "A") }
 /// field value PV: SW`, then CLCV -1.
 #[epics_macros_rs::epics_test]
 async fn swait_init_bad_calc_matches_oracle() {
-    let heard = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let sink = std::sync::Arc::clone(&heard);
-    epics_base_rs::runtime::log::errlog_add_listener(move |m| {
-        sink.lock().unwrap().push(m.to_string());
-    });
+    let capture = epics_base_rs::runtime::log::ErrlogCapture::start();
     let cam = Cam::from_script(r#"record(swait, "SW") { field(CALC, "A+") }"#, &["SW.CLCV"]).await;
-    epics_base_rs::runtime::log::errlog_flush();
     // The loader's own `in CALC expression` line, where it refuses the text,
     // is the load's to pin; this is init_record's.
-    let heard: Vec<String> = std::mem::take(&mut *heard.lock().unwrap())
+    let heard: Vec<String> = capture
+        .finish()
         .into_iter()
         .filter(|m| m.starts_with("recGblRecordError"))
         .collect();

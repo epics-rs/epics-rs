@@ -34,8 +34,9 @@
 //! already ported (`SubRecord::parks_pact`); only the line was missing.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
+use epics_base_rs::runtime::log::ErrlogCapture;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::recgbl::alarm_status;
@@ -46,18 +47,12 @@ use epics_base_rs::types::EpicsValue;
 const S_DB_BAD_SUB: i32 = (511 << 16) | 35;
 
 /// The empty-SNAM line is written during `build()`, so the listener goes first.
-fn listen() -> Arc<Mutex<Vec<String>>> {
-    let heard = Arc::new(Mutex::new(Vec::new()));
-    let sink = Arc::clone(&heard);
-    epics_base_rs::runtime::log::errlog_add_listener(move |m| {
-        sink.lock().expect("sink").push(m.to_string());
-    });
-    heard
+fn listen() -> ErrlogCapture {
+    ErrlogCapture::start()
 }
 
-fn heard(sink: &Arc<Mutex<Vec<String>>>) -> String {
-    epics_base_rs::runtime::log::errlog_flush();
-    sink.lock().expect("sink").join("\n")
+fn heard(sink: &mut ErrlogCapture) -> String {
+    sink.lines().join("\n")
 }
 
 async fn ioc(db_text: &str) -> Arc<PvDatabase> {
@@ -130,14 +125,14 @@ async fn an_lflg_read_asub_does_not_bind_its_snam_at_init() {
 /// C `subRecord.c:118-122` — the report and the PACT park are one branch.
 #[epics_macros_rs::epics_test]
 async fn a_sub_with_an_empty_snam_says_so_on_the_errlog() {
-    let sink = listen();
+    let mut sink = listen();
     let db = ioc(concat!(
         "record(sub, \"T:EMPTY\") { }\n",
         "record(sub, \"T:NAMED\") { field(SNAM,\"theSub\") }\n",
     ))
     .await;
 
-    let log = heard(&sink);
+    let log = heard(&mut sink);
     assert!(
         log.contains("T:EMPTY.SNAM is empty"),
         "C `subRecord.c:119` through `epicsPrintf`, got {log:?}"
@@ -157,10 +152,10 @@ async fn a_sub_with_an_empty_snam_says_so_on_the_errlog() {
 /// which says nothing at all — the report belongs to `sub` alone.
 #[epics_macros_rs::epics_test]
 async fn an_empty_snam_on_an_asub_is_silent() {
-    let sink = listen();
+    let mut sink = listen();
     let db = ioc("record(aSub, \"T:A\") { }\n").await;
 
-    let log = heard(&sink);
+    let log = heard(&mut sink);
     assert!(
         !log.contains("T:A.SNAM is empty"),
         "C reports an empty SNAM only from `subRecord.c:119`, got {log:?}"

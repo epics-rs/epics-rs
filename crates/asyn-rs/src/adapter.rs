@@ -6525,7 +6525,7 @@ mod tests {
     /// devAsynXXXTimeSeries.h:108-114). A child, to read its stdout.
     #[test]
     fn a_port_without_the_records_interface_refuses_it_at_init() {
-        use epics_base_rs::runtime::log::{errlog_add_listener, errlog_flush};
+        use epics_base_rs::runtime::log::ErrlogCapture;
         use epics_base_rs::server::ioc_app::DeviceSupportContext;
         use epics_base_rs::server::records::ai::AiRecord;
         use epics_base_rs::server::records::busy::BusyRecord;
@@ -6648,9 +6648,7 @@ mod tests {
         );
         crate::asyn_record::register_port("fi_port", handle, &crate::registry::open_owner())
             .unwrap();
-        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-        let sink = seen.clone();
-        errlog_add_listener(move |m: &str| sink.lock().unwrap().push(m.to_string()));
+        let errlog = ErrlogCapture::start();
         for (record_type, dtyp, inp, line, _) in cases {
             let ctx = DeviceSupportContext {
                 record_type,
@@ -6674,8 +6672,7 @@ mod tests {
             };
             assert_eq!(dev.init(rec.as_mut()).unwrap(), want, "{dtyp}");
         }
-        errlog_flush();
-        for m in seen.lock().unwrap().iter() {
+        for m in errlog.finish() {
             println!("errlog: {}", m.trim_end_matches('\n'));
         }
     }
@@ -6773,7 +6770,7 @@ mod tests {
     /// type errlogs C's line and dies without an alarm.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_time_series_with_the_wrong_ftvl_errlogs_cs_line() {
-        use epics_base_rs::runtime::log::{errlog_add_listener, errlog_flush};
+        use epics_base_rs::runtime::log::ErrlogCapture;
         use epics_base_rs::server::ioc_app::DeviceSupportContext;
         use epics_base_rs::server::records::waveform::WaveformRecord;
         use epics_base_rs::types::DbFieldType;
@@ -6791,9 +6788,7 @@ mod tests {
         );
         crate::asyn_record::register_port("du_ftvl", handle, &crate::registry::open_owner())
             .unwrap();
-        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-        let sink = seen.clone();
-        errlog_add_listener(move |m: &str| sink.lock().unwrap().push(m.to_string()));
+        let errlog = ErrlogCapture::start();
 
         let ctx = DeviceSupportContext {
             record_type: "waveform",
@@ -6805,10 +6800,9 @@ mod tests {
         dev.set_record_info("DU:FTVL", ScanType::Passive);
         let mut rec = WaveformRecord::new(4, DbFieldType::Double);
         assert_eq!(dev.init(&mut rec).unwrap(), DeviceInitOutcome::dead());
-        errlog_flush();
         let line = "devAsynInt32TimeSeries::initCommon, DU:FTVL field type must be \
                     SIGNED_TYPE or UNSIGNED_TYPE";
-        let seen = seen.lock().unwrap();
+        let seen = errlog.finish();
         assert!(seen.iter().any(|m| m.trim_end() == line), "{seen:?}");
     }
 
@@ -6816,7 +6810,7 @@ mod tests {
     /// connects or calls `drvUserCreate`: a bad FTVL prints only its line.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_time_series_checks_ftvl_before_the_link() {
-        use epics_base_rs::runtime::log::{errlog_add_listener, errlog_flush};
+        use epics_base_rs::runtime::log::ErrlogCapture;
         use epics_base_rs::server::ioc_app::DeviceSupportContext;
         use epics_base_rs::server::records::waveform::WaveformRecord;
         use epics_base_rs::types::DbFieldType;
@@ -6834,9 +6828,7 @@ mod tests {
         );
         crate::asyn_record::register_port("du_order", handle, &crate::registry::open_owner())
             .unwrap();
-        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-        let sink = seen.clone();
-        errlog_add_listener(move |m: &str| sink.lock().unwrap().push(m.to_string()));
+        let errlog = ErrlogCapture::start();
 
         let cases = [
             ("DU:ORD_PARAM", "@asyn(du_order,0)NOPE"),
@@ -6854,8 +6846,7 @@ mod tests {
             let mut rec = WaveformRecord::new(4, DbFieldType::Long);
             assert_eq!(dev.init(&mut rec).unwrap(), DeviceInitOutcome::dead());
         }
-        errlog_flush();
-        let seen = seen.lock().unwrap();
+        let seen = errlog.finish();
         for (name, _) in cases {
             let ours: Vec<_> = seen.iter().filter(|m| m.contains(name)).collect();
             let line = format!(

@@ -27,11 +27,12 @@
 //! The port returned `S_db_noMod` and said nothing at all, so a refused put was
 //! indistinguishable from an accepted one on the console.
 
+use epics_base_rs::runtime::log::ErrlogCapture;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::record::Record;
 use epics_base_rs::types::EpicsValue;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 const DB: &str = r#"
 record(sub, "T:SUB") { field(INAM, "initSub") }
@@ -49,32 +50,25 @@ async fn build() -> Arc<epics_base_rs::server::database::PvDatabase> {
         .0
 }
 
-fn listen() -> Arc<Mutex<Vec<String>>> {
-    let heard = Arc::new(Mutex::new(Vec::new()));
-    let sink = Arc::clone(&heard);
-    epics_base_rs::runtime::log::errlog_add_listener(move |m| {
-        sink.lock().expect("sink").push(m.to_string());
-    });
-    heard
+fn listen() -> ErrlogCapture {
+    ErrlogCapture::start()
 }
 
-fn heard(sink: &Arc<Mutex<Vec<String>>>) -> String {
-    epics_base_rs::runtime::log::errlog_flush();
-    sink.lock().expect("sink").join("")
+fn heard(sink: &mut ErrlogCapture) -> String {
+    sink.lines().join("")
 }
 
-fn forget(sink: &Arc<Mutex<Vec<String>>>) {
-    epics_base_rs::runtime::log::errlog_flush();
-    sink.lock().expect("sink").clear();
+fn forget(sink: &mut ErrlogCapture) {
+    sink.take();
 }
 
 /// The CA / `dbpf` route: `dbPutField` → `dbPut` → `dbPutSpecial(paddr, 0)`.
 /// The line names the record AND the field, and the value does not change.
 #[epics_macros_rs::epics_test]
 async fn a_refused_ca_put_writes_the_line_dbpf_relies_on() {
-    let sink = listen();
+    let mut sink = listen();
     let db = build().await;
-    forget(&sink);
+    forget(&mut sink);
 
     let err = db
         .put_record_field_from_ca("T:SUB", "INAM", EpicsValue::String("zzz".into()))
@@ -85,7 +79,7 @@ async fn a_refused_ca_put_writes_the_line_dbpf_relies_on() {
         "expected S_db_noMod, got {err:?}"
     );
     assert_eq!(
-        heard(&sink),
+        heard(&mut sink),
         "recGblDbaddrError: dbPut Attempt to modify noMod field PV: T:SUB.INAM\n",
         "dbAccess.c:125 through recGbl.c:87-90, verbatim and once"
     );
@@ -100,15 +94,15 @@ async fn a_refused_ca_put_writes_the_line_dbpf_relies_on() {
 /// the `SPC_NOMOD` the oracle's monitor phase already excludes.
 #[epics_macros_rs::epics_test]
 async fn a_refused_internal_put_speaks_from_the_same_gate() {
-    let sink = listen();
+    let mut sink = listen();
     let db = build().await;
-    forget(&sink);
+    forget(&mut sink);
 
     db.put_pv("T:SEL.VAL", EpicsValue::Double(3.0))
         .await
         .expect_err("sel.VAL is special(SPC_NOMOD)");
     assert_eq!(
-        heard(&sink),
+        heard(&mut sink),
         "recGblDbaddrError: dbPut Attempt to modify noMod field PV: T:SEL.VAL\n"
     );
 }
@@ -119,26 +113,30 @@ async fn a_refused_internal_put_speaks_from_the_same_gate() {
 /// would print C's `dbPut` line twice, once before `dbPut` and once inside it.
 #[epics_macros_rs::epics_test]
 async fn the_pre_put_precondition_check_stays_silent() {
-    let sink = listen();
+    let mut sink = listen();
     let db = build().await;
-    forget(&sink);
+    forget(&mut sink);
 
     db.check_external_put_preconditions("T:SUB", "INAM")
         .await
         .expect_err("the precondition check still refuses");
-    assert_eq!(heard(&sink), "", "doPreProcessing writes no errlog line");
+    assert_eq!(
+        heard(&mut sink),
+        "",
+        "doPreProcessing writes no errlog line"
+    );
 }
 
 /// An accepted put says nothing — the line belongs to the refusal, not to the
 /// route.
 #[epics_macros_rs::epics_test]
 async fn an_accepted_put_writes_no_line() {
-    let sink = listen();
+    let mut sink = listen();
     let db = build().await;
-    forget(&sink);
+    forget(&mut sink);
 
     db.put_record_field_from_ca("T:SUB", "DESC", EpicsValue::String("ok".into()))
         .await
         .unwrap();
-    assert_eq!(heard(&sink), "");
+    assert_eq!(heard(&mut sink), "");
 }

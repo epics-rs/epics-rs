@@ -203,20 +203,18 @@ mod tests {
 
     /// What `f` sends to errlog, each pvxs line without its timestamp.
     fn logged(f: impl FnOnce()) -> Vec<String> {
-        use epics_base_rs::runtime::log;
-        let heard = std::sync::Arc::new(Mutex::new(Vec::new()));
-        let sink = heard.clone();
-        let id = log::errlog_add_listener(move |m| {
-            let line = match m.split_once(' ') {
-                Some((time, line)) if time.starts_with(|c: char| c.is_ascii_digit()) => line,
-                _ => m,
-            };
-            sink.lock().unwrap().push(line.to_owned());
-        });
+        let errlog = epics_base_rs::runtime::log::ErrlogCapture::start();
         f();
-        log::errlog_flush();
-        log::errlog_remove_listener(id);
-        heard.lock().unwrap().clone()
+        errlog
+            .finish()
+            .iter()
+            .map(|m| match m.split_once(' ') {
+                Some((time, line)) if time.starts_with(|c: char| c.is_ascii_digit()) => {
+                    line.to_owned()
+                }
+                _ => m.clone(),
+            })
+            .collect()
     }
 
     /// softIocPVX 1.5.3 in a loopback-only netns prints both: the 60-byte

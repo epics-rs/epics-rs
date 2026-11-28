@@ -15767,15 +15767,15 @@ mod destroyed_channel_teardown_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_failed_plain_write_sends_its_status_text() {
         use epics_base_rs::server::pv::WriteForward;
-        let logged = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let listener = epics_base_rs::runtime::log::errlog_add_listener({
-            let logged = logged.clone();
-            move |line| {
-                if line.contains("casStrmClient") {
-                    logged.lock().unwrap().push(line.to_string());
-                }
-            }
-        });
+        let mut errlog = epics_base_rs::runtime::log::ErrlogCapture::start();
+        let mut logged = || -> Vec<String> {
+            errlog
+                .lines()
+                .iter()
+                .filter(|l| l.contains("casStrmClient"))
+                .cloned()
+                .collect()
+        };
         let (db, pending) = parked_read_db().await;
         pending.set_write_hook(Arc::new(|_value, _ctx| {
             Box::pin(async move {
@@ -15831,9 +15831,8 @@ mod destroyed_channel_teardown_tests {
         assert!(early.iter().all(|h| h.cmmd != CA_PROTO_ERROR), "held");
         pending.make_ready(ready_snapshot());
         assert_eq!(error(&mut client).await, unsent, "held, then failed");
-        epics_base_rs::runtime::log::errlog_flush();
         assert_eq!(
-            *logged.lock().unwrap(),
+            logged(),
             [" filename=\"../casStrmClient.cc\" line number=1119  write failed\n"]
         );
 
@@ -15843,10 +15842,8 @@ mod destroyed_channel_teardown_tests {
             .expect("write");
         client.flush().await.expect("flush");
         assert_eq!(error(&mut client).await, unsent, "failed at once");
-        epics_base_rs::runtime::log::errlog_flush();
-        assert_eq!(logged.lock().unwrap().len(), 1, "unlogged");
+        assert_eq!(logged().len(), 1, "unlogged");
 
-        epics_base_rs::runtime::log::errlog_remove_listener(listener);
         drop(client);
         handle.abort();
     }
@@ -17113,13 +17110,7 @@ mod destroyed_channel_teardown_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn each_request_on_a_retired_sid_gets_the_pcas_answer() {
         const FILE: &str = "../../../../src/pcas/generic/casStrmClient.cc";
-        let logged = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sink = logged.clone();
-        let listener = epics_base_rs::runtime::log::errlog_add_listener(move |line| {
-            if line.contains(FILE) {
-                sink.lock().unwrap().push(line.to_string());
-            }
-        });
+        let errlog = epics_base_rs::runtime::log::ErrlogCapture::start();
         let db = Arc::new(PvDatabase::new());
         let peer: SocketAddr = "127.0.0.1:55306".parse().unwrap();
         let (mut client, handle, sid) = retired_circuit(&db, "BR3:pcas", peer).await;
@@ -17192,10 +17183,10 @@ mod destroyed_channel_teardown_tests {
             None,
             "closed after EVENT_CANCEL"
         );
-        epics_base_rs::runtime::log::errlog_flush();
-        epics_base_rs::runtime::log::errlog_remove_listener(listener);
+        let mut logged = errlog.finish();
+        logged.retain(|l| l.contains(FILE));
         assert_eq!(
-            *logged.lock().unwrap(),
+            logged,
             [2151, 2257].map(|line| format!("CAS: bad resource id in \"{FILE}\" at line {line}\n"))
         );
         handle.0.abort();
@@ -18356,24 +18347,18 @@ mod scalar_string_without_nul_tests {
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    /// Every errlog line that starts with `CAS: forcing`.
-    fn forcing_lines() -> (
-        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
-        epics_base_rs::runtime::log::ErrlogListenerId,
-    ) {
-        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sink = seen.clone();
-        let id = epics_base_rs::runtime::log::errlog_add_listener(move |line| {
-            if line.starts_with("CAS: forcing") {
-                sink.lock().unwrap().push(line.to_string());
-            }
-        });
-        (seen, id)
+    /// Every errlog line since the last call that starts with `CAS: forcing`.
+    fn forcing_lines(errlog: &mut epics_base_rs::runtime::log::ErrlogCapture) -> Vec<String> {
+        errlog
+            .take()
+            .into_iter()
+            .filter(|l| l.starts_with("CAS: forcing"))
+            .collect()
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_40_byte_string_put_without_a_nul_drops_the_circuit() {
-        let (seen, listener) = forcing_lines();
+        let mut errlog = epics_base_rs::runtime::log::ErrlogCapture::start();
         for (port, name, cmmd) in [
             (55370, "L41", CA_PROTO_WRITE_NOTIFY),
             (55371, "L128", CA_PROTO_WRITE_NOTIFY),
@@ -18439,9 +18424,8 @@ mod scalar_string_without_nul_tests {
                 .expect("the circuit closes")
                 .unwrap();
             assert!(res.is_err(), "{name} cmd {cmmd}: RSRV_ERROR");
-            epics_base_rs::runtime::log::errlog_flush();
             assert_eq!(
-                std::mem::take(&mut *seen.lock().unwrap()),
+                forcing_lines(&mut errlog),
                 vec![format!("CAS: forcing disconnect from 127.0.0.1:{port}\n")],
                 "{name} cmd {cmmd}"
             );
@@ -18472,7 +18456,6 @@ mod scalar_string_without_nul_tests {
                 );
             }
         }
-        epics_base_rs::runtime::log::errlog_remove_listener(listener);
     }
 
     /// The receive gate's refusals end the circuit with the same line:
@@ -18481,13 +18464,7 @@ mod scalar_string_without_nul_tests {
     /// lines and then the disconnect. N=1 counts the VERSION read with it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_receive_gate_teardown_prints_forcing_disconnect() {
-        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sink = seen.clone();
-        let listener = epics_base_rs::runtime::log::errlog_add_listener(move |line| {
-            if line.starts_with("CAS: ") && line.contains("127.0.0.1:55376") {
-                sink.lock().unwrap().push(line.to_string());
-            }
-        });
+        let errlog = epics_base_rs::runtime::log::ErrlogCapture::start();
         let db = Arc::new(PvDatabase::new());
         let acf = epics_base_rs::server::access_security::new_acf_cell(None);
         let (_acf_reload_tx, acf_reload_rx) = broadcast::channel::<()>(4);
@@ -18528,9 +18505,10 @@ mod scalar_string_without_nul_tests {
             .expect("the circuit closes")
             .unwrap();
         assert!(res.is_err());
-        epics_base_rs::runtime::log::errlog_flush();
+        let mut seen = errlog.finish();
+        seen.retain(|l| l.starts_with("CAS: ") && l.contains("127.0.0.1:55376"));
         assert_eq!(
-            *seen.lock().unwrap(),
+            seen,
             [
                 "CAS: request from 127.0.0.1:55376 => CAS: Missaligned protocol rejected\n",
                 "CAS: Request from 127.0.0.1:55376 => cmmd=23 cid=0x1234 type=7 count=3 postsize=4\n",
@@ -18538,7 +18516,6 @@ mod scalar_string_without_nul_tests {
                 "CAS: forcing disconnect from 127.0.0.1:55376\n",
             ]
         );
-        epics_base_rs::runtime::log::errlog_remove_listener(listener);
     }
 }
 

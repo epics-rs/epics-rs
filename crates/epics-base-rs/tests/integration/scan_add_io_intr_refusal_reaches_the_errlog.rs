@@ -26,25 +26,20 @@
 //! asyndevAiInt32A0`.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
+use epics_base_rs::runtime::log::ErrlogCapture;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
 
 /// The refusal is written during `build()`, so the listener goes on first.
-fn listen() -> Arc<Mutex<Vec<String>>> {
-    let heard = Arc::new(Mutex::new(Vec::new()));
-    let sink = Arc::clone(&heard);
-    epics_base_rs::runtime::log::errlog_add_listener(move |m| {
-        sink.lock().expect("sink").push(m.to_string());
-    });
-    heard
+fn listen() -> ErrlogCapture {
+    ErrlogCapture::start()
 }
 
-fn heard(sink: &Arc<Mutex<Vec<String>>>) -> String {
-    epics_base_rs::runtime::log::errlog_flush();
-    sink.lock().expect("sink").join("\n")
+fn heard(sink: &mut ErrlogCapture) -> String {
+    sink.lines().join("\n")
 }
 
 async fn ioc(db_text: &str) -> Arc<PvDatabase> {
@@ -63,10 +58,10 @@ async fn ioc(db_text: &str) -> Arc<PvDatabase> {
 /// byte, and the demotion it announces.
 #[epics_macros_rs::epics_test]
 async fn a_record_with_no_dset_is_refused_through_recgbl_record_error() {
-    let sink = listen();
+    let mut sink = listen();
     let db = ioc("record(calc, \"T:A\") { field(SCAN,\"I/O Intr\") }\n").await;
 
-    let log = heard(&sink);
+    let log = heard(&mut sink);
     assert!(
         log.contains("recGblRecordError: scanAdd: I/O Intr not valid (no DSET)   PV: T:A"),
         "C `dbScan.c:273-275` through `recGbl.c:68-70`, got {log:?}"
@@ -86,7 +81,7 @@ async fn a_record_with_no_dset_is_refused_through_recgbl_record_error() {
 /// order. softIoc R7.0.10 on the DB below prints A1, A2, B1, L1.
 #[epics_macros_rs::epics_test]
 async fn the_refusals_come_out_in_cs_record_type_order() {
-    let sink = listen();
+    let mut sink = listen();
     ioc(r#"
 record(longin, "L1") { field(SCAN, "I/O Intr") }
 record(ai, "A1") { field(SCAN, "I/O Intr") }
@@ -94,13 +89,10 @@ record(bi, "B1") { field(SCAN, "I/O Intr") }
 record(ai, "A2") { field(SCAN, "I/O Intr") }
 "#)
     .await;
-    epics_base_rs::runtime::log::errlog_flush();
     let log: Vec<String> = sink
-        .lock()
-        .expect("sink")
-        .iter()
+        .take()
+        .into_iter()
         .filter(|m| m.contains("scanAdd"))
-        .cloned()
         .collect();
     let want = ["A1", "A2", "B1", "L1"].map(|pv| {
         format!("recGblRecordError: scanAdd: I/O Intr not valid (no get_ioint_info)  PV: {pv}\n")

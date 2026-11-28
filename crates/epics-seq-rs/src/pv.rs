@@ -1711,22 +1711,11 @@ mod tests {
 
     /// The errlog lines containing `needle` that `f` logs.
     fn logged(needle: &str, f: impl FnOnce()) -> Vec<String> {
-        use epics_base_rs::runtime::log::{
-            errlog_add_listener, errlog_flush, errlog_remove_listener,
-        };
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let id = {
-            let (seen, needle) = (seen.clone(), needle.to_owned());
-            errlog_add_listener(move |m| {
-                if m.contains(&needle) {
-                    seen.lock().push(m.to_owned());
-                }
-            })
-        };
+        let errlog = epics_base_rs::runtime::log::ErrlogCapture::start();
         f();
-        errlog_flush();
-        errlog_remove_listener(id);
-        std::mem::take(&mut *seen.lock())
+        let mut seen = errlog.finish();
+        seen.retain(|m| m.contains(needle));
+        seen
     }
 
     /// Run what `var` queued, then `cmds`, against a [`Refusing`] channel,

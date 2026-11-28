@@ -11,7 +11,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use epics_base_rs::runtime::log::{errlog_add_listener, errlog_flush};
+use epics_base_rs::runtime::log::ErrlogCapture;
 use epics_base_rs::server::autosave::AutosaveStartupConfig;
 use epics_base_rs::server::autosave::manager::AutosaveManager;
 use epics_base_rs::server::autosave::save_set::SaveStrategy;
@@ -89,21 +89,16 @@ fn create_all(holder: &Arc<Mutex<AutosaveStartupConfig>>, db: &Arc<PvDatabase>) 
     run(holder, db, "create_manual_set", &["settings.req", "P=X:"]);
 }
 
-fn heard() -> Arc<Mutex<Vec<String>>> {
-    let heard = Arc::new(Mutex::new(Vec::new()));
-    let sink = heard.clone();
-    errlog_add_listener(move |m| sink.lock().unwrap().push(m.trim_end().to_string()));
-    heard
+fn heard() -> ErrlogCapture {
+    ErrlogCapture::start()
 }
 
-fn refusals(heard: &Mutex<Vec<String>>) -> Vec<String> {
-    errlog_flush();
+fn refusals(heard: &mut ErrlogCapture) -> Vec<String> {
     heard
-        .lock()
-        .unwrap()
+        .lines()
         .iter()
+        .map(|l| l.trim_end().to_string())
         .filter(|l| l.contains("already in"))
-        .cloned()
         .collect()
 }
 
@@ -160,11 +155,11 @@ async fn a_method_twice_is_refused_with_cs_line() {
     let dir = tempfile::tempdir().unwrap();
     let holder = holder(&dir);
     let db = db().await;
-    let heard = heard();
+    let mut heard = heard();
     create_all(&holder, &db);
-    assert!(refusals(&heard).is_empty());
+    assert!(refusals(&mut heard).is_empty());
     create_all(&holder, &db);
-    assert_eq!(refusals(&heard), expected_refusals());
+    assert_eq!(refusals(&mut heard), expected_refusals());
     assert_one_set_with_every_method(&manager(&holder));
 }
 
@@ -193,7 +188,7 @@ async fn a_set_that_did_not_build_is_not_kept() {
     let dir = tempfile::tempdir().unwrap();
     let holder = holder(&dir);
     let db = db().await;
-    let heard = heard();
+    let mut heard = heard();
     let builder = holder.lock().unwrap().into_builder();
     let mgr = Arc::new(builder.build().await);
     holder.lock().unwrap().manager = Some(mgr.clone());
@@ -205,7 +200,7 @@ async fn a_set_that_did_not_build_is_not_kept() {
         &["missing.req", "IOC:trig"],
     );
     run(&holder, &db, "create_manual_set", &["missing.req"]);
-    assert!(refusals(&heard).is_empty());
+    assert!(refusals(&mut heard).is_empty());
     assert!(mgr.status_all().await.is_empty());
 
     std::fs::write(dir.path().join("missing.req"), "IOC:trig\n").unwrap();

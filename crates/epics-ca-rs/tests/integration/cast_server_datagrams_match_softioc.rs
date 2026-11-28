@@ -81,16 +81,9 @@ fn replies_until(sock: &UdpSocket, cid: u32) -> Vec<u32> {
 
 /// Every errlog line `f` produces, in order.
 fn errlog_lines(f: impl FnOnce()) -> Vec<String> {
-    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let sink = seen.clone();
-    epics_base_rs::runtime::log::errlog_flush();
-    let listener = epics_base_rs::runtime::log::errlog_add_listener(move |line| {
-        sink.lock().unwrap().push(line.to_string());
-    });
+    let errlog = epics_base_rs::runtime::log::ErrlogCapture::start();
     f();
-    epics_base_rs::runtime::log::errlog_flush();
-    epics_base_rs::runtime::log::errlog_remove_listener(listener);
-    seen.lock().unwrap().clone()
+    errlog.finish()
 }
 
 /// Sends each datagram followed by a barrier SEARCH that orders them;

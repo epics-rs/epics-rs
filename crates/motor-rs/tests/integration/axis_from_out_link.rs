@@ -188,14 +188,13 @@ fn field(db: &PvDatabase, pv: &str) -> EpicsValue {
 async fn errlog_of<F: std::future::Future<Output = Arc<PvDatabase>>>(
     body: F,
 ) -> (Arc<PvDatabase>, Vec<String>) {
-    use epics_base_rs::runtime::log::{errlog_add_listener, errlog_flush, errlog_remove_listener};
-    let lines = Arc::new(Mutex::new(Vec::new()));
-    let sink = lines.clone();
-    let id = errlog_add_listener(move |m| sink.lock().unwrap().push(m.trim_end().to_owned()));
+    let errlog = epics_base_rs::runtime::log::ErrlogCapture::start();
     let db = body.await;
-    errlog_flush();
-    errlog_remove_listener(id);
-    let lines = lines.lock().unwrap().clone();
+    let lines = errlog
+        .finish()
+        .iter()
+        .map(|m| m.trim_end().to_owned())
+        .collect();
     (db, lines)
 }
 

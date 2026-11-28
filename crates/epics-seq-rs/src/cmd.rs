@@ -354,22 +354,14 @@ mod tests {
 
     #[test]
     fn seq_with_a_negative_stack_size_is_fatal_and_starts_nothing() {
-        use epics_base_rs::runtime::log::{
-            errlog_add_listener, errlog_flush, errlog_remove_listener,
-        };
-
         static P: Recorder = Recorder::new("cmdTestStack");
         seq_register_sequencer_program(&P);
-        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
-        let sink = seen.clone();
-        let id = errlog_add_listener(move |m: &str| sink.lock().push(m.to_owned()));
+        let errlog = epics_base_rs::runtime::log::ErrlogCapture::start();
         let out = seq_out(&[s("cmdTestStack"), ArgValue::Missing, ArgValue::Int(-1)]);
-        errlog_flush();
-        errlog_remove_listener(id);
+        let seen = errlog.finish();
         assert_eq!(out, "");
         assert!(P.1.lock().is_empty());
         let line = "sevr=fatal 3rd argument of seq must be a positive integer";
-        let seen = seen.lock();
         assert!(seen.iter().any(|m| m.trim_end() == line), "{seen:?}");
     }
 

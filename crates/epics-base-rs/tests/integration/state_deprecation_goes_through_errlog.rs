@@ -10,7 +10,6 @@
 
 use std::collections::HashMap;
 use std::os::fd::AsRawFd;
-use std::sync::{Arc, Mutex};
 
 use epics_base_rs::server::ioc_builder::IocBuilder;
 
@@ -20,11 +19,7 @@ by a stringin record.\n";
 
 #[epics_macros_rs::epics_test]
 async fn eltc_0_keeps_the_warning_off_the_console_and_on_the_errlog() {
-    let heard = Arc::new(Mutex::new(Vec::<String>::new()));
-    let sink = Arc::clone(&heard);
-    epics_base_rs::runtime::log::errlog_add_listener(move |m| {
-        sink.lock().expect("sink").push(m.to_string());
-    });
+    let errlog = epics_base_rs::runtime::log::ErrlogCapture::start();
     epics_base_rs::runtime::log::eltc(false);
 
     let builder = IocBuilder::new()
@@ -50,6 +45,6 @@ async fn eltc_0_keeps_the_warning_off_the_console_and_on_the_errlog() {
 
     let err = std::fs::read_to_string(err_sink.path()).unwrap();
     assert!(!err.contains("deprecated"), "stderr was:\n{err}");
-    let log = heard.lock().expect("sink").concat();
+    let log = errlog.finish().concat();
     assert!(log.contains(SOFTIOC), "errlog heard:\n{log}");
 }

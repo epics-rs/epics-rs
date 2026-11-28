@@ -126,27 +126,21 @@ mod tests {
     /// the program. Io starts without the PINI wait and posts them the same.
     #[epics_base_rs::epics_test]
     async fn every_start_posts_seqs_errlog_lines() {
-        let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sink = lines.clone();
-        epics_base_rs::runtime::log::errlog_add_listener(move |m| {
-            if m.contains("equencer") {
-                sink.lock().unwrap().push(m.trim_end().to_owned());
-            }
-        });
+        let errlog = epics_base_rs::runtime::log::ErrlogCapture::start();
         let db = PvDatabase::new();
         let bridge = BlockingBridge::capture();
         seq_start("Io", "name=io1", &bridge, &db).unwrap();
         seq_start("kohzuCtl", "P=T:", &bridge, &db).unwrap();
-        epics_base_rs::runtime::log::errlog_flush();
-        let lines: Vec<String> = lines
-            .lock()
-            .unwrap()
+        let lines: Vec<String> = errlog
+            .finish()
             .iter()
+            .filter(|m| m.contains("equencer"))
+            .map(|m| m.trim_end())
             .map(|l| {
                 let (head, tail) = l.split_once("thread 0x").unwrap_or((l, ""));
                 match tail.split_once(':') {
                     Some((_, rest)) => format!("{head}thread *:{rest}"),
-                    None => l.clone(),
+                    None => l.to_string(),
                 }
             })
             .collect();

@@ -21,10 +21,9 @@
 //! `postEvent 5`, leaving E5 and W6 LINK/INVALID.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 
 use epics_base_rs::error::CaError;
-use epics_base_rs::runtime::log::{errlog_add_listener, errlog_flush};
+use epics_base_rs::runtime::log::ErrlogCapture;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
 
@@ -73,19 +72,14 @@ record(seq, "SQ") {
         .0;
     // No `iocRun` over this database: the running transition is its own.
     db.scan_control().run();
-    let heard = Arc::new(Mutex::new(Vec::<String>::new()));
-    let sink = Arc::clone(&heard);
-    errlog_add_listener(move |m| sink.lock().unwrap().push(m.trim_end().to_string()));
-    let heard = move || {
-        errlog_flush();
-        let mut h = heard.lock().unwrap();
-        let said: Vec<String> = h
+    let mut errlog = ErrlogCapture::start();
+    let mut heard = move || {
+        errlog
+            .take()
             .iter()
+            .map(|m| m.trim_end().to_string())
             .filter(|m| m.starts_with("recGbl"))
-            .cloned()
-            .collect();
-        h.clear();
-        said
+            .collect::<Vec<String>>()
     };
 
     // A DB OUT link: `dbPutLink` -> `dbPut`.

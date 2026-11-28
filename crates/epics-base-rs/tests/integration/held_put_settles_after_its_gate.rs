@@ -6,9 +6,9 @@
 use crate::calink_ioc;
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use epics_base_rs::runtime::log::{errlog_add_listener, errlog_flush};
+use epics_base_rs::runtime::log::ErrlogCapture;
 use epics_base_rs::server::database::PutSplit;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -35,20 +35,15 @@ async fn connected_ioc() -> Arc<PvDatabase> {
     db
 }
 
-fn listen() -> impl Fn() -> Vec<String> {
-    let heard = Arc::new(Mutex::new(Vec::<String>::new()));
-    let sink = Arc::clone(&heard);
-    errlog_add_listener(move |m| sink.lock().unwrap().push(m.to_string()));
+fn listen() -> impl FnMut() -> Vec<String> {
+    let mut errlog = ErrlogCapture::start();
     move || {
-        errlog_flush();
-        let mut heard = heard.lock().unwrap();
-        let said = heard
+        errlog
+            .take()
             .iter()
             .filter(|m| m.contains("Illegal choice PV: MS"))
             .map(|m| m.trim_end().to_string())
-            .collect();
-        heard.clear();
-        said
+            .collect()
     }
 }
 
@@ -63,7 +58,7 @@ fn val(db: &PvDatabase, pv: &str) -> f64 {
 #[epics_macros_rs::epics_test]
 async fn a_held_refusal_is_reported_once_its_gate_drops() {
     let db = connected_ioc().await;
-    let said = listen();
+    let mut said = listen();
     said();
 
     let refused = db.put_many_locked(&["MS"], 2, |puts| {

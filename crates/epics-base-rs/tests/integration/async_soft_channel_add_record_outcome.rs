@@ -14,7 +14,7 @@
 //! a local `dbChannel` whatever its CA flag.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -41,11 +41,7 @@ async fn settle(db: &PvDatabase, name: &str) {
 }
 
 async fn processed(names: &[&str]) -> (Arc<PvDatabase>, String) {
-    let heard = Arc::new(Mutex::new(Vec::new()));
-    let sink = Arc::clone(&heard);
-    epics_base_rs::runtime::log::errlog_add_listener(move |m| {
-        sink.lock().expect("sink").push(m.to_string());
-    });
+    let errlog = epics_base_rs::runtime::log::ErrlogCapture::start();
     let (db, _h) = IocBuilder::new()
         .db_string(DB, &HashMap::new())
         .unwrap()
@@ -58,8 +54,7 @@ async fn processed(names: &[&str]) -> (Arc<PvDatabase>, String) {
             .unwrap();
         settle(&db, name).await;
     }
-    epics_base_rs::runtime::log::errlog_flush();
-    let log = heard.lock().expect("sink").join("\n");
+    let log = errlog.finish().join("\n");
     (db, log)
 }
 

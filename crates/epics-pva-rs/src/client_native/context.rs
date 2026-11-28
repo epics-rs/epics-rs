@@ -3348,18 +3348,11 @@ mod tests {
     #[cfg(tokio_backend)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_first_callers_spawn_one_engine() {
-        use epics_base_rs::runtime::log;
         let client = PvaClient::builder()
             .auto_addr_list(false)
             .addr_list(Vec::new())
             .build();
-        let heard = Arc::new(std::sync::Mutex::new(0usize));
-        let sink = heard.clone();
-        let id = log::errlog_add_listener(move |m| {
-            if m.contains("no search destinations") {
-                *sink.lock().unwrap() += 1;
-            }
-        });
+        let errlog = epics_base_rs::runtime::log::ErrlogCapture::start();
         let reactor = epics_base_rs::runtime::task::Reactor::current().expect("executor");
         let mut set = epics_base_rs::runtime::task::TaskSet::new();
         for _ in 0..8 {
@@ -3375,11 +3368,14 @@ mod tests {
         while let Some(r) = set.join_next().await {
             engines.push(r.expect("task").expect("engine"));
         }
-        log::errlog_flush();
-        log::errlog_remove_listener(id);
+        let heard = errlog
+            .finish()
+            .iter()
+            .filter(|m| m.contains("no search destinations"))
+            .count();
         engines.dedup();
         assert_eq!(engines.len(), 1);
-        assert_eq!(*heard.lock().unwrap(), 1);
+        assert_eq!(heard, 1);
     }
 
     // Control: `share_udp(true)` with no name servers still shares the

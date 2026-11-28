@@ -3914,46 +3914,29 @@ ASG(DEFAULT) {
     /// sentinel that simply never matches.
     #[test]
     fn hag_unresolvable_under_as_check_client_ip_becomes_sentinel() {
-        use crate::runtime::log::{errlog_add_listener, errlog_flush, errlog_remove_listener};
         let _guard = lock_as_check_client_ip();
-        let heard = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sink = heard.clone();
-        let id = errlog_add_listener(move |m| {
-            if m.contains("lab-pc1.invalid") {
-                sink.lock().unwrap().push(m.to_string());
-            }
-        });
+        let capture = crate::runtime::log::ErrlogCapture::start();
         set_as_check_client_ip(true);
         let config = parse_acf("HAG(lab) { lab-pc1.invalid }\n").unwrap();
         // The port's own refresh re-resolves without C's line.
         assert!(config.with_refreshed_hags().is_none());
         set_as_check_client_ip(false);
-        errlog_flush();
-        errlog_remove_listener(id);
+        let mut heard = capture.finish();
+        heard.retain(|m| m.contains("lab-pc1.invalid"));
         assert_eq!(
             config.hag[b"lab".as_slice()],
             bs(&["unresolved:lab-pc1.invalid"])
         );
         // softIoc R7.0.10, `var asCheckClientIP 1`.
-        assert_eq!(
-            *heard.lock().unwrap(),
-            ["ACF: Unable to resolve host 'lab-pc1.invalid'\n"]
-        );
+        assert_eq!(heard, ["ACF: Unable to resolve host 'lab-pc1.invalid'\n"]);
     }
 
     /// C `asInitialize` hashes every UAG user, then every HAG host, and
     /// errlogs each repeat within one group; a failed parse never gets there.
     #[test]
     fn duplicated_members_are_c_s_errlog_lines() {
-        use crate::runtime::log::{errlog_add_listener, errlog_flush, errlog_remove_listener};
         let _guard = lock_as_check_client_ip();
-        let heard = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sink = heard.clone();
-        let id = errlog_add_listener(move |m| {
-            if m.contains("dupuser-q") || m.contains("duphost-q") {
-                sink.lock().unwrap().push(m.to_string());
-            }
-        });
+        let capture = crate::runtime::log::ErrlogCapture::start();
         let acf = "HAG(h) {dupHost-q, DUPHOST-Q, other}\n\
                    UAG(u) {dupuser-q, b, dupuser-q, dupuser-q}\n\
                    UAG(v) {dupuser-q}\n\
@@ -3961,11 +3944,11 @@ ASG(DEFAULT) {
                    ASG(DEFAULT) { RULE(1,READ) }\n";
         parse_acf(acf).unwrap();
         parse_acf(format!("{acf}ASG(X) {{\n")).unwrap_err();
-        errlog_flush();
-        errlog_remove_listener(id);
+        let mut heard = capture.finish();
+        heard.retain(|m| m.contains("dupuser-q") || m.contains("duphost-q"));
         // softIoc R7.0.10, `asInit` of each file.
         assert_eq!(
-            *heard.lock().unwrap(),
+            heard,
             [
                 "Duplicated user 'dupuser-q' in UAG 'u'\n",
                 "Duplicated user 'dupuser-q' in UAG 'u'\n",

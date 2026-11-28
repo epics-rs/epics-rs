@@ -10,7 +10,7 @@
 use std::io::{Read as _, Write as _};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
 use epics_base_rs::runtime::log;
 use epics_base_rs::runtime::task::block_on_sync;
@@ -39,22 +39,12 @@ fn quiet_console() -> &'static PathBuf {
 /// line written meanwhile, which `eltc 0` leaves empty.
 fn lines_for(peer: SocketAddr, send: impl FnOnce()) -> (Vec<String>, Vec<String>) {
     let console = quiet_console();
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    let sink = seen.clone();
-    let listener =
-        log::errlog_add_listener(move |line| sink.lock().unwrap().push(line.to_string()));
+    let capture = log::ErrlogCapture::start();
     let before = std::fs::metadata(console).expect("the console").len() as usize;
     send();
-    log::errlog_flush();
-    log::errlog_remove_listener(listener);
+    let mut errlog = capture.finish();
     let peer = peer.to_string();
-    let errlog = seen
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|l| l.contains(&peer))
-        .cloned()
-        .collect();
+    errlog.retain(|l| l.contains(&peer));
     let console = std::fs::read_to_string(console).expect("read the console")[before..]
         .lines()
         .map(str::to_owned)

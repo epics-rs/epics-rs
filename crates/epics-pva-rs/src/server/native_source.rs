@@ -4735,15 +4735,9 @@ ASG(LOCKED) {
             .await
             .unwrap();
         let source = PvDatabaseSource::new(db.clone());
-        let heard = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-        let sink = heard.clone();
-        let id = epics_base_rs::runtime::log::errlog_add_listener(move |m| {
-            sink.lock().unwrap().push(m.to_string());
-        });
+        let errlog = epics_base_rs::runtime::log::ErrlogCapture::start();
         assert!(!source.has_pv(br#"Y.VAL{"bad":{}}"#).await);
-        epics_base_rs::runtime::log::errlog_flush();
-        epics_base_rs::runtime::log::errlog_remove_listener(id);
-        let lines = heard.lock().unwrap().clone();
+        let lines = errlog.finish();
         let n = lines
             .iter()
             .filter(|l| l.contains("dbChannelCreate: Channel filter 'bad' not found"))
@@ -6944,21 +6938,18 @@ ASG(PLAIN) {
             .access()
             .check("AI:CAP", "h", "alice", "anonymous", "")
             .await;
-        let heard = Arc::new(std::sync::Mutex::new(String::new()));
-        let sink = heard.clone();
-        let listener = epics_base_rs::runtime::log::errlog_add_listener(move |m| {
-            if let Some((_time, line)) = m.split_once(' ') {
-                sink.lock().unwrap().push_str(line);
-            }
-        });
+        let errlog = epics_base_rs::runtime::log::ErrlogCapture::start();
         let opened = source
             .subscribe_checked_opts_marked(checked, ctx, MonitorOptions::default())
             .await;
         assert!(opened.is_none(), "the cap refuses the monitor");
-        epics_base_rs::runtime::log::errlog_flush();
-        epics_base_rs::runtime::log::errlog_remove_listener(listener);
+        let heard: String = errlog
+            .finish()
+            .iter()
+            .filter_map(|m| m.split_once(' ').map(|(_time, line)| line))
+            .collect();
         assert_eq!(
-            *heard.lock().unwrap(),
+            heard,
             format!(
                 "ERR pvxs.tcp.setup Client {peer} Monitor \"AI:CAP\" onSubscribe() error: Failed to create db subscription\n"
             )

@@ -3,19 +3,13 @@
 //! `errlogPrintf`, which errlog cuts at `maxMsgSize` and hands to its
 //! listeners (asynManager.c:3043-3058, :3108, :3171-3221; errlog.c:155-160).
 
-use std::sync::{Arc, Mutex};
-
 use asyn_rs::trace::{TraceFile, TraceInfoMask, TraceIoMask, TraceManager, TraceMask};
-use epics_libcom_rs::runtime::log::{
-    DEFAULT_MAX_MSG_SIZE, eltc, errlog_add_listener, errlog_flush,
-};
+use epics_libcom_rs::runtime::log::{DEFAULT_MAX_MSG_SIZE, ErrlogCapture, eltc};
 
 #[test]
 fn an_errlog_trace_is_one_errlog_message_per_c_print() {
     eltc(false);
-    let got = Arc::new(Mutex::new(Vec::<String>::new()));
-    let sink = Arc::clone(&got);
-    errlog_add_listener(move |m: &str| sink.lock().unwrap().push(m.to_string()));
+    let errlog = ErrlogCapture::start();
 
     let mgr = TraceManager::new();
     mgr.set_trace_file(Some("EL"), TraceFile::Errlog);
@@ -32,12 +26,12 @@ fn an_errlog_trace_is_one_errlog_message_per_c_print() {
     );
     mgr.set_trace_io_mask(Some("EL"), TraceIoMask::ASCII | TraceIoMask::HEX);
     mgr.output_device_io("EL", None, 0, TraceMask::ERROR, b"AB", "io ", "f.c", 9);
-    errlog_flush();
+    let got = errlog.finish();
 
     let trunc = "<<TRUNCATED>>\n";
     let cut = format!("{}{trunc}", &long[..DEFAULT_MAX_MSG_SIZE - 1 - trunc.len()]);
     assert_eq!(
-        *got.lock().unwrap(),
+        got,
         [
             "[EL,-1,0] ",
             "[f.c:7] ",

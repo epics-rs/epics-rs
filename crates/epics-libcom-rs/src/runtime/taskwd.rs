@@ -826,12 +826,7 @@ mod tests {
     /// task's callback.
     #[test]
     fn the_watchdog_thread_reports_a_task_that_stops_checking_in() {
-        let (console_tx, console_rx) = std::sync::mpsc::channel::<String>();
-        let listener = crate::runtime::log::errlog_add_listener(move |m: &str| {
-            if m.contains("stalls") {
-                let _ = console_tx.send(m.to_string());
-            }
-        });
+        let capture = crate::runtime::log::ErrlogCapture::start();
 
         let (fired_tx, fired_rx) = std::sync::mpsc::channel::<()>();
         let _task = taskwd_insert(
@@ -847,14 +842,15 @@ mod tests {
             fired_rx.recv_timeout(Duration::from_secs(10)).is_ok(),
             "the watchdog thread must call a stalled task's callback"
         );
-        let line = console_rx
-            .recv_timeout(Duration::from_secs(10))
+        // The report is posted before the callback runs.
+        let lines = capture.finish();
+        let line = lines
+            .iter()
+            .find(|m| m.contains("stalls"))
             .expect("and say so on the console");
         assert!(
             line.contains("suspended"),
             "C's wording is what an operator greps for: {line}"
         );
-
-        crate::runtime::log::errlog_remove_listener(listener);
     }
 }

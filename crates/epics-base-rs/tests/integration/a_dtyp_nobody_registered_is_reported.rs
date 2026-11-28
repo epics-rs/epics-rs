@@ -19,24 +19,19 @@
 //! `warning:` — which is why both tests here drive that route.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
+use epics_base_rs::runtime::log::ErrlogCapture;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::record::{DbLinkType, DevSup, Dset, register_device_row};
 
-fn listen() -> Arc<Mutex<Vec<String>>> {
-    let heard = Arc::new(Mutex::new(Vec::new()));
-    let sink = Arc::clone(&heard);
-    epics_base_rs::runtime::log::errlog_add_listener(move |m| {
-        sink.lock().expect("sink").push(m.to_string());
-    });
-    heard
+fn listen() -> ErrlogCapture {
+    ErrlogCapture::start()
 }
 
-fn heard(sink: &Arc<Mutex<Vec<String>>>) -> String {
-    epics_base_rs::runtime::log::errlog_flush();
-    sink.lock().expect("sink").join("\n")
+fn heard(sink: &mut ErrlogCapture) -> String {
+    sink.lines().join("\n")
 }
 
 /// `device(<type>, INST_IO, devAsynInt32, "asynInt32")` loaded with no dset
@@ -75,10 +70,10 @@ async fn ioc(db_text: &str) -> Arc<PvDatabase> {
 /// still built, exactly as C builds it.
 #[epics_macros_rs::epics_test]
 async fn a_record_type_that_needs_a_dset_reports_the_missing_one() {
-    let sink = listen();
+    let mut sink = listen();
     let db = ioc("record(ai, \"T:A\") { field(DTYP,\"asynInt32\") }\n").await;
 
-    let log = heard(&sink);
+    let log = heard(&mut sink);
     assert!(
         log.contains("recGblRecordError: ai: init_record Error (514,3) PV: T:A"),
         "C `aiRecord.c:107` through `recGbl.c:68-70`, got {log:?}"
@@ -94,10 +89,10 @@ async fn a_record_type_that_needs_a_dset_reports_the_missing_one() {
 /// and nothing that claims to be C's.
 #[epics_macros_rs::epics_test]
 async fn a_record_type_that_needs_no_dset_stays_silent() {
-    let sink = listen();
+    let mut sink = listen();
     let _db = ioc("record(calc, \"T:C\") { field(DTYP,\"asynInt32\") }\n").await;
 
-    let log = heard(&sink);
+    let log = heard(&mut sink);
     assert!(
         !log.contains("init_record Error (514,3)"),
         "calcRecord.c has no dset check at all, got {log:?}"
@@ -111,7 +106,7 @@ async fn a_record_type_that_needs_no_dset_stays_silent() {
 /// testErrors:AaoInt8Out` lines for a single record.
 #[epics_macros_rs::epics_test]
 async fn the_two_array_types_report_once_per_init_pass() {
-    let sink = listen();
+    let mut sink = listen();
     let _db = ioc(concat!(
         "record(aao, \"T:AAO\") { field(DTYP,\"nobodyRegisteredThis\") }\n",
         "record(aai, \"T:AAI\") { field(DTYP,\"nobodyRegisteredThis\") }\n",
@@ -119,7 +114,7 @@ async fn the_two_array_types_report_once_per_init_pass() {
     ))
     .await;
 
-    let log = heard(&sink);
+    let log = heard(&mut sink);
     let count = |needle: &str| log.matches(needle).count();
     assert_eq!(
         count("aao: init_record Error (514,3) PV: T:AAO"),

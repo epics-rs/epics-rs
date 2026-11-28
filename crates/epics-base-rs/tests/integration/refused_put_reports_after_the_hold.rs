@@ -19,9 +19,9 @@
 //! in `dbput_link_field_refusal_precedes_nomod.rs`.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use epics_base_rs::runtime::log::{errlog_add_listener, errlog_flush};
+use epics_base_rs::runtime::log::ErrlogCapture;
 use epics_base_rs::server::database::PutSplit;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -36,13 +36,14 @@ const CHOICE: &str = "recGblRecordError: Bogus Illegal choice PV: B";
 const INPA: &str = "recGblDbaddrError: dbPut: dbrType = 10, field_type = DBF_INLINK (14). \
                     Illegal Database Request Type PV: C.INPA";
 
-fn listen() -> impl Fn() -> Vec<String> {
-    let heard = Arc::new(Mutex::new(Vec::<String>::new()));
-    let sink = Arc::clone(&heard);
-    errlog_add_listener(move |m| sink.lock().unwrap().push(m.trim_end().to_string()));
+fn listen() -> impl FnMut() -> Vec<String> {
+    let mut errlog = ErrlogCapture::start();
     move || {
-        errlog_flush();
-        std::mem::take(&mut *heard.lock().unwrap())
+        errlog
+            .take()
+            .iter()
+            .map(|m| m.trim_end().to_string())
+            .collect()
     }
 }
 
@@ -73,7 +74,7 @@ fn text(s: &str) -> EpicsValue {
 #[epics_macros_rs::epics_test]
 async fn a_refused_put_reports_after_the_hold_by_its_canonical_name() {
     let db = ioc().await;
-    let heard = listen();
+    let mut heard = listen();
 
     db.put_record_field_from_ca_no_notify("CAL", "CALC", text("A+"))
         .await
@@ -92,7 +93,7 @@ async fn a_refused_put_reports_after_the_hold_by_its_canonical_name() {
 #[epics_macros_rs::epics_test]
 async fn nothing_is_printed_under_the_hold() {
     let db = ioc().await;
-    let heard = listen();
+    let mut heard = listen();
 
     db.put_many_locked(&["C", "S", "B"], 3, |puts| {
         let c = puts.record(0).unwrap();

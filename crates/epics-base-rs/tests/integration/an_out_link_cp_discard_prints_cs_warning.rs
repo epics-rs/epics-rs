@@ -21,22 +21,14 @@
 //! so neither prints.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 
-use epics_base_rs::runtime::log::{errlog_add_listener, errlog_flush, errlog_strip_ansi};
+use epics_base_rs::runtime::log::{ErrlogCapture, errlog_strip_ansi};
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
 
 #[epics_macros_rs::epics_test]
 async fn a_discarded_cp_prints_cs_warning_at_each_parse() {
-    let heard = Arc::new(Mutex::new(Vec::<String>::new()));
-    let sink = Arc::clone(&heard);
-    errlog_add_listener(move |m| {
-        let m = errlog_strip_ansi(m);
-        if m.contains("Discarding") {
-            sink.lock().unwrap().push(m);
-        }
-    });
+    let errlog = ErrlogCapture::start();
     let (db, _) = IocBuilder::new()
         .db_string(
             r#"
@@ -62,7 +54,12 @@ record(ao, "B") { field(OUT, "Z") }
             .await
             .unwrap();
     }
-    errlog_flush();
+    let heard: Vec<String> = errlog
+        .finish()
+        .iter()
+        .map(|m| errlog_strip_ansi(m))
+        .filter(|m| m.contains("Discarding"))
+        .collect();
     let line = |from: &str, to: &str| {
         format!("WARNING: Discarding CP/CPP modifier in CA output link from {from} to {to}.\n")
     };
@@ -74,7 +71,7 @@ record(ao, "B") { field(OUT, "Z") }
     ];
     let mut want = [load.clone(), load].concat();
     want.extend([line("D.OUTB", "G:H"), line("B.OUT", "W:V")]);
-    assert_eq!(*heard.lock().unwrap(), want);
+    assert_eq!(heard, want);
 }
 
 /// Only a PV link reaches C's modifier scan (`dbStaticLib.c:2266-2357`): an
@@ -84,14 +81,7 @@ record(ao, "B") { field(OUT, "Z") }
 /// load and again at `iocInit`, and A1 and A6 never.
 #[epics_macros_rs::epics_test]
 async fn only_a_pv_link_reaches_the_modifier_scan() {
-    let heard = Arc::new(Mutex::new(Vec::<String>::new()));
-    let sink = Arc::clone(&heard);
-    errlog_add_listener(move |m| {
-        let m = errlog_strip_ansi(m);
-        if m.contains("Discarding") && m.contains(" from A") {
-            sink.lock().unwrap().push(m);
-        }
-    });
+    let errlog = ErrlogCapture::start();
     let (db, _) = IocBuilder::new()
         .db_string(
             r#"
@@ -110,7 +100,12 @@ record(ao, "A7") { field(OUT, "pva://x CPP") }
         .await
         .unwrap();
     db.ioc_init().await;
-    errlog_flush();
+    let heard: Vec<String> = errlog
+        .finish()
+        .iter()
+        .map(|m| errlog_strip_ansi(m))
+        .filter(|m| m.contains("Discarding") && m.contains(" from A"))
+        .collect();
     let pass: Vec<String> = [
         ("A2", "{x"),
         ("A3", "\"x\""),
@@ -123,5 +118,5 @@ record(ao, "A7") { field(OUT, "pva://x CPP") }
         format!("WARNING: Discarding CP/CPP modifier in CA output link from {rec}.OUT to {to}.\n")
     })
     .collect();
-    assert_eq!(*heard.lock().unwrap(), [pass.clone(), pass].concat());
+    assert_eq!(heard, [pass.clone(), pass].concat());
 }

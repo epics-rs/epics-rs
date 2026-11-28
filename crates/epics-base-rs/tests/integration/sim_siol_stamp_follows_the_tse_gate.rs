@@ -16,7 +16,7 @@
 
 use epics_base_rs::types::WallTime;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -92,22 +92,16 @@ async fn the_siol_stamp_is_taken_only_at_device_time_and_not_under_a_time_tsel()
 
 #[epics_macros_rs::epics_test]
 async fn a_siol_that_gives_no_stamp_is_logged_only_when_the_stamp_is_owed() {
-    let heard = Arc::new(Mutex::new(Vec::new()));
-    let sink = Arc::clone(&heard);
-    epics_base_rs::runtime::log::errlog_add_listener(move |m| {
-        sink.lock().expect("sink").push(m.to_string());
-    });
+    let mut errlog = epics_base_rs::runtime::log::ErrlogCapture::start();
     let db = ioc().await;
     stamp_after_processing(&db, "SS_DEAD0").await;
-    epics_base_rs::runtime::log::errlog_flush();
-    let log = heard.lock().expect("sink").join("\n");
+    let log = errlog.lines().join("\n");
     assert!(
         !log.contains("SS_DEAD0.SIOL"),
         "TSE=0 owes no SIOL stamp: {log}"
     );
     stamp_after_processing(&db, "SS_DEAD").await;
-    epics_base_rs::runtime::log::errlog_flush();
-    let log = heard.lock().expect("sink").join("\n");
+    let log = errlog.lines().join("\n");
     assert!(
         log.contains(
             "recGblGetTimeStampSimm: dbGetTimeStamp (sim mode) failed, SS_DEAD.SIOL = NOSUCH:Z"

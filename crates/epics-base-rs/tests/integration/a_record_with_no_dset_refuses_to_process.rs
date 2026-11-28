@@ -17,25 +17,20 @@
 //! NO_ALARM` and stamped, and printed none of C's 28 refusal lines.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
+use epics_base_rs::runtime::log::ErrlogCapture;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::record::{DbLinkType, DevSup, Dset, register_device_row};
 use epics_base_rs::types::EpicsValue;
 
-fn listen() -> Arc<Mutex<Vec<String>>> {
-    let heard = Arc::new(Mutex::new(Vec::new()));
-    let sink = Arc::clone(&heard);
-    epics_base_rs::runtime::log::errlog_add_listener(move |m| {
-        sink.lock().expect("sink").push(m.to_string());
-    });
-    heard
+fn listen() -> ErrlogCapture {
+    ErrlogCapture::start()
 }
 
-fn heard(sink: &Arc<Mutex<Vec<String>>>) -> String {
-    epics_base_rs::runtime::log::errlog_flush();
-    sink.lock().expect("sink").join("\n")
+fn heard(sink: &mut ErrlogCapture) -> String {
+    sink.lines().join("\n")
 }
 
 /// `device(<type>, INST_IO, devAsynInt32, "asynInt32")` loaded with no dset
@@ -75,7 +70,7 @@ async fn ioc(db_text: &str) -> Arc<PvDatabase> {
 /// is scanned, because `dbProcess` turns every later entry away.
 #[epics_macros_rs::epics_test]
 async fn the_first_cycle_refuses_and_the_record_stays_active() {
-    let sink = listen();
+    let mut sink = listen();
     let db = ioc(
         "record(ao, \"T:A\") { field(DTYP,\"asynInt32\") field(OUT,\"T:B\") }\n\
                   record(ai, \"T:B\") {}\n",
@@ -87,7 +82,7 @@ async fn the_first_cycle_refuses_and_the_record_stays_active() {
         matches!(status, Err(epics_base_rs::error::CaError::ProcessStatus(s)) if s.get() == (514 << 16) | 5),
         "`aoRecord.c:175` returns S_dev_missingSup, got {status:?}"
     );
-    let after_one = heard(&sink);
+    let after_one = heard(&mut sink);
     assert!(
         after_one.contains("recGblRecordError: write_ao Error (514,5) PV: T:A"),
         "C `aoRecord.c:174` through `recGbl.c:68-70`, got {after_one:?}"
@@ -99,7 +94,7 @@ async fn the_first_cycle_refuses_and_the_record_stays_active() {
     );
 
     db.process_record("T:A").await.unwrap();
-    let after_two = heard(&sink);
+    let after_two = heard(&mut sink);
     assert_eq!(
         after_two.matches("write_ao Error (514,5)").count(),
         1,
@@ -111,11 +106,11 @@ async fn the_first_cycle_refuses_and_the_record_stays_active() {
 /// no dset check anywhere, so a nonsense DTYP must not make it inert.
 #[epics_macros_rs::epics_test]
 async fn a_record_type_with_no_dset_check_still_processes() {
-    let sink = listen();
+    let mut sink = listen();
     let db = ioc("record(calc, \"T:C\") { field(DTYP,\"asynInt32\") field(CALC,\"7\") }\n").await;
 
     db.process_record("T:C").await.unwrap();
-    let log = heard(&sink);
+    let log = heard(&mut sink);
     assert!(
         !log.contains("Error (514,5)"),
         "calcRecord.c `process` has no dset test, got {log:?}"

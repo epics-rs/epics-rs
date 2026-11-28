@@ -4,8 +4,9 @@
 //! `softIoc` R7.0.10-146 (8f5015b66) on the same database and puts.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
+use epics_base_rs::runtime::log::ErrlogCapture;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
@@ -21,21 +22,14 @@ record(waveform, "WS") { field(FTVL, "STRING") field(NELM, "2") }
 record(waveform, "WD") { field(FTVL, "DOUBLE") field(NELM, "2") }
 "#;
 
-fn listen() -> Arc<Mutex<Vec<String>>> {
-    let heard = Arc::new(Mutex::new(Vec::new()));
-    let sink = Arc::clone(&heard);
-    epics_base_rs::runtime::log::errlog_add_listener(move |m| {
-        sink.lock().expect("sink").push(m.to_string());
-    });
-    heard
+fn listen() -> ErrlogCapture {
+    ErrlogCapture::start()
 }
 
 /// The `recGblRecordError` lines heard since the last call.
-fn drain(sink: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
-    epics_base_rs::runtime::log::errlog_flush();
-    sink.lock()
-        .expect("sink")
-        .drain(..)
+fn drain(sink: &mut ErrlogCapture) -> Vec<String> {
+    sink.take()
+        .into_iter()
         .flat_map(|m| m.lines().map(str::to_string).collect::<Vec<_>>())
         .filter(|l| l.starts_with("recGblRecordError"))
         .collect()
@@ -59,10 +53,10 @@ async fn put_inp(db: &PvDatabase, rec: &str, text: &str) -> bool {
 
 #[epics_macros_rs::epics_test]
 async fn a_missing_target_is_refused_at_init_and_on_a_put() {
-    let sink = listen();
+    let mut sink = listen();
     let db = ioc().await;
     assert_eq!(
-        drain(&sink),
+        drain(&mut sink),
         [
             "recGblRecordError: devAiSoftCallback (add_record) link target not found \
           Process Variable Not Found PV: AINIT"
@@ -71,7 +65,7 @@ async fn a_missing_target_is_refused_at_init_and_on_a_put() {
 
     assert!(!put_inp(&db, "ACB", "NOPE").await);
     assert_eq!(
-        drain(&sink),
+        drain(&mut sink),
         [
             "recGblRecordError: devAiSoftCallback (add_record) link target not found \
           Process Variable Not Found PV: ACB"
@@ -84,7 +78,7 @@ async fn a_missing_target_is_refused_at_init_and_on_a_put() {
     assert!(!put_inp(&db, "SCB", "NOPE").await);
     assert!(!put_inp(&db, "LCB", "NOPE").await);
     assert_eq!(
-        drain(&sink),
+        drain(&mut sink),
         [
             "recGblRecordError: devSiSoftCallback (add_record) linked record not found \
              Process Variable Not Found PV: SCB",
@@ -97,7 +91,7 @@ async fn a_missing_target_is_refused_at_init_and_on_a_put() {
     // `dbLinkIsDefined` and fails the PV_LINK test.
     assert!(!put_inp(&db, "LCB", "5").await);
     assert_eq!(
-        drain(&sink),
+        drain(&mut sink),
         [
             "recGblRecordError: devLiSoftCallback (add_record) Illegal INP field \
           Illegal field value PV: LCB"
@@ -106,7 +100,7 @@ async fn a_missing_target_is_refused_at_init_and_on_a_put() {
 
     // A plain soft channel has no `add_record`: the name becomes a CA link.
     assert!(put_inp(&db, "APL", "NOPE").await);
-    assert_eq!(drain(&sink), Vec::<String>::new());
+    assert_eq!(drain(&mut sink), Vec::<String>::new());
 }
 
 /// `add_record`'s `dbChannelCreate` parses the field modifiers too
@@ -116,9 +110,9 @@ async fn a_missing_target_is_refused_at_init_and_on_a_put() {
 /// takes it.
 #[epics_macros_rs::epics_test]
 async fn a_filtered_target_is_created_as_a_channel() {
-    let sink = listen();
+    let mut sink = listen();
     let db = ioc().await;
-    drain(&sink);
+    drain(&mut sink);
     let refused = "recGblRecordError: devAiSoftCallback (add_record) link target not found \
                    Process Variable Not Found PV: ACB";
     for (inp, accepted, shown) in [
@@ -157,7 +151,7 @@ async fn a_filtered_target_is_created_as_a_channel() {
         ("WD.VAL$", false, "WD.VAL$ NPP NMS"),
     ] {
         assert_eq!(put_inp(&db, "ACB", inp).await, accepted, "{inp}");
-        let heard = drain(&sink);
+        let heard = drain(&mut sink);
         if accepted {
             assert!(heard.is_empty(), "{inp}: {heard:?}");
         } else {

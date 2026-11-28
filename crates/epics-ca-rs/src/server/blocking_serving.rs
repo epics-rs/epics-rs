@@ -376,23 +376,20 @@ mod tests {
     #[test]
     fn only_an_ephemeral_request_announces_its_ports() {
         use super::*;
-        use epics_base_rs::runtime::log::{errlog_add_listener, errlog_flush};
-        use std::sync::Mutex;
+        use epics_base_rs::runtime::log::ErrlogCapture;
 
-        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
-        let sink = seen.clone();
-        let _listener = errlog_add_listener(move |line| {
-            if line.starts_with("CA server: UDP search on port ") {
-                sink.lock().unwrap().push(line.trim_end().to_string());
-            }
-        });
+        let mut errlog = ErrlogCapture::start();
+        let mut seen = || -> Vec<String> {
+            errlog
+                .take()
+                .iter()
+                .filter(|l| l.starts_with("CA server: UDP search on port "))
+                .map(|l| l.trim_end().to_string())
+                .collect()
+        };
 
         udp::announce_requested_ephemeral((5064, 5064), (5064, 5064), 1);
-        errlog_flush();
-        assert!(
-            seen.lock().unwrap().is_empty(),
-            "a configured port is silent"
-        );
+        assert!(seen().is_empty(), "a configured port is silent");
 
         let serving = BlockingCaServing::start(
             0,
@@ -402,8 +399,7 @@ mod tests {
             Arc::new(ServerStats::default()),
         )
         .expect("bind an ephemeral server");
-        errlog_flush();
-        let lines = seen.lock().unwrap().clone();
+        let lines = seen();
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(
             lines[0].starts_with(&format!(

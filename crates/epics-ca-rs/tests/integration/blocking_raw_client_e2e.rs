@@ -582,13 +582,7 @@ fn a_dbr_enum_monitor_on_a_stringin_is_getfail_per_update() {
 /// the handshake, which is why N is 0.
 #[test]
 fn a_misaligned_frame_prints_log_header_before_the_disconnect() {
-    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let sink = seen.clone();
-    let listener = epics_base_rs::runtime::log::errlog_add_listener(move |line| {
-        if line.starts_with("CAS: ") {
-            sink.lock().unwrap().push(line.to_string());
-        }
-    });
+    let errlog = epics_base_rs::runtime::log::ErrlogCapture::start();
     let db = seed_db(&[("RAW:MIS", EpicsValue::Double(0.0))]);
     let (server, addr, accept) = start_server(db);
     let mut c = connect_and_handshake(addr);
@@ -608,13 +602,10 @@ fn a_misaligned_frame_prints_log_header_before_the_disconnect() {
         "ECA_INTERNAL"
     );
     c.expect_closed("RSRV_ERROR ends the circuit");
-    epics_base_rs::runtime::log::errlog_flush();
-    let lines: Vec<String> = seen
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|l| l.contains(&peer.to_string()))
-        .cloned()
+    let lines: Vec<String> = errlog
+        .finish()
+        .into_iter()
+        .filter(|l| l.starts_with("CAS: ") && l.contains(&peer.to_string()))
         .collect();
     assert_eq!(
         lines,
@@ -625,31 +616,20 @@ fn a_misaligned_frame_prints_log_header_before_the_disconnect() {
             format!("CAS: forcing disconnect from {peer}\n"),
         ]
     );
-    epics_base_rs::runtime::log::errlog_remove_listener(listener);
 
     server.shutdown();
     accept.join().unwrap();
 }
 
-/// The `CAS: ` console lines naming `peer` that `send` provokes, after
-/// `errlog_flush` has drained them.
+/// The `CAS: ` console lines naming `peer` that `send` provokes.
 fn cas_lines_for(peer: impl Fn() -> SocketAddr, send: impl FnOnce()) -> Vec<String> {
-    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let sink = seen.clone();
-    let listener = epics_base_rs::runtime::log::errlog_add_listener(move |line| {
-        if line.starts_with("CAS: ") {
-            sink.lock().unwrap().push(line.to_string());
-        }
-    });
+    let errlog = epics_base_rs::runtime::log::ErrlogCapture::start();
     send();
-    epics_base_rs::runtime::log::errlog_flush();
-    epics_base_rs::runtime::log::errlog_remove_listener(listener);
+    let lines = errlog.finish();
     let peer = peer().to_string();
-    let lines = seen.lock().unwrap();
     lines
-        .iter()
-        .filter(|l| l.contains(&peer))
-        .cloned()
+        .into_iter()
+        .filter(|l| l.starts_with("CAS: ") && l.contains(&peer))
         .collect()
 }
 
@@ -767,13 +747,7 @@ fn a_bad_command_prints_log_header_before_the_disconnect() {
 /// (camsgtask.c:151), as softIoc 8f5015b66 prints for this put.
 #[test]
 fn a_string_put_without_a_nul_forces_the_disconnect() {
-    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let sink = seen.clone();
-    let listener = epics_base_rs::runtime::log::errlog_add_listener(move |line| {
-        if line.starts_with("CAS: forcing") {
-            sink.lock().unwrap().push(line.to_string());
-        }
-    });
+    let errlog = epics_base_rs::runtime::log::ErrlogCapture::start();
     let db = seed_db(&[("RAW:STR", EpicsValue::String("x".into()))]);
     let (server, addr, accept) = start_server(db.clone());
     let mut c = connect_and_handshake(addr);
@@ -785,14 +759,13 @@ fn a_string_put_without_a_nul_forces_the_disconnect() {
     w.extend_from_slice(&b"abcdefghij".repeat(4));
     c.send(&w);
     c.expect_closed("RSRV_ERROR ends the circuit");
-    epics_base_rs::runtime::log::errlog_flush();
-    let lines = seen.lock().unwrap().clone();
+    let mut lines = errlog.finish();
+    lines.retain(|l| l.starts_with("CAS: forcing"));
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert!(
         lines[0].starts_with("CAS: forcing disconnect from 127.0.0.1:"),
         "{lines:?}"
     );
-    epics_base_rs::runtime::log::errlog_remove_listener(listener);
 
     server.shutdown();
     accept.join().unwrap();

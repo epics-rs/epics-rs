@@ -162,7 +162,7 @@ async fn restore_reports_what_the_file_could_not_save() {
 /// past `LONG_MAX` the 64-bit row is the oracle's, the 32-bit one derived.
 #[epics_macros_rs::epics_test]
 async fn a_boot_restore_counts_the_line_as_c_atol() {
-    use epics_base_rs::runtime::log::{errlog_add_listener, errlog_flush};
+    use epics_base_rs::runtime::log::ErrlogCapture;
     use epics_base_rs::server::autosave::save_set::{RestorePass, restore_boot_file};
     use epics_base_rs::server::autosave::settings::SrSettings;
 
@@ -183,15 +183,13 @@ async fn a_boot_restore_counts_the_line_as_c_atol() {
     )
     .await
     .unwrap();
-    let heard = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-    let sink = heard.clone();
-    errlog_add_listener(move |m| sink.lock().unwrap().push(m.trim_end().to_string()));
+    let errlog = ErrlogCapture::start();
 
     let db = PvDatabase::new();
     restore_boot_file(&db, &path, RestorePass::One, "", &SrSettings::default())
         .await
         .unwrap();
-    errlog_flush();
+    let heard = errlog.finish();
 
     let big = if std::ffi::c_long::BITS == 64 {
         "-1"
@@ -199,11 +197,9 @@ async fn a_boot_restore_counts_the_line_as_c_atol() {
         "2147483647"
     };
     let counted: Vec<String> = heard
-        .lock()
-        .unwrap()
         .iter()
+        .map(|l| l.trim_end().to_string())
         .filter(|l| l.ends_with("had no saved value."))
-        .cloned()
         .collect();
     let want: Vec<String> = ["-3", "4", "0", "7", big, "0", "0", "0"]
         .iter()

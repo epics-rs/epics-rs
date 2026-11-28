@@ -16,11 +16,11 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use epics_base_rs::runtime::log::{errlog_add_listener, errlog_flush};
+use epics_base_rs::runtime::log::ErrlogCapture;
 use epics_base_rs::runtime::task::block_on_sync;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::records::busy::BusyRecord;
@@ -141,9 +141,7 @@ fn put(addr: SocketAddr, rec: &str, value: &str) -> Outcome {
 /// Play `cases` against `rec` on a fresh IOC; give back each outcome and
 /// every errlog line.
 fn run(rec: &str, cases: &[&str]) -> (Vec<Outcome>, Vec<String>) {
-    let heard = Arc::new(Mutex::new(Vec::<String>::new()));
-    let sink = Arc::clone(&heard);
-    errlog_add_listener(move |m| sink.lock().unwrap().push(m.trim_end().to_string()));
+    let mut errlog = ErrlogCapture::start();
 
     let (db, _) = block_on_sync(
         IocBuilder::new()
@@ -154,8 +152,7 @@ fn run(rec: &str, cases: &[&str]) -> (Vec<Outcome>, Vec<String>) {
     )
     .unwrap()
     .unwrap();
-    errlog_flush();
-    heard.lock().unwrap().clear();
+    errlog.take();
     let server = Arc::new(
         BlockingCaServer::bind(
             "127.0.0.1:0",
@@ -172,8 +169,11 @@ fn run(rec: &str, cases: &[&str]) -> (Vec<Outcome>, Vec<String>) {
 
     server.shutdown();
     let _ = accept.join();
-    errlog_flush();
-    let lines = std::mem::take(&mut *heard.lock().unwrap());
+    let lines = errlog
+        .finish()
+        .iter()
+        .map(|m| m.trim_end().to_string())
+        .collect();
     (outcomes, lines)
 }
 

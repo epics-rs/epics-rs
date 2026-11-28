@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use asyn_rs::registry::open_owner;
-use epics_base_rs::runtime::log::{errlog_add_listener, errlog_flush};
+use epics_base_rs::runtime::log::ErrlogCapture;
 use epics_base_rs::runtime::task::{BlockingBridge, set_thread_ok_to_block, sleep};
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -73,13 +73,9 @@ fn diff(s: &str) -> EpicsValue {
 
 /// What `line` sends to errlog.
 fn errlog_of(db: &Arc<PvDatabase>, line: &str) -> String {
-    let out = Arc::new(Mutex::new(String::new()));
-    let o = out.clone();
-    let id = errlog_add_listener(move |m| o.lock().unwrap().push_str(m));
+    let errlog = ErrlogCapture::start();
     iocsh(db, line);
-    errlog_flush();
-    epics_base_rs::runtime::log::errlog_remove_listener(id);
-    out.lock().unwrap().clone()
+    errlog.finish().concat()
 }
 
 #[epics_base_rs::epics_test]

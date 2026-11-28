@@ -898,11 +898,8 @@ mod tests {
     /// (`seq_if.c:89-136`).
     #[epics_macros_rs::epics_test]
     async fn the_refusals_print_the_variable_and_the_pv() {
-        use crate::runtime::log::{errlog_add_listener, errlog_flush, errlog_remove_listener};
         let (db, q) = circuit().await;
-        let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sink = lines.clone();
-        let id = errlog_add_listener(move |m| sink.lock().unwrap().push(m.trim_end().to_owned()));
+        let errlog = crate::runtime::log::ErrlogCapture::start();
         let b = q.pv("motTTH", "B");
         b.put_async(EpicsValue::Short(1)).unwrap();
         let _ = b.put_async(EpicsValue::Short(1));
@@ -910,11 +907,14 @@ mod tests {
             .put_sync_tmo(EpicsValue::Short(1), Duration::from_millis(50))
             .await;
         let _ = b.put_sync_tmo(EpicsValue::Short(1), Duration::ZERO).await;
-        errlog_flush();
-        errlog_remove_listener(id);
+        let lines: Vec<String> = errlog
+            .finish()
+            .iter()
+            .map(|m| m.trim_end().to_owned())
+            .collect();
         release(&db).await;
         assert_eq!(
-            *lines.lock().unwrap(),
+            lines,
             [
                 "sevr=major pvPut(ss ss, var motTTH, pv B): user error (there is already a pvPut pending for this channel/state set combination)",
                 "sevr=major pvPut(ss ss, var motTTH, pv B): failed (timeout waiting for other pvPut requests to finish)",

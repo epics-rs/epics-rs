@@ -5,13 +5,12 @@
 //! (drvAsynIPServerPort.c:444-454).
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use asyn_rs::drivers::ip_server_port::DrvAsynIPServerPort;
 use asyn_rs::port::PortDriver;
 use asyn_rs::user::AsynUser;
-use epics_libcom_rs::runtime::log::{errlog_add_listener, errlog_flush};
+use epics_libcom_rs::runtime::log::ErrlogCapture;
 
 /// Make `setsockopt(SOL_SOCKET, SO_REUSEPORT)` fail with EPERM on this thread.
 fn refuse_reuse_port() {
@@ -48,9 +47,7 @@ fn refuse_reuse_port() {
 
 #[test]
 fn a_refused_fanout_option_is_logged_and_the_udp_server_still_binds() {
-    let lines = Arc::new(Mutex::new(Vec::<String>::new()));
-    let sink = Arc::clone(&lines);
-    errlog_add_listener(move |m: &str| sink.lock().unwrap().push(m.to_string()));
+    let errlog = ErrlogCapture::start();
     // Held for the server, which has no ephemeral-port getter: its
     // SO_REUSEADDR bind on 127.0.0.1 joins the hold and outranks it for
     // unicast.
@@ -80,8 +77,7 @@ fn a_refused_fanout_option_is_logged_and_the_udp_server_still_binds() {
     };
     assert_eq!(&buf[..n], b"alpha");
 
-    errlog_flush();
-    let lines = lines.lock().unwrap();
+    let lines = errlog.finish();
     assert!(
         lines.iter().any(
             |l| l == "epicsSocketEnablePortUseForDatagramFanout: unable to set SO_REUSEPORT?\n"

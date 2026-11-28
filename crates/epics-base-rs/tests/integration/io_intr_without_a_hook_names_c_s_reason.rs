@@ -10,9 +10,8 @@
 //! ```
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 
-use epics_base_rs::runtime::log::{errlog_add_listener, errlog_flush};
+use epics_base_rs::runtime::log::ErrlogCapture;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 
 const DB: &str = r#"record(bo, "BO_RAW") { field(DTYP, "Raw Soft Channel") field(SCAN, "I/O Intr") }
@@ -22,19 +21,15 @@ record(calc, "CALC") { field(SCAN, "I/O Intr") }
 
 #[epics_macros_rs::epics_test]
 async fn scan_add_names_c_s_reason_for_each_record() {
-    let heard = Arc::new(Mutex::new(Vec::<String>::new()));
-    let sink = Arc::clone(&heard);
-    errlog_add_listener(move |m| sink.lock().unwrap().push(m.to_string()));
+    let errlog = ErrlogCapture::start();
     let _db = IocBuilder::new()
         .db_string(DB, &HashMap::new())
         .unwrap()
         .build()
         .await
         .unwrap();
-    errlog_flush();
-    let mut said: Vec<String> = heard
-        .lock()
-        .unwrap()
+    let mut said: Vec<String> = errlog
+        .finish()
         .iter()
         .flat_map(|m| m.lines().map(str::to_string).collect::<Vec<_>>())
         .filter(|l| l.contains("scanAdd"))

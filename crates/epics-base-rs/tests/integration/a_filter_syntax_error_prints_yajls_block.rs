@@ -6,17 +6,14 @@
 //! name below, one IOC per name; the expected text is its console verbatim.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 
-use epics_base_rs::runtime::log::{errlog_add_listener, errlog_flush, errlog_strip_ansi};
+use epics_base_rs::runtime::log::{ErrlogCapture, errlog_strip_ansi};
 use epics_base_rs::server::database::filters::db_channel_create;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 
 #[epics_macros_rs::epics_test]
 async fn each_refusal_prints_cs_text() {
-    let heard = Arc::new(Mutex::new(String::new()));
-    let sink = Arc::clone(&heard);
-    errlog_add_listener(move |m| sink.lock().unwrap().push_str(&errlog_strip_ansi(m)));
+    let mut errlog = ErrlogCapture::start();
     let (db, _) = IocBuilder::new()
         .db_string("record(ai, \"F\") {}\n", &HashMap::new())
         .unwrap()
@@ -67,9 +64,9 @@ async fn each_refusal_prints_cs_text() {
         (r#"F.{"dec":{"n":"x"}} junk"#, String::new()),
     ];
     for (name, want) in cases {
-        heard.lock().unwrap().clear();
+        errlog.take();
         assert!(db_channel_create(&db, name).is_err(), "{name}");
-        errlog_flush();
-        assert_eq!(*heard.lock().unwrap(), want, "{name}");
+        let heard: String = errlog.take().iter().map(|m| errlog_strip_ansi(m)).collect();
+        assert_eq!(heard, want, "{name}");
     }
 }

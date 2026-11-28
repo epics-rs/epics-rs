@@ -1053,10 +1053,11 @@ pub const fn max_message_size(bufsize: usize) -> usize {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ErrlogListenerId(u64);
 
-/// A registered listener, called with the record's bytes as C's
+/// A registered listener, called with the message's admission number (see
+/// [`ErrlogQueue::posted`]) and the record's bytes as C's
 /// `const char *message`. Shared so the worker can call it with the list's
 /// `RefCell` released, which is what lets a callback add or remove listeners.
-type ErrlogListenerFn = std::sync::Arc<dyn Fn(&[u8]) + Send + Sync>;
+type ErrlogListenerFn = std::sync::Arc<dyn Fn(u64, &[u8]) + Send + Sync>;
 
 /// C `listenerNode` (`errlog.c:79-85`).
 struct ListenerNode {
@@ -1145,6 +1146,10 @@ struct ErrlogQueue {
     at_exit: bool,
     to_console: bool,
     flush_seq: u64,
+    /// Messages admitted so far. The worker drains the arena in admission
+    /// order and numbers what it delivers from 0, so a listener is handed the
+    /// value this had when its message was taken.
+    posted: u64,
     /// Producers blocked in [`errlog_flush`], C's `pvt.nFlushers`
     /// (`errlog.c:103`, also under `msgQueueLock`). C counts them and chains
     /// one binary event from each released flusher to the next
@@ -1232,6 +1237,7 @@ fn errlog_pvt2(bufsize: usize, max_msg_size: usize) -> &'static Errlog {
                     // C `errlogInitPvt`: `pvt.toConsole = TRUE`.
                     to_console: true,
                     flush_seq: 0,
+                    posted: 0,
                     flushers: Vec::new(),
                 },
                 CMutex::ErrlogMsgQueue,
@@ -1315,6 +1321,8 @@ fn errlog_exit_handler() {
 fn errlog_worker(errlog: &'static Errlog) {
     let _ = WORKER.set(crate::runtime::task::os_thread_id());
     let parked = errlog.work.waiter();
+    // [`ErrlogQueue::posted`] of the next message drained.
+    let mut delivered: u64 = 0;
     let mut q = errlog.queue.lock();
     loop {
         q.flush_seq += 1;
@@ -1371,7 +1379,8 @@ fn errlog_worker(errlog: &'static Errlog) {
                 console.write(Message::Bytes(&[&record[..len.unwrap_or(record.len())]]));
             }
             let len = len.unwrap_or_else(|| strip_ansi_in_place(record));
-            deliver(&errlog.listeners, &record[..len]);
+            deliver(&errlog.listeners, delivered, &record[..len]);
+            delivered += 1;
         });
         // C `errlog.c:823-824`.
         print.base.fill(0);
@@ -1396,7 +1405,7 @@ fn errlog_worker(errlog: &'static Errlog) {
 /// its lock, once per message. The next node is found after the call, so a
 /// listener added by a callback hears this message, and one removed by it
 /// hears nothing more.
-fn deliver(listeners: &ErrlogListeners, record: &[u8]) {
+fn deliver(listeners: &ErrlogListeners, seq: u64, record: &[u8]) {
     let list = listeners.lock();
     let mut at = 0;
     loop {
@@ -1408,7 +1417,7 @@ fn deliver(listeners: &ErrlogListeners, record: &[u8]) {
             node.active = true;
             std::sync::Arc::clone(&node.listener)
         };
-        listener(record);
+        listener(seq, record);
         let mut nodes = list.borrow_mut();
         // The callback may have removed a node ahead of this one.
         let Some(here) = nodes.iter().position(|n| n.active) else {
@@ -1579,6 +1588,7 @@ impl ErrlogQueue {
         *flag = ERL_STATE_READY | if console { ERL_LOCALECHO } else { 0 };
         text[nchar] = 0;
         self.log.pos += 1 + nchar + 1;
+        self.posted += 1;
         true
     }
 }
@@ -1657,6 +1667,10 @@ pub fn errlog_add_listener_bytes<F>(listener: F) -> ErrlogListenerId
 where
     F: Fn(&[u8]) + Send + Sync + 'static,
 {
+    add_listener(std::sync::Arc::new(move |_, m: &[u8]| listener(m)))
+}
+
+fn add_listener(listener: ErrlogListenerFn) -> ErrlogListenerId {
     let errlog = errlog_pvt();
     let id = ErrlogListenerId(
         errlog
@@ -1665,7 +1679,7 @@ where
     );
     errlog.listeners.lock().borrow_mut().push(ListenerNode {
         id,
-        listener: std::sync::Arc::new(listener),
+        listener,
         active: false,
         removed: false,
     });
@@ -1700,6 +1714,92 @@ pub fn errlog_remove_listener(id: ErrlogListenerId) -> bool {
 pub fn errlog_listener_count() -> usize {
     let list = errlog_pvt().listeners.lock();
     list.borrow().iter().filter(|n| !n.removed).count()
+}
+
+/// Every errlog line posted between [`ErrlogCapture::start`] and
+/// [`ErrlogCapture::finish`], and none posted before the start.
+///
+/// A listener from [`errlog_add_listener`] joins the live list, so it also
+/// hears whatever was still queued when it was added; C's `errlogAddListener`
+/// does not drain either. A capture keeps only the messages admitted after it
+/// was attached, however late the worker delivers the rest, and its listener
+/// is removed when it is dropped, a panic included.
+///
+/// ```
+/// use epics_libcom_rs::runtime::log::{ErrlogCapture, errlog_printf};
+///
+/// let capture = ErrlogCapture::start();
+/// errlog_printf("dbLoadRecords: nothing to load\n");
+/// assert_eq!(capture.finish(), ["dbLoadRecords: nothing to load\n"]);
+/// ```
+pub struct ErrlogCapture {
+    id: ErrlogListenerId,
+    /// The [`ErrlogQueue::posted`] number of the first message still owed.
+    from: u64,
+    heard: std::sync::Arc<parking_lot::Mutex<Vec<(u64, String)>>>,
+    /// The owed lines collected and not yet taken.
+    kept: Vec<String>,
+}
+
+impl ErrlogCapture {
+    /// Attach the capture. It does not wait for the worker, so it may be
+    /// started while a delivery is held up.
+    #[must_use]
+    pub fn start() -> Self {
+        let heard = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&heard);
+        let id = add_listener(std::sync::Arc::new(move |seq, m: &[u8]| {
+            sink.lock()
+                .push((seq, String::from_utf8_lossy(m).into_owned()));
+        }));
+        // Read after the attach: every message admitted from here on is
+        // delivered to the listener already in the list.
+        let from = errlog_pvt().queue.lock().posted;
+        ErrlogCapture {
+            id,
+            from,
+            heard,
+            kept: Vec::new(),
+        }
+    }
+
+    /// The lines posted since the start or the previous `take`, in order and
+    /// each as [`errlog_add_listener`] hands it over; the capture goes on and
+    /// keeps them.
+    pub fn lines(&mut self) -> &[String] {
+        let to = errlog_pvt().queue.lock().posted;
+        errlog_flush();
+        let from = std::mem::replace(&mut self.from, to);
+        let kept = &mut self.kept;
+        self.heard.lock().retain_mut(|(seq, line)| {
+            if *seq >= to {
+                return true;
+            }
+            if *seq >= from {
+                kept.push(std::mem::take(line));
+            }
+            false
+        });
+        &self.kept
+    }
+
+    /// [`Self::lines`], handed over; the capture goes on from here.
+    pub fn take(&mut self) -> Vec<String> {
+        self.lines();
+        std::mem::take(&mut self.kept)
+    }
+
+    /// [`Self::take`], and the capture ends.
+    #[must_use]
+    pub fn finish(mut self) -> Vec<String> {
+        self.take()
+    }
+}
+
+impl Drop for ErrlogCapture {
+    fn drop(&mut self) {
+        errlog_remove_listener(self.id);
+    }
 }
 
 /// C `errlogShow(level)` (`errlog.c:694-720`). Returns the lines rather than
@@ -2225,6 +2325,7 @@ mod tests {
             at_exit: false,
             to_console: true,
             flush_seq: 0,
+            posted: 0,
             flushers: Vec::new(),
         }
     }
@@ -3369,6 +3470,168 @@ mod tests {
         assert!(!errlog_to_console());
         assert!(!eltc(true));
         assert!(errlog_to_console());
+    }
+
+    /// The worker stopped inside its console write for the next echoed line,
+    /// before it hands that line to any listener. What is posted meanwhile
+    /// stays queued and reaches the listeners late, and the listener lock is
+    /// free throughout, so a capture can be started during the hold. Undone
+    /// on drop, panic or not.
+    struct HeldWorker {
+        release: Option<std::sync::mpsc::Sender<()>>,
+        entered: std::sync::mpsc::Receiver<()>,
+        eltc_was: bool,
+        ok_to_block_was: bool,
+    }
+
+    struct HoldingStream {
+        entered: Option<std::sync::mpsc::Sender<()>>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl std::io::Write for HoldingStream {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if let Some(entered) = self.entered.take() {
+                let _ = entered.send(());
+                let _ = self.release.recv();
+            }
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl HeldWorker {
+        fn new() -> Self {
+            // `eltc` flushes, so it goes before the worker can be held.
+            let eltc_was = eltc(true);
+            let ok_to_block_was = crate::runtime::task::thread_is_ok_to_block();
+            // A poster that may block would flush into the hold.
+            crate::runtime::task::set_thread_ok_to_block(false);
+            let (entered_tx, entered) = std::sync::mpsc::channel();
+            let (release, release_rx) = std::sync::mpsc::channel();
+            install_console(ConsoleSink::Set {
+                stream: Box::new(HoldingStream {
+                    entered: Some(entered_tx),
+                    release: release_rx,
+                }),
+                paints: false,
+            });
+            HeldWorker {
+                release: Some(release),
+                entered,
+                eltc_was,
+                ok_to_block_was,
+            }
+        }
+
+        /// Post `line` with echo and return once the worker is held on it.
+        fn hold_on(&self, line: &str) {
+            tracing::subscriber::with_default(ConsoleSubscriber, || errlog_printf(line));
+            self.entered
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("the worker reaches the console write");
+        }
+
+        fn release(&mut self) {
+            self.release.take();
+        }
+    }
+
+    impl Drop for HeldWorker {
+        fn drop(&mut self) {
+            self.release();
+            errlog_set_console_to_stderr();
+            eltc(self.eltc_was);
+            crate::runtime::task::set_thread_ok_to_block(self.ok_to_block_was);
+        }
+    }
+
+    /// Boundary: a line queued before the start. The worker delivers it after
+    /// the capture is attached, as a plain listener added at the same point
+    /// shows, and the capture still leaves it out.
+    #[test]
+    #[serial(errlog)]
+    fn a_capture_leaves_out_a_line_queued_before_it_started() {
+        let mut held = HeldWorker::new();
+        held.hold_on("held\n");
+        errlog_printf_no_console(format_args!("stale\n"));
+
+        let live = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&live);
+        let plain = errlog_add_listener(move |m| sink.lock().unwrap().push(m.to_string()));
+        let capture = ErrlogCapture::start();
+        errlog_printf_no_console(format_args!("fresh\n"));
+        held.release();
+
+        assert_eq!(capture.finish(), ["fresh\n"]);
+        assert!(errlog_remove_listener(plain));
+        assert_eq!(*live.lock().unwrap(), ["held\n", "stale\n", "fresh\n"]);
+    }
+
+    /// Boundary: a line posted inside whose delivery comes after `finish`
+    /// has begun waiting for it.
+    #[test]
+    #[serial(errlog)]
+    fn a_capture_keeps_a_line_posted_inside_and_delivered_late() {
+        let mut held = HeldWorker::new();
+        let capture = ErrlogCapture::start();
+        held.hold_on("held\n");
+        errlog_printf_no_console(format_args!("late\n"));
+
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let finisher = std::thread::spawn(move || {
+            let _ = done_tx.send(capture.finish());
+        });
+        // `finish` has read its end and is waiting in its flush.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while errlog_pvt().queue.lock().flushers.is_empty() {
+            assert!(std::time::Instant::now() < deadline, "finish never flushed");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(
+            done.try_recv().is_err(),
+            "finish returned before the delivery"
+        );
+        held.release();
+
+        let lines = done
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("finish returns once the worker is released");
+        finisher.join().unwrap();
+        assert_eq!(lines, ["held\n", "late\n"]);
+    }
+
+    /// Boundary: `lines` keeps what it read and `take` ends one stretch and
+    /// starts the next.
+    #[test]
+    #[serial(errlog)]
+    fn lines_keeps_and_take_splits_the_capture_at_the_call() {
+        let mut capture = ErrlogCapture::start();
+        errlog_printf_no_console(format_args!("first\n"));
+        assert_eq!(capture.lines(), ["first\n"]);
+        errlog_printf_no_console(format_args!("second\n"));
+        assert_eq!(capture.take(), ["first\n", "second\n"]);
+        errlog_printf_no_console(format_args!("third\n"));
+        assert_eq!(capture.finish(), ["third\n"]);
+    }
+
+    /// Boundary: a capture dropped by a panic takes its listener with it.
+    #[test]
+    #[serial(errlog)]
+    fn a_panic_inside_a_capture_removes_its_listener() {
+        let before = errlog_listener_count();
+        let mut id = None;
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let capture = ErrlogCapture::start();
+            id = Some(capture.id);
+            panic!("a failing assertion inside the capture");
+        }));
+        assert!(unwound.is_err());
+        assert!(!errlog_remove_listener(id.expect("the capture started")));
+        assert_eq!(errlog_listener_count(), before);
     }
 }
 

@@ -3,7 +3,6 @@
 //! errlogged; the same record without that TSEL reports it.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 
 use epics_base_rs::server::ioc_builder::IocBuilder;
 
@@ -15,11 +14,7 @@ record(ai, "TT_PLAIN") { field(SIMM, "YES") field(SIOL, "TT_NOSUCH") field(TSE, 
 
 #[epics_macros_rs::epics_test]
 async fn a_time_tsel_skips_the_siol_stamp_read() {
-    let heard = Arc::new(Mutex::new(Vec::new()));
-    let sink = Arc::clone(&heard);
-    epics_base_rs::runtime::log::errlog_add_listener(move |m| {
-        sink.lock().expect("sink").push(m.to_string());
-    });
+    let errlog = epics_base_rs::runtime::log::ErrlogCapture::start();
     let db = IocBuilder::new()
         .db_string(DB_TEXT, &HashMap::new())
         .unwrap()
@@ -34,8 +29,7 @@ async fn a_time_tsel_skips_the_siol_stamp_read() {
             .or_else(epics_base_rs::error::CaError::unless_process_status)
             .unwrap();
     }
-    epics_base_rs::runtime::log::errlog_flush();
-    let heard = heard.lock().expect("sink").join("\n");
+    let heard = errlog.finish().join("\n");
     assert!(
         heard.contains("TT_PLAIN.SIOL = TT_NOSUCH"),
         "the control record reports its dead SIOL: {heard:?}"

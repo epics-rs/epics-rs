@@ -602,13 +602,7 @@ mod tests {
         .unwrap();
         started_rx.recv_timeout(T).unwrap();
 
-        let heard = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sink = Arc::clone(&heard);
-        let listener = crate::runtime::log::errlog_add_listener(move |m| {
-            if m.contains("scanOnce") {
-                sink.lock().unwrap().push(m.to_string());
-            }
-        });
+        let capture = crate::runtime::log::ErrlogCapture::start();
 
         // Fill the single ring slot (worker is busy).
         q.scan_once("REC", Box::new(|| {})).unwrap();
@@ -618,12 +612,12 @@ mod tests {
         assert_eq!(q.overflow_count(), 2);
 
         // dbScan.c:688: the first overflow of the episode only, by name.
-        crate::runtime::log::errlog_flush();
-        crate::runtime::log::errlog_remove_listener(listener);
-        assert_eq!(
-            *heard.lock().unwrap(),
-            ["OVF1 : WARNING scanOnce: Ring buffer overflow\n"]
-        );
+        let heard: Vec<String> = capture
+            .finish()
+            .into_iter()
+            .filter(|m| m.contains("scanOnce"))
+            .collect();
+        assert_eq!(heard, ["OVF1 : WARNING scanOnce: Ring buffer overflow\n"]);
 
         gate_tx.send(()).unwrap(); // release the worker so it can drain.
     }
